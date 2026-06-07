@@ -1,0 +1,4 @@
+# meson_options.txt
+option('enable_debug', type: 'boolean', value: false, description: 'Enable debug build')
+option('with_asan', type: 'boolean', value: false, description: 'Enable AddressSanitizer')
+option('with_ubsan', type: 'boolean', value: false, description: 'Enable UndefinedBehaviorSanitizer')
