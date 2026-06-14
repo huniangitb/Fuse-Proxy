@@ -71,15 +71,15 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
             if (WIFEXITED(status)) {
                 int code = WEXITSTATUS(status);
                 if (code != 0)
-                    LOG("ns操作 pid=%d 耗时: %ldms, 失败码: %d", target_pid, elapsed, code);
+                    LOG_DBG("ns操作 pid=%d 耗时: %ldms, 失败码: %d", target_pid, elapsed, code);
                 else if (elapsed > 50)
-                    LOG("ns操作 pid=%d 耗时: %ldms", target_pid, elapsed);
+                    LOG_DBG("ns操作 pid=%d 耗时: %ldms", target_pid, elapsed);
                 if (code == 0) return 0;
                 if (child_err) *child_err = code;
                 return -1;
             }
             if (elapsed > 50)
-                LOG("ns操作 pid=%d 耗时: %ldms, 非正常退出", target_pid, elapsed);
+                LOG_DBG("ns操作 pid=%d 耗时: %ldms, 非正常退出", target_pid, elapsed);
             return -1;
         }
         if (ret == -1 && errno != EINTR) return -1;
@@ -97,7 +97,7 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
             if (child_err) *child_err = ETIMEDOUT;
             errno = ETIMEDOUT;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            LOG("ns操作 pid=%d 超时(%dms), 总耗时: %ldms", target_pid, timeout_ms,
+            LOG_DBG("ns操作 pid=%d 超时(%dms), 总耗时: %ldms", target_pid, timeout_ms,
                 (now.tv_sec - t_start.tv_sec) * 1000 + (now.tv_nsec - t_start.tv_nsec) / 1000000);
             return -1;
         }
@@ -392,7 +392,7 @@ static int do_combined_mount(void* raw_args) {
 
     size_t tlen = strlen(target);
 
-    /* 使用 libmount 一次解析 mountinfo，同时收集 backup 和 target 的子挂载 */
+    /* 使用 libmount 解析 mountinfo，收集 target 路径下的子挂载 */
     struct libmnt_table *tb = mnt_new_table();
     if (!tb) {
         log_ns_error("[ns_error] mnt_new_table failed\n");
@@ -404,90 +404,149 @@ static int do_combined_mount(void* raw_args) {
         return errno;
     }
 
-    char backup_mounts[128][PATH_MAX];
-    int backup_count = 0;
+    /* 快速路径: 目标已 FUSE 挂载，无需重复操作 */
+    {
+        struct libmnt_fs *existing = mnt_table_find_target(tb, target, MNT_ITER_BACKWARD);
+        if (existing) {
+            const char *fstype = mnt_fs_get_fstype(existing);
+            if (fstype && (fast_strstr(fstype, "fuse.fuse_daemon") != nullptr ||
+                           fast_strstr(fstype, "fuse_daemon") != nullptr)) {
+                mnt_free_table(tb);
+                return 0;  /* 已挂载，无需操作 */
+            }
+        }
+    }
+
     char target_mounts[128][PATH_MAX];
     int target_count = 0;
 
-    struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
-    if (!itr) {
+    if (preserve_count > 0) {
+        /* === 有子挂载需要保留: 完整备份+恢复流程 === */
+        char backup_mounts[128][PATH_MAX];
+        int backup_count = 0;
+
+        struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
+        if (!itr) {
+            mnt_free_table(tb);
+            return ENOMEM;
+        }
+
+        struct libmnt_fs *fs;
+        while (mnt_table_next_fs(tb, itr, &fs) == 0) {
+            const char *mp = mnt_fs_get_target(fs);
+            if (!mp) continue;
+
+            size_t mplen = strlen(mp);
+            size_t blen = strlen(backup);
+            if (mplen >= blen && strncmp(mp, backup, blen) == 0 &&
+                (mp[blen] == '/' || mp[blen] == '\0') &&
+                strcmp(mp, backup) != 0 && backup_count < 128) {
+                strncpy(backup_mounts[backup_count], mp, PATH_MAX - 1);
+                backup_mounts[backup_count][PATH_MAX - 1] = '\0';
+                backup_count++;
+            }
+
+            if (mplen >= tlen && strncmp(mp, target, tlen) == 0 &&
+                (mp[tlen] == '/' || mp[tlen] == '\0') &&
+                strcmp(mp, target) != 0 && target_count < 128) {
+                strncpy(target_mounts[target_count], mp, PATH_MAX - 1);
+                target_mounts[target_count][PATH_MAX - 1] = '\0';
+                target_count++;
+            }
+        }
+        mnt_free_iter(itr);
         mnt_free_table(tb);
-        return ENOMEM;
-    }
 
-    struct libmnt_fs *fs;
-    while (mnt_table_next_fs(tb, itr, &fs) == 0) {
-        const char *mp = mnt_fs_get_target(fs);
-        if (!mp) continue;
+        /* 1. 递归卸载旧备份挂载点 */
+        lmo_umount_all(backup_mounts, backup_count);
+        lmo_umount_retry(backup);
 
-        size_t mplen = strlen(mp);
-        size_t blen = strlen(backup);
-        if (mplen >= blen && strncmp(mp, backup, blen) == 0 &&
-            (mp[blen] == '/' || mp[blen] == '\0') &&
-            strcmp(mp, backup) != 0 && backup_count < 128) {
-            strncpy(backup_mounts[backup_count], mp, PATH_MAX - 1);
-            backup_mounts[backup_count][PATH_MAX - 1] = '\0';
-            backup_count++;
+        if (mkdir(backup, 0755) != 0 && errno != EEXIST) {
+            log_ns_error("[ns_error] Combined mount mkdir backup failed: mkdir(%s) errno=%d\n", backup, errno);
         }
 
-        if (mplen >= tlen && strncmp(mp, target, tlen) == 0 &&
-            (mp[tlen] == '/' || mp[tlen] == '\0') &&
-            strcmp(mp, target) != 0 && target_count < 128) {
-            strncpy(target_mounts[target_count], mp, PATH_MAX - 1);
-            target_mounts[target_count][PATH_MAX - 1] = '\0';
-            target_count++;
-        }
-    }
-
-    mnt_free_iter(itr);
-    mnt_free_table(tb);
-
-    /* 1. 递归卸载旧备份挂载点 */
-    lmo_umount_all(backup_mounts, backup_count);
-    lmo_umount_retry(backup);
-
-    // 强健性安全保护：保证备份点物理目录存在，防止后续挂载失败
-    if (mkdir(backup, 0755) != 0 && errno != EEXIST) {
-        log_ns_error("[ns_error] Combined mount mkdir backup failed: mkdir(%s) errno=%d\n", backup, errno);
-    }
-
-    /* 2. 将目标挂载树备份到备份点 */
-    if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        int err = errno;
-        log_ns_error("[ns_error] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", target, backup, err, strerror(err));
-        return err;
-    }
-
-    /* 3. 递归卸载目标路径下的原生子挂载 */
-    lmo_umount_all(target_mounts, target_count);
-    lmo_umount_retry(target);
-
-    // 强健性安全保护：保证物理目标目录存在
-    if (mkdir(target, 0755) != 0 && errno != EEXIST) {
-        log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
-    }
-
-    /* 4. 将全局 FUSE 挂载源 bind 到目标路径 */
-    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        int err = errno;
-        log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
-        return err;
-    }
-
-    /* 5. 还原需要保留的原生子挂载点 */
-    for (int i = 0; i < preserve_count; i++) {
-        const char* mp = preserve_paths[i];
-        if (mp[0] == '\0') continue;
-
-        const char* rel = mp + tlen;
-        while (*rel == '/') rel++;
-        char backup_src[PATH_MAX];
-        snprintf(backup_src, sizeof(backup_src), "%s/%s", backup, rel);
-
-        mkdir_recursive(mp);
-        if (mount(backup_src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        /* 2. 将目标挂载树备份到备份点 */
+        if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
             int err = errno;
-            log_ns_error("[ns_error] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", backup_src, mp, err, strerror(err));
+            log_ns_error("[ns_error] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", target, backup, err, strerror(err));
+            return err;
+        }
+
+        /* 3. 递归卸载目标路径下的原生子挂载 */
+        lmo_umount_all(target_mounts, target_count);
+        lmo_umount_retry(target);
+
+        if (mkdir(target, 0755) != 0 && errno != EEXIST) {
+            log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
+        }
+
+        /* 4. 将全局 FUSE 挂载源 bind 到目标路径 */
+        if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+            int err = errno;
+            log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
+            return err;
+        }
+
+        /* 5. 还原需要保留的原生子挂载点 */
+        for (int i = 0; i < preserve_count; i++) {
+            const char* mp = preserve_paths[i];
+            if (mp[0] == '\0') continue;
+
+            const char* rel = mp + tlen;
+            while (*rel == '/') rel++;
+            char backup_src[PATH_MAX];
+            snprintf(backup_src, sizeof(backup_src), "%s/%s", backup, rel);
+
+            mkdir_recursive(mp);
+            if (mount(backup_src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+                int err = errno;
+                log_ns_error("[ns_error] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", backup_src, mp, err, strerror(err));
+            }
+        }
+    } else {
+        /* === 无子挂载需要保留: 快速路径，跳过备份 ===
+         *
+         * 常见情况（>90% 的应用）：/storage/emulated/<uid> 下没有原生子挂载节点，
+         * 无需创建备份、也无需恢复。只需卸载目标下的子挂载（如果存在），然后直接
+         * 覆盖挂载 FUSE 即可。
+         */
+        struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
+        if (!itr) {
+            mnt_free_table(tb);
+            return ENOMEM;
+        }
+
+        struct libmnt_fs *fs;
+        while (mnt_table_next_fs(tb, itr, &fs) == 0) {
+            const char *mp = mnt_fs_get_target(fs);
+            if (!mp) continue;
+
+            size_t mplen = strlen(mp);
+            if (mplen >= tlen && strncmp(mp, target, tlen) == 0 &&
+                (mp[tlen] == '/' || mp[tlen] == '\0') &&
+                strcmp(mp, target) != 0 && target_count < 128) {
+                strncpy(target_mounts[target_count], mp, PATH_MAX - 1);
+                target_mounts[target_count][PATH_MAX - 1] = '\0';
+                target_count++;
+            }
+        }
+        mnt_free_iter(itr);
+        mnt_free_table(tb);
+
+        /* 卸载目标下的子挂载（如有） */
+        if (target_count > 0) {
+            lmo_umount_all(target_mounts, target_count);
+        }
+        lmo_umount_retry(target);
+
+        if (mkdir(target, 0755) != 0 && errno != EEXIST) {
+            log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
+        }
+
+        if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+            int err = errno;
+            log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
+            return err;
         }
     }
 
