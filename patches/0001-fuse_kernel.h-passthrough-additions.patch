@@ -9,6 +9,7 @@ Add from Google/libfuse:
 - struct fuse_read_out (offset, again, padding)
 - struct fuse_passthrough_out_v0
 - FUSE_PASSTHROUGH_UPSTREAM alias
+- fuse_open_out union (passthrough_fh / backing_id)
 - Android passthrough ioctls (V0/V1/V2)
 
 diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
@@ -22,7 +23,7 @@ diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
 +
  	/* CUSE specific operations */
  	CUSE_INIT		= 4096,
- 
+
 @@ -700,6 +703,17 @@ struct fuse_entry_out {
  	struct fuse_attr attr;
  };
@@ -40,13 +41,24 @@ diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
 +
  struct fuse_forget_in {
  	uint64_t	nlookup;
- 
+
 @@ -489,6 +503,7 @@
  #define FUSE_PASSTHROUGH	(1ULL << 37)
 +#define FUSE_PASSTHROUGH_UPSTREAM FUSE_PASSTHROUGH
  #define FUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
- 
-@@ -835,6 +850,20 @@ struct fuse_read_in {
+
+@@ -814,7 +829,10 @@ struct fuse_open_out {
+ 	uint64_t	fh;
+ 	uint32_t	open_flags;
+-	int32_t		backing_id;
++	union {
++		uint32_t	passthrough_fh;
++		int32_t		backing_id;
++	};
+ };
+
+ struct fuse_release_in {
+@@ -835,6 +855,20 @@ struct fuse_read_in {
  	uint32_t	padding;
  };
 
@@ -63,9 +75,9 @@ diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
 +};
 +
  #define FUSE_COMPAT_WRITE_IN_SIZE 24
- 
+
  struct fuse_write_in {
-@@ -1128,6 +1157,11 @@ struct fuse_backing_map {
+@@ -1128,6 +1162,11 @@ struct fuse_backing_map {
  #define FUSE_DEV_IOC_BACKING_CLOSE	_IOW(FUSE_DEV_IOC_MAGIC, 2, uint32_t)
 +/* Android Passthrough ioctls */
 +#define FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0 _IOW(229, 1, struct fuse_passthrough_out_v0)
