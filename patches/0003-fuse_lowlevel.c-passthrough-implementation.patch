@@ -6,22 +6,24 @@ Add from Google/libfuse:
 - fuse_reply_canonical_path() implementation
 - FUSE_PASSTHROUGH_API_UNAVAILABLE/V0/V1/V2/STABLE enum
 - fuse_passthrough_enable() with API version negotiation
-  (tries BACKING_OPEN first, then falls back to V2→V1→V0)
-- do_canonical_path() handler for FUSE_CANONICAL_PATH opcode
-- Both dispatch table entries for CANONICAL_PATH
+- _do_canonical_path() for cached-read dispatch table (4 params)
+- do_canonical_path() for standard dispatch table (3 params)
+- Both dispatch table entries for FUSE_CANONICAL_PATH opcode
 
 diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
 --- a/lib/fuse_lowlevel.c
 +++ b/lib/fuse_lowlevel.c
-@@ -557,6 +557,87 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
+@@ -557,6 +557,97 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
  	return send_reply_ok(req, linkname, strlen(linkname));
  }
 
 +int fuse_reply_canonical_path(fuse_req_t req, const char *path)
 +{
++	/* Kernel expects null-terminated buffer */
 +	return send_reply_ok(req, path, strlen(path) + 1);
 +}
 +
++/* Passthrough API version detection enum */
 +enum {
 +	FUSE_PASSTHROUGH_API_UNAVAILABLE,
 +	FUSE_PASSTHROUGH_API_V0,
@@ -30,12 +32,19 @@ diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
 +	FUSE_PASSTHROUGH_API_STABLE,
 +};
 +
++/**
++ * Enable passthrough for a file descriptor.
++ * Tries upstream BACKING_OPEN first, then falls back
++ * to Android V2/V1/V0 passthrough ioctls.
++ *
++ * @return positive backing_id on success, <=0 on error
++ */
 +int fuse_passthrough_enable(fuse_req_t req, unsigned int fd)
 +{
 +	static int passthrough_version = FUSE_PASSTHROUGH_API_STABLE;
 +	int ret = 0;
 +
-+	/* Try upstream passthrough first */
++	/* Try upstream FUSE passthrough first */
 +	{
 +		struct fuse_backing_map map = { .fd = (int)fd };
 +		ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
@@ -43,58 +52,77 @@ diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
 +			return ret;
 +	}
 +
-+	/* Fall back to Android passthrough ioctls */
++	/* Fall back to Android-specific passthrough ioctls */
 +	switch (passthrough_version) {
 +	case FUSE_PASSTHROUGH_API_STABLE:
 +		passthrough_version = FUSE_PASSTHROUGH_API_V2;
++		/* fall through */
 +	case FUSE_PASSTHROUGH_API_V2:
 +		ret = ioctl(req->se->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &fd);
 +		if (ret == -1 && errno == ENOTTY)
 +			passthrough_version = FUSE_PASSTHROUGH_API_V1;
 +		else break;
-+	case FUSE_PASSTHROUGH_API_V1:
-+		struct fuse_passthrough_out_v0 out = { .fd = fd };
++		/* fall through */
++	case FUSE_PASSTHROUGH_API_V1: {
++		struct fuse_passthrough_out_v0 out = {};
++		out.fd = fd;
 +		ret = ioctl(req->se->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1, &out);
 +		if (ret == -1 && errno == ENOTTY)
 +			passthrough_version = FUSE_PASSTHROUGH_API_V0;
 +		else break;
-+	case FUSE_PASSTHROUGH_API_V0:
-+		struct fuse_passthrough_out_v0 out = { .fd = fd };
++		/* fall through */
++	}
++	case FUSE_PASSTHROUGH_API_V0: {
++		struct fuse_passthrough_out_v0 out = {};
++		out.fd = fd;
 +		ret = ioctl(req->se->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0, &out);
 +		if (ret == -1 && errno == ENOTTY)
 +			passthrough_version = FUSE_PASSTHROUGH_API_UNAVAILABLE;
 +		else break;
++		/* fall through */
++	}
 +	default:
 +		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_enable: no valid API\n");
 +		return -ENOTTY;
 +	}
++
 +	if (ret <= 0)
-+		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_enable: %s\n", strerror(errno));
++		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_enable: %s\n",
++			 strerror(errno));
 +	return ret;
 +}
 +
- int fuse_passthrough_open(fuse_req_t req, int fd)
- ...
- 
-+static void do_canonical_path(fuse_req_t req, fuse_ino_t nodeid,
-+			      const void *inarg)
++/* --- Canonical path handlers --- */
++static void _do_canonical_path(fuse_req_t req, const fuse_ino_t nodeid,
++			       const void *op_in, const void *in_payload)
 +{
-+	(void) inarg;
++	(void)op_in; (void)in_payload;
 +	if (req->se->op.canonical_path)
 +		req->se->op.canonical_path(req, nodeid);
 +	else
 +		fuse_reply_err(req, ENOSYS);
 +}
 +
- static void do_mknod(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
- ...
- 
-@@ -XXX,6 +YYY,7 @@ static struct {
++static void do_canonical_path(fuse_req_t req, const fuse_ino_t nodeid,
++			      const void *inarg)
++{
++	(void)inarg;
++	if (req->se->op.canonical_path)
++		req->se->op.canonical_path(req, nodeid);
++	else
++		fuse_reply_err(req, ENOSYS);
++}
++
+ int fuse_passthrough_open(fuse_req_t req, int fd)
+
+@@ -3494,6 +3585,7 @@ static struct {
+ 	...existing entries...
  	[FUSE_READLINK]	   = { do_readlink,    "READLINK"    },
 +	[FUSE_CANONICAL_PATH] = { do_canonical_path, "CANONICAL_PATH" },
  	[FUSE_SYMLINK]	   = { do_symlink,     "SYMLINK"     },
- ...
-@@ -XXX,6 +YYY,7 @@ static struct {
+ 	...existing entries...
+
+@@ -3550,6 +3642,7 @@ static struct {
  	[FUSE_READLINK]		= { _do_readlink,	"READLINK" },
-+	[FUSE_CANONICAL_PATH]	= { do_canonical_path, "CANONICAL_PATH" },
++	[FUSE_CANONICAL_PATH]	= { _do_canonical_path, "CANONICAL_PATH" },
  	[FUSE_SYMLINK]		= { _do_symlink,	"SYMLINK" },
