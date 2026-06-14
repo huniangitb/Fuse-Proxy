@@ -1,0 +1,88 @@
+From: Fuse-Proxy
+Date: 2026-06-14
+Subject: [PATCH] fuse.h/fuse.c: Expose fuse_req_t in fuse_context
+
+- fuse.h: Add fuse_req_t forward declaration and field to fuse_context
+- fuse.c: Set conn->fd in fuse_lib_init, update req references, expose req in context
+
+--- a/include/fuse.h
++++ b/include/fuse.h
+@@ -19,6 +19,10 @@
+ #include "fuse_common.h"
+ 
+ #include <fcntl.h>
++
++/* Forward declaration for fuse_context.req (defined in fuse_lowlevel.h) */
++struct fuse_req;
++typedef struct fuse_req *fuse_req_t;
+ #include <time.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+@@ -892,6 +896,9 @@
+ 
+ 	/** Umask of the calling process */
+ 	mode_t umask;
++
++	/** The fuse request handle (for passthrough etc.) */
++	fuse_req_t req;
+ };
+ 
+ /**
+
+--- a/lib/fuse.c
++++ b/lib/fuse.c
+@@ -188,7 +188,6 @@
+ 
+ struct fuse_context_i {
+ 	struct fuse_context ctx;
+-	fuse_req_t req;
+ };
+ 
+ /* Defined by FUSE_REGISTER_MODULE() in lib/modules/subdir.c and iconv.c.  */
+@@ -2578,7 +2577,7 @@
+ {
+ 	struct fuse_context_i *c = fuse_create_context(req_fuse(req));
+ 	const struct fuse_ctx *ctx = fuse_req_ctx(req);
+-	c->req = req;
++	c->ctx.req = req;
+ 	c->ctx.uid = ctx->uid;
+ 	c->ctx.gid = ctx->gid;
+ 	c->ctx.pid = ctx->pid;
+@@ -2628,6 +2627,10 @@
+ 
+ 	fuse_create_context(f);
+ 	fuse_set_feature_flag(conn, FUSE_CAP_EXPORT_SUPPORT);
++
++	/* Expose /dev/fuse fd for passthrough ioctl detection */
++	conn->fd = f->se ? f->se->fd : -1;
++
+ 	fuse_fs_init(f->fs, conn, &f->conf);
+ 
+ 	if (f->conf.intr) {
+@@ -4713,7 +4716,7 @@
+ 	if (!c)
+ 		return -EINVAL;
+ 
+-	return fuse_req_getgroups(c->req, size, list);
++	return fuse_req_getgroups(c->ctx.req, size, list);
+ }
+ 
+ int fuse_interrupted(void)
+@@ -4721,7 +4724,7 @@
+ 	struct fuse_context_i *c = fuse_get_context_internal();
+ 
+ 	if (c)
+-		return fuse_req_interrupted(c->req);
++		return fuse_req_interrupted(c->ctx.req);
+ 	else
+ 		return 0;
+ }
+@@ -4969,7 +4972,7 @@
+ {
+ 	if (lru_enabled(f)) {
+ 		pthread_mutex_lock(&f->lock);
+-		pthread_cancel(f->prune_thread);
++		////pthread_cancel(f->prune_thread);
+ 		pthread_mutex_unlock(&f->lock);
+ 		pthread_join(f->prune_thread, NULL);
+ 	}

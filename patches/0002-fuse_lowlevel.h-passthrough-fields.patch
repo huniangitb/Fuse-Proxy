@@ -1,0 +1,98 @@
+From: Fuse-Proxy
+Date: 2026-06-14
+Subject: [PATCH] fuse_lowlevel.h: Add passthrough fields, canonical_path, and passthrough_enable
+
+Add from Google/libfuse:
+- backing_action, backing_fd, bpf_action, bpf_fd to struct fuse_entry_param
+- struct fuse_entry_out / fuse_entry_bpf_out forward declarations
+- canonical_path callback in fuse_lowlevel_ops
+- fuse_reply_canonical_path() declaration
+- fuse_passthrough_enable() declaration for per-file passthrough
+
+--- a/include/fuse_lowlevel.h
++++ b/include/fuse_lowlevel.h
+@@ -102,6 +102,13 @@
+ 	    that come through the kernel, this should be set to a very
+ 	    large value. */
+ 	double entry_timeout;
++
++		/** Passthrough / BPF backing info for this entry */
++		uint64_t	backing_action;
++		uint64_t	backing_fd;
++		uint64_t	bpf_action;
++		uint64_t	bpf_fd;
++
+ };
+ 
+ /**
+@@ -172,6 +179,13 @@
+ #define FUSE_SET_ATTR_TIMES_SET	(1 << 16)
+ #define FUSE_SET_ATTR_TOUCH	(1 << 17)
+ 
++/* Forward declarations for kernel structs */
++struct fuse_entry_out;
++struct fuse_entry_bpf_out;
++
++ 
++
++
+ /* ----------------------------------------------------------- *
+  * Request methods and replies				       *
+  * ----------------------------------------------------------- */
+@@ -360,6 +374,18 @@
+ 	void (*readlink) (fuse_req_t req, fuse_ino_t ino);
+ 
+ 	/**
++	 * Return canonical path for inotify
++	 *
++	 * Valid replies:
++	 *   fuse_reply_canonical_path
++	 *   fuse_reply_err
++	 *
++	 * @param req request handle
++	 * @param ino the inode number
++	 */
++	void (*canonical_path) (fuse_req_t req, fuse_ino_t ino);
++
++	/**
+ 	 * Create file node
+ 	 *
+ 	 * Create a regular file, character device, block device, fifo or
+@@ -1441,6 +1467,18 @@
+ int fuse_reply_readlink(fuse_req_t req, const char *link);
+ 
+ /**
++ * Reply with the canonical path for inotify
++ *
++ * Possible requests:
++ *   canonical_path
++ *
++ * @param req request handle
++ * @param path to canonicalize
++ * @return zero for success, -errno for failure to send reply
++ */
++int fuse_reply_canonical_path(fuse_req_t req, const char *path);
++
++/**
+  * Setup passthrough backing file for open reply
+  *
+  * Currently there should be only one backing id per node / backing file.
+@@ -1456,6 +1494,18 @@
+ int fuse_passthrough_close(fuse_req_t req, int backing_id);
+ 
+ /**
++ * Enable passthrough for a file descriptor.
++ *
++ * This tries the upstream BACKING_OPEN ioctl first and falls back
++ * to Android V2/V1/V0 passthrough ioctls automatically.
++ *
++ * @param req request handle
++ * @param fd file descriptor to enable passthrough for
++ * @return positive backing id on success, <=0 on error
++ */
++int fuse_passthrough_enable(fuse_req_t req, unsigned int fd);
++
++/**
+  * Reply with open parameters
+  *
+  * currently the following members of 'fi' are used:

@@ -35,4 +35,13 @@ void vfs_hash_free(DirHashTable* ht);
 bool vfs_get_virtual_child(const char* parent, const char* desc, char* name);
 void vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_id, void* buf, fuse_fill_dir_t filler, uid_t uid, gid_t gid, DirHashTable* ht, bool is_root);
 
+/* 为合成目录 stat 生成非零 inode，防止 FUSE 内核模块拒绝 inode=0 返回 EINVAL */
+static inline ino_t synthetic_inode(const char *path) {
+    unsigned long h = 5381;
+    int c;
+    while ((c = (unsigned char)*path++))
+        h = ((h << 5) + h) + c;
+    return (ino_t)(h | 1);
+}
+
 #endif

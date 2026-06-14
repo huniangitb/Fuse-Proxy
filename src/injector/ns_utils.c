@@ -15,6 +15,8 @@
 #include "ns_utils.h"
 #include "fast_search.h"
 
+#include <libmount/libmount.h>
+
 struct DebugMountArgs {
     const char* pkg;
     int pid;
@@ -69,15 +71,15 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
             if (WIFEXITED(status)) {
                 int code = WEXITSTATUS(status);
                 if (code != 0)
-                    LOG("ns操作 pid=%d 耗时: %ldms, 失败码: %d", target_pid, elapsed, code);
+                    LOG_DBG("ns操作 pid=%d 耗时: %ldms, 失败码: %d", target_pid, elapsed, code);
                 else if (elapsed > 50)
-                    LOG("ns操作 pid=%d 耗时: %ldms", target_pid, elapsed);
+                    LOG_DBG("ns操作 pid=%d 耗时: %ldms", target_pid, elapsed);
                 if (code == 0) return 0;
                 if (child_err) *child_err = code;
                 return -1;
             }
             if (elapsed > 50)
-                LOG("ns操作 pid=%d 耗时: %ldms, 非正常退出", target_pid, elapsed);
+                LOG_DBG("ns操作 pid=%d 耗时: %ldms, 非正常退出", target_pid, elapsed);
             return -1;
         }
         if (ret == -1 && errno != EINTR) return -1;
@@ -95,7 +97,7 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
             if (child_err) *child_err = ETIMEDOUT;
             errno = ETIMEDOUT;
             clock_gettime(CLOCK_MONOTONIC, &now);
-            LOG("ns操作 pid=%d 超时(%dms), 总耗时: %ldms", target_pid, timeout_ms,
+            LOG_DBG("ns操作 pid=%d 超时(%dms), 总耗时: %ldms", target_pid, timeout_ms,
                 (now.tv_sec - t_start.tv_sec) * 1000 + (now.tv_nsec - t_start.tv_nsec) / 1000000);
             return -1;
         }
@@ -108,6 +110,56 @@ static int run_in_mnt_ns(int target_pid, int (*func)(void*), void* args, int* ch
 }
 
 struct MountArgs { const char *src; const char *target; };
+
+/*
+ * 使用 libmount 解析 mountinfo，收集 base 路径下的子挂载点列表
+ * tb: 已解析的 libmount 表
+ * mounts: 输出数组
+ * max_count: 数组上限
+ * base: 基础路径
+ * exclude_base: 排除 base 自身
+ */
+static int lmo_collect_submounts(struct libmnt_table *tb, char mounts[][PATH_MAX], int max_count,
+                                  const char *base, int exclude_base)
+{
+    struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
+    if (!itr) return 0;
+
+    struct libmnt_fs *fs;
+    int count = 0;
+    size_t blen = strlen(base);
+
+    while (mnt_table_next_fs(tb, itr, &fs) == 0 && count < max_count) {
+        const char *mp = mnt_fs_get_target(fs);
+        if (!mp) continue;
+
+        if (exclude_base && strcmp(mp, base) == 0) continue;
+
+        if (strncmp(mp, base, blen) == 0 &&
+            (mp[blen] == '/' || mp[blen] == '\0')) {
+            strncpy(mounts[count], mp, PATH_MAX - 1);
+            mounts[count][PATH_MAX - 1] = '\0';
+            count++;
+        }
+    }
+    mnt_free_iter(itr);
+    return count;
+}
+
+/* 批量卸载 mount 数组（倒序） */
+static void lmo_umount_all(char mounts[][PATH_MAX], int count)
+{
+    for (int i = count - 1; i >= 0; i--)
+        for (int t = 0; t < 8; t++)
+            if (umount2(mounts[i], MNT_DETACH) == 0) break;
+}
+
+/* 单点重试卸载 */
+static void lmo_umount_retry(const char *target)
+{
+    for (int t = 0; t < 8; t++)
+        if (umount2(target, MNT_DETACH) == 0) break;
+}
 
 static int do_bind_mount(void* raw_args) {
     struct MountArgs* args = (struct MountArgs*)raw_args;
@@ -122,59 +174,35 @@ static int do_bind_mount(void* raw_args) {
 
 static int do_umount_recursive(void* raw_args) {
     const char* target = (const char*)raw_args;
-    size_t tlen = strlen(target);
 
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
+    struct libmnt_table *tb = mnt_new_table();
+    if (tb && mnt_table_parse_file(tb, "/proc/self/mountinfo") == 0) {
         char mounts[128][PATH_MAX];
-        int count = 0;
-        char line[4096];
-        while (fgets(line, sizeof(line), fp) && count < 128) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 &&
-                (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
+        int count = lmo_collect_submounts(tb, mounts, 128, target, 1);
+        lmo_umount_all(mounts, count);
+        mnt_free_table(tb);
+    } else if (tb) {
+        mnt_free_table(tb);
     }
 
-    for (int t = 0; t < 8; t++)
-        if (umount2(target, MNT_DETACH) == 0) break;
+    lmo_umount_retry(target);
     return 0;
 }
 
 static int do_umount_and_rmdir(void* raw_args) {
     const char* target = (const char*)raw_args;
-    size_t tlen = strlen(target);
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
+
+    struct libmnt_table *tb = mnt_new_table();
+    if (tb && mnt_table_parse_file(tb, "/proc/self/mountinfo") == 0) {
         char mounts[64][PATH_MAX];
-        int count = 0;
-        char line[4096];
-        while (fgets(line, sizeof(line), fp) && count < 64) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 && mp[tlen] == '/') {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
+        int count = lmo_collect_submounts(tb, mounts, 64, target, 1);
+        lmo_umount_all(mounts, count);
+        mnt_free_table(tb);
+    } else if (tb) {
+        mnt_free_table(tb);
     }
-    for (int t = 0; t < 8; t++) {
-        if (umount2(target, MNT_DETACH) == 0) break;
-    }
+
+    lmo_umount_retry(target);
     rmdir(target);
     return 0;
 }
@@ -235,79 +263,41 @@ int ns_make_shared(int pid, const char* target) {
 int ns_find_native_submounts(int pid, const char* base_path, char mount_points[][256], int max_count) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0;
 
-    char* buf = malloc(65536);
-    if (!buf) { close(fd); return 0; }
-
-    ssize_t nread = 0;
-    while (nread < 65535) {
-        ssize_t r = read(fd, buf + nread, 65535 - nread);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (r == 0) break;
-        nread += r;
+    struct libmnt_table *tb = mnt_new_table();
+    if (!tb || mnt_table_parse_file(tb, path) != 0) {
+        if (tb) mnt_free_table(tb);
+        return 0;
     }
-    buf[nread] = '\0';
-    close(fd);
 
     int count = 0;
     size_t base_len = strlen(base_path);
-    char* line = buf;
-    while (line < buf + nread && count < max_count) {
-        char* next_line = strchr(line, '\n');
-        if (next_line) *next_line = '\0';
-
-        if (fast_strstr(line, base_path) != nullptr) {
-            char* p = line;
-            int fields_skipped = 0;
-            while (fields_skipped < 4 && *p) {
-                if (*p == ' ') {
-                    fields_skipped++;
-                    while (*p == ' ') p++;
-                } else {
-                    p++;
-                }
-            }
-
-            if (fields_skipped == 4 && *p) {
-                char* mp_start = p;
-                while (*p && *p != ' ') p++;
-                size_t mp_len = p - mp_start;
-
-                if (mp_len > 0 && mp_len < 256) {
-                    char mount_point[256];
-                    memcpy(mount_point, mp_start, mp_len);
-                    mount_point[mp_len] = '\0';
-
-                    if (strncmp(mount_point, base_path, base_len) == 0 &&
-                        (mount_point[base_len] == '/' || mount_point[base_len] == '\0') &&
-                        strcmp(mount_point, base_path) != 0) {
-
-                        const char* sep = fast_strstr(p, " - ");
-                        if (sep) {
-                            char fstype[64] = {0};
-                            if (sscanf(sep + 3, "%63s", fstype) == 1) {
-                                if (fast_strstr(fstype, "fuse") == nullptr) {
-                                    strncpy(mount_points[count], mount_point, 255);
-                                    mount_points[count][255] = '\0';
-                                    count++;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!next_line) break;
-        line = next_line + 1;
+    struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
+    if (!itr) {
+        mnt_free_table(tb);
+        return 0;
     }
 
-    free(buf);
+    struct libmnt_fs *fs;
+    while (mnt_table_next_fs(tb, itr, &fs) == 0 && count < max_count) {
+        const char *mp = mnt_fs_get_target(fs);
+        const char *fstype = mnt_fs_get_fstype(fs);
+        if (!mp || !fstype) continue;
+
+        if (strncmp(mp, base_path, base_len) != 0) continue;
+        if (mp[base_len] != '/' && mp[base_len] != '\0') continue;
+        if (strcmp(mp, base_path) == 0) continue;
+
+        /* 过滤掉 FUSE 文件系统 */
+        if (fast_strstr(fstype, "fuse") != nullptr) continue;
+
+        strncpy(mount_points[count], mp, 255);
+        mount_points[count][255] = '\0';
+        count++;
+    }
+
+    mnt_free_iter(itr);
+    mnt_free_table(tb);
     return count;
 }
 
@@ -363,53 +353,15 @@ static int do_backup_and_clear_target(void* raw_args) {
     struct BackupTargetArgs* args = (struct BackupTargetArgs*)raw_args;
     const char* target = args->target;
     const char* backup = args->backup;
-    size_t tlen = strlen(target);
-    size_t blen = strlen(backup);
 
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char line[4096], mounts[128][PATH_MAX];
-        int count = 0;
-        while (fgets(line, sizeof(line), fp) && count < 128) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, backup) == 0) continue;
-            if (strncmp(mp, backup, blen) == 0 && (mp[blen] == '/' || mp[blen] == '\0')) {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-    }
-    for (int t = 0; t < 8; t++)
-        if (umount2(backup, MNT_DETACH) == 0) break;
+    /* 阶段1：解析 mountinfo，卸载旧备份挂载树 */
+    do_umount_recursive((void*)backup);
 
     if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0)
         return errno;
 
-    fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char line[4096], mounts[128][PATH_MAX];
-        int count = 0;
-        while (fgets(line, sizeof(line), fp) && count < 128) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-    }
-    for (int t = 0; t < 8; t++)
-        if (umount2(target, MNT_DETACH) == 0) break;
+    /* 阶段2：重新解析 mountinfo（挂载已变更），卸载目标路径下的子挂载 */
+    do_umount_recursive((void*)target);
 
     return 0;
 }
@@ -439,143 +391,162 @@ static int do_combined_mount(void* raw_args) {
     int preserve_count = args->preserve_count;
 
     size_t tlen = strlen(target);
-    size_t blen = strlen(backup);
 
-    int fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        log_ns_error("[ns_error] open /proc/self/mountinfo failed, errno=%d\n", errno);
+    /* 使用 libmount 解析 mountinfo，收集 target 路径下的子挂载 */
+    struct libmnt_table *tb = mnt_new_table();
+    if (!tb) {
+        log_ns_error("[ns_error] mnt_new_table failed\n");
+        return ENOMEM;
+    }
+    if (mnt_table_parse_file(tb, "/proc/self/mountinfo") != 0) {
+        log_ns_error("[ns_error] mnt_table_parse_file failed\n");
+        mnt_free_table(tb);
         return errno;
     }
 
-    char* buf = malloc(65536);
-    if (!buf) {
-        close(fd);
-        log_ns_error("[ns_error] malloc memory failed\n");
-        return ENOMEM;
-    }
-
-    ssize_t nread = 0;
-    while (nread < 65535) {
-        ssize_t r = read(fd, buf + nread, 65535 - nread);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
+    /* 快速路径: 目标已 FUSE 挂载，无需重复操作 */
+    {
+        struct libmnt_fs *existing = mnt_table_find_target(tb, target, MNT_ITER_BACKWARD);
+        if (existing) {
+            const char *fstype = mnt_fs_get_fstype(existing);
+            if (fstype && (fast_strstr(fstype, "fuse.fuse_daemon") != nullptr ||
+                           fast_strstr(fstype, "fuse_daemon") != nullptr)) {
+                mnt_free_table(tb);
+                return 0;  /* 已挂载，无需操作 */
+            }
         }
-        if (r == 0) break;
-        nread += r;
     }
-    buf[nread] = '\0';
-    close(fd);
 
-    char backup_mounts[128][PATH_MAX];
-    int backup_count = 0;
     char target_mounts[128][PATH_MAX];
     int target_count = 0;
 
-    char* line = buf;
-    while (line < buf + nread) {
-        char* next_line = strchr(line, '\n');
-        if (next_line) *next_line = '\0';
+    if (preserve_count > 0) {
+        /* === 有子挂载需要保留: 完整备份+恢复流程 === */
+        char backup_mounts[128][PATH_MAX];
+        int backup_count = 0;
 
-        if (fast_strstr(line, backup) != nullptr || fast_strstr(line, target) != nullptr) {
-            char* p = line;
-            int fields_skipped = 0;
-            while (fields_skipped < 4 && *p) {
-                if (*p == ' ') {
-                    fields_skipped++;
-                    while (*p == ' ') p++;
-                } else {
-                    p++;
-                }
+        struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
+        if (!itr) {
+            mnt_free_table(tb);
+            return ENOMEM;
+        }
+
+        struct libmnt_fs *fs;
+        while (mnt_table_next_fs(tb, itr, &fs) == 0) {
+            const char *mp = mnt_fs_get_target(fs);
+            if (!mp) continue;
+
+            size_t mplen = strlen(mp);
+            size_t blen = strlen(backup);
+            if (mplen >= blen && strncmp(mp, backup, blen) == 0 &&
+                (mp[blen] == '/' || mp[blen] == '\0') &&
+                strcmp(mp, backup) != 0 && backup_count < 128) {
+                strncpy(backup_mounts[backup_count], mp, PATH_MAX - 1);
+                backup_mounts[backup_count][PATH_MAX - 1] = '\0';
+                backup_count++;
             }
 
-            if (fields_skipped == 4 && *p) {
-                char* mp_start = p;
-                while (*p && *p != ' ') p++;
-                size_t mp_len = p - mp_start;
-
-                if (mp_len > 0 && mp_len < PATH_MAX) {
-                    char mp[PATH_MAX];
-                    memcpy(mp, mp_start, mp_len);
-                    mp[mp_len] = '\0';
-
-                    if (strcmp(mp, backup) != 0 && strncmp(mp, backup, blen) == 0 && (mp[blen] == '/' || mp[blen] == '\0')) {
-                        if (backup_count < 128) {
-                            strcpy(backup_mounts[backup_count++], mp);
-                        }
-                    }
-                    if (strcmp(mp, target) != 0 && strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                        if (target_count < 128) {
-                            strcpy(target_mounts[target_count++], mp);
-                        }
-                    }
-                }
+            if (mplen >= tlen && strncmp(mp, target, tlen) == 0 &&
+                (mp[tlen] == '/' || mp[tlen] == '\0') &&
+                strcmp(mp, target) != 0 && target_count < 128) {
+                strncpy(target_mounts[target_count], mp, PATH_MAX - 1);
+                target_mounts[target_count][PATH_MAX - 1] = '\0';
+                target_count++;
             }
         }
+        mnt_free_iter(itr);
+        mnt_free_table(tb);
 
-        if (!next_line) break;
-        line = next_line + 1;
-    }
-    free(buf);
+        /* 1. 递归卸载旧备份挂载点 */
+        lmo_umount_all(backup_mounts, backup_count);
+        lmo_umount_retry(backup);
 
-    /* 1. 递归卸载旧备份挂载点 */
-    for (int i = backup_count - 1; i >= 0; i--) {
-        for (int t = 0; t < 8; t++) {
-            if (umount2(backup_mounts[i], MNT_DETACH) == 0) break;
+        if (mkdir(backup, 0755) != 0 && errno != EEXIST) {
+            log_ns_error("[ns_error] Combined mount mkdir backup failed: mkdir(%s) errno=%d\n", backup, errno);
         }
-    }
-    for (int t = 0; t < 8; t++) {
-        if (umount2(backup, MNT_DETACH) == 0) break;
-    }
 
-    // 强健性安全保护：保证备份点物理目录存在，防止后续挂载失败
-    if (mkdir(backup, 0755) != 0 && errno != EEXIST) {
-        log_ns_error("[ns_error] Combined mount mkdir backup failed: mkdir(%s) errno=%d\n", backup, errno);
-    }
-
-    /* 2. 将目标挂载树备份到备份点 */
-    if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        int err = errno;
-        log_ns_error("[ns_error] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", target, backup, err, strerror(err));
-        return err;
-    }
-
-    /* 3. 递归卸载目标路径下的原生子挂载 */
-    for (int i = target_count - 1; i >= 0; i--) {
-        for (int t = 0; t < 8; t++) {
-            if (umount2(target_mounts[i], MNT_DETACH) == 0) break;
-        }
-    }
-    for (int t = 0; t < 8; t++) {
-        if (umount2(target, MNT_DETACH) == 0) break;
-    }
-
-    // 强健性安全保护：保证物理目标目录存在
-    if (mkdir(target, 0755) != 0 && errno != EEXIST) {
-        log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
-    }
-
-    /* 4. 将全局 FUSE 挂载源 bind 到目标路径 */
-    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        int err = errno;
-        log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
-        return err;
-    }
-
-    /* 5. 还原需要保留的原生子挂载点 */
-    for (int i = 0; i < preserve_count; i++) {
-        const char* mp = preserve_paths[i];
-        if (mp[0] == '\0') continue;
-
-        const char* rel = mp + tlen;
-        while (*rel == '/') rel++;
-        char backup_src[PATH_MAX];
-        snprintf(backup_src, sizeof(backup_src), "%s/%s", backup, rel);
-
-        mkdir_recursive(mp);
-        if (mount(backup_src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        /* 2. 将目标挂载树备份到备份点 */
+        if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
             int err = errno;
-            log_ns_error("[ns_error] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", backup_src, mp, err, strerror(err));
+            log_ns_error("[ns_error] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", target, backup, err, strerror(err));
+            return err;
+        }
+
+        /* 3. 递归卸载目标路径下的原生子挂载 */
+        lmo_umount_all(target_mounts, target_count);
+        lmo_umount_retry(target);
+
+        if (mkdir(target, 0755) != 0 && errno != EEXIST) {
+            log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
+        }
+
+        /* 4. 将全局 FUSE 挂载源 bind 到目标路径 */
+        if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+            int err = errno;
+            log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
+            return err;
+        }
+
+        /* 5. 还原需要保留的原生子挂载点 */
+        for (int i = 0; i < preserve_count; i++) {
+            const char* mp = preserve_paths[i];
+            if (mp[0] == '\0') continue;
+
+            const char* rel = mp + tlen;
+            while (*rel == '/') rel++;
+            char backup_src[PATH_MAX];
+            snprintf(backup_src, sizeof(backup_src), "%s/%s", backup, rel);
+
+            mkdir_recursive(mp);
+            if (mount(backup_src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+                int err = errno;
+                log_ns_error("[ns_error] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", backup_src, mp, err, strerror(err));
+            }
+        }
+    } else {
+        /* === 无子挂载需要保留: 快速路径，跳过备份 ===
+         *
+         * 常见情况（>90% 的应用）：/storage/emulated/<uid> 下没有原生子挂载节点，
+         * 无需创建备份、也无需恢复。只需卸载目标下的子挂载（如果存在），然后直接
+         * 覆盖挂载 FUSE 即可。
+         */
+        struct libmnt_iter *itr = mnt_new_iter(MNT_ITER_FORWARD);
+        if (!itr) {
+            mnt_free_table(tb);
+            return ENOMEM;
+        }
+
+        struct libmnt_fs *fs;
+        while (mnt_table_next_fs(tb, itr, &fs) == 0) {
+            const char *mp = mnt_fs_get_target(fs);
+            if (!mp) continue;
+
+            size_t mplen = strlen(mp);
+            if (mplen >= tlen && strncmp(mp, target, tlen) == 0 &&
+                (mp[tlen] == '/' || mp[tlen] == '\0') &&
+                strcmp(mp, target) != 0 && target_count < 128) {
+                strncpy(target_mounts[target_count], mp, PATH_MAX - 1);
+                target_mounts[target_count][PATH_MAX - 1] = '\0';
+                target_count++;
+            }
+        }
+        mnt_free_iter(itr);
+        mnt_free_table(tb);
+
+        /* 卸载目标下的子挂载（如有） */
+        if (target_count > 0) {
+            lmo_umount_all(target_mounts, target_count);
+        }
+        lmo_umount_retry(target);
+
+        if (mkdir(target, 0755) != 0 && errno != EEXIST) {
+            log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
+        }
+
+        if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+            int err = errno;
+            log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
+            return err;
         }
     }
 
@@ -594,22 +565,28 @@ int ns_combined_mount(int pid, const char* source, const char* target, const cha
 int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
-    FILE* fp = fopen(path, "re");
-    if (!fp) return -1;
-    int found = 0;
-    char line[2048], mount_point[1024];
-    while (fgets(line, sizeof(line), fp)) {
-        if (!fast_strstr(line, target_mount)) continue;
-        if (match_fs_name && !fast_strstr(line, match_fs_name)) continue;
 
-        if (fast_strstr(line, " - ") && sscanf(line, "%*s %*s %*s %*s %1023s", mount_point) == 1) {
-            if (strcmp(mount_point, target_mount) == 0) {
+    struct libmnt_table *tb = mnt_new_table();
+    if (!tb || mnt_table_parse_file(tb, path) != 0) {
+        if (tb) mnt_free_table(tb);
+        return -1;
+    }
+
+    int found = 0;
+    /* mnt_table_find_target 使用哈希表 O(1) 查找 */
+    struct libmnt_fs *fs = mnt_table_find_target(tb, target_mount, MNT_ITER_BACKWARD);
+    if (fs) {
+        if (!match_fs_name) {
+            found = 1;
+        } else {
+            const char *fstype = mnt_fs_get_fstype(fs);
+            if (fstype && fast_strstr(fstype, match_fs_name) != nullptr) {
                 found = 1;
-                break;
             }
         }
     }
-    fclose(fp);
+
+    mnt_free_table(tb);
     return found;
 }
 

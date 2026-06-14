@@ -26,16 +26,22 @@ is_clang = cc.get_id() == 'clang'
 # ================= 依赖查找 =================
 fuse3_root = '/data/user/0/com.termux/files/home/fuse3-static-install4'
 fuse_inc = include_directories(fuse3_root + '/include')
-fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
+fuse3_dep = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
 
-# 自动探测 libiconv
-libiconv = cc.find_library('iconv', required: true)
+# 自动探测 libiconv（静态链接）
+libiconv = cc.find_library('iconv', static: true, required: true)
+
+# 自动探测 libmount（静态链接，依赖 libblkid）
+libmount = cc.find_library('mount', static: true, required: true)
+libblkid = cc.find_library('blkid', static: true, required: true)
 
 # 项目通用依赖
 project_deps = [
   dependency('threads'),
-  fuse_lib,
-  libiconv
+  fuse3_dep,
+  libiconv,
+  libmount,
+  libblkid
 ]
 
 # ================= 编译标志 =================
@@ -114,7 +120,6 @@ executable('log_ctl',
   install: true,
   install_dir: install_bin_dir
 )
-
 message('========================================')
 message('构建配置信息:')
 message('  平台: ' + target_triplet)

@@ -10,7 +10,7 @@
 
 #define FALLBACK_ERR_LOG ERROR_LOG_PATH
 
-LogLevel g_min_log_level = LOG_INFO;
+LogLevel g_min_log_level = LOG_DEBUG;
 char g_real_root[PATH_MAX] = {0};
 bool g_persist_all_logs = false;
 bool g_strip_o_direct = false;  

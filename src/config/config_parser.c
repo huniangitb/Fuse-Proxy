@@ -587,45 +587,45 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     bool final_monitor = (cfg && cfg->monitor) || g_global_cfg.monitor;
 
     if (cfg) {
-        LOG_MON("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
+        LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
             pkg, pid, user_id, trigger_source,
             final_monitor ? "ON" : "OFF",
             final_sandbox ? "ON" : "OFF",
             final_redir_count, final_hide_count, final_ro_count);
 
         for (int i = 0; i < cfg->redir_count; i++) {
-            LOG_MON("  [重定向] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
+            LOG_DBG("  [重定向] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
         }
         for (int i = 0; i < cfg->hide_count; i++) {
-            LOG_MON("  [隐藏]   %s", cfg->hide_rules[i]);
+            LOG_DBG("  [隐藏]   %s", cfg->hide_rules[i]);
         }
         for (int i = 0; i < cfg->ro_count; i++) {
-            LOG_MON("  [只读]   %s", cfg->ro_rules[i]);
+            LOG_DBG("  [只读]   %s", cfg->ro_rules[i]);
         }
     } else {
-        const char* match_desc = 
+        const char* match_desc =
             is_wildcard ? "命中通配符 [*]" :
             (g_global_cfg.global_inject ? "命中 GLOBAL_INJECT" : "无匹配规则");
-        LOG_MON("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | %s (全局 MONITOR:%s SANDBOX:%s)",
+        LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | %s (全局 MONITOR:%s SANDBOX:%s)",
             pkg, pid, user_id, trigger_source, match_desc,
             final_monitor ? "ON" : "OFF",
             final_sandbox ? "ON" : "OFF");
     }
 
     if (g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0) {
-        LOG_MON("  [全局规则] MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
+        LOG("  [全局规则] MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
             g_global_cfg.monitor ? "ON" : "OFF",
             g_global_cfg.sandbox ? "ON" : "OFF",
             g_global_cfg.redir_count, g_global_cfg.hide_count, g_global_cfg.ro_count);
 
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            LOG_MON("  [全局重定向] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
+            LOG_DBG("  [全局重定向] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
         }
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
-            LOG_MON("  [全局隐藏]   %s", g_global_cfg.hide_rules[i]);
+            LOG_DBG("  [全局隐藏]   %s", g_global_cfg.hide_rules[i]);
         }
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
-            LOG_MON("  [全局只读]   %s", g_global_cfg.ro_rules[i]);
+            LOG_DBG("  [全局只读]   %s", g_global_cfg.ro_rules[i]);
         }
     }
 

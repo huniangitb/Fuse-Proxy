@@ -441,7 +441,7 @@ void vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_i
                 } \
                 if (vfs_hash_insert(ht, name)) { \
                     struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); \
-                    st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = uid; st_dir.st_gid = gid; \
+                    st_dir.st_ino = synthetic_inode(name); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = uid; st_dir.st_gid = gid; \
                     filler(buf, name, &st_dir, 0, 0); \
                 } \
             } \
