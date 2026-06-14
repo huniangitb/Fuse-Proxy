@@ -1,9 +1,0 @@
-=== PATCH: fuse_kernel.h passthrough additions ===
---- a/include/fuse_kernel.h
-+++ b/include/fuse_kernel.h
-@@ -662,6 +662,9 @@
-+	/* Android specific operations */
-+	FUSE_CANONICAL_PATH     = 2016,
-+
- 	/* CUSE specific operations */
- 	CUSE_INIT		= 4096,
