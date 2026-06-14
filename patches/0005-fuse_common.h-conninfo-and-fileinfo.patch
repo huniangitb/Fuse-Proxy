@@ -1,0 +1,37 @@
+From: Fuse-Proxy
+Date: 2026-06-14
+Subject: [PATCH] fuse_common.h: Add fd to conn_info and passthrough_fh to file_info
+
+- fuse_conn_info: reserved[31] -> reserved[30] + int fd
+- fuse_file_info: padding3 -> uint32_t passthrough_fh
+
+--- a/include/fuse_common.h
++++ b/include/fuse_common.h
+@@ -99,7 +99,11 @@
+ 	/** Padding.  Reserved for future use*/
+ 	uint32_t padding : 23;
+ 	uint32_t padding2 : 32;
+-	uint32_t padding3 : 32;
++
++	/** Passthrough file handle id.  May be filled in by filesystem in
++	 * create and open.  It is used to create a passthrough connection
++	 * between FUSE file and backing file (Android passthrough path). */
++	uint32_t passthrough_fh;
+ 
+ 	/** File handle id.  May be filled in by filesystem in create,
+ 	 * open, and opendir().  Available in most other file operations on the
+@@ -709,7 +713,13 @@
+ 	/**
+ 	 * For future use.
+ 	 */
+-	uint16_t reserved[31];
++	uint16_t reserved[30];
++
++		/**
++		 * File descriptor for /dev/fuse device.
++		 * Filled in by libfuse before calling init().
++		 */
++		int fd;
+ };
+ 
+ struct fuse_session;

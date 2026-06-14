@@ -1,52 +1,88 @@
 From: Fuse-Proxy
 Date: 2026-06-14
-Subject: [PATCH 4/5] fuse_context: expose fuse_req_t for passthrough API
+Subject: [PATCH] fuse.h/fuse.c: Expose fuse_req_t in fuse_context
 
-Add fuse_req_t req field to struct fuse_context so high-level API
-callbacks (open, create, etc.) can access the fuse request handle
-via fuse_get_context()->req and call fuse_passthrough_enable().
+- fuse.h: Add fuse_req_t forward declaration and field to fuse_context
+- fuse.c: Set conn->fd in fuse_lib_init, update req references, expose req in context
 
-Changes:
-- include/fuse.h: add struct fuse_req forward decl + fuse_req_t typedef
-- include/fuse.h: add req field to struct fuse_context
-- lib/fuse.c: remove standalone req from fuse_context_i (now in ctx)
-- lib/fuse.c: c->req → c->ctx.req throughout
-
-diff --git a/include/fuse.h b/include/fuse.h
 --- a/include/fuse.h
 +++ b/include/fuse.h
-@@ -20,4 +20,7 @@
+@@ -19,6 +19,10 @@
  #include "fuse_common.h"
-
-+/* Forward declaration for fuse_context.req */
+ 
+ #include <fcntl.h>
++
++/* Forward declaration for fuse_context.req (defined in fuse_lowlevel.h) */
 +struct fuse_req;
 +typedef struct fuse_req *fuse_req_t;
-+
- #include <fcntl.h>
-@@ -889,4 +892,7 @@ struct fuse_context {
+ #include <time.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+@@ -892,6 +896,9 @@
+ 
  	/** Umask of the calling process */
  	mode_t umask;
 +
-+	/** The fuse request handle (for passthrough, etc.) */
++	/** The fuse request handle (for passthrough etc.) */
 +	fuse_req_t req;
  };
+ 
+ /**
 
-diff --git a/lib/fuse.c b/lib/fuse.c
 --- a/lib/fuse.c
 +++ b/lib/fuse.c
-@@ -188,5 +188,4 @@ struct fuse_context_i {
+@@ -188,7 +188,6 @@
+ 
+ struct fuse_context_i {
  	struct fuse_context ctx;
 -	fuse_req_t req;
  };
  
-@@ -2577,3 +2576,3 @@ static struct fuse *req_fuse_prepare(fuse_req_t req)
- 	c->req = req;							//→ c->ctx.req
+ /* Defined by FUSE_REGISTER_MODULE() in lib/modules/subdir.c and iconv.c.  */
+@@ -2578,7 +2577,7 @@
+ {
+ 	struct fuse_context_i *c = fuse_create_context(req_fuse(req));
+ 	const struct fuse_ctx *ctx = fuse_req_ctx(req);
 -	c->req = req;
 +	c->ctx.req = req;
  	c->ctx.uid = ctx->uid;
-@@ -4712,3 +4711,3 @@ struct fuse_context *fuse_get_context(void)
+ 	c->ctx.gid = ctx->gid;
+ 	c->ctx.pid = ctx->pid;
+@@ -2628,6 +2627,10 @@
+ 
+ 	fuse_create_context(f);
+ 	fuse_set_feature_flag(conn, FUSE_CAP_EXPORT_SUPPORT);
++
++	/* Expose /dev/fuse fd for passthrough ioctl detection */
++	conn->fd = f->se ? f->se->fd : -1;
++
+ 	fuse_fs_init(f->fs, conn, &f->conf);
+ 
+ 	if (f->conf.intr) {
+@@ -4713,7 +4716,7 @@
+ 	if (!c)
+ 		return -EINVAL;
+ 
 -	return fuse_req_getgroups(c->req, size, list);
 +	return fuse_req_getgroups(c->ctx.req, size, list);
-@@ -4720,3 +4719,3 @@ int fuse_req_interrupted(fuse_req_t req)
+ }
+ 
+ int fuse_interrupted(void)
+@@ -4721,7 +4724,7 @@
+ 	struct fuse_context_i *c = fuse_get_context_internal();
+ 
+ 	if (c)
 -		return fuse_req_interrupted(c->req);
 +		return fuse_req_interrupted(c->ctx.req);
+ 	else
+ 		return 0;
+ }
+@@ -4969,7 +4972,7 @@
+ {
+ 	if (lru_enabled(f)) {
+ 		pthread_mutex_lock(&f->lock);
+-		pthread_cancel(f->prune_thread);
++		////pthread_cancel(f->prune_thread);
+ 		pthread_mutex_unlock(&f->lock);
+ 		pthread_join(f->prune_thread, NULL);
+ 	}

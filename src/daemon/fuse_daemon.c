@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 #include <fuse3/fuse.h>
+#include <fuse3/fuse_lowlevel.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -252,6 +253,19 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
         VFS_RETURN(-err); 
     }
     fi->fh = fd;
+
+    /* 尝试 passthrough 加速 I/O */
+    if (g_passthrough_enabled) {
+        fuse_req_t req = fuse_get_context()->req;
+        int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
+        if (backing_id > 0) {
+            fi->passthrough_fh = (uint32_t)backing_id;
+            LOG_DBG("OPEN passthrough: %s -> passthrough_fh=%d", sub_path, backing_id);
+        } else {
+            LOG_DBG("OPEN passthrough不可用: %s", sub_path);
+        }
+    }
+
     VFS_RETURN(0);
 }
 
@@ -279,6 +293,19 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     }
     inherit_parent_attributes(p, S_IFREG);
     fi->fh = fd;
+
+    /* 尝试 passthrough 加速 I/O */
+    if (g_passthrough_enabled) {
+        fuse_req_t req = fuse_get_context()->req;
+        int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
+        if (backing_id > 0) {
+            fi->passthrough_fh = (uint32_t)backing_id;
+            LOG_DBG("CREATE passthrough: %s -> passthrough_fh=%d", sub_path, backing_id);
+        } else {
+            LOG_DBG("CREATE passthrough不可用: %s", sub_path);
+        }
+    }
+
     VFS_RETURN(0);
 }
 
