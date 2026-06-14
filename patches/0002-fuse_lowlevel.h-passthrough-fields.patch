@@ -1,0 +1,60 @@
+From: Fuse-Proxy
+Date: 2026-06-14
+Subject: [PATCH 2/5] fuse_lowlevel.h: Add passthrough fields and canonical_path
+
+Add from Google/libfuse:
+- backing_action, backing_fd, bpf_action, bpf_fd to struct fuse_entry_param
+- Forward declarations for struct fuse_entry_out / fuse_entry_bpf_out
+- canonical_path callback in fuse_lowlevel_ops
+- fuse_reply_canonical_path() declaration
+
+diff --git a/include/fuse_lowlevel.h b/include/fuse_lowlevel.h
+--- a/include/fuse_lowlevel.h
++++ b/include/fuse_lowlevel.h
+@@ -100,6 +100,14 @@ struct fuse_entry_param {
+ 		/** Validity timeout (in seconds) for the name. */
+ 		double entry_timeout;
++
++		/** Passthrough / BPF backing info for this entry */
++		uint64_t	backing_action;
++		uint64_t	backing_fd;
++		uint64_t	bpf_action;
++		uint64_t	bpf_fd;
+ 	};
+
++...
++/* Forward declarations for kernel structs */
++struct fuse_entry_out;
++struct fuse_entry_bpf_out;
++
+ ...
+ 	/**
+ 	 * Read symbolic link
+@@ -377,6 +385,17 @@ struct fuse_lowlevel_ops {
+ 	void (*readlink) (fuse_req_t req, fuse_ino_t ino);
+
++        /**
++	 * Return canonical path for inotify
++	 *
++	 * Valid replies:
++	 *   fuse_reply_canonical_path
++	 *   fuse_reply_err
++	 */
++	void (*canonical_path) (fuse_req_t req, fuse_ino_t ino);
++
+ 	/**
+ 	 * Create file node
+ ...
+ int fuse_reply_readlink(fuse_req_t req, const char *link);
+
++/**
++ * Reply with the canonical path for inotify
++ *
++ * Possible requests:
++ *   canonical_path
++ */
++int fuse_reply_canonical_path(fuse_req_t req, const char *path);
++
+ /**
+  * Setup passthrough backing file for open reply
+  */

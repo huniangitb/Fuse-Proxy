@@ -1,0 +1,100 @@
+From: Fuse-Proxy
+Date: 2026-06-14
+Subject: [PATCH 3/5] fuse_lowlevel.c: Implement passthrough API functions
+
+Add from Google/libfuse:
+- fuse_reply_canonical_path() implementation
+- FUSE_PASSTHROUGH_API_UNAVAILABLE/V0/V1/V2/STABLE enum
+- fuse_passthrough_enable() with API version negotiation
+  (tries BACKING_OPEN first, then falls back to V2→V1→V0)
+- do_canonical_path() handler for FUSE_CANONICAL_PATH opcode
+- Both dispatch table entries for CANONICAL_PATH
+
+diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
+--- a/lib/fuse_lowlevel.c
++++ b/lib/fuse_lowlevel.c
+@@ -557,6 +557,87 @@ int fuse_reply_readlink(fuse_req_t req, const char *linkname)
+ 	return send_reply_ok(req, linkname, strlen(linkname));
+ }
+
++int fuse_reply_canonical_path(fuse_req_t req, const char *path)
++{
++	return send_reply_ok(req, path, strlen(path) + 1);
++}
++
++enum {
++	FUSE_PASSTHROUGH_API_UNAVAILABLE,
++	FUSE_PASSTHROUGH_API_V0,
++	FUSE_PASSTHROUGH_API_V1,
++	FUSE_PASSTHROUGH_API_V2,
++	FUSE_PASSTHROUGH_API_STABLE,
++};
++
++int fuse_passthrough_enable(fuse_req_t req, unsigned int fd)
++{
++	static int passthrough_version = FUSE_PASSTHROUGH_API_STABLE;
++	int ret = 0;
++
++	/* Try upstream passthrough first */
++	{
++		struct fuse_backing_map map = { .fd = (int)fd };
++		ret = ioctl(req->se->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
++		if (ret > 0)
++			return ret;
++	}
++
++	/* Fall back to Android passthrough ioctls */
++	switch (passthrough_version) {
++	case FUSE_PASSTHROUGH_API_STABLE:
++		passthrough_version = FUSE_PASSTHROUGH_API_V2;
++	case FUSE_PASSTHROUGH_API_V2:
++		ret = ioctl(req->se->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &fd);
++		if (ret == -1 && errno == ENOTTY)
++			passthrough_version = FUSE_PASSTHROUGH_API_V1;
++		else break;
++	case FUSE_PASSTHROUGH_API_V1:
++		struct fuse_passthrough_out_v0 out = { .fd = fd };
++		ret = ioctl(req->se->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1, &out);
++		if (ret == -1 && errno == ENOTTY)
++			passthrough_version = FUSE_PASSTHROUGH_API_V0;
++		else break;
++	case FUSE_PASSTHROUGH_API_V0:
++		struct fuse_passthrough_out_v0 out = { .fd = fd };
++		ret = ioctl(req->se->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0, &out);
++		if (ret == -1 && errno == ENOTTY)
++			passthrough_version = FUSE_PASSTHROUGH_API_UNAVAILABLE;
++		else break;
++	default:
++		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_enable: no valid API\n");
++		return -ENOTTY;
++	}
++	if (ret <= 0)
++		fuse_log(FUSE_LOG_ERR, "fuse: passthrough_enable: %s\n", strerror(errno));
++	return ret;
++}
++
+ int fuse_passthrough_open(fuse_req_t req, int fd)
+ ...
+ 
++static void do_canonical_path(fuse_req_t req, fuse_ino_t nodeid,
++			      const void *inarg)
++{
++	(void) inarg;
++	if (req->se->op.canonical_path)
++		req->se->op.canonical_path(req, nodeid);
++	else
++		fuse_reply_err(req, ENOSYS);
++}
++
+ static void do_mknod(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
+ ...
+ 
+@@ -XXX,6 +YYY,7 @@ static struct {
+ 	[FUSE_READLINK]	   = { do_readlink,    "READLINK"    },
++	[FUSE_CANONICAL_PATH] = { do_canonical_path, "CANONICAL_PATH" },
+ 	[FUSE_SYMLINK]	   = { do_symlink,     "SYMLINK"     },
+ ...
+@@ -XXX,6 +YYY,7 @@ static struct {
+ 	[FUSE_READLINK]		= { _do_readlink,	"READLINK" },
++	[FUSE_CANONICAL_PATH]	= { do_canonical_path, "CANONICAL_PATH" },
+ 	[FUSE_SYMLINK]		= { _do_symlink,	"SYMLINK" },
