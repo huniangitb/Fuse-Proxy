@@ -665,66 +665,98 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     else
         LOG_DBG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
 
-    /* 直接通过 ioctl 探测 passthrough 是否可用。
+    /*
+     * 通过 ioctl 探测内核是否实现了 passthrough。
      *
-     * 某些内核虽未通过标准 INIT 能力位通告 FUSE_PASSTHROUGH，
-     * 但实际实现了 PASSTHROUGH_OPEN 系列 ioctl (V0/V1/V2)，
-     * 因此不能依赖 capable 检查作为唯一判断条件。
+     * ioctl PASSTHROUGH_OPEN 有三代: V2(最新) → V1 → V0(最旧)
      *
-     * 优先级: V2(最新) → V1 → V0(最旧)
+     * ioctl 返回值意义:
+     *   > 0  → 成功, 内核已启用 passthrough (backing_id)
+     *   EPERM → ioctl 命令存在但 fc->passthrough=0 (INIT 未完成时的正常状态)
+     *   ENOTTY → 内核完全无此 ioctl 命令 (无 passthrough 支持)
      */
+    int backing_id = -1;
+    int saved_errno = 0;
+    bool ioctl_exists = false;  /* ioctl 命令存在(即使返回 EPERM) */
+
     int test_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (test_fd < 0) {
         LOG_ERR("FUSE Passthrough: ❌ 无法打开/dev/null测试fd: %s", strerror(errno));
-        goto passthrough_done;
+        goto ioctl_probe_done;
     }
-
-    int backing_id = -1;
-    int saved_errno = 0;
 
     /* 尝试 V2 (Android Passthrough API V2) */
     backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &test_fd);
-    if (backing_id <= 0) {
+    if (backing_id > 0) {
+        ioctl_exists = true;
+    } else {
         saved_errno = errno;
-        if (saved_errno == ENOTTY) {
-            /* 尝试 V1 (Android Passthrough API V1) */
+        if (saved_errno == EPERM) {
+            ioctl_exists = true;
+        } else if (saved_errno == ENOTTY) {
+            /* 尝试 V1 */
             struct fuse_passthrough_out_v0 out = { .fd = (uint32_t)test_fd, .len = 0, .vec = NULL };
             errno = 0;
             backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1, &out);
-            if (backing_id <= 0) {
+            if (backing_id > 0) {
+                ioctl_exists = true;
+            } else {
                 saved_errno = errno;
-                if (saved_errno == ENOTTY) {
-                    /* 尝试 V0 (最旧的 Android Passthrough API) */
+                if (saved_errno == EPERM) {
+                    ioctl_exists = true;
+                } else if (saved_errno == ENOTTY) {
+                    /* 尝试 V0 (最旧) */
                     errno = 0;
                     backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0, &out);
-                    if (backing_id <= 0) {
+                    if (backing_id > 0) {
+                        ioctl_exists = true;
+                    } else {
                         saved_errno = errno;
+                        if (saved_errno == EPERM) {
+                            ioctl_exists = true;
+                        }
                     }
                 }
             }
         }
     }
 
-    if (backing_id > 0) {
+    if (ioctl_exists) {
+        /* ioctl 命令存在 → 内核有 passthrough 实现 */
         g_passthrough_enabled = true;
-        LOG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
 
-        /* 关闭测试 backing (非关键, 释放内核资源) */
-        int close_ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
-        if (close_ret < 0)
-            LOG_DBG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
+        if (backing_id > 0) {
+            /* ioctl 直接成功了 (极少见: 内核可能已预设 fc->passthrough) */
+            LOG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
+            /* 关闭测试 backing 释放内核资源 */
+            int close_ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
+            if (close_ret < 0)
+                LOG_DBG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
+        } else {
+            /* saved_errno == EPERM: ioctl 存在但 fc->passthrough=0
+             * 这是预期的 — INIT 尚未完成, 下面通过 want 标志请求内核启用 */
+            LOG_DBG("FUSE Passthrough: ioctl 已确认, 通过INIT请求启用...");
+        }
+
+        /*
+         * 请求内核启用 passthrough:
+         * 将 FUSE_CAP_PASSTHROUGH 加入 conn->want,
+         * 内核收到 INIT 回复后会设置 fc->passthrough = 1,
+         * 后续文件操作的 ioctl 将成功返回 backing_id.
+         *
+         * 注意: 因为 capable 可能不含 FUSE_CAP_PASSTHROUGH,
+         * libfuse 的 _do_init() 中已有覆盖逻辑来绕过
+         * want_flags_valid 检查.
+         */
+        conn->want |= FUSE_CAP_PASSTHROUGH;
+        LOG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
     } else {
-        /* 详细错误分析 */
+        /* 所有 PASSTHROUGH_OPEN 版本都返回 ENOTTY → 完全无支持 */
         int err = saved_errno;
         switch (err) {
         case ENOTTY:
             LOG_ERR("FUSE Passthrough: ❌ 内核FUSE模块不支持任何已知的PASSTHROUGH ioctl");
             LOG_ERR("  → 可能原因: 内核未启用CONFIG_FUSE_PASSTHROUGH或版本过低");
-            break;
-        case EPERM:
-            LOG_ERR("FUSE Passthrough: ❌ ioctl返回EPERM — passthrough被禁用或权限不足");
-            LOG_ERR("  → 可能原因: (1)fc->passthrough未在INIT协商中启用");
-            LOG_ERR("  →          (2)进程缺少CAP_SYS_ADMIN权限");
             break;
         case EBADF:
             LOG_ERR("FUSE Passthrough: ❌ 无效的测试文件描述符 (EBADF) — 审计异常!");
@@ -743,7 +775,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 
     close(test_fd);
 
-passthrough_done:
+ioctl_probe_done:
     if (!g_passthrough_enabled)
         LOG_WRN("FUSE Passthrough: 所有文件I/O将走标准FUSE用户态路径 (性能较低)");
 
