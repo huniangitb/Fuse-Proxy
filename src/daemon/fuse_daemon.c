@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#define FUSE_USE_VERSION 317
 #define _FILE_OFFSET_BITS 64
 #include <fuse3/fuse.h>
 #include <stdio.h>
@@ -21,6 +20,8 @@
 #include "vfs_core.h"
 #include "crash_dump.h"
 #include <fuse3/fuse_log.h>
+#include <fuse3/fuse_kernel.h>
+#include <sys/ioctl.h>
 
 bool g_passthrough_enabled = false;
 bool g_preserve_perms = false;
@@ -94,7 +95,7 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
     if (lstat(p, st) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path))) {
-            memset(st, 0, sizeof(struct stat)); st->st_mode = S_IFDIR | 0755; st->st_nlink = 2; st->st_uid = ctx->uid; st->st_gid = ctx->gid;
+            memset(st, 0, sizeof(struct stat)); st->st_ino = synthetic_inode(sub_path); st->st_mode = S_IFDIR | 0755; st->st_nlink = 2; st->st_uid = ctx->uid; st->st_gid = ctx->gid;
             VFS_RETURN(0);
         }
         log_fuse_err("GETATTR", path, err);
@@ -191,15 +192,20 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     }
     
     if (is_root && force_android_skel && !has_android) { 
-        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid; filler(buf, "Android", &st_dir, 0, 0); 
+        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("Android"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid; filler(buf, "Android", &st_dir, 0, 0);
     }
     if (is_android_dir) {
-        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
-        if (!has_data) filler(buf, "data", &st_dir, 0, 0);
-        if (!has_obb) filler(buf, "obb", &st_dir, 0, 0);
+        if (!has_data) {
+            struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("data"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
+            filler(buf, "data", &st_dir, 0, 0);
+        }
+        if (!has_obb) {
+            struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("obb"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
+            filler(buf, "obb", &st_dir, 0, 0);
+        }
     }
     if (hide_others && !has_pkg && (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 || strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)) {
-        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
+        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode(current_pkg); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
         if (vfs_hash_insert(&ht, current_pkg)) filler(buf, current_pkg, &st_dir, 0, 0);
     }
     
@@ -648,10 +654,59 @@ static void vfs_destroy(void *private_data) {
 }
 
 static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
-    (void)conn;
     cfg->use_ino = 1; cfg->entry_timeout = 1.0; cfg->attr_timeout = 1.0; cfg->negative_timeout = 0.5;
     signal(SIGPIPE, SIG_IGN);
-    char msg[512]; snprintf(msg, 511, "FUSE_ALIVE Global %d", getpid()); send_ipc_message(msg); 
+
+    /* === FUSE Passthrough 启动协商 === */
+    g_passthrough_enabled = false;
+    if (conn->capable & FUSE_CAP_PASSTHROUGH) {
+        LOG("FUSE Passthrough: 内核支持该能力 (capable=0x%x)", conn->capable);
+
+        /* 尝试通过 ioctl 验证 passthrough 是否实际可用 */
+        int test_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (test_fd >= 0) {
+            struct fuse_backing_map map = { .fd = test_fd, .flags = 0 };
+            int ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
+            if (ret > 0) {
+                g_passthrough_enabled = true;
+                LOG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", ret);
+
+                /* 关闭测试 backing，释放资源 */
+                int close_ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_CLOSE, &ret);
+                if (close_ret < 0)
+                    LOG_DBG("FUSE Passthrough: 关闭测试backing_id=%d: %s", ret, strerror(errno));
+            } else {
+                int err = errno;
+                switch (err) {
+                case ENOTTY:
+                    LOG_ERR("FUSE Passthrough: ❌ 内核FUSE模块不支持BACKING_OPEN ioctl (ENOTTY)");
+                    LOG_ERR("  → 可能原因: 内核版本过低或未启用CONFIG_FUSE_PASSTHROUGH");
+                    break;
+                case EOPNOTSUPP:
+                    LOG_ERR("FUSE Passthrough: ❌ 内核FUSE禁用了passthrough (EOPNOTSUPP)");
+                    break;
+                case EPERM:
+                    LOG_ERR("FUSE Passthrough: ❌ 权限不足 (EPERM)，需要CAP_SYS_ADMIN");
+                    break;
+                case EBADF:
+                    LOG_ERR("FUSE Passthrough: ❌ 无效的文件描述符 (EBADF)");
+                    break;
+                default:
+                    LOG_ERR("FUSE Passthrough: ❌ 协商失败 errno=%d (%s)", err, strerror(err));
+                    break;
+                }
+            }
+            close(test_fd);
+        } else {
+            LOG_ERR("FUSE Passthrough: ❌ 无法打开/dev/null测试fd: %s", strerror(errno));
+        }
+    } else {
+        LOG_WRN("FUSE Passthrough: ⚠️ 内核不支持FUSE_CAP_PASSTHROUGH能力位");
+        LOG_WRN("  → 可能原因: 内核版本 < 6.0 或未合入passthrough补丁");
+        LOG_WRN("  → 所有文件I/O将走标准FUSE用户态路径 (性能较低)");
+    }
+
+    char msg[512]; snprintf(msg, 511, "FUSE_ALIVE Global %d", getpid()); send_ipc_message(msg);
     if (g_ready_fd >= 0) { write(g_ready_fd, "1", 1); close(g_ready_fd); g_ready_fd = -1; }
     return nullptr;
 }
