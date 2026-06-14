@@ -9,7 +9,6 @@ Add from Google/libfuse:
 - _do_canonical_path() for cached-read dispatch table (4 params)
 - do_canonical_path() for standard dispatch table (3 params)
 - Both dispatch table entries for FUSE_CANONICAL_PATH opcode
-- _do_init() passthrough capability override for custom Android kernels
 
 diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
 --- a/lib/fuse_lowlevel.c
@@ -115,38 +114,6 @@ diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
 +}
 +
  int fuse_passthrough_open(fuse_req_t req, int fd)
-
-@@ -2904,7 +2996,32 @@ static void _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
- 		fuse_convert_to_conn_want_ext(&se->conn);
- 	}
-
-+	/*
-+	 * FUSE passthrough capability override:
-+	 *
-+	 * Some custom Android kernels implement FUSE passthrough
-+	 * (CONFIG_FUSE_PASSTHROUGH=y) but do not advertise the
-+	 * FUSE_PASSTHROUGH capability bit (1ULL << 37) in the INIT
-+	 * request flags.  Without this override, userspace cannot
-+	 * enable passthrough because:
-+	 *   1. capable_ext lacks FUSE_CAP_PASSTHROUGH
-+	 *   2. LL_SET_DEFAULT skips setting want
-+	 *   3. want_flags_valid() rejects the unknown flag
-+	 *
-+	 * If the init callback has set FUSE_CAP_PASSTHROUGH in want
-+	 * despite the missing capability bit, we assume the kernel
-+	 * actually supports it and just does not advertise it.
-+	 */
-+	if ((se->conn.want_ext & FUSE_CAP_PASSTHROUGH) &&
-+	    !(se->conn.capable_ext & FUSE_CAP_PASSTHROUGH)) {
-+		fuse_log(FUSE_LOG_DEBUG,
-+			 "fuse: enabling passthrough override "
-+			 "(want_ext has FUSE_CAP_PASSTHROUGH but "
-+			 "capable_ext does not)\n");
-+		se->conn.capable_ext |= FUSE_CAP_PASSTHROUGH;
-+		se->conn.capable = fuse_lower_32_bits(se->conn.capable_ext);
-+	}
-+
- 	if (!want_flags_valid(se->conn.capable_ext, se->conn.want_ext)) {
 
 @@ -3494,6 +3611,7 @@ static struct {
  	...existing entries...

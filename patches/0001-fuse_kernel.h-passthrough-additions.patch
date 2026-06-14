@@ -8,7 +8,6 @@ Add from Google/libfuse:
 - struct fuse_entry_bpf_out (backing_action, backing_fd, bpf_action, bpf_fd)
 - struct fuse_read_out (offset, again, padding)
 - struct fuse_passthrough_out_v0
-- FUSE_PASSTHROUGH_UPSTREAM alias
 - fuse_open_out union (passthrough_fh / backing_id)
 - Android passthrough ioctls (V0/V1/V2)
 
@@ -43,8 +42,8 @@ diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
  	uint64_t	nlookup;
 
 @@ -489,6 +503,7 @@
- #define FUSE_PASSTHROUGH	(1ULL << 37)
-+#define FUSE_PASSTHROUGH_UPSTREAM FUSE_PASSTHROUGH
+-#define FUSE_PASSTHROUGH	(1ULL << 37)
++#define FUSE_PASSTHROUGH	(1 << 31)
  #define FUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
 
 @@ -814,7 +829,10 @@ struct fuse_open_out {
