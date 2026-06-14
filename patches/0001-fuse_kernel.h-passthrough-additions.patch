@@ -1,0 +1,77 @@
+From: Fuse-Proxy
+Date: 2026-06-14
+Subject: [PATCH 1/5] fuse_kernel.h: Add Android passthrough definitions
+
+Add from Google/libfuse:
+- FUSE_CANONICAL_PATH opcode (2016) for inotify
+- FUSE_ACTION_KEEP/REMOVE/REPLACE enums
+- struct fuse_entry_bpf_out (backing_action, backing_fd, bpf_action, bpf_fd)
+- struct fuse_read_out (offset, again, padding)
+- struct fuse_passthrough_out_v0
+- FUSE_PASSTHROUGH_UPSTREAM alias
+- Android passthrough ioctls (V0/V1/V2)
+
+diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
+--- a/include/fuse_kernel.h
++++ b/include/fuse_kernel.h
+@@ -663,6 +663,9 @@ enum fuse_opcode {
+ 	FUSE_COPY_FILE_RANGE_64	= 53,
+
++	/* Android specific operations */
++	FUSE_CANONICAL_PATH     = 2016,
++
+ 	/* CUSE specific operations */
+ 	CUSE_INIT		= 4096,
+ 
+@@ -700,6 +703,17 @@ struct fuse_entry_out {
+ 	struct fuse_attr attr;
+ };
+
++#define FUSE_ACTION_KEEP        0
++#define FUSE_ACTION_REMOVE      1
++#define FUSE_ACTION_REPLACE     2
++
++struct fuse_entry_bpf_out {
++        uint64_t        backing_action;
++        uint64_t        backing_fd;
++        uint64_t        bpf_action;
++        uint64_t        bpf_fd;
++};
++
+ struct fuse_forget_in {
+ 	uint64_t	nlookup;
+ 
+@@ -489,6 +503,7 @@
+ #define FUSE_PASSTHROUGH	(1ULL << 37)
++#define FUSE_PASSTHROUGH_UPSTREAM FUSE_PASSTHROUGH
+ #define FUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
+ 
+@@ -835,6 +850,20 @@ struct fuse_read_in {
+ 	uint32_t	padding;
+ };
+
++struct fuse_read_out {
++	uint64_t offset;
++	uint32_t again;
++	uint32_t padding;
++};
++
++struct fuse_passthrough_out_v0 {
++	uint32_t	fd;
++	uint32_t	len;
++	void *		vec;
++};
++
+ #define FUSE_COMPAT_WRITE_IN_SIZE 24
+ 
+ struct fuse_write_in {
+@@ -1128,6 +1157,11 @@ struct fuse_backing_map {
+ #define FUSE_DEV_IOC_BACKING_CLOSE	_IOW(FUSE_DEV_IOC_MAGIC, 2, uint32_t)
++/* Android Passthrough ioctls */
++#define FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0 _IOW(229, 1, struct fuse_passthrough_out_v0)
++#define FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1 _IOW(229, 127, struct fuse_passthrough_out_v0)
++#define FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2 _IOW(229, 126, uint32_t)
++
+ struct fuse_lseek_in {
+ 	uint64_t	fh;
+ 	uint64_t	offset;
