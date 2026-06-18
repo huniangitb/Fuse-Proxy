@@ -260,11 +260,11 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
         if (backing_id > 0) {
             fi->passthrough_fh = (uint32_t)backing_id;
-            LOG_DBG("FUSE Passthrough: ✅ %s -> passthrough_fh=%d (backing_id=%d)",
-                sub_path, fi->passthrough_fh, backing_id);
+            LOG_DBG_PERF("FUSE Passthrough: ✅ %s -> passthrough_fh=%d (backing_id=%d)",
+                    sub_path, fi->passthrough_fh, backing_id);
         } else {
-            LOG_DBG("FUSE Passthrough: ❌ %s -> %s (errno=%d)",
-                sub_path, strerror(errno), errno);
+            LOG_DBG_PERF("FUSE Passthrough: ❌ %s -> %s (errno=%d)",
+                    sub_path, strerror(errno), errno);
         }
     }
 
@@ -286,11 +286,11 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
             if (mkdir_recursive_p(p_dir, 0775) == 0) fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, is_redir ? 0666 : mode);
             free(p_dup);
         }
-        if (fd == -1) { 
-            int err = errno; 
+        if (fd == -1) {
+            int err = errno;
             log_fuse_err("CREATE", path, err);
-            if (err != EEXIST) vfs_log_io_err(current_pkg, "CREATE", sub_path, "errno=%d", err); 
-            VFS_RETURN(-err); 
+            if (err != EEXIST) vfs_log_io_err(current_pkg, "CREATE", sub_path, "errno=%d", err);
+            VFS_RETURN(-err);
         }
     }
     inherit_parent_attributes(p, S_IFREG);
@@ -302,11 +302,11 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
         if (backing_id > 0) {
             fi->passthrough_fh = (uint32_t)backing_id;
-            LOG_DBG("FUSE Passthrough: ✅ %s -> passthrough_fh=%d (backing_id=%d)",
-                sub_path, fi->passthrough_fh, backing_id);
+            LOG_DBG_PERF("FUSE Passthrough: ✅ %s -> passthrough_fh=%d (backing_id=%d)",
+                    sub_path, fi->passthrough_fh, backing_id);
         } else {
-            LOG_DBG("FUSE Passthrough: ❌ %s -> %s (errno=%d)",
-                sub_path, strerror(errno), errno);
+            LOG_DBG_PERF("FUSE Passthrough: ❌ %s -> %s (errno=%d)",
+                    sub_path, strerror(errno), errno);
         }
     }
 
@@ -692,9 +692,9 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     g_passthrough_enabled = false;
 
     if (conn->capable & FUSE_CAP_PASSTHROUGH)
-        LOG_DBG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
+        LOG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
     else
-        LOG_DBG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
+        LOG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
 
     /*
      * 通过 ioctl 探测内核是否实现了 passthrough。
@@ -758,15 +758,15 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 
         if (backing_id > 0) {
             /* ioctl 直接成功了 (极少见: 内核可能已预设 fc->passthrough) */
-            LOG_DBG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
+            LOG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
             /* 关闭测试 backing 释放内核资源 */
             int close_ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
             if (close_ret < 0)
-                LOG_DBG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
+                LOG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
         } else {
             /* saved_errno == EPERM: ioctl 存在但 fc->passthrough=0
              * 这是预期的 — INIT 尚未完成, 下面通过 want 标志请求内核启用 */
-            LOG_DBG("FUSE Passthrough: ioctl 已确认, 通过INIT请求启用...");
+            LOG("FUSE Passthrough: ioctl 已确认, 通过INIT请求启用...");
         }
 
         /*
@@ -780,7 +780,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
          * want_flags_valid 检查.
          */
         conn->want |= FUSE_CAP_PASSTHROUGH;
-        LOG_DBG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
+        LOG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
 
         /* === Passthrough 运行时自检 ===
          *
