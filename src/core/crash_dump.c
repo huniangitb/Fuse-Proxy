@@ -11,11 +11,13 @@
 #include <dirent.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
+#include <dlfcn.h>
 
 #define CRASH_BT_MAX 128
 
-[[gnu::weak]] int backtrace(void *__buffer, int __size);
-[[gnu::weak]] void backtrace_symbols_fd(void *const *__buffer, int __size, int __fd);
+/* 运行时通过 dlsym 探测 backtrace 可用性，避免旧平台弱符号解析不可靠 */
+static int (*g_backtrace_fn)(void**, int) = NULL;
+static void (*g_backtrace_symbols_fd_fn)(void* const*, int, int) = NULL;
 
 void safe_printf(int fd, const char* fmt, ...) {
     char buf[512];
@@ -68,7 +70,11 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         // 非预期崩溃，输出诊断（仅使用 async-safe 系统调用）
         char sep[] = "\n========================================\n";
         write(out_fd, sep, sizeof(sep) - 1);
+#ifdef SYS_gettid
         safe_printf(out_fd, "FUSE DAEMON CRASH - PID: %d, TID: %ld\n", getpid(), syscall(SYS_gettid));
+#else
+        safe_printf(out_fd, "FUSE DAEMON CRASH - PID: %d\n", getpid());
+#endif
         safe_printf(out_fd, "Signal: %d - %s\n", sig, sig_name);
 
         if (sig == SIGSEGV || sig == SIGBUS) {
@@ -91,12 +97,12 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         safe_printf(out_fd, "Stack pointer: 0x%llx\n", (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
 #endif
 
-        // 尝试使用 backtrace
-        if (backtrace && backtrace_symbols_fd) {
+        // 尝试使用 backtrace（运行时已探测）
+        if (g_backtrace_fn && g_backtrace_symbols_fd_fn) {
             void *bt[CRASH_BT_MAX];
-            int frames = backtrace(bt, CRASH_BT_MAX);
+            int frames = g_backtrace_fn(bt, CRASH_BT_MAX);
             safe_printf(out_fd, "Backtrace (%d frames):\n", frames);
-            if (frames > 0) backtrace_symbols_fd(bt, frames, out_fd);
+            if (frames > 0) g_backtrace_symbols_fd_fn(bt, frames, out_fd);
         } else {
             safe_printf(out_fd, "Backtrace not available\n");
         }
@@ -108,14 +114,23 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 }
 
 void install_crash_handlers() {
+    /* 运行时探测 backtrace 是否可用（dlsym 比弱符号更可靠） */
+    *(void**)(&g_backtrace_fn) = dlsym(RTLD_DEFAULT, "backtrace");
+    *(void**)(&g_backtrace_symbols_fd_fn) = dlsym(RTLD_DEFAULT, "backtrace_symbols_fd");
+
     struct sigaction sa;
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
+    /* 逐个安装，失败静默跳过（低API等级可能不支持部分信号） */
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
     sigaction(SIGFPE,  &sa, nullptr);
     sigaction(SIGILL,  &sa, nullptr);
+#ifdef SIGSYS
     sigaction(SIGSYS,  &sa, nullptr);
+#endif
+    LOG_DBG("crash_dump: 安装完成, backtrace=%s",
+            g_backtrace_fn ? "可用" : "不可用");
 }
