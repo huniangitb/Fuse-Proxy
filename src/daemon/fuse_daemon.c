@@ -900,9 +900,9 @@ int main(int argc, char *argv[]) {
     }
     fuse_argv[fuse_argc] = nullptr; 
     
-    prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0); 
-    install_crash_handlers();
+    prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
+    install_crash_handlers();
     vfs_core_init(rules_path);
 
 
