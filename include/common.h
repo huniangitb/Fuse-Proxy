@@ -77,14 +77,14 @@ void stop_logcat_capture();
  *   LOG     - 重要生命周期事件（启动、停止、配置变更结果）  → LOG_INFO  (1)
  *   LOG_WRN - 警告（非错误但值得注意的运行时状况）          → LOG_WARN  (2)
  *   LOG_ERR - 错误条件                                      → LOG_ERROR (3)
- *   LOG_MON - 监控状态变更（监控开启/关闭、规则重载通知）   → LOG_DEBUG (0)
  *   PERROR  - LOG_ERR + strerror(errno) 的快捷方式
  */
 #define LOG_DBG(format, ...) log_internal(LOG_DEBUG, format "\n" __VA_OPT__(,) __VA_ARGS__)
+/* 高频路径专用：仅在 debug 模式才执行格式化发送，避免性能开销 */
+#define LOG_DBG_PERF(format, ...) do { if (g_min_log_level == LOG_DEBUG) log_internal(LOG_DEBUG, format "\n" __VA_OPT__(,) __VA_ARGS__); } while (0)
 #define LOG(format, ...)     log_internal(LOG_INFO, format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define LOG_WRN(format, ...) log_internal(LOG_WARN, format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define LOG_ERR(format, ...) log_internal(LOG_ERROR, format "\n" __VA_OPT__(,) __VA_ARGS__)
-#define LOG_MON(format, ...) log_internal(LOG_MONITOR, format "\n" __VA_OPT__(,) __VA_ARGS__)
 
 #define PERROR(msg) LOG_ERR("%s: %s", msg, strerror(errno))
 

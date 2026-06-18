@@ -48,7 +48,7 @@ static void* signal_monitor_thread(void* arg) {
             memset(uid_cfg_cache, 0, sizeof(uid_cfg_cache)); 
             memset(uid_pkg_cache, 0, sizeof(uid_pkg_cache));
             config_unlock_write();
-            LOG_MON("已接收通知，重新加载配置，全局监控状态: %s", g_global_cfg.monitor ? "开启" : "关闭");
+            LOG_DBG("已接收通知，重新加载配置，全局监控状态: %s", g_global_cfg.monitor ? "开启" : "关闭");
         }
     }
     return nullptr;

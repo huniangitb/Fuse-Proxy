@@ -259,7 +259,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
     long t_total = (t_step.tv_sec - t_start.tv_sec) * 1000 +
                    (t_step.tv_nsec - t_start.tv_nsec) / 1000000;
 
-    LOG("挂载计时: parse_submounts=%ldms mount_attempts=%d total=%ldms",
+    LOG_DBG("挂载计时: parse_submounts=%ldms mount_attempts=%d total=%ldms",
         t_after_submounts, mount_attempts, t_total);
 
     if (success) {

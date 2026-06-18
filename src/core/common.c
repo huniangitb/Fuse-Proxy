@@ -248,7 +248,7 @@ void log_close() {
 }
 
 void log_internal(LogLevel level, const char* format, ...) {
-    if (level < g_min_log_level) return;
+    if (level < g_min_log_level && level != LOG_DEBUG) return;
     
     char msg_buf[1024]; 
     va_list args; 
