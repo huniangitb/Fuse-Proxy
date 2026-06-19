@@ -5,6 +5,8 @@
 #include "config_parser.h"
 #include "ns_utils.h"
 #include "mount_manager.h"
+#include "uid_map.h"
+#include "fast_pid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +16,6 @@
 #include <fnmatch.h>
 #include <sys/stat.h>
 #include <signal.h>
-#include <errno.h>
 #include <sys/socket.h>
 
 #define TRACKED_HASH_SIZE 2048
@@ -87,8 +88,7 @@ static void prune_stale_tracked() {
     }
 }
 
-typedef struct { uid_t uid; char pkg[128]; } UidMap;
-static UidMap g_uid_map[1024];
+static UidMapEntry g_uid_map[UID_MAP_MAX_ENTRIES];
 static int g_uid_map_count = 0;
 
 bool is_isolated_uid(uid_t uid) {
@@ -126,53 +126,23 @@ static bool is_zygote_child(pid_t pid) {
     if (ppid <= 1) return false;
 
     char pcmd[64] = {0};
-    snprintf(path, sizeof(path), "/proc/%d/cmdline", ppid);
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    n = read(fd, pcmd, sizeof(pcmd) - 1);
-    close(fd);
+    if (!proc_get_cmdline(ppid, pcmd, sizeof(pcmd))) return false;
 
-    if (n > 0 && (strcmp(pcmd, "zygote") == 0 || strcmp(pcmd, "zygote64") == 0 || strstr(pcmd, "zygote") != nullptr || strstr(pcmd, "usap") != nullptr))
+    if (strcmp(pcmd, "zygote") == 0 || strcmp(pcmd, "zygote64") == 0 || strstr(pcmd, "zygote") != nullptr || strstr(pcmd, "usap") != nullptr)
         return true;
     return false;
 }
 
 bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc) {
-    char base_pkg[256];
-    strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
-    base_pkg[sizeof(base_pkg) - 1] = '\0';
-    char* colon = strchr(base_pkg, ':');
-    if (colon) *colon = '\0';
-
     int user_id = uid / 100000;
 
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id && (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, cmdline, 0) == 0)) {
-            return g_app_cfgs[i]->inject_enable;
-        }
-    }
+    AppConfig* cfg = find_app_cfg_locked(cmdline, user_id);
+    if (cfg) return cfg->inject_enable;
 
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == -1 && (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, cmdline, 0) == 0)) {
-            return g_app_cfgs[i]->inject_enable;
-        }
-    }
-
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id && strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 && g_app_cfgs[i]->inject_enable) {
-            return true;
-        }
-    }
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == -1 && strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 && g_app_cfgs[i]->inject_enable) {
-            return true;
-        }
-    }
+    if (has_wildcard_enabled_locked(user_id)) return true;
 
     if (g_global_cfg.global_inject && !is_isolated_uid(uid) && !strstr(cmdline, "zygote")) {
-        if (from_ipc || is_zygote_child(pid)) {
-            return true;
-        }
+        if (from_ipc || is_zygote_child(pid)) return true;
     }
 
     return false;
@@ -206,22 +176,50 @@ void update_uid_map(uid_t uid, const char* pkg) {
     char* colon = strchr(clean_pkg, ':');
     if (colon) *colon = '\0';
 
-    bool found = false;
-    for (int i = 0; i < g_uid_map_count; i++) {
-        if (g_uid_map[i].uid == uid) { found = true; break; }
+    /* 增量写入/更新文件 */
+    if (uid_map_upsert(uid, clean_pkg) != 0) {
+        LOG_ERR("uid_map_upsert 失败: %u -> %s", uid, clean_pkg);
+        return;
     }
-    if (!found && g_uid_map_count < 1024) {
+
+    /* 更新内存缓存 */
+    for (int i = 0; i < g_uid_map_count; i++) {
+        if (g_uid_map[i].uid == uid) {
+            strncpy(g_uid_map[i].pkg, clean_pkg, 127);
+            g_uid_map[i].pkg[127] = '\0';
+            LOG_DBG("UID映射已更新: %u -> %s (覆盖旧包名)", uid, clean_pkg);
+            notify_fuses(SIGHUP);
+            return;
+        }
+    }
+    if (g_uid_map_count < UID_MAP_MAX_ENTRIES) {
         g_uid_map[g_uid_map_count].uid = uid;
         strncpy(g_uid_map[g_uid_map_count].pkg, clean_pkg, 127);
+        g_uid_map[g_uid_map_count].pkg[127] = '\0';
         g_uid_map_count++;
-        FILE* fp = fopen(CONFIG_DIR "/uid.map", "w");
-        if (fp) {
-            for (int i = 0; i < g_uid_map_count; i++)
-                fprintf(fp, "%d %s\n", g_uid_map[i].uid, g_uid_map[i].pkg);
-            fclose(fp);
-            LOG_DBG("UID映射已更新: %u -> %s", uid, clean_pkg);
-        }
+        LOG_DBG("UID映射已更新: %u -> %s", uid, clean_pkg);
         notify_fuses(SIGHUP);
+    }
+}
+
+void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path) {
+    /* 卸载 FUSE 挂载 */
+    for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
+        ns_umount_recursive(pid, target_path);
+    }
+    for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
+        ns_umount_recursive(pid, backup_path);
+    }
+
+    /* 从备份恢复或从 init 命名空间重建 */
+    if (ns_is_mounted(pid, backup_path, nullptr) > 0) {
+        ns_bind_mount(pid, backup_path, target_path);
+        ns_umount_recursive(pid, backup_path);
+    }
+    if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
+        char init_src[256];
+        snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
+        ns_bind_mount(pid, init_src, target_path);
     }
 }
 
@@ -235,28 +233,9 @@ void force_recover_tracked_mounts() {
                 char target_path[128];
                 get_target_storage_path(uid, target_path, sizeof(target_path));
                 char backup_path[PATH_MAX];
-                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/nsp_sys_storage");
-                
-                for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
-                    ns_umount_recursive(pid, target_path);
-                }
-                
-                for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
-                    ns_umount_recursive(pid, backup_path);
-                }
+                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
 
-                if (ns_is_mounted(pid, backup_path, nullptr) > 0) {
-                    ns_bind_mount(pid, backup_path, target_path);
-                    ns_umount_recursive(pid, backup_path);
-                }
-                if (ns_is_mounted(pid, target_path, nullptr) > 0) {
-                    e = e->next;
-                    continue;
-                }
-                char init_src[256];
-                snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
-                if (ns_bind_mount(pid, init_src, target_path) != 0)
-                    LOG_ERR("force_recover: PID %d bind 恢复失败", pid);
+                cleanup_app_mounts(pid, target_path, backup_path);
             }
             e = e->next;
         }
@@ -280,14 +259,7 @@ void audit_tracked_apps() {
         while (*pp) {
             int pid = (*pp)->pid;
             char cmd[256] = {0};
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-            int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                read(fd, cmd, sizeof(cmd) - 1);
-                close(fd);
-            }
-            if (cmd[0] == '\0') {
+            if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) {
                 TrackedEntry *tmp = *pp;
                 *pp = (*pp)->next;
                 free(tmp);
@@ -295,32 +267,15 @@ void audit_tracked_apps() {
             }
             uid_t uid = get_app_uid(pid);
             bool is_target = is_target_app(cmd, uid, pid, false);
-            
+
             char target_path[128];
             get_target_storage_path(uid, target_path, sizeof(target_path));
             bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
 
             if (!is_target && has_fuse) {
                 char backup_path[PATH_MAX];
-                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/nsp_sys_storage");
-                
-                for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
-                    ns_umount_recursive(pid, target_path);
-                }
-                
-                for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
-                    ns_umount_recursive(pid, backup_path);
-                }
-
-                if (ns_is_mounted(pid, backup_path, nullptr) > 0) {
-                    ns_bind_mount(pid, backup_path, target_path);
-                    ns_umount_recursive(pid, backup_path);
-                }
-                if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
-                    char init_src[256];
-                    snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
-                    ns_bind_mount(pid, init_src, target_path);
-                }
+                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+                cleanup_app_mounts(pid, target_path, backup_path);
                 LOG("配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。", cmd, pid);
             } else if (is_target && !has_fuse) {
                 const char* mnt_src = get_active_mnt_src();
@@ -345,20 +300,13 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
         while (*pp) {
             int pid = (*pp)->pid;
             char cmd[256] = {0};
-            char path[64];
-            snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-            int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                read(fd, cmd, sizeof(cmd) - 1);
-                close(fd);
-            }
-            if (cmd[0] == '\0') {
+            if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) {
                 TrackedEntry *tmp = *pp;
                 *pp = (*pp)->next;
                 free(tmp);
                 continue;
             }
-            
+
             uid_t uid = get_app_uid(pid);
             int user_id = uid / 100000;
             
@@ -375,27 +323,9 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                 char target_path[128];
                 get_target_storage_path(uid, target_path, sizeof(target_path));
                 char backup_path[PATH_MAX];
-                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/nsp_sys_storage");
-                
-                for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
-                    ns_umount_recursive(pid, target_path);
-                }
-                    
-                for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
-                    ns_umount_recursive(pid, backup_path);
-                }
+                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+                cleanup_app_mounts(pid, target_path, backup_path);
 
-                if (ns_is_mounted(pid, backup_path, nullptr) > 0) {
-                    ns_bind_mount(pid, backup_path, target_path);
-                    ns_umount_recursive(pid, backup_path);
-                }
-                    
-                if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
-                    char init_src[256];
-                    snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
-                    ns_bind_mount(pid, init_src, target_path);
-                }
-                
                 bool is_target = is_target_app(cmd, uid, pid, false);
                 if (is_target && mnt_src) {
                     LOG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 进行重新挂载。", cmd, pid);
@@ -422,13 +352,7 @@ void handle_list_injected(int client_fd) {
             int pid = e->pid;
             if (kill(pid, 0) != 0) { e = e->next; continue; }
             char cmdline[256] = {0};
-            char proc_path[64];
-            snprintf(proc_path, sizeof(proc_path), "/proc/%d/cmdline", pid);
-            int fd = open(proc_path, O_RDONLY | O_CLOEXEC);
-            if (fd < 0) { e = e->next; continue; }
-            ssize_t rlen = read(fd, cmdline, sizeof(cmdline) - 1);
-            close(fd);
-            if (rlen <= 0 || cmdline[0] == '\0') { e = e->next; continue; }
+            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) { e = e->next; continue; }
             uid_t uid = get_app_uid(pid);
             char base_pkg[256];
             strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
@@ -436,22 +360,7 @@ void handle_list_injected(int client_fd) {
             if (colon) *colon = '\0';
             int app_redir = 0, app_hide = 0, app_ro = 0;
             config_lock_read();
-            int user_id = uid / 100000;
-            AppConfig* cfg = nullptr;
-            for (int j = 0; j < g_app_cfg_count; j++) {
-                if (g_app_cfgs[j]->user_id == user_id && (fnmatch(g_app_cfgs[j]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[j]->pkg_name, cmdline, 0) == 0)) {
-                    cfg = g_app_cfgs[j];
-                    break;
-                }
-            }
-            if (!cfg) {
-                for (int j = 0; j < g_app_cfg_count; j++) {
-                    if (g_app_cfgs[j]->user_id == -1 && (fnmatch(g_app_cfgs[j]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[j]->pkg_name, cmdline, 0) == 0)) {
-                        cfg = g_app_cfgs[j];
-                        break;
-                    }
-                }
-            }
+            AppConfig* cfg = find_app_cfg_locked(cmdline, uid / 100000);
             if (cfg) {
                 app_redir = cfg->redir_count;
                 app_hide = cfg->hide_count;

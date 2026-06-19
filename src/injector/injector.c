@@ -28,14 +28,6 @@
 #include <errno.h>
 #include <sys/syscall.h>
 
-struct linux_dirent64 {
-    unsigned long  d_ino;
-    long           d_off;
-    unsigned short d_reclen;
-    unsigned char  d_type;
-    char           d_name[];
-};
-
 volatile sig_atomic_t g_should_exit = 0;
 volatile sig_atomic_t g_reload_config = 0;
 volatile sig_atomic_t g_passive_mode = 0;
@@ -230,26 +222,12 @@ static int cleanup_cb(int pid, const char* cmd, void* data) {
     char target_path[128];
     get_target_storage_path(uid, target_path, sizeof(target_path));
     char backup_path[PATH_MAX];
-    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/nsp_sys_storage");
+    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
     bool has_backup = ns_is_mounted(pid, backup_path, nullptr) > 0;
     bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
     if (!has_backup && !has_fuse) return 0;
-    
-    for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
-        ns_umount_recursive(pid, target_path);
-    }
 
-    for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
-        ns_umount_recursive(pid, backup_path);
-    }
-
-    if (ns_is_mounted(pid, backup_path, nullptr) > 0)
-        ns_move_mount(pid, backup_path, target_path);
-    if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
-        char init_src[256];
-        snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
-        ns_bind_mount(pid, init_src, target_path);
-    }
+    cleanup_app_mounts(pid, target_path, backup_path);
     return 0;
 }
 
@@ -299,18 +277,12 @@ static void find_zygotes() {
     while ((de = readdir(dir)) != nullptr && g_zygote_count < 4) {
         if (de->d_type != DT_DIR) continue;
         if (!isdigit(de->d_name[0])) continue;
+        int pid = atoi(de->d_name);
         char cmdline[64] = {0};
-        char path[64];
-        snprintf(path, sizeof(path), "/proc/%s/cmdline", de->d_name);
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
-            close(fd);
-            if (n > 0) {
-                if (strcmp(cmdline, "zygote") == 0 || strcmp(cmdline, "zygote64") == 0 || 
-                    strcmp(cmdline, "usap32") == 0 || strcmp(cmdline, "usap64") == 0) {
-                    g_zygote_pids[g_zygote_count++] = atoi(de->d_name);
-                }
+        if (proc_get_cmdline(pid, cmdline, sizeof(cmdline))) {
+            if (strcmp(cmdline, "zygote") == 0 || strcmp(cmdline, "zygote64") == 0 ||
+                strcmp(cmdline, "usap32") == 0 || strcmp(cmdline, "usap64") == 0) {
+                g_zygote_pids[g_zygote_count++] = pid;
             }
         }
     }
@@ -386,23 +358,17 @@ int scan_zygote_children() {
             if (pid < 1000) continue;
             if (is_tracked(pid)) continue;
 
-            snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-            int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd < 0) continue;
-            ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
-            close(fd);
-            if (n <= 0) continue;
-            cmdline[n] = '\0';
+            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) continue;
 
             if (!is_process_safe_to_inject(cmdline)) continue;
 
             snprintf(path, sizeof(path), "/proc/%d/status", pid);
-            fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd < 0) continue;
-            n = read(fd, status_buf, sizeof(status_buf) - 1);
-            close(fd);
-            if (n <= 0) continue;
-            status_buf[n] = '\0';
+            int status_fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (status_fd < 0) continue;
+            int status_n = read(status_fd, status_buf, sizeof(status_buf) - 1);
+            close(status_fd);
+            if (status_n <= 0) continue;
+            status_buf[status_n] = '\0';
 
             int ppid = 0, uid = 0;
             char *line = status_buf;

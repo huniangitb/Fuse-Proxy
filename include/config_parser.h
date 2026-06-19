@@ -1,7 +1,8 @@
 #ifndef CONFIG_PARSER_H
 #define CONFIG_PARSER_H
 
-#include "common.h"
+#include <stdbool.h>
+#include <sys/types.h>
 
 #define MAX_PATH_LEN 256
 #define MAX_USERS 64
@@ -60,5 +61,18 @@ void strip_trailing_slash(char* path);
 int mkdir_recursive_p(const char *path, mode_t mode);
 
 void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger_source);
+
+/*
+ * 在应用配置列表中查找匹配的 AppConfig。
+ * 调用方需持有 config_lock_read() 锁。
+ * 查找策略：先按精确 user_id 匹配，再按 user_id==-1 (通配) 匹配。
+ */
+AppConfig* find_app_cfg_locked(const char* pkg, int user_id);
+
+/*
+ * 检查应用是否有通配符 "*" 规则且 inject_enable 启用。
+ * 调用方需持有 config_lock_read() 锁。
+ */
+bool has_wildcard_enabled_locked(int user_id);
 
 #endif

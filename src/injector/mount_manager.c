@@ -20,15 +20,14 @@ static bool is_mount_error_permanent(int err) {
 }
 
 bool app_has_active_rules(const char* pkg, uid_t uid) {
-    char base_pkg[256]; strncpy(base_pkg, pkg, sizeof(base_pkg) - 1); char* colon = strchr(base_pkg, ':'); if (colon) *colon = '\0';
-    int user_id = uid / 100000; config_lock_read(); AppConfig* cfg = nullptr;
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if ((g_app_cfgs[i]->user_id == user_id || g_app_cfgs[i]->user_id == -1) && (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0)) { cfg = g_app_cfgs[i]; break; }
-    }
+    int user_id = uid / 100000;
+    config_lock_read();
+    AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     bool has_rules = false;
     if (cfg) has_rules = (cfg->redir_count > 0 || cfg->hide_count > 0 || cfg->ro_count > 0 || cfg->sandbox);
     if (!has_rules) has_rules = (g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0 || g_global_cfg.sandbox);
-    config_unlock_read(); return has_rules;
+    config_unlock_read();
+    return has_rules;
 }
 
 typedef struct {
@@ -170,7 +169,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     char target_path[128]; get_target_storage_path(uid, target_path, sizeof(target_path));
-    char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/nsp_sys_storage");
+    char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
 
     MountState mnt;
     read_mount_state(pid, target_path, backup_path, &mnt);
@@ -208,19 +207,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         int n = ns_find_native_submounts(pid, target_path, found, 16);
         if (n > 0) {
             config_lock_read();
-            char base_pkg[256];
-            strncpy(base_pkg, pkg, sizeof(base_pkg) - 1);
-            char* colon = strchr(base_pkg, ':');
-            if (colon) *colon = '\0';
-            int user_id = uid / 100000;
-            AppConfig* cfg = nullptr;
-            for (int i = 0; i < g_app_cfg_count; i++) {
-                if ((g_app_cfgs[i]->user_id == user_id || g_app_cfgs[i]->user_id == -1) &&
-                    (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0)) {
-                    cfg = g_app_cfgs[i];
-                    break;
-                }
-            }
+            AppConfig* cfg = find_app_cfg_locked(pkg, uid / 100000);
 
             size_t tlen = strlen(target_path);
             for (int i = 0; i < n; i++) {

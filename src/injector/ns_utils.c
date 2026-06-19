@@ -328,7 +328,7 @@ static int do_bind_mount_with_preserve(void* raw_args) {
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
 
     char backup_base[PATH_MAX];
-    snprintf(backup_base, sizeof(backup_base), BACKUP_DIR "/nsp_sys_storage");
+    snprintf(backup_base, sizeof(backup_base), BACKUP_DIR "/storage");
     size_t target_len = strlen(target);
 
     for (int i = 0; i < preserve_count; i++) {
@@ -529,8 +529,8 @@ static int do_combined_mount(void* raw_args) {
     }
 
     // 强健性安全保护：保证备份点物理目录存在，防止后续挂载失败
-    if (mkdir(backup, 0755) != 0 && errno != EEXIST) {
-        log_ns_error("[ns_error] Combined mount mkdir backup failed: mkdir(%s) errno=%d\n", backup, errno);
+    if (mkdir_recursive(backup) != 0) {
+        log_ns_error("[ns_error] Combined mount mkdir_recursive backup failed: mkdir_recursive(%s) errno=%d\n", backup, errno);
     }
 
     /* 2. 将目标挂载树备份到备份点 */
@@ -551,8 +551,8 @@ static int do_combined_mount(void* raw_args) {
     }
 
     // 强健性安全保护：保证物理目标目录存在
-    if (mkdir(target, 0755) != 0 && errno != EEXIST) {
-        log_ns_error("[ns_error] Combined mount mkdir target failed: mkdir(%s) errno=%d\n", target, errno);
+    if (mkdir_recursive(target) != 0) {
+        log_ns_error("[ns_error] Combined mount mkdir_recursive target failed: mkdir_recursive(%s) errno=%d\n", target, errno);
     }
 
     /* 4. 将全局 FUSE 挂载源 bind 到目标路径 */

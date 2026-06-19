@@ -1,4 +1,5 @@
 #include "config_parser.h"
+#include "common.h"
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <dirent.h>
@@ -532,53 +533,50 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
     return changed_count;
 }
 
-void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* trigger_source) {
-    config_lock_read();
-    int user_id = linux_uid / 100000;
-    
+AppConfig* find_app_cfg_locked(const char* pkg, int user_id) {
     char base_pkg[256];
     strncpy(base_pkg, pkg, sizeof(base_pkg) - 1);
     base_pkg[sizeof(base_pkg) - 1] = '\0';
     char* colon = strchr(base_pkg, ':');
     if (colon) *colon = '\0';
 
-    AppConfig* cfg = nullptr;
-    bool is_wildcard = false;
-    
     for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id && 
-           (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0)) {
-            cfg = g_app_cfgs[i];
-            break;
-        }
+        if (g_app_cfgs[i]->user_id == user_id &&
+            (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 ||
+             fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0))
+            return g_app_cfgs[i];
     }
-    
-    if (!cfg) {
-        for (int i = 0; i < g_app_cfg_count; i++) {
-            if (g_app_cfgs[i]->user_id == -1 && 
-               (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0)) {
-                cfg = g_app_cfgs[i];
-                break;
-            }
-        }
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        if (g_app_cfgs[i]->user_id == -1 &&
+            (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 ||
+             fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0))
+            return g_app_cfgs[i];
     }
-    
-    if (!cfg) {
-        for (int i = 0; i < g_app_cfg_count; i++) {
-            if (g_app_cfgs[i]->user_id == user_id && strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 && g_app_cfgs[i]->inject_enable) {
-                is_wildcard = true;
-                break;
-            }
-        }
-        if (!is_wildcard) {
-            for (int i = 0; i < g_app_cfg_count; i++) {
-                if (g_app_cfgs[i]->user_id == -1 && strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 && g_app_cfgs[i]->inject_enable) {
-                    is_wildcard = true;
-                    break;
-                }
-            }
-        }
+    return NULL;
+}
+
+bool has_wildcard_enabled_locked(int user_id) {
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        if (g_app_cfgs[i]->user_id == user_id &&
+            strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 &&
+            g_app_cfgs[i]->inject_enable)
+            return true;
     }
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        if (g_app_cfgs[i]->user_id == -1 &&
+            strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 &&
+            g_app_cfgs[i]->inject_enable)
+            return true;
+    }
+    return false;
+}
+
+void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* trigger_source) {
+    config_lock_read();
+    int user_id = linux_uid / 100000;
+
+    AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
+    bool is_wildcard = (cfg == NULL) && has_wildcard_enabled_locked(user_id);
 
     int final_redir_count = (cfg ? cfg->redir_count : 0) + g_global_cfg.redir_count;
     int final_hide_count = (cfg ? cfg->hide_count : 0) + g_global_cfg.hide_count;

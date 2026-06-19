@@ -169,28 +169,30 @@ int mkdir_recursive(const char *dir) {
     return 0;
 }
 
+/* 共享的无效 Unicode/控制字符检测逻辑：返回该字符的字节长度(>0表示无效)或0(正常) */
+static int path_char_is_invalid(const unsigned char* p) {
+    if (*p < 0x08) return 1;
+    if (*p > 0x09 && *p < 0x20) return 1;
+    if (*p == 0x7F) return 1;
+
+    if (p[0] == 0xC2 && (p[1] == 0xA0 || p[1] == 0xAD)) return 2;
+
+    if (p[0] == 0xE2 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xAF) return 3;
+    if (p[0] == 0xE2 && p[1] == 0x81 && p[2] >= 0xA0 && p[2] <= 0xAF) return 3;
+    if (p[0] == 0xE1 && p[1] == 0xA0 && p[2] == 0x8E) return 3;
+    if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) return 3;
+
+    if (p[0] == 0xF3 && p[1] == 0xA0 && p[2] == 0x80 && p[3] >= 0x80 && p[3] <= 0xBF) return 4;
+    if (p[0] == 0xF3 && p[1] == 0xA0 && p[2] == 0x81 && p[3] >= 0x80 && p[3] <= 0xAF) return 4;
+
+    return 0;
+}
+
 bool path_contains_invalid_chars(const char* path) {
     const unsigned char* p = (const unsigned char*)path;
     while (*p) {
-        if (*p < 0x08) return true;              
-        if (*p > 0x09 && *p < 0x20) return true; 
-        if (*p == 0x7F) return true;             
-
-        // 检查 2 字节序列: C2 A0 或 C2 AD
-        if (p[0] == 0xC2 && p[1] >= 0xA0 && p[1] <= 0xAD) {
-            if (p[1] == 0xA0 || p[1] == 0xAD) return true;
-        }
-
-        // 检查 3 字节序列: E2 80 80-8A, etc.
-        if (p[0] == 0xE2 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xAF) return true;
-        if (p[0] == 0xE2 && p[1] == 0x81 && p[2] >= 0xA0 && p[2] <= 0xAF) return true;
-        if (p[0] == 0xE1 && p[1] == 0xA0 && p[2] == 0x8E) return true;
-        if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) return true;
-
-        // 检查 4 字节序列: F3 A0 80 80-BF, etc.
-        if (p[0] == 0xF3 && p[1] == 0xA0 && p[2] == 0x80 && p[3] >= 0x80 && p[3] <= 0xBF) return true;
-        if (p[0] == 0xF3 && p[1] == 0xA0 && p[2] == 0x81 && p[3] >= 0x80 && p[3] <= 0xAF) return true;
-
+        int skip = path_char_is_invalid(p);
+        if (skip > 0) return true;
         p++;
     }
     return false;
@@ -203,22 +205,9 @@ void path_sanitize(char* out, size_t size, const char* path) {
     size_t max = size - 1;
 
     while (*p && o < max) {
-        int skip_bytes = 0;
-        bool matched = false;
-
-        if (*p < 0x08) { matched = true; skip_bytes = 1; }
-        else if (*p > 0x09 && *p < 0x20) { matched = true; skip_bytes = 1; }
-        else if (*p == 0x7F) { matched = true; skip_bytes = 1; }
-        else if (p[0] == 0xC2 && (p[1] == 0xA0 || p[1] == 0xAD)) { matched = true; skip_bytes = 2; }
-        else if (p[0] == 0xE2 && p[1] == 0x80 && p[2] >= 0x80 && p[2] <= 0xAF) { matched = true; skip_bytes = 3; }
-        else if (p[0] == 0xE2 && p[1] == 0x81 && p[2] >= 0xA0 && p[2] <= 0xAF) { matched = true; skip_bytes = 3; }
-        else if (p[0] == 0xE1 && p[1] == 0xA0 && p[2] == 0x8E) { matched = true; skip_bytes = 3; }
-        else if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) { matched = true; skip_bytes = 3; }
-        else if (p[0] == 0xF3 && p[1] == 0xA0 && p[2] == 0x80 && p[3] >= 0x80 && p[3] <= 0xBF) { matched = true; skip_bytes = 4; }
-        else if (p[0] == 0xF3 && p[1] == 0xA0 && p[2] == 0x81 && p[3] >= 0x80 && p[3] <= 0xAF) { matched = true; skip_bytes = 4; }
-
-        if (matched) {
-            p += skip_bytes;
+        int skip = path_char_is_invalid(p);
+        if (skip > 0) {
+            p += skip;
         } else {
             out[o++] = *p;
             p++;
