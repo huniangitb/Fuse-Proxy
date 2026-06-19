@@ -29,7 +29,7 @@
 // STORAGE_BASE: FUSE 内部读写直接使用 /data/media（真实物理存储）
 // 应用通过 /mnt/nsp_global/ 或 /storage/emulated/ 访问 FUSE 挂载
 #define STORAGE_BASE "/data/media"
-#define BACKUP_DIR "/mnt/backup"
+#define BACKUP_DIR "/mnt/nsp_backup"
 #define REAL_STORAGE_PATH STORAGE_BASE
 #define MODULES_ROOT "/data/adb/modules"
 

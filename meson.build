@@ -73,10 +73,11 @@ inc_dir = include_directories('include')
 common_sources = [
     'src/core/common.c',
     'src/config/config_parser.c',
-    'src/core/fast_search.c'
+    'src/core/fast_search.c',
+    'src/core/uid_map.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/vfs_core.c', 'src/core/crash_dump.c']
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/vfs_core.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c']
 injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/ns_utils.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================

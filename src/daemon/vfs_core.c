@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "vfs_core.h"
+#include "uid_map.h"
+#include "fast_pid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +13,7 @@
 #include <dirent.h>
 char g_rules_path[PATH_MAX] = {0};
 
-typedef struct { uid_t uid; char pkg[128]; } UidMap;
-static UidMap g_uid_maps[1024];
+static UidMapEntry g_uid_maps[UID_MAP_MAX_ENTRIES];
 static int g_uid_map_count = 0;
 
 #define UID_CACHE_SIZE 2048
@@ -21,19 +22,7 @@ static uid_t uid_cached[UID_CACHE_SIZE] = {0};
 static char uid_pkg_cache[UID_CACHE_SIZE][128];
 
 static void load_uid_map() {
-    FILE* fp = fopen(CONFIG_DIR "/uid.map", "r");
-    g_uid_map_count = 0; 
-    if (!fp) return;
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && g_uid_map_count < 1024) {
-        uid_t u; char p[128];
-        if (sscanf(line, "%d %127s", &u, p) == 2) {
-            g_uid_maps[g_uid_map_count].uid = u;
-            strncpy(g_uid_maps[g_uid_map_count].pkg, p, 127);
-            g_uid_map_count++;
-        }
-    }
-    fclose(fp);
+    g_uid_map_count = uid_map_load(g_uid_maps, UID_MAP_MAX_ENTRIES);
 }
 
 static void* signal_monitor_thread(void* arg) {
@@ -82,10 +71,8 @@ AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
     int user_id = uid / 100000;
     char final_pkg[256] = {0}; pid_t main_pid = tid;
     
-    // 关键：外部调用者已持有 config_lock_read()，移除此处冗余的 config_lock_read() 杜绝锁重入死锁
-    for (int i = 0; i < g_uid_map_count; i++) {
-        if (g_uid_maps[i].uid == uid) { strncpy(final_pkg, g_uid_maps[i].pkg, 255); break; }
-    }
+    const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
+    if (mapped) strncpy(final_pkg, mapped, 255);
 
     if (final_pkg[0] == '\0') {
         char status_path[64]; snprintf(status_path, sizeof(status_path), "/proc/%d/status", tid);
@@ -97,9 +84,7 @@ AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
             }
             fclose(fp);
         }
-        char path[64]; snprintf(path, sizeof(path), "/proc/%d/cmdline", main_pid);
-        int fd = open(path, O_RDONLY);
-        if (fd >= 0) { read(fd, final_pkg, sizeof(final_pkg)-1); close(fd); }
+        proc_get_cmdline(main_pid, final_pkg, sizeof(final_pkg));
     }
 
     char base_pkg[256];
@@ -118,22 +103,10 @@ AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
 
     strncpy(uid_pkg_cache[slot], current_pkg_out, 127); uid_pkg_cache[slot][127] = '\0';
 
-    AppConfig* matched = nullptr;
-    // 关键：同理移除冗余的 config_lock_read() 
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id && (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, final_pkg, 0) == 0)) { 
-            matched = g_app_cfgs[i]; break; 
-        }
-    }
-    if (!matched) {
-        for (int i = 0; i < g_app_cfg_count; i++) {
-            if (g_app_cfgs[i]->user_id == -1 && (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 || fnmatch(g_app_cfgs[i]->pkg_name, final_pkg, 0) == 0)) { 
-                matched = g_app_cfgs[i]; break; 
-            }
-        }
-    }
-    
-    uid_cached[slot] = uid; uid_cfg_cache[slot] = matched; 
+    // 调用方已持有 config_lock_read()
+    AppConfig* matched = find_app_cfg_locked(final_pkg, user_id);
+
+    uid_cached[slot] = uid; uid_cfg_cache[slot] = matched;
     return matched;
 }
 

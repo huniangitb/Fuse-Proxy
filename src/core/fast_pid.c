@@ -8,21 +8,12 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 
 #include "fast_pid.h"
 
 #define DIRENT_BUF_SIZE (1024 * 1024)
-
-struct linux_dirent64 {
-    unsigned long  d_ino;
-    long           d_off;
-    unsigned short d_reclen;
-    unsigned char  d_type;
-    char           d_name[];
-};
 
 static char* g_dirent_buf = nullptr;
 
@@ -74,7 +65,7 @@ static void cache_add_pid(int pid) {
     g_cached_pids[g_cached_count++] = pid;
 }
 
-static bool get_cmdline(int pid, char* buf, size_t size) {
+bool proc_get_cmdline(int pid, char* buf, size_t size) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -90,7 +81,7 @@ static bool get_cmdline(int pid, char* buf, size_t size) {
 
 static bool check_cmdline(int pid, const char* target) {
     char buf[256];
-    if (get_cmdline(pid, buf, sizeof(buf))) {
+    if (proc_get_cmdline(pid, buf, sizeof(buf))) {
         if (strcmp(buf, target) == 0) return true;
     }
     return false;
@@ -145,7 +136,7 @@ void fast_pid_each(pid_callback_t callback, void* data) {
                 if (first >= '1' && first <= '9') {
                     int pid = atoi(d->d_name);
                     if (is_pid_cached(pid)) { bpos += d->d_reclen; continue; }
-                    if (get_cmdline(pid, cmd_buf, sizeof(cmd_buf))) {
+                    if (proc_get_cmdline(pid, cmd_buf, sizeof(cmd_buf))) {
                         int cb_ret = callback(pid, cmd_buf, data);
                         if (cb_ret != 2) cache_add_pid(pid);
                         if (cb_ret == 1) goto cleanup;
