@@ -1,3 +1,4 @@
+`c
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,17 +22,15 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <sys/inotify.h>
+#include <sys/timerfd.h>
 #include <fnmatch.h>
-
 #include "common.h"
-
 #define MAX_MSG_LEN 512
 #define MAX_IO_LOGS 262144 
 #define MAX_SYS_LOGS 50000  
 #define MAX_LOGCAT_LOGS 100000
 #define DEFAULT_LIMIT 500
 #define MAX_EVENTS 256
-
 typedef enum {
     OP_NONE     = 0,
     OP_OPEN     = 1 << 0,
@@ -53,7 +52,6 @@ typedef enum {
     OP_OPENDIR  = 1 << 16,
     OP_READDIR  = 1 << 17,
 } IoOpMask;
-
 typedef struct ClientCtx {
     int fd;
     char line[1536];
@@ -63,20 +61,17 @@ typedef struct ClientCtx {
     struct ClientCtx *next;
     struct ClientCtx *prev;
 } ClientCtx;
-
 typedef struct IgnoreRule {
     int op_mask;
     char *path_prefix;
     bool is_wildcard;
     struct IgnoreRule *next;
 } IgnoreRule;
-
 typedef struct {
     time_t t;
     int level;
     char msg[MAX_MSG_LEN];
 } LogEntry;
-
 typedef struct { 
     LogEntry* data; 
     int head, tail;
@@ -84,28 +79,21 @@ typedef struct {
     int max; 
     pthread_mutex_t lock; 
 } LogBuffer;
-
 typedef struct StreamClient {
     int fd;
     int type;       /* 0=ALL, 1=IO, 2=SYS, 3=LOGCAT */
-    int min_level;  /* 最低日志级别过滤，仅 >= 此级别的日志会推送 */
+    int min_level;  
     struct StreamClient *next;
 } StreamClient;
-
 static LogBuffer g_io_buf, g_sys_buf, g_logcat_buf;
 static volatile sig_atomic_t g_should_exit = 0;
 static int g_server_sock = -1;
-
 static IgnoreRule *g_ignore_rules = nullptr;
 static pthread_rwlock_t g_rules_lock = PTHREAD_RWLOCK_INITIALIZER;
-
 static StreamClient *g_stream_clients = nullptr;
 static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
-
 static ClientCtx *g_active_clients = nullptr;
-
 static int g_epoll_fd = -1;
-
 static void init_buf(LogBuffer* buf, int max) {
     buf->data = calloc(max, sizeof(LogEntry));
     buf->head = buf->tail = 0; 
@@ -113,18 +101,15 @@ static void init_buf(LogBuffer* buf, int max) {
     buf->max = max;
     pthread_mutex_init(&buf->lock, nullptr);
 }
-
 static void destroy_buf(LogBuffer* buf) {
     if (buf->data) { free(buf->data); buf->data = nullptr; }
 }
-
 static void add_stream_client(int fd, int type, int min_level) {
     pthread_mutex_lock(&g_stream_lock);
     StreamClient *c = malloc(sizeof(StreamClient));
     c->fd = fd; c->type = type; c->min_level = min_level; c->next = g_stream_clients; g_stream_clients = c;
     pthread_mutex_unlock(&g_stream_lock);
 }
-
 static void remove_stream_client(int fd) {
     pthread_mutex_lock(&g_stream_lock);
     StreamClient **pp = &g_stream_clients;
@@ -136,7 +121,6 @@ static void remove_stream_client(int fd) {
     }
     pthread_mutex_unlock(&g_stream_lock);
 }
-
 static void broadcast_log(int type, const char *line, int level) {
     pthread_mutex_lock(&g_stream_lock);
     StreamClient *c = g_stream_clients;
@@ -156,19 +140,18 @@ static void broadcast_log(int type, const char *line, int level) {
     }
     pthread_mutex_unlock(&g_stream_lock);
 }
-
 static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     broadcast_log(type, msg, level);
     pthread_mutex_lock(&buf->lock);
     buf->data[buf->head].t = time(nullptr);
     buf->data[buf->head].level = level;
     strncpy(buf->data[buf->head].msg, msg, MAX_MSG_LEN - 1);
+    buf->data[buf->head].msg[MAX_MSG_LEN - 1] = '\0';
     buf->head = (buf->head + 1) % buf->max;
     if (buf->full) buf->tail = (buf->tail + 1) % buf->max;
     else if (buf->head == buf->tail) buf->full = true;
     pthread_mutex_unlock(&buf->lock);
 }
-
 static int parse_op_string(const char *op_str) {
     if (strcmp(op_str, "OPEN") == 0) return OP_OPEN;
     if (strcmp(op_str, "CREATE") == 0) return OP_CREATE;
@@ -190,7 +173,6 @@ static int parse_op_string(const char *op_str) {
     if (strcmp(op_str, "READDIR") == 0) return OP_READDIR;
     return 0;
 }
-
 static void load_ignore_rules() {
     FILE *fp = fopen(MONITOR_IGNORE_PATH, "re");
     pthread_rwlock_wrlock(&g_rules_lock);
@@ -215,8 +197,14 @@ static void load_ignore_rules() {
             if (*p == '[') {
                 char *close_ptr = strchr(p, ']');
                 if (close_ptr) {
-                    *close_ptr = '\0'; char *ops = p+1; char *token = strtok(ops, ",");
-                    while (token) { int op = parse_op_string(token); if (op) op_mask |= op; token = strtok(nullptr, ","); }
+                    *close_ptr = '\0'; char *ops = p+1; 
+                    char *saveptr = nullptr;
+                    char *token = strtok_r(ops, ",", &saveptr);
+                    while (token) { 
+                        int op = parse_op_string(token); 
+                        if (op) op_mask |= op; 
+                        token = strtok_r(nullptr, ",", &saveptr); 
+                    }
                     path = close_ptr+1; while (isspace((unsigned char)*path)) path++;
                 }
             }
@@ -234,7 +222,6 @@ static void load_ignore_rules() {
     snprintf(msg, sizeof(msg), "[log_monitor] 加载监控忽略规则完成，共 %d 条", count);
     push_log(&g_sys_buf, msg, 2, LOG_DEBUG);
 }
-
 static bool should_ignore_io(const char *line) {
     char *op_bracket = strchr(line, '[');
     if (!op_bracket) return false;
@@ -273,7 +260,6 @@ static bool should_ignore_io(const char *line) {
     pthread_rwlock_unlock(&g_rules_lock);
     return ignore;
 }
-
 static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit, int offset, int level_filter) {
     pthread_mutex_lock(&buf->lock);
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
@@ -305,7 +291,6 @@ static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit,
     write(fd, line, strlen(line));
     pthread_mutex_unlock(&buf->lock);
 }
-
 static void add_active_client(ClientCtx *ctx) {
     ctx->next = g_active_clients;
     ctx->prev = nullptr;
@@ -314,7 +299,6 @@ static void add_active_client(ClientCtx *ctx) {
     }
     g_active_clients = ctx;
 }
-
 static void remove_active_client(ClientCtx *ctx) {
     if (ctx->prev) {
         ctx->prev->next = ctx->next;
@@ -325,7 +309,6 @@ static void remove_active_client(ClientCtx *ctx) {
         ctx->next->prev = ctx->prev;
     }
 }
-
 static int process_line(ClientCtx* ctx, char* line) {
     int fd = ctx->fd;
     if (strncmp(line, "LOG_IO:", 7) == 0) {
@@ -352,7 +335,6 @@ static int process_line(ClientCtx* ctx, char* line) {
                strncmp(line, "QUERY_LOGCAT:", 13) == 0) {
         bool is_io = (strstr(line, "IO") != nullptr);
         bool is_logcat = (strstr(line, "LOGCAT") != nullptr);
-        /* 新格式: {level}:{key}:{limit}:{offset} — level 移到最前面，避免 key 被误识别 */
         char *rest = line + (is_io ? 9 : (is_logcat ? 13 : 10));
         int limit = DEFAULT_LIMIT, offset = 0, level_filter = -1;
         char *key = rest;
@@ -425,14 +407,47 @@ static int process_line(ClientCtx* ctx, char* line) {
     }
     return 0; 
 }
-
 static int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
-
 void handle_signal(int sig) { if (sig == SIGINT || sig == SIGTERM) g_should_exit = 1; }
-
+/* 核心优化：合并异步定时器超时回调 */
+static int setup_client_timeout_timer(int epoll_fd) {
+    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd < 0) return -1;
+    struct itimerspec ts = {
+        .it_interval = { .tv_sec = 0, .tv_nsec = 500000000 }, 
+        .it_value    = { .tv_sec = 0, .tv_nsec = 500000000 }
+    };
+    timerfd_settime(timer_fd, 0, &ts, nullptr);
+    struct epoll_event ev_t = { .events = EPOLLIN, .data.fd = timer_fd };
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev_t);
+    return timer_fd;
+}
+static void handle_client_timeout_tick(int timer_fd) {
+    uint64_t expirations;
+    ssize_t r = read(timer_fd, &expirations, sizeof(expirations));
+    (void)r;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ClientCtx *curr_chk = g_active_clients;
+    while (curr_chk) {
+        ClientCtx *next_chk = curr_chk->next;
+        if (!curr_chk->is_streaming) {
+            long elapsed_ms = (now.tv_sec - curr_chk->start_time.tv_sec) * 1000 +
+                              (now.tv_nsec - curr_chk->start_time.tv_nsec) / 1000000;
+            if (elapsed_ms >= 500) {
+                epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, curr_chk->fd, nullptr);
+                close(curr_chk->fd);
+                remove_stream_client(curr_chk->fd);
+                remove_active_client(curr_chk);
+                free(curr_chk);
+            }
+        }
+        curr_chk = next_chk;
+    }
+}
 int main(int argc, char *argv[]) {
     escape_cgroup();
     extern void init_timezone();
@@ -476,30 +491,13 @@ int main(int argc, char *argv[]) {
         inotify_add_watch(inotify_fd, CONFIG_DIR, IN_MODIFY | IN_MOVED_TO | IN_CREATE | IN_CLOSE_WRITE | IN_DELETE);
         ev.events = EPOLLIN; ev.data.fd = inotify_fd; epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, inotify_fd, &ev);
     }
+    /* 启动 client 超时异步定时器并注册至 epoll */
+    int timer_fd = setup_client_timeout_timer(g_epoll_fd);
     while (!g_should_exit) {
-        int nfds = epoll_wait(g_epoll_fd, events, MAX_EVENTS, 100);
-        
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        ClientCtx *curr_chk = g_active_clients;
-        while (curr_chk) {
-            ClientCtx *next_chk = curr_chk->next;
-            if (!curr_chk->is_streaming) {
-                long elapsed_ms = (now.tv_sec - curr_chk->start_time.tv_sec) * 1000 +
-                                  (now.tv_nsec - curr_chk->start_time.tv_nsec) / 1000000;
-                if (elapsed_ms >= 500) {
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, curr_chk->fd, nullptr);
-                    close(curr_chk->fd);
-                    remove_stream_client(curr_chk->fd);
-                    remove_active_client(curr_chk);
-                    free(curr_chk);
-                }
-            }
-            curr_chk = next_chk;
-        }
-
+        int nfds = epoll_wait(g_epoll_fd, events, MAX_EVENTS, -1); /* 取消同步 100ms 超时，转为无限等待 */
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == g_server_sock) {
+            int fd = events[i].data.fd;
+            if (fd == g_server_sock) {
                 int client = accept(g_server_sock, nullptr, nullptr);
                 if (client >= 0) {
                     set_nonblock(client);
@@ -508,11 +506,10 @@ int main(int argc, char *argv[]) {
                     clock_gettime(CLOCK_MONOTONIC, &ctx->start_time);
                     ctx->is_streaming = false;
                     add_active_client(ctx);
-                    
                     ev.events = EPOLLIN | EPOLLET; ev.data.ptr = ctx;
                     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, client, &ev);
                 }
-            } else if (inotify_fd >= 0 && events[i].data.fd == inotify_fd) {
+            } else if (inotify_fd >= 0 && fd == inotify_fd) {
                 char inotify_buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
                 ssize_t len;
                 while ((len = read(inotify_fd, inotify_buf, sizeof(inotify_buf))) > 0) {
@@ -524,6 +521,9 @@ int main(int argc, char *argv[]) {
                     }
                     if (need_reload) load_ignore_rules();
                 }
+            } else if (fd == timer_fd) {
+                /* 处理异步定时器事件 */
+                handle_client_timeout_tick(timer_fd);
             } else {
                 ClientCtx* ctx = (ClientCtx*)events[i].data.ptr;
                 char buf[4096]; bool consumed = false;
@@ -552,8 +552,10 @@ int main(int argc, char *argv[]) {
             }
         }
     }
-    close(g_server_sock); if (inotify_fd >= 0) close(inotify_fd); close(g_epoll_fd);
-    
+    close(g_server_sock); 
+    if (inotify_fd >= 0) close(inotify_fd); 
+    if (timer_fd >= 0) close(timer_fd);
+    close(g_epoll_fd);
     ClientCtx* curr_free = g_active_clients;
     while (curr_free) {
         ClientCtx* next_free = curr_free->next;
@@ -562,7 +564,6 @@ int main(int argc, char *argv[]) {
         curr_free = next_free;
     }
     g_active_clients = nullptr;
-
     destroy_buf(&g_io_buf); destroy_buf(&g_sys_buf); destroy_buf(&g_logcat_buf);
     return 0;
 }
