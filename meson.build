@@ -24,7 +24,7 @@ endif
 is_clang = cc.get_id() == 'clang'
 
 # ================= 依赖查找 =================
-fuse3_root = '/data/user/0/com.termux/files/home/fuse3-static-install4'
+fuse3_root = '/data/user/0/com.termux/files/home/build-install'
 fuse_inc = include_directories(fuse3_root + '/include')
 fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
 
@@ -78,7 +78,7 @@ common_sources = [
 ]
 
 fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/vfs_core.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c']
-injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/ns_utils.c', 'src/core/fast_pid.c']
+injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
 install_bin_dir = 'bin'

@@ -1,3 +1,4 @@
+`c
 #include "config_parser.h"
 #include "common.h"
 #include <sys/stat.h>
@@ -6,26 +7,212 @@
 #include <ctype.h>
 #include <fnmatch.h>
 #include <pthread.h>
-
+#include <stdlib.h>
+#include <string.h>
 AppConfig g_global_cfg;
 AppConfig** g_app_cfgs = nullptr;
 int g_app_cfg_count = 0;
 int g_app_cfg_capacity = 0;
-
 int g_active_users[MAX_USERS];
 int g_active_user_count = 0;
-
 static pthread_rwlock_t g_rules_lock;
-
+TrieNode* trie_create_node(const char* segment) {
+    TrieNode* node = calloc(1, sizeof(TrieNode));
+    if (node && segment) {
+        node->segment = strdup(segment);
+    }
+    return node;
+}
+void trie_free(TrieNode* node) {
+    if (!node) return;
+    for (int i = 0; i < node->child_count; i++) {
+        trie_free(node->children[i]);
+    }
+    free(node->children);
+    free(node->segment);
+    free(node->redir_target);
+    free(node);
+}
+/* 核心修复：更新循环条件为 while (p && *p)，彻底杜绝末尾 Null 指针解引用风险 */
+void trie_insert(TrieNode* root, const char* path, const char* redir_target, bool is_hidden, bool is_ro) {
+    if (!path || !root) return;
+    TrieNode* curr = root;
+    const char* p = path;
+    while (*p == '/') p++;
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) break;
+        TrieNode* child = NULL;
+        for (int i = 0; i < curr->child_count; i++) {
+            if (curr->children[i] && curr->children[i]->segment &&
+                strlen(curr->children[i]->segment) == seg_len &&
+                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
+                child = curr->children[i];
+                break;
+            }
+        }
+        if (!child) {
+            child = trie_create_node(NULL);
+            if (!child) return;
+            child->segment = malloc(seg_len + 1);
+            if (!child->segment) {
+                free(child);
+                return;
+            }
+            memcpy(child->segment, p, seg_len);
+            child->segment[seg_len] = '\0';
+            TrieNode** new_children = realloc(curr->children, sizeof(TrieNode*) * (curr->child_count + 1));
+            if (!new_children) {
+                free(child->segment);
+                free(child);
+                return;
+            }
+            curr->children = new_children;
+            curr->children[curr->child_count++] = child;
+        }
+        curr = child;
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    if (is_hidden) curr->is_hidden = true;
+    if (is_ro)     curr->is_ro = true;
+    if (redir_target) {
+        free(curr->redir_target);
+        curr->redir_target = strdup(redir_target);
+    }
+}
+/* 核心修复：更新循环条件为 while (p && *p) */
+bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool* out_ro, char* out_redir, size_t max_len) {
+    if (!root || !path) return false;
+    const TrieNode* curr = root;
+    const char* p = path;
+    while (*p == '/') p++;
+    bool hidden = root->is_hidden;
+    bool ro = root->is_ro;
+    const char* redir_base = root->redir_target;
+    const char* redir_suffix = p;
+    bool matched = (hidden || ro || redir_base);
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) break;
+        const TrieNode* child = NULL;
+        for (int i = 0; i < curr->child_count; i++) {
+            if (curr->children[i] && curr->children[i]->segment &&
+                strlen(curr->children[i]->segment) == seg_len &&
+                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
+                child = curr->children[i];
+                break;
+            }
+        }
+        if (!child) break; 
+        curr = child;
+        if (curr->is_hidden) hidden = true;
+        if (curr->is_ro)     ro = true;
+        if (curr->redir_target) {
+            redir_base = curr->redir_target;
+            redir_suffix = next ? next : "";
+        }
+        matched = true;
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    if (out_hidden) *out_hidden = hidden;
+    if (out_ro)     *out_ro = ro;
+    if (redir_base && out_redir && max_len > 0) {
+        size_t blen = strlen(redir_base);
+        size_t slen = strlen(redir_suffix);
+        if (blen + slen < max_len) {
+            snprintf(out_redir, max_len, "%s%s", redir_base, redir_suffix);
+        }
+    }
+    return matched;
+}
+/* 核心修复：更新循环条件为 while (p && *p) */
+bool trie_is_redirect_target(const TrieNode* root, const char* path) {
+    if (!root || !path) return false;
+    const TrieNode* curr = root;
+    const char* p = path;
+    while (*p == '/') p++;
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) break;
+        const TrieNode* child = NULL;
+        for (int i = 0; i < curr->child_count; i++) {
+            if (curr->children[i] && curr->children[i]->segment &&
+                strlen(curr->children[i]->segment) == seg_len &&
+                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
+                child = curr->children[i];
+                break;
+            }
+        }
+        if (!child) return false;
+        curr = child;
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    return (curr->redir_target != NULL);
+}
+static bool trie_node_has_rules(const TrieNode* node) {
+    if (!node) return false;
+    if (node->is_hidden || node->is_ro || node->redir_target) return true;
+    for (int i = 0; i < node->child_count; i++) {
+        if (trie_node_has_rules(node->children[i])) return true;
+    }
+    return false;
+}
+/* 核心修复：更新循环条件为 while (p && *p) */
+bool trie_is_ancestor(const TrieNode* root, const char* path) {
+    if (!root || !path) return false;
+    const TrieNode* curr = root;
+    const char* p = path;
+    while (*p == '/') p++;
+    if (*p == '\0') {
+        for (int i = 0; i < curr->child_count; i++) {
+            if (curr->children[i] && trie_node_has_rules(curr->children[i])) return true;
+        }
+        return false;
+    }
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) break;
+        const TrieNode* child = NULL;
+        for (int i = 0; i < curr->child_count; i++) {
+            if (curr->children[i] && curr->children[i]->segment &&
+                strlen(curr->children[i]->segment) == seg_len &&
+                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
+                child = curr->children[i];
+                break;
+            }
+        }
+        if (!child) return false;
+        curr = child;
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    for (int i = 0; i < curr->child_count; i++) {
+        if (curr->children[i] && trie_node_has_rules(curr->children[i])) return true;
+    }
+    return false;
+}
+static bool is_wildcard_string(const char *str) {
+    return strpbrk(str, "*?[]") != NULL;
+}
 void config_init_lock() { pthread_rwlock_init(&g_rules_lock, nullptr); }
 void config_destroy_lock() { pthread_rwlock_destroy(&g_rules_lock); }
 void config_lock_read() { pthread_rwlock_rdlock(&g_rules_lock); }
 void config_unlock_read() { pthread_rwlock_unlock(&g_rules_lock); }
 void config_lock_write() { pthread_rwlock_wrlock(&g_rules_lock); }
 void config_unlock_write() { pthread_rwlock_unlock(&g_rules_lock); }
-
 static void free_app_config_rules(AppConfig* cfg) {
     if (!cfg) return;
+    if (cfg->trie_root) {
+        trie_free(cfg->trie_root);
+        cfg->trie_root = nullptr;
+    }
     if (cfg->hide_rules) {
         for (int i = 0; i < cfg->hide_count; i++) free(cfg->hide_rules[i]);
         free(cfg->hide_rules);
@@ -33,7 +220,6 @@ static void free_app_config_rules(AppConfig* cfg) {
     }
     cfg->hide_count = 0;
     cfg->hide_capacity = 0;
-    
     if (cfg->ro_rules) {
         for (int i = 0; i < cfg->ro_count; i++) free(cfg->ro_rules[i]);
         free(cfg->ro_rules);
@@ -41,7 +227,6 @@ static void free_app_config_rules(AppConfig* cfg) {
     }
     cfg->ro_count = 0;
     cfg->ro_capacity = 0;
-
     if (cfg->redir_rules) {
         free(cfg->redir_rules);
         cfg->redir_rules = nullptr;
@@ -49,7 +234,6 @@ static void free_app_config_rules(AppConfig* cfg) {
     cfg->redir_count = 0;
     cfg->redir_capacity = 0;
 }
-
 static void free_config_rules() {
     free_app_config_rules(&g_global_cfg);
     if (g_app_cfgs) {
@@ -63,7 +247,6 @@ static void free_config_rules() {
     g_app_cfg_count = 0;
     g_app_cfg_capacity = 0;
 }
-
 char* clean_path_string(char* str) {
     if (!str) return nullptr;
     while(isspace((unsigned char)*str)) str++; if(*str == 0) return str;
@@ -72,11 +255,9 @@ char* clean_path_string(char* str) {
     for (int i = 0; str[i]; i++) { if (str[i] == '\r' || str[i] == '\n') { str[i] = '\0'; break; } }
     return str;
 }
-
 void strip_trailing_slash(char* path) {
     size_t len = strlen(path); if (len > 1 && path[len - 1] == '/') path[len - 1] = '\0';
 }
-
 static void sync_attributes(const char* source_parent, const char* target_path) {
     struct stat st;
     if (lstat(source_parent, &st) != 0) return;
@@ -91,7 +272,6 @@ static void sync_attributes(const char* source_parent, const char* target_path) 
         lsetxattr(target_path, "security.selinux", default_ctx, strlen(default_ctx) + 1, 0);
     }
 }
-
 static void inherit_from_parent(const char* real_path) {
     char parent[PATH_MAX]; strncpy(parent, real_path, PATH_MAX - 1);
     char* last = strrchr(parent, '/');
@@ -101,7 +281,6 @@ static void inherit_from_parent(const char* real_path) {
         sync_attributes(parent, real_path);
     }
 }
-
 int mkdir_recursive_p(const char *path, mode_t mode) {
     char tmp[PATH_MAX]; char *p = nullptr; snprintf(tmp, sizeof(tmp), "%s", path);
     size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
@@ -121,13 +300,11 @@ int mkdir_recursive_p(const char *path, mode_t mode) {
     }
     return 0;
 }
-
 static char* get_next_token(char** ptr) {
     char* p = *ptr;
     if (!p) return nullptr;
     while (isspace((unsigned char)*p)) p++;
     if (*p == '\0') { *ptr = nullptr; return nullptr; }
-    
     char* start;
     if (*p == '"') {
         start = ++p;
@@ -142,7 +319,6 @@ static char* get_next_token(char** ptr) {
     }
     return start;
 }
-
 static char* strip_storage_prefix(char* path) {
     if (strncmp(path, "/storage/emulated/", 18) == 0) {
         char* p = path + 18;
@@ -152,23 +328,19 @@ static char* strip_storage_prefix(char* path) {
     }
     return path;
 }
-
 static int cmp_redir(const void* a, const void* b) {
     return (int)strlen(((const RedirectRule*)b)->virtual_prefix) - (int)strlen(((const RedirectRule*)a)->virtual_prefix);
 }
-
 static int cmp_hide(const void* a, const void* b) {
     const char* str_a = *(const char**)a;
     const char* str_b = *(const char**)b;
     return (int)strlen(str_b) - (int)strlen(str_a);
 }
-
 static void parse_config_line(AppConfig* cur, char* line, int user_id) {
     (void)user_id;
     char* p_ptr = line;
     char* tok = get_next_token(&p_ptr);
     if (!tok) return;
-    
     if (strcmp(tok, "MONITOR") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->monitor = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
@@ -181,88 +353,119 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
     } else if (strcmp(tok, "HIDE") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
-            if (cur->hide_count >= cur->hide_capacity) {
-                cur->hide_capacity = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
-                cur->hide_rules = realloc(cur->hide_rules, cur->hide_capacity * sizeof(char*));
-            }
-            cur->hide_rules[cur->hide_count] = malloc(MAX_PATH_LEN);
-            
             char *v_ptr = strip_storage_prefix(val);
-            if (v_ptr[0] != '/' && v_ptr[0] != '*') snprintf(cur->hide_rules[cur->hide_count], MAX_PATH_LEN, "/%s", v_ptr);
-            else strncpy(cur->hide_rules[cur->hide_count], v_ptr, MAX_PATH_LEN - 1);
-            if (strpbrk(cur->hide_rules[cur->hide_count], "*?[]") == nullptr) strip_trailing_slash(cur->hide_rules[cur->hide_count]);
-            cur->hide_count++;
+            char clean_rule[MAX_PATH_LEN];
+            if (v_ptr[0] != '/' && v_ptr[0] != '*') snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
+            else {
+                strncpy(clean_rule, v_ptr, MAX_PATH_LEN - 1);
+                clean_rule[MAX_PATH_LEN - 1] = '\0';
+            }
+            if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
+            if (is_wildcard_string(clean_rule)) {
+                if (cur->hide_count >= cur->hide_capacity) {
+                    cur->hide_capacity = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
+                    cur->hide_rules = realloc(cur->hide_rules, cur->hide_capacity * sizeof(char*));
+                }
+                cur->hide_rules[cur->hide_count] = strdup(clean_rule);
+                cur->hide_count++;
+            } else {
+                trie_insert(cur->trie_root, clean_rule, NULL, true, false);
+            }
         }
     } else if (strcmp(tok, "RO") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
-            if (cur->ro_count >= cur->ro_capacity) {
-                cur->ro_capacity = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
-                cur->ro_rules = realloc(cur->ro_rules, cur->ro_capacity * sizeof(char*));
-            }
-            cur->ro_rules[cur->ro_count] = malloc(MAX_PATH_LEN);
-            
             char *v_ptr = strip_storage_prefix(val);
-            if (v_ptr[0] != '/' && v_ptr[0] != '*') snprintf(cur->ro_rules[cur->ro_count], MAX_PATH_LEN, "/%s", v_ptr);
-            else strncpy(cur->ro_rules[cur->ro_count], v_ptr, MAX_PATH_LEN - 1);
-            if (strpbrk(cur->ro_rules[cur->ro_count], "*?[]") == nullptr) strip_trailing_slash(cur->ro_rules[cur->ro_count]);
-            cur->ro_count++;
+            char clean_rule[MAX_PATH_LEN];
+            if (v_ptr[0] != '/' && v_ptr[0] != '*') snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
+            else {
+                strncpy(clean_rule, v_ptr, MAX_PATH_LEN - 1);
+                clean_rule[MAX_PATH_LEN - 1] = '\0';
+            }
+            if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
+            if (is_wildcard_string(clean_rule)) {
+                if (cur->ro_count >= cur->ro_capacity) {
+                    cur->ro_capacity = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
+                    cur->ro_rules = realloc(cur->ro_rules, cur->ro_capacity * sizeof(char*));
+                }
+                cur->ro_rules[cur->ro_count] = strdup(clean_rule);
+                cur->ro_count++;
+            } else {
+                trie_insert(cur->trie_root, clean_rule, NULL, false, true);
+            }
         }
     } else if (strcmp(tok, "ALLOW") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
-            if (cur->redir_count >= cur->redir_capacity) {
-                cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
-            }
-            RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-            
             char *v_ptr = strip_storage_prefix(val);
-            if (v_ptr[0] == '\0') strcpy(r->virtual_prefix, "/"); 
+            char virtual_prefix[MAX_PATH_LEN];
+            if (v_ptr[0] == '\0') strcpy(virtual_prefix, "/"); 
             else {
-                if (v_ptr[0] != '/') snprintf(r->virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
-                else strncpy(r->virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
+                if (v_ptr[0] != '/') snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
+                else {
+                    strncpy(virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
+                    virtual_prefix[MAX_PATH_LEN - 1] = '\0';
+                }
             }
-            strip_trailing_slash(r->virtual_prefix);
-
-            snprintf(r->real_target, MAX_PATH_LEN - 1, "?%s", r->virtual_prefix);
-            strip_trailing_slash(r->real_target);
+            strip_trailing_slash(virtual_prefix);
+            char real_target[MAX_PATH_LEN];
+            snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
+            strip_trailing_slash(real_target);
+            if (is_wildcard_string(virtual_prefix)) {
+                if (cur->redir_count >= cur->redir_capacity) {
+                    cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
+                    cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
+                }
+                RedirectRule* r = &cur->redir_rules[cur->redir_count++];
+                strcpy(r->virtual_prefix, virtual_prefix);
+                strcpy(r->real_target, real_target);
+            } else {
+                trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
+            }
         }
     } else if (strcmp(tok, "REDIRECT") == 0) {
         char* v1 = get_next_token(&p_ptr);
         char* v2 = get_next_token(&p_ptr);
         if (v1 && v2) {
-            if (cur->redir_count >= cur->redir_capacity) {
-                cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
-            }
-            RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-            
             char *v_ptr = strip_storage_prefix(v1);
-            if (v_ptr[0] == '\0') strcpy(r->virtual_prefix, "/"); 
+            char virtual_prefix[MAX_PATH_LEN];
+            if (v_ptr[0] == '\0') strcpy(virtual_prefix, "/"); 
             else {
-                if (v_ptr[0] != '/') snprintf(r->virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
-                else strncpy(r->virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
+                if (v_ptr[0] != '/') snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
+                else {
+                    strncpy(virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
+                    virtual_prefix[MAX_PATH_LEN - 1] = '\0';
+                }
             }
-            strip_trailing_slash(r->virtual_prefix);
-
+            strip_trailing_slash(virtual_prefix);
+            char real_target[MAX_PATH_LEN];
             if (strncmp(v2, "/storage/emulated/", 18) == 0) {
                 char* p = v2 + 18;
                 while (*p && isdigit((unsigned char)*p)) p++;
                 if (*p == '/') p++;
-                snprintf(r->real_target, MAX_PATH_LEN - 1, "?/%s", p);
+                snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
             }
             else if (strncmp(v2, "/data/", 6) == 0 || strncmp(v2, "/mnt/", 5) == 0 || strncmp(v2, "/storage/", 9) == 0) {
-                strncpy(r->real_target, v2, MAX_PATH_LEN - 1);
+                strncpy(real_target, v2, MAX_PATH_LEN - 1);
             }
             else {
-                snprintf(r->real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
+                snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
             }
-            strip_trailing_slash(r->real_target);
+            strip_trailing_slash(real_target);
+            if (is_wildcard_string(virtual_prefix) || is_wildcard_string(real_target)) {
+                if (cur->redir_count >= cur->redir_capacity) {
+                    cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
+                    cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
+                }
+                RedirectRule* r = &cur->redir_rules[cur->redir_count++];
+                strcpy(r->virtual_prefix, virtual_prefix);
+                strcpy(r->real_target, real_target);
+            } else {
+                trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
+            }
         }
     }
 }
-
 static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     if (strcmp(pkg, "GLOBAL") == 0) return &g_global_cfg;
     for (int i = 0; i < g_app_cfg_count; i++) {
@@ -277,9 +480,9 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     strncpy(g_app_cfgs[g_app_cfg_count]->pkg_name, pkg, 127);
     g_app_cfgs[g_app_cfg_count]->user_id = user_id;
     g_app_cfgs[g_app_cfg_count]->inject_enable = true; 
+    g_app_cfgs[g_app_cfg_count]->trie_root = trie_create_node(NULL); 
     return g_app_cfgs[g_app_cfg_count++];
 }
-
 void scan_active_users() {
     g_active_user_count = 0;
     DIR* dir = opendir("/data/media");
@@ -299,25 +502,21 @@ void scan_active_users() {
         closedir(dir);
     }
 }
-
 void load_config_rules(const char* path) {
     free_config_rules();
     memset(&g_global_cfg, 0, sizeof(AppConfig)); 
-    
+    g_global_cfg.trie_root = trie_create_node(NULL);
     scan_active_users();
-
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
         char app_rules_dir[PATH_MAX];
         if (uid == 0) snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
         else snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
-
         if (access(app_rules_dir, F_OK) != 0) {
             mkdir(app_rules_dir, 0755);
             LOG("自动为多用户 %d 创建应用规则目录: %s", uid, app_rules_dir);
         }
     }
-
     FILE* fp = fopen(path, "r");
     if (fp) {
         AppConfig* cur = &g_global_cfg; char line[2048];
@@ -334,7 +533,6 @@ void load_config_rules(const char* path) {
                     while (isspace(*after)) after++;
                     if (strncmp(after, "OFF", 3) == 0) enabled = false;
                     else if (strncmp(after, "ON", 2) == 0) enabled = true;
-
                     char pkg[128];
                     current_user_id = -1; 
                     char* colon = strchr(sec, ':');
@@ -343,7 +541,6 @@ void load_config_rules(const char* path) {
                         current_user_id = atoi(colon + 1);
                     }
                     strncpy(pkg, sec, sizeof(pkg)-1);
-
                     if (strcmp(pkg, "GLOBAL") == 0) {
                         cur = &g_global_cfg;
                     } else {
@@ -359,13 +556,11 @@ void load_config_rules(const char* path) {
     } else {
         LOG_ERR("无法打开主规则文件: %s (%s)", path, strerror(errno));
     }
-    
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
         char app_rules_dir[PATH_MAX];
         if (uid == 0) snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
         else snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
-
         DIR* dir = opendir(app_rules_dir);
         if (dir) {
             struct dirent* de;
@@ -378,10 +573,8 @@ void load_config_rules(const char* path) {
                         if (len >= sizeof(pkg)) len = sizeof(pkg) - 1;
                         strncpy(pkg, de->d_name, len);
                         pkg[len] = '\0';
-
                         AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
                         AppConfig* cur = file_cur; 
-                        
                         char app_conf_path[PATH_MAX];
                         snprintf(app_conf_path, sizeof(app_conf_path), "%s/%s", app_rules_dir, de->d_name);
                         FILE* afp = fopen(app_conf_path, "r");
@@ -390,7 +583,6 @@ void load_config_rules(const char* path) {
                             while (fgets(line, sizeof(line), afp)) {
                                 char* p = clean_path_string(line);
                                 if (!p || p[0] == '#' || p[0] == 0) continue;
-                                
                                 if (p[0] == '[') {
                                     char* end = strchr(p, ']');
                                     if (end) {
@@ -401,13 +593,11 @@ void load_config_rules(const char* path) {
                                         while (isspace(*after)) after++;
                                         if (strncmp(after, "OFF", 3) == 0) enabled = false;
                                         else if (strncmp(after, "ON", 2) == 0) enabled = true;
-
                                         char sub_pkg[128];
                                         int sub_uid = uid; 
                                         char* colon = strchr(sec, ':');
                                         if (colon) { *colon = '\0'; sub_uid = atoi(colon + 1); }
                                         strncpy(sub_pkg, sec, sizeof(sub_pkg)-1);
-
                                         if (strcmp(sub_pkg, "GLOBAL") == 0) cur = &g_global_cfg;
                                         else { cur = get_or_create_app_cfg(sub_pkg, sub_uid); if (cur) cur->inject_enable = enabled; }
                                     }
@@ -423,7 +613,6 @@ void load_config_rules(const char* path) {
             closedir(dir);
         }
     }
-    
     qsort(g_global_cfg.redir_rules, g_global_cfg.redir_count, sizeof(RedirectRule), cmp_redir);
     qsort(g_global_cfg.hide_rules, g_global_cfg.hide_count, sizeof(char*), cmp_hide);
     qsort(g_global_cfg.ro_rules, g_global_cfg.ro_count, sizeof(char*), cmp_hide);
@@ -433,30 +622,23 @@ void load_config_rules(const char* path) {
         qsort(g_app_cfgs[i]->ro_rules, g_app_cfgs[i]->ro_count, sizeof(char*), cmp_hide);
     }
 }
-
-/* 极致增量审查优化：Injector 仅关心全局 `GLOBAL_INJECT` 标志以及各应用 `inject_enable` (ON/OFF) 物理状态变化与配置段的增删 */
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
     AppConfig old_global_cfg;
     memcpy(&old_global_cfg, &g_global_cfg, sizeof(AppConfig));
-    
     AppConfig** old_app_cfgs = g_app_cfgs;
     int old_app_cfg_count = g_app_cfg_count;
-
     memset(&g_global_cfg, 0, sizeof(AppConfig));
+    g_global_cfg.trie_root = trie_create_node(NULL);
     g_app_cfgs = nullptr;
     g_app_cfg_count = 0;
     g_app_cfg_capacity = 0;
-
     load_config_rules(path);
-
-    // 仅当物理注入标志 GLOBAL_INJECT 改变时才触发全局审查，其他的 FUSE 重定向等规则改变对 Injector 物理层屏蔽
+    // 遵循设计：injector不处理单个挂载树内的文件规则变化，仅处理全局挂载ON/OFF与应用开关
     bool global_changed = (old_global_cfg.global_inject != g_global_cfg.global_inject);
     int changed_count = 0;
-
     if (global_changed) {
-        changed_count = -1; // 触发全局审查重载
+        changed_count = -1;
     } else {
-        // 比对原有配置，仅筛选 inject_enable (ON/OFF) 产生反转或新加入了配置段的应用
         for (int i = 0; i < g_app_cfg_count; i++) {
             AppConfig* new_cfg = g_app_cfgs[i];
             AppConfig* old_cfg = nullptr;
@@ -467,7 +649,6 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
                     break;
                 }
             }
-            // 新配置中新增了配置段，或已存在的配置段 ON/OFF 开关物理翻转
             if (!old_cfg || old_cfg->inject_enable != new_cfg->inject_enable) {
                 if (changed_count < max_changed) {
                     strncpy(out_changed[changed_count].pkg_name, new_cfg->pkg_name, 127);
@@ -477,8 +658,6 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
                 }
             }
         }
-        
-        // 比对已删除的配置段
         for (int j = 0; j < old_app_cfg_count; j++) {
             AppConfig* old_cfg = old_app_cfgs[j];
             if (!old_cfg) continue;
@@ -491,7 +670,6 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
                 }
             }
             if (!found) {
-                // 原有配置段在新规则中被剔除，表明该应用的 ON/OFF 开关及注入态被逻辑变更，将其归入重载目标
                 if (changed_count < max_changed) {
                     strncpy(out_changed[changed_count].pkg_name, old_cfg->pkg_name, 127);
                     out_changed[changed_count].pkg_name[127] = '\0';
@@ -501,104 +679,77 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
             }
         }
     }
-
-    // 释放旧的数据占用
     if (old_app_cfgs) {
         for (int i = 0; i < old_app_cfg_count; i++) {
             if (old_app_cfgs[i]) {
-                if (old_app_cfgs[i]->hide_rules) {
-                    for (int j = 0; j < old_app_cfgs[i]->hide_count; j++) free(old_app_cfgs[i]->hide_rules[j]);
-                    free(old_app_cfgs[i]->hide_rules);
-                }
-                if (old_app_cfgs[i]->ro_rules) {
-                    for (int j = 0; j < old_app_cfgs[i]->ro_count; j++) free(old_app_cfgs[i]->ro_rules[j]);
-                    free(old_app_cfgs[i]->ro_rules);
-                }
-                if (old_app_cfgs[i]->redir_rules) free(old_app_cfgs[i]->redir_rules);
+                free_app_config_rules(old_app_cfgs[i]);
                 free(old_app_cfgs[i]);
             }
         }
         free(old_app_cfgs);
     }
-    if (old_global_cfg.hide_rules) {
-        for (int j = 0; j < old_global_cfg.hide_count; j++) free(old_global_cfg.hide_rules[j]);
-        free(old_global_cfg.hide_rules);
-    }
-    if (old_global_cfg.ro_rules) {
-        for (int j = 0; j < old_global_cfg.ro_count; j++) free(old_global_cfg.ro_rules[j]);
-        free(old_global_cfg.ro_rules);
-    }
-    if (old_global_cfg.redir_rules) free(old_global_cfg.redir_rules);
-
+    free_app_config_rules(&old_global_cfg);
     return changed_count;
 }
-
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id) {
     char base_pkg[256];
     strncpy(base_pkg, pkg, sizeof(base_pkg) - 1);
     base_pkg[sizeof(base_pkg) - 1] = '\0';
     char* colon = strchr(base_pkg, ':');
     if (colon) *colon = '\0';
-
     for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id &&
+        if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == user_id &&
             (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 ||
              fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0))
             return g_app_cfgs[i];
     }
     for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == -1 &&
+        if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == -1 &&
             (fnmatch(g_app_cfgs[i]->pkg_name, base_pkg, 0) == 0 ||
              fnmatch(g_app_cfgs[i]->pkg_name, pkg, 0) == 0))
             return g_app_cfgs[i];
     }
     return NULL;
 }
-
 bool has_wildcard_enabled_locked(int user_id) {
     for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id &&
+        if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == user_id &&
             strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 &&
             g_app_cfgs[i]->inject_enable)
             return true;
     }
     for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == -1 &&
+        if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == -1 &&
             strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 &&
             g_app_cfgs[i]->inject_enable)
             return true;
     }
     return false;
 }
-
 void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* trigger_source) {
     config_lock_read();
     int user_id = linux_uid / 100000;
-
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     bool is_wildcard = (cfg == NULL) && has_wildcard_enabled_locked(user_id);
-
     int final_redir_count = (cfg ? cfg->redir_count : 0) + g_global_cfg.redir_count;
     int final_hide_count = (cfg ? cfg->hide_count : 0) + g_global_cfg.hide_count;
     int final_ro_count = (cfg ? cfg->ro_count : 0) + g_global_cfg.ro_count;
     bool final_sandbox = (cfg && cfg->sandbox) || g_global_cfg.sandbox;
     bool final_monitor = (cfg && cfg->monitor) || g_global_cfg.monitor;
-
     if (cfg) {
-        LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
+        LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向(通配):%d条 隐藏(通配):%d条 只读(通配):%d条",
             pkg, pid, user_id, trigger_source,
             final_monitor ? "ON" : "OFF",
             final_sandbox ? "ON" : "OFF",
             final_redir_count, final_hide_count, final_ro_count);
-
         for (int i = 0; i < cfg->redir_count; i++) {
-            LOG("  [重定向] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
+            LOG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
         }
         for (int i = 0; i < cfg->hide_count; i++) {
-            LOG("  [隐藏]   %s", cfg->hide_rules[i]);
+            LOG("  [隐藏通配]   %s", cfg->hide_rules[i]);
         }
         for (int i = 0; i < cfg->ro_count; i++) {
-            LOG("  [只读]   %s", cfg->ro_rules[i]);
+            LOG("  [只读通配]   %s", cfg->ro_rules[i]);
         }
     } else {
         const char* match_desc = 
@@ -609,23 +760,20 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             final_monitor ? "ON" : "OFF",
             final_sandbox ? "ON" : "OFF");
     }
-
     if (g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0) {
-        LOG_DBG("  [全局规则] MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
+        LOG_DBG("  [全局规则通配] MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
             g_global_cfg.monitor ? "ON" : "OFF",
             g_global_cfg.sandbox ? "ON" : "OFF",
             g_global_cfg.redir_count, g_global_cfg.hide_count, g_global_cfg.ro_count);
-
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            LOG("  [全局重定向] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
+            LOG("  [全局重定向通配] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
         }
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
-            LOG("  [全局隐藏]   %s", g_global_cfg.hide_rules[i]);
+            LOG("  [全局隐藏通配]   %s", g_global_cfg.hide_rules[i]);
         }
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
-            LOG_DBG("  [全局只读]   %s", g_global_cfg.ro_rules[i]);
+            LOG_DBG("  [全局只读通配]   %s", g_global_cfg.ro_rules[i]);
         }
     }
-
     config_unlock_read();
 }

@@ -16,7 +16,6 @@
 #include <pthread.h>
 #include <libgen.h>
 #include <sys/syscall.h>
-
 #include "common.h"
 #include "vfs_core.h"
 #include "crash_dump.h"
@@ -28,22 +27,14 @@ bool g_passthrough_enabled = false;
 bool g_preserve_perms = false;
 static int g_ready_fd = -1;
 static int g_global_root_fd = -1;
-/*
- * FUSE Passthrough 验证
- * =====================
- *
- * 验证由 libfuse 内置的 fuse_passthrough_enable() 完成:
- *   - 返回值 > 0  → passthrough 已在内核侧激活 (backing_id)
- *   - 返回值 <= 0 → passthrough 不可用
- *
- * 这是确定性验证, 不需要额外的用户态追踪或统计.
- * 每文件的结果在 vfs_open/vfs_create 中立即输出.
- */
-
+static int g_bpf_fd = -1;           /* BPF program fd, -1 = disabled */
 typedef enum { MODE_REDIRECT, MODE_OVERLAY } DaemonMode;
 static DaemonMode g_mode = MODE_REDIRECT;
 static char g_lower_dir[PATH_MAX] = {0}; 
 static char g_upper_dir[PATH_MAX] = {0};
+
+static int recursive_rmdir(const char *path);
+static int recursive_copy_dir(const char *src, const char *dst, uid_t uid, gid_t gid);
 
 static void log_fuse_err(const char* op, const char* path, int err_code) {
     int err = err_code < 0 ? -err_code : err_code;
@@ -55,11 +46,9 @@ static void log_fuse_err(const char* op, const char* path, int err_code) {
             vfs_get_app_cfg(ctx->uid, ctx->pid, current_pkg);
             config_unlock_read();
         }
-        // 保留 stderr 输出（已重定向到 fuse_crash.log 供崩溃后诊断）
         fprintf(stderr, "[FUSE_ERR] 应用: %s (PID: %d, UID: %d) | 操作: %s | 路径: %s | 错误码: %d (%s)\n",
                 current_pkg, ctx ? ctx->pid : 0, ctx ? ctx->uid : 0, op, path ? path : "nullptr", err, strerror(err));
         fflush(stderr);
-        // 同步发送至日志系统，支持级别过滤
         LOG_ERR("[FUSE_ERR] %s %s: %s", op, path ? path : "nullptr", strerror(err));
     }
 }
@@ -74,6 +63,7 @@ static bool is_android_skel_dir(const char* sub_path) {
 #define VFS_SETUP_CORE(path_val, err_code) \
     char current_pkg[128] = "unknown"; \
     struct fuse_context* ctx = fuse_get_context(); \
+    if (!ctx) return err_code; \
     config_lock_read(); \
     AppConfig* cfg = vfs_get_app_cfg(ctx->uid, ctx->pid, current_pkg); \
     int path_user_id = -1; \
@@ -89,10 +79,9 @@ static bool is_android_skel_dir(const char* sub_path) {
 
 #define VFS_RETURN(val) do { config_unlock_read(); return val; } while(0)
 
-// ==================== fuse_daemon.c (仅展示修改的 vfs_getattr 部分，其他保持不变) ====================
-// 在 vfs_getattr 函数中，在覆盖 uid/gid 之前添加以下判断
 static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -ENOENT);
+    if (st == nullptr) VFS_RETURN(-EINVAL);
     if (lstat(p, st) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path))) {
@@ -104,8 +93,6 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
         if (err != ENOENT && g_min_log_level == LOG_DEBUG) vfs_log_io_err(current_pkg, "GETATTR", sub_path, "errno=%d real='%s'", err, p);
         VFS_RETURN(-err);
     }
-    
-    // 特殊处理 Android/data 和 Android/obb 路径：不覆盖 uid/gid，直接使用原始文件系统值
     bool is_data_or_obb = (strncmp(sub_path, "/Android/data", 13) == 0 ||
                            strncmp(sub_path, "/Android/obb", 12) == 0);
     if (!g_preserve_perms && !is_data_or_obb) { 
@@ -114,13 +101,11 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
     } else if (is_redir && S_ISDIR(st->st_mode)) {
         st->st_mode = (st->st_mode & ~07777) | 0777;
     }
-    
     if (is_android_skel_dir(sub_path)) {
         st->st_mode = (st->st_mode & ~07777) | S_IFDIR | 0755;
         st->st_uid = ctx->uid;
         st->st_gid = ctx->gid;
     }
-    
     VFS_RETURN(0);
 }
 
@@ -141,7 +126,7 @@ static int vfs_access(const char *path, int mask) {
 static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
     (void)offset; (void)flags; (void)fi; VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(cfg, current_pkg, ctx->uid, "READDIR", sub_path, p, is_redir);
-    
+    LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
     bool skip_sandbox = (path_user_id < 0);
     DirHashTable ht; vfs_hash_init(&ht);
     DIR *dp = opendir(p);
@@ -150,10 +135,9 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     bool is_android_dir = (!skip_sandbox && (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0));
     bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0);
     bool sandbox_enabled = (cfg && cfg->sandbox && hide_others);
-    (void)sandbox_enabled; // 保留逻辑定义，压制编译器未使用警告
+    (void)sandbox_enabled;
     bool force_android_skel = hide_others;
     bool has_data = false, has_obb = false, has_android = false, has_pkg = false;
-
     if (!dp) {
         int err = errno;
         if (!is_android_skel_dir(sub_path) && !(err == ENOENT && (vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path)))) {
@@ -165,11 +149,9 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
             if (is_root) snprintf(item_sub_path, 2047, "/%s", de->d_name); else snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
             if (path_contains_invalid_chars(de->d_name)) continue;
-            
             char dummy_path[PATH_MAX];
             if (ctx->uid != 0 && vfs_sanitize_and_check_hidden(cfg, item_sub_path, nullptr, dummy_path, sizeof(dummy_path), current_pkg, ctx->uid) != 0) continue;
             if (ctx->uid != 0 && vfs_is_redirect_target(cfg, item_sub_path)) continue;
-
             if (is_root && strcmp(de->d_name, "Android") == 0) has_android = true;
             if (is_android_dir) {
                 if (strcmp(de->d_name, "data") == 0) has_data = true;
@@ -179,39 +161,71 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
                 if (strcmp(de->d_name, current_pkg) != 0) continue;
                 has_pkg = true;
             }
-
             if (vfs_hash_insert(&ht, de->d_name)) {
                 struct stat st; memset(&st, 0, sizeof(st));
                 snprintf(item_real_path, 2047, "%s/%s", p, de->d_name);
                 if (lstat(item_real_path, &st) == 0) {
                     if (!g_preserve_perms) { st.st_uid = ctx->uid; st.st_gid = ctx->gid; }
-                    filler(buf, de->d_name, &st, 0, 0);
-                } else filler(buf, de->d_name, nullptr, 0, 0);
+                    if (filler(buf, de->d_name, &st, 0, 0) != 0) {
+                        closedir(dp);
+                        vfs_hash_free(&ht);
+                        VFS_RETURN(0);
+                    }
+                } else {
+                    if (filler(buf, de->d_name, nullptr, 0, 0) != 0) {
+                        closedir(dp);
+                        vfs_hash_free(&ht);
+                        VFS_RETURN(0);
+                    }
+                }
             }
         }
         closedir(dp);
     }
-    
     if (is_root && force_android_skel && !has_android) { 
-        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("Android"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid; filler(buf, "Android", &st_dir, 0, 0);
+        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("Android"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid; 
+        if (filler(buf, "Android", &st_dir, 0, 0) != 0) {
+            vfs_hash_free(&ht);
+            VFS_RETURN(0);
+        }
     }
     if (is_android_dir) {
         if (!has_data) {
             struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("data"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
-            filler(buf, "data", &st_dir, 0, 0);
+            if (filler(buf, "data", &st_dir, 0, 0) != 0) {
+                vfs_hash_free(&ht);
+                VFS_RETURN(0);
+            }
         }
         if (!has_obb) {
             struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("obb"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
-            filler(buf, "obb", &st_dir, 0, 0);
+            if (filler(buf, "obb", &st_dir, 0, 0) != 0) {
+                vfs_hash_free(&ht);
+                VFS_RETURN(0);
+            }
         }
     }
     if (hide_others && !has_pkg && (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 || strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)) {
         struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode(current_pkg); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
-        if (vfs_hash_insert(&ht, current_pkg)) filler(buf, current_pkg, &st_dir, 0, 0);
+        if (vfs_hash_insert(&ht, current_pkg)) {
+            if (filler(buf, current_pkg, &st_dir, 0, 0) != 0) {
+                vfs_hash_free(&ht);
+                VFS_RETURN(0);
+            }
+        }
     }
-    
-    vfs_fill_virtual_dirs(cfg, sub_path, path_user_id, buf, filler, ctx->uid, ctx->gid, &ht, is_root);
-    filler(buf, ".", nullptr, 0, 0); filler(buf, "..", nullptr, 0, 0);
+    if (!vfs_fill_virtual_dirs(cfg, sub_path, path_user_id, buf, filler, ctx->uid, ctx->gid, &ht, is_root)) {
+        vfs_hash_free(&ht);
+        VFS_RETURN(0);
+    }
+    if (filler(buf, ".", nullptr, 0, 0) != 0) {
+        vfs_hash_free(&ht);
+        VFS_RETURN(0);
+    }
+    if (filler(buf, "..", nullptr, 0, 0) != 0) {
+        vfs_hash_free(&ht);
+        VFS_RETURN(0);
+    }
     vfs_hash_free(&ht);
     VFS_RETURN(0);
 }
@@ -253,8 +267,6 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
         VFS_RETURN(-err); 
     }
     fi->fh = fd;
-
-    /* 尝试 passthrough 加速 I/O — fuse_passthrough_enable() 返回值即验证 */
     if (g_passthrough_enabled) {
         fuse_req_t req = fuse_get_context()->req;
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
@@ -267,7 +279,6 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
                     sub_path, strerror(errno), errno);
         }
     }
-
     VFS_RETURN(0);
 }
 
@@ -295,8 +306,6 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     }
     inherit_parent_attributes(p, S_IFREG);
     fi->fh = fd;
-
-    /* 尝试 passthrough 加速 I/O — fuse_passthrough_enable() 返回值即验证 */
     if (g_passthrough_enabled) {
         fuse_req_t req = fuse_get_context()->req;
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
@@ -309,7 +318,6 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
                     sub_path, strerror(errno), errno);
         }
     }
-
     VFS_RETURN(0);
 }
 
@@ -423,6 +431,12 @@ static int vfs_fsync(const char *path, int datasync, struct fuse_file_info *fi) 
     return 0;
 }
 
+static int vfs_flush(const char *path, struct fuse_file_info *fi) {
+    (void)path;
+    (void)fi;
+    return 0;
+}
+
 static int vfs_readlink(const char *path, char *buf, size_t size) {
     VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(cfg, current_pkg, ctx->uid, "READLINK", sub_path, p, is_redir);
@@ -476,17 +490,153 @@ static int vfs_symlink(const char *target, const char *linkpath) {
     VFS_RETURN(0);
 }
 
+static int recursive_rmdir(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -errno;
+    struct dirent *p;
+    int r = 0;
+    while (!r && (p = readdir(d))) {
+        if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..")) continue;
+        char buf[PATH_MAX];
+        snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
+        struct stat statbuf;
+        if (!lstat(buf, &statbuf)) {
+            if (S_ISDIR(statbuf.st_mode)) r = recursive_rmdir(buf);
+            else r = unlink(buf);
+        }
+    }
+    closedir(d);
+    if (!r) r = rmdir(path);
+    return r;
+}
+
+static int recursive_copy_dir(const char *src, const char *dst, uid_t uid, gid_t gid) {
+    struct stat st;
+    if (lstat(src, &st) != 0) return -errno;
+    if (mkdir(dst, st.st_mode & 07777) != 0 && errno != EEXIST) return -errno;
+    lchown(dst, st.st_uid, st.st_gid);
+    DIR *d = opendir(src);
+    if (!d) return -errno;
+    struct dirent *p;
+    int r = 0;
+    while (!r && (p = readdir(d))) {
+        if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, "..")) continue;
+        char s_path[PATH_MAX], d_path[PATH_MAX];
+        snprintf(s_path, sizeof(s_path), "%s/%s", src, p->d_name);
+        snprintf(d_path, sizeof(d_path), "%s/%s", dst, p->d_name);
+        struct stat s_st;
+        if (!lstat(s_path, &s_st)) {
+            if (S_ISDIR(s_st.st_mode)) {
+                r = recursive_copy_dir(s_path, d_path, uid, gid);
+            } else if (S_ISREG(s_st.st_mode)) {
+                int fd_src = open(s_path, O_RDONLY | O_CLOEXEC);
+                if (fd_src >= 0) {
+                    int fd_dst = open(d_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, s_st.st_mode & 0777);
+                    if (fd_dst >= 0) {
+                        char buf[16384]; 
+                        ssize_t r_len;
+                        bool copy_ok = true;
+                        while ((r_len = read(fd_src, buf, sizeof(buf))) > 0) {
+                            ssize_t w_off = 0;
+                            while (w_off < r_len) {
+                                ssize_t w_len = write(fd_dst, buf + w_off, r_len - w_off);
+                                if (w_len < 0) {
+                                    if (errno == EINTR) continue;
+                                    copy_ok = false; break;
+                                }
+                                w_off += w_len;
+                            }
+                            if (!copy_ok) break;
+                        }
+                        if (r_len < 0) copy_ok = false;
+                        if (copy_ok) {
+                            struct timespec ts[2] = {s_st.st_atim, s_st.st_mtim}; 
+                            futimens(fd_dst, ts);
+                            fchown(fd_dst, s_st.st_uid, s_st.st_gid);
+                            fchmod(fd_dst, s_st.st_mode & 07777);
+                            char context[256];
+                            ssize_t ctx_len = lgetxattr(s_path, "security.selinux", context, sizeof(context));
+                            if (ctx_len > 0) lsetxattr(d_path, "security.selinux", context, (size_t)ctx_len, 0);
+                        } else {
+                            r = -EIO;
+                        }
+                        close(fd_dst);
+                        if (!copy_ok) unlink(d_path);
+                    } else {
+                        r = -errno;
+                    }
+                    close(fd_src);
+                } else {
+                    r = -errno;
+                }
+            }
+        }
+    }
+    closedir(d);
+    return r;
+}
+
+static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* st) {
+    int fd_src = open(src, O_RDONLY | O_CLOEXEC);
+    if (fd_src < 0) return -errno;
+    int fd_dst = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st->st_mode & 0777);
+    if (fd_dst < 0) {
+        int err = errno;
+        close(fd_src);
+        return -err;
+    }
+    char *buf = malloc(65536);
+    if (!buf) {
+        close(fd_src); close(fd_dst);
+        return -ENOMEM;
+    }
+    ssize_t r_len;
+    int copy_err = 0;
+    while ((r_len = read(fd_src, buf, 65536)) > 0) {
+        ssize_t w_off = 0;
+        while (w_off < r_len) {
+            ssize_t w_len = write(fd_dst, buf + w_off, (size_t)(r_len - w_off));
+            if (w_len < 0) {
+                if (errno == EINTR) continue;
+                copy_err = -errno;
+                break;
+            }
+            w_off += w_len;
+        }
+        if (copy_err < 0) break;
+    }
+    if (r_len < 0 && copy_err == 0) copy_err = -errno;
+    free(buf);
+    if (copy_err == 0) {
+        struct timespec ts[2] = {st->st_atim, st->st_mtim}; 
+        futimens(fd_dst, ts); 
+        fchown(fd_dst, st->st_uid, st->st_gid); 
+        fchmod(fd_dst, st->st_mode & 07777);
+        char context[256];
+        ssize_t ctx_len = lgetxattr(src, "security.selinux", context, sizeof(context));
+        if (ctx_len > 0) lsetxattr(dst, "security.selinux", context, (size_t)ctx_len, 0);
+    }
+    close(fd_src);
+    close(fd_dst);
+    if (copy_err < 0) {
+        unlink(dst);
+        return copy_err;
+    }
+    return 0;
+}
+
 static int vfs_rename(const char *from, const char *to, unsigned int flags) {
-    char pkg_from[128], pkg_to[128]; struct fuse_context* ctx = fuse_get_context();
+    char pkg_from[128], pkg_to[128]; 
+    struct fuse_context* ctx = fuse_get_context();
+    if (!ctx) return -EACCES;
     config_lock_read();
     AppConfig* cfg_from = vfs_get_app_cfg(ctx->uid, ctx->pid, pkg_from);
     AppConfig* cfg_to = vfs_get_app_cfg(ctx->uid, ctx->pid, pkg_to);
-    char sub_from[PATH_MAX], sub_to[PATH_MAX], p_from[PATH_MAX], p_to[PATH_MAX]; int u_from, u_to;
+    char sub_from[PATH_MAX], sub_to[PATH_MAX], p_from[PATH_MAX], p_to[PATH_MAX]; 
+    int u_from, u_to;
     bool redir_from = false, redir_to = false;
     if (vfs_sanitize_and_check_hidden(cfg_from, from, &u_from, sub_from, sizeof(sub_from), pkg_from, ctx->uid) != 0) { config_unlock_read(); return -ENOENT; }
     if (vfs_sanitize_and_check_hidden(cfg_to, to, &u_to, sub_to, sizeof(sub_to), pkg_to, ctx->uid) != 0) { config_unlock_read(); return -ENOENT; }
-    vfs_log_io(cfg_from, pkg_from, ctx->uid, "RENAME_FROM", sub_from, p_from, false);
-    vfs_log_io(cfg_to, pkg_to, ctx->uid, "RENAME_TO", sub_to, p_to, false);
     if (ctx->uid != 0 && (vfs_is_path_ro(cfg_from, sub_from) || vfs_is_path_ro(cfg_to, sub_to))) { 
         log_fuse_err("RENAME_RO_DENIED", from, EROFS);
         config_unlock_read(); 
@@ -494,53 +644,48 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
     }
     if (vfs_to_real_path(cfg_from, sub_from, p_from, sizeof(p_from), u_from, &redir_from, pkg_from) != 0) { config_unlock_read(); return -ENOENT; }
     if (vfs_to_real_path(cfg_to, sub_to, p_to, sizeof(p_to), u_to, &redir_to, pkg_to) != 0) { config_unlock_read(); return -ENOENT; }
+    vfs_log_io(cfg_from, pkg_from, ctx->uid, "RENAME_FROM", sub_from, p_from, redir_from);
+    vfs_log_io(cfg_to, pkg_to, ctx->uid, "RENAME_TO", sub_to, p_to, redir_to);
     config_unlock_read();
-
 #ifdef SYS_renameat2
     if (flags && syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
 #endif
-
     char *p_to_dup = strdup(p_to), *p_to_dir = dirname(p_to_dup);
-    if (mkdir_recursive_p(p_to_dir, 0775) != 0) { free(p_to_dup); return -ENOENT; } free(p_to_dup);
-
+    int mkdir_res = mkdir_recursive_p(p_to_dir, 0775);
+    free(p_to_dup);
+    if (mkdir_res != 0) {
+        LOG_ERR("重命名创建目标父目录失败: %s (errno=%d)", p_to_dir, errno);
+        return -errno;
+    }
     if (rename(p_from, p_to) == 0) return 0;
-    
     int err = errno;
     if (err == EXDEV) { 
         struct stat st;
-        if (lstat(p_from, &st) == 0 && S_ISREG(st.st_mode)) {
-            int fd_src = open(p_from, O_RDONLY | O_CLOEXEC);
-            if (fd_src >= 0) {
-                int fd_dst = open(p_to, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st.st_mode & 0777);
-                if (fd_dst >= 0) {
-                    char buf[8192];
-                    ssize_t r_len;
-                    bool copy_ok = true;
-                    while ((r_len = read(fd_src, buf, sizeof(buf))) > 0) {
-                        ssize_t w_off = 0;
-                        while (w_off < r_len) {
-                            ssize_t w_len = write(fd_dst, buf + w_off, r_len - w_off);
-                            if (w_len < 0) {
-                                if (errno == EINTR) continue;
-                                copy_ok = false; break;
-                            }
-                            w_off += w_len;
-                        }
-                        if (!copy_ok) break;
-                    }
-                    if (r_len < 0) copy_ok = false;
-
-                    if (copy_ok) {
-                        struct timespec ts[2] = {st.st_atim, st.st_mtim}; 
-                        futimens(fd_dst, ts); 
-                        fchown(fd_dst, st.st_uid, st.st_gid); 
-                        fchmod(fd_dst, st.st_mode & 07777);
-                        close(fd_src); close(fd_dst); unlink(p_from); return 0;
-                    }
-                    close(fd_dst);
+        if (lstat(p_from, &st) == 0) {
+            if (S_ISREG(st.st_mode)) {
+                int copy_res = vfs_rename_copy_file(p_from, p_to, &st);
+                if (copy_res == 0) {
+                    unlink(p_from);
+                    return 0;
                 }
-                close(fd_src);
+                LOG_ERR("跨设备复制文件失败: %s -> %s (err=%d)", p_from, p_to, copy_res);
+                return copy_res;
+            } else if (S_ISDIR(st.st_mode)) {
+                int copy_res = recursive_copy_dir(p_from, p_to, ctx->uid, ctx->gid);
+                if (copy_res == 0) {
+                    if (recursive_rmdir(p_from) == 0) return 0;
+                    else {
+                        recursive_rmdir(p_to); 
+                        return -errno;
+                    }
+                } else {
+                    recursive_rmdir(p_to); 
+                    LOG_ERR("跨设备复制文件夹失败: %s -> %s (err=%d)", p_from, p_to, copy_res);
+                    return copy_res;
+                }
             }
+        } else {
+            return -errno;
         }
     }
     log_fuse_err("RENAME", from, err);
@@ -598,11 +743,11 @@ static int vfs_utimens(const char *path, const struct timespec ts[2], struct fus
         log_fuse_err("UTIMENS_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
-    int ret = utimensat(0, p, ts, AT_SYMLINK_NOFOLLOW);
+    int ret = utimensat(AT_FDCWD, p, ts, AT_SYMLINK_NOFOLLOW);
     if (ret == -1) {
         int err = errno;
         log_fuse_err("UTIMENS", path, err);
-        VFS_RETURN(-err);
+        return -err;
     }
     VFS_RETURN(0);
 }
@@ -687,36 +832,19 @@ static void vfs_destroy(void *private_data) {
 static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     cfg->use_ino = 1; cfg->entry_timeout = 1.0; cfg->attr_timeout = 1.0; cfg->negative_timeout = 0.5;
     signal(SIGPIPE, SIG_IGN);
-
-    /* === FUSE Passthrough 启动协商 === */
     g_passthrough_enabled = false;
-
     if (conn->capable & FUSE_CAP_PASSTHROUGH)
-        LOG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
+        LOG_DBG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
     else
-        LOG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
-
-    /*
-     * 通过 ioctl 探测内核是否实现了 passthrough。
-     *
-     * ioctl PASSTHROUGH_OPEN 有三代: V2(最新) → V1 → V0(最旧)
-     *
-     * ioctl 返回值意义:
-     *   > 0  → 成功, 内核已启用 passthrough (backing_id)
-     *   EPERM → ioctl 命令存在但 fc->passthrough=0 (INIT 未完成时的正常状态)
-     *   ENOTTY → 内核完全无此 ioctl 命令 (无 passthrough 支持)
-     */
+        LOG_DBG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
     int backing_id = -1;
     int saved_errno = 0;
-    bool ioctl_exists = false;  /* ioctl 命令存在(即使返回 EPERM) */
-
+    bool ioctl_exists = false;  
     int test_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (test_fd < 0) {
         LOG_ERR("FUSE Passthrough: ❌ 无法打开/dev/null测试fd: %s", strerror(errno));
         goto ioctl_probe_done;
     }
-
-    /* 尝试 V2 (Android Passthrough API V2) */
     backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &test_fd);
     if (backing_id > 0) {
         ioctl_exists = true;
@@ -725,7 +853,6 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         if (saved_errno == EPERM) {
             ioctl_exists = true;
         } else if (saved_errno == ENOTTY) {
-            /* 尝试 V1 */
             struct fuse_passthrough_out_v0 out = { .fd = (uint32_t)test_fd, .len = 0, .vec = NULL };
             errno = 0;
             backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1, &out);
@@ -736,7 +863,6 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
                 if (saved_errno == EPERM) {
                     ioctl_exists = true;
                 } else if (saved_errno == ENOTTY) {
-                    /* 尝试 V0 (最旧) */
                     errno = 0;
                     backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0, &out);
                     if (backing_id > 0) {
@@ -751,42 +877,18 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
             }
         }
     }
-
     if (ioctl_exists) {
-        /* ioctl 命令存在 → 内核有 passthrough 实现 */
         g_passthrough_enabled = true;
-
         if (backing_id > 0) {
-            /* ioctl 直接成功了 (极少见: 内核可能已预设 fc->passthrough) */
             LOG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
-            /* 关闭测试 backing 释放内核资源 */
             int close_ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
             if (close_ret < 0)
-                LOG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
+                LOG_DBG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
         } else {
-            /* saved_errno == EPERM: ioctl 存在但 fc->passthrough=0
-             * 这是预期的 — INIT 尚未完成, 下面通过 want 标志请求内核启用 */
-            LOG("FUSE Passthrough: ioctl 已确认, 通过INIT请求启用...");
+            LOG_DBG("FUSE Passthrough: ioctl 已确认, 通过INIT请求启用...");
         }
-
-        /*
-         * 请求内核启用 passthrough:
-         * 将 FUSE_CAP_PASSTHROUGH 加入 conn->want,
-         * 内核收到 INIT 回复后会设置 fc->passthrough = 1,
-         * 后续文件操作的 ioctl 将成功返回 backing_id.
-         *
-         * 注意: 因为 capable 可能不含 FUSE_CAP_PASSTHROUGH,
-         * libfuse 的 _do_init() 中已有覆盖逻辑来绕过
-         * want_flags_valid 检查.
-         */
         conn->want |= FUSE_CAP_PASSTHROUGH;
-        LOG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
-
-        /* === Passthrough 运行时自检 ===
-         *
-         * 注意: ioctl 存在性已在 INIT 前的协商阶段通过 EPERM 确认,
-         * 这里不再重复探测。直接验证 backing 存储的 I/O 完整性。
-         */
+        LOG_DBG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
         {
             char testfile[PATH_MAX];
             snprintf(testfile, sizeof(testfile), "%s/0/.pt_self_test_%d_%d",
@@ -798,7 +900,6 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
                 const char magic[] = "PT_SELFTEST";
                 write(tf, magic, sizeof(magic));
                 lseek(tf, 0, SEEK_SET);
-
                 char verify[32] = {0};
                 ssize_t r = read(tf, verify, sizeof(magic));
                 if (r == (ssize_t)sizeof(magic) && memcmp(verify, magic, sizeof(magic)) == 0) {
@@ -807,66 +908,132 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
                     LOG_WRN("FUSE Passthrough: ⚠️ 自检 I/O 完整性异常 (read=%zd %s)",
                             r, r < 0 ? strerror(errno) : "数据不匹配");
                 }
-
                 close(tf);
                 unlink(testfile);
             }
         }
     } else {
-        /* 所有 PASSTHROUGH_OPEN 版本都返回 ENOTTY → 完全无支持 */
         int err = saved_errno;
         switch (err) {
         case ENOTTY:
             LOG_ERR("FUSE Passthrough: ❌ 内核FUSE模块不支持任何已知的PASSTHROUGH ioctl");
-            LOG_ERR("  → 可能原因: 内核未启用CONFIG_FUSE_PASSTHROUGH或版本过低");
             break;
-        case EBADF:
-            LOG_ERR("FUSE Passthrough: ❌ 无效的测试文件描述符 (EBADF) — 审计异常!");
-            break;
-        case EOPNOTSUPP:
-            LOG_ERR("FUSE Passthrough: ❌ 内核FUSE明确禁用了passthrough (EOPNOTSUPP)");
-            break;
-        case EINVAL:
-            LOG_ERR("FUSE Passthrough: ❌ 参数无效 (EINVAL) — ioctl命令可能不兼容");
+        case EPERM:
+            LOG_ERR("FUSE Passthrough: ❌ 缺少运行所需权限 (EPERM)");
             break;
         default:
             LOG_ERR("FUSE Passthrough: ❌ 协商失败 errno=%d (%s)", err, strerror(err));
             break;
         }
     }
-
     close(test_fd);
-
 ioctl_probe_done:
     if (g_passthrough_enabled) {
-        LOG_DBG("FUSE Passthrough: 🟢 启用成功 — fuse_passthrough_enable() 返回值将确认每文件透传状态");
+        LOG("FUSE Passthrough: 🟢 启用成功");
     } else {
         LOG_WRN("FUSE Passthrough: 所有文件I/O将走标准FUSE用户态路径 (性能较低)");
     }
-
     char msg[512]; snprintf(msg, 511, "FUSE_ALIVE Global %d", getpid()); send_ipc_message(msg);
     if (g_ready_fd >= 0) { write(g_ready_fd, "1", 1); close(g_ready_fd); g_ready_fd = -1; }
     return nullptr;
+}
+
+static bool is_fuse_bpf_supported(void) {
+    FILE *fp = fopen("/sys/fs/fuse/features/fuse_bpf", "r");
+    if (!fp) { LOG_DBG("FUSE BPF: 特性文件不可读"); return false; }
+    char line[64]; bool ok = false;
+    if (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        if (len && line[len-1] == '\n') line[--len] = '\0';
+        ok = (strcmp(line, "supported") == 0);
+    }
+    fclose(fp);
+    LOG_DBG("FUSE BPF: %s -> %s", "/sys/fs/fuse/features/fuse_bpf",
+        ok ? "supported" : "not supported");
+    return ok;
+}
+
+#ifndef __NR_bpf
+#if defined(__aarch64__)
+#define __NR_bpf 280
+#else
+#define __NR_bpf 321  
+#endif
+#endif
+#include <linux/bpf.h>
+
+static int open_bpf_prog(void) {
+    static const char *bpf_paths[] = {
+        "/sys/fs/bpf/prog_fuseMedia_fuse_media",
+        "/sys/fs/bpf/prog_fuse_media",
+        NULL
+    };
+    for (int i = 0; bpf_paths[i]; i++) {
+        union bpf_attr attr = {};
+        attr.pathname = (uint64_t)(uintptr_t)bpf_paths[i];
+        attr.bpf_fd = 0;
+        int fd = (int)syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr));
+        if (fd >= 0) {
+            LOG_DBG("FUSE BPF: 已获取程序 %s (fd=%d)", bpf_paths[i], fd);
+            return fd;
+        }
+        LOG_DBG("FUSE BPF: %s: %s", bpf_paths[i], strerror(errno));
+    }
+    LOG_WRN("FUSE BPF: 无法获取 BPF 程序, 将以标准 FUSE 模式运行");
+    return -1;
+}
+
+static int vfs_bpf_setup(const char *path, struct fuse_entry_param *e) {
+    if (g_bpf_fd < 0) return -ENOSYS;
+    if (!path || !e) return -EINVAL;
+    const char *suffix;
+    if ((suffix = strstr(path, "/Android/data")) == NULL &&
+        (suffix = strstr(path, "/Android/obb")) == NULL)
+        return -ENOENT;
+    char real[PATH_MAX];
+    snprintf(real, sizeof(real), "%s%s", STORAGE_BASE, path);
+    if (!S_ISDIR(e->attr.st_mode))
+        return -ENOTDIR;
+    bool is_pkg = (strncmp(suffix, "/Android/data/", 14) == 0 ||
+                   strncmp(suffix, "/Android/obb/", 13) == 0);
+    int bfd = open(real, O_CLOEXEC | O_DIRECTORY | O_RDONLY);
+    if (bfd < 0) {
+        LOG_DBG("FUSE BPF: open(%s) = %s", real, strerror(errno));
+        return -errno;
+    }
+    if (is_pkg) {
+        e->backing_action = FUSE_ACTION_REPLACE;
+        e->backing_fd = (uint64_t)bfd;
+        e->bpf_action = FUSE_ACTION_REMOVE;
+        LOG_DBG_PERF("FUSE BPF: backing %s (fd=%d)", real, bfd);
+    } else {
+        e->backing_action = FUSE_ACTION_REPLACE;
+        e->backing_fd = (uint64_t)bfd;
+        e->bpf_action = FUSE_ACTION_REPLACE;
+        e->bpf_fd = (uint64_t)g_bpf_fd;
+        LOG_DBG_PERF("FUSE BPF: BPF %s (backing=%d, bpf=%d)",
+                real, bfd, g_bpf_fd);
+    }
+    return 0;
 }
 
 static struct fuse_operations vfs_ops = {
     .init = vfs_init, .destroy = vfs_destroy, .getattr = vfs_getattr, .access = vfs_access,
     .readlink = vfs_readlink, .symlink = vfs_symlink, .opendir = vfs_opendir, .readdir = vfs_readdir,
     .open = vfs_open, .create = vfs_create, .read = vfs_read, .write = vfs_write,
-    .release = vfs_release, .fsync = vfs_fsync, 
+    .release = vfs_release, .fsync = vfs_fsync, .flush = vfs_flush,
     .mkdir = vfs_mkdir, .unlink = vfs_unlink, .rmdir = vfs_rmdir,
     .rename = vfs_rename, .chmod = vfs_chmod, .chown = vfs_chown, .truncate = vfs_truncate,
     .utimens = vfs_utimens, .statfs = vfs_statfs, .getxattr = vfs_getxattr, .listxattr = vfs_listxattr,
     .setxattr = vfs_setxattr, .removexattr = vfs_removexattr,
+    .bpf_setup = vfs_bpf_setup,
 };
 
 int main(int argc, char *argv[]) {
     char rules_path[PATH_MAX] = {0};
-    
     char* fuse_argv[argc + 1]; 
     int fuse_argc = 0; 
     if (argc > 0) fuse_argv[fuse_argc++] = argv[0];
-
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--mode=", 7) == 0) {
             if (strcmp(argv[i] + 7, "overlay") == 0) g_mode = MODE_OVERLAY; else g_mode = MODE_REDIRECT;
@@ -899,12 +1066,17 @@ int main(int argc, char *argv[]) {
         }
     }
     fuse_argv[fuse_argc] = nullptr; 
-    
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
     install_crash_handlers();
     vfs_core_init(rules_path);
-
-
+    g_bpf_fd = -1;
+    if (is_fuse_bpf_supported()) {
+        int fd = open_bpf_prog();
+        if (fd >= 0) {
+            g_bpf_fd = fd;
+            LOG("FUSE BPF: 已启用 (bpf_fd=%d)", g_bpf_fd);
+        }
+    }
     return fuse_main(fuse_argc, fuse_argv, &vfs_ops, nullptr);
 }

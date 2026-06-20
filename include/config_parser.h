@@ -1,11 +1,18 @@
 #ifndef CONFIG_PARSER_H
 #define CONFIG_PARSER_H
-
 #include <stdbool.h>
 #include <sys/types.h>
-
 #define MAX_PATH_LEN 256
 #define MAX_USERS 64
+
+typedef struct TrieNode {
+    char *segment;              
+    struct TrieNode **children; 
+    int child_count;            
+    bool is_hidden;
+    bool is_ro;
+    char *redir_target;         
+} TrieNode;
 
 typedef struct { 
     char virtual_prefix[MAX_PATH_LEN]; 
@@ -14,23 +21,21 @@ typedef struct {
 
 typedef struct {
     char pkg_name[128];
-    int user_id;         // 区分用户
+    int user_id;         
     bool inject_enable;   
     bool monitor;
     bool sandbox;
-    bool global_inject;   // 全局规则启用所有应用注入
-    
+    bool global_inject;   
     char** hide_rules;
     int hide_count;
     int hide_capacity;
-    
     char** ro_rules;
     int ro_count;
     int ro_capacity;
-    
     RedirectRule* redir_rules;
     int redir_count;
     int redir_capacity;
+    TrieNode* trie_root;
 } AppConfig;
 
 typedef struct {
@@ -41,7 +46,6 @@ typedef struct {
 extern AppConfig g_global_cfg;
 extern AppConfig** g_app_cfgs;
 extern int g_app_cfg_count;
-
 extern int g_active_users[MAX_USERS];
 extern int g_active_user_count;
 
@@ -51,28 +55,23 @@ void config_lock_read();
 void config_unlock_read();
 void config_lock_write();
 void config_unlock_write();
-
 void scan_active_users();
 void load_config_rules(const char* main_conf_path);
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed);
-
 char* clean_path_string(char* str);
 void strip_trailing_slash(char* path);
 int mkdir_recursive_p(const char *path, mode_t mode);
-
 void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger_source);
-
-/*
- * 在应用配置列表中查找匹配的 AppConfig。
- * 调用方需持有 config_lock_read() 锁。
- * 查找策略：先按精确 user_id 匹配，再按 user_id==-1 (通配) 匹配。
- */
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id);
-
-/*
- * 检查应用是否有通配符 "*" 规则且 inject_enable 启用。
- * 调用方需持有 config_lock_read() 锁。
- */
 bool has_wildcard_enabled_locked(int user_id);
+
+TrieNode* trie_create_node(const char* segment);
+void trie_free(TrieNode* node);
+void trie_insert(TrieNode* root, const char* path, const char* redir_target, bool is_hidden, bool is_ro);
+bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool* out_ro, char* out_redir, size_t max_len);
+
+// 修复严重错误 1：向外暴露 Trie 的精准判定接口，解耦虚拟系统判定
+bool trie_is_redirect_target(const TrieNode* root, const char* path);
+bool trie_is_ancestor(const TrieNode* root, const char* path);
 
 #endif

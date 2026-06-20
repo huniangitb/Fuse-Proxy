@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <signal.h>
+#include <stdbool.h>
 
 struct GlobalFuseInfo {
     pid_t pid;
@@ -23,4 +24,10 @@ extern int g_epoll_fd;
 const char* get_active_mnt_src();
 void notify_fuses(int sig);
 
-#endif
+/* 核心暴露：非阻塞异步控制接口 */
+void register_fuse_ready_pipe(int fd, void* ctx);
+bool register_async_mount_pipe(int fd, void* ctx);
+void handle_fuse_ready_event(void *ptr);
+void handle_async_mount_event(void *ptr);
+
+#endif /* INJECTOR_H */
