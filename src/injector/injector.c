@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "injector.h"
 #include "common.h"
@@ -32,6 +31,7 @@
 volatile sig_atomic_t g_should_exit = 0;
 volatile sig_atomic_t g_reload_config = 0;
 volatile sig_atomic_t g_passive_mode = 0;
+volatile sig_atomic_t g_fuse_ready = 0;
 int g_global_root_fd = -1;
 int g_epoll_fd = -1;
 int g_inotify_fd = -1;
@@ -44,6 +44,21 @@ struct GlobalFuseInfo g_global_fuse = {
     .pid = 1, .fuse_pid = 0, .mnt_path = "/mnt/nsp_global",
     .crash_count = 0, .last_crash_time = 0, .disabled = false
 };
+/* 重入保护：防止并发调用 inject_global_fuse() */
+static volatile int g_fuse_starting = 0;
+/* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
+static int g_pending_first_scan = 0;
+/* 挂载失败重试队列：应对 FUSE 重建期间并发挂载的瞬态失败 */
+#define MAX_RETRY_MOUNTS 64
+typedef struct {
+    char cmdline[256];
+    int pid;
+    uid_t uid;
+    int retries;
+    time_t last_attempt;
+} RetryMountEntry;
+static RetryMountEntry g_retry_mounts[MAX_RETRY_MOUNTS];
+static int g_retry_mount_count = 0;
 /* 异步就绪与挂载任务全局描述符注册系统 */
 static int g_fuse_ready_pipe_fd = -1;
 static void* g_fuse_ready_ctx = nullptr;
@@ -62,8 +77,28 @@ bool register_async_mount_pipe(int fd, void* ctx) {
     g_async_mount_count++;
     return true;
 }
+
+/* 挂载失败重试：将失败项加入重试队列，移除追踪以避免扫描遗漏 */
+void schedule_retry_mount(const char* pkg, int pid) {
+    if (g_retry_mount_count >= MAX_RETRY_MOUNTS) {
+        LOG_DBG("重试队列已满，丢弃 %s(PID:%d) 的重试", pkg, pid);
+        return;
+    }
+    /* 检查是否已在队列中 */
+    for (int i = 0; i < g_retry_mount_count; i++) {
+        if (g_retry_mounts[i].pid == pid) return;
+    }
+    RetryMountEntry *e = &g_retry_mounts[g_retry_mount_count++];
+    strncpy(e->cmdline, pkg, sizeof(e->cmdline) - 1);
+    e->cmdline[sizeof(e->cmdline) - 1] = '\0';
+    e->pid = pid;
+    e->uid = 0; /* 在重试时通过 get_app_uid(pid) 获取 */
+    e->retries = 0;
+    e->last_attempt = 0;
+    LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d", pkg, pid, g_retry_mount_count);
+}
 const char* get_active_mnt_src() {
-    if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) == 0)
+    if (g_fuse_ready && g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) == 0)
         return g_global_fuse.mnt_path;
     return nullptr;
 }
@@ -142,8 +177,18 @@ void handle_fuse_ready_event(void *ptr) {
     epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->pipe_fd, nullptr);
     close(ctx->pipe_fd);
     if (r == 1) {
-        LOG("FUSE 守护进程成功通知就绪，执行共享视图转换");
+        LOG_DBG("FUSE 守护进程成功通知就绪，执行共享视图转换");
         ns_make_shared(g_global_fuse.pid, g_global_fuse.mnt_path);
+        g_fuse_ready = 1;
+        /* 触发延迟的首次扫描 */
+        if (g_pending_first_scan) {
+            g_pending_first_scan = 0;
+            seconds_until_next_scan = 0;
+        }
+        /* 重试之前因 FUSE 未就绪而失败的挂载 */
+        if (g_retry_mount_count > 0) {
+            seconds_until_next_scan = 0;
+        }
     } else {
         LOG_ERR("FUSE 异步启动失败，管道未收到就绪字符");
         dump_crash_log_tail();
@@ -152,16 +197,50 @@ void handle_fuse_ready_event(void *ptr) {
 }
 static void inject_global_fuse() {
     if (g_global_fuse.disabled) return;
+    /* 重入保护：如果已有 FUSE 正在启动，跳过本次 */
+    if (__sync_lock_test_and_set(&g_fuse_starting, 1)) {
+        LOG_DBG("FUSE 已经在启动中，跳过重复启动");
+        return;
+    }
     if (g_global_fuse.fuse_pid > 0) {
         kill(g_global_fuse.fuse_pid, SIGTERM);
-        usleep(50000);
+        /* 等待旧 FUSE 守护进程真正退出，确保 /dev/fuse 关闭、挂载可清理 */
+        for (int wait_ms = 0; wait_ms < 500; wait_ms += 10) {
+            if (kill(g_global_fuse.fuse_pid, 0) != 0) break;
+            usleep(10000);
+        }
+        /* 超时未退出则强制杀死 */
+        if (kill(g_global_fuse.fuse_pid, 0) == 0) {
+            kill(g_global_fuse.fuse_pid, SIGKILL);
+            usleep(50000);
+        }
+        /* 收割子进程，避免僵尸 */
+        int status;
+        waitpid(g_global_fuse.fuse_pid, &status, WNOHANG);
     }
-    ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
+    /*
+     * 启动前预清理：强制卸载 /mnt/nsp_global 上任何残留的 FUSE 挂载，
+     * 包括 FUSE 守护进程已死导致的 "Transport endpoint is not connected" 状态。
+     * 使用 MNT_DETACH 卸载，不依赖 FUSE 守护进程响应。
+     * 无论 global_inject 模式都执行，确保挂载点是干净的。
+     */
+    ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
+    /* 验证挂载点确已清理：循环检查 /proc/self/mountinfo，防止遗留陈旧连接 */
+    for (int verify = 0; verify < 20; verify++) {
+        if (ns_is_mounted(g_global_fuse.pid, g_global_fuse.mnt_path, nullptr) <= 0)
+            break;
+        usleep(20000);
+    }
+    if (!g_global_cfg.global_inject) {
+        /* 非全局注入模式：进一步删除目录，后续由子进程 re-mkdir */
+        ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
+    }
     int ready_pipe[2];
-    if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) return;
+    if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) { __sync_lock_release(&g_fuse_starting); return; }
     pid_t child = fork();
     if (child == -1) {
         close(ready_pipe[0]); close(ready_pipe[1]);
+        __sync_lock_release(&g_fuse_starting);
         return;
     }
     if (child == 0) {
@@ -230,6 +309,7 @@ static void inject_global_fuse() {
     } else {
         close(ready_pipe[0]);
     }
+    __sync_lock_release(&g_fuse_starting);
 }
 static int cleanup_cb(int pid, const char* cmd, void* data) {
     (void)data;
@@ -251,6 +331,7 @@ static void cleanup_all_target_apps() {
 static void check_and_recover_fuse() {
     if (g_global_fuse.disabled || g_global_fuse.pid <= 0) return;
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) != 0) {
+        g_fuse_ready = 0;
         int status = 0;
         if (waitpid(g_global_fuse.fuse_pid, &status, WNOHANG) == g_global_fuse.fuse_pid)
             dump_crash_log_tail();
@@ -417,6 +498,11 @@ int scan_zygote_children() {
             }
         }
         config_unlock_read();
+    } else if (entry_count > 0 && !mnt_src && first_scan) {
+        /* FUSE 尚未就绪，候选进程暂无法注入 —— 安排快速重试 */
+        LOG_DBG("初次扫描发现 %d 候选进程但 FUSE 未就绪，安排快速重试", entry_count);
+        seconds_until_next_scan = 1;
+        g_scan_interval_seconds = 1;
     }
     if (first_scan) {
         clock_gettime(CLOCK_MONOTONIC, &ts_match_end);
@@ -481,7 +567,11 @@ static void do_cleanup() {
                 usleep(10000);
             }
         }
-        ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
+        /* 强制卸载残留的 FUSE 挂载（包括陈旧的 "Transport endpoint not connected" 状态） */
+        ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
+        if (!g_global_cfg.global_inject) {
+            ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
+        }
     }
     config_publisher_cleanup(g_config_pub_fd);
     g_config_pub_fd = -1;
@@ -570,20 +660,17 @@ int main(int argc, char *argv[]) {
     }
     inject_global_fuse();
     if (g_global_fuse.fuse_pid <= 0) exit(1);
+    /*
+     * 不在此处立即执行首次扫描 —— FUSE 守护进程尚未就绪 /mnt/nsp_global 也未传播。
+     * 改为标记延迟扫描，由 handle_fuse_ready_event() 或定时器回调触发首次扫描，
+     * 避免并发挂载子进程在 FUSE 未就绪时拿到 ENOENT。
+     */
+    g_pending_first_scan = 1;
+    seconds_until_next_scan = 0;
     if (start_passive) {
         g_passive_mode = 1;
         LOG("被动监听模式启动");
-    } else {
-        int found = scan_zygote_children();
-        if (found > 0) {
-            g_last_scan_found = true;
-            g_scan_interval_seconds = 30;
-        } else {
-            g_last_scan_found = false;
-            g_scan_interval_seconds = 60;   
-        }
     }
-    seconds_until_next_scan = g_scan_interval_seconds;
     struct epoll_event events[64];
     while (!g_should_exit) {
         int nfds = epoll_wait(g_epoll_fd, events, 64, -1);
@@ -641,6 +728,36 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                             seconds_until_next_scan = g_scan_interval_seconds;
+                        }
+                    }
+                    /* 定时重试之前因 FUSE 未就绪/挂载重建而失败的异步挂载 */
+                    if (g_fuse_ready && g_retry_mount_count > 0) {
+                        const char *mnt_src_retry = get_active_mnt_src();
+                        if (mnt_src_retry) {
+                            int retry_idx = 0;
+                            while (retry_idx < g_retry_mount_count) {
+                                RetryMountEntry *e = &g_retry_mounts[retry_idx];
+                                e->retries++;
+                                if (e->retries > 5) {
+                                    LOG_DBG("重试耗尽，放弃 %s(PID:%d)", e->cmdline, e->pid);
+                                    e->pid = -1; /* 标记删除 */
+                                } else if (kill(e->pid, 0) != 0) {
+                                    LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e->cmdline, e->pid);
+                                    e->pid = -1; /* 标记删除 */
+                                } else {
+                                    uid_t uid = get_app_uid(e->pid);
+                                    LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid, e->retries);
+                                    perform_app_mount(e->cmdline, e->pid, uid, mnt_src_retry, "失败重试");
+                                }
+                                retry_idx++;
+                            }
+                            /* 紧凑删除已标记项 */
+                            int new_count = 0;
+                            for (int i = 0; i < g_retry_mount_count; i++) {
+                                if (g_retry_mounts[i].pid > 0)
+                                    g_retry_mounts[new_count++] = g_retry_mounts[i];
+                            }
+                            g_retry_mount_count = new_count;
                         }
                     }
                 }

@@ -1,4 +1,3 @@
-`c
 #include "config_parser.h"
 #include "common.h"
 #include <sys/stat.h>

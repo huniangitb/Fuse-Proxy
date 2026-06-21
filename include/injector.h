@@ -19,6 +19,7 @@ extern struct GlobalFuseInfo g_global_fuse;
 extern volatile sig_atomic_t g_should_exit;
 extern volatile sig_atomic_t g_reload_config;
 extern volatile sig_atomic_t g_passive_mode;
+extern volatile sig_atomic_t g_fuse_ready;
 extern int g_epoll_fd;
 
 const char* get_active_mnt_src();
@@ -29,5 +30,8 @@ void register_fuse_ready_pipe(int fd, void* ctx);
 bool register_async_mount_pipe(int fd, void* ctx);
 void handle_fuse_ready_event(void *ptr);
 void handle_async_mount_event(void *ptr);
+
+/* 挂载失败重试：由 handle_async_mount_event 在异步挂载失败时调用 */
+void schedule_retry_mount(const char* pkg, int pid);
 
 #endif /* INJECTOR_H */

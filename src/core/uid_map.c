@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "uid_map.h"
 #include "common.h"

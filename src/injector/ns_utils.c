@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include <sched.h>
 #include <fcntl.h>
@@ -18,6 +17,7 @@
 #include "ns_utils.h"
 #include "fast_search.h"
 #include "injector.h"
+#include "inject_target.h"
 struct DebugMountArgs {
     const char* pkg;
     int pid;
@@ -277,6 +277,76 @@ static int do_umount_and_rmdir(void* raw_args) {
     rmdir(target);
     return 0;
 }
+
+/*
+ * do_force_umount_stale — 强制卸载目标路径上的所有挂载（包括陈旧的 FUSE 挂载），
+ * 使用 MNT_DETACH 确保即使 FUSE 守护进程已死也能成功卸载。
+ * 与 do_umount_and_rmdir 的区别：
+ *  - 不执行 rmdir，保留目录结构
+ *  - 更宽松的匹配：目标路径自身以及其下的子挂载全部卸载
+ *  - 对 EINVAL（未挂载）静默跳过
+ *  - 专门用于 inject_global_fuse 启动前的预清理
+ */
+static int do_force_umount_stale(void* raw_args) {
+    const char* target = (const char*)raw_args;
+    size_t tlen = strlen(target);
+    /* 1. 先递归卸载所有子挂载点（从最深层开始） */
+    FILE* fp = fopen("/proc/self/mountinfo", "re");
+    if (fp) {
+        char mounts[64][256];
+        int count = 0;
+        char line[1024];
+        while (fgets(line, sizeof(line), fp) && count < 64) {
+            char mp[PATH_MAX] = {0};
+            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
+            if (strcmp(mp, target) == 0) continue;           /* 目标本身稍后处理 */
+            if (strncmp(mp, target, tlen) == 0 && mp[tlen] == '/') {
+                strncpy(mounts[count], mp, sizeof(mounts[count]) - 1);
+                mounts[count][sizeof(mounts[count]) - 1] = '\0';
+                count++;
+            }
+        }
+        fclose(fp);
+        /* 逆序卸载（最深优先） */
+        for (int i = count - 1; i >= 0; i--) {
+            for (int t = 0; t < 8; t++) {
+                if (umount2(mounts[i], MNT_DETACH) == 0) break;
+                if (errno == EINVAL) break;  /* 本就不是挂载点 */
+            }
+        }
+    }
+    /* 2. 强制卸载目标挂载点本身 */
+    for (int t = 0; t < 8; t++) {
+        if (umount2(target, MNT_DETACH) == 0) break;
+        if (errno == EINVAL) break;  /* 本就不是挂载点，静默通过 */
+    }
+    return 0;
+}
+
+/*
+ * ns_force_umount_stale — 在目标 PID 的挂载命名空间内强制卸载陈旧 FUSE 挂载。
+ * 用于 inject_global_fuse() 启动新 fuse_daemon 之前的预清理，
+ * 确保 /mnt/nsp_global 上没有残留的 "Transport endpoint is not connected" 挂载。
+ *
+ * 多级防御：
+ *   ① umount2(MNT_DETACH) 不依赖 FUSE 守护进程响应
+ *   ② 子挂载优先卸载，避免 EBUSY
+ *   ③ 最多重试 8 次，容忍短暂竞争
+ *   ④ 非挂载点（EINVAL）静默跳过
+ */
+int ns_force_umount_stale(int pid, const char* target) {
+    int child_err = 0;
+    /* 在目标命名空间中执行卸载（超时 5 秒） */
+    int ret = run_in_mnt_ns_timeout(pid, do_force_umount_stale, (void*)target, &child_err, 5000);
+    if (ret != 0) {
+        LOG_DBG("force_umount_stale pid=%d target=%s 子进程异常退出, err=%d",
+                pid, target, child_err);
+    }
+    /* 自己也卸载一次，覆盖 pid 就是当前进程自身的情况 */
+    do_force_umount_stale((void*)target);
+    return 0;
+}
+
 static int do_make_shared(void* raw_args) {
     const char* target = (const char*)raw_args;
     if (mount(nullptr, target, nullptr, MS_SHARED, nullptr) != 0) return errno;
@@ -595,6 +665,38 @@ int ns_combined_mount(int pid, const char* source, const char* target, const cha
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
 }
+/* 全局注入方案：简洁追加挂载，无备份/恢复逻辑 */
+static int do_global_mount(void* raw_args) {
+    struct CombinedMountArgs* args = (struct CombinedMountArgs*)raw_args;
+    const char* source = args->source;
+    const char* target = args->target;
+    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s)\n",
+                     source, target, errno, strerror(errno));
+        return errno;
+    }
+    return 0;
+}
+
+int ns_global_mount_async(int pid, const char* pkg, const char* source, const char* target) {
+    struct CombinedMountArgs *args = malloc(sizeof(struct CombinedMountArgs));
+    if (!args) return -1;
+    args->source = strdup(source);
+    if (!args->source) { free(args); return -1; }
+    args->target = strdup(target);
+    if (!args->target) { free((void*)args->source); free(args); return -1; }
+    args->backup = NULL;
+    args->preserve_paths = NULL;
+    args->preserve_count = 0;
+    int ret = run_in_mnt_ns_async(pid, pkg, do_global_mount, args, args);
+    if (ret < 0) {
+        free((void*)args->source);
+        free((void*)args->target);
+        free(args);
+    }
+    return ret;
+}
+
 /* 核心优化：异步非阻塞合并挂载启动函数 */
 int ns_combined_mount_async(int pid, const char* pkg, const char* source, const char* target, const char* backup,
                             char preserve_paths[][256], int preserve_count) {
@@ -745,10 +847,13 @@ void handle_async_mount_event(void *ptr) {
     int status;
     waitpid(ctx->child_pid, &status, 0); 
     if (r == sizeof(child_ret) && child_ret == 0) {
-        LOG("异步合并挂载成功: App=%s, PID=%d", ctx->pkg_name, ctx->target_pid);
+        LOG_DBG("异步挂载成功: App=%s, PID=%d", ctx->pkg_name, ctx->target_pid);
     } else {
-        LOG_ERR("异步合并挂载失败: App=%s, PID=%d, ret_val=%zd, exit_status=%d", 
+        LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%zd, exit_status=%d", 
                 ctx->pkg_name, ctx->target_pid, r, child_ret);
+        /* 加入重试队列并从追踪中移除，确保后续扫描可重新发现并注入 */
+        schedule_retry_mount(ctx->pkg_name, ctx->target_pid);
+        remove_tracked(ctx->target_pid);
     }
     struct CombinedMountArgs *args = (struct CombinedMountArgs *)ctx->mount_args;
     if (args) {

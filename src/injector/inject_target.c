@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "inject_target.h"
 #include "injector.h"
@@ -198,7 +197,12 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
     for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
         ns_umount_recursive(pid, backup_path);
     }
-    /* 从备份恢复或从 init 命名空间重建 */
+    /* 全局注入方案：直接卸载程序的挂载点，不再需要再次 bind 还原 */
+    if (g_global_cfg.global_inject) {
+        LOG_DBG("全局注入清理: %s (PID: %d) - 已卸载 FUSE 挂载，保留底层原生视图", target_path, pid);
+        return;
+    }
+    /* 原始注入方案：从备份恢复或从 init 命名空间重建 */
     if (ns_is_mounted(pid, backup_path, nullptr) > 0) {
         ns_bind_mount(pid, backup_path, target_path);
         ns_umount_recursive(pid, backup_path);

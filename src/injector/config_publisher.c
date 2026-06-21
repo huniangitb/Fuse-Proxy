@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "config_publisher.h"
 #include "common.h"

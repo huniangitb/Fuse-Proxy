@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "fast_search.h"
 #include <string.h>

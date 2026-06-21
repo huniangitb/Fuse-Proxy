@@ -38,7 +38,7 @@ static int recursive_copy_dir(const char *src, const char *dst, uid_t uid, gid_t
 
 static void log_fuse_err(const char* op, const char* path, int err_code) {
     int err = err_code < 0 ? -err_code : err_code;
-    if (err != 0 && err != ENOENT && err != EEXIST) {
+    if (err != 0 && err != ENOENT && err != EEXIST && err != EROFS) {
         char current_pkg[128] = "unknown";
         struct fuse_context* ctx = fuse_get_context();
         if (ctx) {
@@ -385,6 +385,13 @@ static int vfs_rmdir(const char *path) {
     int ret = rmdir(p);
     if (ret == -1) {
         int err = errno;
+        /* ENOTEMPTY: 目录非空时自动递归删除，规避应用反复重试 */
+        if (err == ENOTEMPTY) {
+            int r = recursive_rmdir(p);
+            if (r == 0) VFS_RETURN(0);
+            log_fuse_err("RMDIR", path, -r);
+            VFS_RETURN(r);
+        }
         log_fuse_err("RMDIR", path, err);
         VFS_RETURN(-err);
     }
