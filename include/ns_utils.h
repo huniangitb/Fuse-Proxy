@@ -63,4 +63,14 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
 
 int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), void* args, void* mount_args);
 
+/* 全局注入方案：简洁追加挂载，无备份/恢复逻辑 */
+int ns_global_mount_async(int pid, const char* pkg, const char* source, const char* target);
+
+/*
+ * 强制卸载陈旧 FUSE 挂载（使用 MNT_DETACH，不依赖 FUSE 守护进程响应），
+ * 在启动新 fuse_daemon 前调用，处理 "Transport endpoint is not connected" 场景。
+ * target: 挂载路径（如 /mnt/nsp_global）
+ */
+int ns_force_umount_stale(int pid, const char* target);
+
 #endif /* NS_UTILS_H */

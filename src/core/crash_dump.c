@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "crash_dump.h"
 #include "common.h"

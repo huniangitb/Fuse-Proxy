@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "mount_manager.h"
 #include "ns_utils.h"
@@ -178,6 +177,32 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
     }
+
+    if (g_global_cfg.global_inject) {
+        /* 全局注入方案：简洁追加挂载，不卸载原有挂载点，不备份不还原 */
+        bool has_rules = app_has_active_rules(pkg, uid);
+        if (mnt.target_is_mounted && !has_rules) {
+            LOG_DBG("全局注入挂载保留: %s (PID: %d, %s) - 无规则冲突，保留原生视图", target_path, pid, pkg);
+            if (uid >= 10000) update_uid_map(uid, pkg);
+            add_tracked(pid);
+            print_active_rules(pkg, pid, uid, trigger);
+            return 0;
+        }
+        if (mnt.backup_has_fuse || mnt.backup_has_fuse_daemon) {
+            ns_umount_recursive(pid, backup_path);
+        }
+        if (ns_global_mount_async(pid, pkg, mnt_src, target_path) == 0) {
+            if (uid >= 10000) update_uid_map(uid, pkg);
+            add_tracked(pid);
+            print_active_rules(pkg, pid, uid, trigger);
+            return 0;
+        } else {
+            LOG_ERR("全局注入异步追加挂载失败: PID=%d, pkg=%s", pid, pkg);
+            return -1;
+        }
+    }
+
+    /* 原始注入方案：备份 + 合并挂载 + 保留非冲突子挂载 */
     if (mnt.backup_has_fuse || mnt.backup_has_fuse_daemon) {
         ns_umount_recursive(pid, backup_path);
     }
@@ -213,7 +238,6 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
             config_unlock_read();
         }
     }
-    /* 核心重构：调用高并发异步合并挂载启动函数，即刻向上返回 */
     if (ns_combined_mount_async(pid, pkg, mnt_src, target_path, backup_path, preserve_paths, preserve_count) == 0) {
         if (uid >= 10000) update_uid_map(uid, pkg);
         add_tracked(pid);

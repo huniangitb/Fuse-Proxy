@@ -1,4 +1,3 @@
-`c
 #define _GNU_SOURCE
 #include "ipc_server.h"
 #include "common.h"
