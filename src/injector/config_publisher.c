@@ -184,6 +184,7 @@ static void build_templates_json(JsonBuf *jb) {
         json_append(jb, "      \"apply_to_app\": [\"*\"],\n");
         json_append(jb, "      \"enable_sandbox\": %s", g_global_cfg.sandbox ? "true" : "false");
         json_append(jb, ",\n      \"global_inject\": %s", g_global_cfg.global_inject ? "true" : "false");
+        json_append(jb, ",\n      \"fuse_direct\": %s", g_global_cfg.fuse_direct ? "true" : "false");
         json_append(jb, ",\n      \"hide_paths\": [");
         append_str_array_json(jb, g_global_cfg.hide_rules, g_global_cfg.hide_count);
         json_append(jb, "\n      ],\n");

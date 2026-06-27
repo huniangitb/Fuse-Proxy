@@ -670,12 +670,25 @@ static int do_global_mount(void* raw_args) {
     struct CombinedMountArgs* args = (struct CombinedMountArgs*)raw_args;
     const char* source = args->source;
     const char* target = args->target;
-    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s)\n",
+    /* 先尝试直接 bind mount（依赖 mount propagation） */
+    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) == 0)
+        return 0;
+    /* ENOENT 表示源路径在当前命名空间不可见 —— 通过父进程的 /proc/<ppid>/root 跨命名空间访问 */
+    if (errno == ENOENT) {
+        char src_buf[256];
+        snprintf(src_buf, sizeof(src_buf), "/proc/%d/root%s", getppid(), source);
+        struct stat st;
+        if (stat(src_buf, &st) == 0 && mount(src_buf, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+            LOG_DBG("全局注入跨 ns 挂载成功: %s(proc) -> %s", source, target);
+            return 0;
+        }
+        log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s), proc fallback also failed\n",
                      source, target, errno, strerror(errno));
         return errno;
     }
-    return 0;
+    log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s)\n",
+                 source, target, errno, strerror(errno));
+    return errno;
 }
 
 int ns_global_mount_async(int pid, const char* pkg, const char* source, const char* target) {
@@ -720,6 +733,7 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     }
     return ret;
 }
+
 int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);

@@ -1,5 +1,6 @@
 #include "config_parser.h"
 #include "common.h"
+#include "inject_target.h"
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <dirent.h>
@@ -349,6 +350,22 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
     } else if (strcmp(tok, "GLOBAL_INJECT") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+    } else if (strcmp(tok, "FUSE_DIRECT") == 0) {
+        char* val = get_next_token(&p_ptr);
+        cur->fuse_direct = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+    } else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0) {
+        /* 读取行尾剩余全部内容，不做分词（原样透传给 fuse_daemon） */
+        char* p = p_ptr;
+        while (p && isspace((unsigned char)*p)) p++;
+        if (p && *p) {
+            size_t len = strlen(p);
+            while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
+            if (len > 0) {
+                size_t copy_len = len < sizeof(cur->fuse_extra_args) - 1 ? len : sizeof(cur->fuse_extra_args) - 1;
+                memcpy(cur->fuse_extra_args, p, copy_len);
+                cur->fuse_extra_args[copy_len] = '\0';
+            }
+        }
     } else if (strcmp(tok, "HIDE") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
@@ -360,14 +377,13 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
                 clean_rule[MAX_PATH_LEN - 1] = '\0';
             }
             if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
-            if (is_wildcard_string(clean_rule)) {
-                if (cur->hide_count >= cur->hide_capacity) {
-                    cur->hide_capacity = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
-                    cur->hide_rules = realloc(cur->hide_rules, cur->hide_capacity * sizeof(char*));
-                }
-                cur->hide_rules[cur->hide_count] = strdup(clean_rule);
-                cur->hide_count++;
-            } else {
+            if (cur->hide_count >= cur->hide_capacity) {
+                cur->hide_capacity = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
+                cur->hide_rules = realloc(cur->hide_rules, cur->hide_capacity * sizeof(char*));
+            }
+            cur->hide_rules[cur->hide_count] = strdup(clean_rule);
+            cur->hide_count++;
+            if (!is_wildcard_string(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, true, false);
             }
         }
@@ -382,14 +398,13 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
                 clean_rule[MAX_PATH_LEN - 1] = '\0';
             }
             if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
-            if (is_wildcard_string(clean_rule)) {
-                if (cur->ro_count >= cur->ro_capacity) {
-                    cur->ro_capacity = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
-                    cur->ro_rules = realloc(cur->ro_rules, cur->ro_capacity * sizeof(char*));
-                }
-                cur->ro_rules[cur->ro_count] = strdup(clean_rule);
-                cur->ro_count++;
-            } else {
+            if (cur->ro_count >= cur->ro_capacity) {
+                cur->ro_capacity = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
+                cur->ro_rules = realloc(cur->ro_rules, cur->ro_capacity * sizeof(char*));
+            }
+            cur->ro_rules[cur->ro_count] = strdup(clean_rule);
+            cur->ro_count++;
+            if (!is_wildcard_string(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, false, true);
             }
         }
@@ -410,15 +425,14 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
             char real_target[MAX_PATH_LEN];
             snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
             strip_trailing_slash(real_target);
-            if (is_wildcard_string(virtual_prefix)) {
-                if (cur->redir_count >= cur->redir_capacity) {
-                    cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                    cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
-                }
-                RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-                strcpy(r->virtual_prefix, virtual_prefix);
-                strcpy(r->real_target, real_target);
-            } else {
+            if (cur->redir_count >= cur->redir_capacity) {
+                cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
+                cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
+            }
+            RedirectRule* r = &cur->redir_rules[cur->redir_count++];
+            strcpy(r->virtual_prefix, virtual_prefix);
+            strcpy(r->real_target, real_target);
+            if (!is_wildcard_string(virtual_prefix)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
         }
@@ -451,15 +465,14 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
             }
             strip_trailing_slash(real_target);
-            if (is_wildcard_string(virtual_prefix) || is_wildcard_string(real_target)) {
-                if (cur->redir_count >= cur->redir_capacity) {
-                    cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                    cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
-                }
-                RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-                strcpy(r->virtual_prefix, virtual_prefix);
-                strcpy(r->real_target, real_target);
-            } else {
+            if (cur->redir_count >= cur->redir_capacity) {
+                cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
+                cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
+            }
+            RedirectRule* r = &cur->redir_rules[cur->redir_count++];
+            strcpy(r->virtual_prefix, virtual_prefix);
+            strcpy(r->real_target, real_target);
+            if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
         }
@@ -733,7 +746,7 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     int final_redir_count = (cfg ? cfg->redir_count : 0) + g_global_cfg.redir_count;
     int final_hide_count = (cfg ? cfg->hide_count : 0) + g_global_cfg.hide_count;
     int final_ro_count = (cfg ? cfg->ro_count : 0) + g_global_cfg.ro_count;
-    bool final_sandbox = (cfg && cfg->sandbox) || g_global_cfg.sandbox;
+    bool final_sandbox = (cfg && cfg->sandbox) || (g_global_cfg.sandbox && !is_media_provider(pkg));
     bool final_monitor = (cfg && cfg->monitor) || g_global_cfg.monitor;
     if (cfg) {
         LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向(通配):%d条 隐藏(通配):%d条 只读(通配):%d条",
@@ -742,13 +755,13 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             final_sandbox ? "ON" : "OFF",
             final_redir_count, final_hide_count, final_ro_count);
         for (int i = 0; i < cfg->redir_count; i++) {
-            LOG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
+            LOG_DBG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
         }
         for (int i = 0; i < cfg->hide_count; i++) {
-            LOG("  [隐藏通配]   %s", cfg->hide_rules[i]);
+            LOG_DBG("  [隐藏通配]   %s", cfg->hide_rules[i]);
         }
         for (int i = 0; i < cfg->ro_count; i++) {
-            LOG("  [只读通配]   %s", cfg->ro_rules[i]);
+            LOG_DBG("  [只读通配]   %s", cfg->ro_rules[i]);
         }
     } else {
         const char* match_desc = 
@@ -765,10 +778,10 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             g_global_cfg.sandbox ? "ON" : "OFF",
             g_global_cfg.redir_count, g_global_cfg.hide_count, g_global_cfg.ro_count);
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            LOG("  [全局重定向通配] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
+            LOG_DBG("  [全局重定向通配] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
         }
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
-            LOG("  [全局隐藏通配]   %s", g_global_cfg.hide_rules[i]);
+            LOG_DBG("  [全局隐藏通配]   %s", g_global_cfg.hide_rules[i]);
         }
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
             LOG_DBG("  [全局只读通配]   %s", g_global_cfg.ro_rules[i]);

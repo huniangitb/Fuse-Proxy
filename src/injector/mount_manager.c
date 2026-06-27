@@ -53,7 +53,12 @@ bool app_has_active_rules(const char* pkg, uid_t uid) {
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     bool has_rules = false;
     if (cfg) has_rules = (cfg->redir_count > 0 || cfg->hide_count > 0 || cfg->ro_count > 0 || cfg->sandbox);
-    if (!has_rules) has_rules = (g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0 || g_global_cfg.sandbox);
+    if (!has_rules) {
+        bool use_global_sandbox = !is_media_provider(pkg);
+        has_rules = (g_global_cfg.global_inject ||
+                     g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0 ||
+                     (g_global_cfg.sandbox && use_global_sandbox));
+    }
     config_unlock_read();
     return has_rules;
 }
@@ -124,8 +129,9 @@ static bool path_prefix_overlap(const char* a, const char* b) {
     if (strncmp(a, b, minlen) != 0) return false;
     return (a[minlen] == '/' || a[minlen] == '\0') && (b[minlen] == '/' || b[minlen] == '\0');
 }
-static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path) {
+static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path, const char* pkg) {
     bool conflicts = false;
+    bool is_media = is_media_provider(pkg);
     if (cfg) {
         for (int i = 0; i < cfg->redir_count && !conflicts; i++) {
             if (path_prefix_overlap(cfg->redir_rules[i].virtual_prefix, rel_path)) conflicts = true;
@@ -153,7 +159,8 @@ static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const cha
         for (int i = 0; i < g_global_cfg.ro_count && !conflicts; i++) {
             if (path_prefix_overlap(g_global_cfg.ro_rules[i], rel_path)) conflicts = true;
         }
-        if (g_global_cfg.sandbox && !conflicts) {
+        /* com.android.providers.media.module 默认关闭沙盒，不受全局设置影响，除非显式配置开启 */
+        if (g_global_cfg.sandbox && !conflicts && !is_media) {
             const char* sb[] = {"/Android/data", "/Android/obb"};
             for (int s = 0; s < 2 && !conflicts; s++) {
                 if (path_prefix_overlap(sb[s], rel_path)) conflicts = true;
@@ -162,6 +169,7 @@ static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const cha
     }
     return conflicts;
 }
+
 int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, const char* trigger) {
     char target_path[128]; get_target_storage_path(uid, target_path, sizeof(target_path));
     char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
@@ -178,8 +186,22 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         return 0;
     }
 
-    if (g_global_cfg.global_inject) {
-        /* 全局注入方案：简洁追加挂载，不卸载原有挂载点，不备份不还原 */
+    /* 解析 fuse_direct：per-app 优先，未设置则回退到全局 */
+    bool fuse_direct = g_global_cfg.fuse_direct;
+    {
+        config_lock_read();
+        AppConfig* cfg = find_app_cfg_locked(pkg, uid / 100000);
+        if (cfg && cfg->fuse_direct) fuse_direct = true;
+        config_unlock_read();
+    }
+
+    if (fuse_direct) {
+        /* FUSE 直挂方案：简洁追加挂载，不卸载原有挂载点，不备份不还原 */
+        /* 在发起异步挂载前，验证挂载源是否存在，避免 ENOENT 空转 */
+        if (mnt_src && access(mnt_src, F_OK) != 0) {
+            LOG_ERR("全局注入跳过 %s(PID:%d): 挂载源 %s 不存在(FUSE可能未就绪)", pkg, pid, mnt_src);
+            return -1;
+        }
         bool has_rules = app_has_active_rules(pkg, uid);
         if (mnt.target_is_mounted && !has_rules) {
             LOG_DBG("全局注入挂载保留: %s (PID: %d, %s) - 无规则冲突，保留原生视图", target_path, pid, pkg);
@@ -231,7 +253,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
                 const char* rel = found[i] + tlen;
                 char rel_buf[256];
                 snprintf(rel_buf, sizeof(rel_buf), "/%s", rel[0] == '/' ? rel + 1 : rel);
-                if (!submount_conflicts_with_rules_locked(cfg, rel_buf)) {
+                if (!submount_conflicts_with_rules_locked(cfg, rel_buf, pkg)) {
                     snprintf(preserve_paths[preserve_count++], 256, "%s%s", target_path, rel_buf);
                 }
             }

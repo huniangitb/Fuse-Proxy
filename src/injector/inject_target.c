@@ -92,15 +92,19 @@ bool is_isolated_uid(uid_t uid) {
 }
 bool is_process_safe_to_inject(const char* cmdline) {
     if (strstr(cmdline, "_zygote")) return false;
-    if (strstr(cmdline, "com.android.providers.media")) return false;
-    if (strstr(cmdline, "android.process.media")) return false;
     if (strstr(cmdline, "com.google.android.webview")) return false;
     if (strstr(cmdline, "com.android.webview")) return false;
     if (strstr(cmdline, "injector")) return false;
     if (strstr(cmdline, "fuse_daemon")) return false;
+    if (strstr(cmdline, "usap")) return false;
     return true;
 }
-static bool is_zygote_child(pid_t pid) {
+
+bool is_media_provider(const char* pkg) {
+    return (strstr(pkg, "com.android.providers.media") != nullptr);
+}
+
+bool is_zygote_child(pid_t pid) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -189,7 +193,7 @@ void update_uid_map(uid_t uid, const char* pkg) {
     }
     notify_fuses(SIGHUP);
 }
-void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path) {
+void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid) {
     /* 卸载 FUSE 挂载 */
     for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
         ns_umount_recursive(pid, target_path);
@@ -197,9 +201,21 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
     for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
         ns_umount_recursive(pid, backup_path);
     }
-    /* 全局注入方案：直接卸载程序的挂载点，不再需要再次 bind 还原 */
-    if (g_global_cfg.global_inject) {
-        LOG_DBG("全局注入清理: %s (PID: %d) - 已卸载 FUSE 挂载，保留底层原生视图", target_path, pid);
+    /* 解析 fuse_direct：per-app 优先，未设置则回退到全局 */
+    bool fuse_direct = g_global_cfg.fuse_direct;
+    {
+        char pkg[256] = {0};
+        proc_get_cmdline(pid, pkg, sizeof(pkg));
+        if (pkg[0]) {
+            config_lock_read();
+            AppConfig* cfg = find_app_cfg_locked(pkg, uid / 100000);
+            if (cfg && cfg->fuse_direct) fuse_direct = true;
+            config_unlock_read();
+        }
+    }
+    /* FUSE 直挂方案：直接卸载程序的挂载点，不再需要再次 bind 还原 */
+    if (fuse_direct) {
+        LOG_DBG("FUSE 直挂清理: %s (PID: %d) - 已卸载 FUSE 挂载，保留底层原生视图", target_path, pid);
         return;
     }
     /* 原始注入方案：从备份恢复或从 init 命名空间重建 */
@@ -224,7 +240,7 @@ void force_recover_tracked_mounts() {
                 get_target_storage_path(uid, target_path, sizeof(target_path));
                 char backup_path[PATH_MAX];
                 snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                cleanup_app_mounts(pid, target_path, backup_path);
+                cleanup_app_mounts(pid, target_path, backup_path, uid);
             }
             e = e->next;
         }
@@ -261,7 +277,7 @@ void audit_tracked_apps() {
             if (!is_target && has_fuse) {
                 char backup_path[PATH_MAX];
                 snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                cleanup_app_mounts(pid, target_path, backup_path);
+                cleanup_app_mounts(pid, target_path, backup_path, uid);
                 LOG_DBG("配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。", cmd, pid);
             } else if (is_target && !has_fuse) {
                 const char* mnt_src = get_active_mnt_src();
@@ -304,7 +320,7 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                 get_target_storage_path(uid, target_path, sizeof(target_path));
                 char backup_path[PATH_MAX];
                 snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                cleanup_app_mounts(pid, target_path, backup_path);
+                cleanup_app_mounts(pid, target_path, backup_path, uid);
                 bool is_target = is_target_app(cmd, uid, pid, false);
                 if (is_target && mnt_src) {
                     LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 进行重新挂载。", cmd, pid);

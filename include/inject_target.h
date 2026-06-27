@@ -7,6 +7,7 @@
 
 bool is_isolated_uid(uid_t uid);
 bool is_process_safe_to_inject(const char* cmdline);
+bool is_media_provider(const char* pkg);
 bool is_target_app(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc);
 /* 已持锁版本：调用方需确保已通过 config_lock_read() 获取配置锁 */
 bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc);
@@ -34,7 +35,7 @@ void init_uid_map_cache(void);
  * 3. 如果 backup_path 存在，移动到 target_path
  * 4. 否则从 /proc/1/root 做 bind mount 恢复
  */
-void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path);
+void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid);
 
 /*
  * 获取当前所有已注入应用列表的快照。
