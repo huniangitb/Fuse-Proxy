@@ -44,6 +44,10 @@ struct GlobalFuseInfo g_global_fuse = {
     .pid = 1, .fuse_pid = 0, .mnt_path = "/mnt/nsp_global",
     .crash_count = 0, .last_crash_time = 0, .disabled = false
 };
+struct GlobalFuseInfo g_media_fuse = {
+    .pid = 1, .fuse_pid = 0, .mnt_path = "/mnt/nsp_media",
+    .crash_count = 0, .last_crash_time = 0, .disabled = false
+};
 /* 重入保护：防止并发调用 inject_global_fuse() */
 static volatile int g_fuse_starting = 0;
 /* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
@@ -109,6 +113,17 @@ const char* get_active_mnt_src() {
         return nullptr;
     }
     return g_global_fuse.mnt_path;
+}
+const char* get_media_mnt_src() {
+    if (g_media_fuse.fuse_pid <= 0) return nullptr;
+    if (kill(g_media_fuse.fuse_pid, 0) != 0) return nullptr;
+    /* 验证挂载点真实存在且可达（非断连/非缺失） */
+    struct stat st;
+    if (stat(g_media_fuse.mnt_path, &st) != 0) {
+        LOG_DBG("媒体 FUSE 挂载点 %s 不可达: %s", g_media_fuse.mnt_path, strerror(errno));
+        return nullptr;
+    }
+    return g_media_fuse.mnt_path;
 }
 void notify_fuses(int sig) {
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, sig) != 0 && errno != ESRCH)
@@ -348,6 +363,93 @@ static void inject_global_fuse() {
     }
     __sync_lock_release(&g_fuse_starting);
 }
+/* 启动媒体 FUSE 实例（含 --no-passthrough），专供 com.android.providers.media.module */
+static void inject_media_fuse() {
+    if (g_media_fuse.disabled) return;
+    if (g_media_fuse.fuse_pid > 0) {
+        kill(g_media_fuse.fuse_pid, SIGTERM);
+        for (int wait_ms = 0; wait_ms < 500; wait_ms += 10) {
+            if (kill(g_media_fuse.fuse_pid, 0) != 0) break;
+            usleep(10000);
+        }
+        if (kill(g_media_fuse.fuse_pid, 0) == 0) {
+            kill(g_media_fuse.fuse_pid, SIGKILL);
+            usleep(50000);
+        }
+        int status;
+        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+    }
+    ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
+    for (int verify = 0; verify < 20; verify++) {
+        if (ns_is_mounted(g_media_fuse.pid, g_media_fuse.mnt_path, nullptr) <= 0) break;
+        usleep(20000);
+    }
+    if (!g_global_cfg.fuse_direct) {
+        ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
+    }
+    int ready_pipe[2];
+    if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) return;
+    pid_t child = fork();
+    if (child == -1) { close(ready_pipe[0]); close(ready_pipe[1]); return; }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        sigset_t empty_mask;
+        sigemptyset(&empty_mask);
+        pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr);
+        char ns_path[64];
+        snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", g_media_fuse.pid);
+        int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) _exit(10);
+        if (setns(fd, CLONE_NEWNS) != 0) { close(fd); _exit(11); }
+        close(fd);
+        if (mkdir(g_media_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
+        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+        if (log_fd >= 0) {
+            dup2(log_fd, STDERR_FILENO);
+            dup2(log_fd, STDOUT_FILENO);
+            close(log_fd);
+        }
+        char exe[256];
+        snprintf(exe, sizeof(exe), "%s/fuse_daemon", get_self_dir());
+        char arg_ready[64];
+        snprintf(arg_ready, sizeof(arg_ready), "--ready-fd=%d", ready_pipe[1]);
+        fcntl(ready_pipe[1], F_SETFD, 0);
+        char arg_global[64];
+        if (g_global_root_fd >= 0) {
+            fcntl(g_global_root_fd, F_SETFD, 0);
+            snprintf(arg_global, sizeof(arg_global), "--global-root-fd=%d", g_global_root_fd);
+        } else {
+            strcpy(arg_global, "--global-root-fd=-1");
+        }
+        const char* log_lvl = "info";
+        if (g_min_log_level == LOG_DEBUG) log_lvl = "debug";
+        else if (g_min_log_level == LOG_ERROR) log_lvl = "error";
+        else if (g_min_log_level == LOG_WARN) log_lvl = "warn";
+        char* args[32];
+        int ai = 0;
+        args[ai++] = "fuse_daemon";
+        args[ai++] = g_media_fuse.mnt_path;
+        args[ai++] = "--mode=redirect";
+        args[ai++] = "--root=" STORAGE_BASE;
+        args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
+        if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
+        args[ai++] = arg_ready;
+        args[ai++] = arg_global;
+        args[ai++] = (char*)log_lvl;
+        args[ai++] = "--no-passthrough";
+        args[ai++] = "-f";
+        args[ai++] = "-o";
+        args[ai++] = "allow_other,auto_cache,fsname=fuse_daemon,subtype=fuse_daemon";
+        args[ai] = nullptr;
+        setenv("LD_LIBRARY_PATH", get_self_dir(), 1);
+        execv(exe, args);
+        _exit(13);
+    }
+    close(ready_pipe[1]);
+    g_media_fuse.fuse_pid = child;
+    /* 不绑定 ready pipe epoll（不等待就绪），在主循环中轮询检查即可 */
+    (void)ready_pipe;
+}
 static int cleanup_cb(int pid, const char* cmd, void* data) {
     (void)data;
     if (!is_process_safe_to_inject(cmd)) return 0;
@@ -417,6 +519,41 @@ static void check_and_recover_fuse() {
         if (g_global_fuse.fuse_pid > 0) {
             cleanup_all_target_apps();
             g_pending_remount = 1;
+        }
+    }
+    /* 媒体 FUSE 崩溃恢复 */
+    if (g_media_fuse.fuse_pid > 0 && kill(g_media_fuse.fuse_pid, 0) != 0) {
+        int status;
+        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+        g_media_fuse.fuse_pid = 0;
+        time_t now = time(nullptr);
+        if (now - g_media_fuse.last_crash_time < 60)
+            g_media_fuse.crash_count++;
+        else
+            g_media_fuse.crash_count = 1;
+        g_media_fuse.last_crash_time = now;
+        if (g_media_fuse.crash_count > 5) {
+            g_media_fuse.disabled = true;
+            return;
+        }
+        inject_media_fuse();
+    } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready) {
+        /* 媒体 FUSE 惰性启动：初始时未启动但当前配置需要 */
+        bool need = g_global_cfg.global_inject ||
+                    g_global_cfg.redir_count > 0 ||
+                    g_global_cfg.hide_count > 0 ||
+                    g_global_cfg.ro_count > 0;
+        if (!need && !g_media_fuse.disabled) {
+            config_lock_read();
+            AppConfig* media_cfg = find_app_cfg_locked("com.android.providers.media.module", 0);
+            need = (media_cfg && media_cfg->inject_enable &&
+                (media_cfg->redir_count > 0 || media_cfg->hide_count > 0 ||
+                 media_cfg->ro_count > 0 || media_cfg->sandbox));
+            config_unlock_read();
+        }
+        if (need) {
+            LOG("惰性启动媒体 FUSE 实例");
+            inject_media_fuse();
         }
     }
 }
@@ -641,6 +778,27 @@ static void do_cleanup() {
             ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
         }
     }
+    /* 清理媒体 FUSE 实例 */
+    if (g_media_fuse.fuse_pid > 0) {
+        kill(g_media_fuse.fuse_pid, SIGTERM);
+        int status;
+        for (int i = 0; i < 20; i++) {
+            if (waitpid(g_media_fuse.fuse_pid, &status, WNOHANG) == g_media_fuse.fuse_pid) {
+                g_media_fuse.fuse_pid = 0;
+                break;
+            }
+            usleep(50000);
+        }
+        if (g_media_fuse.fuse_pid > 0) {
+            kill(g_media_fuse.fuse_pid, SIGKILL);
+            waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+            g_media_fuse.fuse_pid = 0;
+        }
+        ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
+        if (!g_global_cfg.fuse_direct) {
+            ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
+        }
+    }
     config_publisher_cleanup(g_config_pub_fd);
     g_config_pub_fd = -1;
     log_close();
@@ -728,6 +886,22 @@ int main(int argc, char *argv[]) {
     }
     inject_global_fuse();
     if (g_global_fuse.fuse_pid <= 0) exit(1);
+    /* 仅当 media module 为注入目标时才启动专用 FUSE 实例 */
+    {
+        bool need_media_fuse = g_global_cfg.global_inject ||
+                           g_global_cfg.redir_count > 0 ||
+                           g_global_cfg.hide_count > 0 ||
+                           g_global_cfg.ro_count > 0;
+        if (!need_media_fuse) {
+            config_lock_read();
+            AppConfig* media_cfg = find_app_cfg_locked("com.android.providers.media.module", 0);
+            need_media_fuse = (media_cfg && media_cfg->inject_enable &&
+                (media_cfg->redir_count > 0 || media_cfg->hide_count > 0 ||
+                 media_cfg->ro_count > 0 || media_cfg->sandbox));
+            config_unlock_read();
+        }
+        if (need_media_fuse) inject_media_fuse();
+    }
     /*
      * 不在此处立即执行首次扫描 —— FUSE 守护进程尚未就绪 /mnt/nsp_global 也未传播。
      * 改为标记延迟扫描，由 handle_fuse_ready_event() 或定时器回调触发首次扫描，

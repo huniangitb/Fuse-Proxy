@@ -3,6 +3,7 @@
 #include "ns_utils.h"
 #include "config_parser.h"
 #include "inject_target.h"
+#include "injector.h"
 #include "common.h"
 #include "fast_search.h"
 #include <stdio.h>
@@ -171,6 +172,16 @@ static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const cha
 }
 
 int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, const char* trigger) {
+    /* media provider 走专用 FUSE 实例（全局禁用 fd 透传） */
+    if (strstr(pkg, "com.android.providers.media") != NULL) {
+        const char* media_src = get_media_mnt_src();
+        if (media_src) {
+            mnt_src = media_src;
+        } else {
+            LOG_ERR("媒体 FUSE 实例不可用，%s(PID:%d) 挂载失败", pkg, pid);
+            return -1;
+        }
+    }
     char target_path[128]; get_target_storage_path(uid, target_path, sizeof(target_path));
     char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
     MountState mnt;
