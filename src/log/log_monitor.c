@@ -23,6 +23,7 @@
 #include <sys/inotify.h>
 #include <sys/timerfd.h>
 #include <fnmatch.h>
+#include <sys/uio.h>
 #include "common.h"
 #define MAX_MSG_LEN 512
 #define MAX_IO_LOGS 262144 
@@ -81,7 +82,8 @@ typedef struct {
 typedef struct StreamClient {
     int fd;
     int type;       /* 0=ALL, 1=IO, 2=SYS, 3=LOGCAT */
-    int min_level;  
+    int min_level;
+    bool level_tag; /* true = SYS 消息前插 LEVEL| 标签（api 模式） */
     struct StreamClient *next;
 } StreamClient;
 static LogBuffer g_io_buf, g_sys_buf, g_logcat_buf;
@@ -103,10 +105,11 @@ static void init_buf(LogBuffer* buf, int max) {
 static void destroy_buf(LogBuffer* buf) {
     if (buf->data) { free(buf->data); buf->data = nullptr; }
 }
-static void add_stream_client(int fd, int type, int min_level) {
+static void add_stream_client(int fd, int type, int min_level, bool level_tag) {
     pthread_mutex_lock(&g_stream_lock);
     StreamClient *c = malloc(sizeof(StreamClient));
-    c->fd = fd; c->type = type; c->min_level = min_level; c->next = g_stream_clients; g_stream_clients = c;
+    c->fd = fd; c->type = type; c->min_level = min_level; c->level_tag = level_tag;
+    c->next = g_stream_clients; g_stream_clients = c;
     pthread_mutex_unlock(&g_stream_lock);
 }
 static void remove_stream_client(int fd) {
@@ -121,12 +124,35 @@ static void remove_stream_client(int fd) {
     pthread_mutex_unlock(&g_stream_lock);
 }
 static void broadcast_log(int type, const char *line, int level) {
+    size_t len = strlen(line);
+    char nl = '\n';
+    char level_pref[4]; /* "0|", "1|", "2|", "3|" */
     pthread_mutex_lock(&g_stream_lock);
     StreamClient *c = g_stream_clients;
     while (c) {
         if (c->fd > 0 && (c->type == 0 || c->type == type)) {
             if (level >= c->min_level) {
-                ssize_t ret = send(c->fd, line, strlen(line), MSG_NOSIGNAL | MSG_DONTWAIT);
+                struct iovec iov[3];
+                int iovlen;
+                if (type == 2 && c->level_tag) {  /* SYS + api: 前插等级标签 */
+                    level_pref[0] = '0' + (level % 10);
+                    level_pref[1] = '|';
+                    iov[0].iov_base = level_pref;
+                    iov[0].iov_len = 2;
+                    iov[1].iov_base = (void *)line;
+                    iov[1].iov_len = len;
+                    iov[2].iov_base = &nl;
+                    iov[2].iov_len = 1;
+                    iovlen = 3;
+                } else {
+                    iov[0].iov_base = (void *)line;
+                    iov[0].iov_len = len;
+                    iov[1].iov_base = &nl;
+                    iov[1].iov_len = 1;
+                    iovlen = 2;
+                }
+                struct msghdr msg = { .msg_iov = iov, .msg_iovlen = iovlen };
+                ssize_t ret = sendmsg(c->fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (ret <= 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) { close(c->fd); c->fd = -1; }
             }
         }
@@ -308,6 +334,26 @@ static void remove_active_client(ClientCtx *ctx) {
         ctx->next->prev = ctx->prev;
     }
 }
+static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level) {
+    char line_buf[MAX_MSG_LEN + 2]; /* msg + \n */
+    pthread_mutex_lock(&buf->lock);
+    int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
+    int idx = buf->tail;
+    for (int i = 0; i < total_in_buf; i++) {
+        if (buf->data[idx].level >= min_level) {
+            size_t msg_len = strnlen(buf->data[idx].msg, MAX_MSG_LEN);
+            if (msg_len > MAX_MSG_LEN - 1) msg_len = MAX_MSG_LEN - 1;
+            memcpy(line_buf, buf->data[idx].msg, msg_len);
+            line_buf[msg_len] = '\n';
+            line_buf[msg_len + 1] = '\0';
+            ssize_t ret = send(fd, line_buf, msg_len + 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (ret <= 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) break;
+        }
+        idx = (idx + 1) % buf->max;
+    }
+    pthread_mutex_unlock(&buf->lock);
+    (void)type;
+}
 static int process_line(ClientCtx* ctx, char* line) {
     int fd = ctx->fd;
     if (strncmp(line, "LOG_IO:", 7) == 0) {
@@ -373,30 +419,44 @@ static int process_line(ClientCtx* ctx, char* line) {
     } else if (strncmp(line, "STREAM_IO", 9) == 0) {
         int min_level = 0;
         if (line[9] == ':') min_level = atoi(line + 10);
-        add_stream_client(fd, 1, min_level);
-        ctx->is_streaming = true;
         write(fd, "OK\n", 3);
+        dump_buf_to_client(fd, &g_io_buf, 1, min_level);
+        add_stream_client(fd, 1, min_level, false);
+        ctx->is_streaming = true;
+        return 0;
+    } else if (strncmp(line, "STREAM_SYS_API", 14) == 0) {
+        int min_level = 0;
+        if (line[14] == ':') min_level = atoi(line + 15);
+        write(fd, "OK\n", 3);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level);
+        add_stream_client(fd, 2, min_level, true);
+        ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_SYS", 10) == 0) {
         int min_level = 0;
         if (line[10] == ':') min_level = atoi(line + 11);
-        add_stream_client(fd, 2, min_level);
-        ctx->is_streaming = true;
         write(fd, "OK\n", 3);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level);
+        add_stream_client(fd, 2, min_level, false);
+        ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_LOGCAT", 13) == 0) {
         int min_level = 0;
         if (line[13] == ':') min_level = atoi(line + 14);
-        add_stream_client(fd, 3, min_level);
-        ctx->is_streaming = true;
         write(fd, "OK\n", 3);
+        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level);
+        add_stream_client(fd, 3, min_level, false);
+        ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_ALL", 10) == 0) {
         int min_level = 0;
         if (line[10] == ':') min_level = atoi(line + 11);
-        add_stream_client(fd, 0, min_level);
-        ctx->is_streaming = true;
         write(fd, "OK\n", 3);
+        dump_buf_to_client(fd, &g_io_buf, 1, min_level);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level);
+        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level);
+        add_stream_client(fd, 0, min_level, false);
+        ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STOP_STREAM", 11) == 0) {
         remove_stream_client(fd); 

@@ -28,6 +28,7 @@ bool g_preserve_perms = false;
 static int g_ready_fd = -1;
 static int g_global_root_fd = -1;
 static int g_bpf_fd = -1;           /* BPF program fd, -1 = disabled */
+static bool g_passthrough_disabled = false; /* --no-passthrough 显式禁用 */
 typedef enum { MODE_REDIRECT, MODE_OVERLAY } DaemonMode;
 static DaemonMode g_mode = MODE_REDIRECT;
 static char g_lower_dir[PATH_MAX] = {0}; 
@@ -840,6 +841,10 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     cfg->use_ino = 1; cfg->entry_timeout = 1.0; cfg->attr_timeout = 1.0; cfg->negative_timeout = 0.5;
     signal(SIGPIPE, SIG_IGN);
     g_passthrough_enabled = false;
+    if (g_passthrough_disabled) {
+        LOG("FUSE Passthrough: 已被 --no-passthrough 参数禁用");
+        goto skip_passthrough;
+    }
     if (conn->capable & FUSE_CAP_PASSTHROUGH)
         LOG_DBG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
     else
@@ -935,6 +940,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     }
     close(test_fd);
 ioctl_probe_done:
+skip_passthrough:
     if (g_passthrough_enabled) {
         LOG("FUSE Passthrough: 🟢 启用成功");
     } else {
@@ -1060,6 +1066,10 @@ int main(int argc, char *argv[]) {
             g_preserve_perms = true;
         } else if (strcmp(argv[i], "--strip-o-direct") == 0) { 
             g_strip_o_direct = true;
+        } else if (strcmp(argv[i], "--no-bpf") == 0) {
+            g_bpf_fd = -2; /* 显式禁用 */
+        } else if (strcmp(argv[i], "--no-passthrough") == 0) {
+            g_passthrough_disabled = true;
         } else if (strcmp(argv[i], "debug") == 0) { 
             g_min_log_level = LOG_DEBUG; fuse_argv[fuse_argc++] = "-d"; 
         } else if (strcmp(argv[i], "info") == 0) {
@@ -1077,13 +1087,19 @@ int main(int argc, char *argv[]) {
     log_init("fuse_daemon");
     install_crash_handlers();
     vfs_core_init(rules_path);
-    g_bpf_fd = -1;
-    if (is_fuse_bpf_supported()) {
-        int fd = open_bpf_prog();
-        if (fd >= 0) {
-            g_bpf_fd = fd;
-            LOG("FUSE BPF: 已启用 (bpf_fd=%d)", g_bpf_fd);
+    /* 若未通过 --no-bpf 显式禁用，则尝试初始化 FUSE BPF */
+    if (g_bpf_fd != -2) {
+        g_bpf_fd = -1;
+        if (is_fuse_bpf_supported()) {
+            int fd = open_bpf_prog();
+            if (fd >= 0) {
+                g_bpf_fd = fd;
+                LOG("FUSE BPF: 已启用 (bpf_fd=%d)", g_bpf_fd);
+            }
         }
+    } else {
+        LOG("FUSE BPF: 已被 --no-bpf 参数禁用");
+        g_bpf_fd = -1;
     }
     return fuse_main(fuse_argc, fuse_argv, &vfs_ops, nullptr);
 }

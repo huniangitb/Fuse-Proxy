@@ -48,6 +48,8 @@ struct GlobalFuseInfo g_global_fuse = {
 static volatile int g_fuse_starting = 0;
 /* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
 static int g_pending_first_scan = 0;
+/* FUSE 崩溃恢复后待重挂标记：新 FUSE 就绪时重挂所有追踪应用 */
+static volatile sig_atomic_t g_pending_remount = 0;
 /* 挂载失败重试队列：应对 FUSE 重建期间并发挂载的瞬态失败 */
 #define MAX_RETRY_MOUNTS 64
 typedef struct {
@@ -98,9 +100,15 @@ void schedule_retry_mount(const char* pkg, int pid) {
     LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d", pkg, pid, g_retry_mount_count);
 }
 const char* get_active_mnt_src() {
-    if (g_fuse_ready && g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) == 0)
-        return g_global_fuse.mnt_path;
-    return nullptr;
+    if (!g_fuse_ready || g_global_fuse.fuse_pid <= 0) return nullptr;
+    if (kill(g_global_fuse.fuse_pid, 0) != 0) return nullptr;
+    /* 穿透性验证：stat 确认挂载点真实存在且可达（非断连/非缺失） */
+    struct stat st;
+    if (stat(g_global_fuse.mnt_path, &st) != 0) {
+        LOG_DBG("FUSE 挂载点 %s 不可达: %s", g_global_fuse.mnt_path, strerror(errno));
+        return nullptr;
+    }
+    return g_global_fuse.mnt_path;
 }
 void notify_fuses(int sig) {
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, sig) != 0 && errno != ESRCH)
@@ -170,6 +178,8 @@ typedef struct {
     int pipe_fd;
     pid_t child_pid;
 } FuseReadyCtx;
+/* 前向声明：崩溃恢复时重新挂载所有追踪应用 */
+static void remount_all_tracked(void);
 void handle_fuse_ready_event(void *ptr) {
     FuseReadyCtx *ctx = (FuseReadyCtx*)ptr;
     char buf;
@@ -178,8 +188,20 @@ void handle_fuse_ready_event(void *ptr) {
     close(ctx->pipe_fd);
     if (r == 1) {
         LOG_DBG("FUSE 守护进程成功通知就绪，执行共享视图转换");
-        ns_make_shared(g_global_fuse.pid, g_global_fuse.mnt_path);
-        g_fuse_ready = 1;
+        if (ns_make_shared(g_global_fuse.pid, g_global_fuse.mnt_path) != 0) {
+            LOG_ERR("FUSE 共享传播设置失败: make_shared(%s)", g_global_fuse.mnt_path);
+            /* 不设置 g_fuse_ready，等待 check_and_recover_fuse 重试 */
+        } else {
+            /* 共享传播成功，验证挂载点真实就绪：stat 确认 FUSE 文件系统已可达 */
+            struct stat st;
+            if (stat(g_global_fuse.mnt_path, &st) != 0) {
+                LOG_ERR("FUSE 就绪验证失败: stat(%s) → %s", g_global_fuse.mnt_path, strerror(errno));
+                /* 不设置 g_fuse_ready，后续 check_and_recover_fuse 会处理 */
+            } else {
+                g_fuse_ready = 1;
+                LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
+            }
+        }
         /* 触发延迟的首次扫描 */
         if (g_pending_first_scan) {
             g_pending_first_scan = 0;
@@ -188,6 +210,10 @@ void handle_fuse_ready_event(void *ptr) {
         /* 重试之前因 FUSE 未就绪而失败的挂载 */
         if (g_retry_mount_count > 0) {
             seconds_until_next_scan = 0;
+        }
+        /* FUSE 崩溃恢复：重挂所有已被清理的追踪应用 */
+        if (g_pending_remount) {
+            remount_all_tracked();
         }
     } else {
         LOG_ERR("FUSE 异步启动失败，管道未收到就绪字符");
@@ -231,8 +257,8 @@ static void inject_global_fuse() {
             break;
         usleep(20000);
     }
-    if (!g_global_cfg.global_inject) {
-        /* 非全局注入模式：进一步删除目录，后续由子进程 re-mkdir */
+    if (!g_global_cfg.fuse_direct) {
+        /* 非 FUSE 直挂模式：进一步删除目录，后续由子进程 re-mkdir */
         ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
     }
     int ready_pipe[2];
@@ -277,7 +303,7 @@ static void inject_global_fuse() {
         if (g_min_log_level == LOG_DEBUG) log_lvl = "debug";
         else if (g_min_log_level == LOG_ERROR) log_lvl = "error";
         else if (g_min_log_level == LOG_WARN) log_lvl = "warn";
-        char* args[16];
+        char* args[32];
         int ai = 0;
         args[ai++] = "fuse_daemon";
         args[ai++] = g_global_fuse.mnt_path;
@@ -288,6 +314,17 @@ static void inject_global_fuse() {
         args[ai++] = arg_ready;
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
+        /* 追加 FUSE_EXTRA_ARGS 透传参数（injector 不做任何转译） */
+        if (g_global_cfg.fuse_extra_args[0]) {
+            char extra_copy[512];
+            strncpy(extra_copy, g_global_cfg.fuse_extra_args, sizeof(extra_copy) - 1);
+            extra_copy[sizeof(extra_copy) - 1] = '\0';
+            char *tok = strtok(extra_copy, " ");
+            while (tok && ai < 31) {
+                args[ai++] = tok;
+                tok = strtok(nullptr, " ");
+            }
+        }
         args[ai++] = "-f";
         args[ai++] = "-o";
         args[ai++] = "allow_other,auto_cache,fsname=fuse_daemon,subtype=fuse_daemon";
@@ -322,11 +359,40 @@ static int cleanup_cb(int pid, const char* cmd, void* data) {
     bool has_backup = ns_is_mounted(pid, backup_path, nullptr) > 0;
     bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
     if (!has_backup && !has_fuse) return 0;
-    cleanup_app_mounts(pid, target_path, backup_path);
+    cleanup_app_mounts(pid, target_path, backup_path, uid);
     return 0;
 }
 static void cleanup_all_target_apps() {
     fast_pid_each(cleanup_cb, nullptr);
+}
+/* FUSE 崩溃恢复重挂回调 */
+static int remount_cb(int pid, const char* cmd, void* data) {
+    if (!is_process_safe_to_inject(cmd)) return 0;
+    uid_t uid = get_app_uid(pid);
+    if (is_target_app(cmd, uid, pid, false)) {
+        const char* mnt_src = (const char*)data;
+        char pkg[256];
+        strncpy(pkg, cmd, sizeof(pkg) - 1);
+        pkg[sizeof(pkg) - 1] = '\0';
+        char *colon = strchr(pkg, ':');
+        if (colon) *colon = '\0';
+        if (perform_app_mount(pkg, pid, uid, mnt_src, "FUSE崩溃恢复重挂") != 0) {
+            LOG_DBG("FUSE 崩溃恢复重挂失败: %s(PID:%d)", pkg, pid);
+        }
+    }
+    return 0;
+}
+/* FUSE 崩溃恢复：新 FUSE 就绪后，重挂所有仍活跃的追踪应用 */
+static void remount_all_tracked() {
+    const char* mnt_src = get_active_mnt_src();
+    if (!mnt_src) {
+        LOG_DBG("FUSE 尚未就绪，推迟重挂所有追踪应用");
+        return;
+    }
+    LOG("FUSE 崩溃恢复: 开始重挂所有目标应用");
+    fast_pid_each(remount_cb, (void*)mnt_src);
+    g_pending_remount = 0;
+    LOG("FUSE 崩溃恢复重挂完成");
 }
 static void check_and_recover_fuse() {
     if (g_global_fuse.disabled || g_global_fuse.pid <= 0) return;
@@ -348,8 +414,10 @@ static void check_and_recover_fuse() {
         }
         force_recover_tracked_mounts();
         inject_global_fuse();
-        if (g_global_fuse.fuse_pid > 0)
+        if (g_global_fuse.fuse_pid > 0) {
             cleanup_all_target_apps();
+            g_pending_remount = 1;
+        }
     }
 }
 typedef struct {
@@ -569,7 +637,7 @@ static void do_cleanup() {
         }
         /* 强制卸载残留的 FUSE 挂载（包括陈旧的 "Transport endpoint not connected" 状态） */
         ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
-        if (!g_global_cfg.global_inject) {
+        if (!g_global_cfg.fuse_direct) {
             ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
         }
     }
@@ -747,7 +815,12 @@ int main(int argc, char *argv[]) {
                                 } else {
                                     uid_t uid = get_app_uid(e->pid);
                                     LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid, e->retries);
-                                    perform_app_mount(e->cmdline, e->pid, uid, mnt_src_retry, "失败重试");
+                                    int ret = perform_app_mount(e->cmdline, e->pid, uid, mnt_src_retry, "失败重试");
+                                    if (ret == 0) {
+                                        /* 挂载成功或跳过（如已有自身FUSE/无规则冲突），移除重试条目 */
+                                        LOG_DBG("重试成功/跳过, 移除 %s(PID:%d) 的重试", e->cmdline, e->pid);
+                                        e->pid = -1;
+                                    }
                                 }
                                 retry_idx++;
                             }

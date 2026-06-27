@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <stddef.h>
 #include <ctype.h>
 #include <signal.h>
@@ -130,8 +131,11 @@ static void handle_stream_config(bool api_mode) {
             printf("===== 当前配置 (首次推送) =====\n%s\n", resp);
         }
     }
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
+    struct sigaction sa = { .sa_handler = sigint_handler };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
     /* 持续接收后续变更推送 */
     while (g_running) {
         n = config_broadcast_recv(sock, resp, BROADCAST_RECEIVE_MAX_SIZE, 60000);
@@ -243,23 +247,42 @@ static void stream_logs(const char* stream_cmd) {
         close(sock);
         return;
     }
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
-    FILE* fp = fdopen(sock, "r");
-    if (!fp) {
-        perror("fdopen");
-        close(sock);
-        return;
+    struct sigaction sa = { .sa_handler = sigint_handler };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    /* 使用 epoll + 原始 read + 手动拆行，确保 Ctrl+C 能正常退出 */
+    char buf[4096];
+    char line_buf[512];
+    size_t line_pos = 0;
+    int epfd = epoll_create1(0);
+    if (epfd < 0) { perror("epoll_create1"); close(sock); return; }
+    struct epoll_event ep_ev = { .events = EPOLLIN, .data.fd = sock };
+    epoll_ctl(epfd, EPOLL_CTL_ADD, sock, &ep_ev);
+    while (g_running) {
+        struct epoll_event ev;
+        int ret = epoll_wait(epfd, &ev, 1, 1000);
+        if (!g_running) break;
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ret == 0) continue;  /* 超时，回检查 g_running */
+        ssize_t n = read(sock, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == '\n') {
+                line_buf[line_pos] = '\0';
+                process_and_print(line_buf, false, false);
+                line_pos = 0;
+            } else if (line_pos < sizeof(line_buf) - 1) {
+                line_buf[line_pos++] = buf[i];
+            }
+        }
     }
-    char* line = nullptr;
-    size_t len = 0;
-    ssize_t read_len;
-    while (g_running && (read_len = getline(&line, &len, fp)) != -1) {
-        if (read_len > 0 && line[read_len - 1] == '\n') line[read_len - 1] = '\0';
-        process_and_print(line, false, false);
-    }
-    free(line);
-    fclose(fp);
+    close(epfd);
+    close(sock);
 }
 int main(int argc, char *argv[]) {
     if (argc < 2) usage(argv[0]);
@@ -300,7 +323,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(pos_args[0], "stream-io") == 0) {
             snprintf(stream_cmd, sizeof(stream_cmd), "STREAM_IO:%s", level);
         } else if (strcmp(pos_args[0], "stream-sys") == 0) {
-            snprintf(stream_cmd, sizeof(stream_cmd), "STREAM_SYS:%s", level);
+            snprintf(stream_cmd, sizeof(stream_cmd), api_mode ? "STREAM_SYS_API:%s" : "STREAM_SYS:%s", level);
         } else if (strcmp(pos_args[0], "stream-logcat") == 0) {
             snprintf(stream_cmd, sizeof(stream_cmd), "STREAM_LOGCAT:%s", level);
         } else if (strcmp(pos_args[0], "stream-all") == 0) {

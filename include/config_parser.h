@@ -26,6 +26,7 @@ typedef struct {
     bool monitor;
     bool sandbox;
     bool global_inject;   
+    bool fuse_direct;   
     char** hide_rules;
     int hide_count;
     int hide_capacity;
@@ -36,6 +37,7 @@ typedef struct {
     int redir_count;
     int redir_capacity;
     TrieNode* trie_root;
+    char fuse_extra_args[512];
 } AppConfig;
 
 typedef struct {
