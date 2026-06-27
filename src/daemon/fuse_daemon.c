@@ -269,11 +269,7 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
     }
     fi->fh = fd;
     if (g_passthrough_enabled) {
-        /* 从 uid.map 查包名，判断是否为 media provider 以跳过 fd 透传 */
-        const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, ctx->uid);
-        bool is_media = (mapped && strstr(mapped, "com.android.providers.media") != NULL);
-        if (!is_media) {
-            fuse_req_t req = fuse_get_context()->req;
+        fuse_req_t req = fuse_get_context()->req;
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
         if (backing_id > 0) {
             fi->passthrough_fh = (uint32_t)backing_id;
@@ -312,11 +308,7 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     inherit_parent_attributes(p, S_IFREG);
     fi->fh = fd;
     if (g_passthrough_enabled) {
-        /* 从 uid.map 查包名，判断是否为 media provider 以跳过 fd 透传 */
-        const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, ctx->uid);
-        bool is_media = (mapped && strstr(mapped, "com.android.providers.media") != NULL);
-        if (!is_media) {
-            fuse_req_t req = fuse_get_context()->req;
+        fuse_req_t req = fuse_get_context()->req;
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
         if (backing_id > 0) {
             fi->passthrough_fh = (uint32_t)backing_id;
