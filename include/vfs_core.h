@@ -2,6 +2,7 @@
 #define VFS_CORE_H
 #include "common.h"
 #include "config_parser.h"
+#include "uid_map.h"
 #include <fuse3/fuse.h>
 #define HASH_BUCKETS 1024
 typedef struct HashNode { char* name; struct HashNode* next; } HashNode;
@@ -9,6 +10,8 @@ typedef struct { HashNode* buckets[HASH_BUCKETS]; } DirHashTable;
 extern bool g_passthrough_enabled;
 extern bool g_preserve_perms;
 extern char g_rules_path[PATH_MAX];
+extern UidMapEntry g_uid_maps[];
+extern int g_uid_map_count;
 void vfs_core_init(const char* rules_path);
 AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out);
 int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out, char* sub_path_out, size_t sub_path_size, const char* current_pkg, uid_t uid);
