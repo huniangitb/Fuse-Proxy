@@ -25,7 +25,7 @@
 #include <fnmatch.h>
 #include <sys/uio.h>
 #include "common.h"
-#define MAX_MSG_LEN 512
+#define MAX_MSG_LEN 4096
 #define MAX_IO_LOGS 262144 
 #define MAX_SYS_LOGS 50000  
 #define MAX_LOGCAT_LOGS 100000
@@ -463,6 +463,20 @@ static int process_line(ClientCtx* ctx, char* line) {
         ctx->is_streaming = false;
         write(fd, "OK\n", 3); 
         return 1; 
+    } else if (strcmp(line, "COUNT") == 0) {
+        pthread_mutex_lock(&g_io_buf.lock);
+        int io_total = g_io_buf.full ? g_io_buf.max : (g_io_buf.head - g_io_buf.tail + g_io_buf.max) % g_io_buf.max;
+        pthread_mutex_unlock(&g_io_buf.lock);
+        pthread_mutex_lock(&g_sys_buf.lock);
+        int sys_total = g_sys_buf.full ? g_sys_buf.max : (g_sys_buf.head - g_sys_buf.tail + g_sys_buf.max) % g_sys_buf.max;
+        pthread_mutex_unlock(&g_sys_buf.lock);
+        pthread_mutex_lock(&g_logcat_buf.lock);
+        int logcat_total = g_logcat_buf.full ? g_logcat_buf.max : (g_logcat_buf.head - g_logcat_buf.tail + g_logcat_buf.max) % g_logcat_buf.max;
+        pthread_mutex_unlock(&g_logcat_buf.lock);
+        char resp[128];
+        int len = snprintf(resp, sizeof(resp), "COUNT|%d|%d|%d\n", io_total, sys_total, logcat_total);
+        write(fd, resp, len);
+        return 1;
     }
     return 0; 
 }

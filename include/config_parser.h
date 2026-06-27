@@ -24,7 +24,9 @@ typedef struct {
     int user_id;         
     bool inject_enable;   
     bool monitor;
+    bool monitor_explicit; /* true = 显式设置过 MONITOR ON/OFF，可覆盖全局 */
     bool sandbox;
+    bool sandbox_explicit; /* true = 显式设置过 SANDBOX ON/OFF，可覆盖全局 */
     bool global_inject;   
     bool fuse_direct;   
     char** hide_rules;
