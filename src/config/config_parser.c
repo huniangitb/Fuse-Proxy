@@ -344,9 +344,11 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
     if (strcmp(tok, "MONITOR") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->monitor = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+        cur->monitor_explicit = true;
     } else if (strcmp(tok, "SANDBOX") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->sandbox = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+        cur->sandbox_explicit = true;
     } else if (strcmp(tok, "GLOBAL_INJECT") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
@@ -746,8 +748,18 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     int final_redir_count = (cfg ? cfg->redir_count : 0) + g_global_cfg.redir_count;
     int final_hide_count = (cfg ? cfg->hide_count : 0) + g_global_cfg.hide_count;
     int final_ro_count = (cfg ? cfg->ro_count : 0) + g_global_cfg.ro_count;
-    bool final_sandbox = (cfg && cfg->sandbox) || (g_global_cfg.sandbox && !is_media_provider(pkg));
-    bool final_monitor = (cfg && cfg->monitor) || g_global_cfg.monitor;
+    bool final_sandbox;
+    if (cfg && cfg->sandbox_explicit) {
+        final_sandbox = cfg->sandbox;
+    } else {
+        final_sandbox = g_global_cfg.sandbox && !is_media_provider(pkg);
+    }
+    bool final_monitor;
+    if (cfg && cfg->monitor_explicit) {
+        final_monitor = cfg->monitor;
+    } else {
+        final_monitor = g_global_cfg.monitor;
+    }
     if (cfg) {
         LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向(通配):%d条 隐藏(通配):%d条 只读(通配):%d条",
             pkg, pid, user_id, trigger_source,
