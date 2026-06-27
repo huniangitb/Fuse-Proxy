@@ -13,8 +13,8 @@
 #include <dirent.h>
 
 char g_rules_path[PATH_MAX] = {0};
-static UidMapEntry g_uid_maps[UID_MAP_MAX_ENTRIES];
-static int g_uid_map_count = 0;
+UidMapEntry g_uid_maps[UID_MAP_MAX_ENTRIES];
+int g_uid_map_count = 0;
 
 #define UID_CACHE_SIZE 2048
 typedef struct {
