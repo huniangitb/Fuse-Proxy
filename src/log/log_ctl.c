@@ -581,6 +581,117 @@ static void handle_status(bool api_mode) {
 /* ========== set-rule / remove-rule 处理 ========== */
 
 /*
+ * 行指针操作辅助函数
+ * 流程：先 read_lines 索引全部行 → 扫描段边界 → 对目标行插入/替换/删除
+ */
+
+/* 读取文件全部行到内存，返回 lines 数组和行数 */
+static char **read_file_lines(const char *path, int *out_count, int *out_cap) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) { *out_count = 0; *out_cap = 0; return NULL; }
+    char **lines = NULL;
+    int count = 0, cap = 0;
+    char buf[2048];
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (count >= cap) {
+            cap = cap == 0 ? 64 : cap * 2;
+            char **new_lines = realloc(lines, cap * sizeof(char *));
+            if (!new_lines) {
+                for (int j = 0; j < count; j++) free(lines[j]);
+                free(lines);
+                fclose(fp);
+                *out_count = 0; *out_cap = 0; return NULL;
+            }
+            lines = new_lines;
+        }
+        lines[count] = strdup(buf);
+        if (!lines[count]) {
+            for (int j = 0; j < count; j++) free(lines[j]);
+            free(lines);
+            fclose(fp);
+            *out_count = 0; *out_cap = 0; return NULL;
+        }
+        count++;
+    }
+    fclose(fp);
+    *out_count = count; *out_cap = cap;
+    return lines;
+}
+
+/* 写回文件，成功返回 true */
+static bool write_file_lines(const char *path, char **lines, int count) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) return false;
+    for (int i = 0; i < count; i++) {
+        if (fputs(lines[i], fp) < 0) { fclose(fp); return false; }
+    }
+    fclose(fp);
+    return true;
+}
+
+/* 释放 lines 数组 */
+static void free_file_lines(char **lines, int count) {
+    for (int i = 0; i < count; i++) free(lines[i]);
+    free(lines);
+}
+
+/* 在 pos 位置插入一行 text，返回新行数或 -1 */
+static int insert_line_at(char ***lines, int *cap, int count, int pos, const char *text) {
+    if (pos < 0 || pos > count) return -1;
+    if (count >= *cap) {
+        *cap = *cap == 0 ? 64 : *cap * 2;
+        char **new_lines = realloc(*lines, *cap * sizeof(char *));
+        if (!new_lines) return -1;
+        *lines = new_lines;
+    }
+    memmove(&(*lines)[pos + 1], &(*lines)[pos], (count - pos) * sizeof(char *));
+    (*lines)[pos] = strdup(text);
+    return (*lines)[pos] ? count + 1 : -1;
+}
+
+/* 删除 pos 位置的行 */
+static void remove_line_at(char **lines, int *count, int pos) {
+    if (pos < 0 || pos >= *count) return;
+    free(lines[pos]);
+    memmove(&lines[pos], &lines[pos + 1], (*count - pos - 1) * sizeof(char *));
+    (*count)--;
+}
+
+/* 在数组末尾追加一行，返回新行数或 -1 */
+static int append_line(char ***lines, int *cap, int count, const char *text) {
+    return insert_line_at(lines, cap, count, count, text);
+}
+
+/* 查找段头 [name] 的索引，支持 [name:uid] 匹配 */
+static int find_section_header(char **lines, int count, const char *name) {
+    size_t nlen = strlen(name);
+    for (int i = 0; i < count; i++) {
+        char *p = lines[i];
+        while (isspace((unsigned char)*p)) p++;
+        if (p[0] == '[' && strncmp(p + 1, name, nlen) == 0) {
+            char after = p[1 + nlen];
+            if (after == ']' || after == ':') return i;
+        }
+    }
+    return -1;
+}
+
+/* 查找段内 [header_idx] 段中 type 类型开关的行索引，未找到返回 -1 */
+static int find_switch_in_section(char **lines, int count, int header_idx, const char *type) {
+    size_t tlen = strlen(type);
+    for (int i = header_idx + 1; i < count; i++) {
+        char *p = lines[i];
+        while (isspace((unsigned char)*p)) p++;
+        if (p[0] == '[') break;
+        if (strncasecmp(p, type, tlen) == 0 &&
+            (p[tlen] == ' ' || p[tlen] == '\t' || p[tlen] == '\n')) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
  * set-rule 写入规则到应用配置文件
  * 格式: log_ctl set-rule <pkg> <type> <value> [--uid uid] [api]
  * type:
@@ -611,15 +722,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         mkdir_recursive(rule_dir);
     }
 
-    /* 以追加模式写入 */
-    FILE *fp = fopen(rule_path, "a");
-    if (!fp) {
-        char err_buf[256];
-        snprintf(err_buf, sizeof(err_buf), "无法打开规则文件 %s: %s", rule_path, strerror(errno));
-        json_api_error(api_mode, "\"set-rule\"", err_buf);
-        return;
-    }
-
     char line[1024];
     if (strcmp(type, "REDIRECT") == 0) {
         /* value 格式: "source|target" */
@@ -648,22 +750,138 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                strcmp(type, "FUSE_DIRECT") == 0) {
         snprintf(line, sizeof(line), "%s %s\n", type, value);
     } else {
-        fclose(fp);
         char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "未知规则类型: %s (支持: HIDE, RO, REDIRECT, ALLOW, MONITOR, SANDBOX, GLOBAL_INJECT, FUSE_DIRECT)", type);
         json_api_error(api_mode, "\"set-rule\"", err_buf);
         return;
     }
 
-    if (fputs(line, fp) < 0) {
-        char err_buf[256];
-        snprintf(err_buf, sizeof(err_buf), "写入规则文件失败: %s", strerror(errno));
-        fclose(fp);
-        json_api_error(api_mode, "\"set-rule\"", err_buf);
-        return;
-    }
-    fclose(fp);
+    /*
+     * GLOBAL 规则（包括开关和路径类）:
+     * 先索引行 → 找到 GLOBAL 段 → 对目标行替换或插入 → 写回
+     * 开关类（MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT）支持原地更新已有行；
+     * 路径类（HIDE/RO/REDIRECT/ALLOW）不支持更新，始终在 [GLOBAL] 行后插入。
+     */
+    bool is_global_switch = (strcmp(type, "MONITOR") == 0 ||
+                             strcmp(type, "SANDBOX") == 0 ||
+                             strcmp(type, "GLOBAL_INJECT") == 0 ||
+                             strcmp(type, "FUSE_DIRECT") == 0);
+    if (strcmp(pkg, "GLOBAL") == 0) {
+        int line_count = 0, line_cap = 0;
+        char **lines = read_file_lines(rule_path, &line_count, &line_cap);
+        if (!lines) {
+            /* 文件不存在，直接创建并写入 [GLOBAL] 段 */
+            FILE *fp = fopen(rule_path, "w");
+            if (!fp) {
+                char err_buf[256];
+                snprintf(err_buf, sizeof(err_buf), "无法创建规则文件 %s: %s", rule_path, strerror(errno));
+                json_api_error(api_mode, "\"set-rule\"", err_buf);
+                return;
+            }
+            fprintf(fp, "[GLOBAL]\n");
+            fputs(line, fp);
+            fclose(fp);
+            goto report_success;
+        }
 
+        /* 索引 GLOBAL 段头位置 */
+        int hdr = find_section_header(lines, line_count, "GLOBAL");
+        bool changed = false;
+
+        if (is_global_switch && hdr >= 0) {
+            /* 开关类：查找已有同类型开关行 */
+            int old = find_switch_in_section(lines, line_count, hdr, type);
+            if (old >= 0) {
+                if (strcmp(lines[old], line) != 0) {
+                    free(lines[old]);
+                    lines[old] = strdup(line);
+                    if (!lines[old]) {
+                        free_file_lines(lines, line_count);
+                        json_api_error(api_mode, "\"set-rule\"", "内存不足");
+                        return;
+                    }
+                    changed = true;
+                }
+                /* 内容相同则跳过写回 */
+            } else {
+                /* 未找到：在段头后插入 */
+                int new_count = insert_line_at(&lines, &line_cap, line_count, hdr + 1, line);
+                if (new_count < 0) {
+                    free_file_lines(lines, line_count);
+                    json_api_error(api_mode, "\"set-rule\"", "内存不足");
+                    return;
+                }
+                line_count = new_count;
+                changed = true;
+            }
+        } else if (hdr >= 0) {
+            /* 路径类：在段头后插入，但先检查是否已有相同行避免重复 */
+            bool dup = false;
+            for (int i = hdr + 1; i < line_count; i++) {
+                char *p = lines[i];
+                while (isspace((unsigned char)*p)) p++;
+                if (p[0] == '[') break;
+                if (strcmp(p, line) == 0) { dup = true; break; }
+            }
+            if (!dup) {
+                int new_count = insert_line_at(&lines, &line_cap, line_count, hdr + 1, line);
+                if (new_count < 0) {
+                    free_file_lines(lines, line_count);
+                    json_api_error(api_mode, "\"set-rule\"", "内存不足");
+                    return;
+                }
+                line_count = new_count;
+                changed = true;
+            }
+        } else {
+            /* 连 [GLOBAL] 段都没有：追加 [GLOBAL] 段和新规则 */
+            int new_count = append_line(&lines, &line_cap, line_count, "[GLOBAL]\n");
+            if (new_count < 0) {
+                free_file_lines(lines, line_count);
+                json_api_error(api_mode, "\"set-rule\"", "内存不足");
+                return;
+            }
+            line_count = new_count;
+            new_count = append_line(&lines, &line_cap, line_count, line);
+            if (new_count < 0) {
+                free_file_lines(lines, line_count);
+                json_api_error(api_mode, "\"set-rule\"", "内存不足");
+                return;
+            }
+            line_count = new_count;
+            changed = true;
+        }
+
+        if (changed) {
+            if (!write_file_lines(rule_path, lines, line_count)) {
+                char err_buf[256];
+                snprintf(err_buf, sizeof(err_buf), "无法写入规则文件 %s: %s", rule_path, strerror(errno));
+                free_file_lines(lines, line_count);
+                json_api_error(api_mode, "\"set-rule\"", err_buf);
+                return;
+            }
+        }
+        free_file_lines(lines, line_count);
+    } else {
+        /* 非 GLOBAL 包：追加到应用配置文件末尾 */
+        FILE *fp = fopen(rule_path, "a");
+        if (!fp) {
+            char err_buf[256];
+            snprintf(err_buf, sizeof(err_buf), "无法打开规则文件 %s: %s", rule_path, strerror(errno));
+            json_api_error(api_mode, "\"set-rule\"", err_buf);
+            return;
+        }
+        if (fputs(line, fp) < 0) {
+            char err_buf[256];
+            snprintf(err_buf, sizeof(err_buf), "写入规则文件失败: %s", strerror(errno));
+            fclose(fp);
+            json_api_error(api_mode, "\"set-rule\"", err_buf);
+            return;
+        }
+        fclose(fp);
+    }
+
+report_success:
     if (api_mode) {
         char data_buf[1024];
         char esc_file[256], esc_line[256];
@@ -674,7 +892,7 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
             esc_file, esc_line, pkg, type, value);
         json_api_finish(true, "\"set-rule\"", data_buf);
     } else {
-        printf("已向 %s 追加规则: %s", rule_path, line);
+        printf("已向 %s 写入规则: %s", rule_path, line);
     }
 }
 
@@ -697,87 +915,52 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
     }
 
-    /* 读取原文件，跳过匹配的第 index 条 type 规则 */
-    FILE *fp = fopen(rule_path, "r");
-    if (!fp) {
+    /* 先索引全部行，再定位目标删除 */
+    int line_count = 0, line_cap = 0;
+    char **lines = read_file_lines(rule_path, &line_count, &line_cap);
+    if (!lines) {
         char err_buf[256];
         snprintf(err_buf, sizeof(err_buf), "无法打开规则文件 %s: %s", rule_path, strerror(errno));
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
 
-    /* 读取所有行到内存 */
-    char **lines = NULL;
-    int line_count = 0, line_cap = 0;
-    char buf[2048];
-    int skip_idx = 0;
-    bool removed = false;
-
-    while (fgets(buf, sizeof(buf), fp)) {
-        /* 跳过空白行和注释 */
-        char *trimmed = buf;
-        while (isspace((unsigned char)*trimmed)) trimmed++;
-        bool is_type_rule = (strncasecmp(trimmed, type, strlen(type)) == 0 &&
-                            (trimmed[strlen(type)] == ' ' || trimmed[strlen(type)] == '\t'));
-
-        if (is_type_rule && skip_idx == index) {
-            removed = true;
+    /* 扫描全部行，找到第 index 条 type 类型规则 */
+    int found_idx = -1, skip_idx = 0;
+    size_t tlen = strlen(type);
+    for (int i = 0; i < line_count; i++) {
+        char *p = lines[i];
+        while (isspace((unsigned char)*p)) p++;
+        /* 跳过注释 */
+        if (p[0] == '#') continue;
+        bool is_type_rule = (strncasecmp(p, type, tlen) == 0 &&
+                            (p[tlen] == ' ' || p[tlen] == '\t'));
+        if (is_type_rule) {
+            if (skip_idx == index) { found_idx = i; break; }
             skip_idx++;
-            continue;
         }
-        if (is_type_rule) skip_idx++;
-
-        /* 保留此行 */
-        if (line_count >= line_cap) {
-            line_cap = line_cap == 0 ? 64 : line_cap * 2;
-            char **new_lines = realloc(lines, line_cap * sizeof(char *));
-            if (!new_lines) {
-                for (int j = 0; j < line_count; j++) free(lines[j]);
-                free(lines);
-                fclose(fp);
-                json_api_error(api_mode, "\"remove-rule\"", "内存不足");
-                return;
-            }
-            lines = new_lines;
-        }
-        lines[line_count] = strdup(buf);
-        if (!lines[line_count]) {
-            for (int j = 0; j < line_count; j++) free(lines[j]);
-            free(lines);
-            fclose(fp);
-            json_api_error(api_mode, "\"remove-rule\"", "内存不足");
-            return;
-        }
-        line_count++;
     }
-    fclose(fp);
 
-    if (!removed) {
-        for (int j = 0; j < line_count; j++) free(lines[j]);
-        free(lines);
+    if (found_idx < 0) {
+        free_file_lines(lines, line_count);
         char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "未找到 %s 类型的第 %d 条规则", type, index);
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
 
+    /* 删除目标行 */
+    remove_line_at(lines, &line_count, found_idx);
+
     /* 写回文件 */
-    fp = fopen(rule_path, "w");
-    if (!fp) {
-        for (int j = 0; j < line_count; j++) free(lines[j]);
-        free(lines);
+    if (!write_file_lines(rule_path, lines, line_count)) {
         char err_buf[256];
         snprintf(err_buf, sizeof(err_buf), "无法写入规则文件 %s: %s", rule_path, strerror(errno));
+        free_file_lines(lines, line_count);
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
-
-    for (int i = 0; i < line_count; i++) {
-        fputs(lines[i], fp);
-        free(lines[i]);
-    }
-    free(lines);
-    fclose(fp);
+    free_file_lines(lines, line_count);
 
     if (api_mode) {
         char esc_file[256];
@@ -910,11 +1093,25 @@ void process_and_print(char* line, bool force_uid, [[maybe_unused]] bool api_mod
     char* open_b = strchr(line, '[');
     if (open_b && !force_uid) {
         char* open_p = strchr(open_b, '(');
-        char* close_p = strchr(open_b, ')');
-        if (open_p && close_p && open_p < close_p) {
-            bool is_uid = true;
-            for (char* c = open_p + 1; c < close_p; c++) if (!isdigit((unsigned char)*c)) is_uid = false;
-            if (is_uid) memmove(open_p, close_p + 1, strlen(close_p + 1) + 1);
+        if (open_p) {
+            char* close_p = strchr(open_p, ')');
+            bool valid_close = (close_p && close_p > open_p);
+            if (valid_close) {
+                bool is_uid = true;
+                for (char* c = open_p + 1; c < close_p; c++) if (!isdigit((unsigned char)*c)) is_uid = false;
+                if (is_uid) memmove(open_p, close_p + 1, strlen(close_p + 1) + 1);
+            } else {
+                /* 没有找到 )：可能是截断导致，尝试找到 ] 或行尾作为终止点 */
+                char* close_b = strchr(open_p, ']');
+                char* term = close_b ? close_b : (open_p + strlen(open_p));
+                if (term > open_p) {
+                    bool is_uid = true;
+                    for (char* c = open_p + 1; c < term; c++) {
+                        if (!isdigit((unsigned char)*c)) { is_uid = false; break; }
+                    }
+                    if (is_uid) memmove(open_p, term, strlen(term) + 1);
+                }
+            }
         }
     }
     printf("%s\n", line);
@@ -1301,16 +1498,24 @@ int main(int argc, char *argv[]) {
     write(sock, cmd, strlen(cmd));
     shutdown(sock, SHUT_WR);
     struct pollfd pfd = { .fd = sock, .events = POLLIN };
-    if (poll(&pfd, 1, 1000) <= 0) {
+    if (poll(&pfd, 1, 5000) <= 0) {
         close(sock);
         return 1;
     }
-    char resp[16384];
+    /* 使用动态缓冲区：避免固定 16KB 限制导致响应截断 */
+    size_t cap = 65536;
+    char *resp = malloc(cap);
+    if (!resp) { close(sock); return 1; }
     size_t total = 0;
-    while (total < sizeof(resp) - 1) {
-        ssize_t n = read(sock, resp + total, sizeof(resp) - 1 - total);
-        if (n <= 0) break;
-        total += n;
+    ssize_t n;
+    while ((n = read(sock, resp + total, cap - 1 - total)) > 0) {
+        total += (size_t)n;
+        if (total >= cap - 1) {
+            cap *= 2;
+            char *tmp = realloc(resp, cap);
+            if (!tmp) { free(resp); close(sock); return 1; }
+            resp = tmp;
+        }
     }
     if (total > 0) {
         resp[total] = '\0';
@@ -1333,17 +1538,26 @@ int main(int argc, char *argv[]) {
                 has_done = true;
             }
 
-            char esc[16384];
-            json_escape_str(resp, esc, sizeof(esc));
-            char data_buf[16384 + 128];
+            /* 动态分配 JSON 转义缓冲区（最多 6x 膨胀）和 data 缓冲区 */
+            size_t raw_len = strlen(resp);
+            size_t esc_cap = raw_len * 6 + 1;
+            char *esc = malloc(esc_cap);
+            if (!esc) { free(resp); close(sock); return 1; }
+            json_escape_str(resp, esc, esc_cap);
+
+            size_t data_cap = esc_cap + 256;
+            char *data_buf = malloc(data_cap);
+            if (!data_buf) { free(esc); free(resp); close(sock); return 1; }
             if (has_done) {
-                snprintf(data_buf, sizeof(data_buf),
+                snprintf(data_buf, data_cap,
                     "{\"raw\":\"%s\",\"done\":{\"total\":%d,\"remaining\":%d}}",
                     esc, done_total, done_remaining);
             } else {
-                snprintf(data_buf, sizeof(data_buf), "{\"raw\":\"%s\"}", esc);
+                snprintf(data_buf, data_cap, "{\"raw\":\"%s\"}", esc);
             }
             json_api_finish(true, (strncmp(pos_args[0], "search", 6) == 0) ? "\"search\"" : "\"clear\"", data_buf);
+            free(data_buf);
+            free(esc);
         } else {
             char* line = strtok(resp, "\n");
             while (line) {
@@ -1361,6 +1575,7 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+    free(resp);
     close(sock);
     return 0;
 }
