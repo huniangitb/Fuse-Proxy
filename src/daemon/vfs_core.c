@@ -71,6 +71,7 @@ void vfs_core_init(const char* rules_path) {
     pthread_t sig_thread; 
     pthread_create(&sig_thread, nullptr, signal_monitor_thread, nullptr); 
     pthread_detach(sig_thread);
+    
     config_lock_write();
     load_config_rules(g_rules_path);
     load_uid_map();
@@ -93,6 +94,7 @@ AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
         return cached_cfg;
     }
     pthread_mutex_unlock(&g_uid_cache[slot].lock);
+    
     int user_id = uid / 100000;
     char final_pkg[256] = {0}; 
     pid_t main_pid = tid;
@@ -123,6 +125,7 @@ AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
     if (colon) *colon = 0;
     strncpy(current_pkg_out, base_pkg, 127); 
     current_pkg_out[127] = '\0';
+    
     if (strlen(base_pkg) < 3 || strstr(base_pkg, "zygote") != nullptr || strstr(base_pkg, "<pre-") != nullptr) {
         if (base_pkg[0] == '\0') {
             strncpy(base_pkg, "unknown", sizeof(base_pkg) - 1);
@@ -138,6 +141,7 @@ AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
         pthread_mutex_unlock(&g_uid_cache[slot].lock);
         return nullptr; 
     }
+    
     AppConfig* matched = find_app_cfg_locked(final_pkg, user_id);
     pthread_mutex_lock(&g_uid_cache[slot].lock);
     g_uid_cache[slot].uid = uid;
@@ -231,7 +235,7 @@ int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_us
     return 0;
 }
 
-static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id, const char* current_pkg) {
+static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id, const char* current_pkg, bool skip_sandbox) {
     if (!c) return false;
     bool matched = false;
     if (c->redir_rules && c->redir_count > 0) {
@@ -264,8 +268,9 @@ static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int
         }
     }
     if (matched) return true;
-
-    if (c->sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0) {
+    
+    /* 拦截所有的沙盒请求，如果显式设定了 skip_sandbox 则直接跳过 */
+    if (!skip_sandbox && c->sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0) {
         if (strncmp(sub_path, "/Android", 8) == 0) {
             if (sub_path[8] == '\0' || sub_path[8] == '/') {
                 bool is_data = (strncmp(sub_path, "/Android/data", 13) == 0 && (sub_path[13] == '\0' || sub_path[13] == '/'));
@@ -305,6 +310,7 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
     bool redir = false;
     bool dummy_hidden = false;
     bool dummy_ro = false;
+    
     if (cfg && cfg->trie_root) {
         if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
             if (temp[0] != '\0') redir = true;
@@ -316,11 +322,22 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
             if (temp[0] != '\0') redir = true;
         }
     }
+    
+    /* 核心修复：还原 ALLOW 或部分 REDIRECT 被 Trie 拦截的 `?` 前缀动态解析机制 */
+    if (redir && temp[0] == '?') {
+        int effective_uid = user_id >= 0 ? user_id : 0;
+        char real_base[1024];
+        snprintf(real_base, sizeof(real_base), STORAGE_BASE "/%d%s", effective_uid, temp + 1);
+        strncpy(temp, real_base, sizeof(temp) - 1);
+        temp[sizeof(temp) - 1] = '\0';
+    }
+    
     if (!redir) {
-        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg);
+        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : false);
     }
     if (!redir) {
-        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg);
+        bool app_explicit_sandbox = (cfg && cfg->sandbox_explicit);
+        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : app_explicit_sandbox);
     }
     if (!redir) {
         if (user_id >= 0) snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);
@@ -450,13 +467,14 @@ bool vfs_is_redirect_target(AppConfig* cfg, const char* sub_path) {
                 }
             }
         }
-        if (!res && g_global_cfg.sandbox && strcmp(sub_path, "/") == 0) res = true;
+        if (!res && !(cfg && cfg->sandbox_explicit) && g_global_cfg.sandbox && strcmp(sub_path, "/") == 0) res = true;
     }
     return res;
 }
 
 void vfs_log_io(AppConfig* cfg, const char* pkg, uid_t uid, const char* op, const char* sub_path, const char* real_path, bool is_redir) {
-    if ((cfg && cfg->monitor) || g_global_cfg.monitor) {
+    bool monitor_on = (cfg && cfg->monitor_explicit) ? cfg->monitor : g_global_cfg.monitor;
+    if (monitor_on) {
         if (is_redir) {
             log_internal(LOG_IO, "[%s(%u)] [%s] %s -> %s", pkg, uid, op, sub_path, real_path);
         } else {
@@ -537,7 +555,8 @@ bool vfs_is_virtual_dir_empty(AppConfig* cfg, const char* sub_path, const char* 
     struct dirent *de; 
     bool empty = true;
     bool is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
-    bool sandbox_enabled = (cfg && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0);
+    bool sandbox_enabled = (!g_disable_sandbox && cfg && cfg->sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0);
+    
     while ((de = readdir(dp)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         if (path_contains_invalid_chars(de->d_name)) continue;
@@ -582,6 +601,7 @@ bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_i
             } \
         } \
     } while(0)
+    
     PROCESS_CFG_DIRS(cfg);
     PROCESS_CFG_DIRS(&g_global_cfg);
 #undef PROCESS_CFG_DIRS

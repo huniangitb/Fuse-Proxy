@@ -336,7 +336,7 @@ static int cmp_hide(const void* a, const void* b) {
     const char* str_b = *(const char**)b;
     return (int)strlen(str_b) - (int)strlen(str_a);
 }
-static void parse_config_line(AppConfig* cur, char* line, int user_id) {
+static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_num, const char* file_path) {
     (void)user_id;
     char* p_ptr = line;
     char* tok = get_next_token(&p_ptr);
@@ -478,6 +478,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
         }
+    } else {
+        LOG_WRN("不支持的规则 \"%s\" (行 %d, 文件 %s)", tok, line_num, file_path);
     }
 }
 static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
@@ -535,7 +537,9 @@ void load_config_rules(const char* path) {
     if (fp) {
         AppConfig* cur = &g_global_cfg; char line[2048];
         int current_user_id = -1;
+        int line_num = 0;
         while (fgets(line, sizeof(line), fp)) {
+            line_num++;
             char* p = clean_path_string(line); if (!p || p[0] == '#' || p[0] == 0) continue;
             if (p[0] == '[') {
                 char* end = strchr(p, ']');
@@ -564,7 +568,7 @@ void load_config_rules(const char* path) {
                 }
                 continue;
             }
-            if (cur) parse_config_line(cur, p, current_user_id);
+            if (cur) parse_config_line(cur, p, current_user_id, line_num, path);
         }
         fclose(fp);
     } else {
@@ -594,7 +598,9 @@ void load_config_rules(const char* path) {
                         FILE* afp = fopen(app_conf_path, "r");
                         if (afp) {
                             char line[2048];
+                            int app_line_num = 0;
                             while (fgets(line, sizeof(line), afp)) {
+                                app_line_num++;
                                 char* p = clean_path_string(line);
                                 if (!p || p[0] == '#' || p[0] == 0) continue;
                                 if (p[0] == '[') {
@@ -617,7 +623,7 @@ void load_config_rules(const char* path) {
                                     }
                                     continue;
                                 }
-                                if (cur) parse_config_line(cur, p, uid);
+                                if (cur) parse_config_line(cur, p, uid, app_line_num, app_conf_path);
                             }
                             fclose(afp);
                         }

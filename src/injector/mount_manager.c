@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fnmatch.h>
 #include <stdlib.h>
+
 static char* read_file_dynamic(const char* path, size_t* out_size) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return NULL;
@@ -48,6 +49,7 @@ static char* read_file_dynamic(const char* path, size_t* out_size) {
     if (out_size) *out_size = size;
     return buf;
 }
+
 bool app_has_active_rules(const char* pkg, uid_t uid) {
     int user_id = uid / 100000;
     config_lock_read();
@@ -63,6 +65,7 @@ bool app_has_active_rules(const char* pkg, uid_t uid) {
     config_unlock_read();
     return has_rules;
 }
+
 typedef struct {
     bool target_has_fuse;
     bool target_has_fuse_daemon;
@@ -71,6 +74,7 @@ typedef struct {
     bool backup_has_fuse_daemon;
     bool backup_is_mounted;
 } MountState;
+
 static bool read_mount_state(int pid, const char* target, const char* backup, MountState* st) {
     memset(st, 0, sizeof(*st));
     char path[64];
@@ -125,11 +129,13 @@ static bool read_mount_state(int pid, const char* target, const char* backup, Mo
     free(buf);
     return true;
 }
+
 static bool path_prefix_overlap(const char* a, const char* b) {
     size_t alen = strlen(a), blen = strlen(b), minlen = alen < blen ? alen : blen;
     if (strncmp(a, b, minlen) != 0) return false;
     return (a[minlen] == '/' || a[minlen] == '\0') && (b[minlen] == '/' || b[minlen] == '\0');
 }
+
 static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path, const char* pkg) {
     bool conflicts = false;
     bool is_media = is_media_provider(pkg);
@@ -171,17 +177,44 @@ static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const cha
     return conflicts;
 }
 
+/*
+ * 精确研判当前请求挂载的应用包名是否为 com.android.providers.media.module（包含多租户变体）。
+ */
+static bool is_exact_media_module(const char* pkg) {
+    if (!pkg) return false;
+    if (strcmp(pkg, "com.android.providers.media.module") == 0 ||
+        strcmp(pkg, "com.android.providers.media") == 0 ||
+        strncmp(pkg, "com.android.providers.media.module:", 34) == 0 ||
+        strncmp(pkg, "com.android.providers.media:", 28) == 0) {
+        return true;
+    }
+    return false;
+}
+
 int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, const char* trigger) {
-    /* media provider 走专用 FUSE 实例（全局禁用 fd 透传） */
-    if (strstr(pkg, "com.android.providers.media") != NULL) {
+    /*
+     * 专属映射策略：
+     * 1. 如果是 com.android.providers.media.module，则强制映射到专用媒体 FUSE 挂载源，不允许使用全局 FUSE。
+     * 2. 如果是其他普通应用，强制限制挂载源为全局 FUSE，绝对阻止使用媒体 FUSE 挂载源，实现强隔离。
+     */
+    if (is_exact_media_module(pkg)) {
         const char* media_src = get_media_mnt_src();
         if (media_src) {
             mnt_src = media_src;
         } else {
-            LOG_ERR("媒体 FUSE 实例不可用，%s(PID:%d) 挂载失败", pkg, pid);
+            LOG_ERR("专用媒体 FUSE 实例未就绪/未启用，拒绝为媒体模块 %s(PID:%d) 执行挂载", pkg, pid);
+            return -1;
+        }
+    } else {
+        const char* active_src = get_active_mnt_src();
+        if (active_src) {
+            mnt_src = active_src;
+        } else {
+            LOG_ERR("全局 FUSE 实例不可用，%s(PID:%d) 挂载失败", pkg, pid);
             return -1;
         }
     }
+
     char target_path[128]; get_target_storage_path(uid, target_path, sizeof(target_path));
     char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
     MountState mnt;
@@ -189,6 +222,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         LOG_ERR("读取挂载状态失败: PID=%d, target=%s", pid, target_path);
         return -1;
     }
+    
     if (mnt.target_has_fuse || mnt.target_has_fuse_daemon) {
         LOG_DBG("挂载跳过: %s (PID: %d, %s) - 已经存在程序自身的 FUSE 挂载", target_path, pid, pkg);
         if (uid >= 10000) update_uid_map(uid, pkg);
@@ -196,7 +230,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
     }
-
+    
     /* 解析 fuse_direct：per-app 优先，未设置则回退到全局 */
     bool fuse_direct = g_global_cfg.fuse_direct;
     {
@@ -205,11 +239,11 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         if (cfg && cfg->fuse_direct) fuse_direct = true;
         config_unlock_read();
     }
-
+    
     if (fuse_direct) {
         /* FUSE 直挂方案：简洁追加挂载，不卸载原有挂载点，不备份不还原 */
         /* 在发起异步挂载前，验证挂载源是否存在，避免 ENOENT 空转 */
-        if (mnt_src && access(mnt_src, F_OK) != 0) {
+        if (mnt_src && faccessat(g_global_root_fd, mnt_src + 1, F_OK, 0) != 0) {
             LOG_ERR("全局注入跳过 %s(PID:%d): 挂载源 %s 不存在(FUSE可能未就绪)", pkg, pid, mnt_src);
             return -1;
         }
@@ -234,7 +268,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
             return -1;
         }
     }
-
+    
     /* 原始注入方案：备份 + 合并挂载 + 保留非冲突子挂载 */
     if (mnt.backup_has_fuse || mnt.backup_has_fuse_daemon) {
         ns_umount_recursive(pid, backup_path);
@@ -251,6 +285,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
     }
+    
     char preserve_paths[16][256];
     int preserve_count = 0;
     if (mnt.target_is_mounted && has_rules) {

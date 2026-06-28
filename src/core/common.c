@@ -7,17 +7,40 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/system_properties.h>
+#include <stdatomic.h>
+#include <sys/eventfd.h>
+#include <poll.h>
 #define FALLBACK_ERR_LOG ERROR_LOG_PATH
+
 LogLevel g_min_log_level = LOG_INFO;
 char g_real_root[PATH_MAX] = {0};
 bool g_persist_all_logs = false;
-bool g_strip_o_direct = false;  
+bool g_strip_o_direct = false;
 static char g_self_dir[PATH_MAX] = {0};
-static char g_proc_name[64] = "unknown"; 
+static char g_proc_name[64] = "unknown";
 static bool g_log_inited = false;
-static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER; 
-static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER; 
-static int g_log_sock = -1; 
+static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define LOG_BUF_CAPACITY 8192
+#define LOG_BUF_MASK     (LOG_BUF_CAPACITY - 1)
+#define LOG_MSG_MAX_LEN  1024
+
+typedef struct {
+    char     msg[LOG_MSG_MAX_LEN];
+    LogLevel level;
+} LogEntry;
+
+typedef struct {
+    LogEntry      entries[LOG_BUF_CAPACITY];
+    _Atomic(int)  head;
+    int           tail;
+    _Atomic(int)  dropped;
+} LogRingBuffer;
+
+static LogRingBuffer g_log_ring;
+static pthread_t     g_log_sender_tid;
+static int           g_log_event_fd = -1;
+static _Atomic(bool) g_log_shutdown = false;
 void init_timezone() {
     const char *tz = getenv("TZ");
     if (tz && tz[0] != '\0') {
@@ -203,81 +226,145 @@ void path_sanitize(char* out, size_t size, const char* path) {
     }
     out[o] = '\0';
 }
+static void *log_sender_thread(void *arg) {
+    (void)arg;
+    int sock = -1;
+    struct timespec retry_after = {0, 0};
+
+    while (!atomic_load_explicit(&g_log_shutdown, memory_order_relaxed)) {
+        if (sock < 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > retry_after.tv_sec ||
+                (now.tv_sec == retry_after.tv_sec && now.tv_nsec >= retry_after.tv_nsec)) {
+                sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                if (sock >= 0) {
+                    struct sockaddr_in addr;
+                    memset(&addr, 0, sizeof(addr));
+                    addr.sin_family = AF_INET;
+                    addr.sin_port = htons(LOG_TCP_PORT);
+                    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+                    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+                    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                        close(sock); sock = -1;
+                        clock_gettime(CLOCK_MONOTONIC, &retry_after);
+                        retry_after.tv_nsec += 100000000;
+                        if (retry_after.tv_nsec >= 1000000000) {
+                            retry_after.tv_sec++;
+                            retry_after.tv_nsec -= 1000000000;
+                        }
+                    }
+                }
+            }
+        }
+
+        int consumed = 0;
+        while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
+            if (sock < 0) break;  /* 未连接：保留 ring 数据等待重连，避免丢弃式消耗（tail++/consumed++）导致空转 */
+            LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
+            if (sock >= 0) {
+                char packet[LOG_MSG_MAX_LEN + 128];
+                int len;
+                if (e->level == LOG_IO)
+                    len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
+                else if (e->level == LOG_LOGCAT)
+                    len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
+                else
+                    len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
+                                   e->level, g_proc_name, e->msg);
+                ssize_t sent = send(sock, packet, len, MSG_NOSIGNAL);
+                if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    close(sock); sock = -1;
+                    clock_gettime(CLOCK_MONOTONIC, &retry_after);
+                    retry_after.tv_nsec += 100000000;
+                    if (retry_after.tv_nsec >= 1000000000) {
+                        retry_after.tv_sec++;
+                        retry_after.tv_nsec -= 1000000000;
+                    }
+                    break;
+                }
+                if (sent < 0) break;
+            }
+            g_log_ring.tail++;
+            consumed++;
+        }
+
+        if (!consumed) {
+            struct pollfd pfd = { .fd = g_log_event_fd, .events = POLLIN };
+            poll(&pfd, 1, 100);
+            /* eventfd 为非 semaphore 模式：计数器只能靠 read 清零。poll 返回后必须读空，
+               否则计数器永久 ≥1 → POLLIN 永久就绪 → poll 立即返回形成紧密空转（100% 单核） */
+            if (pfd.revents & POLLIN) {
+                uint64_t val;
+                while (read(g_log_event_fd, &val, sizeof(val)) > 0) { }
+            }
+        }
+    }
+
+    while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
+        LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
+        if (sock >= 0) {
+            char packet[LOG_MSG_MAX_LEN + 128];
+            int len;
+            if (e->level == LOG_IO)
+                len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
+            else if (e->level == LOG_LOGCAT)
+                len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
+            else
+                len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
+                               e->level, g_proc_name, e->msg);
+            send(sock, packet, len, MSG_NOSIGNAL);
+        }
+        g_log_ring.tail++;
+    }
+    if (sock >= 0) close(sock);
+    return NULL;
+}
+
 void log_init(const char* process_name) {
     init_timezone();
-    pthread_mutex_lock(&g_log_mutex);
     strncpy(g_proc_name, process_name, sizeof(g_proc_name) - 1);
     mkdir_recursive(LOG_DIR);
+    atomic_store_explicit(&g_log_ring.head, 0, memory_order_relaxed);
+    g_log_ring.tail = 0;
+    atomic_store_explicit(&g_log_ring.dropped, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_log_shutdown, false, memory_order_relaxed);
+    g_log_event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    pthread_create(&g_log_sender_tid, NULL, log_sender_thread, NULL);
     g_log_inited = true;
-    pthread_mutex_unlock(&g_log_mutex);
 }
+
 void log_close() {
-    pthread_mutex_lock(&g_log_mutex);
-    if (!g_log_inited) { 
-        pthread_mutex_unlock(&g_log_mutex); 
-        return; 
-    }
-    if (g_log_sock >= 0) { close(g_log_sock); g_log_sock = -1; }
+    if (!g_log_inited) return;
+    atomic_store_explicit(&g_log_shutdown, true, memory_order_release);
+    uint64_t val = 1;
+    if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
+    pthread_join(g_log_sender_tid, NULL);
+    if (g_log_event_fd >= 0) { close(g_log_event_fd); g_log_event_fd = -1; }
     g_log_inited = false;
-    pthread_mutex_unlock(&g_log_mutex);
 }
+
 void log_internal(LogLevel level, const char* format, ...) {
     if (level < g_min_log_level && level != LOG_DEBUG) return;
-    char msg_buf[1024]; 
-    va_list args; 
+    char msg_buf[LOG_MSG_MAX_LEN];
+    va_list args;
     va_start(args, format);
-    vsnprintf(msg_buf, sizeof(msg_buf), format, args); 
+    vsnprintf(msg_buf, sizeof(msg_buf), format, args);
     va_end(args);
     size_t mlen = strlen(msg_buf);
-    while (mlen > 0 && (msg_buf[mlen - 1] == '\n' || msg_buf[mlen - 1] == '\r')) {
+    while (mlen > 0 && (msg_buf[mlen - 1] == '\n' || msg_buf[mlen - 1] == '\r'))
         msg_buf[--mlen] = '\0';
-    }
     if (g_persist_all_logs) {
         if (level == LOG_LOGCAT) persist_log_to_disk("logcat", msg_buf, true);
         else if (level == LOG_IO) persist_log_to_disk("io", msg_buf, true);
         else persist_log_to_disk("sys", msg_buf, true);
     }
-    if (pthread_mutex_trylock(&g_log_mutex) != 0) return;
-    if (!g_log_inited) {
-        pthread_mutex_unlock(&g_log_mutex);
-        return;
-    }
-    if (g_log_sock < 0) {
-        g_log_sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (g_log_sock >= 0) {
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(LOG_TCP_PORT);
-            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 20000; 
-            setsockopt(g_log_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            if (connect(g_log_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-                close(g_log_sock);
-                g_log_sock = -1;
-            } else {
-                int flags = fcntl(g_log_sock, F_GETFL, 0);
-                fcntl(g_log_sock, F_SETFL, flags | O_NONBLOCK);
-            }
-        }
-    }
-    if (g_log_sock >= 0) {
-        char packet[1280];
-        int len = 0;
-        if (level == LOG_IO) {
-            len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", msg_buf);
-        } else if (level == LOG_LOGCAT) {
-            len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", msg_buf);
-        } else {
-            len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n", level, g_proc_name, msg_buf);
-        }
-        if (send(g_log_sock, packet, len, MSG_NOSIGNAL | MSG_DONTWAIT) < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS) {
-                close(g_log_sock); g_log_sock = -1;
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_log_mutex);
+    if (!g_log_inited) return;
+    int slot = atomic_fetch_add_explicit(&g_log_ring.head, 1, memory_order_relaxed) & LOG_BUF_MASK;
+    strncpy(g_log_ring.entries[slot].msg, msg_buf, LOG_MSG_MAX_LEN - 1);
+    g_log_ring.entries[slot].msg[LOG_MSG_MAX_LEN - 1] = '\0';
+    g_log_ring.entries[slot].level = level;
+    uint64_t val = 1;
+    if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
 }

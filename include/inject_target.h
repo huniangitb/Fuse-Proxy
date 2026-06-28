@@ -21,13 +21,11 @@ void audit_tracked_apps();
 void audit_and_remount_specific_apps(ChangedPkg* changed, int count);
 void force_recover_tracked_mounts();
 void handle_list_injected(int client_fd);
-
 /* 
  * 初始化从物理文件恢复的 UID 映射内存缓存。
  * 避免在每次程序重新启动时丢失已持久化的 UID 记录。
  */
 void init_uid_map_cache(void);
-
 /*
  * 通用的应用挂载清理/恢复操作：
  * 1. 尝试卸载 target_path 上的 FUSE 挂载
@@ -36,18 +34,21 @@ void init_uid_map_cache(void);
  * 4. 否则从 /proc/1/root 做 bind mount 恢复
  */
 void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid);
-
 /*
  * 获取当前所有已注入应用列表的快照。
  * 填充 pid、pkg、uid 数组，返回实际填充数量。
  * 用于外部模块（如 config_publisher）读取注入状态。
  */
 int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids, int max_count);
-
 /*
  * 获取 UID 映射表的快照。
  * 基于 inject_target 内部的内存缓存。
  */
 int get_uid_map_snapshot(UidMapEntry *out, int max_count);
+
+/*
+ * 核心检查：判断当前配置中 com.android.providers.media.module 是否为注入目标对象。
+ */
+bool is_media_module_injected_target(void);
 
 #endif
