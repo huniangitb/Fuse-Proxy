@@ -25,12 +25,37 @@
 
 bool g_passthrough_enabled = false;
 bool g_preserve_perms = false;
+bool g_disable_sandbox = false; /* 新增：禁用沙盒功能标志 */
+
 static int g_ready_fd = -1;
 static int g_global_root_fd = -1;
 static int g_bpf_fd = -1;           /* BPF program fd, -1 = disabled */
 static bool g_passthrough_disabled = false; /* --no-passthrough 显式禁用 */
+static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
+
+#define MAX_PENDING_CLOSE 64
+static int g_pending_close_fds[MAX_PENDING_CLOSE];
+static int g_pending_close_count = 0;
+
+static void vfs_defer_close(int fd) {
+    if (fd < 0) return;
+    if (g_pending_close_count < MAX_PENDING_CLOSE) {
+        g_pending_close_fds[g_pending_close_count++] = fd;
+    } else {
+        close(fd);
+    }
+}
+
+static void vfs_flush_pending_closes(void) {
+    for (int i = 0; i < g_pending_close_count; i++) {
+        close(g_pending_close_fds[i]);
+    }
+    g_pending_close_count = 0;
+}
+
 typedef enum { MODE_REDIRECT, MODE_OVERLAY } DaemonMode;
 static DaemonMode g_mode = MODE_REDIRECT;
+
 static char g_lower_dir[PATH_MAX] = {0}; 
 static char g_upper_dir[PATH_MAX] = {0};
 
@@ -81,6 +106,7 @@ static bool is_android_skel_dir(const char* sub_path) {
 #define VFS_RETURN(val) do { config_unlock_read(); return val; } while(0)
 
 static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
+    vfs_flush_pending_closes();
     (void)fi; VFS_SETUP_CORE(path, -ENOENT);
     if (st == nullptr) VFS_RETURN(-EINVAL);
     if (lstat(p, st) == -1) {
@@ -111,6 +137,7 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
 }
 
 static int vfs_access(const char *path, int mask) {
+    vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, -ENOENT);
     if (access(p, mask) == -1) {
         int err = errno; 
@@ -125,20 +152,24 @@ static int vfs_access(const char *path, int mask) {
 }
 
 static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
+    vfs_flush_pending_closes();
     (void)offset; (void)flags; (void)fi; VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(cfg, current_pkg, ctx->uid, "READDIR", sub_path, p, is_redir);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
-    bool skip_sandbox = (path_user_id < 0);
+    
+    /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑 */
+    bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
+    
     DirHashTable ht; vfs_hash_init(&ht);
     DIR *dp = opendir(p);
     char item_sub_path[2048], item_real_path[2048];
     bool is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
     bool is_android_dir = (!skip_sandbox && (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0));
     bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0);
-    bool sandbox_enabled = (cfg && cfg->sandbox && hide_others);
-    (void)sandbox_enabled;
+    bool sandbox_enabled = (!g_disable_sandbox && cfg && cfg->sandbox && hide_others);
     bool force_android_skel = hide_others;
     bool has_data = false, has_obb = false, has_android = false, has_pkg = false;
+    
     if (!dp) {
         int err = errno;
         if (!is_android_skel_dir(sub_path) && !(err == ENOENT && (vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path)))) {
@@ -183,6 +214,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         }
         closedir(dp);
     }
+    
     if (is_root && force_android_skel && !has_android) { 
         struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("Android"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid; 
         if (filler(buf, "Android", &st_dir, 0, 0) != 0) {
@@ -250,6 +282,7 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
 }
 
 static int vfs_open(const char *path, struct fuse_file_info *fi) {
+    vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(cfg, current_pkg, ctx->uid, "OPEN", sub_path, p, is_redir);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
@@ -386,7 +419,6 @@ static int vfs_rmdir(const char *path) {
     int ret = rmdir(p);
     if (ret == -1) {
         int err = errno;
-        /* ENOTEMPTY: 目录非空时自动递归删除，规避应用反复重试 */
         if (err == ENOTEMPTY) {
             int r = recursive_rmdir(p);
             if (r == 0) VFS_RETURN(0);
@@ -833,6 +865,7 @@ static int vfs_removexattr(const char *path, const char *name) {
 static void vfs_destroy(void *private_data) {
     (void)private_data; LOG_DBG("FUSE 守护进程正在退出，清理资源...");
     log_close();
+    if (g_bpf_fd >= 0) close(g_bpf_fd);
     if (g_global_root_fd >= 0) close(g_global_root_fd);
     char msg[256]; snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid()); send_ipc_message(msg);
 }
@@ -841,14 +874,17 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     cfg->use_ino = 1; cfg->entry_timeout = 1.0; cfg->attr_timeout = 1.0; cfg->negative_timeout = 0.5;
     signal(SIGPIPE, SIG_IGN);
     g_passthrough_enabled = false;
+    
     if (g_passthrough_disabled) {
         LOG("FUSE Passthrough: 已被 --no-passthrough 参数禁用");
         goto skip_passthrough;
     }
+    
     if (conn->capable & FUSE_CAP_PASSTHROUGH)
         LOG_DBG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
     else
         LOG_DBG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
+        
     int backing_id = -1;
     int saved_errno = 0;
     bool ioctl_exists = false;  
@@ -857,6 +893,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         LOG_ERR("FUSE Passthrough: ❌ 无法打开/dev/null测试fd: %s", strerror(errno));
         goto ioctl_probe_done;
     }
+    
     backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &test_fd);
     if (backing_id > 0) {
         ioctl_exists = true;
@@ -889,6 +926,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
             }
         }
     }
+    
     if (ioctl_exists) {
         g_passthrough_enabled = true;
         if (backing_id > 0) {
@@ -901,29 +939,6 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         }
         conn->want |= FUSE_CAP_PASSTHROUGH;
         LOG_DBG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
-        {
-            char testfile[PATH_MAX];
-            snprintf(testfile, sizeof(testfile), "%s/0/.pt_self_test_%d_%d",
-                     STORAGE_BASE, getpid(), (int)time(NULL));
-            int tf = open(testfile, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-            if (tf < 0) {
-                LOG_DBG("FUSE Passthrough: 自检无法创建测试文件: %s", strerror(errno));
-            } else {
-                const char magic[] = "PT_SELFTEST";
-                write(tf, magic, sizeof(magic));
-                lseek(tf, 0, SEEK_SET);
-                char verify[32] = {0};
-                ssize_t r = read(tf, verify, sizeof(magic));
-                if (r == (ssize_t)sizeof(magic) && memcmp(verify, magic, sizeof(magic)) == 0) {
-                    LOG_DBG("FUSE Passthrough: 自检通过 — backing 存储 I/O 完整性验证正常");
-                } else {
-                    LOG_WRN("FUSE Passthrough: ⚠️ 自检 I/O 完整性异常 (read=%zd %s)",
-                            r, r < 0 ? strerror(errno) : "数据不匹配");
-                }
-                close(tf);
-                unlink(testfile);
-            }
-        }
     } else {
         int err = saved_errno;
         switch (err) {
@@ -939,6 +954,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         }
     }
     close(test_fd);
+
 ioctl_probe_done:
 skip_passthrough:
     if (g_passthrough_enabled) {
@@ -999,34 +1015,34 @@ static int open_bpf_prog(void) {
 static int vfs_bpf_setup(const char *path, struct fuse_entry_param *e) {
     if (g_bpf_fd < 0) return -ENOSYS;
     if (!path || !e) return -EINVAL;
-    const char *suffix;
-    if ((suffix = strstr(path, "/Android/data")) == NULL &&
-        (suffix = strstr(path, "/Android/obb")) == NULL)
-        return -ENOENT;
+
     char real[PATH_MAX];
-    snprintf(real, sizeof(real), "%s%s", STORAGE_BASE, path);
+
+    if (!g_is_media_fuse) {
+        const char *suffix;
+        if ((suffix = strstr(path, "/Android/data")) == NULL &&
+            (suffix = strstr(path, "/Android/obb")) == NULL)
+            return -ENOENT;
+    }
+
+    snprintf(real, sizeof(real), "%s%s", g_real_root, path);
     if (!S_ISDIR(e->attr.st_mode))
         return -ENOTDIR;
-    bool is_pkg = (strncmp(suffix, "/Android/data/", 14) == 0 ||
-                   strncmp(suffix, "/Android/obb/", 13) == 0);
+
     int bfd = open(real, O_CLOEXEC | O_DIRECTORY | O_RDONLY);
     if (bfd < 0) {
         LOG_DBG("FUSE BPF: open(%s) = %s", real, strerror(errno));
         return -errno;
     }
-    if (is_pkg) {
-        e->backing_action = FUSE_ACTION_REPLACE;
-        e->backing_fd = (uint64_t)bfd;
-        e->bpf_action = FUSE_ACTION_REMOVE;
-        LOG_DBG_PERF("FUSE BPF: backing %s (fd=%d)", real, bfd);
-    } else {
-        e->backing_action = FUSE_ACTION_REPLACE;
-        e->backing_fd = (uint64_t)bfd;
-        e->bpf_action = FUSE_ACTION_REPLACE;
-        e->bpf_fd = (uint64_t)g_bpf_fd;
-        LOG_DBG_PERF("FUSE BPF: BPF %s (backing=%d, bpf=%d)",
-                real, bfd, g_bpf_fd);
-    }
+
+    e->backing_action = FUSE_ACTION_REPLACE;
+    e->backing_fd = (uint64_t)bfd;
+    e->bpf_action = FUSE_ACTION_REPLACE;
+    e->bpf_fd = (uint64_t)g_bpf_fd;
+    LOG_DBG_PERF("FUSE BPF: backing %s (fd=%d, bpf=%d, media=%d)",
+            real, bfd, g_bpf_fd, g_is_media_fuse);
+
+    vfs_defer_close(bfd);
     return 0;
 }
 
@@ -1067,9 +1083,14 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--strip-o-direct") == 0) { 
             g_strip_o_direct = true;
         } else if (strcmp(argv[i], "--no-bpf") == 0) {
-            g_bpf_fd = -2; /* 显式禁用 */
+            g_bpf_fd = -2; 
         } else if (strcmp(argv[i], "--no-passthrough") == 0) {
             g_passthrough_disabled = true;
+        } else if (strcmp(argv[i], "--media-fuse") == 0) {
+            g_is_media_fuse = true;
+        } else if (strcmp(argv[i], "--disable-sandbox") == 0) {
+            /* 解析并应用禁用沙盒指令 */
+            g_disable_sandbox = true;
         } else if (strcmp(argv[i], "debug") == 0 || strcmp(argv[i], "--debug") == 0) { 
             g_min_log_level = LOG_DEBUG; fuse_argv[fuse_argc++] = "-d"; 
         } else if (strcmp(argv[i], "info") == 0) {
@@ -1087,7 +1108,11 @@ int main(int argc, char *argv[]) {
     log_init("fuse_daemon");
     install_crash_handlers();
     vfs_core_init(rules_path);
-    /* 若未通过 --no-bpf 显式禁用，则尝试初始化 FUSE BPF */
+    
+    if (g_disable_sandbox) {
+        LOG("沙盒特性已强制禁用");
+    }
+
     if (g_bpf_fd != -2) {
         g_bpf_fd = -1;
         if (is_fuse_bpf_supported()) {

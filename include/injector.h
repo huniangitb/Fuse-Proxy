@@ -22,9 +22,10 @@ extern volatile sig_atomic_t g_reload_config;
 extern volatile sig_atomic_t g_passive_mode;
 extern volatile sig_atomic_t g_fuse_ready;
 extern int g_epoll_fd;
+extern int g_global_root_fd;  /* 追加根目录 fd 的全局外部引用 */
 
-const char* get_active_mnt_src();
-const char* get_media_mnt_src();
+const char* get_active_mnt_src(void);
+const char* get_media_mnt_src(void);
 void notify_fuses(int sig);
 
 /* 核心暴露：非阻塞异步控制接口 */

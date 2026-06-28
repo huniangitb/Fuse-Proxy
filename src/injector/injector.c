@@ -28,6 +28,7 @@
 #include <fnmatch.h>
 #include <errno.h>
 #include <sys/syscall.h>
+
 volatile sig_atomic_t g_should_exit = 0;
 volatile sig_atomic_t g_reload_config = 0;
 volatile sig_atomic_t g_passive_mode = 0;
@@ -48,12 +49,14 @@ struct GlobalFuseInfo g_media_fuse = {
     .pid = 1, .fuse_pid = 0, .mnt_path = "/mnt/nsp_media",
     .crash_count = 0, .last_crash_time = 0, .disabled = false
 };
+
 /* 重入保护：防止并发调用 inject_global_fuse() */
 static volatile int g_fuse_starting = 0;
 /* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
 static int g_pending_first_scan = 0;
 /* FUSE 崩溃恢复后待重挂标记：新 FUSE 就绪时重挂所有追踪应用 */
 static volatile sig_atomic_t g_pending_remount = 0;
+
 /* 挂载失败重试队列：应对 FUSE 重建期间并发挂载的瞬态失败 */
 #define MAX_RETRY_MOUNTS 64
 typedef struct {
@@ -65,6 +68,7 @@ typedef struct {
 } RetryMountEntry;
 static RetryMountEntry g_retry_mounts[MAX_RETRY_MOUNTS];
 static int g_retry_mount_count = 0;
+
 /* 异步就绪与挂载任务全局描述符注册系统 */
 static int g_fuse_ready_pipe_fd = -1;
 static void* g_fuse_ready_ctx = nullptr;
@@ -72,10 +76,12 @@ static void* g_fuse_ready_ctx = nullptr;
 static int g_async_mount_fds[MAX_ASYNC_MOUNTS];
 static void* g_async_mount_ctxs[MAX_ASYNC_MOUNTS];
 static int g_async_mount_count = 0;
+
 void register_fuse_ready_pipe(int fd, void* ctx) {
     g_fuse_ready_pipe_fd = fd;
     g_fuse_ready_ctx = ctx;
 }
+
 bool register_async_mount_pipe(int fd, void* ctx) {
     if (g_async_mount_count >= MAX_ASYNC_MOUNTS) return false;
     g_async_mount_fds[g_async_mount_count] = fd;
@@ -84,13 +90,11 @@ bool register_async_mount_pipe(int fd, void* ctx) {
     return true;
 }
 
-/* 挂载失败重试：将失败项加入重试队列，移除追踪以避免扫描遗漏 */
 void schedule_retry_mount(const char* pkg, int pid) {
     if (g_retry_mount_count >= MAX_RETRY_MOUNTS) {
         LOG_DBG("重试队列已满，丢弃 %s(PID:%d) 的重试", pkg, pid);
         return;
     }
-    /* 检查是否已在队列中 */
     for (int i = 0; i < g_retry_mount_count; i++) {
         if (g_retry_mounts[i].pid == pid) return;
     }
@@ -98,37 +102,39 @@ void schedule_retry_mount(const char* pkg, int pid) {
     strncpy(e->cmdline, pkg, sizeof(e->cmdline) - 1);
     e->cmdline[sizeof(e->cmdline) - 1] = '\0';
     e->pid = pid;
-    e->uid = 0; /* 在重试时通过 get_app_uid(pid) 获取 */
+    e->uid = 0; 
     e->retries = 0;
     e->last_attempt = 0;
     LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d", pkg, pid, g_retry_mount_count);
 }
+
 const char* get_active_mnt_src() {
     if (!g_fuse_ready || g_global_fuse.fuse_pid <= 0) return nullptr;
     if (kill(g_global_fuse.fuse_pid, 0) != 0) return nullptr;
-    /* 穿透性验证：stat 确认挂载点真实存在且可达（非断连/非缺失） */
-    struct stat st;
-    if (stat(g_global_fuse.mnt_path, &st) != 0) {
-        LOG_DBG("FUSE 挂载点 %s 不可达: %s", g_global_fuse.mnt_path, strerror(errno));
+    if (faccessat(g_global_root_fd, g_global_fuse.mnt_path + 1, F_OK, 0) != 0) {
+        LOG_DBG("FUSE 挂载点 g_global_fuse %s 不可达: %s", g_global_fuse.mnt_path, strerror(errno));
         return nullptr;
     }
     return g_global_fuse.mnt_path;
 }
+
 const char* get_media_mnt_src() {
     if (g_media_fuse.fuse_pid <= 0) return nullptr;
     if (kill(g_media_fuse.fuse_pid, 0) != 0) return nullptr;
-    /* 验证挂载点真实存在且可达（非断连/非缺失） */
-    struct stat st;
-    if (stat(g_media_fuse.mnt_path, &st) != 0) {
-        LOG_DBG("媒体 FUSE 挂载点 %s 不可达: %s", g_media_fuse.mnt_path, strerror(errno));
+    if (faccessat(g_global_root_fd, g_media_fuse.mnt_path + 1, F_OK, 0) != 0) {
+        LOG_DBG("媒体 FUSE 挂载点 g_media_fuse %s 不可达: %s", g_media_fuse.mnt_path, strerror(errno));
         return nullptr;
     }
     return g_media_fuse.mnt_path;
 }
+
 void notify_fuses(int sig) {
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, sig) != 0 && errno != ESRCH)
         LOG_ERR("通知全局 FUSE 失败");
+    if (g_media_fuse.fuse_pid > 0 && kill(g_media_fuse.fuse_pid, sig) != 0 && errno != ESRCH)
+        LOG_ERR("通知媒体 FUSE 失败");
 }
+
 static void setup_inotify_watches() {
     if (g_inotify_fd >= 0) {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_inotify_fd, nullptr);
@@ -151,12 +157,14 @@ static void setup_inotify_watches() {
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = g_inotify_fd };
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_inotify_fd, &ev);
 }
+
 static void reload_injector_config() {
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     config_unlock_write();
     setup_inotify_watches();
 }
+
 static void dump_crash_log_tail() {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/fuse_crash.log", LOG_DIR);
@@ -188,13 +196,14 @@ static void dump_crash_log_tail() {
         }
     }
 }
-/* 核心优化：就绪通知管道的异步 epoll 回调实现 */
+
 typedef struct {
     int pipe_fd;
     pid_t child_pid;
 } FuseReadyCtx;
-/* 前向声明：崩溃恢复时重新挂载所有追踪应用 */
+
 static void remount_all_tracked(void);
+
 void handle_fuse_ready_event(void *ptr) {
     FuseReadyCtx *ctx = (FuseReadyCtx*)ptr;
     char buf;
@@ -205,28 +214,21 @@ void handle_fuse_ready_event(void *ptr) {
         LOG_DBG("FUSE 守护进程成功通知就绪，执行共享视图转换");
         if (ns_make_shared(g_global_fuse.pid, g_global_fuse.mnt_path) != 0) {
             LOG_ERR("FUSE 共享传播设置失败: make_shared(%s)", g_global_fuse.mnt_path);
-            /* 不设置 g_fuse_ready，等待 check_and_recover_fuse 重试 */
         } else {
-            /* 共享传播成功，验证挂载点真实就绪：stat 确认 FUSE 文件系统已可达 */
-            struct stat st;
-            if (stat(g_global_fuse.mnt_path, &st) != 0) {
+            if (faccessat(g_global_root_fd, g_global_fuse.mnt_path + 1, F_OK, 0) != 0) {
                 LOG_ERR("FUSE 就绪验证失败: stat(%s) → %s", g_global_fuse.mnt_path, strerror(errno));
-                /* 不设置 g_fuse_ready，后续 check_and_recover_fuse 会处理 */
             } else {
                 g_fuse_ready = 1;
                 LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
             }
         }
-        /* 触发延迟的首次扫描 */
         if (g_pending_first_scan) {
             g_pending_first_scan = 0;
             seconds_until_next_scan = 0;
         }
-        /* 重试之前因 FUSE 未就绪而失败的挂载 */
         if (g_retry_mount_count > 0) {
             seconds_until_next_scan = 0;
         }
-        /* FUSE 崩溃恢复：重挂所有已被清理的追踪应用 */
         if (g_pending_remount) {
             remount_all_tracked();
         }
@@ -236,44 +238,33 @@ void handle_fuse_ready_event(void *ptr) {
     }
     free(ctx);
 }
+
 static void inject_global_fuse() {
     if (g_global_fuse.disabled) return;
-    /* 重入保护：如果已有 FUSE 正在启动，跳过本次 */
     if (__sync_lock_test_and_set(&g_fuse_starting, 1)) {
         LOG_DBG("FUSE 已经在启动中，跳过重复启动");
         return;
     }
     if (g_global_fuse.fuse_pid > 0) {
         kill(g_global_fuse.fuse_pid, SIGTERM);
-        /* 等待旧 FUSE 守护进程真正退出，确保 /dev/fuse 关闭、挂载可清理 */
         for (int wait_ms = 0; wait_ms < 500; wait_ms += 10) {
             if (kill(g_global_fuse.fuse_pid, 0) != 0) break;
             usleep(10000);
         }
-        /* 超时未退出则强制杀死 */
         if (kill(g_global_fuse.fuse_pid, 0) == 0) {
             kill(g_global_fuse.fuse_pid, SIGKILL);
             usleep(50000);
         }
-        /* 收割子进程，避免僵尸 */
         int status;
         waitpid(g_global_fuse.fuse_pid, &status, WNOHANG);
     }
-    /*
-     * 启动前预清理：强制卸载 /mnt/nsp_global 上任何残留的 FUSE 挂载，
-     * 包括 FUSE 守护进程已死导致的 "Transport endpoint is not connected" 状态。
-     * 使用 MNT_DETACH 卸载，不依赖 FUSE 守护进程响应。
-     * 无论 global_inject 模式都执行，确保挂载点是干净的。
-     */
     ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
-    /* 验证挂载点确已清理：循环检查 /proc/self/mountinfo，防止遗留陈旧连接 */
     for (int verify = 0; verify < 20; verify++) {
         if (ns_is_mounted(g_global_fuse.pid, g_global_fuse.mnt_path, nullptr) <= 0)
             break;
         usleep(20000);
     }
     if (!g_global_cfg.fuse_direct) {
-        /* 非 FUSE 直挂模式：进一步删除目录，后续由子进程 re-mkdir */
         ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
     }
     int ready_pipe[2];
@@ -329,7 +320,6 @@ static void inject_global_fuse() {
         args[ai++] = arg_ready;
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
-        /* 追加 FUSE_EXTRA_ARGS 透传参数（injector 不做任何转译） */
         if (g_global_cfg.fuse_extra_args[0]) {
             char extra_copy[512];
             strncpy(extra_copy, g_global_cfg.fuse_extra_args, sizeof(extra_copy) - 1);
@@ -350,7 +340,6 @@ static void inject_global_fuse() {
     }
     close(ready_pipe[1]);
     g_global_fuse.fuse_pid = child;
-    /* 将管道读端绑定至 epoll 回调触发，使主流程免去 5 秒的同步挂起 */
     FuseReadyCtx *ctx = malloc(sizeof(FuseReadyCtx));
     if (ctx) {
         ctx->pipe_fd = ready_pipe[0];
@@ -363,7 +352,7 @@ static void inject_global_fuse() {
     }
     __sync_lock_release(&g_fuse_starting);
 }
-/* 启动媒体 FUSE 实例（含 --no-passthrough），专供 com.android.providers.media.module */
+
 static void inject_media_fuse() {
     if (g_media_fuse.disabled) return;
     if (g_media_fuse.fuse_pid > 0) {
@@ -437,9 +426,14 @@ static void inject_media_fuse() {
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
         args[ai++] = "--no-passthrough";
+        args[ai++] = "--media-fuse";
+
+        /* ============== 核心改动：在启动参数中强制追加禁用沙盒标志 ============== */
+        args[ai++] = "--disable-sandbox";
+        
         args[ai++] = "-f";
         args[ai++] = "-o";
-        args[ai++] = "allow_other,auto_cache,fsname=fuse_daemon,subtype=fuse_daemon";
+        args[ai++] = "allow_other,auto_cache,fsname=fuse_daemon,subtype=fuse_media_daemon";
         args[ai] = nullptr;
         setenv("LD_LIBRARY_PATH", get_self_dir(), 1);
         execv(exe, args);
@@ -447,9 +441,9 @@ static void inject_media_fuse() {
     }
     close(ready_pipe[1]);
     g_media_fuse.fuse_pid = child;
-    /* 不绑定 ready pipe epoll（不等待就绪），在主循环中轮询检查即可 */
-    (void)ready_pipe;
+    close(ready_pipe[0]);
 }
+
 static int cleanup_cb(int pid, const char* cmd, void* data) {
     (void)data;
     if (!is_process_safe_to_inject(cmd)) return 0;
@@ -464,10 +458,11 @@ static int cleanup_cb(int pid, const char* cmd, void* data) {
     cleanup_app_mounts(pid, target_path, backup_path, uid);
     return 0;
 }
+
 static void cleanup_all_target_apps() {
     fast_pid_each(cleanup_cb, nullptr);
 }
-/* FUSE 崩溃恢复重挂回调 */
+
 static int remount_cb(int pid, const char* cmd, void* data) {
     if (!is_process_safe_to_inject(cmd)) return 0;
     uid_t uid = get_app_uid(pid);
@@ -484,7 +479,7 @@ static int remount_cb(int pid, const char* cmd, void* data) {
     }
     return 0;
 }
-/* FUSE 崩溃恢复：新 FUSE 就绪后，重挂所有仍活跃的追踪应用 */
+
 static void remount_all_tracked() {
     const char* mnt_src = get_active_mnt_src();
     if (!mnt_src) {
@@ -496,6 +491,7 @@ static void remount_all_tracked() {
     g_pending_remount = 0;
     LOG("FUSE 崩溃恢复重挂完成");
 }
+
 static void check_and_recover_fuse() {
     if (g_global_fuse.disabled || g_global_fuse.pid <= 0) return;
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) != 0) {
@@ -521,7 +517,11 @@ static void check_and_recover_fuse() {
             g_pending_remount = 1;
         }
     }
-    /* 媒体 FUSE 崩溃恢复 */
+    
+    /* 
+     * 媒体 FUSE 专属崩溃恢复：
+     * 只有当 com.android.providers.media.module 仍是注入目标时才拉起。
+     */
     if (g_media_fuse.fuse_pid > 0 && kill(g_media_fuse.fuse_pid, 0) != 0) {
         int status;
         waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
@@ -536,35 +536,43 @@ static void check_and_recover_fuse() {
             g_media_fuse.disabled = true;
             return;
         }
-        inject_media_fuse();
-    } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready) {
-        /* 媒体 FUSE 惰性启动：初始时未启动但当前配置需要 */
-        bool need = g_global_cfg.global_inject ||
-                    g_global_cfg.redir_count > 0 ||
-                    g_global_cfg.hide_count > 0 ||
-                    g_global_cfg.ro_count > 0;
-        if (!need && !g_media_fuse.disabled) {
-            config_lock_read();
-            AppConfig* media_cfg = find_app_cfg_locked("com.android.providers.media.module", 0);
-            need = (media_cfg && media_cfg->inject_enable &&
-                (media_cfg->redir_count > 0 || media_cfg->hide_count > 0 ||
-                 media_cfg->ro_count > 0 || media_cfg->sandbox));
-            config_unlock_read();
-        }
-        if (need) {
-            LOG("惰性启动媒体 FUSE 实例");
+        if (is_media_module_injected_target()) {
+            LOG("专用媒体 FUSE 异常退出，执行重新拉起任务");
             inject_media_fuse();
         }
+    } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready) {
+        /* 
+         * 媒体 FUSE 惰性启动：
+         * 初始时未启动，在定时轮询中检测到 com.android.providers.media.module 变动为注入目标时，惰性启动媒体 FUSE。
+         */
+        if (is_media_module_injected_target()) {
+            LOG("惰性启动媒体 FUSE 实例 (com.android.providers.media.module 专属)");
+            inject_media_fuse();
+        }
+    } else if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
+        /*
+         * 热重载安全防御：
+         * 媒体组件不再是注入目标时，安全终结其专属 FUSE，防止挂载空转。
+         */
+        LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
+        kill(g_media_fuse.fuse_pid, SIGTERM);
+        int status;
+        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+        g_media_fuse.fuse_pid = 0;
+        ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
     }
 }
+
 typedef struct {
     char cmdline[256];
     int pid;
     uid_t uid;
     const char *mnt_src;
 } MountTask;
+
 static pid_t g_zygote_pids[4] = {0};
 static int g_zygote_count = 0;
+
 static void find_zygotes() {
     g_zygote_count = 0;
     DIR* dir = opendir("/proc");
@@ -584,12 +592,14 @@ static void find_zygotes() {
     }
     closedir(dir);
 }
+
 static bool is_parent_zygote(pid_t ppid) {
     for (int i = 0; i < g_zygote_count; i++) {
         if (g_zygote_pids[i] == ppid) return true;
     }
     return false;
 }
+
 int scan_zygote_children() {
     static bool first_scan = true;
     struct timespec ts_start, ts_zygote;
@@ -682,69 +692,62 @@ int scan_zygote_children() {
                        (ts_zygote.tv_nsec - ts_start.tv_nsec) / 1000000;
         LOG("初次扫描 - 扫描 /proc 完成, 收集 %d 个候选进程, 耗时: %ldms", entry_count, elapsed);
     }
-    #define MAX_TASKS 256
-    MountTask *tasks[MAX_TASKS];
-    int task_count = 0;
-    const char *mnt_src = get_active_mnt_src();
+    
+    #define MAX_ASYNC_MOUNTS_LOCAL 128
+    int m_count = 0;
+    MountTask* m_tasks = malloc(MAX_ASYNC_MOUNTS_LOCAL * sizeof(MountTask));
+    if (!m_tasks) {
+        free(entries);
+        return 0;
+    }
+    
+    config_lock_read();
+    for (int i = 0; i < entry_count && m_count < MAX_ASYNC_MOUNTS_LOCAL; i++) {
+        if (is_target_app_locked(entries[i].cmdline, entries[i].uid, entries[i].pid, false)) {
+            m_tasks[m_count].pid = entries[i].pid;
+            m_tasks[m_count].uid = entries[i].uid;
+            strncpy(m_tasks[m_count].cmdline, entries[i].cmdline, sizeof(m_tasks[m_count].cmdline) - 1);
+            m_tasks[m_count].cmdline[sizeof(m_tasks[m_count].cmdline) - 1] = '\0';
+            m_count++;
+        }
+    }
+    config_unlock_read();
+    
     struct timespec ts_match_start, ts_match_end;
     if (first_scan) clock_gettime(CLOCK_MONOTONIC, &ts_match_start);
-    if (mnt_src && entry_count > 0) {
-        config_lock_read();
-        for (int i = 0; i < entry_count && task_count < MAX_TASKS; i++) {
-            if (is_target_app_locked(entries[i].cmdline, entries[i].uid, entries[i].pid, false)) {
-                MountTask *task = malloc(sizeof(MountTask));
-                if (task) {
-                    strncpy(task->cmdline, entries[i].cmdline, sizeof(task->cmdline) - 1);
-                    task->pid = entries[i].pid;
-                    task->uid = entries[i].uid;
-                    task->mnt_src = mnt_src;
-                    tasks[task_count++] = task;
-                }
-            }
-        }
-        config_unlock_read();
-    } else if (entry_count > 0 && !mnt_src && first_scan) {
-        /* FUSE 尚未就绪，候选进程暂无法注入 —— 安排快速重试 */
-        LOG_DBG("初次扫描发现 %d 候选进程但 FUSE 未就绪，安排快速重试", entry_count);
-        seconds_until_next_scan = 1;
-        g_scan_interval_seconds = 1;
-    }
-    if (first_scan) {
-        clock_gettime(CLOCK_MONOTONIC, &ts_match_end);
-        long elapsed = (ts_match_end.tv_sec - ts_match_start.tv_sec) * 1000 +
-                       (ts_match_end.tv_nsec - ts_match_start.tv_nsec) / 1000000;
-        LOG("初次扫描 - 配置匹配完成, %d候选/%d配置, 耗时: %ldms", entry_count, g_app_cfg_count, elapsed);
-    }
-    if (task_count > 0) {
-        for (int i = 0; i < task_count; i++) {
+    if (m_count > 0) {
+        for (int i = 0; i < m_count; i++) {
             struct timespec ts_mnt;
             if (first_scan) clock_gettime(CLOCK_MONOTONIC, &ts_mnt);
-            perform_app_mount(tasks[i]->cmdline, tasks[i]->pid, tasks[i]->uid, tasks[i]->mnt_src, "主动扫描");
+            
+            perform_app_mount(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid, nullptr, "主动扫描");
+            
             if (first_scan) {
                 struct timespec ts_mnt_end;
                 clock_gettime(CLOCK_MONOTONIC, &ts_mnt_end);
                 long el = (ts_mnt_end.tv_sec - ts_mnt.tv_sec) * 1000 +
                           (ts_mnt_end.tv_nsec - ts_mnt.tv_nsec) / 1000000;
-                LOG("初次扫描 - 挂载 %s(PID:%d) 完成, 耗时: %ldms", tasks[i]->cmdline, tasks[i]->pid, el);
+                LOG("初次扫描 - 挂载 %s(PID:%d) 完成, 耗时: %ldms", m_tasks[i].cmdline, m_tasks[i].pid, el);
             }
-            free(tasks[i]);
         }
     }
     if (first_scan) {
-        struct timespec ts_end;
-        clock_gettime(CLOCK_MONOTONIC, &ts_end);
-        long elapsed = (ts_end.tv_sec - ts_start.tv_sec) * 1000 +
-                       (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000;
-        LOG("初次扫描完成 - 共发现 %d 个应用, 总耗时: %ldms", task_count, elapsed);
+        clock_gettime(CLOCK_MONOTONIC, &ts_match_end);
+        long elapsed = (ts_match_end.tv_sec - ts_match_start.tv_sec) * 1000 +
+                       (ts_match_end.tv_nsec - ts_match_start.tv_nsec) / 1000000;
+        LOG("初次扫描 - 配置匹配完成, %d 候选/%d 配置, 耗时: %ldms", m_count, g_app_cfg_count, elapsed);
         first_scan = false;
     }
+    free(m_tasks);
     free(entries);
-    return task_count;
+    return m_count;
 }
+
 void reap_zombies() {
     int status;
     while (waitpid(-1, &status, WNOHANG) > 0);
 }
+
 static void do_cleanup() {
     g_should_exit = 1;
     if (g_inotify_fd >= 0) {
@@ -772,13 +775,11 @@ static void do_cleanup() {
                 usleep(10000);
             }
         }
-        /* 强制卸载残留的 FUSE 挂载（包括陈旧的 "Transport endpoint not connected" 状态） */
         ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
         if (!g_global_cfg.fuse_direct) {
             ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
         }
     }
-    /* 清理媒体 FUSE 实例 */
     if (g_media_fuse.fuse_pid > 0) {
         kill(g_media_fuse.fuse_pid, SIGTERM);
         int status;
@@ -805,6 +806,7 @@ static void do_cleanup() {
     config_destroy_lock();
     fast_pid_cleanup();
 }
+
 int main(int argc, char *argv[]) {
     escape_cgroup();
     sigset_t sig_mask;
@@ -836,10 +838,11 @@ int main(int argc, char *argv[]) {
     for (int x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
         if (x != g_global_root_fd) close(x);
     }
-    int dev_null = open("/dev/null", O_RDWR);
+    int dev_null = open("/dev/null", O_RDWR | O_CLOEXEC);
     dup2(dev_null, 0);
     dup2(dev_null, 1);
     dup2(dev_null, 2);
+    close(dev_null);
     log_init("injector");
     config_init_lock();
     fast_pid_init();
@@ -886,27 +889,14 @@ int main(int argc, char *argv[]) {
     }
     inject_global_fuse();
     if (g_global_fuse.fuse_pid <= 0) exit(1);
-    /* 仅当 media module 为注入目标时才启动专用 FUSE 实例 */
-    {
-        bool need_media_fuse = g_global_cfg.global_inject ||
-                           g_global_cfg.redir_count > 0 ||
-                           g_global_cfg.hide_count > 0 ||
-                           g_global_cfg.ro_count > 0;
-        if (!need_media_fuse) {
-            config_lock_read();
-            AppConfig* media_cfg = find_app_cfg_locked("com.android.providers.media.module", 0);
-            need_media_fuse = (media_cfg && media_cfg->inject_enable &&
-                (media_cfg->redir_count > 0 || media_cfg->hide_count > 0 ||
-                 media_cfg->ro_count > 0 || media_cfg->sandbox));
-            config_unlock_read();
-        }
-        if (need_media_fuse) inject_media_fuse();
+    
+    if (is_media_module_injected_target()) {
+        LOG("检测到 com.android.providers.media.module 在注入目标之列，正在启动专用媒体 FUSE 实例。");
+        inject_media_fuse();
+    } else {
+        LOG_DBG("com.android.providers.media.module 未开启注入，跳过媒体 FUSE 实例的启动。");
     }
-    /*
-     * 不在此处立即执行首次扫描 —— FUSE 守护进程尚未就绪 /mnt/nsp_global 也未传播。
-     * 改为标记延迟扫描，由 handle_fuse_ready_event() 或定时器回调触发首次扫描，
-     * 避免并发挂载子进程在 FUSE 未就绪时拿到 ENOENT。
-     */
+    
     g_pending_first_scan = 1;
     seconds_until_next_scan = 0;
     if (start_passive) {
@@ -972,7 +962,6 @@ int main(int argc, char *argv[]) {
                             seconds_until_next_scan = g_scan_interval_seconds;
                         }
                     }
-                    /* 定时重试之前因 FUSE 未就绪/挂载重建而失败的异步挂载 */
                     if (g_fuse_ready && g_retry_mount_count > 0) {
                         const char *mnt_src_retry = get_active_mnt_src();
                         if (mnt_src_retry) {
@@ -982,23 +971,21 @@ int main(int argc, char *argv[]) {
                                 e->retries++;
                                 if (e->retries > 5) {
                                     LOG_DBG("重试耗尽，放弃 %s(PID:%d)", e->cmdline, e->pid);
-                                    e->pid = -1; /* 标记删除 */
+                                    e->pid = -1; 
                                 } else if (kill(e->pid, 0) != 0) {
                                     LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e->cmdline, e->pid);
-                                    e->pid = -1; /* 标记删除 */
+                                    e->pid = -1; 
                                 } else {
                                     uid_t uid = get_app_uid(e->pid);
                                     LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid, e->retries);
-                                    int ret = perform_app_mount(e->cmdline, e->pid, uid, mnt_src_retry, "失败重试");
+                                    int ret = perform_app_mount(e->cmdline, e->pid, uid, nullptr, "失败重试");
                                     if (ret == 0) {
-                                        /* 挂载成功或跳过（如已有自身FUSE/无规则冲突），移除重试条目 */
                                         LOG_DBG("重试成功/跳过, 移除 %s(PID:%d) 的重试", e->cmdline, e->pid);
                                         e->pid = -1;
                                     }
                                 }
                                 retry_idx++;
                             }
-                            /* 紧凑删除已标记项 */
                             int new_count = 0;
                             for (int i = 0; i < g_retry_mount_count; i++) {
                                 if (g_retry_mounts[i].pid > 0)
@@ -1040,7 +1027,6 @@ int main(int argc, char *argv[]) {
                 g_fuse_ready_pipe_fd = -1;
                 g_fuse_ready_ctx = nullptr;
             } else {
-                /* 核心改造：检查是否属于异步命名空间挂载管道描述符 */
                 int mount_idx = -1;
                 for (int m = 0; m < g_async_mount_count; m++) {
                     if (g_async_mount_fds[m] == fd) {
@@ -1050,6 +1036,8 @@ int main(int argc, char *argv[]) {
                 }
                 if (mount_idx >= 0) {
                     handle_async_mount_event(g_async_mount_ctxs[mount_idx]);
+                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_async_mount_fds[mount_idx], nullptr);
+                    close(g_async_mount_fds[mount_idx]);
                     g_async_mount_fds[mount_idx] = g_async_mount_fds[g_async_mount_count - 1];
                     g_async_mount_ctxs[mount_idx] = g_async_mount_ctxs[g_async_mount_count - 1];
                     g_async_mount_count--;
@@ -1062,23 +1050,29 @@ int main(int argc, char *argv[]) {
         if (g_reload_config && !g_should_exit) {
             g_reload_config = 0;
             fast_pid_cache_clear();
-            ChangedPkg changed_pkgs[128];
+            ChangedPkg out_changed[128];
             config_lock_write();
-            int changed_count = reload_config_rules_diff(INJECTOR_CONFIG_PATH, changed_pkgs, 128);
+            int changed_count = reload_config_rules_diff(INJECTOR_CONFIG_PATH, out_changed, 128);
             config_unlock_write();
             setup_inotify_watches();
             config_publisher_broadcast();
+            
+            if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
+                LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
+                kill(g_media_fuse.fuse_pid, SIGTERM);
+                int status;
+                waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+                g_media_fuse.fuse_pid = 0;
+                ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
+            } else if (g_media_fuse.fuse_pid <= 0 && is_media_module_injected_target() && g_fuse_ready) {
+                LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
+                inject_media_fuse();
+            }
+
             if (changed_count == -1) {
-                LOG_DBG("全局规则变动或重置");
                 audit_tracked_apps();
-                if (!g_passive_mode) {
-                    scan_zygote_children();
-                }
             } else if (changed_count > 0) {
-                LOG_DBG("局部规则分析：检测到 %d 个应用的规则更新", changed_count);
-                audit_and_remount_specific_apps(changed_pkgs, changed_count);
-            } else {
-                LOG_DBG("规则未有实质内容变化，跳过增量审查。");
+                audit_and_remount_specific_apps(out_changed, changed_count);
             }
         }
     }

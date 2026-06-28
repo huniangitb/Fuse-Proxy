@@ -19,6 +19,7 @@
 #include "config_parser.h"
 
 static volatile sig_atomic_t g_running = 1;
+
 void sigint_handler(int sig) {
     (void)sig;
     g_running = 0;
@@ -66,16 +67,8 @@ void usage(const char* prog) {
 }
 
 /* ========== JSON API 结构化输出 ========== */
-
-/* 返回结构化 JSON 响应，供前端 UI 解析
- * 格式: {"status":"ok","command":"cmd","data":...,"timestamp":ts}
- * 错误: {"status":"error","command":"cmd","error":"msg","timestamp":ts}
- */
-
 static void json_api_start(bool api_mode) {
-    if (!api_mode) return;
-    /* 调用者在成功场景调用此函数开启 JSON 输出 */
-    /* 实际输出由 json_api_finish / json_api_error 完成 */
+    (void)api_mode;
 }
 
 static void json_api_finish(bool api_mode, const char *cmd, const char *json_data) {
@@ -93,7 +86,6 @@ static void json_api_error(bool api_mode, const char *cmd, const char *error_msg
     }
     printf("{\"status\":\"error\",\"command\":%s,\"error\":",
            cmd ? cmd : "null");
-    /* 手动转义 error_msg 中的特殊字符 */
     if (error_msg) {
         putchar('"');
         for (const char *p = error_msg; *p; p++) {
@@ -117,7 +109,6 @@ static void json_api_error(bool api_mode, const char *cmd, const char *error_msg
     printf(",\"timestamp\":%lld}\n", (long long)time(NULL));
 }
 
-/* 简单 JSON 转义辅助：将字符串写入缓冲区并转义，返回写入长度 */
 static int json_escape_str(const char *src, char *dst, size_t dst_size) {
     if (!src || !dst || dst_size == 0) return 0;
     size_t pos = 0;
@@ -144,8 +135,6 @@ static int json_escape_str(const char *src, char *dst, size_t dst_size) {
 }
 
 /* ========== 配置文件读写辅助 ========== */
-
-/* 读取 PID 文件，返回 PID 或 -1 */
 static int read_pid_file(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) return -1;
@@ -155,7 +144,6 @@ static int read_pid_file(const char *path) {
     return pid;
 }
 
-/* 向注入器发送 SIGHUP 触发配置重载 */
 static const char* send_reload_signal(void) {
     int pid = read_pid_file(INJECTOR_PID_PATH);
     if (pid <= 0) return "无法读取注入器 PID 文件";
@@ -164,10 +152,9 @@ static const char* send_reload_signal(void) {
         snprintf(err_buf, sizeof(err_buf), "发送 SIGHUP 到 PID %d 失败: %s", pid, strerror(errno));
         return err_buf;
     }
-    return NULL; /* 成功 */
+    return NULL;
 }
 
-/* 获取应用规则文件路径 */
 static void get_app_rule_path(char *buf, size_t size, const char *pkg, int user_id) {
     if (user_id == 0)
         snprintf(buf, size, "%s/App-rules/%s.conf", CONFIG_DIR, pkg);
@@ -175,7 +162,6 @@ static void get_app_rule_path(char *buf, size_t size, const char *pkg, int user_
         snprintf(buf, size, "%s/App-rules-%d/%s.conf", CONFIG_DIR, user_id, pkg);
 }
 
-/* 获取应用规则目录 */
 static void get_app_rule_dir(char *buf, size_t size, int user_id) {
     if (user_id == 0)
         snprintf(buf, size, "%s/App-rules", CONFIG_DIR);
@@ -184,14 +170,10 @@ static void get_app_rule_dir(char *buf, size_t size, int user_id) {
 }
 
 /* ========== 解析本地规则 ========== */
-
-/* 从内存解析后的结构中构建 JSON（类似 config_publisher 的 build_templates_json） */
 static void build_parsed_rules_json(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     size_t pos = 0;
     pos += snprintf(out + pos, out_size - pos, "{");
-
-    /* 全局配置 */
     config_lock_read();
     pos += snprintf(out + pos, out_size - pos,
         "\"global\":{\"sandbox\":%s,\"global_inject\":%s,\"fuse_direct\":%s,\"monitor\":%s,\"inject_enable\":true,\"hide_count\":%d,\"ro_count\":%d,\"redir_count\":%d},",
@@ -202,8 +184,7 @@ static void build_parsed_rules_json(char *out, size_t out_size) {
         g_global_cfg.hide_count,
         g_global_cfg.ro_count,
         g_global_cfg.redir_count);
-
-    /* 应用配置列表 */
+    
     pos += snprintf(out + pos, out_size - pos, "\"apps\":[");
     for (int i = 0; i < g_app_cfg_count; i++) {
         AppConfig *cfg = g_app_cfgs[i];
@@ -226,16 +207,12 @@ static void build_parsed_rules_json(char *out, size_t out_size) {
     pos += snprintf(out + pos, out_size - pos, "]}");
 }
 
-/* 处理 parse-rules: 加载并解析本地磁盘规则，输出 JSON */
 static void handle_parse_rules(bool api_mode) {
-    /* 本地加载：使用 config_parser 的 load_config_rules */
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     config_unlock_write();
-
     char json_buf[65536];
     build_parsed_rules_json(json_buf, sizeof(json_buf));
-
     if (api_mode) {
         json_api_finish(true, "\"parse-rules\"", json_buf);
     } else {
@@ -243,14 +220,11 @@ static void handle_parse_rules(bool api_mode) {
     }
 }
 
-/* 处理 validate-rules: 尝试加载，验证规则语法正确性 */
 static void handle_validate_rules(bool api_mode) {
-    /* 尝试加载，但不保留结果（重新加载一遍然后释放） */
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     int app_count = g_app_cfg_count;
     config_unlock_write();
-
     if (api_mode) {
         char data_buf[512];
         snprintf(data_buf, sizeof(data_buf),
@@ -264,15 +238,13 @@ static void handle_validate_rules(bool api_mode) {
     }
 }
 
-/* 处理 get-global-rules: 本地解析并查看 [GLOBAL] 段全部规则 */
+/* 核心修复：分离 ALLOW 规则和 REDIRECT 规则并输出 */
 static void handle_get_global_rules(bool api_mode) {
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     config_unlock_write();
-
     config_lock_read();
     if (api_mode) {
-        /* 构建 JSON 输出 */
         char data_buf[65536];
         size_t pos = 0;
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
@@ -281,8 +253,7 @@ static void handle_get_global_rules(bool api_mode) {
             g_global_cfg.monitor ? "true" : "false",
             g_global_cfg.sandbox ? "true" : "false",
             g_global_cfg.fuse_direct ? "true" : "false");
-
-        /* HIDE 规则 */
+        
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"hide_rules\":[");
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
             char esc[1024];
@@ -291,8 +262,7 @@ static void handle_get_global_rules(bool api_mode) {
             pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc);
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
-
-        /* RO 规则 */
+        
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"ro_rules\":[");
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
             char esc[1024];
@@ -302,32 +272,54 @@ static void handle_get_global_rules(bool api_mode) {
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
 
-        /* REDIRECT 规则 */
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"redirect_rules\":[");
+        /* 进行规则分流研判 */
+        int real_redir_cnt = 0;
+        int allow_cnt = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
+            if (g_global_cfg.redir_rules[i].real_target[0] == '?') allow_cnt++;
+            else real_redir_cnt++;
+        }
+
+        /* 纯重定向规则输出 (剔除 '?' 伪重定向) */
+        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"redirect_rules\":[");
+        int printed_redir = 0;
+        for (int i = 0; i < g_global_cfg.redir_count; i++) {
+            if (g_global_cfg.redir_rules[i].real_target[0] == '?') continue;
             char esc_v[1024], esc_r[1024];
             json_escape_str(g_global_cfg.redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
             json_escape_str(g_global_cfg.redir_rules[i].real_target, esc_r, sizeof(esc_r));
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
+            if (printed_redir > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
             pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
                 "{\"virtual_prefix\":\"%s\",\"real_target\":\"%s\"}", esc_v, esc_r);
+            printed_redir++;
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
 
-        /* FUSE_EXTRA_ARGS */
+        /* 纯 ALLOW 规则单独输出 */
+        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"allow_rules\":[");
+        int printed_allow = 0;
+        for (int i = 0; i < g_global_cfg.redir_count; i++) {
+            if (g_global_cfg.redir_rules[i].real_target[0] != '?') continue;
+            char esc_v[1024];
+            json_escape_str(g_global_cfg.redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
+            if (printed_allow > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
+            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc_v);
+            printed_allow++;
+        }
+        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+
         char esc_fuse[512];
         json_escape_str(g_global_cfg.fuse_extra_args, esc_fuse, sizeof(esc_fuse));
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
             "\"fuse_extra_args\":\"%s\",", esc_fuse);
-
-        /* 统计计数 */
+        
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "\"counts\":{\"hide\":%d,\"ro\":%d,\"redirect\":%d}}",
+            "\"counts\":{\"hide\":%d,\"ro\":%d,\"redirect\":%d,\"allow\":%d}}",
             g_global_cfg.hide_count,
             g_global_cfg.ro_count,
-            g_global_cfg.redir_count);
+            real_redir_cnt,
+            allow_cnt);
         config_unlock_read();
-
         json_api_finish(true, "\"get-global-rules\"", data_buf);
     } else {
         printf("===== 全局规则 (GLOBAL) =====\n\n");
@@ -336,22 +328,37 @@ static void handle_get_global_rules(bool api_mode) {
         printf("  MONITOR       %s\n", g_global_cfg.monitor ? "ON" : "OFF");
         printf("  SANDBOX       %s\n", g_global_cfg.sandbox ? "ON" : "OFF");
         printf("  FUSE_DIRECT   %s\n", g_global_cfg.fuse_direct ? "ON" : "OFF");
-
         printf("\n--- HIDE 规则 (%d 条) ---\n", g_global_cfg.hide_count);
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
             printf("  [%d] HIDE %s\n", i, g_global_cfg.hide_rules[i]);
         }
-
         printf("\n--- RO 规则 (%d 条) ---\n", g_global_cfg.ro_count);
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
             printf("  [%d] RO %s\n", i, g_global_cfg.ro_rules[i]);
         }
-
-        printf("\n--- REDIRECT 规则 (%d 条) ---\n", g_global_cfg.redir_count);
+        
+        int real_redir_cnt = 0;
+        int allow_cnt = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            printf("  [%d] REDIRECT %s %s\n", i,
+            if (g_global_cfg.redir_rules[i].real_target[0] == '?') allow_cnt++;
+            else real_redir_cnt++;
+        }
+
+        printf("\n--- REDIRECT 规则 (%d 条) ---\n", real_redir_cnt);
+        int idx = 0;
+        for (int i = 0; i < g_global_cfg.redir_count; i++) {
+            if (g_global_cfg.redir_rules[i].real_target[0] == '?') continue;
+            printf("  [%d] REDIRECT %s %s\n", idx++,
                    g_global_cfg.redir_rules[i].virtual_prefix,
                    g_global_cfg.redir_rules[i].real_target);
+        }
+
+        printf("\n--- ALLOW 规则 (%d 条) ---\n", allow_cnt);
+        idx = 0;
+        for (int i = 0; i < g_global_cfg.redir_count; i++) {
+            if (g_global_cfg.redir_rules[i].real_target[0] != '?') continue;
+            printf("  [%d] ALLOW %s\n", idx++,
+                   g_global_cfg.redir_rules[i].virtual_prefix);
         }
 
         if (g_global_cfg.fuse_extra_args[0]) {
@@ -362,12 +369,11 @@ static void handle_get_global_rules(bool api_mode) {
     }
 }
 
-/* 处理 get-app-rules: 根据包名查看指定应用的配置和规则 */
+/* 核心修复：应用配置查询逻辑同步分离 ALLOW */
 static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     config_unlock_write();
-
     config_lock_read();
     AppConfig *cfg = find_app_cfg_locked(pkg, user_id);
     if (!cfg) {
@@ -377,7 +383,6 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         json_api_error(api_mode, "\"get-app-rules\"", err);
         return;
     }
-
     if (api_mode) {
         char data_buf[65536];
         size_t pos = 0;
@@ -391,8 +396,7 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
             cfg->monitor ? "true" : "false",
             cfg->sandbox ? "true" : "false",
             cfg->fuse_direct ? "true" : "false");
-
-        /* HIDE 规则 */
+        
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"hide_rules\":[");
         for (int i = 0; i < cfg->hide_count; i++) {
             char esc[1024];
@@ -401,8 +405,7 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
             pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc);
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
-
-        /* RO 规则 */
+        
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"ro_rules\":[");
         for (int i = 0; i < cfg->ro_count; i++) {
             char esc[1024];
@@ -412,26 +415,46 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
 
-        /* REDIRECT 规则 */
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"redirect_rules\":[");
+        int real_redir_cnt = 0;
+        int allow_cnt = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
+            if (cfg->redir_rules[i].real_target[0] == '?') allow_cnt++;
+            else real_redir_cnt++;
+        }
+
+        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"redirect_rules\":[");
+        int printed_redir = 0;
+        for (int i = 0; i < cfg->redir_count; i++) {
+            if (cfg->redir_rules[i].real_target[0] == '?') continue;
             char esc_v[1024], esc_r[1024];
             json_escape_str(cfg->redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
             json_escape_str(cfg->redir_rules[i].real_target, esc_r, sizeof(esc_r));
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
+            if (printed_redir > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
             pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
                 "{\"virtual_prefix\":\"%s\",\"real_target\":\"%s\"}", esc_v, esc_r);
+            printed_redir++;
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
 
-        /* 统计计数 */
+        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"allow_rules\":[");
+        int printed_allow = 0;
+        for (int i = 0; i < cfg->redir_count; i++) {
+            if (cfg->redir_rules[i].real_target[0] != '?') continue;
+            char esc_v[1024];
+            json_escape_str(cfg->redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
+            if (printed_allow > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
+            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc_v);
+            printed_allow++;
+        }
+        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "\"counts\":{\"hide\":%d,\"ro\":%d,\"redirect\":%d}}",
+            "\"counts\":{\"hide\":%d,\"ro\":%d,\"redirect\":%d,\"allow\":%d}}",
             cfg->hide_count,
             cfg->ro_count,
-            cfg->redir_count);
+            real_redir_cnt,
+            allow_cnt);
         config_unlock_read();
-
         json_api_finish(true, "\"get-app-rules\"", data_buf);
     } else {
         printf("===== 应用规则: %s (UID %d) =====\n\n", cfg->pkg_name, cfg->user_id);
@@ -440,22 +463,37 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         printf("  MONITOR       %s\n", cfg->monitor ? "ON" : "OFF");
         printf("  SANDBOX       %s\n", cfg->sandbox ? "ON" : "OFF");
         printf("  FUSE_DIRECT   %s\n", cfg->fuse_direct ? "ON" : "OFF");
-
         printf("\n--- HIDE 规则 (%d 条) ---\n", cfg->hide_count);
         for (int i = 0; i < cfg->hide_count; i++) {
             printf("  [%d] HIDE %s\n", i, cfg->hide_rules[i]);
         }
-
         printf("\n--- RO 规则 (%d 条) ---\n", cfg->ro_count);
         for (int i = 0; i < cfg->ro_count; i++) {
             printf("  [%d] RO %s\n", i, cfg->ro_rules[i]);
         }
 
-        printf("\n--- REDIRECT 规则 (%d 条) ---\n", cfg->redir_count);
+        int real_redir_cnt = 0;
+        int allow_cnt = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
-            printf("  [%d] REDIRECT %s %s\n", i,
+            if (cfg->redir_rules[i].real_target[0] == '?') allow_cnt++;
+            else real_redir_cnt++;
+        }
+
+        printf("\n--- REDIRECT 规则 (%d 条) ---\n", real_redir_cnt);
+        int idx = 0;
+        for (int i = 0; i < cfg->redir_count; i++) {
+            if (cfg->redir_rules[i].real_target[0] == '?') continue;
+            printf("  [%d] REDIRECT %s %s\n", idx++,
                    cfg->redir_rules[i].virtual_prefix,
                    cfg->redir_rules[i].real_target);
+        }
+
+        printf("\n--- ALLOW 规则 (%d 条) ---\n", allow_cnt);
+        idx = 0;
+        for (int i = 0; i < cfg->redir_count; i++) {
+            if (cfg->redir_rules[i].real_target[0] != '?') continue;
+            printf("  [%d] ALLOW %s\n", idx++,
+                   cfg->redir_rules[i].virtual_prefix);
         }
 
         if (cfg->fuse_extra_args[0]) {
@@ -467,8 +505,6 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
 }
 
 /* ========== 配置管理命令 ========== */
-
-/* 处理 reload-config: 向注入器发送 SIGHUP 信号 */
 static void handle_reload_config(bool api_mode) {
     const char *err = send_reload_signal();
     if (err) {
@@ -487,13 +523,9 @@ static void handle_reload_config(bool api_mode) {
 }
 
 /* ========== 系统状态 ========== */
-
-/* 处理 status: 全面系统状态 */
 static void handle_status(bool api_mode) {
-    /* 收集所有状态 */
     int injector_pid = read_pid_file(INJECTOR_PID_PATH);
     bool injector_alive = (injector_pid > 0 && kill(injector_pid, 0) == 0);
-
     int fuse_pid = 0;
     FILE *fp = fopen("/proc/self/mountinfo", "r");
     if (fp) {
@@ -508,13 +540,11 @@ static void handle_status(bool api_mode) {
         }
         fclose(fp);
     }
-
     bool fuse_alive = (fuse_pid > 0 && kill(fuse_pid, 0) == 0);
     int main_conf_size = 0;
     struct stat st;
     if (stat(INJECTOR_CONFIG_PATH, &st) == 0) main_conf_size = (int)st.st_size;
-
-    /* 扫描 App-rules 目录 */
+    
     int app_rule_files = 0;
     DIR *dir = opendir(CONFIG_DIR);
     if (dir) {
@@ -540,12 +570,11 @@ static void handle_status(bool api_mode) {
         }
         closedir(dir);
     }
-
-    /* 统计当前内存中的配置 */
+    
     config_lock_read();
     int mem_app_count = g_app_cfg_count;
     config_unlock_read();
-
+    
     if (api_mode) {
         char data_buf[4096];
         char time_str[64];
@@ -553,7 +582,6 @@ static void handle_status(bool api_mode) {
         struct tm tm_info;
         localtime_r(&now, &tm_info);
         strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm_info);
-
         snprintf(data_buf, sizeof(data_buf),
             "{\"timestamp\":%lld,\"time\":\"%s\","
             "\"injector\":{\"pid\":%d,\"alive\":%s},"
@@ -579,13 +607,6 @@ static void handle_status(bool api_mode) {
 }
 
 /* ========== set-rule / remove-rule 处理 ========== */
-
-/*
- * 行指针操作辅助函数
- * 流程：先 read_lines 索引全部行 → 扫描段边界 → 对目标行插入/替换/删除
- */
-
-/* 读取文件全部行到内存，返回 lines 数组和行数 */
 static char **read_file_lines(const char *path, int *out_count, int *out_cap) {
     FILE *fp = fopen(path, "r");
     if (!fp) { *out_count = 0; *out_cap = 0; return NULL; }
@@ -618,7 +639,6 @@ static char **read_file_lines(const char *path, int *out_count, int *out_cap) {
     return lines;
 }
 
-/* 写回文件，成功返回 true */
 static bool write_file_lines(const char *path, char **lines, int count) {
     FILE *fp = fopen(path, "w");
     if (!fp) return false;
@@ -629,13 +649,11 @@ static bool write_file_lines(const char *path, char **lines, int count) {
     return true;
 }
 
-/* 释放 lines 数组 */
 static void free_file_lines(char **lines, int count) {
     for (int i = 0; i < count; i++) free(lines[i]);
     free(lines);
 }
 
-/* 在 pos 位置插入一行 text，返回新行数或 -1 */
 static int insert_line_at(char ***lines, int *cap, int count, int pos, const char *text) {
     if (pos < 0 || pos > count) return -1;
     if (count >= *cap) {
@@ -649,7 +667,6 @@ static int insert_line_at(char ***lines, int *cap, int count, int pos, const cha
     return (*lines)[pos] ? count + 1 : -1;
 }
 
-/* 删除 pos 位置的行 */
 static void remove_line_at(char **lines, int *count, int pos) {
     if (pos < 0 || pos >= *count) return;
     free(lines[pos]);
@@ -657,12 +674,10 @@ static void remove_line_at(char **lines, int *count, int pos) {
     (*count)--;
 }
 
-/* 在数组末尾追加一行，返回新行数或 -1 */
 static int append_line(char ***lines, int *cap, int count, const char *text) {
     return insert_line_at(lines, cap, count, count, text);
 }
 
-/* 查找段头 [name] 的索引，支持 [name:uid] 匹配 */
 static int find_section_header(char **lines, int count, const char *name) {
     size_t nlen = strlen(name);
     for (int i = 0; i < count; i++) {
@@ -676,7 +691,6 @@ static int find_section_header(char **lines, int count, const char *name) {
     return -1;
 }
 
-/* 查找段内 [header_idx] 段中 type 类型开关的行索引，未找到返回 -1 */
 static int find_switch_in_section(char **lines, int count, int header_idx, const char *type) {
     size_t tlen = strlen(type);
     for (int i = header_idx + 1; i < count; i++) {
@@ -691,40 +705,23 @@ static int find_switch_in_section(char **lines, int count, int header_idx, const
     return -1;
 }
 
-/*
- * set-rule 写入规则到应用配置文件
- * 格式: log_ctl set-rule <pkg> <type> <value> [--uid uid] [api]
- * type:
- *   HIDE <path>          - 添加隐藏路径
- *   RO <path>            - 添加只读路径
- *   REDIRECT <src> <dst> - 添加重定向规则 (value格式: "src|dst")
- *   ALLOW <path>         - 添加允许规则
- *   MONITOR ON|OFF       - 设置监控开关
- *   SANDBOX ON|OFF       - 设置沙盒开关
- *   GLOBAL_INJECT ON|OFF - 设置全局注入
- *   FUSE_DIRECT ON|OFF   - 设置FUSE直通
- */
 static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                             const char *value, int user_id) {
     if (!pkg || !type || !value) {
         json_api_error(api_mode, "\"set-rule\"", "缺少必要参数: pkg type value");
         return;
     }
-
     char rule_path[PATH_MAX];
     if (strcmp(pkg, "GLOBAL") == 0) {
         snprintf(rule_path, sizeof(rule_path), "%s", INJECTOR_CONFIG_PATH);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
-        /* 确保目录存在 */
         char rule_dir[PATH_MAX];
         get_app_rule_dir(rule_dir, sizeof(rule_dir), user_id);
         mkdir_recursive(rule_dir);
     }
-
     char line[1024];
     if (strcmp(type, "REDIRECT") == 0) {
-        /* value 格式: "source|target" */
         char src[512], dst[512];
         const char *sep = strchr(value, '|');
         if (sep) {
@@ -751,17 +748,11 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         snprintf(line, sizeof(line), "%s %s\n", type, value);
     } else {
         char err_buf[128];
-        snprintf(err_buf, sizeof(err_buf), "未知规则类型: %s (支持: HIDE, RO, REDIRECT, ALLOW, MONITOR, SANDBOX, GLOBAL_INJECT, FUSE_DIRECT)", type);
+        snprintf(err_buf, sizeof(err_buf), "未知规则类型: %s", type);
         json_api_error(api_mode, "\"set-rule\"", err_buf);
         return;
     }
-
-    /*
-     * GLOBAL 规则（包括开关和路径类）:
-     * 先索引行 → 找到 GLOBAL 段 → 对目标行替换或插入 → 写回
-     * 开关类（MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT）支持原地更新已有行；
-     * 路径类（HIDE/RO/REDIRECT/ALLOW）不支持更新，始终在 [GLOBAL] 行后插入。
-     */
+    
     bool is_global_switch = (strcmp(type, "MONITOR") == 0 ||
                              strcmp(type, "SANDBOX") == 0 ||
                              strcmp(type, "GLOBAL_INJECT") == 0 ||
@@ -770,7 +761,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         int line_count = 0, line_cap = 0;
         char **lines = read_file_lines(rule_path, &line_count, &line_cap);
         if (!lines) {
-            /* 文件不存在，直接创建并写入 [GLOBAL] 段 */
             FILE *fp = fopen(rule_path, "w");
             if (!fp) {
                 char err_buf[256];
@@ -783,13 +773,9 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
             fclose(fp);
             goto report_success;
         }
-
-        /* 索引 GLOBAL 段头位置 */
         int hdr = find_section_header(lines, line_count, "GLOBAL");
         bool changed = false;
-
         if (is_global_switch && hdr >= 0) {
-            /* 开关类：查找已有同类型开关行 */
             int old = find_switch_in_section(lines, line_count, hdr, type);
             if (old >= 0) {
                 if (strcmp(lines[old], line) != 0) {
@@ -802,9 +788,7 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                     }
                     changed = true;
                 }
-                /* 内容相同则跳过写回 */
             } else {
-                /* 未找到：在段头后插入 */
                 int new_count = insert_line_at(&lines, &line_cap, line_count, hdr + 1, line);
                 if (new_count < 0) {
                     free_file_lines(lines, line_count);
@@ -815,7 +799,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                 changed = true;
             }
         } else if (hdr >= 0) {
-            /* 路径类：在段头后插入，但先检查是否已有相同行避免重复 */
             bool dup = false;
             for (int i = hdr + 1; i < line_count; i++) {
                 char *p = lines[i];
@@ -834,7 +817,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                 changed = true;
             }
         } else {
-            /* 连 [GLOBAL] 段都没有：追加 [GLOBAL] 段和新规则 */
             int new_count = append_line(&lines, &line_cap, line_count, "[GLOBAL]\n");
             if (new_count < 0) {
                 free_file_lines(lines, line_count);
@@ -851,7 +833,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
             line_count = new_count;
             changed = true;
         }
-
         if (changed) {
             if (!write_file_lines(rule_path, lines, line_count)) {
                 char err_buf[256];
@@ -863,7 +844,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         }
         free_file_lines(lines, line_count);
     } else {
-        /* 非 GLOBAL 包：追加到应用配置文件末尾 */
         FILE *fp = fopen(rule_path, "a");
         if (!fp) {
             char err_buf[256];
@@ -880,7 +860,6 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         }
         fclose(fp);
     }
-
 report_success:
     if (api_mode) {
         char data_buf[1024];
@@ -896,7 +875,6 @@ report_success:
     }
 }
 
-/* remove-rule: 从文件中删除指定索引的规则 */
 static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
                                int index, int user_id) {
     if (!pkg || !type) {
@@ -907,15 +885,12 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         json_api_error(api_mode, "\"remove-rule\"", "索引必须 >= 0");
         return;
     }
-
     char rule_path[PATH_MAX];
     if (strcmp(pkg, "GLOBAL") == 0) {
         snprintf(rule_path, sizeof(rule_path), "%s", INJECTOR_CONFIG_PATH);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
     }
-
-    /* 先索引全部行，再定位目标删除 */
     int line_count = 0, line_cap = 0;
     char **lines = read_file_lines(rule_path, &line_count, &line_cap);
     if (!lines) {
@@ -924,14 +899,11 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
-
-    /* 扫描全部行，找到第 index 条 type 类型规则 */
     int found_idx = -1, skip_idx = 0;
     size_t tlen = strlen(type);
     for (int i = 0; i < line_count; i++) {
         char *p = lines[i];
         while (isspace((unsigned char)*p)) p++;
-        /* 跳过注释 */
         if (p[0] == '#') continue;
         bool is_type_rule = (strncasecmp(p, type, tlen) == 0 &&
                             (p[tlen] == ' ' || p[tlen] == '\t'));
@@ -940,7 +912,6 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
             skip_idx++;
         }
     }
-
     if (found_idx < 0) {
         free_file_lines(lines, line_count);
         char err_buf[128];
@@ -948,11 +919,7 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
-
-    /* 删除目标行 */
     remove_line_at(lines, &line_count, found_idx);
-
-    /* 写回文件 */
     if (!write_file_lines(rule_path, lines, line_count)) {
         char err_buf[256];
         snprintf(err_buf, sizeof(err_buf), "无法写入规则文件 %s: %s", rule_path, strerror(errno));
@@ -961,7 +928,6 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         return;
     }
     free_file_lines(lines, line_count);
-
     if (api_mode) {
         char esc_file[256];
         json_escape_str(rule_path, esc_file, sizeof(esc_file));
@@ -975,7 +941,7 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
     }
 }
 
-/* ========== 配置广播接收（原有） ========== */
+/* ========== 配置广播接收 ========== */
 static int config_broadcast_connect(void) {
     int sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (sock < 0) {
@@ -993,6 +959,7 @@ static int config_broadcast_connect(void) {
     }
     return sock;
 }
+
 static int config_broadcast_send_cmd(int sock, const char *cmd) {
     struct sockaddr_un pub = { .sun_family = AF_UNIX };
     pub.sun_path[0] = '\0';
@@ -1001,6 +968,7 @@ static int config_broadcast_send_cmd(int sock, const char *cmd) {
     return sendto(sock, cmd, strlen(cmd), MSG_NOSIGNAL,
                   (struct sockaddr *)&pub, pub_len);
 }
+
 static ssize_t config_broadcast_recv(int sock, char *buf, size_t size, int timeout_ms) {
     struct pollfd pfd = { .fd = sock, .events = POLLIN };
     int ret = poll(&pfd, 1, timeout_ms);
@@ -1010,7 +978,9 @@ static ssize_t config_broadcast_recv(int sock, char *buf, size_t size, int timeo
     if (n > 0) buf[n] = '\0';
     return n;
 }
+
 #define BROADCAST_RECEIVE_MAX_SIZE (256 * 1024)
+
 static void handle_get_config(bool api_mode, bool static_mode) {
     int sock = config_broadcast_connect();
     if (sock < 0) return;
@@ -1041,6 +1011,7 @@ static void handle_get_config(bool api_mode, bool static_mode) {
     }
     free(resp);
 }
+
 static void handle_stream_config(bool api_mode) {
     int sock = config_broadcast_connect();
     if (sock < 0) return;
@@ -1089,6 +1060,7 @@ static void handle_stream_config(bool api_mode) {
     free(resp);
     close(sock);
 }
+
 void process_and_print(char* line, bool force_uid, [[maybe_unused]] bool api_mode) {
     char* open_b = strchr(line, '[');
     if (open_b && !force_uid) {
@@ -1101,7 +1073,6 @@ void process_and_print(char* line, bool force_uid, [[maybe_unused]] bool api_mod
                 for (char* c = open_p + 1; c < close_p; c++) if (!isdigit((unsigned char)*c)) is_uid = false;
                 if (is_uid) memmove(open_p, close_p + 1, strlen(close_p + 1) + 1);
             } else {
-                /* 没有找到 )：可能是截断导致，尝试找到 ] 或行尾作为终止点 */
                 char* close_b = strchr(open_p, ']');
                 char* term = close_b ? close_b : (open_p + strlen(open_p));
                 if (term > open_p) {
@@ -1117,6 +1088,7 @@ void process_and_print(char* line, bool force_uid, [[maybe_unused]] bool api_mod
     printf("%s\n", line);
     fflush(stdout);
 }
+
 static void handle_list_injected(bool api_mode) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -1144,11 +1116,9 @@ static void handle_list_injected(bool api_mode) {
     }
     resp[n] = '\0';
     if (api_mode) {
-        /* 将 DONE 行剥离出来作为单独字段，不混入 raw 内容 */
         char *done_line = NULL;
         int done_total = 0;
         bool has_done = false;
-
         done_line = strstr(resp, "\nDONE|");
         if (done_line) {
             *done_line = '\0';
@@ -1157,11 +1127,9 @@ static void handle_list_injected(bool api_mode) {
             done_line = resp;
             resp[0] = '\0';
         }
-
         if (done_line && sscanf(done_line + 5, "%d", &done_total) == 1) {
             has_done = true;
         }
-
         char esc[8192];
         json_escape_str(resp, esc, sizeof(esc));
         char data_buf[8192 + 128];
@@ -1196,13 +1164,9 @@ static void handle_list_injected(bool api_mode) {
     printf("\n共计 %d 个应用已注入\n", total);
 }
 
-/* ========== 用户列表 ========== */
-
-/* 处理 list-users: 列出当前活跃用户及每个用户下的应用配置数 */
 static void handle_list_users(bool api_mode) {
     config_lock_read();
     int count = g_active_user_count;
-
     if (api_mode) {
         char data_buf[4096];
         size_t pos = 0;
@@ -1210,7 +1174,6 @@ static void handle_list_users(bool api_mode) {
             "{\"count\":%d,\"users\":[", count);
         for (int i = 0; i < count; i++) {
             int uid = g_active_users[i];
-            /* 统计该用户下已解析的应用数 */
             int app_cnt = 0;
             for (int j = 0; j < g_app_cfg_count; j++) {
                 if (g_app_cfgs[j]->user_id == uid) app_cnt++;
@@ -1221,7 +1184,6 @@ static void handle_list_users(bool api_mode) {
         }
         pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "]}");
         config_unlock_read();
-
         json_api_finish(true, "\"list-users\"", data_buf);
     } else {
         printf("===== 活跃用户列表 (%d) =====\n", count);
@@ -1288,7 +1250,6 @@ static void stream_logs(const char* stream_cmd) {
             } else if (line_pos < sizeof(line_buf) - 1) {
                 line_buf[line_pos++] = buf[i];
             } else {
-                /* 行缓冲已满但还未遇到 \n：先刷出当前内容，继续接收续传 */
                 line_buf[line_pos] = '\0';
                 process_and_print(line_buf, false, false);
                 line_pos = 0;
@@ -1302,8 +1263,6 @@ static void stream_logs(const char* stream_cmd) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) usage(argv[0]);
-
-    /* 解析全局选项和位置参数 */
     bool api_mode = false;
     bool force_uid = false;
     bool static_mode = false;
@@ -1311,7 +1270,6 @@ int main(int argc, char *argv[]) {
     char *pos_args[10] = {NULL};
     int pos_idx = 0;
     int user_id = 0;
-
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "api") == 0) {
             api_mode = true;
@@ -1341,8 +1299,7 @@ int main(int argc, char *argv[]) {
         }
     }
     if (pos_idx < 1) usage(argv[0]);
-
-    /* 处理新的本地规则解析与配置命令 */
+    
     if (strcmp(pos_args[0], "parse-rules") == 0) {
         handle_parse_rules(api_mode);
         return 0;
@@ -1388,8 +1345,6 @@ int main(int argc, char *argv[]) {
         handle_remove_rule(api_mode, pos_args[1], pos_args[2], index, user_id);
         return 0;
     }
-
-    /* 处理流式命令 */
     if (strncmp(pos_args[0], "stream", 6) == 0) {
         const char *level = level_arg ? level_arg : "0";
         char stream_cmd[64] = {0};
@@ -1423,8 +1378,6 @@ int main(int argc, char *argv[]) {
         handle_stream_config(api_mode);
         return 0;
     }
-
-    /* log-count 需要连接日志服务 */
     if (strcmp(pos_args[0], "log-count") == 0) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in log_addr;
@@ -1459,8 +1412,7 @@ int main(int argc, char *argv[]) {
         }
         return 0;
     }
-
-    /* 其余命令（search / clear）需要连接日志服务 */
+    
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("创建 socket 失败");
@@ -1502,7 +1454,7 @@ int main(int argc, char *argv[]) {
         close(sock);
         return 1;
     }
-    /* 使用动态缓冲区：避免固定 16KB 限制导致响应截断 */
+    
     size_t cap = 65536;
     char *resp = malloc(cap);
     if (!resp) { close(sock); return 1; }
@@ -1520,31 +1472,26 @@ int main(int argc, char *argv[]) {
     if (total > 0) {
         resp[total] = '\0';
         if (api_mode) {
-            /* search/clear 的 API 模式：将 DONE 行剥离出来作为单独字段，不混入 raw 内容 */
             char *done_line = NULL;
             int done_total = 0, done_remaining = 0;
             bool has_done = false;
-
             done_line = strstr(resp, "\nDONE|");
             if (done_line) {
-                *done_line = '\0';      /* 截断 resp，只保留 DONE 之前的内容作为 raw */
-                done_line++;            /* 移到 "DONE|..." */
+                *done_line = '\0';      
+                done_line++;            
             } else if (strncmp(resp, "DONE|", 5) == 0) {
-                done_line = resp;       /* 只有 DONE 行，raw 为空 */
+                done_line = resp;       
                 resp[0] = '\0';
             }
-
             if (done_line && sscanf(done_line + 5, "%d|%d", &done_total, &done_remaining) >= 1) {
                 has_done = true;
             }
-
-            /* 动态分配 JSON 转义缓冲区（最多 6x 膨胀）和 data 缓冲区 */
+            
             size_t raw_len = strlen(resp);
             size_t esc_cap = raw_len * 6 + 1;
             char *esc = malloc(esc_cap);
             if (!esc) { free(resp); close(sock); return 1; }
             json_escape_str(resp, esc, esc_cap);
-
             size_t data_cap = esc_cap + 256;
             char *data_buf = malloc(data_cap);
             if (!data_buf) { free(esc); free(resp); close(sock); return 1; }

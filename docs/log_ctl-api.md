@@ -135,6 +135,7 @@ fun logCtl(vararg args: String): String {
 | | [`log-count`](#17-log-count--日志统计) | 获取各日志缓冲区总计条数 |
 | | [`list-injected`](#14-list-injected--已注入列表) | 查看已注入应用列表 |
 | **流式日志** | [`stream-io / stream-sys / stream-logcat / stream-all`](#18-流式日志命令) | 实时流式输出日志 |
+| **前端接入** | [日志格式与前端展示规范](#日志格式与前端展示规范) | 日志格式解析规则、前端格式化显示建议 |
 
 > ⚠️ **重要**：`stream-*` 和 `stream-config` 是长连接命令，会持续输出直到进程被终止。前端调用时应当**异步启动进程**，逐行读取 stdout。
 
@@ -791,6 +792,391 @@ log_ctl stream-all [--level level] [api]
 ### 前端处理方式
 
 参考 [`stream-config` 的前端处理](#4-stream-config--订阅配置变更)。
+
+---
+
+## 日志格式与前端展示规范
+
+本章节为前端应用提供日志数据的格式解析规则和格式化显示建议。
+
+### 日志格式规范
+
+#### 三种日志类型总览
+
+| 类型 | 说明 | 缓冲区容量 | 级别过滤 | 写入来源 |
+|------|------|-----------|---------|---------|
+| SYS | 系统日志（注入器、FUSE 等组件运行日志） | 50,000 条 | 支持 (`--level`) | 各组件通过 TCP 发送 |
+| IO | I/O 操作日志（FUSE 文件操作记录） | 262,144 条 | 不支持 | FUSE 守护进程 |
+| Logcat | Android Logcat 日志 | 100,000 条 | 不支持 | 系统 logcat |
+
+#### SYS 系统日志行格式
+
+search 查询结果中，SYS 日志的 message 部分有两种格式：
+
+**格式 A**（无级别前缀）：
+
+```
+[进程名] 消息内容
+```
+
+**格式 B**（带 `LOG_SYS:` 级别前缀）：
+
+```
+LOG_SYS:<级别数字>:[进程名] 消息内容
+```
+
+实际输出示例：
+
+```
+[fuse_daemon] 已接收通知，重新加载配置
+LOG_SYS:1:[fuse_daemon] FUSE Passthrough: 🟢 启用成功
+LOG_SYS:0:[injector] IPC 服务已启动
+```
+
+> **注意**：PID 不一定出现，格式取决于日志来源。前端解析时应兼容两种格式。
+
+SYS 日志级别定义：
+
+| 值 | 级别 | 建议前景色 |
+|----|------|-----------|
+| 0 | DEBUG | #9E9E9E（灰色） |
+| 1 | INFO | #2196F3（蓝色） |
+| 2 | WARN | #FF9800（橙色） |
+| 3 | ERROR | #F44336（红色） |
+
+#### IO 日志行格式
+
+```
+[操作类型] /路径
+```
+
+带重定向时：
+
+```
+[操作类型] /源路径 -> /目标路径
+```
+
+IO 操作类型一览：
+
+| 操作类型 | 说明 | 建议颜色 |
+|---------|------|---------|
+| OPEN | 打开文件 | #4CAF50（绿色） |
+| CREATE | 创建文件 | #4CAF50（绿色） |
+| READ | 读取文件 | #2196F3（蓝色） |
+| WRITE | 写入文件 | #FF9800（橙色） |
+| UNLINK | 删除文件 | #F44336（红色） |
+| MKDIR | 创建目录 | #4CAF50（绿色） |
+| RMDIR | 删除目录 | #F44336（红色） |
+| RENAME | 重命名 | #9C27B0（紫色） |
+| GETATTR | 获取属性 | #9E9E9E（灰色） |
+| ACCESS | 访问检查 | #9E9E9E（灰色） |
+| TRUNCATE | 截断文件 | #FF9800（橙色） |
+| UTIMENS | 修改时间 | #9E9E9E（灰色） |
+| CHMOD | 修改权限 | #9C27B0（紫色） |
+| CHOWN | 修改所有者 | #9C27B0（紫色） |
+| READLINK | 读取链接 | #2196F3（蓝色） |
+| STATFS | 文件系统信息 | #9E9E9E（灰色） |
+| OPENDIR | 打开目录 | #4CAF50（绿色） |
+| READDIR | 读取目录 | #2196F3（蓝色） |
+
+#### Logcat 日志行格式
+
+直接为 Android logcat 原始文本，无固定结构。
+
+---
+
+### search 查询结果解析
+
+#### API 响应结构
+
+```json
+{
+  "status": "ok",
+  "command": "search",
+  "data": {
+    "raw": "2024-06-28 00:20:00 [injector(1234)] 注入成功\n2024-06-28 00:20:01 [fuse_daemon(5678)] 路径拒绝",
+    "done": {
+      "total": 10,
+      "remaining": 5
+    }
+  }
+}
+```
+
+#### raw 字段逐行解析
+
+`raw` 字段为多行文本，每行格式：
+
+```
+YYYY-MM-DD HH:MM:SS | 消息内容
+```
+
+**分隔规则**：
+
+1. 按 `\n` 分割得到每一行
+2. 每行按**第一个** `|` 分割为 **时间戳** 和 **消息体**
+3. 消息体的格式取决于日志类型（SYS 为 `[进程名] 内容` 或 `LOG_SYS:级别:[进程名] 内容`，IO 为 `[操作类型] /路径`，Logcat 为原始文本）
+
+> **注意**：`|` 字符在消息体中可能出现（如 IO 日志的重定向路径），但时间戳与消息体之间的分隔符始终是**第一个** `|`。
+
+#### 分页计算
+
+```kotlin
+// 获取总条数
+val countJson = logCtl("log-count", "api")
+val totalCount = countJson.getJSONObject("data").getInt("sys") // 或 "io" / "logcat"
+
+// 分页查询
+val pageSize = 50
+val totalPages = (totalCount + pageSize - 1) / pageSize
+
+// 第 N 页（从 1 开始）
+val offset = (page - 1) * pageSize
+logCtl("search-sys", "", pageSize.toString(), offset.toString(), "api")
+```
+
+#### Kotlin 解析示例
+
+```kotlin
+data class LogEntry(
+    val timestamp: String,    // "2026-07-04 11:41:03"
+    val message: String,      // "[fuse_daemon] 已接收通知" 或 "LOG_SYS:1:[fuse_daemon] FUSE 启用成功"
+    val level: Int? = null,   // SYS 日志：0-3（从 LOG_SYS 前缀提取）；IO/Logcat：null
+    val processName: String? = null  // "fuse_daemon"
+)
+
+fun parseSearchResult(jsonStr: String): List<LogEntry> {
+    val json = JSONObject(jsonStr)
+    val data = json.getJSONObject("data")
+    val raw = data.getString("raw")
+    val entries = mutableListOf<LogEntry>()
+
+    // 兼容两种 SYS 日志格式的正则
+    val logSysRegex = Regex("""LOG_SYS:(\d+):\[(\w+)\]""")  // 格式 B: LOG_SYS:级别:[进程名]
+    val bracketRegex = Regex("""\[(\w+)\]""")                // 格式 A: [进程名]
+
+    for (line in raw.split("\n")) {
+        if (line.isBlank()) continue
+        val pipeIdx = line.indexOf('|')
+        if (pipeIdx < 0) continue
+
+        val timestamp = line.substring(0, pipeIdx).trim()
+        val message = line.substring(pipeIdx + 1).trim()
+
+        var level: Int? = null
+        var processName: String? = null
+
+        // 优先匹配格式 B（带 LOG_SYS 前缀）
+        val logSysMatch = logSysRegex.find(message)
+        if (logSysMatch != null) {
+            level = logSysMatch.groupValues[1].toIntOrNull()
+            processName = logSysMatch.groupValues[2]
+        } else {
+            // 匹配格式 A（仅 [进程名]）
+            val bracketMatch = bracketRegex.find(message)
+            if (bracketMatch != null) {
+                processName = bracketMatch.groupValues[1]
+            }
+        }
+
+        entries.add(LogEntry(
+            timestamp = timestamp,
+            message = message,
+            level = level,
+            processName = processName
+        ))
+    }
+    return entries
+}
+```
+
+---
+
+### stream 流式日志解析
+
+#### 各子命令输出格式对照
+
+| 子命令 | api 模式输出 | 非 api 模式输出 |
+|--------|-------------|---------------|
+| `stream-sys` | JSON 包装，data 中含 level 前缀 | 逐行原始文本 |
+| `stream-io` | 逐行原始文本（无 JSON 包装） | 逐行原始文本 |
+| `stream-logcat` | 逐行原始文本（无 JSON 包装） | 逐行原始文本 |
+| `stream-all` | 逐行原始文本（混合，无 JSON 包装） | 逐行原始文本 |
+
+> **重要**：除 `stream-sys` 外，其他 stream 命令即使加了 `api` 参数，也只输出纯文本行（无 JSON 包装）。
+
+#### stream-sys API 模式详解
+
+调用命令：
+
+```bash
+log_ctl stream-sys --level 1 api
+```
+
+log_monitor 收到 `STREAM_SYS_API:1` 命令后，会为每条 SYS 日志前插级别标签：
+
+```
+<级别数字>|<原始消息>
+```
+
+示例输出：
+
+```
+1|[injector(1234)] 注入成功
+2|[fuse_daemon(5678)] 路径拒绝
+3|[injector(1234)] 注入失败: 权限不足
+```
+
+**解析规则**：
+
+1. 按行读取
+2. 每行按第一个 `|` 分割
+3. 左侧为级别数字（0=DEBUG, 1=INFO, 2=WARN, 3=ERROR）
+4. 右侧为消息体，格式为 `[进程名(PID)] 内容`
+
+#### stream-sys 非 API 模式
+
+调用命令：
+
+```bash
+log_ctl stream-sys --level 1
+```
+
+log_monitor 收到 `STREAM_SYS:1` 命令后，**不添加**级别标签，直接输出原始消息：
+
+```
+[injector(1234)] 注入成功
+[fuse_daemon(5678)] 路径拒绝
+```
+
+#### stream-io / stream-logcat / stream-all
+
+所有模式均输出原始文本行，无 JSON 包装，无级别标签。
+
+`stream-all` 混合输出三种日志，前端可通过消息格式初步区分：
+
+- 含 `[操作类型] /path` 格式的为 IO 日志
+- 含 `[进程名(PID)]` 格式的为 SYS 日志
+- 其余为 Logcat 日志
+
+#### Kotlin 流式处理示例
+
+```kotlin
+fun streamSysLogs(minLevel: Int = 0, callback: (LogEntry) -> Unit): Process {
+    val proc = ProcessBuilder()
+        .command("/data/Namespace-Proxy/bin/log_ctl", "stream-sys",
+                 "--level", minLevel.toString(), "api")
+        .start()
+
+    thread {
+        proc.inputStream.bufferedReader().use { reader ->
+            var line = reader.readLine()
+            while (line != null) {
+                // stream-sys API 模式：格式为 "级别|消息"
+                val pipeIdx = line.indexOf('|')
+                if (pipeIdx > 0) {
+                    val level = line.substring(0, pipeIdx).toIntOrNull()
+                    val message = line.substring(pipeIdx + 1)
+                    // 兼容两种格式：LOG_SYS:级别:[进程名] 或 [进程名]
+                    val logSysRegex = Regex("""LOG_SYS:\d+:\[(\w+)\]""")
+                    val bracketRegex = Regex("""\[(\w+)\]""")
+                    val match = logSysRegex.find(message) ?: bracketRegex.find(message)
+                    callback(LogEntry(
+                        timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()),
+                        message = message,
+                        level = level,
+                        processName = match?.groupValues?.get(1)
+                    ))
+                }
+                line = reader.readLine()
+            }
+        }
+    }
+    return proc
+}
+```
+
+---
+
+### 前端格式化显示规范
+
+#### 日志级别着色方案
+
+| 级别 | 值 | 推荐文字色 | 推荐背景色 | 说明 |
+|------|---|-----------|-----------|------|
+| DEBUG | 0 | #9E9E9E | 透明 | 低优先级调试信息 |
+| INFO | 1 | #2196F3 | 透明 | 常规运行信息 |
+| WARN | 2 | #FF9800 | #FFF3E0 | 警告信息 |
+| ERROR | 3 | #F44336 | #FFEBEE | 错误信息 |
+
+#### 日志类型分Tab建议
+
+建议前端提供三个 Tab 页签：
+
+| Tab | 标签 | 数据源 | 特殊处理 |
+|-----|------|--------|---------|
+| 系统日志 | SYS | `search-sys` / `stream-sys` | 支持级别过滤，显示进程名 |
+| I/O 日志 | IO | `search-io` / `stream-io` | 操作类型图标，路径截断显示 |
+| Logcat | Logcat | `stream-logcat` | 保留原始格式 |
+
+#### 进程名提取与高亮
+
+从消息体中提取进程名（兼容两种格式）：
+
+```kotlin
+// 格式 B: LOG_SYS:级别:[进程名] 消息
+val logSysRegex = Regex("""LOG_SYS:\d+:\[(\w+)\]""")
+// 格式 A: [进程名] 消息
+val bracketRegex = Regex("""\[(\w+)\]""")
+
+val match = logSysRegex.find(message) ?: bracketRegex.find(message)
+val processName = match?.groupValues?.get(1)  // "fuse_daemon"
+```
+
+显示建议：
+
+- 进程名用**加粗**或**不同颜色**突出显示
+- 格式 B 中的 `LOG_SYS:级别:` 前缀可选择隐藏，仅显示 `[进程名] 消息` 部分
+
+#### 时间戳处理
+
+原始格式：`2024-06-28 00:20:00`
+
+显示建议：
+
+- **详细模式**：显示完整时间戳
+- **简洁模式**：显示相对时间（如 "3分钟前"、"昨天 00:20"）
+- **排序**：按时间戳降序排列（最新在前）
+
+#### IO 路径显示优化
+
+对于长路径，建议：
+
+- 显示最后两级目录 + 文件名
+- 完整路径显示在 Tooltip 中
+- 例：`/data/media/0/Android/data/com.tencent.mobileqq/files/secret.txt` → `.../files/secret.txt`
+
+#### 搜索关键词高亮
+
+在消息体中高亮搜索关键词：
+
+```kotlin
+fun highlightKeyword(text: String, keyword: String): SpannableString {
+    val spannable = SpannableString(text)
+    var start = 0
+    while (true) {
+        val idx = text.indexOf(keyword, start, ignoreCase = true)
+        if (idx < 0) break
+        spannable.setSpan(
+            BackgroundColorSpan(Color.YELLOW),
+            idx, idx + keyword.length,
+            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        start = idx + keyword.length
+    }
+    return spannable
+}
+```
 
 ---
 

@@ -17,15 +17,19 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <sys/socket.h>
+
 #define TRACKED_HASH_SIZE 2048
 typedef struct TrackedEntry {
     int pid;
     struct TrackedEntry *next;
 } TrackedEntry;
+
 static TrackedEntry *g_tracked_hash[TRACKED_HASH_SIZE];
+
 static unsigned int hash_pid(int pid) {
     return (unsigned int)pid % TRACKED_HASH_SIZE;
 }
+
 void add_tracked(int pid) {
     unsigned int h = hash_pid(pid);
     TrackedEntry *e = g_tracked_hash[h];
@@ -42,6 +46,7 @@ void add_tracked(int pid) {
         g_tracked_hash[h] = e;
     }
 }
+
 bool is_tracked(int pid) {
     unsigned int h = hash_pid(pid);
     TrackedEntry *e = g_tracked_hash[h];
@@ -53,6 +58,7 @@ bool is_tracked(int pid) {
     }
     return false;
 }
+
 void remove_tracked(int pid) {
     unsigned int h = hash_pid(pid);
     TrackedEntry **pp = &g_tracked_hash[h];
@@ -66,6 +72,7 @@ void remove_tracked(int pid) {
         pp = &(*pp)->next;
     }
 }
+
 static void prune_stale_tracked() {
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
         TrackedEntry **pp = &g_tracked_hash[i];
@@ -80,16 +87,20 @@ static void prune_stale_tracked() {
         }
     }
 }
+
 static UidMapEntry g_uid_map[UID_MAP_MAX_ENTRIES];
 static int g_uid_map_count = 0;
+
 void init_uid_map_cache(void) {
     g_uid_map_count = uid_map_load(g_uid_map, UID_MAP_MAX_ENTRIES);
     LOG_DBG("UID映射内存缓存已初始化: 从文件载入 %d 条映射记录", g_uid_map_count);
 }
+
 bool is_isolated_uid(uid_t uid) {
     uid_t app_id = uid % 100000;
     return (app_id >= 90000 && app_id <= 99999);
 }
+
 bool is_process_safe_to_inject(const char* cmdline) {
     if (strstr(cmdline, "_zygote")) return false;
     if (strstr(cmdline, "com.google.android.webview")) return false;
@@ -126,6 +137,7 @@ bool is_zygote_child(pid_t pid) {
         return true;
     return false;
 }
+
 bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc) {
     int user_id = uid / 100000;
     AppConfig* cfg = find_app_cfg_locked(cmdline, user_id);
@@ -136,22 +148,26 @@ bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_i
     }
     return false;
 }
+
 bool is_target_app(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc) {
     config_lock_read();
     bool result = is_target_app_locked(cmdline, uid, pid, from_ipc);
     config_unlock_read();
     return result;
 }
+
 uid_t get_app_uid(int pid) {
     struct stat st;
     char path[64];
     snprintf(path, 63, "/proc/%d", pid);
     return (stat(path, &st) == 0) ? st.st_uid : 0;
 }
+
 void get_target_storage_path(uid_t uid, char* path, size_t size) {
     (void)uid;
     snprintf(path, size, "%s", "/storage/emulated");
 }
+
 void update_uid_map(uid_t uid, const char* pkg) {
     if (uid < 10000 || is_isolated_uid(uid)) return;
     char clean_pkg[128];
@@ -193,6 +209,7 @@ void update_uid_map(uid_t uid, const char* pkg) {
     }
     notify_fuses(SIGHUP);
 }
+
 void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid) {
     /* 卸载 FUSE 挂载 */
     for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
@@ -229,6 +246,7 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
         ns_bind_mount(pid, init_src, target_path);
     }
 }
+
 void force_recover_tracked_mounts() {
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
         TrackedEntry *e = g_tracked_hash[i];
@@ -255,6 +273,7 @@ void force_recover_tracked_mounts() {
         g_tracked_hash[i] = nullptr;
     }
 }
+
 /* 核心优化：配置审查时，就算应用解除注入，只要进程依然物理存活，就必须保持哈希追踪监听 */
 void audit_tracked_apps() {
     prune_stale_tracked();
@@ -290,6 +309,7 @@ void audit_tracked_apps() {
         }
     }
 }
+
 /* 核心优化：局部规则发生变化时，解除注入仅做解挂视图动作，绝对保留 PID 节点的物理追踪 */
 void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
     prune_stale_tracked();
@@ -335,6 +355,7 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
         }
     }
 }
+
 void handle_list_injected(int client_fd) {
     char reply[4096];
     int offset = 0;
@@ -383,6 +404,7 @@ void handle_list_injected(int client_fd) {
     snprintf(reply + offset, sizeof(reply) - offset, "DONE|%d\n", total);
     send(client_fd, reply, strlen(reply), MSG_NOSIGNAL);
 }
+
 int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids, int max_count) {
     int count = 0;
     for (int i = 0; i < TRACKED_HASH_SIZE && count < max_count; i++) {
@@ -417,6 +439,7 @@ int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids,
     }
     return count;
 }
+
 int get_uid_map_snapshot(UidMapEntry *out, int max_count) {
     int count = g_uid_map_count;
     if (count > max_count) count = max_count;
@@ -426,4 +449,47 @@ int get_uid_map_snapshot(UidMapEntry *out, int max_count) {
         out[i].pkg[127] = '\0';
     }
     return count;
+}
+
+/*
+ * 精确分析当前规则中 com.android.providers.media.module 是否真正属于注入目标。
+ * 支持多用户 UID 解析。
+ */
+bool is_media_module_injected_target(void) {
+    bool target = false;
+    config_lock_read();
+    
+    // 1. 优先扫描活跃用户的专属规则
+    for (int i = 0; i < g_active_user_count; i++) {
+        int user_id = g_active_users[i];
+        AppConfig* cfg = find_app_cfg_locked("com.android.providers.media.module", user_id);
+        if (cfg) {
+            if (cfg->inject_enable) {
+                target = true;
+                break;
+            }
+        } else {
+            // 如果该用户下没有显式规则，则看是否命中了通配符 [*] 注入
+            if (has_wildcard_enabled_locked(user_id)) {
+                target = true;
+                break;
+            }
+            // 或者是全局注入方案开启
+            if (g_global_cfg.global_inject) {
+                target = true;
+                break;
+            }
+        }
+    }
+
+    // 2. 无活跃用户时，回退到默认用户配置判定
+    if (!target && g_global_cfg.global_inject) {
+        AppConfig* cfg = find_app_cfg_locked("com.android.providers.media.module", 0);
+        if (!cfg || cfg->inject_enable) {
+            target = true;
+        }
+    }
+
+    config_unlock_read();
+    return target;
 }

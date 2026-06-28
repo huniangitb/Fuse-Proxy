@@ -8,7 +8,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
-#include <pthread.h>
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,13 +23,32 @@
 #include <sys/timerfd.h>
 #include <fnmatch.h>
 #include <sys/uio.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
+#include <dirent.h>
 #include "common.h"
 #define MAX_MSG_LEN 4096
-#define MAX_IO_LOGS 262144 
-#define MAX_SYS_LOGS 50000  
-#define MAX_LOGCAT_LOGS 100000
+#define MAX_IO_LOGS 524288
+#define MAX_SYS_LOGS 200000
+#define MAX_LOGCAT_LOGS 200000
 #define DEFAULT_LIMIT 500
 #define MAX_EVENTS 256
+#define RING_CAP 16384
+#define OVERFLOW_DIR "/data/Namespace-Proxy/log/overflow"
+typedef struct AsyncCtx {
+    int fd;
+    int type;               /* 0=undef, 1=IO, 2=SYS, 3=LOGCAT */
+    pthread_t tid;
+    volatile bool disconnected;
+    struct { char msg[512]; int level; } entries[RING_CAP];
+    volatile int head;
+    volatile int tail;
+    int notify_fd;
+    struct AsyncCtx *next;
+} AsyncCtx;
+
+static int set_nonblock(int fd);
+static int set_block(int fd);
 typedef enum {
     OP_NONE     = 0,
     OP_OPEN     = 1 << 0,
@@ -72,12 +90,11 @@ typedef struct {
     int level;
     char msg[MAX_MSG_LEN];
 } LogEntry;
-typedef struct { 
-    LogEntry* data; 
+typedef struct {
+    LogEntry* data;
     int head, tail;
-    bool full; 
-    int max; 
-    pthread_mutex_t lock; 
+    bool full;
+    int max;
 } LogBuffer;
 typedef struct StreamClient {
     int fd;
@@ -87,33 +104,29 @@ typedef struct StreamClient {
     struct StreamClient *next;
 } StreamClient;
 static LogBuffer g_io_buf, g_sys_buf, g_logcat_buf;
+static bool should_ignore_io(const char *line);
 static volatile sig_atomic_t g_should_exit = 0;
 static int g_server_sock = -1;
 static IgnoreRule *g_ignore_rules = nullptr;
-static pthread_rwlock_t g_rules_lock = PTHREAD_RWLOCK_INITIALIZER;
 static StreamClient *g_stream_clients = nullptr;
-static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
 static ClientCtx *g_active_clients = nullptr;
+static AsyncCtx *g_async_clients = nullptr;
 static int g_epoll_fd = -1;
 static void init_buf(LogBuffer* buf, int max) {
     buf->data = calloc(max, sizeof(LogEntry));
-    buf->head = buf->tail = 0; 
+    buf->head = buf->tail = 0;
     buf->full = false;
     buf->max = max;
-    pthread_mutex_init(&buf->lock, nullptr);
 }
 static void destroy_buf(LogBuffer* buf) {
     if (buf->data) { free(buf->data); buf->data = nullptr; }
 }
 static void add_stream_client(int fd, int type, int min_level, bool level_tag) {
-    pthread_mutex_lock(&g_stream_lock);
     StreamClient *c = malloc(sizeof(StreamClient));
     c->fd = fd; c->type = type; c->min_level = min_level; c->level_tag = level_tag;
     c->next = g_stream_clients; g_stream_clients = c;
-    pthread_mutex_unlock(&g_stream_lock);
 }
 static void remove_stream_client(int fd) {
-    pthread_mutex_lock(&g_stream_lock);
     StreamClient **pp = &g_stream_clients;
     while (*pp) {
         if ((*pp)->fd == fd) {
@@ -121,13 +134,11 @@ static void remove_stream_client(int fd) {
         }
         pp = &(*pp)->next;
     }
-    pthread_mutex_unlock(&g_stream_lock);
 }
 static void broadcast_log(int type, const char *line, int level) {
     size_t len = strlen(line);
     char nl = '\n';
     char level_pref[4]; /* "0|", "1|", "2|", "3|" */
-    pthread_mutex_lock(&g_stream_lock);
     StreamClient *c = g_stream_clients;
     while (c) {
         if (c->fd > 0 && (c->type == 0 || c->type == type)) {
@@ -163,19 +174,111 @@ static void broadcast_log(int type, const char *line, int level) {
         if ((*pp)->fd == -1) { StreamClient *tmp = *pp; *pp = (*pp)->next; free(tmp); }
         else { pp = &(*pp)->next; }
     }
-    pthread_mutex_unlock(&g_stream_lock);
+}
+static void overflow_write(const char *log_type, const char *msg, int level, time_t t) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s.overflow", OVERFLOW_DIR, log_type);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+    char time_buf[32];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    char line[MAX_MSG_LEN + 128];
+    int len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf, level, msg);
+    write(fd, line, len);
+    close(fd);
 }
 static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     broadcast_log(type, msg, level);
-    pthread_mutex_lock(&buf->lock);
-    buf->data[buf->head].t = time(nullptr);
+    time_t now = time(nullptr);
+    if (buf->full) {
+        const char *type_str = (type == 1) ? "io" : (type == 3) ? "logcat" : "sys";
+        overflow_write(type_str, msg, level, now);
+        return;
+    }
+    buf->data[buf->head].t = now;
     buf->data[buf->head].level = level;
     strncpy(buf->data[buf->head].msg, msg, MAX_MSG_LEN - 1);
     buf->data[buf->head].msg[MAX_MSG_LEN - 1] = '\0';
     buf->head = (buf->head + 1) % buf->max;
-    if (buf->full) buf->tail = (buf->tail + 1) % buf->max;
-    else if (buf->head == buf->tail) buf->full = true;
-    pthread_mutex_unlock(&buf->lock);
+    if (buf->head == buf->tail) buf->full = true;
+}
+static void drain_async(AsyncCtx *ctx) {
+    while (ctx->tail != ctx->head) {
+        char *msg = ctx->entries[ctx->tail].msg;
+        int level = ctx->entries[ctx->tail].level;
+        if (ctx->type == 1) {
+            if (!should_ignore_io(msg))
+                push_log(&g_io_buf, msg, 1, LOG_INFO);
+        } else if (ctx->type == 2) {
+            push_log(&g_sys_buf, msg, 2, level);
+        } else if (ctx->type == 3) {
+            push_log(&g_logcat_buf, msg, 3, LOG_INFO);
+        }
+        ctx->tail = (ctx->tail + 1) & (RING_CAP - 1);
+    }
+}
+static void cleanup_async(AsyncCtx *ctx) {
+    AsyncCtx **pp = &g_async_clients;
+    while (*pp) {
+        if (*pp == ctx) { *pp = ctx->next; break; }
+        pp = &(*pp)->next;
+    }
+    if (ctx->fd >= 0) close(ctx->fd);
+    if (ctx->notify_fd >= 0) close(ctx->notify_fd);
+    free(ctx);
+}
+static void *async_log_thread(void *arg) {
+    AsyncCtx *ctx = arg;
+    char buf[4096];
+    char line[512];
+    int pos = 0;
+    while (!ctx->disconnected) {
+        ssize_t n = read(ctx->fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == '\n') {
+                line[pos] = '\0';
+                if (pos > 0) {
+                    char *msg = line;
+                    int level = LOG_INFO;
+                    if (ctx->type == 0) {
+                        if (strncmp(msg, "LOG_IO:", 7) == 0)
+                            { ctx->type = 1; msg += 7; }
+                        else if (strncmp(msg, "LOG_SYS:", 8) == 0)
+                            { ctx->type = 2; msg += 8; }
+                        else if (strncmp(msg, "LOG_LOGCAT:", 11) == 0)
+                            { ctx->type = 3; msg += 11; }
+                    }
+                    if (ctx->type == 2 && msg[0] >= '0' && msg[0] <= '9') {
+                        level = msg[0] - '0';
+                        char *colon = strchr(msg, ':');
+                        if (colon) msg = colon + 1;
+                    }
+                    int next = (ctx->head + 1) & (RING_CAP - 1);
+                    if (next != ctx->tail) {
+                        strncpy(ctx->entries[ctx->head].msg, msg, 511);
+                        ctx->entries[ctx->head].msg[511] = '\0';
+                        ctx->entries[ctx->head].level = level;
+                        ctx->head = next;
+                        uint64_t val = 1;
+                        write(ctx->notify_fd, &val, sizeof(val));
+                    } else {
+                        const char *type_str = (ctx->type == 1) ? "io" : (ctx->type == 3) ? "logcat" : "sys";
+                        overflow_write(type_str, msg, level, time(nullptr));
+                    }
+                }
+                pos = 0;
+            } else if (pos < 511) {
+                line[pos++] = buf[i];
+            }
+        }
+    }
+    uint64_t val = 1;
+    write(ctx->notify_fd, &val, sizeof(val));
+    ctx->disconnected = true;
+    return nullptr;
 }
 static int parse_op_string(const char *op_str) {
     if (strcmp(op_str, "OPEN") == 0) return OP_OPEN;
@@ -200,7 +303,6 @@ static int parse_op_string(const char *op_str) {
 }
 static void load_ignore_rules() {
     FILE *fp = fopen(MONITOR_IGNORE_PATH, "re");
-    pthread_rwlock_wrlock(&g_rules_lock);
     IgnoreRule *cur = g_ignore_rules;
     while (cur) {
         IgnoreRule *next = cur->next;
@@ -222,13 +324,13 @@ static void load_ignore_rules() {
             if (*p == '[') {
                 char *close_ptr = strchr(p, ']');
                 if (close_ptr) {
-                    *close_ptr = '\0'; char *ops = p+1; 
+                    *close_ptr = '\0'; char *ops = p+1;
                     char *saveptr = nullptr;
                     char *token = strtok_r(ops, ",", &saveptr);
-                    while (token) { 
-                        int op = parse_op_string(token); 
-                        if (op) op_mask |= op; 
-                        token = strtok_r(nullptr, ",", &saveptr); 
+                    while (token) {
+                        int op = parse_op_string(token);
+                        if (op) op_mask |= op;
+                        token = strtok_r(nullptr, ",", &saveptr);
                     }
                     path = close_ptr+1; while (isspace((unsigned char)*path)) path++;
                 }
@@ -242,7 +344,6 @@ static void load_ignore_rules() {
         }
         fclose(fp);
     }
-    pthread_rwlock_unlock(&g_rules_lock);
     char msg[256];
     snprintf(msg, sizeof(msg), "[log_monitor] 加载监控忽略规则完成，共 %d 条", count);
     push_log(&g_sys_buf, msg, 2, LOG_DEBUG);
@@ -269,8 +370,7 @@ static bool should_ignore_io(const char *line) {
     size_t path_len = path_end - path_start;
     if (path_len >= sizeof(path_buf)) path_len = sizeof(path_buf)-1;
     strncpy(path_buf, path_start, path_len); path_buf[path_len] = '\0';
-    pthread_rwlock_rdlock(&g_rules_lock);
-    IgnoreRule *rule = g_ignore_rules; 
+    IgnoreRule *rule = g_ignore_rules;
     bool ignore = false;
     while (rule) {
         if (rule->op_mask & op_mask) {
@@ -282,15 +382,45 @@ static bool should_ignore_io(const char *line) {
         }
         rule = rule->next;
     }
-    pthread_rwlock_unlock(&g_rules_lock);
     return ignore;
 }
-static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit, int offset, int level_filter) {
-    pthread_mutex_lock(&buf->lock);
+static void search_overflow_file(int fd, const char *log_type, const char *key,
+                                  int limit, int offset, int level_filter, int *sent_count, int *total_matched) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s.overflow", OVERFLOW_DIR, log_type);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char fline[MAX_MSG_LEN + 128];
+    int skip_count = 0;
+    while (fgets(fline, sizeof(fline), fp)) {
+        size_t flen = strlen(fline);
+        while (flen > 0 && (fline[flen-1] == '\n' || fline[flen-1] == '\r')) fline[--flen] = '\0';
+        char *pipe1 = strchr(fline, '|');
+        if (!pipe1) continue;
+        char *pipe2 = strchr(pipe1 + 1, '|');
+        if (!pipe2) continue;
+        int msg_level = atoi(pipe1 + 1);
+        char *msg = pipe2 + 1;
+        bool level_match = (level_filter < 0 || msg_level >= level_filter);
+        bool key_match = (!key || key[0] == '\0' || strstr(msg, key));
+        if (level_match && key_match) {
+            (*total_matched)++;   /* 仅统计匹配 level/key 的行，与 search_log_paged 的 buffer 计数一致 */
+            if (skip_count < offset) skip_count++;
+            else if (*sent_count < limit) {
+                char outline[MAX_MSG_LEN + 128];
+                int len = snprintf(outline, sizeof(outline), "%s\n", fline);
+                write(fd, outline, len);
+                (*sent_count)++;
+            }
+        }
+    }
+    fclose(fp);
+}
+static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit, int offset, int level_filter, const char *log_type) {
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
     int total_matched = 0; int idx = buf->tail;
     for (int i = 0; i < total_in_buf; i++) {
-        bool level_match = (level_filter < 0 || buf->data[idx].level == level_filter);
+        bool level_match = (level_filter < 0 || buf->data[idx].level >= level_filter);
         if (level_match && (!key || key[0] == '\0' || strstr(buf->data[idx].msg, key))) total_matched++;
         idx = (idx + 1) % buf->max;
     }
@@ -298,7 +428,7 @@ static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit,
     idx = (buf->head - 1 + buf->max) % buf->max;
     char line[MAX_MSG_LEN + 128];
     for (int i = 0; i < total_in_buf && sent_count < limit; i++) {
-        bool level_match = (level_filter < 0 || buf->data[idx].level == level_filter);
+        bool level_match = (level_filter < 0 || buf->data[idx].level >= level_filter);
         if (level_match && (!key || key[0] == '\0' || strstr(buf->data[idx].msg, key))) {
             if (skip_count < offset) skip_count++;
             else {
@@ -310,11 +440,13 @@ static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit,
         }
         idx = (idx - 1 + buf->max) % buf->max;
     }
+    if (log_type) {
+        search_overflow_file(fd, log_type, key, limit, offset, level_filter, &sent_count, &total_matched);
+    }
     int remaining = total_matched - (offset + sent_count);
     if (remaining < 0) remaining = 0;
     snprintf(line, sizeof(line), "DONE|%d|%d\n", total_matched, remaining);
     write(fd, line, strlen(line));
-    pthread_mutex_unlock(&buf->lock);
 }
 static void add_active_client(ClientCtx *ctx) {
     ctx->next = g_active_clients;
@@ -336,7 +468,6 @@ static void remove_active_client(ClientCtx *ctx) {
 }
 static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level) {
     char line_buf[MAX_MSG_LEN + 2]; /* msg + \n */
-    pthread_mutex_lock(&buf->lock);
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
     int idx = buf->tail;
     for (int i = 0; i < total_in_buf; i++) {
@@ -351,31 +482,47 @@ static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level) 
         }
         idx = (idx + 1) % buf->max;
     }
-    pthread_mutex_unlock(&buf->lock);
     (void)type;
 }
 static int process_line(ClientCtx* ctx, char* line) {
     int fd = ctx->fd;
-    if (strncmp(line, "LOG_IO:", 7) == 0) {
-        ctx->is_streaming = true; 
-        if (should_ignore_io(line + 7)) return 0;
-        push_log(&g_io_buf, line + 7, 1, LOG_INFO);
-        return 0;
-    } else if (strncmp(line, "LOG_SYS:", 8) == 0) {
-        ctx->is_streaming = true; 
-        char *msg = line + 8;
+    if (strncmp(line, "LOG_IO:", 7) == 0 ||
+        strncmp(line, "LOG_SYS:", 8) == 0 ||
+        strncmp(line, "LOG_LOGCAT:", 11) == 0) {
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->fd, nullptr);
+        AsyncCtx *actx = calloc(1, sizeof(AsyncCtx));
+        actx->fd = ctx->fd;
+        /* async 线程以阻塞方式 read：accept 时该 fd 被设为非阻塞，若保持非阻塞，
+           无数据时 read 返回 EAGAIN 会被误判为对端断开而退出，进而拆除连接、反向触发生产者忙等 */
+        set_block(actx->fd);
+        actx->notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        actx->disconnected = false;
+        char *msg = line;
         int level = LOG_INFO;
-        if (*msg >= '0' && *msg <= '9') {
-            level = atoi(msg);
-            char *colon = strchr(msg, ':');
-            if (colon) msg = colon + 1;
-        }
-        push_log(&g_sys_buf, msg, 2, level);
-        return 0;
-    } else if (strncmp(line, "LOG_LOGCAT:", 11) == 0) {
-        ctx->is_streaming = true; 
-        push_log(&g_logcat_buf, line + 11, 3, LOG_INFO);
-        return 0;
+        if (strncmp(msg, "LOG_IO:", 7) == 0)
+            { actx->type = 1; msg += 7; }
+        else if (strncmp(msg, "LOG_SYS:", 8) == 0)
+            { actx->type = 2; msg += 8;
+              if (msg[0] >= '0' && msg[0] <= '9') {
+                  level = msg[0] - '0';
+                  char *colon = strchr(msg, ':');
+                  if (colon) msg = colon + 1;
+              }
+            }
+        else if (strncmp(msg, "LOG_LOGCAT:", 11) == 0)
+            { actx->type = 3; msg += 11; }
+        strncpy(actx->entries[0].msg, msg, 511);
+        actx->entries[0].msg[511] = '\0';
+        actx->entries[0].level = level;
+        actx->head = 1; actx->tail = 0;
+        actx->next = g_async_clients;
+        g_async_clients = actx;
+        struct epoll_event ev = { .events = EPOLLIN, .data.fd = actx->notify_fd };
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, actx->notify_fd, &ev);
+        pthread_create(&actx->tid, nullptr, async_log_thread, actx);
+        pthread_detach(actx->tid);
+        ctx->fd = -1;
+        return 1;
     } else if (strncmp(line, "QUERY_IO:", 9) == 0 || strncmp(line, "QUERY_SYS:", 10) == 0 ||
                strncmp(line, "QUERY_LOGCAT:", 13) == 0) {
         bool is_io = (strstr(line, "IO") != nullptr);
@@ -399,22 +546,22 @@ static int process_line(ClientCtx* ctx, char* line) {
                 limit = atoi(limit_s);
             }
         }
-        search_log_paged(fd, is_io ? &g_io_buf : (is_logcat ? &g_logcat_buf : &g_sys_buf), key, limit, offset, level_filter);
+        search_log_paged(fd, is_io ? &g_io_buf : (is_logcat ? &g_logcat_buf : &g_sys_buf), key, limit, offset, level_filter, is_io ? "io" : (is_logcat ? "logcat" : "sys"));
         return 1; 
     } else if (strcmp(line, "CLEAR_IO") == 0) {
-        pthread_mutex_lock(&g_io_buf.lock); g_io_buf.head = g_io_buf.tail = 0; g_io_buf.full = false;
-        pthread_mutex_unlock(&g_io_buf.lock);
-        write(fd, "OK\n", 3); 
-        return 1; 
+        g_io_buf.head = g_io_buf.tail = 0; g_io_buf.full = false;
+        unlink(OVERFLOW_DIR "/io.overflow");
+        write(fd, "OK\n", 3);
+        return 1;
     } else if (strcmp(line, "CLEAR_SYS") == 0) {
-        pthread_mutex_lock(&g_sys_buf.lock); g_sys_buf.head = g_sys_buf.tail = 0; g_sys_buf.full = false;
-        pthread_mutex_unlock(&g_sys_buf.lock);
-        write(fd, "OK\n", 3); 
-        return 1; 
+        g_sys_buf.head = g_sys_buf.tail = 0; g_sys_buf.full = false;
+        unlink(OVERFLOW_DIR "/sys.overflow");
+        write(fd, "OK\n", 3);
+        return 1;
     } else if (strcmp(line, "CLEAR_LOGCAT") == 0) {
-        pthread_mutex_lock(&g_logcat_buf.lock); g_logcat_buf.head = g_logcat_buf.tail = 0; g_logcat_buf.full = false;
-        pthread_mutex_unlock(&g_logcat_buf.lock);
-        write(fd, "OK\n", 3); 
+        g_logcat_buf.head = g_logcat_buf.tail = 0; g_logcat_buf.full = false;
+        unlink(OVERFLOW_DIR "/logcat.overflow");
+        write(fd, "OK\n", 3);
         return 1; 
     } else if (strncmp(line, "STREAM_IO", 9) == 0) {
         int min_level = 0;
@@ -464,15 +611,9 @@ static int process_line(ClientCtx* ctx, char* line) {
         write(fd, "OK\n", 3); 
         return 1; 
     } else if (strcmp(line, "COUNT") == 0) {
-        pthread_mutex_lock(&g_io_buf.lock);
         int io_total = g_io_buf.full ? g_io_buf.max : (g_io_buf.head - g_io_buf.tail + g_io_buf.max) % g_io_buf.max;
-        pthread_mutex_unlock(&g_io_buf.lock);
-        pthread_mutex_lock(&g_sys_buf.lock);
         int sys_total = g_sys_buf.full ? g_sys_buf.max : (g_sys_buf.head - g_sys_buf.tail + g_sys_buf.max) % g_sys_buf.max;
-        pthread_mutex_unlock(&g_sys_buf.lock);
-        pthread_mutex_lock(&g_logcat_buf.lock);
         int logcat_total = g_logcat_buf.full ? g_logcat_buf.max : (g_logcat_buf.head - g_logcat_buf.tail + g_logcat_buf.max) % g_logcat_buf.max;
-        pthread_mutex_unlock(&g_logcat_buf.lock);
         char resp[128];
         int len = snprintf(resp, sizeof(resp), "COUNT|%d|%d|%d\n", io_total, sys_total, logcat_total);
         write(fd, resp, len);
@@ -483,6 +624,11 @@ static int process_line(ClientCtx* ctx, char* line) {
 static int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+static int set_block(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 }
 void handle_signal(int sig) { if (sig == SIGINT || sig == SIGTERM) g_should_exit = 1; }
 /* 核心优化：合并异步定时器超时回调 */
@@ -520,6 +666,19 @@ static void handle_client_timeout_tick(int timer_fd) {
         }
         curr_chk = next_chk;
     }
+    AsyncCtx **app = &g_async_clients;
+    while (*app) {
+        AsyncCtx *a = *app;
+        if (a->disconnected) {
+            *app = a->next;
+            epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, a->notify_fd, nullptr);
+            if (a->fd >= 0) close(a->fd);
+            if (a->notify_fd >= 0) close(a->notify_fd);
+            free(a);
+        } else {
+            app = &(*app)->next;
+        }
+    }
 }
 int main(int argc, char *argv[]) {
     escape_cgroup();
@@ -545,6 +704,22 @@ int main(int argc, char *argv[]) {
     }
     (void)verbose;
     init_buf(&g_io_buf, MAX_IO_LOGS); init_buf(&g_sys_buf, MAX_SYS_LOGS); init_buf(&g_logcat_buf, MAX_LOGCAT_LOGS);
+    mkdir(OVERFLOW_DIR, 0755);
+    {
+        DIR *od = opendir(OVERFLOW_DIR);
+        if (od) {
+            time_t cutoff = time(NULL) - 86400;
+            struct dirent *de;
+            while ((de = readdir(od)) != nullptr) {
+                if (de->d_type != DT_REG) continue;
+                char fpath[PATH_MAX];
+                snprintf(fpath, sizeof(fpath), "%s/%s", OVERFLOW_DIR, de->d_name);
+                struct stat st;
+                if (stat(fpath, &st) == 0 && st.st_mtime < cutoff) unlink(fpath);
+            }
+            closedir(od);
+        }
+    }
     if (g_persist_all_logs) mkdir("/data/Namespace-Proxy/log", 0755);
     load_ignore_rules();
     g_server_sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -598,6 +773,20 @@ int main(int argc, char *argv[]) {
                 /* 处理异步定时器事件 */
                 handle_client_timeout_tick(timer_fd);
             } else {
+                int event_fd = events[i].data.fd;
+                AsyncCtx *actx = nullptr;
+                for (AsyncCtx *a = g_async_clients; a; a = a->next) {
+                    if (a->notify_fd == event_fd) { actx = a; break; }
+                }
+                if (actx) {
+                    uint64_t val;
+                    read(actx->notify_fd, &val, sizeof(val));
+                    drain_async(actx);
+                    if (actx->disconnected) {
+                        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, actx->notify_fd, nullptr);
+                        cleanup_async(actx);
+                    }
+                } else {
                 ClientCtx* ctx = (ClientCtx*)events[i].data.ptr;
                 char buf[4096]; bool consumed = false;
                 while (!consumed) {
@@ -617,10 +806,11 @@ int main(int argc, char *argv[]) {
                 }
                 if (consumed) {
                     epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->fd, nullptr);
-                    close(ctx->fd); 
-                    remove_stream_client(ctx->fd); 
+                    close(ctx->fd);
+                    remove_stream_client(ctx->fd);
                     remove_active_client(ctx);
                     free(ctx);
+                }
                 }
             }
         }
@@ -637,6 +827,16 @@ int main(int argc, char *argv[]) {
         curr_free = next_free;
     }
     g_active_clients = nullptr;
+    AsyncCtx *a_curr = g_async_clients;
+    while (a_curr) {
+        AsyncCtx *a_next = a_curr->next;
+        a_curr->disconnected = true;
+        if (a_curr->fd >= 0) close(a_curr->fd);
+        if (a_curr->notify_fd >= 0) close(a_curr->notify_fd);
+        free(a_curr);
+        a_curr = a_next;
+    }
+    g_async_clients = nullptr;
     destroy_buf(&g_io_buf); destroy_buf(&g_sys_buf); destroy_buf(&g_logcat_buf);
     return 0;
 }
