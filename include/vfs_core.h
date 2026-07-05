@@ -25,7 +25,7 @@ int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_us
 int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t size, int user_id, bool* is_redir_out, const char* current_pkg);
 bool vfs_is_virtual_ancestor(AppConfig* cfg, const char* sub_path);
 bool vfs_is_redirect_target(AppConfig* cfg, const char* sub_path);
-bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path);
+bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path, const char* current_pkg);
 bool vfs_is_virtual_dir_empty(AppConfig* cfg, const char* sub_path, const char* real_path, const char* current_pkg);
 bool vfs_is_other_app_pkg(const char* sub_path, const char* current_pkg);
 
@@ -38,7 +38,7 @@ void vfs_hash_free(DirHashTable* ht);
 
 /* 核心修复：添加安全长度 max_len 限制声明 */
 bool vfs_get_virtual_child(const char* parent, const char* desc, char* name, size_t max_len);
-bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_id, void* buf, fuse_fill_dir_t filler, uid_t uid, gid_t gid, DirHashTable* ht, bool is_root);
+bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_id, void* buf, fuse_fill_dir_t filler, uid_t uid, gid_t gid, DirHashTable* ht, bool is_root, const char* current_pkg);
 
 /* 为合成目录 stat 生成非零 inode，防止 FUSE 内核模块拒绝 inode=0 返回 EINVAL */
 static inline ino_t synthetic_inode(const char *path) {

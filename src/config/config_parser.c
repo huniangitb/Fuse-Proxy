@@ -1,5 +1,6 @@
 #include "config_parser.h"
 #include "common.h"
+#include "path_vars.h"
 #include "inject_target.h"
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -233,6 +234,27 @@ static void free_app_config_rules(AppConfig* cfg) {
     }
     cfg->redir_count = 0;
     cfg->redir_capacity = 0;
+    if (cfg->var_names) {
+        for (int i = 0; i < cfg->var_count; i++) free(cfg->var_names[i]);
+        free(cfg->var_names);
+        cfg->var_names = nullptr;
+    }
+    if (cfg->var_values) {
+        for (int i = 0; i < cfg->var_count; i++) free(cfg->var_values[i]);
+        free(cfg->var_values);
+        cfg->var_values = nullptr;
+    }
+    if (cfg->var_resolved) {
+        for (int i = 0; i < cfg->var_count; i++) free(cfg->var_resolved[i]);
+        free(cfg->var_resolved);
+        cfg->var_resolved = nullptr;
+    }
+    if (cfg->var_is_static) {
+        free(cfg->var_is_static);
+        cfg->var_is_static = nullptr;
+    }
+    cfg->var_count = 0;
+    cfg->var_capacity = 0;
 }
 static void free_config_rules() {
     free_app_config_rules(&g_global_cfg);
@@ -339,6 +361,30 @@ static int cmp_hide(const void* a, const void* b) {
 static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_num, const char* file_path) {
     (void)user_id;
     char* p_ptr = line;
+    /* 先尝试 NAME=VALUE 赋值（紧凑形式，无空格围绕 =） */
+    {
+        char vname[128], vvalue[MAX_PATH_LEN];
+        if (parse_var_assignment(line, vname, sizeof vname, vvalue, sizeof vvalue)) {
+            if (strcmp(vname, "package") == 0) {
+                LOG_WRN("不允许覆盖系统保留变量 package (行 %d, 文件 %s)", line_num, file_path);
+            } else {
+                if (cur->var_count >= cur->var_capacity) {
+                    int newcap = cur->var_capacity == 0 ? 8 : cur->var_capacity * 2;
+                    cur->var_names   = realloc(cur->var_names,   newcap * sizeof(char*));
+                    cur->var_values  = realloc(cur->var_values,  newcap * sizeof(char*));
+                    cur->var_resolved= realloc(cur->var_resolved,newcap * sizeof(char*));
+                    cur->var_is_static = realloc(cur->var_is_static, newcap * sizeof(bool));
+                    cur->var_capacity = newcap;
+                }
+                cur->var_names[cur->var_count] = strdup(vname);
+                cur->var_values[cur->var_count] = strdup(vvalue);
+                cur->var_resolved[cur->var_count] = NULL;
+                cur->var_is_static[cur->var_count] = false;
+                cur->var_count++;
+            }
+            return;
+        }
+    }
     char* tok = get_next_token(&p_ptr);
     if (!tok) return;
     if (strcmp(tok, "MONITOR") == 0) {
@@ -385,7 +431,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             }
             cur->hide_rules[cur->hide_count] = strdup(clean_rule);
             cur->hide_count++;
-            if (!is_wildcard_string(clean_rule)) {
+            if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, true, false);
             }
         }
@@ -406,7 +452,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             }
             cur->ro_rules[cur->ro_count] = strdup(clean_rule);
             cur->ro_count++;
-            if (!is_wildcard_string(clean_rule)) {
+            if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, false, true);
             }
         }
@@ -434,7 +480,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
             strcpy(r->virtual_prefix, virtual_prefix);
             strcpy(r->real_target, real_target);
-            if (!is_wildcard_string(virtual_prefix)) {
+            if (!is_wildcard_string(virtual_prefix) && !has_path_var(virtual_prefix)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
         }
@@ -454,14 +500,20 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             }
             strip_trailing_slash(virtual_prefix);
             char real_target[MAX_PATH_LEN];
-            if (strncmp(v2, "/storage/emulated/", 18) == 0) {
+            if (has_path_var(v2)) {
+                /* 含变量：原样存入，路径分类延迟到运行时 build_real_base_from_target */
+                strncpy(real_target, v2, MAX_PATH_LEN - 1);
+                real_target[MAX_PATH_LEN - 1] = '\0';
+            }
+            else if (strncmp(v2, "/storage/emulated/", 18) == 0) {
                 char* p = v2 + 18;
                 while (*p && isdigit((unsigned char)*p)) p++;
                 if (*p == '/') p++;
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
             }
-            else if (strncmp(v2, "/data/", 6) == 0 || strncmp(v2, "/mnt/", 5) == 0 || strncmp(v2, "/storage/", 9) == 0) {
+            else if (is_system_abs_path(v2)) {
                 strncpy(real_target, v2, MAX_PATH_LEN - 1);
+                real_target[MAX_PATH_LEN - 1] = '\0';
             }
             else {
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
@@ -474,7 +526,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
             strcpy(r->virtual_prefix, virtual_prefix);
             strcpy(r->real_target, real_target);
-            if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target)) {
+            if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) && !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
         }
@@ -640,6 +692,10 @@ void load_config_rules(const char* path) {
         qsort(g_app_cfgs[i]->redir_rules, g_app_cfgs[i]->redir_count, sizeof(RedirectRule), cmp_redir);
         qsort(g_app_cfgs[i]->hide_rules, g_app_cfgs[i]->hide_count, sizeof(char*), cmp_hide);
         qsort(g_app_cfgs[i]->ro_rules, g_app_cfgs[i]->ro_count, sizeof(char*), cmp_hide);
+    }
+    analyze_var_staticness(&g_global_cfg, NULL);
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        analyze_var_staticness(g_app_cfgs[i], &g_global_cfg);
     }
 }
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {

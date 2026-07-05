@@ -39,6 +39,12 @@ typedef struct {
     int redir_count;
     int redir_capacity;
     TrieNode* trie_root;
+    char** var_names;
+    char** var_values;      /* 原始值（含 $ 占位），动态变量运行时展开用 */
+    char** var_resolved;    /* 静态变量的预计算展开值；动态变量为 NULL */
+    bool*  var_is_static;   /* 静态/动态标记 */
+    int    var_count;
+    int    var_capacity;
     char fuse_extra_args[512];
 } AppConfig;
 

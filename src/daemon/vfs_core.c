@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "vfs_core.h"
+#include "path_vars.h"
 #include "uid_map.h"
 #include "fast_pid.h"
 #include <stdio.h>
@@ -219,18 +220,34 @@ static bool is_path_hidden_internal(AppConfig* cfg, const char* sub_path, const 
     if (cfg && cfg->hide_rules) {
         for (int i = 0; i < cfg->hide_count; i++) {
             if (cfg->hide_rules[i]) {
-                if (fnmatch(cfg->hide_rules[i], sub_path, 0) == 0) { return true; }
-                size_t len = strlen(cfg->hide_rules[i]);
-                if (strncmp(sub_path, cfg->hide_rules[i], len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
+                const char* rule = cfg->hide_rules[i];
+                char expanded[PATH_MAX];
+                const char* match_str = rule;
+                if (has_path_var(rule)) {
+                    if (!pkg_resolvable(current_pkg)) continue;
+                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg, current_pkg);
+                    match_str = expanded;
+                }
+                if (fnmatch(match_str, sub_path, 0) == 0) { return true; }
+                size_t len = strlen(match_str);
+                if (strncmp(sub_path, match_str, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
             }
         }
     }
     if (g_global_cfg.hide_rules) {
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
             if (g_global_cfg.hide_rules[i]) {
-                if (fnmatch(g_global_cfg.hide_rules[i], sub_path, 0) == 0) { return true; }
-                size_t len = strlen(g_global_cfg.hide_rules[i]);
-                if (strncmp(sub_path, g_global_cfg.hide_rules[i], len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
+                const char* rule = g_global_cfg.hide_rules[i];
+                char expanded[PATH_MAX];
+                const char* match_str = rule;
+                if (has_path_var(rule)) {
+                    if (!pkg_resolvable(current_pkg)) continue;
+                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg, current_pkg);
+                    match_str = expanded;
+                }
+                if (fnmatch(match_str, sub_path, 0) == 0) { return true; }
+                size_t len = strlen(match_str);
+                if (strncmp(sub_path, match_str, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
             }
         }
     }
@@ -256,7 +273,7 @@ int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_us
     return 0;
 }
 
-static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id, const char* current_pkg, bool skip_sandbox) {
+static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id, const char* current_pkg, bool skip_sandbox, size_t temp_size) {
     if (!c) return false;
     bool matched = false;
     if (c->redir_rules && c->redir_count > 0) {
@@ -266,23 +283,21 @@ static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int
             bool is_root = (strcmp(prefix, "/") == 0);
             if (is_root || (strncmp(sub_path, prefix, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/'))) {
                 const char* suffix = is_root ? sub_path : (sub_path + len);
-                char real_base[MAX_PATH_LEN];
+                char real_base[PATH_MAX];
                 const char* target = c->redir_rules[i].real_target;
-                if (target[0] == '?') {
-                    int effective_uid = user_id >= 0 ? user_id : 0;
-                    snprintf(real_base, sizeof(real_base), STORAGE_BASE "/%d%s", effective_uid, target + 1);
-                } else {
-                    strncpy(real_base, target, sizeof(real_base) - 1); 
-                    real_base[sizeof(real_base) - 1] = '\0';
+                if (!build_real_base_from_target(target, (user_id >= 0 ? user_id : 0),
+                                                 real_base, sizeof real_base,
+                                                 c, &g_global_cfg, current_pkg)) {
+                    continue;   /* 含 $ 但包名不可解析 → 本条 redir 不命中 */
                 }
                 size_t tlen = strlen(real_base);
                 bool t_slash = (tlen > 0 && real_base[tlen-1] == '/'); 
                 bool s_slash = (suffix[0] == '/');
-                if (t_slash && s_slash) snprintf(temp, 1023, "%s%s", real_base, suffix + 1);
+                if (t_slash && s_slash) snprintf(temp, temp_size, "%s%s", real_base, suffix + 1);
                 else if (!t_slash && !s_slash) {
-                    if (suffix[0] == '\0') snprintf(temp, 1023, "%s", real_base);
-                    else snprintf(temp, 1023, "%s/%s", real_base, suffix);
-                } else snprintf(temp, 1023, "%s%s", real_base, suffix);
+                    if (suffix[0] == '\0') snprintf(temp, temp_size, "%s", real_base);
+                    else snprintf(temp, temp_size, "%s/%s", real_base, suffix);
+                } else snprintf(temp, temp_size, "%s%s", real_base, suffix);
                 matched = true;
                 break;
             }
@@ -320,14 +335,14 @@ static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int
         if (effective_uid < 0) effective_uid = 0;
         snprintf(sandbox_target, sizeof(sandbox_target), STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);
         if (access(sandbox_target, F_OK) != 0) mkdir_recursive_p(sandbox_target, 0775);
-        snprintf(temp, 1023, "%s%s", sandbox_target, sub_path);
+        snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
         return true;
     }
     return false;
 }
 
 int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t size, int user_id, bool* is_redir_out, const char* current_pkg) {
-    char temp[1024] = {0}; 
+    char temp[PATH_MAX] = {0};
     bool redir = false;
     bool dummy_hidden = false;
     bool dummy_ro = false;
@@ -354,11 +369,11 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
     }
     
     if (!redir) {
-        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : false);
+        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : false, sizeof(temp));
     }
     if (!redir) {
         bool app_explicit_sandbox = (cfg && cfg->sandbox_explicit);
-        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : app_explicit_sandbox);
+        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : app_explicit_sandbox, sizeof(temp));
     }
     if (!redir) {
         if (user_id >= 0) snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);
@@ -371,7 +386,7 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
     return 0;
 }
 
-bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path) {
+bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path, const char* current_pkg) {
     bool dummy_hidden = false;
     bool ro = false;
     if (cfg && cfg->trie_root) {
@@ -388,18 +403,34 @@ bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path) {
     if (cfg && cfg->ro_rules) {
         for (int i = 0; i < cfg->ro_count; i++) {
             if (cfg->ro_rules[i]) {
-                if (fnmatch(cfg->ro_rules[i], sub_path, 0) == 0) { return true; }
-                size_t len = strlen(cfg->ro_rules[i]);
-                if (strncmp(sub_path, cfg->ro_rules[i], len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
+                const char* rule = cfg->ro_rules[i];
+                char expanded[PATH_MAX];
+                const char* match_str = rule;
+                if (has_path_var(rule)) {
+                    if (!pkg_resolvable(current_pkg)) continue;
+                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg, current_pkg);
+                    match_str = expanded;
+                }
+                if (fnmatch(match_str, sub_path, 0) == 0) { return true; }
+                size_t len = strlen(match_str);
+                if (strncmp(sub_path, match_str, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
             }
         }
     }
     if (g_global_cfg.ro_rules) {
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
             if (g_global_cfg.ro_rules[i]) {
-                if (fnmatch(g_global_cfg.ro_rules[i], sub_path, 0) == 0) { return true; }
-                size_t len = strlen(g_global_cfg.ro_rules[i]);
-                if (strncmp(sub_path, g_global_cfg.ro_rules[i], len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
+                const char* rule = g_global_cfg.ro_rules[i];
+                char expanded[PATH_MAX];
+                const char* match_str = rule;
+                if (has_path_var(rule)) {
+                    if (!pkg_resolvable(current_pkg)) continue;
+                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg, current_pkg);
+                    match_str = expanded;
+                }
+                if (fnmatch(match_str, sub_path, 0) == 0) { return true; }
+                size_t len = strlen(match_str);
+                if (strncmp(sub_path, match_str, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) { return true; }
             }
         }
     }
@@ -598,7 +629,7 @@ bool vfs_is_virtual_dir_empty(AppConfig* cfg, const char* sub_path, const char* 
     return empty;
 }
 
-bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_id, void* buf, fuse_fill_dir_t filler, uid_t uid, gid_t gid, DirHashTable* ht, bool is_root) {
+bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_id, void* buf, fuse_fill_dir_t filler, uid_t uid, gid_t gid, DirHashTable* ht, bool is_root, const char* current_pkg) {
 #define PROCESS_CFG_DIRS(c) \
     do { \
         if (!(c) || !(c)->redir_rules) break; \
@@ -609,9 +640,8 @@ bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_i
                 if (is_root) snprintf(full_vpath, PATH_MAX, "/%s", name); \
                 else snprintf(full_vpath, PATH_MAX, "%s/%s", sub_path, name); \
                 if (strcmp(full_vpath, (c)->redir_rules[i].virtual_prefix) == 0) { \
-                     char dummy[1024]; const char* target = (c)->redir_rules[i].real_target; \
-                     if (target[0] == '?') { int effective_uid = path_user_id >= 0 ? path_user_id : 0; snprintf(dummy, sizeof(dummy), STORAGE_BASE "/%d%s", effective_uid, target + 1); } \
-                     else { strncpy(dummy, target, sizeof(dummy)-1); dummy[sizeof(dummy)-1] = '\0'; } \
+                     char dummy[PATH_MAX]; \
+                     if (!build_real_base_from_target((c)->redir_rules[i].real_target, (path_user_id >= 0 ? path_user_id : 0), dummy, sizeof dummy, (c), &g_global_cfg, current_pkg)) continue; \
                      if (access(dummy, F_OK) != 0) continue; \
                 } \
                 if (vfs_hash_insert(ht, name)) { \

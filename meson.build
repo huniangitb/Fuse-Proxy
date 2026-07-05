@@ -73,6 +73,7 @@ inc_dir = include_directories('include')
 common_sources = [
     'src/core/common.c',
     'src/config/config_parser.c',
+    'src/config/path_vars.c',
     'src/core/fast_search.c',
     'src/core/uid_map.c'
 ]
@@ -115,6 +116,12 @@ executable('log_ctl',
   install: true,
   install_dir: install_bin_dir
 )
+
+# ================= 单元测试 =================
+test_path_vars_exe = executable('test_path_vars',
+  ['tests/test_path_vars.c', 'src/config/path_vars.c'],
+  include_directories: inc_dir)
+test('path_vars', test_path_vars_exe)
 
 message('========================================')
 message('构建配置信息:')
