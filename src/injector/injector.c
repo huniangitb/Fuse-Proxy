@@ -936,7 +936,6 @@ int main(int argc, char *argv[]) {
                         reload_cooldown_seconds--;
                         if (reload_cooldown_seconds == 0) {
                             g_reload_config = 1;
-                            notify_fuses(SIGHUP);
                         }
                     }
                     if (!g_passive_mode) {

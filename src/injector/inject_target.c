@@ -207,7 +207,6 @@ void update_uid_map(uid_t uid, const char* pkg) {
         g_uid_map_count++;
         LOG_DBG("UID内存映射已更新 (新增记录): %u -> %s", uid, clean_pkg);
     }
-    notify_fuses(SIGHUP);
 }
 
 void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid) {

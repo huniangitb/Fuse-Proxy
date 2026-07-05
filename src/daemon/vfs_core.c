@@ -6,11 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <ctype.h>
 #include <fnmatch.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <sys/inotify.h>
+#include <poll.h>
 
 char g_rules_path[PATH_MAX] = {0};
 UidMapEntry g_uid_maps[UID_MAP_MAX_ENTRIES];
@@ -29,29 +30,53 @@ static void load_uid_map() {
     g_uid_map_count = uid_map_load(g_uid_maps, UID_MAP_MAX_ENTRIES);
 }
 
-static void* signal_monitor_thread(void* arg) {
-    (void)arg; 
-    sigset_t set; 
-    int sig; 
-    sigemptyset(&set); 
-    sigaddset(&set, SIGHUP);
-    while (true) {
-        if (sigwait(&set, &sig) != 0) continue;
-        if (sig == SIGHUP) {
-            config_lock_write();
-            load_config_rules(g_rules_path); 
-            load_uid_map();
-            for (int i = 0; i < UID_CACHE_SIZE; i++) {
-                pthread_mutex_lock(&g_uid_cache[i].lock);
-                g_uid_cache[i].uid = 0;
-                g_uid_cache[i].cfg = nullptr;
-                g_uid_cache[i].pkg[0] = '\0';
-                pthread_mutex_unlock(&g_uid_cache[i].lock);
-            }
-            config_unlock_write();
-            LOG_DBG("已接收通知，重新加载配置，全局监控状态: %s", g_global_cfg.monitor ? "开启" : "关闭");
-        }
+static void reload_config(void) {
+    config_lock_write();
+    load_config_rules(g_rules_path);
+    load_uid_map();
+    for (int i = 0; i < UID_CACHE_SIZE; i++) {
+        pthread_mutex_lock(&g_uid_cache[i].lock);
+        g_uid_cache[i].uid = 0;
+        g_uid_cache[i].cfg = nullptr;
+        g_uid_cache[i].pkg[0] = '\0';
+        pthread_mutex_unlock(&g_uid_cache[i].lock);
     }
+    config_unlock_write();
+    LOG_DBG("已检测到配置变更，重新加载配置，全局监控状态: %s",
+            g_global_cfg.monitor ? "开启" : "关闭");
+}
+
+static void* config_monitor_thread(void* arg) {
+    (void)arg;
+
+    int inotify_fd = inotify_init1(IN_CLOEXEC);
+    if (inotify_fd < 0) return nullptr;
+
+    /* 从 g_rules_path 提取目录路径 */
+    char dir[PATH_MAX];
+    strncpy(dir, g_rules_path, sizeof(dir) - 1);
+    char *slash = strrchr(dir, '/');
+    if (!slash) { close(inotify_fd); return nullptr; }
+    *slash = '\0';
+
+    int wd = inotify_add_watch(inotify_fd, dir, IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO);
+    if (wd < 0) { close(inotify_fd); return nullptr; }
+
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    while (true) {
+        ssize_t len = read(inotify_fd, buf, sizeof(buf));
+        if (len <= 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* 延迟 1 秒防抖，等写入完成 */
+        sleep(1);
+
+        reload_config();
+    }
+
+    close(inotify_fd);
     return nullptr;
 }
 
@@ -64,12 +89,8 @@ void vfs_core_init(const char* rules_path) {
         g_uid_cache[i].cfg = nullptr;
         g_uid_cache[i].pkg[0] = '\0';
     }
-    sigset_t set; 
-    sigemptyset(&set); 
-    sigaddset(&set, SIGHUP); 
-    pthread_sigmask(SIG_BLOCK, &set, nullptr);
-    pthread_t sig_thread; 
-    pthread_create(&sig_thread, nullptr, signal_monitor_thread, nullptr); 
+    pthread_t sig_thread;
+    pthread_create(&sig_thread, nullptr, config_monitor_thread, nullptr);
     pthread_detach(sig_thread);
     
     config_lock_write();
