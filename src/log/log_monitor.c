@@ -243,13 +243,12 @@ static void *async_log_thread(void *arg) {
                 if (pos > 0) {
                     char *msg = line;
                     int level = LOG_INFO;
-                    if (ctx->type == 0) {
-                        if (strncmp(msg, "LOG_IO:", 7) == 0)
-                            { ctx->type = 1; msg += 7; }
-                        else if (strncmp(msg, "LOG_SYS:", 8) == 0)
-                            { ctx->type = 2; msg += 8; }
-                        else if (strncmp(msg, "LOG_LOGCAT:", 11) == 0)
-                            { ctx->type = 3; msg += 11; }
+                    if (strncmp(msg, "LOG_IO:", 7) == 0) {
+                        ctx->type = 1; msg += 7;
+                    } else if (strncmp(msg, "LOG_SYS:", 8) == 0) {
+                        ctx->type = 2; msg += 8;
+                    } else if (strncmp(msg, "LOG_LOGCAT:", 11) == 0) {
+                        ctx->type = 3; msg += 11;
                     }
                     if (ctx->type == 2 && msg[0] >= '0' && msg[0] <= '9') {
                         level = msg[0] - '0';

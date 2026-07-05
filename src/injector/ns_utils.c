@@ -545,6 +545,7 @@ int ns_backup_and_clear_target(int pid, const char* target, const char* backup) 
     return ret;
 }
 struct CombinedMountArgs {
+    const char* pkg;
     const char* source;
     const char* target;
     const char* backup;
@@ -553,6 +554,7 @@ struct CombinedMountArgs {
 };
 static int do_combined_mount(void* raw_args) {
     struct CombinedMountArgs* args = (struct CombinedMountArgs*)raw_args;
+    const char* pkg = args->pkg;
     const char* source = args->source;
     const char* target = args->target;
     const char* backup = args->backup;
@@ -563,7 +565,8 @@ static int do_combined_mount(void* raw_args) {
     size_t nread = 0;
     char* buf = read_file_dynamic("/proc/self/mountinfo", &nread);
     if (!buf) {
-        log_ns_error("[ns_error] open /proc/self/mountinfo failed, errno=%d\n", errno);
+        log_ns_error("[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d\n", pkg, errno);
+        log_internal(LOG_ERROR, "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg, errno);
         return errno;
     }
     char backup_mounts[128][256];
@@ -619,11 +622,13 @@ static int do_combined_mount(void* raw_args) {
         if (umount2(backup, MNT_DETACH) == 0) break;
     }
     if (mkdir_recursive(backup) != 0) {
-        log_ns_error("[ns_error] Combined mount mkdir_recursive backup failed: mkdir_recursive(%s) errno=%d\n", backup, errno);
+        log_ns_error("[ns_error] [%s] Combined mount mkdir_recursive backup failed: mkdir_recursive(%s) errno=%d\n", pkg, backup, errno);
+        log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount mkdir_recursive backup failed: mkdir_recursive(%s) errno=%d", pkg, backup, errno);
     }
     if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
-        log_ns_error("[ns_error] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", target, backup, err, strerror(err));
+        log_ns_error("[ns_error] [%s] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", pkg, target, backup, err, strerror(err));
+        log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)", pkg, target, backup, err, strerror(err));
         return err;
     }
     for (int i = target_count - 1; i >= 0; i--) {
@@ -635,11 +640,13 @@ static int do_combined_mount(void* raw_args) {
         if (umount2(target, MNT_DETACH) == 0) break;
     }
     if (mkdir_recursive(target) != 0) {
-        log_ns_error("[ns_error] Combined mount mkdir_recursive target failed: mkdir_recursive(%s) errno=%d\n", target, errno);
+        log_ns_error("[ns_error] [%s] Combined mount mkdir_recursive target failed: mkdir_recursive(%s) errno=%d\n", pkg, target, errno);
+        log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount mkdir_recursive target failed: mkdir_recursive(%s) errno=%d", pkg, target, errno);
     }
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
-        log_ns_error("[ns_error] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", source, target, err, strerror(err));
+        log_ns_error("[ns_error] [%s] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)\n", pkg, source, target, err, strerror(err));
+        log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount FUSE source failed: mount(%s -> %s) errno=%d (%s)", pkg, source, target, err, strerror(err));
         return err;
     }
     for (int i = 0; i < preserve_count; i++) {
@@ -652,14 +659,15 @@ static int do_combined_mount(void* raw_args) {
         mkdir_recursive(mp);
         if (mount(backup_src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
             int err = errno;
-            log_ns_error("[ns_error] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", backup_src, mp, err, strerror(err));
+            log_ns_error("[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", pkg, backup_src, mp, err, strerror(err));
+            log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)", pkg, backup_src, mp, err, strerror(err));
         }
     }
     return 0;
 }
-int ns_combined_mount(int pid, const char* source, const char* target, const char* backup,
+int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
                       char preserve_paths[][256], int preserve_count) {
-    struct CombinedMountArgs args = { source, target, backup, preserve_paths, preserve_count };
+    struct CombinedMountArgs args = { pkg, source, target, backup, preserve_paths, preserve_count };
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_combined_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -715,6 +723,7 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
                             char preserve_paths[][256], int preserve_count) {
     struct CombinedMountArgs *args = malloc(sizeof(struct CombinedMountArgs));
     if (!args) return -1;
+    args->pkg = pkg ? strdup(pkg) : NULL;
     args->source = strdup(source);
     args->target = strdup(target);
     args->backup = strdup(backup);
@@ -725,6 +734,7 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     }
     int ret = run_in_mnt_ns_async(pid, pkg, do_combined_mount, args, args);
     if (ret < 0) {
+        free((void*)args->pkg);
         free((void*)args->source);
         free((void*)args->target);
         free((void*)args->backup);

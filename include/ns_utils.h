@@ -54,7 +54,7 @@ int ns_restore_system_fuse(int mnt_ns_pid, const char* fuse_src, const char* bac
 int ns_backup_and_clear_target(int pid, const char* target, const char* backup);
 
 /* 阻塞式合并挂载（作为向下兼容） */
-int ns_combined_mount(int pid, const char* source, const char* target, const char* backup,
+int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
                       char preserve_paths[][256], int preserve_count);
 
 /* 核心优化：高并发非阻塞异步合并挂载 */

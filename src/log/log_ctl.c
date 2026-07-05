@@ -861,6 +861,13 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         fclose(fp);
     }
 report_success:
+    if (!api_mode) {
+        /* 通知注入器重新加载配置 */
+        const char *err = send_reload_signal();
+        if (err) {
+            fprintf(stderr, "警告: %s（配置已写入，需手动触发重载）\n", err);
+        }
+    }
     if (api_mode) {
         char data_buf[1024];
         char esc_file[256], esc_line[256];
@@ -928,6 +935,12 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         return;
     }
     free_file_lines(lines, line_count);
+    if (!api_mode) {
+        const char *err = send_reload_signal();
+        if (err) {
+            fprintf(stderr, "警告: %s（配置已写入，需手动触发重载）\n", err);
+        }
+    }
     if (api_mode) {
         char esc_file[256];
         json_escape_str(rule_path, esc_file, sizeof(esc_file));
