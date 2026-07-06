@@ -7,7 +7,7 @@
 - **Socket 类型**: `AF_UNIX` / `SOCK_DGRAM`（抽象命名空间）
 - **Socket 路径**: `nsp_config_broadcast`（抽象地址，无文件残留）
 - **权限要求**: 拥有 `AF_UNIX` 通信权限即可（root / system_app / 同 UID）
-- **JSON 上限**: 64KB
+- **JSON 上限**: 256KB
 
 ---
 
@@ -110,8 +110,7 @@ data class ConfigResponse(
     val timestamp: Long = 0,
     val injector: InjectorInfo? = null,
     @SerialName("global_fuse") val globalFuse: FuseInfo? = null,
-    val templates: List<Template> = emptyList(),
-    @SerialName("uid_map") val uidMap: List<UidEntry> = emptyList()
+    val templates: List<Template> = emptyList()
 )
 
 @Serializable
@@ -158,8 +157,33 @@ data class UidEntry(
 data class StaticResponse(
     val timestamp: Long = 0,
     val type: String = "static",
-    @SerialName("injector_conf") val injectorConf: String? = null,
+    val global: GlobalRules? = null,
+    val apps: List<AppEntry> = emptyList(),
     @SerialName("app_rules") val appRules: List<StaticRuleFile> = emptyList()
+)
+
+@Serializable
+data class GlobalRules(
+    val switches: Switches? = null,
+    @SerialName("ro_rules") val roRules: List<String> = emptyList(),
+    @SerialName("hide_rules") val hideRules: List<String> = emptyList(),
+    @SerialName("redirect_rules") val redirectRules: List<String> = emptyList(),
+    @SerialName("allow_rules") val allowRules: List<String> = emptyList()
+)
+
+@Serializable
+data class Switches(
+    @SerialName("global_inject") val globalInject: String = "OFF",
+    val monitor: String = "ON",
+    val sandbox: String = "OFF",
+    @SerialName("fuse_direct") val fuseDirect: String = "OFF"
+)
+
+@Serializable
+data class AppEntry(
+    val pkg: String = "",
+    @SerialName("user_id") val userId: Int = 0,
+    @SerialName("inject_enable") val injectEnable: String = "OFF"
 )
 
 @Serializable
@@ -363,6 +387,7 @@ class ConfigSubscriptionService : Service() {
       "apply_to_app": ["*"],
       "enable_sandbox": false,
       "global_inject": true,
+      "fuse_direct": false,
       "hide_paths": [],
       "read_only_path": [],
       "redirect_rules": [
@@ -380,9 +405,6 @@ class ConfigSubscriptionService : Service() {
       "read_only_path": ["/storage/emulated/0/HarmonyOS_Sans_SC_Regular.ttf/"],
       "redirect_rules": []
     }
-  ],
-  "uid_map": [
-    { "uid": 10123, "pkg": "com.example.app" }
   ]
 }
 ```
@@ -395,31 +417,53 @@ class ConfigSubscriptionService : Service() {
 | `templates[].hook_operation` | List\<String\> | 固定 `["query","insert"]`，直接透传 |
 | `templates[].apply_to_app` | List\<String\> | 该模板作用的应用列表 |
 | `templates[].enable_sandbox` | Boolean | 沙盒模式开关 |
+| `templates[].global_inject` | Boolean | 全局注入开关（仅 GLOBAL 模板） |
+| `templates[].fuse_direct` | Boolean | FUSE 直通开关（仅 GLOBAL 模板） |
+| `templates[].monitor` | Boolean | 监控开关（仅应用模板） |
+| `templates[].inject_enable` | Boolean | 注入使能（仅应用模板） |
 | `templates[].hide_paths` | List\<String\> | 隐藏路径列表 |
 | `templates[].read_only_path` | List\<String\> | 只读路径列表 |
 | `templates[].redirect_rules` | List\<RedirectRule\> | 重定向规则 |
 | `redirect_rules[].source` | String | 虚拟路径 |
 | `redirect_rules[].target` | String | 实际目标路径 |
-| `uid_map[]` | List\<UidEntry\> | UID → 包名映射 |
 
-### STATIC 响应（原始规则文件）
+### STATIC 响应（磁盘原始规则文件解析结果）
 
 ```json
 {
   "timestamp": 1718000000,
   "type": "static",
-  "injector_conf": "[GLOBAL]\nREDIRECT /sdcard /data/media/0\n",
+  "global": {
+    "switches": {
+      "global_inject": "OFF",
+      "monitor": "ON",
+      "sandbox": "OFF",
+      "fuse_direct": "OFF"
+    },
+    "ro_rules": ["/123 云盘/Cache/", "/HyperOS_Sandbox/"],
+    "hide_rules": [],
+    "redirect_rules": ["/sdcard/src /sdcard/dst"],
+    "allow_rules": []
+  },
+  "apps": [
+    {"pkg": "com.termux", "user_id": 0, "inject_enable": "OFF"},
+    {"pkg": "com.tencent.mobileqq", "user_id": 0, "inject_enable": "ON"}
+  ],
   "app_rules": [
     {
-      "file": "com.example.conf",
+      "file": "com.tencent.mobileqq.conf",
       "user_dir": "App-rules",
-      "content": "HIDE /system/fonts\nRO /storage/emulated/0/file.ttf/"
+      "content": "SANDBOX ON\n"
     }
   ]
 }
 ```
 
----
+- `global.switches`：全局开关（`global_inject`、`monitor`、`sandbox`、`fuse_direct`，值为 `"ON"` / `"OFF"`）
+- `global.ro_rules` / `hide_rules` / `redirect_rules` / `allow_rules`：各类型规则列表
+- `apps[].inject_enable`：应用注入开关（`"ON"` / `"OFF"`）
+- `app_rules[].content`：规则文件原始内容（JSON 转义字符串）
+
 
 ## Android 端常见问题
 
@@ -457,7 +501,7 @@ allow <app_domain> nsp_config_broadcast_socket:sock_file { write read };
 | 文件 | 说明 |
 |------|------|
 | `include/config_publisher.h` | 广播服务 API 声明 |
-| `src/injector/config_publisher.c` | 核心实现（~450 行） |
+| `src/injector/config_publisher.c` | 核心实现（~687 行） |
 | `src/injector/injector.c` | 集成：初始化、epoll 处理、重载广播、清理 |
 | `src/log/log_ctl.c` | CLI 客户端：`get-config` / `get-config --static` / `stream-config` |
 | `include/common.h` | `CONFIG_BROADCAST_SOCKET` 常量 |

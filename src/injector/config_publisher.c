@@ -17,6 +17,7 @@
 #include <sys/un.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
+#include <json-c/json.h>
 #define PUBSUB_SOCKET_NAME    CONFIG_BROADCAST_SOCKET
 #define MAX_SUBSCRIBERS       32
 #define MAX_SNAPSHOT_APPS     256
@@ -28,210 +29,132 @@ struct Subscriber {
 };
 static struct Subscriber g_subscribers[MAX_SUBSCRIBERS];
 static int g_subscriber_count = 0;
-typedef struct {
-    char *buf;
-    int len;
-    int capacity;
-} JsonBuf;
-static void json_init(JsonBuf *jb, int initial_capacity) {
-    jb->capacity = initial_capacity > 0 ? initial_capacity : 4096;
-    jb->buf = malloc(jb->capacity);
-    jb->len = 0;
-    if (jb->buf) {
-        jb->buf[0] = '\0';
-    }
+static void build_injector_json(json_object *root) {
+    json_object *injector = json_object_new_object();
+    json_object_object_add(injector, "pid", json_object_new_int(getpid()));
+    json_object_object_add(injector, "passive", json_object_new_boolean(g_passive_mode));
+    json_object_object_add(injector, "mode", json_object_new_string(g_passive_mode ? "passive" : "active"));
+    json_object_object_add(root, "injector", injector);
 }
-static void json_ensure_capacity(JsonBuf *jb, int need) {
-    if (!jb->buf) return;
-    /* 核心修复：确保判定中包含 + 1 的 Null 终止哨兵安全冗余。
-     * 即使 need 的字节刚好填满可用空间，也仍有一字节的空闲存放末尾的 '\0'。 */
-    if (jb->len + need + 1 > jb->capacity) {
-        int new_capacity = jb->capacity * 2;
-        while (new_capacity < jb->len + need + 1) {
-            new_capacity *= 2;
-        }
-        char *new_buf = realloc(jb->buf, new_capacity);
-        if (!new_buf) {
-            return; 
-        }
-        jb->buf = new_buf;
-        jb->capacity = new_capacity;
-    }
+static void build_global_fuse_json(json_object *root) {
+    json_object *global_fuse = json_object_new_object();
+    json_object_object_add(global_fuse, "fuse_pid", json_object_new_int(g_global_fuse.fuse_pid));
+    json_object_object_add(global_fuse, "disabled", json_object_new_boolean(g_global_fuse.disabled));
+    json_object_object_add(root, "global_fuse", global_fuse);
 }
-__attribute__((format(printf, 2, 3)))
-static void json_append(JsonBuf *jb, const char *fmt, ...) {
-    if (!jb->buf) return;
-    va_list ap;
-    va_start(ap, fmt);
-    va_list ap_copy;
-    va_copy(ap_copy, ap);
-    int remaining = jb->capacity - jb->len;
-    int n = vsnprintf(jb->buf + jb->len, remaining, fmt, ap_copy);
-    va_end(ap_copy);
-    if (n >= remaining) {
-        int new_capacity = jb->capacity * 2;
-        while (new_capacity < jb->len + n + 1) {
-            new_capacity *= 2;
-        }
-        char *new_buf = realloc(jb->buf, new_capacity);
-        if (!new_buf) {
-            va_end(ap);
-            return; 
-        }
-        jb->buf = new_buf;
-        jb->capacity = new_capacity;
-        remaining = jb->capacity - jb->len;
-        vsnprintf(jb->buf + jb->len, remaining, fmt, ap);
-    }
-    va_end(ap);
-    if (n > 0) {
-        jb->len += n;
-    }
-}
-static void json_escape(JsonBuf *jb, const char *str, bool quoted) {
-    if (!str) {
-        json_append(jb, "null");
-        return;
-    }
-    if (quoted) {
-        json_ensure_capacity(jb, 1);
-        jb->buf[jb->len++] = '"';
-    }
-    for (const char *p = str; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        json_ensure_capacity(jb, 6);
-        switch (c) {
-            case '"':  
-                jb->buf[jb->len++] = '\\';
-                jb->buf[jb->len++] = '"';
-                break;
-            case '\\': 
-                jb->buf[jb->len++] = '\\';
-                jb->buf[jb->len++] = '\\';
-                break;
-            case '\n': 
-                jb->buf[jb->len++] = '\\';
-                jb->buf[jb->len++] = 'n';
-                break;
-            case '\r': 
-                jb->buf[jb->len++] = '\\';
-                jb->buf[jb->len++] = 'r';
-                break;
-            case '\t': 
-                jb->buf[jb->len++] = '\\';
-                jb->buf[jb->len++] = 't';
-                break;
-            default:
-                if (c < 0x20) {
-                    int n = snprintf(jb->buf + jb->len, 7, "\\u%04x", c);
-                    if (n > 0) jb->len += n;
-                } else {
-                    jb->buf[jb->len++] = (char)c;
-                }
-                break;
-        }
-    }
-    if (quoted) {
-        json_ensure_capacity(jb, 1);
-        jb->buf[jb->len++] = '"';
-    }
-    jb->buf[jb->len] = '\0';
-}
-static void build_injector_json(JsonBuf *jb) {
-    json_append(jb,
-        "\"injector\":{\"pid\":%d,\"passive\":%s,\"mode\":",
-        getpid(),
-        g_passive_mode ? "true" : "false");
-    json_escape(jb, g_passive_mode ? "passive" : "active", true);
-    json_append(jb, "},");
-}
-static void build_global_fuse_json(JsonBuf *jb) {
-    json_append(jb,
-        "\"global_fuse\":{\"fuse_pid\":%d,\"disabled\":%s},",
-        g_global_fuse.fuse_pid,
-        g_global_fuse.disabled ? "true" : "false");
-}
-static void append_redir_rules_json(JsonBuf *jb, AppConfig *cfg) {
+static void append_redir_rules_json(json_object *arr, AppConfig *cfg) {
     for (int i = 0; i < cfg->redir_count; i++) {
-        if (i > 0) json_append(jb, ",");
-        json_append(jb, "{\"source\":");
-        json_escape(jb, cfg->redir_rules[i].virtual_prefix, true);
-        json_append(jb, ",\"target\":");
-        json_escape(jb, cfg->redir_rules[i].real_target, true);
-        json_append(jb, "}");
+        json_object *rule = json_object_new_object();
+        json_object_object_add(rule, "source", json_object_new_string(cfg->redir_rules[i].virtual_prefix));
+        json_object_object_add(rule, "target", json_object_new_string(cfg->redir_rules[i].real_target));
+        json_object_array_add(arr, rule);
     }
 }
-static void append_str_array_json(JsonBuf *jb, char **rules, int count) {
+static void append_str_array_json(json_object *arr, char **rules, int count) {
     for (int i = 0; i < count; i++) {
-        if (i > 0) json_append(jb, ",");
-        json_escape(jb, rules[i], true);
+        json_object_array_add(arr, json_object_new_string(rules[i]));
     }
 }
-static void build_templates_json(JsonBuf *jb) {
+static void build_templates_json(json_object *root) {
     config_lock_read();
-    json_append(jb, "\"templates\":[");
-    {
-        json_append(jb, "{\"template_name\":\"GLOBAL\",\"hook_operation\":[\"query\",\"insert\"],\"apply_to_app\":[\"*\"],");
-        json_append(jb, "\"enable_sandbox\":%s", g_global_cfg.sandbox ? "true" : "false");
-        json_append(jb, ",\"global_inject\":%s", g_global_cfg.global_inject ? "true" : "false");
-        json_append(jb, ",\"fuse_direct\":%s", g_global_cfg.fuse_direct ? "true" : "false");
-        json_append(jb, ",\"hide_paths\":[");
-        append_str_array_json(jb, g_global_cfg.hide_rules, g_global_cfg.hide_count);
-        json_append(jb, "],\"read_only_path\":[");
-        append_str_array_json(jb, g_global_cfg.ro_rules, g_global_cfg.ro_count);
-        json_append(jb, "],\"redirect_rules\":[");
-        append_redir_rules_json(jb, &g_global_cfg);
-        json_append(jb, "]}");
-    }
+    json_object *templates = json_object_new_array();
+    
+    // GLOBAL 模板
+    json_object *global = json_object_new_object();
+    json_object_object_add(global, "template_name", json_object_new_string("GLOBAL"));
+    
+    json_object *hook_op = json_object_new_array();
+    json_object_array_add(hook_op, json_object_new_string("query"));
+    json_object_array_add(hook_op, json_object_new_string("insert"));
+    json_object_object_add(global, "hook_operation", hook_op);
+    
+    json_object *apply_to = json_object_new_array();
+    json_object_array_add(apply_to, json_object_new_string("*"));
+    json_object_object_add(global, "apply_to_app", apply_to);
+    
+    json_object_object_add(global, "enable_sandbox", json_object_new_boolean(g_global_cfg.sandbox));
+    json_object_object_add(global, "global_inject", json_object_new_boolean(g_global_cfg.global_inject));
+    json_object_object_add(global, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
+    
+    json_object *hide_paths = json_object_new_array();
+    append_str_array_json(hide_paths, g_global_cfg.hide_rules, g_global_cfg.hide_count);
+    json_object_object_add(global, "hide_paths", hide_paths);
+    
+    json_object *read_only = json_object_new_array();
+    append_str_array_json(read_only, g_global_cfg.ro_rules, g_global_cfg.ro_count);
+    json_object_object_add(global, "read_only_path", read_only);
+    
+    json_object *redir_rules = json_object_new_array();
+    append_redir_rules_json(redir_rules, &g_global_cfg);
+    json_object_object_add(global, "redirect_rules", redir_rules);
+    
+    json_object_array_add(templates, global);
+    
+    // 应用模板
     for (int i = 0; i < g_app_cfg_count; i++) {
         AppConfig *cfg = g_app_cfgs[i];
-        json_append(jb, ",{");
-        json_append(jb, "\"template_name\":");
-        json_escape(jb, cfg->pkg_name, true);
-        json_append(jb, ",\"hook_operation\":[\"query\",\"insert\"],\"apply_to_app\":[");
-        json_escape(jb, cfg->pkg_name, true);
-        json_append(jb, "],");
-        json_append(jb, "\"enable_sandbox\":%s", cfg->sandbox ? "true" : "false");
-        json_append(jb, ",\"monitor\":%s", cfg->monitor ? "true" : "false");
-        json_append(jb, ",\"inject_enable\":%s", cfg->inject_enable ? "true" : "false");
-        json_append(jb, ",\"hide_paths\":[");
-        append_str_array_json(jb, cfg->hide_rules, cfg->hide_count);
-        json_append(jb, "],\"read_only_path\":[");
-        append_str_array_json(jb, cfg->ro_rules, cfg->ro_count);
-        json_append(jb, "],\"redirect_rules\":[");
-        append_redir_rules_json(jb, cfg);
-        json_append(jb, "]}");
+        json_object *app = json_object_new_object();
+        json_object_object_add(app, "template_name", json_object_new_string(cfg->pkg_name));
+        
+        json_object *hook_op = json_object_new_array();
+        json_object_array_add(hook_op, json_object_new_string("query"));
+        json_object_array_add(hook_op, json_object_new_string("insert"));
+        json_object_object_add(app, "hook_operation", hook_op);
+        
+        json_object *apply_to = json_object_new_array();
+        json_object_array_add(apply_to, json_object_new_string(cfg->pkg_name));
+        json_object_object_add(app, "apply_to_app", apply_to);
+        
+        json_object_object_add(app, "enable_sandbox", json_object_new_boolean(cfg->sandbox));
+        json_object_object_add(app, "monitor", json_object_new_boolean(cfg->monitor));
+        json_object_object_add(app, "inject_enable", json_object_new_boolean(cfg->inject_enable));
+        
+        json_object *hide_paths = json_object_new_array();
+        append_str_array_json(hide_paths, cfg->hide_rules, cfg->hide_count);
+        json_object_object_add(app, "hide_paths", hide_paths);
+        
+        json_object *read_only = json_object_new_array();
+        append_str_array_json(read_only, cfg->ro_rules, cfg->ro_count);
+        json_object_object_add(app, "read_only_path", read_only);
+        
+        json_object *redir_rules = json_object_new_array();
+        append_redir_rules_json(redir_rules, cfg);
+        json_object_object_add(app, "redirect_rules", redir_rules);
+        
+        json_object_array_add(templates, app);
     }
-    json_append(jb, "],");
+    
+    json_object_object_add(root, "templates", templates);
     config_unlock_read();
 }
-static void build_uidmap_json(JsonBuf *jb) {
+#ifdef CONFIG_PUBLISHER_ENABLE_UIDMAP
+static void build_uidmap_json(json_object *root) {
     UidMapEntry entries[MAX_SNAPSHOT_UIDMAP];
     int count = get_uid_map_snapshot(entries, MAX_SNAPSHOT_UIDMAP);
-    json_append(jb, "\"uid_map\":[");
+    json_object *uid_map = json_object_new_array();
     for (int i = 0; i < count; i++) {
-        if (i > 0) json_append(jb, ",");
-        json_append(jb, "{\"uid\":%u,\"pkg\":", entries[i].uid);
-        json_escape(jb, entries[i].pkg, true);
-        json_append(jb, "}");
+        json_object *entry = json_object_new_object();
+        json_object_object_add(entry, "uid", json_object_new_int(entries[i].uid));
+        json_object_object_add(entry, "pkg", json_object_new_string(entries[i].pkg));
+        json_object_array_add(uid_map, entry);
     }
-    json_append(jb, "]");
+    json_object_object_add(root, "uid_map", uid_map);
 }
+#endif /* CONFIG_PUBLISHER_ENABLE_UIDMAP */
 static char *build_config_json_payload(int *out_len) {
-    JsonBuf jb;
-    json_init(&jb, 16384); 
-    if (!jb.buf) {
-        *out_len = 0;
-        return NULL;
-    }
-    json_append(&jb, "{");
-    json_append(&jb, "\"timestamp\":%lld,", (long long)time(NULL));
-    build_injector_json(&jb);
-    build_global_fuse_json(&jb);
-    build_templates_json(&jb);
-    json_append(&jb, "}");
-    *out_len = jb.len;
-    return jb.buf;
+    json_object *root = json_object_new_object();
+    json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
+    build_injector_json(root);
+    build_global_fuse_json(root);
+    build_templates_json(root);
+    
+    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    int len = strlen(json_str);
+    char *result = strdup(json_str);
+    json_object_put(root);
+    
+    *out_len = len;
+    return result;
 }
 static void broadcast_json(int sock_fd);
 static int g_pub_fd = -1;
@@ -260,23 +183,25 @@ static void broadcast_json(int sock_fd) {
     }
     free(json);
 }
-#define MAX_FILE_SIZE (16 * 1024)  
+#define MAX_FILE_SIZE (256 * 1024)  
 #define MAX_STATIC_FILES 256
 static int read_file_content(const char *path, char **out_buf) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-    struct stat st;
-    off_t fsize = 0;
-    if (fstat(fd, &st) == 0) {
-        fsize = st.st_size;
-    }
-    if (fsize > MAX_FILE_SIZE) fsize = MAX_FILE_SIZE;
-    size_t alloc_size = (fsize > 0) ? (size_t)fsize : 4096;
-    char *buf = malloc(alloc_size + 1);
-    if (!buf) { close(fd); return -1; }
+    size_t cap = 4096;
     size_t total_read = 0;
-    while (total_read < alloc_size) {
-        ssize_t n = read(fd, buf + total_read, alloc_size - total_read);
+    char *buf = malloc(cap);
+    if (!buf) { close(fd); return -1; }
+    while (1) {
+        if (total_read >= cap) {
+            cap *= 2;
+            if (cap > MAX_FILE_SIZE) cap = MAX_FILE_SIZE;
+            char *new_buf = realloc(buf, cap);
+            if (!new_buf) { free(buf); close(fd); return -1; }
+            buf = new_buf;
+        }
+        size_t remaining = cap - total_read;
+        ssize_t n = read(fd, buf + total_read, remaining);
         if (n < 0) {
             if (errno == EINTR) continue;
             free(buf);
@@ -293,38 +218,57 @@ static int read_file_content(const char *path, char **out_buf) {
 }
 static void handle_static_request(int sock_fd, struct sockaddr_un *cli_addr,
                                    socklen_t cli_len) {
-    JsonBuf jb;
-    json_init(&jb, 32768);
-    if (!jb.buf) return;
-    json_append(&jb, "{");
-    json_append(&jb, "\"timestamp\":%lld,", (long long)time(NULL));
-    json_append(&jb, "\"type\":\"static\",");
+    json_object *root = json_object_new_object();
+    json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
+    json_object_object_add(root, "type", json_object_new_string("static"));
 
     /* 解析 injector.conf */
     char *conf_content = NULL;
     int conf_len = read_file_content(INJECTOR_CONFIG_PATH, &conf_content);
     if (conf_len >= 0 && conf_content) {
+        json_object *global = json_object_new_object();
+        json_object *switches = json_object_new_object();
+        json_object *ro_rules = json_object_new_array();
+        json_object *hide_rules = json_object_new_array();
+        json_object *redirect_rules = json_object_new_array();
+        json_object *allow_rules = json_object_new_array();
+        json_object *apps = json_object_new_array();
+
         bool in_global = false;
-        /* 逐行解析 */
-        char *line = conf_content;
         char *saveptr1 = NULL;
-
-        json_append(&jb, "\"global\":{");
-        json_append(&jb, "\"switches\":{");
-        bool first_switch = true;
-        /* 收集规则 */
-        int ro_cap = 0, hide_cap = 0, redirect_cap = 0, allow_cap = 0;
-        char **ro_list = NULL, **hide_list = NULL, **redirect_list = NULL, **allow_list = NULL;
-        int ro_cnt = 0, hide_cnt = 0, redirect_cnt = 0, allow_cnt = 0;
-
         char *tok = strtok_r(conf_content, "\n", &saveptr1);
+
         while (tok) {
-            /* 跳过空行和注释 */
             while (*tok == ' ' || *tok == '\t') tok++;
             if (*tok == '\0' || *tok == '#') { tok = strtok_r(nullptr, "\n", &saveptr1); continue; }
 
             if (tok[0] == '[') {
                 in_global = (strcmp(tok, "[GLOBAL]") == 0);
+                if (!in_global) {
+                    /* 解析 [pkg:uid] ON/OFF */
+                    char pkg[128] = {0};
+                    int uid = 0;
+                    char state[8] = {0};
+                    char *end = strchr(tok + 1, ']');
+                    if (end) {
+                        size_t len = end - (tok + 1);
+                        char inner[256];
+                        snprintf(inner, sizeof(inner), "%.*s", (int)len, tok + 1);
+                        char *colon = strrchr(inner, ':');
+                        if (colon) { *colon = '\0'; uid = atoi(colon + 1); }
+                        snprintf(pkg, sizeof(pkg), "%s", inner);
+                        char *rest = end + 1;
+                        while (*rest == ' ' || *rest == '\t') rest++;
+                        sscanf(rest, "%7s", state);
+                    }
+                    if (pkg[0]) {
+                        json_object *app = json_object_new_object();
+                        json_object_object_add(app, "pkg", json_object_new_string(pkg));
+                        json_object_object_add(app, "user_id", json_object_new_int(uid));
+                        json_object_object_add(app, "inject_enable", json_object_new_string(state[0] ? state : "OFF"));
+                        json_object_array_add(apps, app);
+                    }
+                }
                 tok = strtok_r(nullptr, "\n", &saveptr1);
                 continue;
             }
@@ -332,168 +276,54 @@ static void handle_static_request(int sock_fd, struct sockaddr_un *cli_addr,
             if (in_global) {
                 char val[4096];
                 if (sscanf(tok, "GLOBAL_INJECT = %4095s", val) == 1 ||
-                    sscanf(tok, "GLOBAL_INJECT %4095s", val) == 1) {
-                    if (!first_switch) json_append(&jb, ",");
-                    json_append(&jb, "\"global_inject\":");
-                    json_escape(&jb, val, true);
-                    first_switch = false;
-                } else if (sscanf(tok, "MONITOR = %4095s", val) == 1 ||
-                           sscanf(tok, "MONITOR %4095s", val) == 1) {
-                    if (!first_switch) json_append(&jb, ",");
-                    json_append(&jb, "\"monitor\":");
-                    json_escape(&jb, val, true);
-                    first_switch = false;
-                } else if (sscanf(tok, "SANDBOX = %4095s", val) == 1 ||
-                           sscanf(tok, "SANDBOX %4095s", val) == 1) {
-                    if (!first_switch) json_append(&jb, ",");
-                    json_append(&jb, "\"sandbox\":");
-                    json_escape(&jb, val, true);
-                    first_switch = false;
-                } else if (sscanf(tok, "FUSE_DIRECT = %4095s", val) == 1 ||
-                           sscanf(tok, "FUSE_DIRECT %4095s", val) == 1) {
-                    if (!first_switch) json_append(&jb, ",");
-                    json_append(&jb, "\"fuse_direct\":");
-                    json_escape(&jb, val, true);
-                    first_switch = false;
-                } else if (strncmp(tok, "RO ", 3) == 0 || strncmp(tok, "RO\t", 2) == 0) {
+                    sscanf(tok, "GLOBAL_INJECT %4095s", val) == 1)
+                    json_object_object_add(switches, "global_inject", json_object_new_string(val));
+                else if (sscanf(tok, "MONITOR = %4095s", val) == 1 ||
+                         sscanf(tok, "MONITOR %4095s", val) == 1)
+                    json_object_object_add(switches, "monitor", json_object_new_string(val));
+                else if (sscanf(tok, "SANDBOX = %4095s", val) == 1 ||
+                         sscanf(tok, "SANDBOX %4095s", val) == 1)
+                    json_object_object_add(switches, "sandbox", json_object_new_string(val));
+                else if (sscanf(tok, "FUSE_DIRECT = %4095s", val) == 1 ||
+                         sscanf(tok, "FUSE_DIRECT %4095s", val) == 1)
+                    json_object_object_add(switches, "fuse_direct", json_object_new_string(val));
+                else if (strncmp(tok, "RO ", 3) == 0 || strncmp(tok, "RO\t", 2) == 0) {
                     char *path = tok + 3;
                     while (*path == ' ' || *path == '\t') path++;
-                    if (*path) {
-                        if (ro_cnt >= ro_cap) {
-                            ro_cap = ro_cap ? ro_cap * 2 : 8;
-                            ro_list = realloc(ro_list, ro_cap * sizeof(char*));
-                        }
-                        ro_list[ro_cnt++] = strdup(path);
-                    }
+                    if (*path) json_object_array_add(ro_rules, json_object_new_string(path));
                 } else if (strncmp(tok, "HIDE ", 5) == 0 || strncmp(tok, "HIDE\t", 5) == 0) {
                     char *path = tok + 5;
                     while (*path == ' ' || *path == '\t') path++;
-                    if (*path) {
-                        if (hide_cnt >= hide_cap) {
-                            hide_cap = hide_cap ? hide_cap * 2 : 8;
-                            hide_list = realloc(hide_list, hide_cap * sizeof(char*));
-                        }
-                        hide_list[hide_cnt++] = strdup(path);
-                    }
+                    if (*path) json_object_array_add(hide_rules, json_object_new_string(path));
                 } else if (strncmp(tok, "REDIRECT ", 9) == 0 || strncmp(tok, "REDIRECT\t", 9) == 0) {
                     char *path = tok + 9;
                     while (*path == ' ' || *path == '\t') path++;
-                    if (*path) {
-                        if (redirect_cnt >= redirect_cap) {
-                            redirect_cap = redirect_cap ? redirect_cap * 2 : 8;
-                            redirect_list = realloc(redirect_list, redirect_cap * sizeof(char*));
-                        }
-                        redirect_list[redirect_cnt++] = strdup(path);
-                    }
+                    if (*path) json_object_array_add(redirect_rules, json_object_new_string(path));
                 } else if (strncmp(tok, "ALLOW ", 6) == 0 || strncmp(tok, "ALLOW\t", 6) == 0) {
                     char *path = tok + 6;
                     while (*path == ' ' || *path == '\t') path++;
-                    if (*path) {
-                        if (allow_cnt >= allow_cap) {
-                            allow_cap = allow_cap ? allow_cap * 2 : 8;
-                            allow_list = realloc(allow_list, allow_cap * sizeof(char*));
-                        }
-                        allow_list[allow_cnt++] = strdup(path);
-                    }
+                    if (*path) json_object_array_add(allow_rules, json_object_new_string(path));
                 }
             }
             tok = strtok_r(nullptr, "\n", &saveptr1);
         }
-        json_append(&jb, "},"); /* 关闭 switches */
 
-        /* RO 规则 */
-        json_append(&jb, "\"ro_rules\":[");
-        for (int i = 0; i < ro_cnt; i++) {
-            if (i > 0) json_append(&jb, ",");
-            json_escape(&jb, ro_list[i], true);
-            free(ro_list[i]);
-        }
-        free(ro_list);
-        json_append(&jb, "],");
-
-        /* HIDE 规则 */
-        json_append(&jb, "\"hide_rules\":[");
-        for (int i = 0; i < hide_cnt; i++) {
-            if (i > 0) json_append(&jb, ",");
-            json_escape(&jb, hide_list[i], true);
-            free(hide_list[i]);
-        }
-        free(hide_list);
-        json_append(&jb, "],");
-
-        /* REDIRECT 规则 */
-        json_append(&jb, "\"redirect_rules\":[");
-        for (int i = 0; i < redirect_cnt; i++) {
-            if (i > 0) json_append(&jb, ",");
-            json_escape(&jb, redirect_list[i], true);
-            free(redirect_list[i]);
-        }
-        free(redirect_list);
-        json_append(&jb, "],");
-
-        /* ALLOW 规则 */
-        json_append(&jb, "\"allow_rules\":[");
-        for (int i = 0; i < allow_cnt; i++) {
-            if (i > 0) json_append(&jb, ",");
-            json_escape(&jb, allow_list[i], true);
-            free(allow_list[i]);
-        }
-        free(allow_list);
-        json_append(&jb, "],");
-
-        /* 解析 [pkg:uid] ON/OFF 应用开关 */
-        json_append(&jb, "\"apps\":[");
-        bool first_app = true;
-        /* 重新解析，提取应用开关 */
-        saveptr1 = nullptr;
-        tok = strtok_r(conf_content, "\n", &saveptr1);
-        while (tok) {
-            while (*tok == ' ' || *tok == '\t') tok++;
-            if (*tok == '\0' || *tok == '#') { tok = strtok_r(nullptr, "\n", &saveptr1); continue; }
-            if (tok[0] == '[' && strcmp(tok, "[GLOBAL]") != 0) {
-                /* 解析 [pkg:uid] ON/OFF */
-                char pkg[128] = {0};
-                int uid = 0;
-                char state[8] = {0};
-                if (tok[0] == '[') {
-                    char *end = strchr(tok + 1, ']');
-                    if (end) {
-                        size_t len = end - (tok + 1);
-                        char inner[256];
-                        snprintf(inner, sizeof(inner), "%.*s", (int)len, tok + 1);
-                        char *colon = strrchr(inner, ':');
-                        if (colon) {
-                            *colon = '\0';
-                            uid = atoi(colon + 1);
-                        }
-                        snprintf(pkg, sizeof(pkg), "%s", inner);
-                        char *rest = end + 1;
-                        while (*rest == ' ' || *rest == '\t') rest++;
-                        sscanf(rest, "%7s", state);
-                    }
-                }
-                if (pkg[0]) {
-                    if (!first_app) json_append(&jb, ",");
-                    json_append(&jb, "{\"pkg\":");
-                    json_escape(&jb, pkg, true);
-                    json_append(&jb, ",\"user_id\":%d,\"inject_enable\":", uid);
-                    json_escape(&jb, state[0] ? state : "OFF", true);
-                    json_append(&jb, "}");
-                    first_app = false;
-                }
-            }
-            tok = strtok_r(nullptr, "\n", &saveptr1);
-        }
-        json_append(&jb, "],");
+        json_object_object_add(global, "switches", switches);
+        json_object_object_add(global, "ro_rules", ro_rules);
+        json_object_object_add(global, "hide_rules", hide_rules);
+        json_object_object_add(global, "redirect_rules", redirect_rules);
+        json_object_object_add(global, "allow_rules", allow_rules);
+        json_object_object_add(root, "global", global);
+        json_object_object_add(root, "apps", apps);
 
         free(conf_content);
     } else {
-        json_append(&jb, "\"global\":null,\"apps\":[],");
+        json_object_object_add(root, "global", NULL);
+        json_object_object_add(root, "apps", json_object_new_array());
     }
 
     /* app_rules: 扫描文件系统读取每个应用规则文件内容 */
-    json_append(&jb, "\"app_rules\":[");
-    bool first_rule = true;
+    json_object *app_rules = json_object_new_array();
     DIR *dir = opendir(CONFIG_DIR);
     if (dir) {
         struct dirent *de;
@@ -511,34 +341,31 @@ static void handle_static_request(int sock_fd, struct sockaddr_un *cli_addr,
                 if (rde->d_type != DT_REG && rde->d_type != DT_LNK) continue;
                 char *dot = strrchr(rde->d_name, '.');
                 if (!dot || strcmp(dot, ".conf") != 0) continue;
-                if (!first_rule) json_append(&jb, ",");
-                first_rule = false;
                 char file_path[PATH_MAX];
                 snprintf(file_path, sizeof(file_path), "%s/%s", rules_dir, rde->d_name);
-                json_append(&jb, "{\"file\":");
-                json_escape(&jb, rde->d_name, true);
-                json_append(&jb, ",\"user_dir\":");
-                json_escape(&jb, de->d_name, true);
-                json_append(&jb, ",\"content\":");
+                json_object *rule = json_object_new_object();
+                json_object_object_add(rule, "file", json_object_new_string(rde->d_name));
+                json_object_object_add(rule, "user_dir", json_object_new_string(de->d_name));
                 char *fc = NULL;
                 int fc_len = read_file_content(file_path, &fc);
                 if (fc_len >= 0 && fc) {
-                    json_escape(&jb, fc, true);
+                    json_object_object_add(rule, "content", json_object_new_string(fc));
                     free(fc);
                 } else {
-                    json_append(&jb, "null");
+                    json_object_object_add(rule, "content", NULL);
                 }
-                json_append(&jb, "}");
+                json_object_array_add(app_rules, rule);
             }
             closedir(rdir);
         }
         closedir(dir);
     }
-    json_append(&jb, "]");
-    json_append(&jb, "}");
-    sendto(sock_fd, jb.buf, jb.len, MSG_NOSIGNAL | MSG_DONTWAIT,
+    json_object_object_add(root, "app_rules", app_rules);
+
+    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    sendto(sock_fd, json_str, strlen(json_str), MSG_NOSIGNAL | MSG_DONTWAIT,
            (struct sockaddr *)cli_addr, cli_len);
-    free(jb.buf);
+    json_object_put(root);
 }
 static void handle_get_request(int sock_fd, struct sockaddr_un *cli_addr,
                                 socklen_t cli_len) {
@@ -551,7 +378,7 @@ static void handle_get_request(int sock_fd, struct sockaddr_un *cli_addr,
 }
 static void handle_subscribe(int sock_fd, struct sockaddr_un *cli_addr,
                               socklen_t cli_len) {
-    for (int i = 0; i < MAX_SUBSCRIBERS && i < g_subscriber_count; i++) {
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (g_subscribers[i].active && g_subscribers[i].addr_len == cli_len &&
             memcmp(&g_subscribers[i].addr, cli_addr, cli_len) == 0) {
             handle_get_request(sock_fd, cli_addr, cli_len);
@@ -576,7 +403,7 @@ static void handle_subscribe(int sock_fd, struct sockaddr_un *cli_addr,
     handle_get_request(sock_fd, cli_addr, cli_len);
 }
 static void handle_unsubscribe(struct sockaddr_un *cli_addr, socklen_t cli_len) {
-    for (int i = 0; i < MAX_SUBSCRIBERS && i < g_subscriber_count; i++) {
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (g_subscribers[i].active && g_subscribers[i].addr_len == cli_len &&
             memcmp(&g_subscribers[i].addr, cli_addr, cli_len) == 0) {
             g_subscribers[i].active = false;

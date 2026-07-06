@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <time.h>
+#include <json-c/json.h>
 #include "common.h"
 #include "config_parser.h"
 
@@ -61,22 +62,15 @@ void usage(const char* prog) {
     printf("\n选项:\n");
     printf("  -u               始终显示 UID\n");
     printf("  api              以 API 格式输出（供程序调用，结构化 JSON）\n");
-    printf("  --subscribe      订阅模式，持续接收配置变更\n");
     printf("  --uid <uid>      指定用户 ID（默认 0）\n");
     exit(1);
 }
 
 /* ========== JSON API 结构化输出 ========== */
-static void json_api_start(bool api_mode) {
-    (void)api_mode;
-}
-
 static void json_api_finish(bool api_mode, const char *cmd, const char *json_data) {
+    (void)cmd;
     if (!api_mode) return;
-    printf("{\"status\":\"ok\",\"command\":%s,\"data\":%s,\"timestamp\":%lld}\n",
-           cmd ? cmd : "null",
-           json_data ? json_data : "null",
-           (long long)time(NULL));
+    printf("%s\n", json_data ? json_data : "{}");
 }
 
 static void json_api_error(bool api_mode, const char *cmd, const char *error_msg) {
@@ -84,54 +78,13 @@ static void json_api_error(bool api_mode, const char *cmd, const char *error_msg
         fprintf(stderr, "错误: %s\n", error_msg ? error_msg : "未知错误");
         return;
     }
-    printf("{\"status\":\"error\",\"command\":%s,\"error\":",
-           cmd ? cmd : "null");
-    if (error_msg) {
-        putchar('"');
-        for (const char *p = error_msg; *p; p++) {
-            unsigned char c = (unsigned char)*p;
-            switch (c) {
-                case '"':  printf("\\\""); break;
-                case '\\': printf("\\\\"); break;
-                case '\n': printf("\\n"); break;
-                case '\r': printf("\\r"); break;
-                case '\t': printf("\\t"); break;
-                default:
-                    if (c < 0x20) printf("\\u%04x", c);
-                    else putchar(c);
-                    break;
-            }
-        }
-        putchar('"');
-    } else {
-        printf("null");
-    }
-    printf(",\"timestamp\":%lld}\n", (long long)time(NULL));
-}
-
-static int json_escape_str(const char *src, char *dst, size_t dst_size) {
-    if (!src || !dst || dst_size == 0) return 0;
-    size_t pos = 0;
-    for (const char *p = src; *p && pos < dst_size - 1; p++) {
-        unsigned char c = (unsigned char)*p;
-        switch (c) {
-            case '"':  if (pos + 2 < dst_size) { dst[pos++] = '\\'; dst[pos++] = '"'; } break;
-            case '\\': if (pos + 2 < dst_size) { dst[pos++] = '\\'; dst[pos++] = '\\'; } break;
-            case '\n': if (pos + 2 < dst_size) { dst[pos++] = '\\'; dst[pos++] = 'n'; } break;
-            case '\r': if (pos + 2 < dst_size) { dst[pos++] = '\\'; dst[pos++] = 'r'; } break;
-            case '\t': if (pos + 2 < dst_size) { dst[pos++] = '\\'; dst[pos++] = 't'; } break;
-            default:
-                if (c < 0x20) {
-                    int n = snprintf(dst + pos, dst_size - pos, "\\u%04x", c);
-                    if (n > 0) pos += (size_t)n;
-                } else {
-                    dst[pos++] = (char)c;
-                }
-                break;
-        }
-    }
-    dst[pos] = '\0';
-    return (int)pos;
+    json_object *root = json_object_new_object();
+    json_object_object_add(root, "status", json_object_new_string("error"));
+    json_object_object_add(root, "command", cmd ? json_object_new_string(cmd) : NULL);
+    json_object_object_add(root, "error", error_msg ? json_object_new_string(error_msg) : NULL);
+    json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
+    printf("%s\n", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+    json_object_put(root);
 }
 
 /* ========== 配置文件读写辅助 ========== */
@@ -170,54 +123,53 @@ static void get_app_rule_dir(char *buf, size_t size, int user_id) {
 }
 
 /* ========== 解析本地规则 ========== */
-static void build_parsed_rules_json(char *out, size_t out_size) {
-    if (!out || out_size == 0) return;
-    size_t pos = 0;
-    pos += snprintf(out + pos, out_size - pos, "{");
+static json_object *build_parsed_rules_json(void) {
+    json_object *root = json_object_new_object();
     config_lock_read();
-    pos += snprintf(out + pos, out_size - pos,
-        "\"global\":{\"sandbox\":%s,\"global_inject\":%s,\"fuse_direct\":%s,\"monitor\":%s,\"inject_enable\":true,\"hide_count\":%d,\"ro_count\":%d,\"redir_count\":%d},",
-        g_global_cfg.sandbox ? "true" : "false",
-        g_global_cfg.global_inject ? "true" : "false",
-        g_global_cfg.fuse_direct ? "true" : "false",
-        g_global_cfg.monitor ? "true" : "false",
-        g_global_cfg.hide_count,
-        g_global_cfg.ro_count,
-        g_global_cfg.redir_count);
-    
-    pos += snprintf(out + pos, out_size - pos, "\"apps\":[");
+
+    json_object *global = json_object_new_object();
+    json_object_object_add(global, "sandbox", json_object_new_boolean(g_global_cfg.sandbox));
+    json_object_object_add(global, "global_inject", json_object_new_boolean(g_global_cfg.global_inject));
+    json_object_object_add(global, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
+    json_object_object_add(global, "monitor", json_object_new_boolean(g_global_cfg.monitor));
+    json_object_object_add(global, "inject_enable", json_object_new_boolean(true));
+    json_object_object_add(global, "hide_count", json_object_new_int(g_global_cfg.hide_count));
+    json_object_object_add(global, "ro_count", json_object_new_int(g_global_cfg.ro_count));
+    json_object_object_add(global, "redir_count", json_object_new_int(g_global_cfg.redir_count));
+    json_object_object_add(root, "global", global);
+
+    json_object *apps = json_object_new_array();
     for (int i = 0; i < g_app_cfg_count; i++) {
         AppConfig *cfg = g_app_cfgs[i];
-        char esc_pkg[256];
-        json_escape_str(cfg->pkg_name, esc_pkg, sizeof(esc_pkg));
-        if (i > 0) pos += snprintf(out + pos, out_size - pos, ",");
-        pos += snprintf(out + pos, out_size - pos,
-            "{\"pkg\":\"%s\",\"user_id\":%d,\"inject_enable\":%s,\"monitor\":%s,\"sandbox\":%s,\"fuse_direct\":%s,\"hide_count\":%d,\"ro_count\":%d,\"redir_count\":%d}",
-            esc_pkg,
-            cfg->user_id,
-            cfg->inject_enable ? "true" : "false",
-            cfg->monitor ? "true" : "false",
-            cfg->sandbox ? "true" : "false",
-            cfg->fuse_direct ? "true" : "false",
-            cfg->hide_count,
-            cfg->ro_count,
-            cfg->redir_count);
+        json_object *app = json_object_new_object();
+        json_object_object_add(app, "pkg", json_object_new_string(cfg->pkg_name));
+        json_object_object_add(app, "user_id", json_object_new_int(cfg->user_id));
+        json_object_object_add(app, "inject_enable", json_object_new_boolean(cfg->inject_enable));
+        json_object_object_add(app, "monitor", json_object_new_boolean(cfg->monitor));
+        json_object_object_add(app, "sandbox", json_object_new_boolean(cfg->sandbox));
+        json_object_object_add(app, "fuse_direct", json_object_new_boolean(cfg->fuse_direct));
+        json_object_object_add(app, "hide_count", json_object_new_int(cfg->hide_count));
+        json_object_object_add(app, "ro_count", json_object_new_int(cfg->ro_count));
+        json_object_object_add(app, "redir_count", json_object_new_int(cfg->redir_count));
+        json_object_array_add(apps, app);
     }
+    json_object_object_add(root, "apps", apps);
+
     config_unlock_read();
-    pos += snprintf(out + pos, out_size - pos, "]}");
+    return root;
 }
 
 static void handle_parse_rules(bool api_mode) {
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     config_unlock_write();
-    char json_buf[65536];
-    build_parsed_rules_json(json_buf, sizeof(json_buf));
+    json_object *json = build_parsed_rules_json();
     if (api_mode) {
-        json_api_finish(true, "\"parse-rules\"", json_buf);
+        json_api_finish(true, "\"parse-rules\"", json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN));
     } else {
-        printf("===== 本地规则解析结果 =====\n%s\n", json_buf);
+        printf("===== 本地规则解析结果 =====\n%s\n", json_object_to_json_string_ext(json, JSON_C_TO_STRING_PLAIN));
     }
+    json_object_put(json);
 }
 
 static void handle_validate_rules(bool api_mode) {
@@ -226,11 +178,14 @@ static void handle_validate_rules(bool api_mode) {
     int app_count = g_app_cfg_count;
     config_unlock_write();
     if (api_mode) {
-        char data_buf[512];
-        snprintf(data_buf, sizeof(data_buf),
-            "{\"valid\":true,\"app_count\":%d,\"global_hide_rules\":%d,\"global_ro_rules\":%d,\"global_redir_rules\":%d}",
-            app_count, g_global_cfg.hide_count, g_global_cfg.ro_count, g_global_cfg.redir_count);
-        json_api_finish(true, "\"validate-rules\"", data_buf);
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "valid", json_object_new_boolean(true));
+        json_object_object_add(root, "app_count", json_object_new_int(app_count));
+        json_object_object_add(root, "global_hide_rules", json_object_new_int(g_global_cfg.hide_count));
+        json_object_object_add(root, "global_ro_rules", json_object_new_int(g_global_cfg.ro_count));
+        json_object_object_add(root, "global_redir_rules", json_object_new_int(g_global_cfg.redir_count));
+        json_api_finish(true, "\"validate-rules\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("规则验证通过。共解析 %d 个应用配置。\n", app_count);
         printf("全局: %d 条 HIDE, %d 条 RO, %d 条 REDIRECT\n",
@@ -245,82 +200,64 @@ static void handle_get_global_rules(bool api_mode) {
     config_unlock_write();
     config_lock_read();
     if (api_mode) {
-        char data_buf[65536];
-        size_t pos = 0;
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "{\"switches\":{\"global_inject\":%s,\"monitor\":%s,\"sandbox\":%s,\"fuse_direct\":%s},",
-            g_global_cfg.global_inject ? "true" : "false",
-            g_global_cfg.monitor ? "true" : "false",
-            g_global_cfg.sandbox ? "true" : "false",
-            g_global_cfg.fuse_direct ? "true" : "false");
-        
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"hide_rules\":[");
-        for (int i = 0; i < g_global_cfg.hide_count; i++) {
-            char esc[1024];
-            json_escape_str(g_global_cfg.hide_rules[i], esc, sizeof(esc));
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc);
-        }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
-        
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"ro_rules\":[");
-        for (int i = 0; i < g_global_cfg.ro_count; i++) {
-            char esc[1024];
-            json_escape_str(g_global_cfg.ro_rules[i], esc, sizeof(esc));
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc);
-        }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+        json_object *root = json_object_new_object();
 
-        /* 进行规则分流研判 */
-        int real_redir_cnt = 0;
-        int allow_cnt = 0;
+        /* switches */
+        json_object *switches = json_object_new_object();
+        json_object_object_add(switches, "global_inject", json_object_new_boolean(g_global_cfg.global_inject));
+        json_object_object_add(switches, "monitor", json_object_new_boolean(g_global_cfg.monitor));
+        json_object_object_add(switches, "sandbox", json_object_new_boolean(g_global_cfg.sandbox));
+        json_object_object_add(switches, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
+        json_object_object_add(root, "switches", switches);
+
+        /* hide_rules */
+        json_object *hide_rules = json_object_new_array();
+        for (int i = 0; i < g_global_cfg.hide_count; i++)
+            json_object_array_add(hide_rules, json_object_new_string(g_global_cfg.hide_rules[i]));
+        json_object_object_add(root, "hide_rules", hide_rules);
+
+        /* ro_rules */
+        json_object *ro_rules = json_object_new_array();
+        for (int i = 0; i < g_global_cfg.ro_count; i++)
+            json_object_array_add(ro_rules, json_object_new_string(g_global_cfg.ro_rules[i]));
+        json_object_object_add(root, "ro_rules", ro_rules);
+
+        /* 分流: redirect vs allow */
+        int real_redir_cnt = 0, allow_cnt = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
             if (g_global_cfg.redir_rules[i].real_target[0] == '?') allow_cnt++;
             else real_redir_cnt++;
         }
 
-        /* 纯重定向规则输出 (剔除 '?' 伪重定向) */
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"redirect_rules\":[");
-        int printed_redir = 0;
+        json_object *redirect_rules = json_object_new_array();
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
             if (g_global_cfg.redir_rules[i].real_target[0] == '?') continue;
-            char esc_v[1024], esc_r[1024];
-            json_escape_str(g_global_cfg.redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
-            json_escape_str(g_global_cfg.redir_rules[i].real_target, esc_r, sizeof(esc_r));
-            if (printed_redir > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-                "{\"virtual_prefix\":\"%s\",\"real_target\":\"%s\"}", esc_v, esc_r);
-            printed_redir++;
+            json_object *rule = json_object_new_object();
+            json_object_object_add(rule, "virtual_prefix", json_object_new_string(g_global_cfg.redir_rules[i].virtual_prefix));
+            json_object_object_add(rule, "real_target", json_object_new_string(g_global_cfg.redir_rules[i].real_target));
+            json_object_array_add(redirect_rules, rule);
         }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+        json_object_object_add(root, "redirect_rules", redirect_rules);
 
-        /* 纯 ALLOW 规则单独输出 */
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"allow_rules\":[");
-        int printed_allow = 0;
+        json_object *allow_rules = json_object_new_array();
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
             if (g_global_cfg.redir_rules[i].real_target[0] != '?') continue;
-            char esc_v[1024];
-            json_escape_str(g_global_cfg.redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
-            if (printed_allow > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc_v);
-            printed_allow++;
+            json_object_array_add(allow_rules, json_object_new_string(g_global_cfg.redir_rules[i].virtual_prefix));
         }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+        json_object_object_add(root, "allow_rules", allow_rules);
 
-        char esc_fuse[512];
-        json_escape_str(g_global_cfg.fuse_extra_args, esc_fuse, sizeof(esc_fuse));
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "\"fuse_extra_args\":\"%s\",", esc_fuse);
-        
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "\"counts\":{\"hide\":%d,\"ro\":%d,\"redirect\":%d,\"allow\":%d}}",
-            g_global_cfg.hide_count,
-            g_global_cfg.ro_count,
-            real_redir_cnt,
-            allow_cnt);
+        json_object_object_add(root, "fuse_extra_args", json_object_new_string(g_global_cfg.fuse_extra_args));
+
+        json_object *counts = json_object_new_object();
+        json_object_object_add(counts, "hide", json_object_new_int(g_global_cfg.hide_count));
+        json_object_object_add(counts, "ro", json_object_new_int(g_global_cfg.ro_count));
+        json_object_object_add(counts, "redirect", json_object_new_int(real_redir_cnt));
+        json_object_object_add(counts, "allow", json_object_new_int(allow_cnt));
+        json_object_object_add(root, "counts", counts);
+
         config_unlock_read();
-        json_api_finish(true, "\"get-global-rules\"", data_buf);
+        json_api_finish(true, "\"get-global-rules\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("===== 全局规则 (GLOBAL) =====\n\n");
         printf("--- Switch 开关 ---\n");
@@ -384,78 +321,60 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         return;
     }
     if (api_mode) {
-        char data_buf[65536];
-        size_t pos = 0;
-        char esc_pkg[256];
-        json_escape_str(cfg->pkg_name, esc_pkg, sizeof(esc_pkg));
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "{\"pkg\":\"%s\",\"user_id\":%d,"
-            "\"switches\":{\"inject_enable\":%s,\"monitor\":%s,\"sandbox\":%s,\"fuse_direct\":%s},",
-            esc_pkg, cfg->user_id,
-            cfg->inject_enable ? "true" : "false",
-            cfg->monitor ? "true" : "false",
-            cfg->sandbox ? "true" : "false",
-            cfg->fuse_direct ? "true" : "false");
-        
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"hide_rules\":[");
-        for (int i = 0; i < cfg->hide_count; i++) {
-            char esc[1024];
-            json_escape_str(cfg->hide_rules[i], esc, sizeof(esc));
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc);
-        }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
-        
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"ro_rules\":[");
-        for (int i = 0; i < cfg->ro_count; i++) {
-            char esc[1024];
-            json_escape_str(cfg->ro_rules[i], esc, sizeof(esc));
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc);
-        }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "pkg", json_object_new_string(cfg->pkg_name));
+        json_object_object_add(root, "user_id", json_object_new_int(cfg->user_id));
 
-        int real_redir_cnt = 0;
-        int allow_cnt = 0;
+        json_object *switches = json_object_new_object();
+        json_object_object_add(switches, "inject_enable", json_object_new_boolean(cfg->inject_enable));
+        json_object_object_add(switches, "monitor", json_object_new_boolean(cfg->monitor));
+        json_object_object_add(switches, "sandbox", json_object_new_boolean(cfg->sandbox));
+        json_object_object_add(switches, "fuse_direct", json_object_new_boolean(cfg->fuse_direct));
+        json_object_object_add(root, "switches", switches);
+
+        json_object *hide_rules = json_object_new_array();
+        for (int i = 0; i < cfg->hide_count; i++)
+            json_object_array_add(hide_rules, json_object_new_string(cfg->hide_rules[i]));
+        json_object_object_add(root, "hide_rules", hide_rules);
+
+        json_object *ro_rules = json_object_new_array();
+        for (int i = 0; i < cfg->ro_count; i++)
+            json_object_array_add(ro_rules, json_object_new_string(cfg->ro_rules[i]));
+        json_object_object_add(root, "ro_rules", ro_rules);
+
+        int real_redir_cnt = 0, allow_cnt = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
             if (cfg->redir_rules[i].real_target[0] == '?') allow_cnt++;
             else real_redir_cnt++;
         }
 
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"redirect_rules\":[");
-        int printed_redir = 0;
+        json_object *redirect_rules = json_object_new_array();
         for (int i = 0; i < cfg->redir_count; i++) {
             if (cfg->redir_rules[i].real_target[0] == '?') continue;
-            char esc_v[1024], esc_r[1024];
-            json_escape_str(cfg->redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
-            json_escape_str(cfg->redir_rules[i].real_target, esc_r, sizeof(esc_r));
-            if (printed_redir > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-                "{\"virtual_prefix\":\"%s\",\"real_target\":\"%s\"}", esc_v, esc_r);
-            printed_redir++;
+            json_object *rule = json_object_new_object();
+            json_object_object_add(rule, "virtual_prefix", json_object_new_string(cfg->redir_rules[i].virtual_prefix));
+            json_object_object_add(rule, "real_target", json_object_new_string(cfg->redir_rules[i].real_target));
+            json_object_array_add(redirect_rules, rule);
         }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+        json_object_object_add(root, "redirect_rules", redirect_rules);
 
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"allow_rules\":[");
-        int printed_allow = 0;
+        json_object *allow_rules = json_object_new_array();
         for (int i = 0; i < cfg->redir_count; i++) {
             if (cfg->redir_rules[i].real_target[0] != '?') continue;
-            char esc_v[1024];
-            json_escape_str(cfg->redir_rules[i].virtual_prefix, esc_v, sizeof(esc_v));
-            if (printed_allow > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "\"%s\"", esc_v);
-            printed_allow++;
+            json_object_array_add(allow_rules, json_object_new_string(cfg->redir_rules[i].virtual_prefix));
         }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "],");
+        json_object_object_add(root, "allow_rules", allow_rules);
 
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "\"counts\":{\"hide\":%d,\"ro\":%d,\"redirect\":%d,\"allow\":%d}}",
-            cfg->hide_count,
-            cfg->ro_count,
-            real_redir_cnt,
-            allow_cnt);
+        json_object *counts = json_object_new_object();
+        json_object_object_add(counts, "hide", json_object_new_int(cfg->hide_count));
+        json_object_object_add(counts, "ro", json_object_new_int(cfg->ro_count));
+        json_object_object_add(counts, "redirect", json_object_new_int(real_redir_cnt));
+        json_object_object_add(counts, "allow", json_object_new_int(allow_cnt));
+        json_object_object_add(root, "counts", counts);
+
         config_unlock_read();
-        json_api_finish(true, "\"get-app-rules\"", data_buf);
+        json_api_finish(true, "\"get-app-rules\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("===== 应用规则: %s (UID %d) =====\n\n", cfg->pkg_name, cfg->user_id);
         printf("--- Switch 开关 ---\n");
@@ -576,25 +495,40 @@ static void handle_status(bool api_mode) {
     config_unlock_read();
     
     if (api_mode) {
-        char data_buf[4096];
-        char time_str[64];
         time_t now = time(NULL);
         struct tm tm_info;
+        char time_str[64];
         localtime_r(&now, &tm_info);
         strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm_info);
-        snprintf(data_buf, sizeof(data_buf),
-            "{\"timestamp\":%lld,\"time\":\"%s\","
-            "\"injector\":{\"pid\":%d,\"alive\":%s},"
-            "\"fuse\":{\"pid\":%d,\"alive\":%s},"
-            "\"config\":{\"main_conf_path\":\"%s\",\"main_conf_size\":%d,\"app_rule_files\":%d,\"parsed_apps_in_memory\":%d},"
-            "\"system\":{\"config_dir\":\"%s\",\"pid_file\":\"%s\"}}",
-            (long long)now, time_str,
-            injector_pid, injector_alive ? "true" : "false",
-            fuse_pid, fuse_alive ? "true" : "false",
-            INJECTOR_CONFIG_PATH, main_conf_size,
-            app_rule_files, mem_app_count,
-            CONFIG_DIR, INJECTOR_PID_PATH);
-        json_api_finish(true, "\"status\"", data_buf);
+
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "timestamp", json_object_new_int64(now));
+        json_object_object_add(root, "time", json_object_new_string(time_str));
+
+        json_object *injector = json_object_new_object();
+        json_object_object_add(injector, "pid", json_object_new_int(injector_pid));
+        json_object_object_add(injector, "alive", json_object_new_boolean(injector_alive));
+        json_object_object_add(root, "injector", injector);
+
+        json_object *fuse = json_object_new_object();
+        json_object_object_add(fuse, "pid", json_object_new_int(fuse_pid));
+        json_object_object_add(fuse, "alive", json_object_new_boolean(fuse_alive));
+        json_object_object_add(root, "fuse", fuse);
+
+        json_object *config = json_object_new_object();
+        json_object_object_add(config, "main_conf_path", json_object_new_string(INJECTOR_CONFIG_PATH));
+        json_object_object_add(config, "main_conf_size", json_object_new_int(main_conf_size));
+        json_object_object_add(config, "app_rule_files", json_object_new_int(app_rule_files));
+        json_object_object_add(config, "parsed_apps_in_memory", json_object_new_int(mem_app_count));
+        json_object_object_add(root, "config", config);
+
+        json_object *system = json_object_new_object();
+        json_object_object_add(system, "config_dir", json_object_new_string(CONFIG_DIR));
+        json_object_object_add(system, "pid_file", json_object_new_string(INJECTOR_PID_PATH));
+        json_object_object_add(root, "system", system);
+
+        json_api_finish(true, "\"status\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("===== 系统状态概览 =====\n");
         printf("时间: %lld\n", (long long)time(NULL));
@@ -869,14 +803,14 @@ report_success:
         }
     }
     if (api_mode) {
-        char data_buf[1024];
-        char esc_file[256], esc_line[256];
-        json_escape_str(rule_path, esc_file, sizeof(esc_file));
-        json_escape_str(line, esc_line, sizeof(esc_line));
-        snprintf(data_buf, sizeof(data_buf),
-            "{\"file\":\"%s\",\"line\":\"%s\",\"pkg\":\"%s\",\"type\":\"%s\",\"value\":\"%s\"}",
-            esc_file, esc_line, pkg, type, value);
-        json_api_finish(true, "\"set-rule\"", data_buf);
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "file", json_object_new_string(rule_path));
+        json_object_object_add(root, "line", json_object_new_string(line));
+        json_object_object_add(root, "pkg", json_object_new_string(pkg));
+        json_object_object_add(root, "type", json_object_new_string(type));
+        json_object_object_add(root, "value", json_object_new_string(value));
+        json_api_finish(true, "\"set-rule\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("已向 %s 写入规则: %s", rule_path, line);
     }
@@ -942,13 +876,13 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         }
     }
     if (api_mode) {
-        char esc_file[256];
-        json_escape_str(rule_path, esc_file, sizeof(esc_file));
-        char data_buf[512];
-        snprintf(data_buf, sizeof(data_buf),
-            "{\"file\":\"%s\",\"pkg\":\"%s\",\"type\":\"%s\",\"index\":%d}",
-            esc_file, pkg, type, index);
-        json_api_finish(true, "\"remove-rule\"", data_buf);
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "file", json_object_new_string(rule_path));
+        json_object_object_add(root, "pkg", json_object_new_string(pkg));
+        json_object_object_add(root, "type", json_object_new_string(type));
+        json_object_object_add(root, "index", json_object_new_int(index));
+        json_api_finish(true, "\"remove-rule\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("已从 %s 删除第 %d 条 %s 规则\n", rule_path, index, type);
     }
@@ -1143,16 +1077,15 @@ static void handle_list_injected(bool api_mode) {
         if (done_line && sscanf(done_line + 5, "%d", &done_total) == 1) {
             has_done = true;
         }
-        char esc[8192];
-        json_escape_str(resp, esc, sizeof(esc));
-        char data_buf[8192 + 128];
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "raw", json_object_new_string(resp));
         if (has_done) {
-            snprintf(data_buf, sizeof(data_buf),
-                "{\"raw\":\"%s\",\"done\":{\"total\":%d}}", esc, done_total);
-        } else {
-            snprintf(data_buf, sizeof(data_buf), "{\"raw\":\"%s\"}", esc);
+            json_object *done = json_object_new_object();
+            json_object_object_add(done, "total", json_object_new_int(done_total));
+            json_object_object_add(root, "done", done);
         }
-        json_api_finish(true, "\"list-injected\"", data_buf);
+        json_api_finish(true, "\"list-injected\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
         return;
     }
     int total = 0;
@@ -1181,23 +1114,24 @@ static void handle_list_users(bool api_mode) {
     config_lock_read();
     int count = g_active_user_count;
     if (api_mode) {
-        char data_buf[4096];
-        size_t pos = 0;
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-            "{\"count\":%d,\"users\":[", count);
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "count", json_object_new_int(count));
+        json_object *users = json_object_new_array();
         for (int i = 0; i < count; i++) {
             int uid = g_active_users[i];
             int app_cnt = 0;
             for (int j = 0; j < g_app_cfg_count; j++) {
                 if (g_app_cfgs[j]->user_id == uid) app_cnt++;
             }
-            if (i > 0) pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, ",");
-            pos += snprintf(data_buf + pos, sizeof(data_buf) - pos,
-                "{\"uid\":%d,\"app_count\":%d}", uid, app_cnt);
+            json_object *user = json_object_new_object();
+            json_object_object_add(user, "uid", json_object_new_int(uid));
+            json_object_object_add(user, "app_count", json_object_new_int(app_cnt));
+            json_object_array_add(users, user);
         }
-        pos += snprintf(data_buf + pos, sizeof(data_buf) - pos, "]}");
+        json_object_object_add(root, "users", users);
         config_unlock_read();
-        json_api_finish(true, "\"list-users\"", data_buf);
+        json_api_finish(true, "\"list-users\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
     } else {
         printf("===== 活跃用户列表 (%d) =====\n", count);
         for (int i = 0; i < count; i++) {
@@ -1369,6 +1303,9 @@ int main(int argc, char *argv[]) {
             snprintf(stream_cmd, sizeof(stream_cmd), "STREAM_LOGCAT:%s", level);
         } else if (strcmp(pos_args[0], "stream-all") == 0) {
             snprintf(stream_cmd, sizeof(stream_cmd), "STREAM_ALL:%s", level);
+        } else if (strcmp(pos_args[0], "stream-config") == 0) {
+            handle_stream_config(api_mode);
+            return 0;
         } else {
             usage(argv[0]);
         }
@@ -1385,10 +1322,6 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(pos_args[0], "get-config") == 0) {
         handle_get_config(api_mode, static_mode);
-        return 0;
-    }
-    if (strcmp(pos_args[0], "stream-config") == 0) {
-        handle_stream_config(api_mode);
         return 0;
     }
     if (strcmp(pos_args[0], "log-count") == 0) {
@@ -1499,25 +1432,18 @@ int main(int argc, char *argv[]) {
             if (done_line && sscanf(done_line + 5, "%d|%d", &done_total, &done_remaining) >= 1) {
                 has_done = true;
             }
-            
-            size_t raw_len = strlen(resp);
-            size_t esc_cap = raw_len * 6 + 1;
-            char *esc = malloc(esc_cap);
-            if (!esc) { free(resp); close(sock); return 1; }
-            json_escape_str(resp, esc, esc_cap);
-            size_t data_cap = esc_cap + 256;
-            char *data_buf = malloc(data_cap);
-            if (!data_buf) { free(esc); free(resp); close(sock); return 1; }
+
+            json_object *root = json_object_new_object();
+            json_object_object_add(root, "raw", json_object_new_string(resp));
             if (has_done) {
-                snprintf(data_buf, data_cap,
-                    "{\"raw\":\"%s\",\"done\":{\"total\":%d,\"remaining\":%d}}",
-                    esc, done_total, done_remaining);
-            } else {
-                snprintf(data_buf, data_cap, "{\"raw\":\"%s\"}", esc);
+                json_object *done = json_object_new_object();
+                json_object_object_add(done, "total", json_object_new_int(done_total));
+                json_object_object_add(done, "remaining", json_object_new_int(done_remaining));
+                json_object_object_add(root, "done", done);
             }
-            json_api_finish(true, (strncmp(pos_args[0], "search", 6) == 0) ? "\"search\"" : "\"clear\"", data_buf);
-            free(data_buf);
-            free(esc);
+            json_api_finish(true, (strncmp(pos_args[0], "search", 6) == 0) ? "\"search\"" : "\"clear\"",
+                           json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+            json_object_put(root);
         } else {
             char* line = strtok(resp, "\n");
             while (line) {

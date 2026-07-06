@@ -88,12 +88,55 @@ static void prune_stale_tracked() {
     }
 }
 
-static UidMapEntry g_uid_map[UID_MAP_MAX_ENTRIES];
+static UidMapEntry *g_uid_map = NULL;
 static int g_uid_map_count = 0;
+static int g_uid_map_cap = 0;
+
+/* uid_map_upsert 失败的 UID 集合，避免反复重试 */
+#define MAX_FAILED_UIDS 64
+static uid_t g_failed_uids[MAX_FAILED_UIDS];
+static int g_failed_uid_count = 0;
+
+static bool uid_has_failed(uid_t uid) {
+    for (int i = 0; i < g_failed_uid_count; i++) {
+        if (g_failed_uids[i] == uid) return true;
+    }
+    return false;
+}
+
+static void uid_mark_failed(uid_t uid) {
+    if (uid_has_failed(uid)) return;
+    if (g_failed_uid_count < MAX_FAILED_UIDS)
+        g_failed_uids[g_failed_uid_count++] = uid;
+}
 
 void init_uid_map_cache(void) {
-    g_uid_map_count = uid_map_load(g_uid_map, UID_MAP_MAX_ENTRIES);
-    LOG_DBG("UID映射内存缓存已初始化: 从文件载入 %d 条映射记录", g_uid_map_count);
+    /* 初次分配：从 UID_MAP_INIT_CAPACITY 开始，读取文件，若不够则翻倍重试 */
+    int cap = UID_MAP_INIT_CAPACITY;
+    g_uid_map = malloc((size_t)cap * sizeof(UidMapEntry));
+    if (!g_uid_map) {
+        LOG_ERR("uid_map_cache: malloc(%d) 失败", cap);
+        g_uid_map_count = 0;
+        g_uid_map_cap = 0;
+        return;
+    }
+    g_uid_map_count = uid_map_load(g_uid_map, cap);
+    while (g_uid_map_count > 0 && g_uid_map_count == cap) {
+        cap *= 2;
+        UidMapEntry *new_map = realloc(g_uid_map, (size_t)cap * sizeof(UidMapEntry));
+        if (!new_map) {
+            LOG_ERR("uid_map_cache: realloc(%d) 失败", cap);
+            free(g_uid_map);
+            g_uid_map = NULL;
+            g_uid_map_count = 0;
+            g_uid_map_cap = 0;
+            return;
+        }
+        g_uid_map = new_map;
+        g_uid_map_count = uid_map_load(g_uid_map, cap);
+    }
+    g_uid_map_cap = cap;
+    LOG_DBG("UID映射内存缓存已初始化: 从文件载入 %d 条映射记录 (容量 %d)", g_uid_map_count, g_uid_map_cap);
 }
 
 bool is_isolated_uid(uid_t uid) {
@@ -170,6 +213,7 @@ void get_target_storage_path(uid_t uid, char* path, size_t size) {
 
 void update_uid_map(uid_t uid, const char* pkg) {
     if (uid < 10000 || is_isolated_uid(uid)) return;
+    if (uid_has_failed(uid)) return;
     char clean_pkg[128];
     strncpy(clean_pkg, pkg, sizeof(clean_pkg) - 1);
     clean_pkg[sizeof(clean_pkg) - 1] = '\0';
@@ -185,8 +229,14 @@ void update_uid_map(uid_t uid, const char* pkg) {
         }
     }
     /* 2. 只有在数据发生变更或属于全新映射时，才穿透执行物理磁盘落盘 */
-    if (uid_map_upsert(uid, clean_pkg) != 0) {
-        LOG_ERR("uid_map_upsert 失败: %u -> %s", uid, clean_pkg);
+    int ret = uid_map_upsert(uid, clean_pkg);
+    if (ret != 0) {
+        const char *reason = "未知错误";
+        if (ret == UID_MAP_ERR_FULL) reason = "条目已满(>1024)";
+        else if (ret == UID_MAP_ERR_IO) reason = "文件写入失败";
+        else if (ret == UID_MAP_ERR_RENAME) reason = "原子重命名失败";
+        LOG_ERR("uid_map_upsert 失败: %u -> %s (%s)", uid, clean_pkg, reason);
+        uid_mark_failed(uid);
         return;
     }
     /* 3. 同步更新内存缓存 */
@@ -200,7 +250,18 @@ void update_uid_map(uid_t uid, const char* pkg) {
             break;
         }
     }
-    if (!updated && g_uid_map_count < UID_MAP_MAX_ENTRIES) {
+    if (!updated) {
+        if (g_uid_map_count >= g_uid_map_cap) {
+            /* 缓存容量不够，动态扩容 */
+            int new_cap = g_uid_map_cap ? g_uid_map_cap * 2 : UID_MAP_INIT_CAPACITY;
+            UidMapEntry *new_map = realloc(g_uid_map, (size_t)new_cap * sizeof(UidMapEntry));
+            if (!new_map) {
+                LOG_ERR("update_uid_map: realloc(%d) 失败，无法缓存 %s", new_cap, clean_pkg);
+                return;
+            }
+            g_uid_map = new_map;
+            g_uid_map_cap = new_cap;
+        }
         g_uid_map[g_uid_map_count].uid = uid;
         strncpy(g_uid_map[g_uid_map_count].pkg, clean_pkg, 127);
         g_uid_map[g_uid_map_count].pkg[127] = '\0';

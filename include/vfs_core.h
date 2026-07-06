@@ -16,7 +16,7 @@ extern bool g_preserve_perms;
 extern bool g_disable_sandbox;  /* 新增：全局禁用当前 FUSE 实例的沙盒特性 */
 
 extern char g_rules_path[PATH_MAX];
-extern UidMapEntry g_uid_maps[];
+extern UidMapEntry *g_uid_maps;
 extern int g_uid_map_count;
 
 void vfs_core_init(const char* rules_path);
