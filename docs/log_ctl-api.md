@@ -133,7 +133,6 @@ fun logCtl(vararg args: String): String {
 | **日志查询** | [`search-io / search-sys`](#16-search-io--search-sys--查询日志) | 查询 I/O 或系统日志 |
 | | [`clear-io / clear-sys`](#13-clear-io--clear-sys--清除日志) | 清除 I/O 或系统日志 |
 | | [`log-count`](#17-log-count--日志统计) | 获取各日志缓冲区总计条数 |
-| | [`list-injected`](#14-list-injected--已注入列表) | 查看已注入应用列表 |
 | **流式日志** | [`stream-io / stream-sys / stream-logcat / stream-all`](#18-流式日志命令) | 实时流式输出日志 |
 | **前端接入** | [日志格式与前端展示规范](#日志格式与前端展示规范) | 日志格式解析规则、前端格式化显示建议 |
 
@@ -204,7 +203,7 @@ log_ctl get-config api
 
 ### 响应 (data)
 
-返回注入器 `config_publisher` 推送的完整配置 JSON（紧凑单行格式，最大 256KB）。前端解析时直接 `JSON.parse()` 整个 `data` 字符串即可。
+返回注入器 `config_publisher` 推送的完整配置 JSON（紧凑单行格式，最大 256KB）。前端直接访问 `data` 字段（已为 JSON 对象）即可。
 
 返回结构（格式化展示）：
 
@@ -265,7 +264,7 @@ log_ctl stream-config api
 每收到一次配置变更，输出一行 JSON：
 
 ```json
-{"status":"ok","command":"stream-config","data":"<完整配置JSON>","timestamp":1719523200}
+{"status":"ok","command":"stream-config","data":{"timestamp":1719523200,"injector":{"pid":1234,"passive":false,"mode":"active"},"global_fuse":{"fuse_pid":5678,"disabled":false},"templates":[...]},"timestamp":1719523200}
 ```
 
 ### 前端处理方式
@@ -349,7 +348,7 @@ log_ctl get-global-rules api
 ### 响应 (data)
 
 ```json
-{"switches":{"global_inject":false,"monitor":true,"sandbox":true,"fuse_direct":false},"hide_rules":["/sdcard/secret"],"ro_rules":["/123 云盘/Cache/","/HyperOS_Sandbox/"],"redirect_rules":[{"virtual_prefix":"/sdcard/A","real_target":"/data/B"}],"fuse_extra_args":"","counts":{"hide":1,"ro":2,"redirect":1}}
+{"switches":{"global_inject":false,"monitor":true,"sandbox":true,"fuse_direct":false},"hide_rules":["/sdcard/secret"],"ro_rules":["/123 云盘/Cache/","/HyperOS_Sandbox/"],"redirect_rules":[{"virtual_prefix":"/sdcard/A","real_target":"/data/B"}],"allow_rules":[],"fuse_extra_args":"","counts":{"hide":1,"ro":2,"redirect":1,"allow":0}}
 ```
 
 ### 字段说明
@@ -360,7 +359,12 @@ log_ctl get-global-rules api
 | `hide_rules` | string[] | HIDE 路径列表 |
 | `ro_rules` | string[] | RO 路径列表 |
 | `redirect_rules` | object[] | REDIRECT 规则列表（含 `virtual_prefix` 和 `real_target`） |
+| `allow_rules` | object[] | ALLOW 规则列表（含 `virtual_prefix` 和 `real_target`） |
 | `counts` | object | 各规则数量统计 |
+| `counts.hide` | int | HIDE 规则数量 |
+| `counts.ro` | int | RO 规则数量 |
+| `counts.redirect` | int | REDIRECT 规则数量 |
+| `counts.allow` | int | ALLOW 规则数量 |
 
 ---
 
@@ -390,7 +394,7 @@ log_ctl get-app-rules com.tencent.mobileqq   # 纯文本模式
 ### 响应 (data) — api 模式
 
 ```json
-{"pkg":"com.tencent.mobileqq","user_id":0,"switches":{"inject_enable":true,"monitor":false,"sandbox":true,"fuse_direct":false},"hide_rules":["/sdcard/secret"],"ro_rules":[],"redirect_rules":[],"counts":{"hide":1,"ro":0,"redirect":0}}
+{"pkg":"com.tencent.mobileqq","user_id":0,"switches":{"inject_enable":true,"monitor":false,"sandbox":true,"fuse_direct":false},"hide_rules":["/sdcard/secret"],"ro_rules":[],"redirect_rules":[],"allow_rules":[],"counts":{"hide":1,"ro":0,"redirect":0,"allow":0}}
 ```
 
 ### 响应 (data) — 文本模式
@@ -422,7 +426,12 @@ log_ctl get-app-rules com.tencent.mobileqq   # 纯文本模式
 | `hide_rules` | string[] | HIDE 路径列表 |
 | `ro_rules` | string[] | RO 路径列表 |
 | `redirect_rules` | object[] | REDIRECT 规则列表 |
+| `allow_rules` | object[] | ALLOW 规则列表 |
 | `counts` | object | 各规则数量统计 |
+| `counts.hide` | int | HIDE 规则数量 |
+| `counts.ro` | int | RO 规则数量 |
+| `counts.redirect` | int | REDIRECT 规则数量 |
+| `counts.allow` | int | ALLOW 规则数量 |
 
 ---
 
@@ -515,7 +524,7 @@ log_ctl set-rule GLOBAL RO /data/media/0/secret api
 }
 ```
 
-> ⚠️ `set-rule` 只追加写入文件，不会自动触发重载。但 Injector 已通过 `inotify` 监听文件变更，文件写入后片刻即自动生效。
+> ⚠️ `set-rule` 写入文件后，Injector 会通过 `inotify` 自动感知文件变更并重载（非 api 模式下还会额外发送 SIGHUP 信号确保即时生效）。
 
 ---
 
@@ -601,7 +610,7 @@ log_ctl search-sys [--level level] [key] [limit] [offset] [api]
 |------|------|------|
 | `--level` | 日志级别过滤（仅 search-sys 生效） | `-1`（全部） |
 | `key` | 搜索关键词 | `""`（全部） |
-| `limit` | 返回条数上限 | `500` |
+| `limit` | 返回条数上限 | `100` |
 | `offset` | 偏移量 | `0` |
 
 ### 示例
@@ -781,13 +790,14 @@ log_ctl stream-all [--level level] [api]
 
 ### 输出格式
 
-`stream-sys` 在 `api` 模式下输出结构化 JSON（每行一个）：
+`stream-sys` 在 `api` 模式下输出纯文本（每行一个），格式为 `<级别数字>|<原始消息>`：
 
-```json
-{"status":"ok","command":"<line-content>","data":null,"timestamp":1719523200}
+```
+1|[injector(1234)] 注入成功
+2|[fuse_daemon(5678)] 路径拒绝
 ```
 
-> `stream-io` / `stream-logcat` / `stream-all` 的 api 模式在当前版本中仍输出纯文本（每行一条日志记录）。
+> `stream-io` / `stream-logcat` / `stream-all` 的 api 模式同样输出纯文本（每行一条日志记录）。
 
 ### 前端处理方式
 
@@ -998,12 +1008,12 @@ fun parseSearchResult(jsonStr: String): List<LogEntry> {
 
 | 子命令 | api 模式输出 | 非 api 模式输出 |
 |--------|-------------|---------------|
-| `stream-sys` | JSON 包装，data 中含 level 前缀 | 逐行原始文本 |
-| `stream-io` | 逐行原始文本（无 JSON 包装） | 逐行原始文本 |
-| `stream-logcat` | 逐行原始文本（无 JSON 包装） | 逐行原始文本 |
-| `stream-all` | 逐行原始文本（混合，无 JSON 包装） | 逐行原始文本 |
+| `stream-sys` | 逐行纯文本（带级别前缀） | 逐行原始文本 |
+| `stream-io` | 逐行原始文本 | 逐行原始文本 |
+| `stream-logcat` | 逐行原始文本 | 逐行原始文本 |
+| `stream-all` | 逐行原始文本（混合） | 逐行原始文本 |
 
-> **重要**：除 `stream-sys` 外，其他 stream 命令即使加了 `api` 参数，也只输出纯文本行（无 JSON 包装）。
+> **重要**：所有 stream 命令在 api 模式下均输出纯文本行（无 JSON 包装）。`stream-sys` 的 api 模式会在每行前添加级别数字前缀。
 
 #### stream-sys API 模式详解
 

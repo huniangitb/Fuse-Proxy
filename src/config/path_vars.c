@@ -265,7 +265,7 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
                                  const AppConfig* app_cfg, const AppConfig* global_cfg,
                                  const char* current_pkg) {
     if (!target || !real_base || sz == 0) return false;
-    char expanded[PATH_MAX];
+    char expanded[PATH_MAX * 4];
     const char* t = target;
     if (has_path_var(target)) {
         if (!pkg_resolvable(current_pkg)) return false;   /* 规则失效 */

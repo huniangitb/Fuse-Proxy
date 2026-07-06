@@ -192,6 +192,10 @@ static bool is_exact_media_module(const char* pkg) {
 }
 
 int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, const char* trigger) {
+    if (kill(pid, 0) != 0) {
+        LOG_DBG("目标进程已退出，跳过挂载: %s(PID:%d)", pkg, pid);
+        return -1;
+    }
     /*
      * 专属映射策略：
      * 1. 如果是 com.android.providers.media.module，则强制映射到专用媒体 FUSE 挂载源，不允许使用全局 FUSE。

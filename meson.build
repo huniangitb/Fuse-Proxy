@@ -31,11 +31,15 @@ fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, r
 # 自动探测 libiconv
 libiconv = cc.find_library('iconv', required: true)
 
+# json-c 静态库
+json_c = cc.find_library('json-c', static: true, required: true)
+
 # 项目通用依赖
 project_deps = [
   dependency('threads'),
   fuse_lib,
-  libiconv
+  libiconv,
+  json_c
 ]
 
 # ================= 编译标志 =================

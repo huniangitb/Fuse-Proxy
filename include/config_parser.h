@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #define MAX_PATH_LEN 256
 #define MAX_USERS 64
+#define MAX_REASONABLE_UID 1000
 
 typedef struct TrieNode {
     char *segment;              

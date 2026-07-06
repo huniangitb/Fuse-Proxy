@@ -187,7 +187,19 @@ static void overflow_write(const char *log_type, const char *msg, int level, tim
     char line[MAX_MSG_LEN + 128];
     int len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf, level, msg);
     write(fd, line, len);
-    close(fd);
+
+    /* 日志轮转：超过 1MB 时自动切割 */
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 1024 * 1024) {
+        close(fd);
+        char rotated[PATH_MAX];
+        char ts[20];
+        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_buf);
+        snprintf(rotated, sizeof(rotated), "%s/%s.overflow.%s", OVERFLOW_DIR, log_type, ts);
+        rename(path, rotated);
+    } else {
+        close(fd);
+    }
 }
 static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     broadcast_log(type, msg, level);
@@ -717,6 +729,42 @@ int main(int argc, char *argv[]) {
                 if (stat(fpath, &st) == 0 && st.st_mtime < cutoff) unlink(fpath);
             }
             closedir(od);
+        }
+        /* 清理轮转文件：每种类型最多保留 5 个 */
+        const char *types[] = {"io", "sys", "logcat"};
+        for (int t = 0; t < 3; t++) {
+            char pattern[64];
+            snprintf(pattern, sizeof(pattern), "%s.overflow.*", types[t]);
+            od = opendir(OVERFLOW_DIR);
+            if (!od) continue;
+            /* 收集匹配的轮转文件 */
+            char files[32][PATH_MAX];
+            time_t mtimes[32];
+            int count = 0;
+            struct dirent *de2;
+            while ((de2 = readdir(od)) != nullptr && count < 32) {
+                if (de2->d_type != DT_REG) continue;
+                if (fnmatch(pattern, de2->d_name, 0) != 0) continue;
+                snprintf(files[count], PATH_MAX, "%s/%s", OVERFLOW_DIR, de2->d_name);
+                struct stat st;
+                if (stat(files[count], &st) == 0) {
+                    mtimes[count] = st.st_mtime;
+                    count++;
+                }
+            }
+            closedir(od);
+            /* 按修改时间降序排序，删除第 6 个及之后的 */
+            for (int i = 0; i < count - 1; i++) {
+                for (int j = i + 1; j < count; j++) {
+                    if (mtimes[j] > mtimes[i]) {
+                        char tmp_path[PATH_MAX]; strncpy(tmp_path, files[i], PATH_MAX);
+                        strncpy(files[i], files[j], PATH_MAX);
+                        strncpy(files[j], tmp_path, PATH_MAX);
+                        time_t tmp_t = mtimes[i]; mtimes[i] = mtimes[j]; mtimes[j] = tmp_t;
+                    }
+                }
+            }
+            for (int i = 5; i < count; i++) unlink(files[i]);
         }
     }
     if (g_persist_all_logs) mkdir("/data/Namespace-Proxy/log", 0755);

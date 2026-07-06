@@ -370,10 +370,20 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             } else {
                 if (cur->var_count >= cur->var_capacity) {
                     int newcap = cur->var_capacity == 0 ? 8 : cur->var_capacity * 2;
-                    cur->var_names   = realloc(cur->var_names,   newcap * sizeof(char*));
-                    cur->var_values  = realloc(cur->var_values,  newcap * sizeof(char*));
-                    cur->var_resolved= realloc(cur->var_resolved,newcap * sizeof(char*));
-                    cur->var_is_static = realloc(cur->var_is_static, newcap * sizeof(bool));
+                    char **new_names = realloc(cur->var_names, newcap * sizeof(char*));
+                    char **new_values = realloc(cur->var_values, newcap * sizeof(char*));
+                    char **new_resolved = realloc(cur->var_resolved, newcap * sizeof(char*));
+                    bool *new_is_static = realloc(cur->var_is_static, newcap * sizeof(bool));
+                    if (!new_names || !new_values || !new_resolved || !new_is_static) {
+                        LOG_ERR("realloc 变量数组失败 (行 %d)", line_num);
+                        free(new_names); free(new_values);
+                        free(new_resolved); free(new_is_static);
+                        return;
+                    }
+                    cur->var_names   = new_names;
+                    cur->var_values  = new_values;
+                    cur->var_resolved= new_resolved;
+                    cur->var_is_static = new_is_static;
                     cur->var_capacity = newcap;
                 }
                 cur->var_names[cur->var_count] = strdup(vname);
@@ -426,8 +436,14 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             }
             if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
             if (cur->hide_count >= cur->hide_capacity) {
-                cur->hide_capacity = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
-                cur->hide_rules = realloc(cur->hide_rules, cur->hide_capacity * sizeof(char*));
+                int new_cap = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
+                char **new_hide = realloc(cur->hide_rules, new_cap * sizeof(char*));
+                if (!new_hide) {
+                    LOG_ERR("realloc hide_rules 失败");
+                    return;
+                }
+                cur->hide_rules = new_hide;
+                cur->hide_capacity = new_cap;
             }
             cur->hide_rules[cur->hide_count] = strdup(clean_rule);
             cur->hide_count++;
@@ -447,8 +463,14 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             }
             if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
             if (cur->ro_count >= cur->ro_capacity) {
-                cur->ro_capacity = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
-                cur->ro_rules = realloc(cur->ro_rules, cur->ro_capacity * sizeof(char*));
+                int new_cap = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
+                char **new_ro = realloc(cur->ro_rules, new_cap * sizeof(char*));
+                if (!new_ro) {
+                    LOG_ERR("realloc ro_rules 失败");
+                    return;
+                }
+                cur->ro_rules = new_ro;
+                cur->ro_capacity = new_cap;
             }
             cur->ro_rules[cur->ro_count] = strdup(clean_rule);
             cur->ro_count++;
@@ -474,8 +496,14 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
             strip_trailing_slash(real_target);
             if (cur->redir_count >= cur->redir_capacity) {
-                cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
+                int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
+                RedirectRule *new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
+                if (!new_redir) {
+                    LOG_ERR("realloc redir_rules 失败 (ALLOW)");
+                    return;
+                }
+                cur->redir_rules = new_redir;
+                cur->redir_capacity = new_cap;
             }
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
             strcpy(r->virtual_prefix, virtual_prefix);
@@ -520,8 +548,14 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             }
             strip_trailing_slash(real_target);
             if (cur->redir_count >= cur->redir_capacity) {
-                cur->redir_capacity = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                cur->redir_rules = realloc(cur->redir_rules, cur->redir_capacity * sizeof(RedirectRule));
+                int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
+                RedirectRule *new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
+                if (!new_redir) {
+                    LOG_ERR("realloc redir_rules 失败 (ALLOW)");
+                    return;
+                }
+                cur->redir_rules = new_redir;
+                cur->redir_capacity = new_cap;
             }
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
             strcpy(r->virtual_prefix, virtual_prefix);
@@ -541,8 +575,14 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
             return g_app_cfgs[i];
     }
     if (g_app_cfg_count >= g_app_cfg_capacity) {
-        g_app_cfg_capacity = g_app_cfg_capacity == 0 ? 8 : g_app_cfg_capacity * 2;
-        g_app_cfgs = realloc(g_app_cfgs, g_app_cfg_capacity * sizeof(AppConfig*));
+        int new_cap = g_app_cfg_capacity == 0 ? 8 : g_app_cfg_capacity * 2;
+        AppConfig **new_cfgs = realloc(g_app_cfgs, new_cap * sizeof(AppConfig*));
+        if (!new_cfgs) {
+            LOG_ERR("realloc g_app_cfgs 失败，跳过应用 %s", pkg);
+            return nullptr;
+        }
+        g_app_cfgs = new_cfgs;
+        g_app_cfg_capacity = new_cap;
     }
     g_app_cfgs[g_app_cfg_count] = calloc(1, sizeof(AppConfig));
     strncpy(g_app_cfgs[g_app_cfg_count]->pkg_name, pkg, 127);
@@ -553,22 +593,52 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
 }
 void scan_active_users() {
     g_active_user_count = 0;
-    DIR* dir = opendir("/data/media");
-    if (dir) {
-        struct dirent* de;
-        while ((de = readdir(dir)) != nullptr) {
-            if (de->d_type == DT_DIR || de->d_type == DT_LNK) {
-                bool is_num = true;
-                for (int i = 0; de->d_name[i]; i++) {
-                    if (!isdigit(de->d_name[i])) { is_num = false; break; }
-                }
-                if (is_num && g_active_user_count < MAX_USERS) {
-                    g_active_users[g_active_user_count++] = atoi(de->d_name);
-                }
+
+    // 优先通过 pm list users 获取真实用户列表
+    FILE* fp = popen("pm list users 2>/dev/null", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            int uid = -1;
+            if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
+                if (uid >= 0 && g_active_user_count < MAX_USERS)
+                    g_active_users[g_active_user_count++] = uid;
             }
         }
-        closedir(dir);
+        pclose(fp);
     }
+
+    // pm 失败时回退到 /data/media/ 扫描
+    if (g_active_user_count == 0) {
+        DIR* dir = opendir("/data/media");
+        if (dir) {
+            struct dirent* de;
+            while ((de = readdir(dir)) != nullptr) {
+                if (de->d_type == DT_DIR || de->d_type == DT_LNK) {
+                    bool is_num = true;
+                    for (int i = 0; de->d_name[i]; i++) {
+                        if (!isdigit(de->d_name[i])) { is_num = false; break; }
+                    }
+                    if (is_num && g_active_user_count < MAX_USERS) {
+                        int uid = atoi(de->d_name);
+                        if (uid >= 0 && uid < MAX_REASONABLE_UID)
+                            g_active_users[g_active_user_count++] = uid;
+                    }
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    // 确保至少有 user 0
+    if (g_active_user_count == 0) {
+        g_active_users[0] = 0;
+        g_active_user_count = 1;
+    }
+
+    LOG_DBG("scan_active_users: 发现 %d 个活跃用户", g_active_user_count);
+    for (int i = 0; i < g_active_user_count; i++)
+        LOG_DBG("  活跃用户[%d]: uid=%d", i, g_active_users[i]);
 }
 void load_config_rules(const char* path) {
     free_config_rules();

@@ -15,7 +15,7 @@
 #include <poll.h>
 
 char g_rules_path[PATH_MAX] = {0};
-UidMapEntry g_uid_maps[UID_MAP_MAX_ENTRIES];
+UidMapEntry *g_uid_maps = NULL;
 int g_uid_map_count = 0;
 
 #define UID_CACHE_SIZE 2048
@@ -28,7 +28,30 @@ typedef struct {
 static UidCacheSlot g_uid_cache[UID_CACHE_SIZE];
 
 static void load_uid_map() {
-    g_uid_map_count = uid_map_load(g_uid_maps, UID_MAP_MAX_ENTRIES);
+    /* 释放旧缓存，重新动态分配 */
+    free(g_uid_maps);
+    int cap = UID_MAP_INIT_CAPACITY;
+    g_uid_maps = malloc((size_t)cap * sizeof(UidMapEntry));
+    if (!g_uid_maps) {
+        LOG_ERR("load_uid_map: malloc(%d) 失败", cap);
+        g_uid_map_count = 0;
+        return;
+    }
+    g_uid_map_count = uid_map_load(g_uid_maps, cap);
+    while (g_uid_map_count > 0 && g_uid_map_count == cap) {
+        cap *= 2;
+        UidMapEntry *new_maps = realloc(g_uid_maps, (size_t)cap * sizeof(UidMapEntry));
+        if (!new_maps) {
+            LOG_ERR("load_uid_map: realloc(%d) 失败", cap);
+            free(g_uid_maps);
+            g_uid_maps = NULL;
+            g_uid_map_count = 0;
+            return;
+        }
+        g_uid_maps = new_maps;
+        g_uid_map_count = uid_map_load(g_uid_maps, cap);
+    }
+    LOG_DBG("uid.map 已加载: %d 条映射 (容量 %d)", g_uid_map_count, cap);
 }
 
 static void reload_config(void) {

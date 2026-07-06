@@ -3,7 +3,13 @@
 
 #include <sys/types.h>
 
-#define UID_MAP_MAX_ENTRIES 1024
+#define UID_MAP_MAX_ENTRIES 1024   /* 旧兼容定义：固定数组最大容量，BSS 存活期可用此值 */
+#define UID_MAP_INIT_CAPACITY 256  /* uid_map_upsert 初始堆分配大小，支持动态扩容 */
+
+/* uid_map_upsert 错误码 */
+#define UID_MAP_ERR_FULL    -1  /* 条目已满(不再使用，保留兼容) */
+#define UID_MAP_ERR_IO      -2  /* 文件操作失败 / 内存分配失败 */
+#define UID_MAP_ERR_RENAME  -3  /* 原子重命名失败 */
 
 /* 原有平铺结构定义，保持磁盘加载与快照机制的兼容 */
 typedef struct {
@@ -22,9 +28,9 @@ typedef struct UidTreeNode {
 /* 从 CONFIG_DIR/uid.map 文件加载 UID 映射表 */
 int uid_map_load(UidMapEntry *entries, int max_entries);
 
-/* 
+/*
  * 增量写入: 如果 uid 已存在于 uid.map 则更新其包名，否则追加新行。
- * 不会覆写文件中的其他记录。返回 0 成功，-1 失败。
+ * 不会覆写文件中的其他记录。返回 0 成功，负值失败（UID_MAP_ERR_*）。
  */
 int uid_map_upsert(uid_t uid, const char* pkg);
 
