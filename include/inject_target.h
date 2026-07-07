@@ -6,6 +6,7 @@
 #include "uid_map.h"
 
 bool is_isolated_uid(uid_t uid);
+bool is_system_app(uid_t uid);
 bool is_process_safe_to_inject(const char* cmdline);
 bool is_media_provider(const char* pkg);
 bool is_target_app(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc);

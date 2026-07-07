@@ -44,10 +44,23 @@ static void build_global_fuse_json(json_object *root) {
 }
 static void append_redir_rules_json(json_object *arr, AppConfig *cfg) {
     for (int i = 0; i < cfg->redir_count; i++) {
+        if (cfg->redir_rules[i].is_allow) continue;  // ALLOW 规则单独输出
         json_object *rule = json_object_new_object();
         json_object_object_add(rule, "source", json_object_new_string(cfg->redir_rules[i].virtual_prefix));
-        json_object_object_add(rule, "target", json_object_new_string(cfg->redir_rules[i].real_target));
+        const char *raw_target = cfg->redir_rules[i].real_target;
+        if (raw_target[0] == '?') {
+            json_object_object_add(rule, "target", json_object_new_string(raw_target + 1));
+        } else {
+            json_object_object_add(rule, "target", json_object_new_string(raw_target));
+        }
         json_object_array_add(arr, rule);
+    }
+}
+
+static void append_allow_rules_json(json_object *arr, AppConfig *cfg) {
+    for (int i = 0; i < cfg->redir_count; i++) {
+        if (!cfg->redir_rules[i].is_allow) continue;  // 只输出 ALLOW 规则
+        json_object_array_add(arr, json_object_new_string(cfg->redir_rules[i].virtual_prefix));
     }
 }
 static void append_str_array_json(json_object *arr, char **rules, int count) {
@@ -88,6 +101,18 @@ static void build_templates_json(json_object *root) {
     append_redir_rules_json(redir_rules, &g_global_cfg);
     json_object_object_add(global, "redirect_rules", redir_rules);
     
+    // 仅在存在 ALLOW 规则时才添加 allow_rules 字段，减少空数组输出
+    if (g_global_cfg.redir_count > 0) {
+        int allow_cnt = 0;
+        for (int j = 0; j < g_global_cfg.redir_count; j++)
+            if (g_global_cfg.redir_rules[j].is_allow) allow_cnt++;
+        if (allow_cnt > 0) {
+            json_object *allow_rules = json_object_new_array();
+            append_allow_rules_json(allow_rules, &g_global_cfg);
+            json_object_object_add(global, "allow_rules", allow_rules);
+        }
+    }
+    
     json_object_array_add(templates, global);
     
     // 应用模板
@@ -121,6 +146,18 @@ static void build_templates_json(json_object *root) {
         append_redir_rules_json(redir_rules, cfg);
         json_object_object_add(app, "redirect_rules", redir_rules);
         
+        // 仅在存在 ALLOW 规则时才添加 allow_rules 字段
+        if (cfg->redir_count > 0) {
+            int allow_cnt = 0;
+            for (int j = 0; j < cfg->redir_count; j++)
+                if (cfg->redir_rules[j].is_allow) allow_cnt++;
+            if (allow_cnt > 0) {
+                json_object *allow_rules = json_object_new_array();
+                append_allow_rules_json(allow_rules, cfg);
+                json_object_object_add(app, "allow_rules", allow_rules);
+            }
+        }
+        
         json_object_array_add(templates, app);
     }
     
@@ -148,7 +185,7 @@ static char *build_config_json_payload(int *out_len) {
     build_global_fuse_json(root);
     build_templates_json(root);
     
-    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
     int len = strlen(json_str);
     char *result = strdup(json_str);
     json_object_put(root);
@@ -362,7 +399,7 @@ static void handle_static_request(int sock_fd, struct sockaddr_un *cli_addr,
     }
     json_object_object_add(root, "app_rules", app_rules);
 
-    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    const char *json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
     sendto(sock_fd, json_str, strlen(json_str), MSG_NOSIGNAL | MSG_DONTWAIT,
            (struct sockaddr *)cli_addr, cli_len);
     json_object_put(root);
