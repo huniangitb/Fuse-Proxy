@@ -18,6 +18,7 @@ typedef struct TrieNode {
 typedef struct { 
     char virtual_prefix[MAX_PATH_LEN]; 
     char real_target[MAX_PATH_LEN]; 
+    bool is_allow;           // true=ALLOW 规则, false=REDIRECT 规则
 } RedirectRule;
 
 typedef struct {
@@ -29,7 +30,8 @@ typedef struct {
     bool sandbox;
     bool sandbox_explicit; /* true = 显式设置过 SANDBOX ON/OFF，可覆盖全局 */
     bool global_inject;   
-    bool fuse_direct;   
+    bool fuse_direct;
+    bool skip_system_apps; /* 默认跳过 Android 系统应用 (uid < 10000)，配置 SKIP_SYSTEM_APPS OFF 可关闭 */
     char** hide_rules;
     int hide_count;
     int hide_capacity;

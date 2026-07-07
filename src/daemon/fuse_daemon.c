@@ -36,21 +36,26 @@ static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
 #define MAX_PENDING_CLOSE 64
 static int g_pending_close_fds[MAX_PENDING_CLOSE];
 static int g_pending_close_count = 0;
+static pthread_mutex_t g_pending_close_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void vfs_defer_close(int fd) {
     if (fd < 0) return;
+    pthread_mutex_lock(&g_pending_close_mutex);
     if (g_pending_close_count < MAX_PENDING_CLOSE) {
         g_pending_close_fds[g_pending_close_count++] = fd;
     } else {
         close(fd);
     }
+    pthread_mutex_unlock(&g_pending_close_mutex);
 }
 
 static void vfs_flush_pending_closes(void) {
+    pthread_mutex_lock(&g_pending_close_mutex);
     for (int i = 0; i < g_pending_close_count; i++) {
         close(g_pending_close_fds[i]);
     }
     g_pending_close_count = 0;
+    pthread_mutex_unlock(&g_pending_close_mutex);
 }
 
 typedef enum { MODE_REDIRECT, MODE_OVERLAY } DaemonMode;
@@ -166,7 +171,6 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     bool is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
     bool is_android_dir = (!skip_sandbox && (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0));
     bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0);
-    bool sandbox_enabled = (!g_disable_sandbox && cfg && cfg->sandbox && hide_others);
     bool force_android_skel = hide_others;
     bool has_data = false, has_obb = false, has_android = false, has_pkg = false;
     

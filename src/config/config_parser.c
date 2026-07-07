@@ -411,6 +411,9 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
     } else if (strcmp(tok, "FUSE_DIRECT") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->fuse_direct = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+    } else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0) {
+        char* val = get_next_token(&p_ptr);
+        cur->skip_system_apps = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
     } else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0) {
         /* 读取行尾剩余全部内容，不做分词（原样透传给 fuse_daemon） */
         char* p = p_ptr;
@@ -508,6 +511,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
             strcpy(r->virtual_prefix, virtual_prefix);
             strcpy(r->real_target, real_target);
+            r->is_allow = true;
             if (!is_wildcard_string(virtual_prefix) && !has_path_var(virtual_prefix)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
@@ -560,6 +564,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
             strcpy(r->virtual_prefix, virtual_prefix);
             strcpy(r->real_target, real_target);
+            r->is_allow = false;
             if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) && !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
@@ -644,6 +649,7 @@ void load_config_rules(const char* path) {
     free_config_rules();
     memset(&g_global_cfg, 0, sizeof(AppConfig)); 
     g_global_cfg.trie_root = trie_create_node(NULL);
+    g_global_cfg.skip_system_apps = true; /* 默认跳过系统应用 */
     scan_active_users();
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
@@ -775,6 +781,7 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
     int old_app_cfg_count = g_app_cfg_count;
     memset(&g_global_cfg, 0, sizeof(AppConfig));
     g_global_cfg.trie_root = trie_create_node(NULL);
+    g_global_cfg.skip_system_apps = true; /* 默认跳过系统应用 */
     g_app_cfgs = nullptr;
     g_app_cfg_count = 0;
     g_app_cfg_capacity = 0;

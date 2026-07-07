@@ -225,23 +225,24 @@ static void handle_get_global_rules(bool api_mode) {
         /* 分流: redirect vs allow */
         int real_redir_cnt = 0, allow_cnt = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            if (g_global_cfg.redir_rules[i].real_target[0] == '?') allow_cnt++;
+            if (g_global_cfg.redir_rules[i].is_allow) allow_cnt++;
             else real_redir_cnt++;
         }
 
         json_object *redirect_rules = json_object_new_array();
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            if (g_global_cfg.redir_rules[i].real_target[0] == '?') continue;
+            if (g_global_cfg.redir_rules[i].is_allow) continue;
             json_object *rule = json_object_new_object();
             json_object_object_add(rule, "virtual_prefix", json_object_new_string(g_global_cfg.redir_rules[i].virtual_prefix));
-            json_object_object_add(rule, "real_target", json_object_new_string(g_global_cfg.redir_rules[i].real_target));
+            const char *raw = g_global_cfg.redir_rules[i].real_target;
+            json_object_object_add(rule, "real_target", json_object_new_string(raw[0] == '?' ? raw + 1 : raw));
             json_object_array_add(redirect_rules, rule);
         }
         json_object_object_add(root, "redirect_rules", redirect_rules);
 
         json_object *allow_rules = json_object_new_array();
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            if (g_global_cfg.redir_rules[i].real_target[0] != '?') continue;
+            if (!g_global_cfg.redir_rules[i].is_allow) continue;
             json_object_array_add(allow_rules, json_object_new_string(g_global_cfg.redir_rules[i].virtual_prefix));
         }
         json_object_object_add(root, "allow_rules", allow_rules);
@@ -277,23 +278,24 @@ static void handle_get_global_rules(bool api_mode) {
         int real_redir_cnt = 0;
         int allow_cnt = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            if (g_global_cfg.redir_rules[i].real_target[0] == '?') allow_cnt++;
+            if (g_global_cfg.redir_rules[i].is_allow) allow_cnt++;
             else real_redir_cnt++;
         }
 
         printf("\n--- REDIRECT 规则 (%d 条) ---\n", real_redir_cnt);
         int idx = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            if (g_global_cfg.redir_rules[i].real_target[0] == '?') continue;
+            if (g_global_cfg.redir_rules[i].is_allow) continue;
+            const char *raw = g_global_cfg.redir_rules[i].real_target;
             printf("  [%d] REDIRECT %s %s\n", idx++,
                    g_global_cfg.redir_rules[i].virtual_prefix,
-                   g_global_cfg.redir_rules[i].real_target);
+                   raw[0] == '?' ? raw + 1 : raw);
         }
 
         printf("\n--- ALLOW 规则 (%d 条) ---\n", allow_cnt);
         idx = 0;
         for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            if (g_global_cfg.redir_rules[i].real_target[0] != '?') continue;
+            if (!g_global_cfg.redir_rules[i].is_allow) continue;
             printf("  [%d] ALLOW %s\n", idx++,
                    g_global_cfg.redir_rules[i].virtual_prefix);
         }
@@ -344,23 +346,24 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
 
         int real_redir_cnt = 0, allow_cnt = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
-            if (cfg->redir_rules[i].real_target[0] == '?') allow_cnt++;
+            if (cfg->redir_rules[i].is_allow) allow_cnt++;
             else real_redir_cnt++;
         }
 
         json_object *redirect_rules = json_object_new_array();
         for (int i = 0; i < cfg->redir_count; i++) {
-            if (cfg->redir_rules[i].real_target[0] == '?') continue;
+            if (cfg->redir_rules[i].is_allow) continue;
             json_object *rule = json_object_new_object();
             json_object_object_add(rule, "virtual_prefix", json_object_new_string(cfg->redir_rules[i].virtual_prefix));
-            json_object_object_add(rule, "real_target", json_object_new_string(cfg->redir_rules[i].real_target));
+            const char *raw = cfg->redir_rules[i].real_target;
+            json_object_object_add(rule, "real_target", json_object_new_string(raw[0] == '?' ? raw + 1 : raw));
             json_object_array_add(redirect_rules, rule);
         }
         json_object_object_add(root, "redirect_rules", redirect_rules);
 
         json_object *allow_rules = json_object_new_array();
         for (int i = 0; i < cfg->redir_count; i++) {
-            if (cfg->redir_rules[i].real_target[0] != '?') continue;
+            if (!cfg->redir_rules[i].is_allow) continue;
             json_object_array_add(allow_rules, json_object_new_string(cfg->redir_rules[i].virtual_prefix));
         }
         json_object_object_add(root, "allow_rules", allow_rules);
@@ -394,23 +397,24 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         int real_redir_cnt = 0;
         int allow_cnt = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
-            if (cfg->redir_rules[i].real_target[0] == '?') allow_cnt++;
+            if (cfg->redir_rules[i].is_allow) allow_cnt++;
             else real_redir_cnt++;
         }
 
         printf("\n--- REDIRECT 规则 (%d 条) ---\n", real_redir_cnt);
         int idx = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
-            if (cfg->redir_rules[i].real_target[0] == '?') continue;
+            if (cfg->redir_rules[i].is_allow) continue;
+            const char *raw = cfg->redir_rules[i].real_target;
             printf("  [%d] REDIRECT %s %s\n", idx++,
                    cfg->redir_rules[i].virtual_prefix,
-                   cfg->redir_rules[i].real_target);
+                   raw[0] == '?' ? raw + 1 : raw);
         }
 
         printf("\n--- ALLOW 规则 (%d 条) ---\n", allow_cnt);
         idx = 0;
         for (int i = 0; i < cfg->redir_count; i++) {
-            if (cfg->redir_rules[i].real_target[0] != '?') continue;
+            if (!cfg->redir_rules[i].is_allow) continue;
             printf("  [%d] ALLOW %s\n", idx++,
                    cfg->redir_rules[i].virtual_prefix);
         }

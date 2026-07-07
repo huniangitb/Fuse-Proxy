@@ -144,6 +144,10 @@ bool is_isolated_uid(uid_t uid) {
     return (app_id >= 90000 && app_id <= 99999);
 }
 
+bool is_system_app(uid_t uid) {
+    return (uid < 10000);
+}
+
 bool is_process_safe_to_inject(const char* cmdline) {
     if (strstr(cmdline, "_zygote")) return false;
     if (strstr(cmdline, "com.google.android.webview")) return false;
@@ -187,6 +191,8 @@ bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_i
     if (cfg) return cfg->inject_enable;
     if (has_wildcard_enabled_locked(user_id)) return true;
     if (g_global_cfg.global_inject && !is_isolated_uid(uid) && !strstr(cmdline, "zygote")) {
+        /* 默认跳过系统应用 (uid < 10000)，除非配置 SKIP_SYSTEM_APPS OFF */
+        if (g_global_cfg.skip_system_apps && is_system_app(uid)) return false;
         if (from_ipc || is_zygote_child(pid)) return true;
     }
     return false;
