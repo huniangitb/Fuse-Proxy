@@ -4,8 +4,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <stddef.h>
@@ -1008,6 +1006,8 @@ static void handle_stream_config(bool api_mode) {
             }
         }
     }
+    /* 退出前主动取消订阅，避免 injector 端残留死订阅 */
+    config_broadcast_send_cmd(sock, "UNSUBSCRIBE");
     free(resp);
     close(sock);
 }
@@ -1150,13 +1150,11 @@ static void handle_list_users(bool api_mode) {
 }
 
 static void stream_logs(const char* stream_cmd) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(LOG_TCP_PORT);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(addr.sun_path) - 2);
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+    if (connect(sock, (struct sockaddr*)&addr, len) < 0) {
         perror("连接日志服务失败");
         return;
     }
@@ -1329,13 +1327,11 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     if (strcmp(pos_args[0], "log-count") == 0) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in log_addr;
-        memset(&log_addr, 0, sizeof(log_addr));
-        log_addr.sin_family = AF_INET;
-        log_addr.sin_port = htons(LOG_TCP_PORT);
-        inet_pton(AF_INET, "127.0.0.1", &log_addr.sin_addr);
-        if (connect(sock, (struct sockaddr*)&log_addr, sizeof(log_addr)) < 0) {
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un log_addr = { .sun_family = AF_UNIX };
+        strncpy(log_addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(log_addr.sun_path) - 2);
+        socklen_t log_addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+        if (connect(sock, (struct sockaddr*)&log_addr, log_addr_len) < 0) {
             perror("连接日志服务失败");
             return 1;
         }
@@ -1363,17 +1359,15 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("创建 socket 失败");
         return 1;
     }
-    struct sockaddr_in log_addr;
-    memset(&log_addr, 0, sizeof(log_addr));
-    log_addr.sin_family = AF_INET;
-    log_addr.sin_port = htons(LOG_TCP_PORT);
-    inet_pton(AF_INET, "127.0.0.1", &log_addr.sin_addr);
-    if (connect(sock, (struct sockaddr*)&log_addr, sizeof(log_addr)) < 0) {
+    struct sockaddr_un log_addr = { .sun_family = AF_UNIX };
+    strncpy(log_addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(log_addr.sun_path) - 2);
+    socklen_t log_addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+    if (connect(sock, (struct sockaddr*)&log_addr, log_addr_len) < 0) {
         perror("连接日志服务失败");
         close(sock);
         return 1;

@@ -104,7 +104,7 @@ void schedule_retry_mount(const char* pkg, int pid) {
     e->pid = pid;
     e->uid = 0; 
     e->retries = 0;
-    e->last_attempt = 0;
+    e->last_attempt = time(NULL);
     LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d", pkg, pid, g_retry_mount_count);
 }
 
@@ -802,6 +802,7 @@ static void do_cleanup() {
     }
     config_publisher_cleanup(g_config_pub_fd);
     g_config_pub_fd = -1;
+    cleanup_system_pkg_cache();
     log_close();
     config_destroy_lock();
     fast_pid_cleanup();
@@ -844,6 +845,7 @@ int main(int argc, char *argv[]) {
     dup2(dev_null, 2);
     close(dev_null);
     log_init("injector");
+    init_system_pkg_cache();
     config_init_lock();
     fast_pid_init();
     init_uid_map_cache();
@@ -975,7 +977,20 @@ int main(int argc, char *argv[]) {
                                     LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e->cmdline, e->pid);
                                     e->pid = -1; 
                                 } else {
+                                    /* 指数退避：第 N 次重试间隔 2^(N-2) 秒 (N>=2) */
+                                    if (e->retries > 1) {
+                                        time_t now = time(NULL);
+                                        int backoff = 1 << (e->retries - 2); /* 1, 2, 4, 8 秒 */
+                                        if (now - e->last_attempt < backoff) {
+                                            LOG_DBG("重试退避 %s(PID:%d), 第%d次, 已过%lds<%ds",
+                                                    e->cmdline, e->pid, e->retries,
+                                                    now - e->last_attempt, backoff);
+                                            retry_idx++;
+                                            continue;
+                                        }
+                                    }
                                     uid_t uid = get_app_uid(e->pid);
+                                    e->last_attempt = time(NULL);
                                     LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid, e->retries);
                                     int ret = perform_app_mount(e->cmdline, e->pid, uid, nullptr, "失败重试");
                                     if (ret == 0) {

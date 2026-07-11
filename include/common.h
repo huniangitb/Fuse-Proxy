@@ -29,10 +29,10 @@
 // STORAGE_BASE: FUSE 内部读写直接使用 /data/media（真实物理存储）
 #define STORAGE_BASE "/data/media"
 
-#define BACKUP_DIR "/mnt/nsp_backup"
+#define BACKUP_DIR "/data/local/tmp/nsp_backup"
 #define REAL_STORAGE_PATH STORAGE_BASE
 #define MODULES_ROOT "/data/adb/modules"
-#define LOG_TCP_PORT 34215
+#define LOG_SOCKET_NAME "nsp_log_socket"
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 #define CONFIG_BROADCAST_SOCKET "nsp_config_broadcast"
 

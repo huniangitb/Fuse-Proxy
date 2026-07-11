@@ -5,8 +5,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
@@ -40,7 +38,7 @@ typedef struct AsyncCtx {
     int type;               /* 0=undef, 1=IO, 2=SYS, 3=LOGCAT */
     pthread_t tid;
     volatile bool disconnected;
-    struct { char msg[512]; int level; } entries[RING_CAP];
+    struct { char msg[512]; int level; int type; } entries[RING_CAP];
     volatile int head;
     volatile int tail;
     int notify_fd;
@@ -220,12 +218,13 @@ static void drain_async(AsyncCtx *ctx) {
     while (ctx->tail != ctx->head) {
         char *msg = ctx->entries[ctx->tail].msg;
         int level = ctx->entries[ctx->tail].level;
-        if (ctx->type == 1) {
+        int entry_type = ctx->entries[ctx->tail].type;
+        if (entry_type == 1) {
             if (!should_ignore_io(msg))
                 push_log(&g_io_buf, msg, 1, LOG_INFO);
-        } else if (ctx->type == 2) {
+        } else if (entry_type == 2) {
             push_log(&g_sys_buf, msg, 2, level);
-        } else if (ctx->type == 3) {
+        } else if (entry_type == 3) {
             push_log(&g_logcat_buf, msg, 3, LOG_INFO);
         }
         ctx->tail = (ctx->tail + 1) & (RING_CAP - 1);
@@ -272,6 +271,7 @@ static void *async_log_thread(void *arg) {
                         strncpy(ctx->entries[ctx->head].msg, msg, 511);
                         ctx->entries[ctx->head].msg[511] = '\0';
                         ctx->entries[ctx->head].level = level;
+                        ctx->entries[ctx->head].type = ctx->type;
                         ctx->head = next;
                         uint64_t val = 1;
                         write(ctx->notify_fd, &val, sizeof(val));
@@ -510,10 +510,11 @@ static int process_line(ClientCtx* ctx, char* line) {
         actx->disconnected = false;
         char *msg = line;
         int level = LOG_INFO;
+        int entry_type = 0;
         if (strncmp(msg, "LOG_IO:", 7) == 0)
-            { actx->type = 1; msg += 7; }
+            { entry_type = 1; msg += 7; }
         else if (strncmp(msg, "LOG_SYS:", 8) == 0)
-            { actx->type = 2; msg += 8;
+            { entry_type = 2; msg += 8;
               if (msg[0] >= '0' && msg[0] <= '9') {
                   level = msg[0] - '0';
                   char *colon = strchr(msg, ':');
@@ -521,10 +522,12 @@ static int process_line(ClientCtx* ctx, char* line) {
               }
             }
         else if (strncmp(msg, "LOG_LOGCAT:", 11) == 0)
-            { actx->type = 3; msg += 11; }
+            { entry_type = 3; msg += 11; }
+        actx->type = entry_type;
         strncpy(actx->entries[0].msg, msg, 511);
         actx->entries[0].msg[511] = '\0';
         actx->entries[0].level = level;
+        actx->entries[0].type = entry_type;
         actx->head = 1; actx->tail = 0;
         actx->next = g_async_clients;
         g_async_clients = actx;
@@ -769,14 +772,14 @@ int main(int argc, char *argv[]) {
     }
     if (g_persist_all_logs) mkdir("/data/Namespace-Proxy/log", 0755);
     load_ignore_rules();
-    g_server_sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    int optval = 1; setsockopt(g_server_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-    struct sockaddr_in addr;
+    g_server_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(LOG_TCP_PORT);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    bind(g_server_sock, (struct sockaddr*)&addr, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+    unlink(LOG_SOCKET_NAME);
+    bind(g_server_sock, (struct sockaddr*)&addr, addr_len);
     listen(g_server_sock, 128);
     g_epoll_fd = epoll_create1(0);
     struct epoll_event ev, events[MAX_EVENTS];
