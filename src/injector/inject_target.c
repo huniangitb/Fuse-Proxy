@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <pthread.h>
 
 #define TRACKED_HASH_SIZE 2048
 typedef struct TrackedEntry {
@@ -25,16 +26,135 @@ typedef struct TrackedEntry {
 } TrackedEntry;
 
 static TrackedEntry *g_tracked_hash[TRACKED_HASH_SIZE];
+static pthread_mutex_t g_tracked_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* 系统应用包名缓存 */
+#define SYSTEM_PKG_HASH_SIZE 1024
+typedef struct SystemPkgEntry {
+    char pkg[128];
+    struct SystemPkgEntry *next;
+} SystemPkgEntry;
+
+static SystemPkgEntry *g_system_pkg_hash[SYSTEM_PKG_HASH_SIZE];
+static pthread_mutex_t g_system_pkg_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool g_system_pkg_cache_loaded = false;
+
+static unsigned int hash_pkg_name(const char* pkg) {
+    unsigned int hash = 5381;
+    while (*pkg) {
+        hash = ((hash << 5) + hash) + (unsigned char)*pkg;
+        pkg++;
+    }
+    return hash % SYSTEM_PKG_HASH_SIZE;
+}
+
+static void free_system_pkg_cache(void) {
+    for (int i = 0; i < SYSTEM_PKG_HASH_SIZE; i++) {
+        SystemPkgEntry *e = g_system_pkg_hash[i];
+        while (e) {
+            SystemPkgEntry *tmp = e;
+            e = e->next;
+            free(tmp);
+        }
+        g_system_pkg_hash[i] = NULL;
+    }
+    g_system_pkg_cache_loaded = false;
+}
+
+static void add_system_pkg(const char* pkg) {
+    unsigned int h = hash_pkg_name(pkg);
+    SystemPkgEntry *e = g_system_pkg_hash[h];
+    while (e) {
+        if (strcmp(e->pkg, pkg) == 0) return;
+        e = e->next;
+    }
+    SystemPkgEntry *new_entry = malloc(sizeof(SystemPkgEntry));
+    if (new_entry) {
+        strncpy(new_entry->pkg, pkg, sizeof(new_entry->pkg) - 1);
+        new_entry->pkg[sizeof(new_entry->pkg) - 1] = '\0';
+        new_entry->next = g_system_pkg_hash[h];
+        g_system_pkg_hash[h] = new_entry;
+    }
+}
+
+static bool load_system_pkg_cache(void) {
+    if (g_system_pkg_cache_loaded) return true;
+
+    FILE* fp = popen("pm list packages -s 2>/dev/null", "r");
+    if (!fp) {
+        LOG_WRN("load_system_pkg_cache: pm list packages -s 执行失败，回退到 UID 判断");
+        g_system_pkg_cache_loaded = true;
+        return false;
+    }
+
+    char line[512];
+    int count = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "package:", 8) == 0) {
+            char* pkg = line + 8;
+            char* nl = strchr(pkg, '\n');
+            if (nl) *nl = '\0';
+            nl = strchr(pkg, '\r');
+            if (nl) *nl = '\0';
+            char* colon = strchr(pkg, ':');
+            if (colon) *colon = '\0';
+            if (pkg[0]) {
+                pthread_mutex_lock(&g_system_pkg_mutex);
+                add_system_pkg(pkg);
+                pthread_mutex_unlock(&g_system_pkg_mutex);
+                count++;
+            }
+        }
+    }
+    pclose(fp);
+
+    pthread_mutex_lock(&g_system_pkg_mutex);
+    g_system_pkg_cache_loaded = true;
+    pthread_mutex_unlock(&g_system_pkg_mutex);
+
+    LOG_DBG("load_system_pkg_cache: 加载了 %d 个系统应用包名", count);
+    return count > 0;
+}
+
+static bool is_system_pkg_cached(const char* pkg) {
+    if (!pkg || !pkg[0]) return false;
+    load_system_pkg_cache();
+
+    pthread_mutex_lock(&g_system_pkg_mutex);
+    unsigned int h = hash_pkg_name(pkg);
+    SystemPkgEntry *e = g_system_pkg_hash[h];
+    while (e) {
+        if (strcmp(e->pkg, pkg) == 0) {
+            pthread_mutex_unlock(&g_system_pkg_mutex);
+            return true;
+        }
+        e = e->next;
+    }
+    pthread_mutex_unlock(&g_system_pkg_mutex);
+    return false;
+}
+
+void cleanup_system_pkg_cache(void) {
+    pthread_mutex_lock(&g_system_pkg_mutex);
+    free_system_pkg_cache();
+    pthread_mutex_unlock(&g_system_pkg_mutex);
+}
+
+void init_system_pkg_cache(void) {
+    load_system_pkg_cache();
+}
 
 static unsigned int hash_pid(int pid) {
     return (unsigned int)pid % TRACKED_HASH_SIZE;
 }
 
 void add_tracked(int pid) {
+    pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
     TrackedEntry *e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
+            pthread_mutex_unlock(&g_tracked_mutex);
             return;
         }
         e = e->next;
@@ -45,21 +165,26 @@ void add_tracked(int pid) {
         e->next = g_tracked_hash[h];
         g_tracked_hash[h] = e;
     }
+    pthread_mutex_unlock(&g_tracked_mutex);
 }
 
 bool is_tracked(int pid) {
+    pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
     TrackedEntry *e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
+            pthread_mutex_unlock(&g_tracked_mutex);
             return true;
         }
         e = e->next;
     }
+    pthread_mutex_unlock(&g_tracked_mutex);
     return false;
 }
 
 void remove_tracked(int pid) {
+    pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
     TrackedEntry **pp = &g_tracked_hash[h];
     while (*pp) {
@@ -71,9 +196,11 @@ void remove_tracked(int pid) {
         }
         pp = &(*pp)->next;
     }
+    pthread_mutex_unlock(&g_tracked_mutex);
 }
 
 static void prune_stale_tracked() {
+    pthread_mutex_lock(&g_tracked_mutex);
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
         TrackedEntry **pp = &g_tracked_hash[i];
         while (*pp) {
@@ -86,6 +213,7 @@ static void prune_stale_tracked() {
             }
         }
     }
+    pthread_mutex_unlock(&g_tracked_mutex);
 }
 
 static UidMapEntry *g_uid_map = NULL;
@@ -148,6 +276,19 @@ bool is_system_app(uid_t uid) {
     return (uid < 10000);
 }
 
+bool is_system_app_by_pkg(const char* cmdline, uid_t uid) {
+    char base_pkg[256] = {0};
+    if (cmdline && cmdline[0]) {
+        strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
+        char* colon = strchr(base_pkg, ':');
+        if (colon) *colon = '\0';
+    }
+    if (base_pkg[0] && is_system_pkg_cached(base_pkg)) {
+        return true;
+    }
+    return is_system_app(uid);
+}
+
 bool is_process_safe_to_inject(const char* cmdline) {
     if (strstr(cmdline, "_zygote")) return false;
     if (strstr(cmdline, "com.google.android.webview")) return false;
@@ -191,8 +332,8 @@ bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_i
     if (cfg) return cfg->inject_enable;
     if (has_wildcard_enabled_locked(user_id)) return true;
     if (g_global_cfg.global_inject && !is_isolated_uid(uid) && !strstr(cmdline, "zygote")) {
-        /* 默认跳过系统应用 (uid < 10000)，除非配置 SKIP_SYSTEM_APPS OFF */
-        if (g_global_cfg.skip_system_apps && is_system_app(uid)) return false;
+        /* 默认跳过系统应用，pm list packages -s 查询失败时回退到 uid < 10000 */
+        if (g_global_cfg.skip_system_apps && is_system_app_by_pkg(cmdline, uid)) return false;
         if (from_ipc || is_zygote_child(pid)) return true;
     }
     return false;

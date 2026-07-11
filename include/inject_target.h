@@ -7,6 +7,9 @@
 
 bool is_isolated_uid(uid_t uid);
 bool is_system_app(uid_t uid);
+bool is_system_app_by_pkg(const char* cmdline, uid_t uid);
+void init_system_pkg_cache(void);
+void cleanup_system_pkg_cache(void);
 bool is_process_safe_to_inject(const char* cmdline);
 bool is_media_provider(const char* pkg);
 bool is_target_app(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc);

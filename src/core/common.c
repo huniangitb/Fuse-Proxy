@@ -1,8 +1,6 @@
 #include "common.h"
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -41,6 +39,7 @@ static LogRingBuffer g_log_ring;
 static pthread_t     g_log_sender_tid;
 static int           g_log_event_fd = -1;
 static _Atomic(bool) g_log_shutdown = false;
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 void init_timezone() {
     const char *tz = getenv("TZ");
     if (tz && tz[0] != '\0') {
@@ -165,11 +164,15 @@ int mkdir_recursive(const char *dir) {
     size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
     for (p = tmp + 1; *p; p++) {
         if (*p == '/') {
-            *p = 0; if (access(tmp, F_OK) != 0) mkdir(tmp, 0755);
+            *p = 0;
+            if (access(tmp, F_OK) != 0 && mkdir(tmp, 0755) != 0) {
+                *p = '/';
+                return -1;
+            }
             *p = '/';
         }
     }
-    if (access(tmp, F_OK) != 0) mkdir(tmp, 0755);
+    if (access(tmp, F_OK) != 0 && mkdir(tmp, 0755) != 0) return -1;
     return 0;
 }
 /* 核心修复：共享的无效 Unicode/控制字符检测逻辑。
@@ -237,16 +240,14 @@ static void *log_sender_thread(void *arg) {
             clock_gettime(CLOCK_MONOTONIC, &now);
             if (now.tv_sec > retry_after.tv_sec ||
                 (now.tv_sec == retry_after.tv_sec && now.tv_nsec >= retry_after.tv_nsec)) {
-                sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
                 if (sock >= 0) {
-                    struct sockaddr_in addr;
-                    memset(&addr, 0, sizeof(addr));
-                    addr.sin_family = AF_INET;
-                    addr.sin_port = htons(LOG_TCP_PORT);
-                    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+                    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+                    strncpy(addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(addr.sun_path) - 2);
+                    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
                     struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
                     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-                    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                    if (connect(sock, (struct sockaddr*)&addr, len) < 0) {
                         close(sock); sock = -1;
                         clock_gettime(CLOCK_MONOTONIC, &retry_after);
                         retry_after.tv_nsec += 100000000;
@@ -361,10 +362,12 @@ void log_internal(LogLevel level, const char* format, ...) {
         else persist_log_to_disk("sys", msg_buf, true);
     }
     if (!g_log_inited) return;
+    pthread_mutex_lock(&g_log_mutex);
     int slot = atomic_fetch_add_explicit(&g_log_ring.head, 1, memory_order_relaxed) & LOG_BUF_MASK;
     strncpy(g_log_ring.entries[slot].msg, msg_buf, LOG_MSG_MAX_LEN - 1);
     g_log_ring.entries[slot].msg[LOG_MSG_MAX_LEN - 1] = '\0';
     g_log_ring.entries[slot].level = level;
+    pthread_mutex_unlock(&g_log_mutex);
     uint64_t val = 1;
     if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
 }
