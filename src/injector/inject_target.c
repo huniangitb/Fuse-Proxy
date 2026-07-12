@@ -393,7 +393,6 @@ void update_uid_map(uid_t uid, const char* pkg) {
             strncpy(g_uid_map[i].pkg, clean_pkg, 127);
             g_uid_map[i].pkg[127] = '\0';
             updated = true;
-            LOG_DBG("UID内存映射已更新 (覆盖旧记录): %u -> %s", uid, clean_pkg);
             break;
         }
     }

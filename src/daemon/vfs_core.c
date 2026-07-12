@@ -73,34 +73,50 @@ static void reload_config(void) {
 static void* config_monitor_thread(void* arg) {
     (void)arg;
 
-    int inotify_fd = inotify_init1(IN_CLOEXEC);
-    if (inotify_fd < 0) return nullptr;
+    int inotify_fd = -1;
+    int wd = -1;
+    /* inotify fd 因内核内存压力可能失效，外层循环负责重建 watch */
+    while (!g_log_shutdown) {
+        if (inotify_fd < 0) {
+            inotify_fd = inotify_init1(IN_CLOEXEC);
+            if (inotify_fd < 0) {
+                sleep(2);
+                continue;
+            }
+        }
+        if (wd < 0) {
+            char dir[PATH_MAX];
+            strncpy(dir, g_rules_path, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
+            char *slash = strrchr(dir, '/');
+            if (!slash) { close(inotify_fd); inotify_fd = -1; sleep(2); continue; }
+            *slash = '\0';
+            wd = inotify_add_watch(inotify_fd, dir, IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO);
+            if (wd < 0) { close(inotify_fd); inotify_fd = -1; sleep(2); continue; }
+        }
 
-    /* 从 g_rules_path 提取目录路径 */
-    char dir[PATH_MAX];
-    strncpy(dir, g_rules_path, sizeof(dir) - 1);
-    char *slash = strrchr(dir, '/');
-    if (!slash) { close(inotify_fd); return nullptr; }
-    *slash = '\0';
-
-    int wd = inotify_add_watch(inotify_fd, dir, IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO);
-    if (wd < 0) { close(inotify_fd); return nullptr; }
-
-    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-    while (true) {
+        char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
         ssize_t len = read(inotify_fd, buf, sizeof(buf));
         if (len <= 0) {
             if (errno == EINTR) continue;
-            break;
+            /* read 永久失败：重建 inotify fd 与 watch */
+            inotify_rm_watch(inotify_fd, wd);
+            wd = -1;
+            close(inotify_fd);
+            inotify_fd = -1;
+            continue;
         }
 
-        /* 延迟 1 秒防抖，等写入完成 */
+        /* 合并窗口：read 可能返回多个叠加事件，sleep 后仅 reload 一次，
+           避免每个事件触发一次 reload */
         sleep(1);
-
         reload_config();
     }
 
-    close(inotify_fd);
+    if (inotify_fd >= 0) {
+        if (wd >= 0) inotify_rm_watch(inotify_fd, wd);
+        close(inotify_fd);
+    }
     return nullptr;
 }
 
@@ -125,15 +141,15 @@ void vfs_core_init(const char* rules_path) {
 
 AppConfig* vfs_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
     if (uid < 10000) {
-        strncpy(current_pkg_out, "system", 127);
-        current_pkg_out[127] = '\0';
-        return nullptr; 
+        strncpy(current_pkg_out, "system", sizeof(g_uid_cache[0].pkg) - 1);
+        current_pkg_out[sizeof(g_uid_cache[0].pkg) - 1] = '\0';
+        return nullptr;
     }
     int slot = uid % UID_CACHE_SIZE;
     pthread_mutex_lock(&g_uid_cache[slot].lock);
     if (g_uid_cache[slot].uid == uid && g_uid_cache[slot].cfg != (AppConfig*)-1) {
-        strncpy(current_pkg_out, g_uid_cache[slot].pkg, 127);
-        current_pkg_out[127] = '\0';
+        strncpy(current_pkg_out, g_uid_cache[slot].pkg, sizeof(g_uid_cache[slot].pkg) - 1);
+        current_pkg_out[sizeof(g_uid_cache[slot].pkg) - 1] = '\0';
         AppConfig* cached_cfg = g_uid_cache[slot].cfg;
         pthread_mutex_unlock(&g_uid_cache[slot].lock);
         return cached_cfg;
@@ -349,13 +365,19 @@ static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int
             (strncmp(sub_path, exp_obb, elen_obb) == 0 && (sub_path[elen_obb] == '\0' || sub_path[elen_obb] == '/'))) {
             return false;
         }
-        char sandbox_target[MAX_PATH_LEN];
         int effective_uid = user_id;
         if (effective_uid < 0) {
             struct fuse_context* fctx = fuse_get_context();
             if (fctx && fctx->uid >= 10000) effective_uid = (int)(fctx->uid / 100000);
         }
         if (effective_uid < 0) effective_uid = 0;
+        /* 长度校验：current_pkg 来自 uid 缓存可极长，避免 sandbox_target 截断后 mkdir 错误位置 */
+        char sandbox_target[MAX_PATH_LEN];
+        int need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);
+        if (need <= 0 || (size_t)need >= sizeof(sandbox_target)) {
+            LOG_WRN("sandbox 路径过长（%d），放弃沙盒重定向: pkg=%s", need, current_pkg);
+            return false;
+        }
         snprintf(sandbox_target, sizeof(sandbox_target), STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);
         if (access(sandbox_target, F_OK) != 0) mkdir_recursive_p(sandbox_target, 0775);
         snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
@@ -392,11 +414,16 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
     }
     
     if (!redir) {
-        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : false, sizeof(temp));
+        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp));
     }
     if (!redir) {
-        bool app_explicit_sandbox = (cfg && cfg->sandbox_explicit);
-        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, g_disable_sandbox ? true : app_explicit_sandbox, sizeof(temp));
+        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp));
+    }
+    if (!redir && !g_disable_sandbox) {
+        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp));
+    }
+    if (!redir && !g_disable_sandbox) {
+        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp));
     }
     if (!redir) {
         if (user_id >= 0) snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);

@@ -13,7 +13,124 @@
 #include <errno.h>
 #include <stddef.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include "config_parser.h"
+#include "ns_utils.h"
+
+/* IPC 线程挂载参数 */
+typedef struct {
+    char pkg[256];
+    int pid;
+    uid_t uid;
+    char mnt_src[256];
+} IpcMountArg;
+
+static void* ipc_mount_thread(void* raw) {
+    IpcMountArg* arg = (IpcMountArg*)raw;
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+    /* IPC 线程设置最高实时调度优先级，确保不被普通进程抢占 */
+    {
+        struct sched_param param;
+        param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+            /* 降级：SCHED_FIFO 需要 CAP_SYS_NICE，失败时退化为最低 nice */
+            LOG_DBG("IPC线程: SCHED_FIFO 设置失败(%s), 降级为 nice -20", strerror(errno));
+            setpriority(PRIO_PROCESS, 0, -20);
+        }
+    }
+
+    //LOG("IPC线程开始异步挂载: %s(PID:%d)", arg->pkg, arg->pid);
+
+    /* 先加入追踪列表，防止并发重入（幂等操作） */
+    add_tracked(arg->pid);
+
+    if (kill(arg->pid, 0) != 0) {
+        LOG_DBG("IPC线程: 进程已死 %s(PID:%d)", arg->pkg, arg->pid);
+        remove_tracked(arg->pid);
+        free(arg);
+        return NULL;
+    }
+    if (arg->uid >= 10000) update_uid_map(arg->uid, arg->pkg);
+
+    /* 再做一次配置匹配（主线程已检查过，但线程内重检保证一致性） */
+    if (!is_target_app(arg->pkg, arg->uid, arg->pid, true)) {
+        LOG_DBG("IPC线程: 配置无匹配 %s(PID:%d)", arg->pkg, arg->pid);
+        remove_tracked(arg->pid);
+        free(arg);
+        return NULL;
+    }
+
+    /* 检查 FUSE 源 */
+    const char* mnt_src = get_active_mnt_src();
+    if (!mnt_src) {
+        LOG_ERR("IPC线程: 全局 FUSE 不可用，无法为 %s(PID:%d) 挂载", arg->pkg, arg->pid);
+        remove_tracked(arg->pid);
+        free(arg);
+        return NULL;
+    }
+
+    int ret = -1;
+    bool fast_path = false;
+
+    /*
+     * 快速路径（fuse_direct）：跳过 /proc/pid/mountinfo 读取，直接发起异步 bind mount。
+     * 对于首次启动的应用，目标路径几乎一定未被挂载，无需提前检查挂载状态，
+     * 显著减少延迟，避免目标进程抢先创建文件。
+     */
+    if (g_global_cfg.fuse_direct) {
+        char target_path[128];
+        get_target_storage_path(arg->uid, target_path, sizeof(target_path));
+
+        ret = ns_global_mount_async(arg->pid, arg->pkg, mnt_src, target_path);
+        if (ret == 0) {
+            fast_path = true;
+            /* 快速路径成功：手动处理追踪标记与日志 */
+            add_tracked(arg->pid);
+            print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
+        }
+    }
+
+    /*
+     * 慢速路径：回退到完整的 perform_app_mount（含 mountinfo 读取）。
+     * 命中场景：非 fuse_direct 模式、或快速路径 mount 失败（需诊断挂载状态）。
+     */
+    if (!fast_path) {
+        ret = perform_app_mount(arg->pkg, arg->pid, arg->uid, NULL, "IPC通知");
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    long elapsed_us = (ts_end.tv_sec - ts_start.tv_sec) * 1000000L +
+                      (ts_end.tv_nsec - ts_start.tv_nsec) / 1000L;
+
+    if (ret == 0) {
+        LOG("IPC挂载完成: %s(PID:%d)%s 耗时: %ldus",
+            arg->pkg, arg->pid, fast_path ? " [快速路径]" : "", elapsed_us);
+    } else {
+        LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
+        remove_tracked(arg->pid);
+    }
+    free(arg);
+    return NULL;
+}
 int ipc_server_init() {
+    /* 将整个 injector 进程绑定到大核 4-7，减少调度迁移延迟 */
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CPU_SET(4, &cpus);
+    CPU_SET(5, &cpus);
+    CPU_SET(6, &cpus);
+    CPU_SET(7, &cpus);
+    if (sched_setaffinity(0, sizeof(cpus), &cpus) != 0) {
+        LOG_DBG("IPC: 进程 CPU 亲和性设置失败: %s", strerror(errno));
+    } else {
+        LOG("IPC: 进程已绑定到 CPU 4-7");
+    }
+
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0); 
     if (sock < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX }; 
@@ -53,39 +170,63 @@ void handle_ipc_client_readable(int client_fd) {
         close(client_fd); 
         return; 
     }
-    char pkg[256]; 
+    char pkg[256];
     int pid = 0, uid = 0;
     if (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3 || sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3) {
+        /* 输入校验：拒绝越界 pid/uid，避免后续 /proc/<pid> 路径被构造用于越权访问 */
+        if (pid <= 0 || pid >= 1048576 /* PID_BITMAP_MAX, Android PID 上限 */) {
+            LOG_WRN("IPC: 拒绝非法 pid=%d", pid);
+            send(client_fd, "ERR", 3, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
+        }
+        if (uid < 0) {
+            LOG_WRN("IPC: 拒绝非法 uid=%d", uid);
+            send(client_fd, "ERR", 3, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
+        }
         if (!g_passive_mode) {
             g_passive_mode = true;
             LOG("已接收到IPC通知，切换到被动模式，停止周期扫描");
         }
-        if (is_isolated_uid(uid) || strstr(pkg, "_zygote") != nullptr) { 
-            send(client_fd, "OK", 2, MSG_NOSIGNAL); 
-            close(client_fd); 
-            return; 
+        if (is_isolated_uid(uid) || strstr(pkg, "_zygote") != nullptr) {
+            send(client_fd, "OK", 2, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
         }
-        char clean_pkg[256]; 
-        strncpy(clean_pkg, pkg, sizeof(clean_pkg) - 1); 
+        char clean_pkg[256];
+        strncpy(clean_pkg, pkg, sizeof(clean_pkg) - 1);
         clean_pkg[sizeof(clean_pkg) - 1] = '\0';
-        char* colon = strchr(clean_pkg, ':'); 
+        char* colon = strchr(clean_pkg, ':');
         if (colon) *colon = '\0';
         if (uid >= 10000) update_uid_map(uid, clean_pkg);
         send(client_fd, "OK", 2, MSG_NOSIGNAL);
         close(client_fd); // 快速释放客户端连接
-        if (kill(pid, 0) == 0) {
-            add_tracked(pid);
-        }
-        bool match = is_target_app(pkg, uid, pid, true);
-        if (!match) return; 
+
+        /* 核心修复：使用 clean_pkg 而非原始 pkg 进行配置匹配，
+           避免带 ':process' 后缀的包名误判为未配置应用 */
+        if (!is_target_app(clean_pkg, uid, pid, true)) return;
         if (access("/storage/emulated/", F_OK) != 0) return;
-        const char* mnt_src = get_active_mnt_src();
-        if (!mnt_src) { 
-            LOG_ERR("IPC: 全局 FUSE 不可用，无法为 %s 挂载", pkg); 
-            return; 
+
+        /* 异步线程挂载：不阻塞主循环，子进程在后台完成 */
+        IpcMountArg* arg = malloc(sizeof(IpcMountArg));
+        if (arg) {
+            strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
+            arg->pkg[sizeof(arg->pkg) - 1] = '\0';
+            arg->pid = pid;
+            arg->uid = uid;
+            arg->mnt_src[0] = '\0';
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, ipc_mount_thread, arg) == 0) {
+                pthread_detach(tid);
+                LOG_DBG("IPC派发异步挂载线程: %s(PID:%d)", clean_pkg, pid);
+            } else {
+                LOG_ERR("IPC创建挂载线程失败: %s(PID:%d)", clean_pkg, pid);
+                free(arg);
+            }
         }
-        perform_app_mount(pkg, pid, uid, mnt_src, "IPC通知");
-        return; 
+        return;
     }
     if (strncmp(buf, "LIST_INJECTED", 13) == 0) {
         handle_list_injected(client_fd);

@@ -24,7 +24,7 @@ endif
 is_clang = cc.get_id() == 'clang'
 
 # ================= 依赖查找 =================
-fuse3_root = '/data/user/0/com.termux/files/home/build-install'
+fuse3_root = get_option('fuse3_root')
 fuse_inc = include_directories(fuse3_root + '/include')
 fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
 
@@ -126,6 +126,17 @@ test_path_vars_exe = executable('test_path_vars',
   ['tests/test_path_vars.c', 'src/config/path_vars.c'],
   include_directories: inc_dir)
 test('path_vars', test_path_vars_exe)
+
+test_trie_exe = executable('test_trie',
+  ['tests/test_trie.c', 'src/config/config_parser.c'],
+  include_directories: inc_dir,
+  dependencies: [libiconv, json_c])
+test('trie', test_trie_exe)
+
+test_path_sanitize_exe = executable('test_path_sanitize',
+  ['tests/test_path_sanitize.c', 'src/core/common.c'],
+  include_directories: inc_dir)
+test('path_sanitize', test_path_sanitize_exe)
 
 message('========================================')
 message('构建配置信息:')
