@@ -204,7 +204,7 @@ static void broadcast_json(int sock_fd) {
     char *json = build_config_json_payload(&len);
     if (!json) return;
     LOG_DBG("配置广播: %d 订阅者, JSON 大小 %d 字节", g_subscriber_count, len);
-    for (int i = 0; i < MAX_SUBSCRIBERS && i < g_subscriber_count; i++) {
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (!g_subscribers[i].active) continue;
         ssize_t ret = sendto(sock_fd, json, len, MSG_NOSIGNAL | MSG_DONTWAIT,
                              (struct sockaddr *)&g_subscribers[i].addr,
@@ -218,6 +218,12 @@ static void broadcast_json(int sock_fd) {
             }
         }
     }
+    /* 清理后重算真实活跃订阅数 */
+    int alive = 0;
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+        if (g_subscribers[i].active) alive++;
+    }
+    g_subscriber_count = alive;
     free(json);
 }
 #define MAX_FILE_SIZE (256 * 1024)  
@@ -422,20 +428,31 @@ static void handle_subscribe(int sock_fd, struct sockaddr_un *cli_addr,
             return;
         }
     }
-    if (g_subscriber_count >= MAX_SUBSCRIBERS) {
-        LOG_DBG("配置广播: 订阅者已满 (%d), 拒绝新订阅", MAX_SUBSCRIBERS);
-        return;
-    }
     int idx = -1;
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (!g_subscribers[i].active) { idx = i; break; }
     }
-    if (idx < 0) return;
+    if (idx < 0) {
+        /* 所有 slot 都被占用，强制移除第一个旧订阅者腾出空间 */
+        for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+            if (g_subscribers[i].active) {
+                LOG("配置广播: 强制移除旧订阅者 #%d", i);
+                g_subscribers[i].active = false;
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx < 0) return;  /* 不应走到这里，但保留防御 */
     memcpy(&g_subscribers[idx].addr, cli_addr, cli_len);
     g_subscribers[idx].addr_len = cli_len;
     g_subscribers[idx].active = true;
-    if (idx >= g_subscriber_count)
-        g_subscriber_count = idx + 1;
+    /* 重算真实活跃订阅数 */
+    int alive = 0;
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+        if (g_subscribers[i].active) alive++;
+    }
+    g_subscriber_count = alive;
     LOG("配置广播: 新订阅者 #%d 已注册, 当前 %d 个订阅者", idx, g_subscriber_count);
     handle_get_request(sock_fd, cli_addr, cli_len);
 }
@@ -444,6 +461,12 @@ static void handle_unsubscribe(struct sockaddr_un *cli_addr, socklen_t cli_len) 
         if (g_subscribers[i].active && g_subscribers[i].addr_len == cli_len &&
             memcmp(&g_subscribers[i].addr, cli_addr, cli_len) == 0) {
             g_subscribers[i].active = false;
+            /* 重算真实活跃订阅数 */
+            int alive = 0;
+            for (int j = 0; j < MAX_SUBSCRIBERS; j++) {
+                if (g_subscribers[j].active) alive++;
+            }
+            g_subscriber_count = alive;
             LOG("配置广播: 订阅者 #%d 已取消订阅", i);
             return;
         }

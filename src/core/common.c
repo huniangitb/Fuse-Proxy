@@ -99,13 +99,20 @@ void escape_cgroup() {
     };
     for (int i = 0; i < 4; i++) {
         int fd = open(targets[i], O_WRONLY | O_CLOEXEC);
-        if (fd >= 0) { write(fd, pid_s, strlen(pid_s)); close(fd); }
+        if (fd >= 0) {
+            /* 静默吞掉写入失败：cgroup 路径在不同 Android 版本与配置下可能不存在或无写权限 */
+            if (write(fd, pid_s, strlen(pid_s)) < 0) {
+                LOG_DBG("escape_cgroup: 写入 %s 失败: %s", targets[i], strerror(errno));
+            }
+            close(fd);
+        }
     }
 }
-int send_ipc_message(const char* message) {
+/* 抽取的 IPC 连接 helper：send_ipc_message / query_ipc_message 共用，
+   统一 500ms 收发超时与 abstract namespace 绑定逻辑 */
+static int connect_ipc() {
     int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock_fd < 0) return -1;
-    // 健壮性保障：设置严格的 500ms 超时，防止死锁的 FUSE / 注入器导致此接口挂死
     struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
     setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -117,25 +124,18 @@ int send_ipc_message(const char* message) {
     if (connect(sock_fd, (struct sockaddr*)&server_addr, len) < 0) {
         close(sock_fd); return -1;
     }
+    return sock_fd;
+}
+int send_ipc_message(const char* message) {
+    int sock_fd = connect_ipc();
+    if (sock_fd < 0) return -1;
     send(sock_fd, message, strlen(message), MSG_NOSIGNAL);
     close(sock_fd);
     return 0;
 }
 int query_ipc_message(const char* command, char* out_buf, size_t buf_size) {
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int sock_fd = connect_ipc();
     if (sock_fd < 0) return -1;
-    // 健壮性保障：超时设定不高于 0.5 秒
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
-    setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    struct sockaddr_un server_addr = {0};
-    server_addr.sun_family = AF_UNIX;
-    server_addr.sun_path[0] = '\0';
-    strncpy(server_addr.sun_path + 1, IPC_SOCKET_NAME, sizeof(server_addr.sun_path) - 2);
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(IPC_SOCKET_NAME);
-    if (connect(sock_fd, (struct sockaddr*)&server_addr, len) < 0) {
-        close(sock_fd); return -1;
-    }
     send(sock_fd, command, strlen(command), MSG_NOSIGNAL);
     shutdown(sock_fd, SHUT_WR);
     ssize_t total = 0;
@@ -156,10 +156,13 @@ char* get_self_dir() {
         buf[len] = '\0'; char* last_slash = strrchr(buf, '/');
         if (last_slash) *last_slash = '\0';
         strncpy(g_self_dir, buf, sizeof(g_self_dir) - 1);
-    } else strcpy(g_self_dir, "/data/local/tmp");
+    } else { strncpy(g_self_dir, "/data/local/tmp", sizeof(g_self_dir) - 1); g_self_dir[sizeof(g_self_dir) - 1] = '\0'; }
     return g_self_dir;
 }
 int mkdir_recursive(const char *dir) {
+    if (!dir) return -1;
+    size_t in_len = strlen(dir);
+    if (in_len == 0 || in_len >= 256) return -1;   /* 拒绝空与超长输入，杜绝 snprintf 静默截断 */
     char tmp[256], *p = nullptr; snprintf(tmp, sizeof(tmp), "%s", dir);
     size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
     for (p = tmp + 1; *p; p++) {
@@ -263,37 +266,48 @@ static void *log_sender_thread(void *arg) {
         int consumed = 0;
         while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
             if (sock < 0) break;  /* 未连接：保留 ring 数据等待重连，避免丢弃式消耗（tail++/consumed++）导致空转 */
+            /* 持锁读取并打包：与 log_internal 的写入互斥，杜绝 sender 读到撕裂的半写字符串 */
+            pthread_mutex_lock(&g_log_mutex);
             LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
-            if (sock >= 0) {
-                char packet[LOG_MSG_MAX_LEN + 128];
-                int len;
-                if (e->level == LOG_IO)
-                    len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
-                else if (e->level == LOG_LOGCAT)
-                    len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
-                else
-                    len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
-                                   e->level, g_proc_name, e->msg);
-                ssize_t sent = send(sock, packet, len, MSG_NOSIGNAL);
-                if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    close(sock); sock = -1;
-                    clock_gettime(CLOCK_MONOTONIC, &retry_after);
-                    retry_after.tv_nsec += 100000000;
-                    if (retry_after.tv_nsec >= 1000000000) {
-                        retry_after.tv_sec++;
-                        retry_after.tv_nsec -= 1000000000;
-                    }
-                    break;
+            char packet[LOG_MSG_MAX_LEN + 128];
+            int len;
+            if (e->level == LOG_IO)
+                len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
+            else if (e->level == LOG_LOGCAT)
+                len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
+            else
+                len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
+                               e->level, g_proc_name, e->msg);
+            pthread_mutex_unlock(&g_log_mutex);
+            ssize_t sent = send(sock, packet, len, MSG_NOSIGNAL);
+            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                close(sock); sock = -1;
+                clock_gettime(CLOCK_MONOTONIC, &retry_after);
+                retry_after.tv_nsec += 100000000;
+                if (retry_after.tv_nsec >= 1000000000) {
+                    retry_after.tv_sec++;
+                    retry_after.tv_nsec -= 1000000000;
                 }
-                if (sent < 0) break;
+                break;
             }
+            if (sent < 0) break;
             g_log_ring.tail++;
             consumed++;
         }
 
         if (!consumed) {
+            /* sock 未就绪且 ring 非空时也等待 retry_after，避免紧密空转；
+               ring 为空时靠 eventfd 唤醒，sock 未就绪时靠 retry_after 节流重连 */
             struct pollfd pfd = { .fd = g_log_event_fd, .events = POLLIN };
-            poll(&pfd, 1, 100);
+            int poll_ms = 100;
+            if (sock < 0) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                int retry_ms = (int)(retry_after.tv_sec - now.tv_sec) * 1000
+                            + (int)(retry_after.tv_nsec - now.tv_nsec) / 1000000;
+                if (retry_ms > 0 && retry_ms < poll_ms) poll_ms = retry_ms;
+            }
+            poll(&pfd, 1, poll_ms);
             /* eventfd 为非 semaphore 模式：计数器只能靠 read 清零。poll 返回后必须读空，
                否则计数器永久 ≥1 → POLLIN 永久就绪 → poll 立即返回形成紧密空转（100% 单核） */
             if (pfd.revents & POLLIN) {
@@ -304,19 +318,19 @@ static void *log_sender_thread(void *arg) {
     }
 
     while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
+        pthread_mutex_lock(&g_log_mutex);
         LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
-        if (sock >= 0) {
-            char packet[LOG_MSG_MAX_LEN + 128];
-            int len;
-            if (e->level == LOG_IO)
-                len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
-            else if (e->level == LOG_LOGCAT)
-                len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
-            else
-                len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
-                               e->level, g_proc_name, e->msg);
-            send(sock, packet, len, MSG_NOSIGNAL);
-        }
+        char packet[LOG_MSG_MAX_LEN + 128];
+        int len;
+        if (e->level == LOG_IO)
+            len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
+        else if (e->level == LOG_LOGCAT)
+            len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
+        else
+            len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
+                           e->level, g_proc_name, e->msg);
+        pthread_mutex_unlock(&g_log_mutex);
+        if (sock >= 0) send(sock, packet, len, MSG_NOSIGNAL);
         g_log_ring.tail++;
     }
     if (sock >= 0) close(sock);
@@ -332,7 +346,21 @@ void log_init(const char* process_name) {
     atomic_store_explicit(&g_log_ring.dropped, 0, memory_order_relaxed);
     atomic_store_explicit(&g_log_shutdown, false, memory_order_relaxed);
     g_log_event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    pthread_create(&g_log_sender_tid, NULL, log_sender_thread, NULL);
+    if (g_log_event_fd < 0) {
+        /* eventfd 失败：日志子系统降级为仅落盘模式，不派 sender 线程 */
+        LOG_ERR("log_init: eventfd 创建失败: %s", strerror(errno));
+        g_log_inited = false;
+        return;
+    }
+    if (pthread_create(&g_log_sender_tid, NULL, log_sender_thread, NULL) != 0) {
+        /* sender 线程派失败：日志将堆积于 ring buffer 但永不被发送，
+           关闭 eventfd 避免后续无效写入 */
+        LOG_ERR("log_init: sender 线程创建失败: %s", strerror(errno));
+        close(g_log_event_fd);
+        g_log_event_fd = -1;
+        g_log_inited = false;
+        return;
+    }
     g_log_inited = true;
 }
 

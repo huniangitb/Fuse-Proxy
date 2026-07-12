@@ -41,9 +41,10 @@ typedef enum {
     LOG_INFO    = 1,
     LOG_WARN    = 2,
     LOG_ERROR   = 3,
-    LOG_MONITOR = 0,
-    LOG_IO      = 100,
-    LOG_LOGCAT  = 101
+    /* 通道标记：使用高位段避免与严重级别 0~3 冲突，g_min_log_level 比较时只看 0~3 */
+    LOG_MONITOR = 0x80,
+    LOG_IO      = 0x81,
+    LOG_LOGCAT  = 0x82
 } LogLevel;
 
 extern LogLevel g_min_log_level;

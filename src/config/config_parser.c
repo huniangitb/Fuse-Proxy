@@ -200,7 +200,11 @@ bool trie_is_ancestor(const TrieNode* root, const char* path) {
     return false;
 }
 static bool is_wildcard_string(const char *str) {
-    return strpbrk(str, "*?[]") != NULL;
+    /* `?` 作为首字符是项目自定义的"相对当前 user 存储"前缀，非 fnmatch 通配；
+       仅从第二字符起检测真正的通配符 * ? [ ]，避免 ALLOW/REDIRECT 的 ? 前缀路径被误判跳过 trie */
+    if (!str || !str[0]) return false;
+    const char *p = (str[0] == '?') ? str + 1 : str;
+    return strpbrk(p, "*?[]") != NULL;
 }
 void config_init_lock() { pthread_rwlock_init(&g_rules_lock, nullptr); }
 void config_destroy_lock() { pthread_rwlock_destroy(&g_rules_lock); }
@@ -509,8 +513,10 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 cur->redir_capacity = new_cap;
             }
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-            strcpy(r->virtual_prefix, virtual_prefix);
-            strcpy(r->real_target, real_target);
+            strncpy(r->virtual_prefix, virtual_prefix, sizeof(r->virtual_prefix) - 1);
+            r->virtual_prefix[sizeof(r->virtual_prefix) - 1] = '\0';
+            strncpy(r->real_target, real_target, sizeof(r->real_target) - 1);
+            r->real_target[sizeof(r->real_target) - 1] = '\0';
             r->is_allow = true;
             if (!is_wildcard_string(virtual_prefix) && !has_path_var(virtual_prefix)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
@@ -562,8 +568,10 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 cur->redir_capacity = new_cap;
             }
             RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-            strcpy(r->virtual_prefix, virtual_prefix);
-            strcpy(r->real_target, real_target);
+            strncpy(r->virtual_prefix, virtual_prefix, sizeof(r->virtual_prefix) - 1);
+            r->virtual_prefix[sizeof(r->virtual_prefix) - 1] = '\0';
+            strncpy(r->real_target, real_target, sizeof(r->real_target) - 1);
+            r->real_target[sizeof(r->real_target) - 1] = '\0';
             r->is_allow = false;
             if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) && !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
@@ -906,13 +914,13 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             final_sandbox ? "ON" : "OFF",
             final_redir_count, final_hide_count, final_ro_count);
         for (int i = 0; i < cfg->redir_count; i++) {
-            LOG_DBG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
+            //LOG_DBG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
         }
         for (int i = 0; i < cfg->hide_count; i++) {
-            LOG_DBG("  [隐藏通配]   %s", cfg->hide_rules[i]);
+            //LOG_DBG("  [隐藏通配]   %s", cfg->hide_rules[i]);
         }
         for (int i = 0; i < cfg->ro_count; i++) {
-            LOG_DBG("  [只读通配]   %s", cfg->ro_rules[i]);
+            //LOG_DBG("  [只读通配]   %s", cfg->ro_rules[i]);
         }
     } else {
         const char* match_desc = 
