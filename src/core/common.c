@@ -38,7 +38,7 @@ typedef struct {
 static LogRingBuffer g_log_ring;
 static pthread_t     g_log_sender_tid;
 static int           g_log_event_fd = -1;
-static _Atomic(bool) g_log_shutdown = false;
+_Atomic(bool) g_log_shutdown = false;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 void init_timezone() {
     const char *tz = getenv("TZ");

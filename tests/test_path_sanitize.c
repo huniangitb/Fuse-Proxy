@@ -51,11 +51,11 @@ static void test_sanitize(void) {
     CHECK(out[0] == '\0');
 
     /* 含非法字符被剥离 */
-    path_sanitize(out, sizeof(out), "/sd\x07card/\xc2\xa0file");
+    path_sanitize(out, sizeof(out), "/sd\x07""card/\xc2\xa0""file");
     CHECK(strcmp(out, "/sdcard/file") == 0);
 
     /* 多字节非法被整体跳过（U+202E 3 字节） */
-    path_sanitize(out, sizeof(out), "a\xe2\x80\xaeb");
+    path_sanitize(out, sizeof(out), "a\xe2\x80\xae""b");
     CHECK(strcmp(out, "ab") == 0);
 
     /* 截断保护：输出超长不越界，结果以 null 结尾 */

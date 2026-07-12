@@ -37,7 +37,6 @@ int g_global_root_fd = -1;
 int g_epoll_fd = -1;
 int g_inotify_fd = -1;
 int g_config_pub_fd = -1;
-static int reload_cooldown_seconds = 0;
 static int seconds_until_next_scan = 1; 
 static int g_scan_interval_seconds = 30;   
 static bool g_last_scan_found = false;          
@@ -939,12 +938,6 @@ int main(int argc, char *argv[]) {
                 if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
                     check_and_recover_fuse();
                     reap_zombies();
-                    if (reload_cooldown_seconds > 0) {
-                        reload_cooldown_seconds--;
-                        if (reload_cooldown_seconds == 0) {
-                            g_reload_config = 1;
-                        }
-                    }
                     if (!g_passive_mode) {
                         if (seconds_until_next_scan > 0) {
                             seconds_until_next_scan--;
@@ -1027,7 +1020,7 @@ int main(int argc, char *argv[]) {
                         ptr += sizeof(struct inotify_event) + ev->len;
                     }
                     if (need_reload) {
-                        reload_cooldown_seconds = 1; 
+                        g_reload_config = 1;  /* 直接触发，去除 cooldown race */
                     }
                 }
             } else if (fd == ipc_sock) {

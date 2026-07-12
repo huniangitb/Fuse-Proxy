@@ -108,6 +108,43 @@ static void test_trie_predicates(void) {
     trie_free(root);
 }
 
+/* matched 返回值语义：途经无规则的中间节点不得误判为命中 */
+static void test_trie_matched_semantics(void) {
+    TrieNode* root = trie_create_node(NULL);
+    CHECK(root != NULL);
+
+    /* 仅 com.foo 挂 redirect，com.bar 未配置 */
+    trie_insert(root, "/Android/data/com.foo/files", "/real/foo", false, false);
+
+    /* 途经 /Android、/data（无规则中间节点）后到 com.bar 断开：不算命中 */
+    bool hidden = false, ro = false;
+    char out[256] = {0};
+    CHECK(trie_lookup(root, "/Android/data/com.bar/files", &hidden, &ro, out, sizeof(out)) == false);
+    CHECK(hidden == false);
+    CHECK(ro == false);
+    CHECK(out[0] == '\0');
+
+    /* 精确命中真实规则：算命中 */
+    CHECK(trie_lookup(root, "/Android/data/com.foo/files", &hidden, &ro, out, sizeof(out)) == true);
+
+    /* 祖先继承 redirect：子路径命中且拼接 suffix */
+    char out2[256] = {0};
+    CHECK(trie_lookup(root, "/Android/data/com.foo/files/sub/deep", NULL, NULL, out2, sizeof(out2)) == true);
+    CHECK(strcmp(out2, "/real/foo/sub/deep") == 0);
+
+    /* 中间节点自身（无规则）不算命中 */
+    CHECK(trie_lookup(root, "/Android/data/com.foo", NULL, NULL, NULL, 0) == false);
+    CHECK(trie_lookup(root, "/Android/data", NULL, NULL, NULL, 0) == false);
+
+    /* 仅 hidden 标记也算命中 */
+    trie_insert(root, "/secret", NULL, true, false);
+    hidden = false; ro = false;
+    CHECK(trie_lookup(root, "/secret/inner", &hidden, &ro, NULL, 0) == true);
+    CHECK(hidden == true);
+
+    trie_free(root);
+}
+
 /* 超长 segment 不溢出（MAX_PATH_LEN=256 限制内） */
 static void test_trie_long_segment(void) {
     TrieNode* root = trie_create_node(NULL);
@@ -130,6 +167,7 @@ int main(void) {
     test_trie_insert_lookup();
     test_trie_edge();
     test_trie_predicates();
+    test_trie_matched_semantics();
     test_trie_long_segment();
     if (g_fail) { printf("FAILED %d\n", g_fail); return 1; }
     printf("all passed\n");

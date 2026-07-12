@@ -99,10 +99,11 @@ static bool is_android_skel_dir(const char* sub_path) {
     AppConfig* cfg = vfs_get_app_cfg(ctx->uid, ctx->pid, current_pkg); \
     int path_user_id = -1; \
     char sub_path[PATH_MAX]; \
-    if (vfs_sanitize_and_check_hidden(cfg, path_val, &path_user_id, sub_path, sizeof(sub_path), current_pkg, ctx->uid) != 0) { config_unlock_read(); return err_code; } \
+    TrieMatch tm = { .valid = false }; \
+    if (vfs_sanitize_and_check_hidden(cfg, path_val, &path_user_id, sub_path, sizeof(sub_path), current_pkg, ctx->uid, &tm) != 0) { config_unlock_read(); return err_code; } \
     char p[PATH_MAX]; \
     bool is_redir = false; \
-    if (vfs_to_real_path(cfg, sub_path, p, sizeof(p), path_user_id, &is_redir, current_pkg) != 0) { config_unlock_read(); return err_code; }
+    if (vfs_to_real_path(cfg, sub_path, p, sizeof(p), path_user_id, &is_redir, current_pkg, &tm) != 0) { config_unlock_read(); return err_code; }
 
 #define VFS_SETUP_LOG(path_val, err_code, op) \
     VFS_SETUP_CORE(path_val, err_code) \
@@ -186,7 +187,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             if (is_root) snprintf(item_sub_path, 2047, "/%s", de->d_name); else snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
             if (path_contains_invalid_chars(de->d_name)) continue;
             char dummy_path[PATH_MAX];
-            if (ctx->uid != 0 && vfs_sanitize_and_check_hidden(cfg, item_sub_path, nullptr, dummy_path, sizeof(dummy_path), current_pkg, ctx->uid) != 0) continue;
+            if (ctx->uid != 0 && vfs_sanitize_and_check_hidden(cfg, item_sub_path, nullptr, dummy_path, sizeof(dummy_path), current_pkg, ctx->uid, nullptr) != 0) continue;
             if (ctx->uid != 0 && vfs_is_redirect_target(cfg, item_sub_path)) continue;
             if (is_root && strcmp(de->d_name, "Android") == 0) has_android = true;
             if (is_android_dir) {
@@ -290,7 +291,7 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
     VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(cfg, current_pkg, ctx->uid, "OPEN", sub_path, p, is_redir);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         int accmode = fi->flags & O_ACCMODE;
         if (accmode == O_WRONLY || accmode == O_RDWR || (fi->flags & O_CREAT) || (fi->flags & O_TRUNC) || (fi->flags & O_APPEND)) {
             log_fuse_err("OPEN_RO_DENIED", path, EROFS);
@@ -323,7 +324,7 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
 static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     VFS_SETUP_CORE(path, -EACCES);
     vfs_log_io(cfg, current_pkg, ctx->uid, "CREATE", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("CREATE_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -362,7 +363,7 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
 static int vfs_mkdir(const char *path, mode_t mode) {
     VFS_SETUP_CORE(path, -EACCES);
     vfs_log_io(cfg, current_pkg, ctx->uid, "MKDIR", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("MKDIR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -387,7 +388,7 @@ static int vfs_mkdir(const char *path, mode_t mode) {
 static int vfs_unlink(const char *path) {
     VFS_SETUP_CORE(path, -EACCES);
     vfs_log_io(cfg, current_pkg, ctx->uid, "UNLINK", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("UNLINK_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -403,7 +404,7 @@ static int vfs_unlink(const char *path) {
 static int vfs_rmdir(const char *path) {
     VFS_SETUP_CORE(path, -EACCES);
     vfs_log_io(cfg, current_pkg, ctx->uid, "RMDIR", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("RMDIR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -513,7 +514,7 @@ static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
 static int vfs_symlink(const char *target, const char *linkpath) {
     VFS_SETUP_CORE(linkpath, -EACCES);
     vfs_log_io(cfg, current_pkg, ctx->uid, "SYMLINK", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("SYMLINK_RO_DENIED", linkpath, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -676,18 +677,19 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
     config_lock_read();
     AppConfig* cfg_from = vfs_get_app_cfg(ctx->uid, ctx->pid, pkg_from);
     AppConfig* cfg_to = vfs_get_app_cfg(ctx->uid, ctx->pid, pkg_to);
-    char sub_from[PATH_MAX], sub_to[PATH_MAX], p_from[PATH_MAX], p_to[PATH_MAX]; 
+    char sub_from[PATH_MAX], sub_to[PATH_MAX], p_from[PATH_MAX], p_to[PATH_MAX];
     int u_from, u_to;
     bool redir_from = false, redir_to = false;
-    if (vfs_sanitize_and_check_hidden(cfg_from, from, &u_from, sub_from, sizeof(sub_from), pkg_from, ctx->uid) != 0) { config_unlock_read(); return -ENOENT; }
-    if (vfs_sanitize_and_check_hidden(cfg_to, to, &u_to, sub_to, sizeof(sub_to), pkg_to, ctx->uid) != 0) { config_unlock_read(); return -ENOENT; }
-    if (ctx->uid != 0 && (vfs_is_path_ro(cfg_from, sub_from, pkg_from) || vfs_is_path_ro(cfg_to, sub_to, pkg_to))) {
+    TrieMatch tm_from = { .valid = false }, tm_to = { .valid = false };
+    if (vfs_sanitize_and_check_hidden(cfg_from, from, &u_from, sub_from, sizeof(sub_from), pkg_from, ctx->uid, &tm_from) != 0) { config_unlock_read(); return -ENOENT; }
+    if (vfs_sanitize_and_check_hidden(cfg_to, to, &u_to, sub_to, sizeof(sub_to), pkg_to, ctx->uid, &tm_to) != 0) { config_unlock_read(); return -ENOENT; }
+    if (ctx->uid != 0 && (vfs_is_path_ro(cfg_from, sub_from, pkg_from, &tm_from) || vfs_is_path_ro(cfg_to, sub_to, pkg_to, &tm_to))) {
         log_fuse_err("RENAME_RO_DENIED", from, EROFS);
-        config_unlock_read(); 
-        return -EROFS; 
+        config_unlock_read();
+        return -EROFS;
     }
-    if (vfs_to_real_path(cfg_from, sub_from, p_from, sizeof(p_from), u_from, &redir_from, pkg_from) != 0) { config_unlock_read(); return -ENOENT; }
-    if (vfs_to_real_path(cfg_to, sub_to, p_to, sizeof(p_to), u_to, &redir_to, pkg_to) != 0) { config_unlock_read(); return -ENOENT; }
+    if (vfs_to_real_path(cfg_from, sub_from, p_from, sizeof(p_from), u_from, &redir_from, pkg_from, &tm_from) != 0) { config_unlock_read(); return -ENOENT; }
+    if (vfs_to_real_path(cfg_to, sub_to, p_to, sizeof(p_to), u_to, &redir_to, pkg_to, &tm_to) != 0) { config_unlock_read(); return -ENOENT; }
     vfs_log_io(cfg_from, pkg_from, ctx->uid, "RENAME_FROM", sub_from, p_from, redir_from);
     vfs_log_io(cfg_to, pkg_to, ctx->uid, "RENAME_TO", sub_to, p_to, redir_to);
     config_unlock_read();
@@ -738,7 +740,7 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
 
 static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("CHMOD_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -753,7 +755,7 @@ static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
 
 static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("CHOWN_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -768,7 +770,7 @@ static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_in
 
 static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("TRUNCATE_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -776,14 +778,14 @@ static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
     if (ret == -1) {
         int err = errno;
         log_fuse_err("TRUNCATE", path, err);
-        return -err;
+        VFS_RETURN(-err);
     }
-    return 0;
+    VFS_RETURN(0);
 }
 
 static int vfs_utimens(const char *path, const struct timespec ts[2], struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("UTIMENS_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -791,7 +793,7 @@ static int vfs_utimens(const char *path, const struct timespec ts[2], struct fus
     if (ret == -1) {
         int err = errno;
         log_fuse_err("UTIMENS", path, err);
-        return -err;
+        VFS_RETURN(-err);
     }
     VFS_RETURN(0);
 }
@@ -822,7 +824,7 @@ static int vfs_getxattr(const char *path, const char *name, char *value, size_t 
         log_fuse_err("GETXATTR", path, err);
         VFS_RETURN(-err);
     }
-    return (int)res;
+    VFS_RETURN((int)res);
 }
 
 static int vfs_listxattr(const char *path, char *list, size_t size) {
@@ -833,12 +835,12 @@ static int vfs_listxattr(const char *path, char *list, size_t size) {
         log_fuse_err("LISTXATTR", path, err);
         VFS_RETURN(-err);
     }
-    return (int)res;
+    VFS_RETURN((int)res);
 }
 
 static int vfs_setxattr(const char *path, const char *name, const char *value, size_t size, int flags) {
     VFS_SETUP_CORE(path, -ENOENT);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("SETXATTR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -853,7 +855,7 @@ static int vfs_setxattr(const char *path, const char *name, const char *value, s
 
 static int vfs_removexattr(const char *path, const char *name) {
     VFS_SETUP_CORE(path, -ENOENT);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg)) {
+    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
         log_fuse_err("REMOVEXATTR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
