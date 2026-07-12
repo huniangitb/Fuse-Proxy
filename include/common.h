@@ -50,7 +50,8 @@ typedef enum {
 extern LogLevel g_min_log_level;
 extern bool g_persist_all_logs;
 extern char g_real_root[PATH_MAX];
-extern bool g_strip_o_direct;  
+extern bool g_strip_o_direct;
+extern _Atomic(bool) g_log_shutdown;  
 
 void log_init(const char* process_name);
 void log_close();

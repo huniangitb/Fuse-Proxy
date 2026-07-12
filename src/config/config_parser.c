@@ -93,7 +93,6 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
     bool ro = root->is_ro;
     const char* redir_base = root->redir_target;
     const char* redir_suffix = p;
-    bool matched = (hidden || ro || redir_base);
     while (p && *p) {
         const char* next = strchr(p, '/');
         size_t seg_len = next ? (size_t)(next - p) : strlen(p);
@@ -107,7 +106,7 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
                 break;
             }
         }
-        if (!child) break; 
+        if (!child) break;
         curr = child;
         if (curr->is_hidden) hidden = true;
         if (curr->is_ro)     ro = true;
@@ -115,7 +114,6 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
             redir_base = curr->redir_target;
             redir_suffix = next ? next : "";
         }
-        matched = true;
         p = next;
         while (p && *p == '/') p++;
     }
@@ -128,7 +126,9 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
             snprintf(out_redir, max_len, "%s%s", redir_base, redir_suffix);
         }
     }
-    return matched;
+    /* matched 语义：命中至少一条真实规则（含祖先继承的 redirect），
+       而非仅"路径途经了无规则的中间节点"——后者会误判 /Android/data/<未配置包> */
+    return (hidden || ro || redir_base != NULL);
 }
 /* 核心修复：更新循环条件为 while (p && *p) */
 bool trie_is_redirect_target(const TrieNode* root, const char* path) {

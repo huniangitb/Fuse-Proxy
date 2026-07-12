@@ -75,10 +75,12 @@ static void* config_monitor_thread(void* arg) {
 
     int inotify_fd = -1;
     int wd = -1;
-    /* inotify fd 因内核内存压力可能失效，外层循环负责重建 watch */
+    /* inotify fd 因内核内存压力或原子替换（vim/sed -i）可能失效，
+       外层循环负责重建 watch；log_close() 设置 g_log_shutdown 后退出循环，释放 inotify 资源。
+       非阻塞 fd + poll 超时避免 read 永久卡死；处理 IN_IGNORED 以感知 watch 失效 */
     while (!g_log_shutdown) {
         if (inotify_fd < 0) {
-            inotify_fd = inotify_init1(IN_CLOEXEC);
+            inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
             if (inotify_fd < 0) {
                 sleep(2);
                 continue;
@@ -91,26 +93,55 @@ static void* config_monitor_thread(void* arg) {
             char *slash = strrchr(dir, '/');
             if (!slash) { close(inotify_fd); inotify_fd = -1; sleep(2); continue; }
             *slash = '\0';
-            wd = inotify_add_watch(inotify_fd, dir, IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO);
+            /* 扩展掩码：覆盖原子替换全阶段（IN_MOVED_FROM/IN_MOVED_TO/IN_CREATE/IN_DELETE/IN_DELETE_SELF） */
+            wd = inotify_add_watch(inotify_fd, dir,
+                IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO | IN_MOVED_FROM | IN_CREATE | IN_DELETE | IN_DELETE_SELF);
             if (wd < 0) { close(inotify_fd); inotify_fd = -1; sleep(2); continue; }
         }
 
-        char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-        ssize_t len = read(inotify_fd, buf, sizeof(buf));
-        if (len <= 0) {
+        /* poll 等待事件，5 秒超时让外层循环能感知 g_log_shutdown */
+        struct pollfd pfd = { .fd = inotify_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 5000);
+        if (pr < 0) {
             if (errno == EINTR) continue;
-            /* read 永久失败：重建 inotify fd 与 watch */
+            /* poll 永久失败：重建 inotify fd 与 watch */
             inotify_rm_watch(inotify_fd, wd);
             wd = -1;
             close(inotify_fd);
             inotify_fd = -1;
             continue;
         }
+        if (pr == 0) continue;  /* 超时，无事件 */
 
-        /* 合并窗口：read 可能返回多个叠加事件，sleep 后仅 reload 一次，
-           避免每个事件触发一次 reload */
+        char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+        ssize_t len = read(inotify_fd, buf, sizeof(buf));
+        if (len < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;  /* EAGAIN: 非阻塞无数据 */
+            /* 真正的永久失败：重建 */
+            inotify_rm_watch(inotify_fd, wd);
+            wd = -1;
+            close(inotify_fd);
+            inotify_fd = -1;
+            continue;
+        }
+        if (len == 0) continue;  /* EOF，不应发生但防御性处理 */
+
+        /* 遍历事件：检测 IN_IGNORED（watch 失效，需重建）；
+           合并窗口：sleep 1 秒让多个叠加事件归并，再仅 reload 一次 */
+        bool watch_invalidated = false;
+        for (char* p = buf; p < buf + len; ) {
+            struct inotify_event* ev = (struct inotify_event*)p;
+            if (ev->mask & IN_IGNORED) watch_invalidated = true;
+            p += sizeof(struct inotify_event) + ev->len;
+        }
+
         sleep(1);
         reload_config();
+
+        /* watch 被内核撤销（如原子替换），下一轮重建 */
+        if (watch_invalidated) {
+            wd = -1;
+        }
     }
 
     if (inotify_fd >= 0) {
@@ -235,7 +266,45 @@ bool vfs_is_other_app_pkg(const char* sub_path, const char* current_pkg) {
     return false;
 }
 
-static bool is_path_hidden_internal(AppConfig* cfg, const char* sub_path, const char* current_pkg) {
+void vfs_trie_resolve(AppConfig* cfg, const char* sub_path, TrieMatch* out) {
+    if (!out) return;
+    out->valid = true;
+    out->hidden = false;
+    out->ro = false;
+    out->has_redir = false;
+    out->redir[0] = '\0';
+
+    /* app trie 优先：一次遍历同时取 hidden/ro/redir */
+    if (cfg && cfg->trie_root) {
+        bool h = false, r = false;
+        char redir[PATH_MAX]; redir[0] = '\0';
+        if (trie_lookup(cfg->trie_root, sub_path, &h, &r, redir, sizeof(redir))) {
+            if (h) out->hidden = true;
+            if (r) out->ro = true;
+            if (redir[0] != '\0') {
+                out->has_redir = true;
+                strncpy(out->redir, redir, sizeof(out->redir) - 1);
+                out->redir[sizeof(out->redir) - 1] = '\0';
+            }
+        }
+    }
+    /* global trie：hidden/ro 取并集；redir 仅在 app 未命中时兜底（与原 app 优先语义一致） */
+    if (g_global_cfg.trie_root) {
+        bool h = false, r = false;
+        char redir[PATH_MAX]; redir[0] = '\0';
+        if (trie_lookup(g_global_cfg.trie_root, sub_path, &h, &r, redir, sizeof(redir))) {
+            if (h) out->hidden = true;
+            if (r) out->ro = true;
+            if (!out->has_redir && redir[0] != '\0') {
+                out->has_redir = true;
+                strncpy(out->redir, redir, sizeof(out->redir) - 1);
+                out->redir[sizeof(out->redir) - 1] = '\0';
+            }
+        }
+    }
+}
+
+static bool is_path_hidden_internal(AppConfig* cfg, const char* sub_path, const char* current_pkg, const TrieMatch* tm) {
     if (strncmp(sub_path, CONFIG_DIR, strlen(CONFIG_DIR)) == 0) return true;
     if (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0 ||
         strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
@@ -243,17 +312,22 @@ static bool is_path_hidden_internal(AppConfig* cfg, const char* sub_path, const 
         return false; 
     }
     if (vfs_is_other_app_pkg(sub_path, current_pkg)) return true;
-    bool hidden = false;
-    bool dummy_ro = false;
-    if (cfg && cfg->trie_root) {
-        if (trie_lookup(cfg->trie_root, sub_path, &hidden, &dummy_ro, NULL, 0)) {
-            if (hidden) return true;
+    /* Trie 静态规则命中：优先复用缓存，避免重复遍历 */
+    if (tm && tm->valid) {
+        if (tm->hidden) return true;
+    } else {
+        bool hidden = false;
+        bool dummy_ro = false;
+        if (cfg && cfg->trie_root) {
+            if (trie_lookup(cfg->trie_root, sub_path, &hidden, &dummy_ro, NULL, 0)) {
+                if (hidden) return true;
+            }
         }
-    }
-    if (g_global_cfg.trie_root) {
-        bool global_hidden = false;
-        if (trie_lookup(g_global_cfg.trie_root, sub_path, &global_hidden, &dummy_ro, NULL, 0)) {
-            if (global_hidden) return true;
+        if (g_global_cfg.trie_root) {
+            bool global_hidden = false;
+            if (trie_lookup(g_global_cfg.trie_root, sub_path, &global_hidden, &dummy_ro, NULL, 0)) {
+                if (global_hidden) return true;
+            }
         }
     }
     if (cfg && cfg->hide_rules) {
@@ -293,7 +367,7 @@ static bool is_path_hidden_internal(AppConfig* cfg, const char* sub_path, const 
     return false;
 }
 
-int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out, char* sub_path_out, size_t sub_path_size, const char* current_pkg, uid_t uid) {
+int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out, char* sub_path_out, size_t sub_path_size, const char* current_pkg, uid_t uid, TrieMatch* tm_out) {
     if (!path) return -ENOENT;
     const char* sub_path_orig = path;
     if (path[0] == '/' && isdigit((unsigned char)path[1])) {
@@ -308,7 +382,10 @@ int vfs_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_us
         strncpy(sub_path_out, sub_path_orig, sub_path_size - 1);
         sub_path_out[sub_path_size - 1] = '\0';
     }
-    if (uid != 0 && is_path_hidden_internal(cfg, sub_path_out, current_pkg)) return -ENOENT;
+    /* sub_path 已定型：一次性 resolve app+global 两棵 Trie，供本函数判 hidden
+       及后续 to_real_path(redir)/is_path_ro(ro) 复用，避免重复遍历 */
+    if (tm_out) vfs_trie_resolve(cfg, sub_path_out, tm_out);
+    if (uid != 0 && is_path_hidden_internal(cfg, sub_path_out, current_pkg, tm_out)) return -ENOENT;
     return 0;
 }
 
@@ -386,24 +463,33 @@ static bool check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int
     return false;
 }
 
-int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t size, int user_id, bool* is_redir_out, const char* current_pkg) {
+int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t size, int user_id, bool* is_redir_out, const char* current_pkg, const TrieMatch* tm) {
     char temp[PATH_MAX] = {0};
     bool redir = false;
-    bool dummy_hidden = false;
-    bool dummy_ro = false;
-    
-    if (cfg && cfg->trie_root) {
-        if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
-            if (temp[0] != '\0') redir = true;
+
+    /* Trie 静态 redirect 命中：优先复用缓存（含 app 优先语义），否则自查 */
+    if (tm && tm->valid) {
+        if (tm->has_redir) {
+            strncpy(temp, tm->redir, sizeof(temp) - 1);
+            temp[sizeof(temp) - 1] = '\0';
+            redir = true;
+        }
+    } else {
+        bool dummy_hidden = false;
+        bool dummy_ro = false;
+        if (cfg && cfg->trie_root) {
+            if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
+                if (temp[0] != '\0') redir = true;
+            }
+        }
+        if (!redir && g_global_cfg.trie_root) {
+            temp[0] = '\0';
+            if (trie_lookup(g_global_cfg.trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
+                if (temp[0] != '\0') redir = true;
+            }
         }
     }
-    if (!redir && g_global_cfg.trie_root) {
-        temp[0] = '\0';
-        if (trie_lookup(g_global_cfg.trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
-            if (temp[0] != '\0') redir = true;
-        }
-    }
-    
+
     /* 核心修复：还原 ALLOW 或部分 REDIRECT 被 Trie 拦截的 `?` 前缀动态解析机制 */
     if (redir && temp[0] == '?') {
         int effective_uid = user_id >= 0 ? user_id : 0;
@@ -420,10 +506,16 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
         redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp));
     }
     if (!redir && !g_disable_sandbox) {
-        redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp));
+        bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
+        if (!app_sandbox_off) {
+            redir = check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp));
+        }
     }
     if (!redir && !g_disable_sandbox) {
-        redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp));
+        bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
+        if (!app_sandbox_off) {
+            redir = check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp));
+        }
     }
     if (!redir) {
         if (user_id >= 0) snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);
@@ -436,18 +528,23 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
     return 0;
 }
 
-bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path, const char* current_pkg) {
-    bool dummy_hidden = false;
-    bool ro = false;
-    if (cfg && cfg->trie_root) {
-        if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &ro, NULL, 0)) {
-            if (ro) return true;
+bool vfs_is_path_ro(AppConfig* cfg, const char* sub_path, const char* current_pkg, const TrieMatch* tm) {
+    /* Trie 静态 RO 命中：优先复用缓存，否则自查 */
+    if (tm && tm->valid) {
+        if (tm->ro) return true;
+    } else {
+        bool dummy_hidden = false;
+        bool ro = false;
+        if (cfg && cfg->trie_root) {
+            if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &ro, NULL, 0)) {
+                if (ro) return true;
+            }
         }
-    }
-    if (g_global_cfg.trie_root) {
-        bool global_ro = false;
-        if (trie_lookup(g_global_cfg.trie_root, sub_path, &dummy_hidden, &global_ro, NULL, 0)) {
-            if (global_ro) return true;
+        if (g_global_cfg.trie_root) {
+            bool global_ro = false;
+            if (trie_lookup(g_global_cfg.trie_root, sub_path, &dummy_hidden, &global_ro, NULL, 0)) {
+                if (global_ro) return true;
+            }
         }
     }
     if (cfg && cfg->ro_rules) {
@@ -665,7 +762,7 @@ bool vfs_is_virtual_dir_empty(AppConfig* cfg, const char* sub_path, const char* 
         char item_sub_path[2048];
         if (is_root) snprintf(item_sub_path, 2047, "/%s", de->d_name);
         else snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
-        if (ctx->uid != 0 && (is_path_hidden_internal(cfg, item_sub_path, current_pkg) || vfs_is_redirect_target(cfg, item_sub_path))) continue;
+        if (ctx->uid != 0 && (is_path_hidden_internal(cfg, item_sub_path, current_pkg, nullptr) || vfs_is_redirect_target(cfg, item_sub_path))) continue;
         if (sandbox_enabled) {
             if (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
                 strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0) {

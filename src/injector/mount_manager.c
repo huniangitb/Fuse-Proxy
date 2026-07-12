@@ -189,6 +189,7 @@ static bool path_prefix_overlap(const char* a, const char* b) {
 static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path, const char* pkg) {
     bool conflicts = false;
     bool is_media = is_media_provider(pkg);
+    bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
     if (cfg) {
         for (int i = 0; i < cfg->redir_count && !conflicts; i++) {
             if (path_prefix_overlap(cfg->redir_rules[i].virtual_prefix, rel_path)) conflicts = true;
@@ -217,7 +218,7 @@ static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const cha
             if (path_prefix_overlap(g_global_cfg.ro_rules[i], rel_path)) conflicts = true;
         }
         /* com.android.providers.media.module 默认关闭沙盒，不受全局设置影响，除非显式配置开启 */
-        if (g_global_cfg.sandbox && !conflicts && !is_media) {
+        if (g_global_cfg.sandbox && !conflicts && !is_media && !app_sandbox_off) {
             const char* sb[] = {"/Android/data", "/Android/obb"};
             for (int s = 0; s < 2 && !conflicts; s++) {
                 if (path_prefix_overlap(sb[s], rel_path)) conflicts = true;
