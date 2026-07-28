@@ -494,7 +494,10 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
     if (redir && temp[0] == '?') {
         int effective_uid = user_id >= 0 ? user_id : 0;
         char real_base[1024];
-        snprintf(real_base, sizeof(real_base), STORAGE_BASE "/%d%s", effective_uid, temp + 1);
+        if (g_real_root[0])
+            snprintf(real_base, sizeof(real_base), "%s/%d%s", g_real_root, effective_uid, temp + 1);
+        else
+            snprintf(real_base, sizeof(real_base), STORAGE_BASE "/%d%s", effective_uid, temp + 1);
         strncpy(temp, real_base, sizeof(temp) - 1);
         temp[sizeof(temp) - 1] = '\0';
     }
@@ -518,8 +521,17 @@ int vfs_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t
         }
     }
     if (!redir) {
-        if (user_id >= 0) snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);
-        else snprintf(temp, sizeof(temp), STORAGE_BASE "%s", sub_path);
+        if (user_id >= 0) {
+            if (g_real_root[0])
+                snprintf(temp, sizeof(temp), "%s/%d%s", g_real_root, user_id, sub_path);
+            else
+                snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);
+        } else {
+            if (g_real_root[0])
+                snprintf(temp, sizeof(temp), "%s%s", g_real_root, sub_path);
+            else
+                snprintf(temp, sizeof(temp), STORAGE_BASE "%s", sub_path);
+        }
     }
     strncpy(out_buf, temp, size - 1);
     out_buf[size - 1] = '\0';

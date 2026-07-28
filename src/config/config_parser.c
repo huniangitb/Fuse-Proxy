@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "config_parser.h"
 #include "common.h"
 #include "path_vars.h"
@@ -111,6 +112,7 @@ static void sync_attributes(const char* source_parent, const char* target_path) 
     if (lstat(source_parent, &st) != 0) return;
     if (lchown(target_path, st.st_uid, st.st_gid) != 0) {}
     chmod(target_path, st.st_mode & 07777);
+#ifdef TARGET_ANDROID
     char context[256];
     ssize_t ctx_len = lgetxattr(source_parent, "security.selinux", context, sizeof(context));
     if (ctx_len > 0) {
@@ -119,6 +121,7 @@ static void sync_attributes(const char* source_parent, const char* target_path) 
         const char* default_ctx = "u:object_r:media_rw_data_file:s0";
         lsetxattr(target_path, "security.selinux", default_ctx, strlen(default_ctx) + 1, 0);
     }
+#endif
 }
 static void inherit_from_parent(const char* real_path) {
     char parent[PATH_MAX]; strncpy(parent, real_path, PATH_MAX - 1);

@@ -26,12 +26,17 @@
 #define APP_RULES_DIR CONFIG_DIR "/App-rules"
 #define INJECTOR_PID_PATH CONFIG_DIR "/injector.pid"
 
-// STORAGE_BASE: FUSE 内部读写直接使用 /data/media（真实物理存储）
+// STORAGE_BASE: FUSE 内部读写使用的真实物理存储根目录
+#ifdef TARGET_ANDROID
 #define STORAGE_BASE "/data/media"
-
-#define BACKUP_DIR "/data/local/tmp/nsp_backup"
-#define REAL_STORAGE_PATH STORAGE_BASE
+#define BACKUP_DIR CONFIG_DIR "/nsp_backup"
 #define MODULES_ROOT "/data/adb/modules"
+#else
+#define STORAGE_BASE "/var/fuse-proxy/storage"
+#define BACKUP_DIR "/var/fuse-proxy/backup"
+#define MODULES_ROOT "/etc/fuse-proxy/modules"
+#endif
+#define REAL_STORAGE_PATH STORAGE_BASE
 #define LOG_SOCKET_NAME "nsp_log_socket"
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 #define CONFIG_BROADCAST_SOCKET "nsp_config_broadcast"

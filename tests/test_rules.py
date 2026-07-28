@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""规则边界测试 v6 — 所有文件访问路径含 user_id (0/...)"""
+import subprocess,os,sys,time,shutil
+from pathlib import Path
+
+MNT="/tmp/fuse_rules_test/mnt"; STORAGE="/tmp/fuse_rules_test/storage"
+CONF="/tmp/Namespace-Proxy/injector.conf"
+DAEMON=os.environ.get("FUSE_DAEMON") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
+PASS=0; FAIL=0; ERRS=[]
+def log(m): print(f"  {m}")
+def ok(d): global PASS; PASS+=1; log(f"✅ {d}")
+def fail(d,dt=""): global FAIL; FAIL+=1; log(f"❌ {d}: {dt}"); ERRS.append((d,dt))
+
+def setup():
+    shutil.rmtree("/tmp/fuse_rules_test",ignore_errors=True)
+    subprocess.run(["fusermount3","-u",MNT],capture_output=True)
+    for d in ["0/Download/Pics","0/Download/Music","0/Download/Docs"]:
+        os.makedirs(f"{STORAGE}/{d}",exist_ok=True)
+    os.makedirs(MNT,exist_ok=True); os.makedirs("/tmp/Namespace-Proxy",exist_ok=True)
+    (Path(STORAGE)/"0/Download/hi.txt").write_text("hello")
+    (Path(STORAGE)/"0/Download/Pics/1.jpg").write_text("img1")
+    (Path(STORAGE)/"0/Download/Music/song.mp3").write_text("music")
+    (Path(STORAGE)/"0/Download/中文.txt").write_text("zh")
+    (Path(STORAGE)/"0/Download/a b.txt").write_text("spaces")
+    Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").parent.mkdir(parents=True,exist_ok=True)
+    Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").write_text("deep")
+    Path(f"{STORAGE}/0/Empty").mkdir(exist_ok=True)
+
+def wconf(t): open(CONF,"w").write(t.strip())
+def start():
+    p=subprocess.Popen([DAEMON,"--root="+STORAGE,"--rules="+CONF,"-f",MNT,"info"],
+                       stdout=open("/tmp/fr.log","w"),stderr=subprocess.STDOUT)
+    for _ in range(30):
+        time.sleep(0.3)
+        try:
+            if os.listdir(MNT): return p
+        except: pass
+        if p.poll() is not None: return None
+    return p
+def stop(p):
+    if p: p.terminate()
+    try: p.wait(3)
+    except: p.kill()
+    subprocess.run(["fusermount3","-u",MNT],capture_output=True)
+
+def run(conf,checks,label=""):
+    log(f"\n── {label} ──"); wconf(conf); p=start()
+    if not p: return fail("启动失败")
+    try:
+        m=Path(MNT)
+        for c in checks:
+            name=c[0]; path=c[1]; fp=m/path
+            try:
+                want=c[2] if len(c)>2 else "EXISTS"
+                if want=="EXISTS": ok(name) if fp.exists() else fail(name,"missing")
+                elif want=="NOT_EXISTS": ok(name) if not fp.exists() else fail(name,"存在")
+                elif want=="LIST":
+                    items=sorted(os.listdir(fp)); exp=c[3]
+                    # exp=="" 表示期望目录为空
+                    passed = (items == []) if exp == "" else (exp in items)
+                    ok(name) if passed else fail(name,f"entries={items}")
+                else:
+                    got=fp.read_text().strip()
+                    ok(name) if got==want else fail(name,f"got='{got}'")
+            except Exception as e: fail(name,str(e))
+    finally: stop(p)
+
+def main():
+    global PASS,FAIL
+    log("═══ 规则边界测试 v6 ═══\n")
+    setup()
+
+    # ── REDIRECT 基本 ──
+    # 配置: virtual="/云盘/" → real="/Download/"
+    # 访问: /0/云盘/hi.txt → FUSE 剥离 /0/ → sub_path="/云盘/hi.txt" → redirect → /Download/hi.txt
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /云盘/ /Download/""", [
+        ("R:目录可见","0/云盘","EXISTS"),
+        ("R:读文件","0/云盘/hi.txt","hello"),
+    ],"1.REDIRECT基本")
+
+    # ── 嵌套 REDIRECT ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /盘/ /Download/
+REDIRECT /盘/图/ /Download/Pics/""", [
+        ("嵌套:根文件","0/盘/hi.txt","hello"),
+        ("嵌套:子文件","0/盘/图/1.jpg","img1"),
+    ],"2.嵌套REDIRECT")
+
+    # ── ALLOW + REDIRECT ──
+    run("""[GLOBAL] MONITOR OFF
+ALLOW /我的应用/
+REDIRECT /我的应用/ /Download/""", [
+        ("A+R:可见","0/我的应用","EXISTS"),
+        ("A+R:文件","0/我的应用/hi.txt","hello"),
+    ],"3.ALLOW+REDIRECT")
+
+    # ── HIDE 精确路径 ──
+    # 配置: HIDE /Download/Pics/  → 隐藏路径 sub_path="/Download/Pics/..."
+    run("""[GLOBAL] MONITOR OFF
+HIDE /Download/Pics/""", [
+        ("HIDE:Pics影藏","0/Download/Pics/1.jpg","NOT_EXISTS"),
+        ("HIDE:其他可见","0/Download/hi.txt","hello"),
+    ],"4.HIDE精确")
+
+    # ── HIDE 通配符 ──
+    run("""[GLOBAL] MONITOR OFF
+HIDE /Download/*.mp3""", [
+        ("通配:mp3隐藏","0/Download/Music/song.mp3","NOT_EXISTS"),
+        ("通配:其他可见","0/Download/hi.txt","hello"),
+    ],"5.HIDE通配")
+
+    # ── RO 只读 ──
+    run("""[GLOBAL] MONITOR OFF
+RO /Download/Pics/""", [
+        ("RO:可读","0/Download/Pics/1.jpg","img1"),
+    ],"6.RO只读")
+    # RO写拒
+    try:
+        (Path(MNT)/"0/Download/Pics/n.txt").write_bytes(b"x")
+        fail("RO写拒","文件被写入")
+        (Path(MNT)/"0/Download/Pics/n.txt").unlink(missing_ok=True)
+    except: ok("6b.RO:写入被拒")
+
+    # ── RO + REDIRECT ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /相册/ /Download/Pics/
+RO /相册/""", [
+        ("RO+R:可读","0/相册/1.jpg","img1"),
+    ],"7.RO+REDIRECT")
+
+    # ── 最长前缀优先 ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /数据/ /Download/
+REDIRECT /数据/图片/ /Download/Pics/""", [
+        ("前缀:根","0/数据/hi.txt","hello"),
+        ("前缀:子","0/数据/图片/1.jpg","img1"),
+    ],"8.最长前缀")
+
+    # ── HIDE 覆盖 REDIRECT ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /秘密/ /Download/Pics/
+HIDE /秘密/""", [
+        ("HIDE>R","0/秘密/1.jpg","NOT_EXISTS"),
+    ],"9.HIDE覆盖REDIRECT")
+
+    # ── 沙盒 ON + REDIRECT ──
+    run("""[GLOBAL] MONITOR OFF
+SANDBOX ON
+REDIRECT /网盘/ /Download/""", [
+        ("沙盒+R:文件","0/网盘/hi.txt","hello"),
+    ],"10.沙盒+REDIRECT")
+
+    # ── 沙盒 ON + ALLOW + REDIRECT ──
+    run("""[GLOBAL] MONITOR OFF
+SANDBOX ON
+ALLOW /网盘/
+REDIRECT /网盘/ /Download/""", [
+        ("沙盒+A+R","0/网盘/hi.txt","hello"),
+    ],"11.沙盒+ALLOW+REDIRECT")
+
+    # ── Unicode ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /国际/ /Download/""", [
+        ("Unicode中文","0/国际/中文.txt","zh"),
+    ],"12.Unicode")
+
+    # ── 特殊字符 ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /特殊/ /Download/""", [
+        ("空格","0/特殊/a b.txt","spaces"),
+    ],"13.特殊字符")
+
+    # ── 深层路径 ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /deep/ /a/b/c/d/e/f/g/h/i/j/""", [
+        ("深层10级","0/deep/k.txt","deep"),
+    ],"14.深层路径")
+
+    # ── 空目录 ──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /空/ /Empty/""", [
+        ("空目录","0/空","EXISTS"),
+        ("空目录列表","0/空","LIST",""),
+    ],"15.空目录")
+
+    # ── 热重载 ──
+    log("\n── 16.热重载 ──")
+    wconf("[GLOBAL] MONITOR OFF\nREDIRECT /v1/ /Download/\n")
+    p=start(); m=Path(MNT)
+    if not p: fail("热重载启动")
+    else:
+        try:
+            ok("热1:v1可见") if (m/"0/v1/hi.txt").read_text().strip()=="hello" else fail("热1")
+            wconf("[GLOBAL] MONITOR OFF\nREDIRECT /v1/ /Download/\nREDIRECT /v2/ /Download/Pics/\n")
+            time.sleep(3); _=os.listdir(m)
+            ok("热2:v2新增") if (m/"0/v2/1.jpg").read_text().strip()=="img1" else fail("热2")
+            wconf("[GLOBAL] MONITOR OFF\nREDIRECT /v1/ /Download/\n")
+            time.sleep(3); _=os.listdir(m)
+            ok("热3:v2已移除") if not (m/"0/v2/1.jpg").exists() else fail("热3")
+        except Exception as e: fail("热重载",str(e))
+        finally: stop(p)
+
+    # cleanup
+    subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)
+    subprocess.run(["fusermount3","-u",MNT],capture_output=True)
+    log(f"\n❖ {PASS} 通过 | {FAIL} 失败 | 共 {PASS+FAIL}")
+    for d,dt in ERRS: log(f"  ❌ {d}: {dt}")
+    return 0 if FAIL==0 else 1
+
+if __name__=="__main__": sys.exit(main())

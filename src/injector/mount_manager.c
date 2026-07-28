@@ -12,7 +12,9 @@
 #include <unistd.h>
 #include <fnmatch.h>
 #include <stdlib.h>
+#ifdef TARGET_ANDROID
 #include <sys/system_properties.h>
+#endif
 
 static char* read_file_dynamic(const char* path, size_t* out_size) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -246,6 +248,7 @@ static bool is_exact_media_module(const char* pkg) {
 static int g_bpf_fuse_running = -1;
 
 static inline bool is_bpf_fuse_running(void) {
+#ifdef TARGET_ANDROID
     if (g_bpf_fuse_running < 0) {
         char prop[PROP_VALUE_MAX];
         g_bpf_fuse_running = (__system_property_get("ro.fuse.bpf.is_running", prop) > 0
@@ -254,6 +257,9 @@ static inline bool is_bpf_fuse_running(void) {
             LOG_DBG("(ro.fuse.bpf.is_running=true)，跳过子挂载扫描");
     }
     return g_bpf_fuse_running == 1;
+#else
+    return false;
+#endif
 }
 
 /* FUSE 挂载源可用性缓存，进程生命周期内不会变化 */

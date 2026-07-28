@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <time.h>
 #include <dirent.h>
+#include <stdint.h>
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <dlfcn.h>
