@@ -17,15 +17,7 @@ typedef struct {
     char pkg[128];
 } UidMapEntry;
 
-/* 二叉搜索树（2-树）节点定义 */
-typedef struct UidTreeNode {
-    uid_t uid;
-    char pkg[128];
-    struct UidTreeNode *left;
-    struct UidTreeNode *right;
-} UidTreeNode;
-
-/* 从 CONFIG_DIR/uid.map 文件加载 UID 映射表 */
+/* 从 CONFIG_DIR/uid.map 文件加载 UID 映射表（加载后按 uid 排序，支持二分查询） */
 int uid_map_load(UidMapEntry *entries, int max_entries);
 
 /*
@@ -34,15 +26,7 @@ int uid_map_load(UidMapEntry *entries, int max_entries);
  */
 int uid_map_upsert(uid_t uid, const char* pkg);
 
-/* 向下兼容的传统平铺查询，内部已自动升级为 O(log N) 的折半匹配 */
+/* 平铺数组查询：对已排序的 entries 做 O(log N) 折半匹配 */
 const char* uid_map_lookup(const UidMapEntry *entries, int count, uid_t uid);
-
-/* 
- * 二叉搜索树（2-树）专用操作 API 
- * 支持无序数组自动构建高度平衡的搜索树，并提供常数级的检索效率。
- */
-UidTreeNode* uid_tree_build_from_array(const UidMapEntry *entries, int count);
-const char* uid_tree_search(const UidTreeNode* root, uid_t uid);
-void uid_tree_free(UidTreeNode* root);
 
 #endif /* UID_MAP_H */

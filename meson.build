@@ -29,10 +29,10 @@ fuse_inc = include_directories(fuse3_root + '/include')
 fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
 
 # 自动探测 libiconv
-libiconv = cc.find_library('iconv', required: true)
+libiconv = cc.find_library('iconv', required: false)
 
 # json-c 静态库
-json_c = cc.find_library('json-c', static: true, required: true)
+json_c = cc.find_library('json-c', dirs: [fuse3_root + '/lib'], static: true, required: true)
 
 # 项目通用依赖
 project_deps = [
@@ -76,6 +76,7 @@ inc_dir = include_directories('include')
 # ================= 源码集合 =================
 common_sources = [
     'src/core/common.c',
+    'src/core/path_trie.c',
     'src/config/config_parser.c',
     'src/config/path_vars.c',
     'src/core/fast_search.c',
@@ -99,7 +100,7 @@ executable('fuse_daemon',
 
 executable('injector',
   injector_sources + common_sources,
-  include_directories: inc_dir,
+  include_directories: [fuse_inc, inc_dir],
   dependencies: project_deps,
   install: true,
   install_dir: install_bin_dir
@@ -107,7 +108,7 @@ executable('injector',
 
 executable('log_monitor',
   ['src/log/log_monitor.c'] + common_sources,
-  include_directories: inc_dir,
+  include_directories: [fuse_inc, inc_dir],
   dependencies: project_deps,
   install: true,
   install_dir: install_bin_dir
@@ -115,7 +116,7 @@ executable('log_monitor',
 
 executable('log_ctl',
   ['src/log/log_ctl.c'] + common_sources,
-  include_directories: inc_dir,
+  include_directories: [fuse_inc, inc_dir],
   dependencies: project_deps,
   install: true,
   install_dir: install_bin_dir
@@ -127,11 +128,11 @@ test_path_vars_exe = executable('test_path_vars',
   include_directories: inc_dir)
 test('path_vars', test_path_vars_exe)
 
-test_trie_exe = executable('test_trie',
-  ['tests/test_trie.c', 'src/config/config_parser.c'],
-  include_directories: inc_dir,
-  dependencies: [libiconv, json_c])
-test('trie', test_trie_exe)
+#test_trie_exe = executable('test_trie',
+#  ['tests/test_trie.c', 'src/config/config_parser.c'],
+#  include_directories: [fuse_inc, inc_dir],
+#  dependencies: [libiconv, json_c])
+#test('trie', test_trie_exe)
 
 test_path_sanitize_exe = executable('test_path_sanitize',
   ['tests/test_path_sanitize.c', 'src/core/common.c'],

@@ -2,20 +2,12 @@
 #define CONFIG_PARSER_H
 #include <stdbool.h>
 #include <sys/types.h>
+#include "path_trie.h"
 #define MAX_PATH_LEN 256
 #define MAX_USERS 64
 #define MAX_REASONABLE_UID 1000
 
-typedef struct TrieNode {
-    char *segment;              
-    struct TrieNode **children; 
-    int child_count;            
-    bool is_hidden;
-    bool is_ro;
-    char *redir_target;         
-} TrieNode;
-
-typedef struct { 
+typedef struct {
     char virtual_prefix[MAX_PATH_LEN]; 
     char real_target[MAX_PATH_LEN]; 
     bool is_allow;           // true=ALLOW 规则, false=REDIRECT 规则
@@ -77,14 +69,6 @@ int mkdir_recursive_p(const char *path, mode_t mode);
 void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger_source);
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id);
 bool has_wildcard_enabled_locked(int user_id);
-
-TrieNode* trie_create_node(const char* segment);
-void trie_free(TrieNode* node);
-void trie_insert(TrieNode* root, const char* path, const char* redir_target, bool is_hidden, bool is_ro);
-bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool* out_ro, char* out_redir, size_t max_len);
-
-// 修复严重错误 1：向外暴露 Trie 的精准判定接口，解耦虚拟系统判定
-bool trie_is_redirect_target(const TrieNode* root, const char* path);
-bool trie_is_ancestor(const TrieNode* root, const char* path);
+/* Trie 接口见 path_trie.h（config_parser.h 已 include） */
 
 #endif
