@@ -597,7 +597,7 @@ log_ctl reload-config api
 
 ## 12. `search-io` / `search-sys` — 查询日志
 
-查询历史日志。通过 TCP 连接日志服务（`127.0.0.1:34215`）。
+查询历史日志。通过抽象 Unix Socket(`nsp_log_socket`，AF_UNIX SOCK_STREAM)连接日志服务。
 
 ### 调用
 
@@ -815,7 +815,7 @@ log_ctl stream-all [--level level] [api]
 
 | 类型 | 说明 | 缓冲区容量 | 级别过滤 | 写入来源 |
 |------|------|-----------|---------|---------|
-| SYS | 系统日志（注入器、FUSE 等组件运行日志） | 50,000 条 | 支持 (`--level`) | 各组件通过 TCP 发送 |
+| SYS | 系统日志（注入器、FUSE 等组件运行日志） | 50,000 条 | 支持 (`--level`) | 各组件通过抽象 Unix Socket 发送 |
 | IO | I/O 操作日志（FUSE 文件操作记录） | 262,144 条 | 不支持 | FUSE 守护进程 |
 | Logcat | Android Logcat 日志 | 100,000 条 | 不支持 | 系统 logcat |
 
@@ -1225,6 +1225,6 @@ fun highlightKeyword(text: String, keyword: String): SpannableString {
 | 主配置文件 | `/data/Namespace-Proxy/injector.conf` |
 | 应用规则目录 | `/data/Namespace-Proxy/App-rules` |
 | PID 文件 | `/data/Namespace-Proxy/injector.pid` |
-| 日志端口 | 34215 (TCP, 127.0.0.1) |
+| 日志 Socket | `nsp_log_socket`（抽象 UDS，AF_UNIX SOCK_STREAM） |
 | 配置广播 Socket | `nsp_config_broadcast`（抽象 UDS） |
 | IPC Socket | `nsp_ipc_socket`（抽象 UDS） |

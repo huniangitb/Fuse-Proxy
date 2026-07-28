@@ -17,188 +17,6 @@ int g_app_cfg_capacity = 0;
 int g_active_users[MAX_USERS];
 int g_active_user_count = 0;
 static pthread_rwlock_t g_rules_lock;
-TrieNode* trie_create_node(const char* segment) {
-    TrieNode* node = calloc(1, sizeof(TrieNode));
-    if (node && segment) {
-        node->segment = strdup(segment);
-    }
-    return node;
-}
-void trie_free(TrieNode* node) {
-    if (!node) return;
-    for (int i = 0; i < node->child_count; i++) {
-        trie_free(node->children[i]);
-    }
-    free(node->children);
-    free(node->segment);
-    free(node->redir_target);
-    free(node);
-}
-/* 核心修复：更新循环条件为 while (p && *p)，彻底杜绝末尾 Null 指针解引用风险 */
-void trie_insert(TrieNode* root, const char* path, const char* redir_target, bool is_hidden, bool is_ro) {
-    if (!path || !root) return;
-    TrieNode* curr = root;
-    const char* p = path;
-    while (*p == '/') p++;
-    while (p && *p) {
-        const char* next = strchr(p, '/');
-        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
-        if (seg_len == 0) break;
-        TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
-        if (!child) {
-            child = trie_create_node(NULL);
-            if (!child) return;
-            child->segment = malloc(seg_len + 1);
-            if (!child->segment) {
-                free(child);
-                return;
-            }
-            memcpy(child->segment, p, seg_len);
-            child->segment[seg_len] = '\0';
-            TrieNode** new_children = realloc(curr->children, sizeof(TrieNode*) * (curr->child_count + 1));
-            if (!new_children) {
-                free(child->segment);
-                free(child);
-                return;
-            }
-            curr->children = new_children;
-            curr->children[curr->child_count++] = child;
-        }
-        curr = child;
-        p = next;
-        while (p && *p == '/') p++;
-    }
-    if (is_hidden) curr->is_hidden = true;
-    if (is_ro)     curr->is_ro = true;
-    if (redir_target) {
-        free(curr->redir_target);
-        curr->redir_target = strdup(redir_target);
-    }
-}
-/* 核心修复：更新循环条件为 while (p && *p) */
-bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool* out_ro, char* out_redir, size_t max_len) {
-    if (!root || !path) return false;
-    const TrieNode* curr = root;
-    const char* p = path;
-    while (*p == '/') p++;
-    bool hidden = root->is_hidden;
-    bool ro = root->is_ro;
-    const char* redir_base = root->redir_target;
-    const char* redir_suffix = p;
-    while (p && *p) {
-        const char* next = strchr(p, '/');
-        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
-        if (seg_len == 0) break;
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
-        if (!child) break;
-        curr = child;
-        if (curr->is_hidden) hidden = true;
-        if (curr->is_ro)     ro = true;
-        if (curr->redir_target) {
-            redir_base = curr->redir_target;
-            redir_suffix = next ? next : "";
-        }
-        p = next;
-        while (p && *p == '/') p++;
-    }
-    if (out_hidden) *out_hidden = hidden;
-    if (out_ro)     *out_ro = ro;
-    if (redir_base && out_redir && max_len > 0) {
-        size_t blen = strlen(redir_base);
-        size_t slen = strlen(redir_suffix);
-        if (blen + slen < max_len) {
-            snprintf(out_redir, max_len, "%s%s", redir_base, redir_suffix);
-        }
-    }
-    /* matched 语义：命中至少一条真实规则（含祖先继承的 redirect），
-       而非仅"路径途经了无规则的中间节点"——后者会误判 /Android/data/<未配置包> */
-    return (hidden || ro || redir_base != NULL);
-}
-/* 核心修复：更新循环条件为 while (p && *p) */
-bool trie_is_redirect_target(const TrieNode* root, const char* path) {
-    if (!root || !path) return false;
-    const TrieNode* curr = root;
-    const char* p = path;
-    while (*p == '/') p++;
-    while (p && *p) {
-        const char* next = strchr(p, '/');
-        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
-        if (seg_len == 0) break;
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
-        if (!child) return false;
-        curr = child;
-        p = next;
-        while (p && *p == '/') p++;
-    }
-    return (curr->redir_target != NULL);
-}
-static bool trie_node_has_rules(const TrieNode* node) {
-    if (!node) return false;
-    if (node->is_hidden || node->is_ro || node->redir_target) return true;
-    for (int i = 0; i < node->child_count; i++) {
-        if (trie_node_has_rules(node->children[i])) return true;
-    }
-    return false;
-}
-/* 核心修复：更新循环条件为 while (p && *p) */
-bool trie_is_ancestor(const TrieNode* root, const char* path) {
-    if (!root || !path) return false;
-    const TrieNode* curr = root;
-    const char* p = path;
-    while (*p == '/') p++;
-    if (*p == '\0') {
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && trie_node_has_rules(curr->children[i])) return true;
-        }
-        return false;
-    }
-    while (p && *p) {
-        const char* next = strchr(p, '/');
-        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
-        if (seg_len == 0) break;
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
-        if (!child) return false;
-        curr = child;
-        p = next;
-        while (p && *p == '/') p++;
-    }
-    for (int i = 0; i < curr->child_count; i++) {
-        if (curr->children[i] && trie_node_has_rules(curr->children[i])) return true;
-    }
-    return false;
-}
 static bool is_wildcard_string(const char *str) {
     /* `?` 作为首字符是项目自定义的"相对当前 user 存储"前缀，非 fnmatch 通配；
        仅从第二字符起检测真正的通配符 * ? [ ]，避免 ALLOW/REDIRECT 的 ? 前缀路径被误判跳过 trie */
@@ -282,7 +100,11 @@ char* clean_path_string(char* str) {
     return str;
 }
 void strip_trailing_slash(char* path) {
-    size_t len = strlen(path); if (len > 1 && path[len - 1] == '/') path[len - 1] = '\0';
+    /* 剥尾随 '/'，但保留 "?/"——'?' 后必跟 '/' 是内部前缀语义（见 docs/path-variables.md），
+       剥成裸 '?' 会使 Trie 命中根 redirect 时拼出 ?Android 而非 ?/Android，
+       导致 vfs_to_real_path 还原成 /data/media/0Android（缺分隔符） */
+    size_t len = strlen(path);
+    if (len > 1 && path[len - 1] == '/' && !(len == 2 && path[0] == '?')) path[len - 1] = '\0';
 }
 static void sync_attributes(const char* source_parent, const char* target_path) {
     struct stat st;
@@ -349,8 +171,11 @@ static char* strip_storage_prefix(char* path) {
     if (strncmp(path, "/storage/emulated/", 18) == 0) {
         char* p = path + 18;
         while (*p && isdigit((unsigned char)*p)) p++;
-        if (*p == '/') return p;
-        if (*p == '\0') return "/";
+        if (*p == '/') return p;       /* /storage/emulated/0/Download -> /Download */
+        if (*p == '\0') return "/";    /* /storage/emulated/0 -> / */
+        /* 异常形态:缺数字 user_id 或后跟非数字(如 /storage/emulated/Download)。
+           把 p 退回非数字起始位置,前面补 '/',让残留当子路径(与正常 emulated 剥离一致)。 */
+        return p - 1;
     }
     return path;
 }
@@ -499,6 +324,10 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 }
             }
             strip_trailing_slash(virtual_prefix);
+            if (is_wildcard_string(virtual_prefix)) {
+                LOG_WRN("ALLOW 不支持通配符，规则已忽略；如需放行该目录请去掉 '*' (行 %d, 文件 %s): %s", line_num, file_path, val);
+                return;
+            }
             char real_target[MAX_PATH_LEN];
             snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
             strip_trailing_slash(real_target);
