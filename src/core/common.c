@@ -4,7 +4,9 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#ifdef TARGET_ANDROID
 #include <sys/system_properties.h>
+#endif
 #include <stdatomic.h>
 #include <sys/eventfd.h>
 #include <poll.h>
@@ -46,7 +48,8 @@ void init_timezone() {
         tzset();
         return;
     }
-    char prop_buf[PROP_VALUE_MAX];
+    char prop_buf[256];
+#ifdef TARGET_ANDROID
     int len = __system_property_get("persist.sys.timezone", prop_buf);
     if (len > 0) {
         setenv("TZ", prop_buf, 1);
@@ -54,6 +57,9 @@ void init_timezone() {
         return;
     }
     FILE *fp = fopen("/data/property/persist.sys.timezone", "re");
+#else
+    FILE *fp = fopen("/etc/timezone", "re");
+#endif
     if (fp) {
         if (fgets(prop_buf, sizeof(prop_buf), fp)) {
             size_t plen = strlen(prop_buf);

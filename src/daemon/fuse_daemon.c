@@ -20,8 +20,10 @@
 #include "vfs_core.h"
 #include "crash_dump.h"
 #include <fuse3/fuse_log.h>
+#ifdef TARGET_ANDROID
 #include <fuse3/fuse_kernel.h>
 #include <sys/ioctl.h>
+#endif
 
 bool g_passthrough_enabled = false;
 bool g_preserve_perms = false;
@@ -29,7 +31,9 @@ bool g_disable_sandbox = false; /* 新增：禁用沙盒功能标志 */
 
 static int g_ready_fd = -1;
 static int g_global_root_fd = -1;
+#ifdef TARGET_ANDROID
 static int g_bpf_fd = -1;           /* BPF program fd, -1 = disabled */
+#endif
 static bool g_passthrough_disabled = false; /* --no-passthrough 显式禁用 */
 static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
 
@@ -38,6 +42,7 @@ static int g_pending_close_fds[MAX_PENDING_CLOSE];
 static int g_pending_close_count = 0;
 static pthread_mutex_t g_pending_close_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef TARGET_ANDROID
 static void vfs_defer_close(int fd) {
     if (fd < 0) return;
     pthread_mutex_lock(&g_pending_close_mutex);
@@ -48,6 +53,7 @@ static void vfs_defer_close(int fd) {
     }
     pthread_mutex_unlock(&g_pending_close_mutex);
 }
+#endif
 
 static void vfs_flush_pending_closes(void) {
     pthread_mutex_lock(&g_pending_close_mutex);
@@ -285,9 +291,11 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
             mode_t final_mode = st.st_mode & 07777;
             if (!S_ISDIR(base_mode)) { final_mode &= ~0111; final_mode &= ~06000; }
             chmod(real_path, final_mode);
+#ifdef TARGET_ANDROID
             char context[256]; ssize_t ctx_len = lgetxattr(parent, "security.selinux", context, sizeof(context));
             if (ctx_len > 0) lsetxattr(real_path, "security.selinux", context, (size_t)ctx_len, 0);
             else if (strstr(real_path, STORAGE_BASE) == real_path) lsetxattr(real_path, "security.selinux", "u:object_r:media_rw_data_file:s0", 35, 0);
+#endif
         }
     }
 }
@@ -312,6 +320,7 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
         VFS_RETURN(-err); 
     }
     fi->fh = fd;
+#ifdef TARGET_ANDROID
     if (g_passthrough_enabled) {
         fuse_req_t req = fuse_get_context()->req;
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
@@ -324,6 +333,7 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
                     sub_path, strerror(errno), errno);
         }
     }
+#endif
     VFS_RETURN(0);
 }
 
@@ -351,6 +361,7 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     }
     inherit_parent_attributes(p, S_IFREG);
     fi->fh = fd;
+#ifdef TARGET_ANDROID
     if (g_passthrough_enabled) {
         fuse_req_t req = fuse_get_context()->req;
         int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
@@ -363,6 +374,7 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
                     sub_path, strerror(errno), errno);
         }
     }
+#endif
     VFS_RETURN(0);
 }
 
@@ -605,9 +617,11 @@ static int recursive_copy_dir(const char *src, const char *dst, uid_t uid, gid_t
                             futimens(fd_dst, ts);
                             fchown(fd_dst, s_st.st_uid, s_st.st_gid);
                             fchmod(fd_dst, s_st.st_mode & 07777);
+#ifdef TARGET_ANDROID
                             char context[256];
                             ssize_t ctx_len = lgetxattr(s_path, "security.selinux", context, sizeof(context));
                             if (ctx_len > 0) lsetxattr(d_path, "security.selinux", context, (size_t)ctx_len, 0);
+#endif
                         } else {
                             r = -EIO;
                         }
@@ -663,9 +677,11 @@ static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* s
         futimens(fd_dst, ts); 
         fchown(fd_dst, st->st_uid, st->st_gid); 
         fchmod(fd_dst, st->st_mode & 07777);
+#ifdef TARGET_ANDROID
         char context[256];
         ssize_t ctx_len = lgetxattr(src, "security.selinux", context, sizeof(context));
         if (ctx_len > 0) lsetxattr(dst, "security.selinux", context, (size_t)ctx_len, 0);
+#endif
     }
     close(fd_src);
     close(fd_dst);
@@ -816,6 +832,7 @@ static int vfs_getxattr(const char *path, const char *name, char *value, size_t 
     ssize_t res = lgetxattr(p, name, value, size);
     if (res == -1) {
         if (errno == ENODATA || errno == EOPNOTSUPP) {
+#ifdef TARGET_ANDROID
             if (strcmp(name, "security.selinux") == 0) {
                 const char* default_ctx = "u:object_r:media_rw_data_file:s0";
                 size_t len = strlen(default_ctx) + 1;
@@ -824,6 +841,7 @@ static int vfs_getxattr(const char *path, const char *name, char *value, size_t 
                 strcpy(value, default_ctx);
                 VFS_RETURN((int)len);
             }
+#endif
             VFS_RETURN(-errno);
         }
         int err = errno;
@@ -877,8 +895,10 @@ static int vfs_removexattr(const char *path, const char *name) {
 static void vfs_destroy(void *private_data) {
     (void)private_data; LOG_DBG("FUSE 守护进程正在退出，清理资源...");
     log_close();
-    if (g_bpf_fd >= 0) close(g_bpf_fd);
     if (g_global_root_fd >= 0) close(g_global_root_fd);
+#ifdef TARGET_ANDROID
+    if (g_bpf_fd >= 0) close(g_bpf_fd);
+#endif
     char msg[256]; snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid()); send_ipc_message(msg);
 }
 
@@ -887,6 +907,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     signal(SIGPIPE, SIG_IGN);
     g_passthrough_enabled = false;
     
+#ifdef TARGET_ANDROID
     if (g_passthrough_disabled) {
         LOG("FUSE Passthrough: 已被 --no-passthrough 参数禁用");
         goto skip_passthrough;
@@ -969,6 +990,9 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 
 ioctl_probe_done:
 skip_passthrough:
+#else
+    LOG("主线FUSE: passthrough 不可用，走标准用户态路径");
+#endif
     if (g_passthrough_enabled) {
         LOG("FUSE Passthrough: 🟢 启用成功");
     } else {
@@ -979,6 +1003,7 @@ skip_passthrough:
     return nullptr;
 }
 
+#ifdef TARGET_ANDROID
 static bool is_fuse_bpf_supported(void) {
     FILE *fp = fopen("/sys/fs/fuse/features/fuse_bpf", "r");
     if (!fp) { LOG_DBG("FUSE BPF: 特性文件不可读"); return false; }
@@ -1023,7 +1048,9 @@ static int open_bpf_prog(void) {
     LOG_WRN("FUSE BPF: 无法获取 BPF 程序, 将以标准 FUSE 模式运行");
     return -1;
 }
+#endif
 
+#ifdef TARGET_ANDROID
 static int vfs_bpf_setup(const char *path, struct fuse_entry_param *e) {
     if (g_bpf_fd < 0) return -ENOSYS;
     if (!path || !e) return -EINVAL;
@@ -1057,6 +1084,7 @@ static int vfs_bpf_setup(const char *path, struct fuse_entry_param *e) {
     vfs_defer_close(bfd);
     return 0;
 }
+#endif
 
 static struct fuse_operations vfs_ops = {
     .init = vfs_init, .destroy = vfs_destroy, .getattr = vfs_getattr, .access = vfs_access,
@@ -1067,7 +1095,9 @@ static struct fuse_operations vfs_ops = {
     .rename = vfs_rename, .chmod = vfs_chmod, .chown = vfs_chown, .truncate = vfs_truncate,
     .utimens = vfs_utimens, .statfs = vfs_statfs, .getxattr = vfs_getxattr, .listxattr = vfs_listxattr,
     .setxattr = vfs_setxattr, .removexattr = vfs_removexattr,
+#ifdef TARGET_ANDROID
     .bpf_setup = vfs_bpf_setup,
+#endif
 };
 
 int main(int argc, char *argv[]) {
@@ -1094,8 +1124,10 @@ int main(int argc, char *argv[]) {
             g_preserve_perms = true;
         } else if (strcmp(argv[i], "--strip-o-direct") == 0) { 
             g_strip_o_direct = true;
+#ifdef TARGET_ANDROID
         } else if (strcmp(argv[i], "--no-bpf") == 0) {
             g_bpf_fd = -2; 
+#endif
         } else if (strcmp(argv[i], "--no-passthrough") == 0) {
             g_passthrough_disabled = true;
         } else if (strcmp(argv[i], "--media-fuse") == 0) {
@@ -1125,6 +1157,7 @@ int main(int argc, char *argv[]) {
         LOG("沙盒特性已强制禁用");
     }
 
+#ifdef TARGET_ANDROID
     if (g_bpf_fd != -2) {
         g_bpf_fd = -1;
         if (is_fuse_bpf_supported()) {
@@ -1138,5 +1171,6 @@ int main(int argc, char *argv[]) {
         LOG("FUSE BPF: 已被 --no-bpf 参数禁用");
         g_bpf_fd = -1;
     }
+#endif
     return fuse_main(fuse_argc, fuse_argv, &vfs_ops, nullptr);
 }
