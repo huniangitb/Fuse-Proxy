@@ -275,12 +275,18 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
     if (t[0] == '?') {
         /* 相对当前 user 存储（ALLOW/相对路径在 parse 阶段转成的 ? 前缀，等价原 vfs_core.c:271-274）。
            t+1 以 '/' 开头（? 后必跟 /），故 %s 前不再加 /，与原始 snprintf 一致。 */
-        snprintf(real_base, sz, STORAGE_BASE "/%d%s", user_id, t + 1);
+        if (g_real_root[0])
+            snprintf(real_base, sz, "%s/%d%s", g_real_root, user_id, t + 1);
+        else
+            snprintf(real_base, sz, STORAGE_BASE "/%d%s", user_id, t + 1);
     } else if (strncmp(t, "/storage/emulated/", 18) == 0) {
         const char* rest = t + 18;
         while (*rest && isdigit((unsigned char)*rest)) rest++;
         if (*rest == '/') rest++;
-        snprintf(real_base, sz, STORAGE_BASE "/%d/%s", user_id, rest);
+        if (g_real_root[0])
+            snprintf(real_base, sz, "%s/%d/%s", g_real_root, user_id, rest);
+        else
+            snprintf(real_base, sz, STORAGE_BASE "/%d/%s", user_id, rest);
     } else if (is_system_abs_path(t)) {
         strncpy(real_base, t, sz - 1);
         real_base[sz - 1] = '\0';
