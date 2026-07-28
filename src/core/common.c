@@ -399,3 +399,7 @@ void log_internal(LogLevel level, const char* format, ...) {
     uint64_t val = 1;
     if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
 }
+
+bool is_media_provider(const char* pkg) {
+    return (strstr(pkg, "com.android.providers.media") != nullptr);
+}

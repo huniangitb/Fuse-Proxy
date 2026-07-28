@@ -86,7 +86,8 @@ static void build_templates_json(json_object *root) {
     json_object_object_add(global, "apply_to_app", apply_to);
     
     json_object_object_add(global, "enable_sandbox", json_object_new_boolean(g_global_cfg.sandbox));
-    json_object_object_add(global, "global_inject", json_object_new_boolean(g_global_cfg.global_inject));
+    /* 全局注入状态强制关闭，不再跟随 g_global_cfg.global_inject 规则改变 */
+    json_object_object_add(global, "global_inject", json_object_new_boolean(false));
     json_object_object_add(global, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
     
     json_object *hide_paths = json_object_new_array();

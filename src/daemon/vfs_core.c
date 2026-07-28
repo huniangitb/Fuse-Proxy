@@ -789,7 +789,6 @@ bool vfs_fill_virtual_dirs(AppConfig* cfg, const char* sub_path, int path_user_i
                 if (strcmp(full_vpath, (c)->redir_rules[i].virtual_prefix) == 0) { \
                      char dummy[PATH_MAX]; \
                      if (!build_real_base_from_target((c)->redir_rules[i].real_target, (path_user_id >= 0 ? path_user_id : 0), dummy, sizeof dummy, (c), &g_global_cfg, current_pkg)) continue; \
-                     if (access(dummy, F_OK) != 0) continue; \
                 } \
                 if (vfs_hash_insert(ht, name)) { \
                     struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); \

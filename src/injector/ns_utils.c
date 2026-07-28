@@ -562,7 +562,7 @@ static int do_combined_mount(void* raw_args) {
     int preserve_count = args->preserve_count;
     size_t tlen = strlen(target);
     size_t blen = strlen(backup);
-    log_ns_error("[combined] Step A: read mountinfo for pkg=%s\n", pkg);
+    //log_ns_error("[combined] Step A: read mountinfo for pkg=%s\n", pkg);
     size_t nread = 0;
     char* buf = read_file_dynamic("/proc/self/mountinfo", &nread);
     if (!buf) {
@@ -614,48 +614,48 @@ static int do_combined_mount(void* raw_args) {
         line = next_line + 1;
     }
     free(buf);
-    log_ns_error("[combined] Step B: umount2 sub-backup mounts, count=%d\n", backup_count);
+    //log_ns_error("[combined] Step B: umount2 sub-backup mounts, count=%d\n", backup_count);
     for (int i = backup_count - 1; i >= 0; i--) {
         for (int t = 0; t < 8; t++) {
             if (umount2(backup_mounts[i], MNT_DETACH) == 0) break;
         }
     }
-    log_ns_error("[combined] Step C: umount2 backup=%s\n", backup);
+   // log_ns_error("[combined] Step C: umount2 backup=%s\n", backup);
     for (int t = 0; t < 8; t++) {
         if (umount2(backup, MNT_DETACH) == 0) break;
     }
-    log_ns_error("[combined] Step D: mkdir_recursive backup=%s\n", backup);
+ //   log_ns_error("[combined] Step D: mkdir_recursive backup=%s\n", backup);
     if (mkdir_recursive(backup) != 0) {
         int err = errno;
         log_ns_error("[ns_error] [%s] Combined mount mkdir_recursive backup failed: mkdir_recursive(%s) errno=%d (%s)\n", pkg, backup, err, strerror(err));
         log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount mkdir_recursive backup failed: mkdir_recursive(%s) errno=%d (%s)", pkg, backup, err, strerror(err));
         return err;
     }
-    log_ns_error("[combined] Step E: mount(target->backup) target=%s backup=%s\n", target, backup);
+   // log_ns_error("[combined] Step E: mount(target->backup) target=%s backup=%s\n", target, backup);
     if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
         log_ns_error("[ns_error] [%s] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", pkg, target, backup, err, strerror(err));
         log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)", pkg, target, backup, err, strerror(err));
         return err;
     }
-    log_ns_error("[combined] Step F: umount2 sub-target mounts, count=%d\n", target_count);
+  //  log_ns_error("[combined] Step F: umount2 sub-target mounts, count=%d\n", target_count);
     for (int i = target_count - 1; i >= 0; i--) {
         for (int t = 0; t < 8; t++) {
             if (umount2(target_mounts[i], MNT_DETACH) == 0) break;
         }
     }
-    log_ns_error("[combined] Step G: umount2 target=%s\n", target);
+ //   log_ns_error("[combined] Step G: umount2 target=%s\n", target);
     for (int t = 0; t < 8; t++) {
         if (umount2(target, MNT_DETACH) == 0) break;
     }
-    log_ns_error("[combined] Step H: mkdir_recursive target=%s\n", target);
+  //  log_ns_error("[combined] Step H: mkdir_recursive target=%s\n", target);
     if (mkdir_recursive(target) != 0) {
         int err = errno;
         log_ns_error("[ns_error] [%s] Combined mount mkdir_recursive target failed: mkdir_recursive(%s) errno=%d (%s)\n", pkg, target, err, strerror(err));
         log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount mkdir_recursive target failed: mkdir_recursive(%s) errno=%d (%s)", pkg, target, err, strerror(err));
         return err;
     }
-    log_ns_error("[combined] Step I: mount(source->target) source=%s target=%s\n", source, target);
+  //  log_ns_error("[combined] Step I: mount(source->target) source=%s target=%s\n", source, target);
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
         log_ns_error("[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)\n",
@@ -664,7 +664,7 @@ static int do_combined_mount(void* raw_args) {
                      pkg, source, target, err, strerror(err));
         return err;
     }
-    log_ns_error("[combined] Step J: preserve sub-mounts, count=%d\n", preserve_count);
+  //  log_ns_error("[combined] Step J: preserve sub-mounts, count=%d\n", preserve_count);
     for (int i = 0; i < preserve_count; i++) {
         const char* mp = preserve_paths[i];
         if (mp[0] == '\0') continue;
@@ -679,7 +679,7 @@ static int do_combined_mount(void* raw_args) {
             log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)", pkg, backup_src, mp, err, strerror(err));
         }
     }
-    log_ns_error("[combined] Step Z: done\n");
+  //  log_ns_error("[combined] Step Z: done\n");
     return 0;
 }
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,

@@ -220,11 +220,17 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         closedir(dp);
     }
     
-    if (is_root && force_android_skel && !has_android) { 
-        struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("Android"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid; 
-        if (filler(buf, "Android", &st_dir, 0, 0) != 0) {
-            vfs_hash_free(&ht);
-            VFS_RETURN(0);
+    if (is_root && force_android_skel && !has_android) {
+        /* 经 ht 去重：ALLOW /Android 会使 vfs_is_redirect_target 在物理循环里跳过真实
+           Android（:191），has_android 因此为 false；但 vfs_fill_virtual_dirs 会经 ht
+           合成虚拟 Android。此处若不经 ht 直接 filler，将与后者各填一份 → 出现两个 Android。
+           与 :246 hide_others 合成 current_pkg 的做法对齐：先 vfs_hash_insert 再 filler。 */
+        if (vfs_hash_insert(&ht, "Android")) {
+            struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir)); st_dir.st_ino = synthetic_inode("Android"); st_dir.st_mode = S_IFDIR | 0755; st_dir.st_uid = ctx->uid; st_dir.st_gid = ctx->gid;
+            if (filler(buf, "Android", &st_dir, 0, 0) != 0) {
+                vfs_hash_free(&ht);
+                VFS_RETURN(0);
+            }
         }
     }
     if (is_android_dir) {

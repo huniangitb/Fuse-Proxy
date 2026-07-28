@@ -299,9 +299,6 @@ bool is_process_safe_to_inject(const char* cmdline) {
     return true;
 }
 
-bool is_media_provider(const char* pkg) {
-    return (strstr(pkg, "com.android.providers.media") != nullptr);
-}
 
 bool is_zygote_child(pid_t pid) {
     char path[64];
