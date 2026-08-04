@@ -57,6 +57,12 @@ static void free_app_config_rules(AppConfig* cfg) {
     }
     cfg->redir_count = 0;
     cfg->redir_capacity = 0;
+    if (cfg->ftp_rules) {
+        free(cfg->ftp_rules);
+        cfg->ftp_rules = nullptr;
+    }
+    cfg->ftp_count = 0;
+    cfg->ftp_capacity = 0;
     if (cfg->var_names) {
         for (int i = 0; i < cfg->var_count; i++) free(cfg->var_names[i]);
         free(cfg->var_names);
@@ -366,9 +372,57 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             }
         }
+    } else if (strcmp(tok, "FTP") == 0) {
+        /* FTP <虚拟前缀> <段名>：虚拟前缀命中时由 FTP 后端（段名）提供。
+           规则所在段决定作用域：GLOBAL=全局，应用段=仅该应用 */
+        char* v1 = get_next_token(&p_ptr);
+        char* v2 = get_next_token(&p_ptr);
+        if (!v1 || !v2) {
+            LOG_WRN("FTP 规则缺少参数 (行 %d, 文件 %s)", line_num, file_path);
+            return;
+        }
+        char virtual_prefix[MAX_PATH_LEN];
+        if (v1[0] != '/') snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v1);
+        else { strncpy(virtual_prefix, v1, MAX_PATH_LEN - 1); virtual_prefix[MAX_PATH_LEN - 1] = '\0'; }
+        strip_trailing_slash(virtual_prefix);
+        if (virtual_prefix[0] == '\0') strcpy(virtual_prefix, "/");
+        if (cur->ftp_count >= cur->ftp_capacity) {
+            int newcap = cur->ftp_capacity == 0 ? 8 : cur->ftp_capacity * 2;
+            FtpRule* new_rules = realloc(cur->ftp_rules, newcap * sizeof(FtpRule));
+            if (!new_rules) { LOG_ERR("realloc ftp_rules 失败 (行 %d)", line_num); return; }
+            cur->ftp_rules = new_rules;
+            cur->ftp_capacity = newcap;
+        }
+        FtpRule* fr = &cur->ftp_rules[cur->ftp_count++];
+        memset(fr, 0, sizeof *fr);
+        strncpy(fr->virtual_prefix, virtual_prefix, sizeof fr->virtual_prefix - 1);
+        fr->virtual_prefix[sizeof fr->virtual_prefix - 1] = '\0';
+        strncpy(fr->backend_name, v2, sizeof fr->backend_name - 1);
+        fr->backend_name[sizeof fr->backend_name - 1] = '\0';
     } else {
         LOG_WRN("不支持的规则 \"%s\" (行 %d, 文件 %s)", tok, line_num, file_path);
     }
+}
+
+/* FTP 规则最长前缀优先匹配：sub_path 命中 FTP 规则时输出后端段名 */
+bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_out, size_t sz) {
+    if (!cfg || !sub_path || cfg->ftp_count <= 0) return false;
+    FtpRule* best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < cfg->ftp_count; i++) {
+        const char* p = cfg->ftp_rules[i].virtual_prefix;
+        size_t plen = strlen(p);
+        if (plen > best_len && strncmp(p, sub_path, plen) == 0 &&
+            (sub_path[plen] == '\0' || sub_path[plen] == '/')) {
+            best = &cfg->ftp_rules[i];
+            best_len = plen;
+        }
+    }
+    if (best && backend_out && sz) {
+        strncpy(backend_out, best->backend_name, sz - 1);
+        backend_out[sz - 1] = '\0';
+    }
+    return best != NULL;
 }
 static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     if (strcmp(pkg, "GLOBAL") == 0) return &g_global_cfg;

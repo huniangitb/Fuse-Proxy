@@ -216,6 +216,108 @@ static void prune_stale_tracked() {
     pthread_mutex_unlock(&g_tracked_mutex);
 }
 
+/* ================= 全量应用 PID 缓存 =================
+   非被动模式下每次扫描刷新：缓存所有 zygote 子进程（含已停用/未追踪
+   的应用），便于规则变化时快速定位 pid 立即挂载，无需等待应用重启
+   或下一次扫描。 */
+
+#define ALL_APPS_HASH_SIZE 2048
+typedef struct AllAppEntry {
+    int pid;
+    uid_t uid;
+    char cmdline[256];
+    struct AllAppEntry *next;
+} AllAppEntry;
+
+static AllAppEntry *g_all_apps_hash[ALL_APPS_HASH_SIZE];
+static pthread_mutex_t g_all_apps_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned int hash_app_pid(int pid) {
+    return ((unsigned int)pid * 2654435761u) % ALL_APPS_HASH_SIZE;
+}
+
+void all_apps_upsert(int pid, uid_t uid, const char* cmdline) {
+    if (pid <= 0 || !cmdline) return;
+    pthread_mutex_lock(&g_all_apps_mutex);
+    unsigned int h = hash_app_pid(pid);
+    AllAppEntry *e = g_all_apps_hash[h];
+    while (e) {
+        if (e->pid == pid) {
+            e->uid = uid;
+            strncpy(e->cmdline, cmdline, sizeof e->cmdline - 1);
+            e->cmdline[sizeof e->cmdline - 1] = '\0';
+            pthread_mutex_unlock(&g_all_apps_mutex);
+            return;
+        }
+        e = e->next;
+    }
+    e = malloc(sizeof *e);
+    if (e) {
+        e->pid = pid;
+        e->uid = uid;
+        strncpy(e->cmdline, cmdline, sizeof e->cmdline - 1);
+        e->cmdline[sizeof e->cmdline - 1] = '\0';
+        e->next = g_all_apps_hash[h];
+        g_all_apps_hash[h] = e;
+    }
+    pthread_mutex_unlock(&g_all_apps_mutex);
+}
+
+/* 按包名查找存活的运行中应用（fnmatch 匹配完整 cmdline，支持 :process 后缀）。
+   用于规则变化响应快速定位 pid。 */
+bool all_apps_find_by_cmdline(const char* pkg, int* pid_out, uid_t* uid_out) {
+    if (!pkg) return false;
+    bool found = false;
+    pthread_mutex_lock(&g_all_apps_mutex);
+    for (int i = 0; i < ALL_APPS_HASH_SIZE && !found; i++) {
+        AllAppEntry *e = g_all_apps_hash[i];
+        while (e) {
+            if (kill(e->pid, 0) == 0 && fnmatch(pkg, e->cmdline, 0) == 0) {
+                if (pid_out) *pid_out = e->pid;
+                if (uid_out) *uid_out = e->uid;
+                found = true;
+                break;
+            }
+            e = e->next;
+        }
+    }
+    pthread_mutex_unlock(&g_all_apps_mutex);
+    return found;
+}
+
+/* 移除已死进程（扫描刷新时清理，保留存活项） */
+void all_apps_prune(void) {
+    pthread_mutex_lock(&g_all_apps_mutex);
+    for (int i = 0; i < ALL_APPS_HASH_SIZE; i++) {
+        AllAppEntry **pp = &g_all_apps_hash[i];
+        while (*pp) {
+            if (kill((*pp)->pid, 0) != 0) {
+                AllAppEntry *tmp = *pp;
+                *pp = (*pp)->next;
+                free(tmp);
+            } else {
+                pp = &(*pp)->next;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_all_apps_mutex);
+}
+
+/* 释放全部节点（进程退出清理） */
+void all_apps_cleanup(void) {
+    pthread_mutex_lock(&g_all_apps_mutex);
+    for (int i = 0; i < ALL_APPS_HASH_SIZE; i++) {
+        AllAppEntry *e = g_all_apps_hash[i];
+        while (e) {
+            AllAppEntry *tmp = e;
+            e = e->next;
+            free(tmp);
+        }
+        g_all_apps_hash[i] = NULL;
+    }
+    pthread_mutex_unlock(&g_all_apps_mutex);
+}
+
 static UidMapEntry *g_uid_map = NULL;
 static int g_uid_map_count = 0;
 static int g_uid_map_cap = 0;
@@ -555,6 +657,29 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
             // 安全保留追踪节点。由于 add_tracked 的无副作用性（若 PID 重复则不改变任何链表指针），
             // 直接进行 pp 后移是 100% 内存安全的，杜绝了重置外层大循环（i = -1）产生的多余 CPU 轮转
             pp = &(*pp)->next;
+        }
+    }
+    /* 缓存补充：变更包不在追踪列表（如曾被停用的应用）时，从全量应用
+       缓存快速定位运行中的 pid 立即挂载，无需等待应用重启或下次扫描 */
+    for (int c = 0; c < count; c++) {
+        int pid = 0;
+        uid_t uid = 0;
+        if (!all_apps_find_by_cmdline(changed[c].pkg_name, &pid, &uid)) continue;
+        if (is_tracked(pid)) continue;   /* 追踪列表已处理 */
+        char cmd[256] = {0};
+        if (!proc_get_cmdline(pid, cmd, sizeof cmd)) continue;
+        int user_id = uid / 100000;
+        if (changed[c].user_id != -1 && changed[c].user_id != user_id) continue;
+        if (!is_target_app(cmd, uid, pid, false)) continue;
+        char target_path[128];
+        get_target_storage_path(uid, target_path, sizeof target_path);
+        bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 ||
+                         ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
+        if (has_fuse) continue;
+        if (mnt_src) {
+            add_tracked(pid);
+            perform_app_mount(cmd, pid, uid, mnt_src, "缓存快速响应规则变化");
+            LOG("缓存响应: %s (PID: %d) 规则启用，立即挂载", cmd, pid);
         }
     }
 }

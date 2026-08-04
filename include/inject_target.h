@@ -21,6 +21,15 @@ void get_target_storage_path(uid_t uid, char* path, size_t size);
 void add_tracked(int pid);
 bool is_tracked(int pid);
 void remove_tracked(int pid);
+/*
+ * 全量应用 PID 缓存（非被动模式每次扫描刷新，含已停用/未追踪应用）。
+ * 目的：规则变化（如某应用重新启用）时快速定位运行中的 pid 立即挂载，
+ * 无需等待应用重启或下一次扫描。
+ */
+void all_apps_upsert(int pid, uid_t uid, const char* cmdline);
+bool all_apps_find_by_cmdline(const char* pkg, int* pid_out, uid_t* uid_out);
+void all_apps_prune(void);
+void all_apps_cleanup(void);
 void audit_tracked_apps();
 void audit_and_remount_specific_apps(ChangedPkg* changed, int count);
 void force_recover_tracked_mounts();

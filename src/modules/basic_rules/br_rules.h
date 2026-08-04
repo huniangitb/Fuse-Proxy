@@ -52,6 +52,8 @@ typedef struct {
     bool is_virtual_ancestor;
     bool is_redirect_target;
     bool is_other_app_pkg;
+    bool is_ftp;              /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定） */
+    char ftp_backend[64];     /* FTP 段名（ftp.conf [段名]） */
     bool monitor_on;
 } BrResult;
 

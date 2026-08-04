@@ -98,6 +98,24 @@ void persist_log_to_disk(const char* log_type, const char* message, bool append_
     }
     pthread_mutex_unlock(&g_persist_mutex);
 }
+
+/* 监控日志落盘（无条件，不依赖 g_persist_all_logs）：MONITOR ON 时保证
+   应用操作路径始终可查（LOG_DIR/persistent_io.log），即使 log_ctl/UDS
+   链路不可用也能从日志文件查看 */
+void persist_io_log(const char* message) {
+    if (!message) return;
+    mkdir_recursive(LOG_DIR);
+    pthread_mutex_lock(&g_persist_mutex);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/persistent_io.log", LOG_DIR);
+    FILE* fp = fopen(path, "a");
+    if (fp) {
+        char time_buf[64];
+        fprintf(fp, "[%s] %s\n", get_current_time_str(time_buf, sizeof(time_buf)), message);
+        fclose(fp);
+    }
+    pthread_mutex_unlock(&g_persist_mutex);
+}
 void escape_cgroup() {
     int pid = getpid(); char pid_s[32]; snprintf(pid_s, sizeof(pid_s), "%d", pid);
     const char* targets[] = {
@@ -442,9 +460,11 @@ void log_internal(LogLevel level, const char* format, ...) {
     size_t mlen = strlen(msg_buf);
     while (mlen > 0 && (msg_buf[mlen - 1] == '\n' || msg_buf[mlen - 1] == '\r'))
         msg_buf[--mlen] = '\0';
-    if (g_persist_all_logs) {
+    if (level == LOG_IO) {
+        /* 监控日志始终落盘（MONITOR ON 时操作路径可查，见 persist_io_log） */
+        persist_io_log(msg_buf);
+    } else if (g_persist_all_logs) {
         if (level == LOG_LOGCAT) persist_log_to_disk("logcat", msg_buf, true);
-        else if (level == LOG_IO) persist_log_to_disk("io", msg_buf, true);
         else persist_log_to_disk("sys", msg_buf, true);
     }
     if (!g_log_inited) return;

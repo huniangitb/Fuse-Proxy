@@ -18,7 +18,13 @@
 #include <pthread.h>
 #include <stddef.h>
 
+/* 配置根目录：Android 用 /data/Namespace-Proxy；GNU 用 /var/fuse-proxy
+   （GNU 无 /data，日志/配置/模块默认路径须可写） */
+#ifdef TARGET_ANDROID
 #define CONFIG_DIR "/data/Namespace-Proxy"
+#else
+#define CONFIG_DIR "/var/fuse-proxy"
+#endif
 #define LOG_DIR  CONFIG_DIR "/log"
 #define ERROR_LOG_PATH LOG_DIR "/error.log"
 #define INJECTOR_CONFIG_PATH CONFIG_DIR "/injector.conf"
