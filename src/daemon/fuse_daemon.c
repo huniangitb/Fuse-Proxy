@@ -1,8 +1,11 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 /* 后端文件句柄标记：open/create 命中后端时置位（本地 fd 不置位），
-   read/write/release/fsync 据此区分本地 fd 与模块句柄 */
-#define NSP_FH_BACKEND_FLAG (1ULL << 63)
+   read/write/release/fsync 据此区分本地 fd 与模块句柄。
+   用 bit40（非 bit63）：Android tagged-pointer 检测对 fh 的 top byte
+   （bit 56-63）非零会 SIGABRT（"Pointer tag truncated"）；bit40 置位
+   不触发该检测，且远高于普通 fd 范围 */
+#define NSP_FH_BACKEND_FLAG (1ULL << 40)
 #include <fuse3/fuse.h>
 #include <fuse3/fuse_lowlevel.h>
 #include <stdio.h>
@@ -540,6 +543,7 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
 }
 
 static int vfs_open(const char *path, struct fuse_file_info *fi) {
+    FTP_DBG("vfs_open: 入口 path=%s\n", path);
     vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(current_pkg, ctx->uid, "OPEN", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
@@ -558,7 +562,14 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
         int brc = bops->backend_open(sub_path, fi->flags, &h);
         module_backend_put(bops);
         if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        /* FTP 路径：句柄为模块小整数 ID（非 fd），不设 FD 透传等本地
+           文件系统才可用的优化（passthrough 仅对下方本地 open 的 fd）；
+           设 direct_io 绕过内核 page cache——FUSE 内核在 close 后可能
+           失效 page cache，但 dentry 缓存仍命中第二次 open 导致 read
+           返回空（复用缓存的 fh 但 page cache 已空） */
         fi->fh = h | NSP_FH_BACKEND_FLAG;
+        fi->direct_io = 1;
+        FTP_DBG("vfs_open: 后端命中 sub=%s fh=%llu flags=%o direct_io=1\n", sub_path, (unsigned long long)fi->fh, fi->flags);
         VFS_RETURN(0);
     }
     int fd = open(p, fi->flags | O_CLOEXEC, is_redir ? 0666 : 0);
@@ -738,18 +749,25 @@ static int vfs_rmdir(const char *path) {
 }
 
 static int vfs_read(const char *path, char *buf, size_t size, off_t off, struct fuse_file_info *fi) {
+    FTP_DBG("vfs_read: 入口 path=%s fh=%llu off=%lld size=%zu\n", path, (unsigned long long)(fi ? fi->fh : 0), (long long)off, size);
     if ((fi->fh & NSP_FH_BACKEND_FLAG) && module_backend_active()) {
         /* 后端句柄（本地 fd 无标记）：轻量解析（仅剥离 /0/）定位后端模块 */
         int uid = -1; char sub[PATH_MAX];
         if (fw_parse_path(path, &uid, sub, sizeof sub) == 0) {
             const NspModuleOps* bops = NULL;
+            FTP_DBG("vfs_read: fh=%llu sub=%s\n", (unsigned long long)fi->fh, sub);
             if (module_backend_lookup(sub, &bops) == 0 && bops->backend_read) {
                 size_t got = 0;
                 int rc = bops->backend_read(fi->fh & ~NSP_FH_BACKEND_FLAG, buf, size, off, &got);
                 module_backend_put(bops);
+                FTP_DBG("vfs_read: 后端返回 rc=%d got=%zu\n", rc, got);
                 return rc == 0 ? (int)got : (rc < 0 ? rc : -EIO);
             }
+            FTP_DBG("vfs_read: 后端未命中 sub=%s\n", sub);
         }
+        /* 后端句柄但未命中后端（模块卸载/路径不匹配）：返回错误，不把
+           后端句柄当 fd 用（pread 后端 ID 会 EBADF 或崩溃） */
+        return -EIO;
     }
     ssize_t ret = pread(fi->fh, buf, size, off);
     if (ret == -1) {
@@ -772,6 +790,7 @@ static int vfs_write(const char *path, const char *buf, size_t size, off_t off, 
                 return rc == 0 ? (int)wrote : (rc < 0 ? rc : -EIO);
             }
         }
+        return -EIO;   /* 后端句柄未命中后端，不 pwrite */
     }
     ssize_t ret = pwrite(fi->fh, buf, size, off);
     if (ret == -1) {
@@ -783,6 +802,7 @@ static int vfs_write(const char *path, const char *buf, size_t size, off_t off, 
 }
 
 static int vfs_release(const char *path, struct fuse_file_info *fi) {
+    FTP_DBG("vfs_release: 入口 path=%s fh=%llu\n", path, (unsigned long long)(fi ? fi->fh : 0));
     if ((fi->fh & NSP_FH_BACKEND_FLAG) && module_backend_active()) {
         /* 后端句柄（本地 fd 无标记）：避免完整 resolve 在 HIDE/解析失败时提前返回而泄漏
            已打开的 fd；未命中后端则兜底 close */
@@ -795,6 +815,7 @@ static int vfs_release(const char *path, struct fuse_file_info *fi) {
                 return rc < 0 ? rc : 0;
             }
         }
+        return 0;   /* 后端句柄未命中后端：不 close（非 fd），避免崩溃 */
     }
     close(fi->fh);
     return 0;
