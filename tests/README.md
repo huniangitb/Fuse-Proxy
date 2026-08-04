@@ -25,9 +25,20 @@ python3 tests/test_functional.py
 # 规则边界测试：ALLOW/REDIRECT/HIDE/RO/通配符/优先级/沙盒/热重载
 python3 tests/test_rules.py
 
+# 模块热插拔测试：模块加载/卸载/重载/多模块并集
+python3 tests/test_modules.py
+
+# FTP 后端端到端测试：FTP 读写 + $FTP_云盘 变量 + REDIRECT（需 vsftpd 匿名服务）
+python3 tests/test_ftp.py
+
 # 指定 daemon 路径（默认使用 build_gnu/fuse_daemon）
 FUSE_DAEMON=/path/to/fuse_daemon python3 tests/test_rules.py
 ```
+
+> `test_ftp.py` 前置：本机运行 vsftpd 匿名服务（127.0.0.1:21，匿名根
+> `/home/bdy/ftp` 不可写、其下 `upload/` 777 可写区），测试自动把
+> `ftp_module.so` 预置到临时模块目录；脚本用 `FTP_MODULE_SO` /
+> `BASIC_RULES_SO` / `FUSE_DAEMON` 环境变量覆盖产物路径。
 
 ## 测试覆盖
 
@@ -48,3 +59,13 @@ FUSE_DAEMON=/path/to/fuse_daemon python3 tests/test_rules.py
 
 > 注意：配置中的 REDIRECT 虚拟前缀不含 user_id（如 `/云盘/`），
 > 测试通过 `/0/云盘/...` 访问（FUSE 自动剥离 `/0/` 后匹配）。
+
+### test_modules.py
+- 模块加载/卸载/重载（inotify 热插拔）
+- 多模块 resolve 并集（REDIRECT/SANDBOX 优先级、HIDE/RO 并集）
+- 无模块时框架直通回退
+
+### test_ftp.py
+- FTP 后端端到端：列目录/读/写/读回/mkdir/rename/unlink/rmdir
+- 变量 `$FTP_云盘` + `REDIRECT /云盘 $FTP_云盘` 生效
+- 普通路径直通不受影响

@@ -447,6 +447,39 @@ int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out) {
     return any ? NSP_DISPATCH_OK : NSP_DISPATCH_NONE;
 }
 
+int module_backend_lookup(const char* path, const NspModuleOps** ops_out) {
+    if (!path || !ops_out) return -1;
+    pthread_rwlock_rdlock(&g_module_lock);
+    for (int i = 0; i < g_module_count; i++) {
+        ModuleEntry* m = &g_modules[i];
+        if (!m->active || m->info.type != NSP_MODULE_TYPE_BACKEND) continue;
+        if (!(m->info.caps & NSP_CAP_BACKEND_IO)) continue;
+        if (!m->info.ops || !m->info.ops->backend_match) continue;
+        if (m->info.ops->backend_match(path) == 1) {
+            *ops_out = m->info.ops;
+            pthread_rwlock_unlock(&g_module_lock);
+            return 0;
+        }
+    }
+    pthread_rwlock_unlock(&g_module_lock);
+    return -1;
+}
+
+bool module_backend_active(void) {
+    bool any = false;
+    pthread_rwlock_rdlock(&g_module_lock);
+    for (int i = 0; i < g_module_count; i++) {
+        ModuleEntry* m = &g_modules[i];
+        if (m->active && m->info.type == NSP_MODULE_TYPE_BACKEND &&
+            (m->info.caps & NSP_CAP_BACKEND_IO)) {
+            any = true;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&g_module_lock);
+    return any;
+}
+
 int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max) {
     if (!q || !out || max <= 0) return 0;

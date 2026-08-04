@@ -172,6 +172,38 @@ shared_library('basic_rules',
   install_dir: install_bin_dir + '/modules/basic_rules'
 )
 
+# ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库）。
+# 由 fuse_daemon 启动后热加载（与 basic_rules 同构）：解析 ftp.conf 并把
+# FTP 服务器挂载为本地 FUSE 文件系统，经 get_vars 注册 FTP_<段名> 变量。
+ftp_module_sources = [
+    'src/modules/ftp/ftp_module.c',
+    'src/modules/ftp/ftp_conf.c',
+    'src/modules/ftp/ftp_client.c',
+    'src/modules/ftp/ftp_fuse.c',
+    'src/core/common.c',
+]
+
+# ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库，无 FUSE 实现）。
+# 只提供 FTP 操作方法（backend_*），由 fuse_daemon 框架在路径命中时调用；
+# 不依赖 libfuse（Android 静态库带 GNU 符号版本无法链接共享库，且框架已
+# 实现 FUSE，模块无需重复）。fuse 无关头文件仅 libc。
+ftp_module_sources = [
+    'src/modules/ftp/ftp_module.c',
+    'src/modules/ftp/ftp_conf.c',
+    'src/modules/ftp/ftp_client.c',
+    'src/modules/ftp/ftp_backend.c',
+    'src/core/common.c',
+]
+
+shared_library('ftp_module',
+  ftp_module_sources,
+  include_directories: all_inc_dirs,
+  dependencies: [dependency('threads')],
+  name_prefix: '',  # 生成 ftp_module.so（加载器按 <模块名>.so 扫描，与目录名一致）
+  install: true,
+  install_dir: install_bin_dir + '/modules/ftp_module'
+)
+
 # ================= 测试 =================
 # 测试流程由 Python 脚本完成（tests/ 目录），详见 tests/README.md
 message('========================================')
