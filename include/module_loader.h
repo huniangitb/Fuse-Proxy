@@ -1,0 +1,54 @@
+#ifndef MODULE_LOADER_H
+#define MODULE_LOADER_H
+/*
+ * module_loader.h — 框架侧（fuse_daemon）热插拔模块加载器接口
+ *
+ * 职责：
+ *   - 扫描 MODULES_DIR/<模块名>/<模块名>.so，dlopen 加载并校验 ABI
+ *   - 维护注册表（能力位 → 模块链），供分派器按能力调用
+ *   - inotify 监听模块目录实现热插拔（放入=加载，删除=卸载，覆盖=重载）
+ *   - 提供规则决策 / readdir 补充的聚合分派入口（无模块时快速路径）
+ */
+#include <stdbool.h>
+#include <stdint.h>
+#include "nsp_module.h"
+
+#define MAX_MODULES 16
+
+/* 分派返回值 */
+#define NSP_DISPATCH_NONE 0   /* 无规则模块注册 / 无命中 → 框架回退默认路径 */
+#define NSP_DISPATCH_OK   1   /* 已填充决策结果 */
+
+/* 初始化：mkdir 模块目录 + 全量扫描 + 启动热插拔监控线程。
+   rules_path 为框架规则配置路径（--rules=），modules_dir 为模块目录
+   （NULL 用默认 MODULES_DIR，可经 --modules-dir 覆盖），flags 为启动标志
+   （NSP_FLAG_*），均经 NspFrameworkApi 提供给模块。 */
+int module_system_init(const char* rules_path, const char* modules_dir, uint32_t flags);
+/* 卸载全部模块并停止监控 */
+void module_system_shutdown(void);
+
+/* 规则决策分派：遍历注册了规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）的模块，
+   聚合填充 out。返回 NSP_DISPATCH_OK / NSP_DISPATCH_NONE。 */
+int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out);
+
+/* 轻量路径探测分派：readdir 逐条目过滤用（只判 hidden/redirect_target 等，
+   无模块时返回 NSP_DISPATCH_NONE）。 */
+int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out);
+
+/* readdir 虚拟目录补充：遍历声明 READDIR_EXTRA 的模块合并条目，返回总条目数 */
+int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
+                            const char* pkg, bool is_root, NspDirEntry* out, int max);
+
+/* 配置热重载通知：遍历声明 reload 的模块（框架配置变更时调用） */
+void module_notify_reload(void);
+
+/* uid → 包名解析（框架日志用）：遍历声明 get_pkg 的模块，第一个成功返回 0 */
+int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
+
+/* 已加载模块快照（供 IPC LIST_MODULES）：填充 names，返回数量 */
+int module_snapshot(char names[][64], int max);
+
+/* 是否有任何活跃模块 */
+bool module_any_loaded(void);
+
+#endif /* MODULE_LOADER_H */

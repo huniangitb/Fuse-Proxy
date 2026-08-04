@@ -17,8 +17,41 @@
 #include <time.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <dirent.h>
 #include "config_parser.h"
 #include "ns_utils.h"
+
+/* LIST_MODULES 应答：扫描模块目录，列出含 <name>.so 的模块（与 fuse_daemon 加载约定一致） */
+static void handle_list_modules(int client_fd) {
+    char reply[4096];
+    int offset = 0;
+    DIR* d = opendir(MODULES_DIR);
+    if (d) {
+        struct dirent* de;
+        while ((de = readdir(d)) && offset < (int)sizeof(reply) - 64) {
+            if (de->d_name[0] == '.') continue;
+            char so[PATH_MAX];
+            snprintf(so, sizeof so, "%s/%s/%s.so", MODULES_DIR, de->d_name, de->d_name);
+            if (access(so, F_OK) == 0) {
+                /* 先算整行长度，放得下才追加，防止 offset 越过缓冲区
+                   （snprintf 返回应写长度，255 字符模块名单行最长 263 字节） */
+                int n = snprintf(nullptr, 0, "MODULE|%s\n", de->d_name);
+                if (n <= 0 || n >= (int)sizeof(reply) - offset) break;
+                int w = snprintf(reply + offset, (size_t)((int)sizeof(reply) - offset), "MODULE|%s\n", de->d_name);
+                if (w > 0) offset += w;
+            }
+        }
+        closedir(d);
+    }
+    if (offset < (int)sizeof(reply) - 4) {
+        int n = snprintf(reply + offset, sizeof(reply) - (size_t)offset, "END\n");
+        if (n > 0) offset += n;
+    } else {
+        offset = (int)sizeof(reply) - 1;   /* 钳制，杜绝 size 回绕越界写 */
+        reply[offset] = '\0';
+    }
+    send(client_fd, reply, offset, MSG_NOSIGNAL);
+}
 
 /* IPC 线程挂载参数 */
 typedef struct {
@@ -230,6 +263,19 @@ void handle_ipc_client_readable(int client_fd) {
     }
     if (strncmp(buf, "LIST_INJECTED", 13) == 0) {
         handle_list_injected(client_fd);
+        close(client_fd);
+        return;
+    }
+    if (strncmp(buf, "LIST_MODULES", 12) == 0) {
+        handle_list_modules(client_fd);
+        close(client_fd);
+        return;
+    }
+    if (strncmp(buf, "MODULE_CHANGED", 14) == 0) {
+        /* fuse_daemon 热插拔模块变更通知：置标志，主循环全量重挂 */
+        extern volatile sig_atomic_t g_module_changed;
+        g_module_changed = 1;
+        send(client_fd, "OK", 2, MSG_NOSIGNAL);
         close(client_fd);
         return;
     }

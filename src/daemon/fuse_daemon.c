@@ -16,9 +16,10 @@
 #include <pthread.h>
 #include <libgen.h>
 #include <sys/syscall.h>
+#include <ctype.h>
 #include "common.h"
-#include "vfs_core.h"
 #include "crash_dump.h"
+#include "module_loader.h"
 #include <fuse3/fuse_log.h>
 #ifdef TARGET_ANDROID
 #include <fuse3/fuse_kernel.h>
@@ -36,6 +37,7 @@ static int g_bpf_fd = -1;           /* BPF program fd, -1 = disabled */
 #endif
 static bool g_passthrough_disabled = false; /* --no-passthrough 显式禁用 */
 static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
+static char g_modules_dir_arg[PATH_MAX] = {0}; /* --modules-dir: 热插拔模块目录覆盖 */
 
 #define MAX_PENDING_CLOSE 64
 static int g_pending_close_fds[MAX_PENDING_CLOSE];
@@ -79,15 +81,97 @@ static void log_fuse_err(const char* op, const char* path, int err_code) {
         char current_pkg[128] = "unknown";
         struct fuse_context* ctx = fuse_get_context();
         if (ctx) {
-            config_lock_read();
-            vfs_get_app_cfg(ctx->uid, ctx->pid, current_pkg);
-            config_unlock_read();
+            module_dispatch_get_pkg(ctx->uid, ctx->pid, current_pkg, sizeof(current_pkg));
         }
         fprintf(stderr, "[FUSE_ERR] 应用: %s (PID: %d, UID: %d) | 操作: %s | 路径: %s | 错误码: %d (%s)\n",
                 current_pkg, ctx ? ctx->pid : 0, ctx ? ctx->uid : 0, op, path ? path : "nullptr", err, strerror(err));
         fflush(stderr);
         LOG_ERR("[FUSE_ERR] %s %s: %s", op, path ? path : "nullptr", strerror(err));
     }
+}
+
+/* 框架最小路径解析（无规则模块时的直通回退）：剥离 /0/ user_id 前缀 + 非法字符清理 */
+static int fw_parse_path(const char* path, int* user_id_out, char* sub_path_out, size_t sz) {
+    if (!path) return -ENOENT;
+    const char* sub = path;
+    if (path[0] == '/' && isdigit((unsigned char)path[1])) {
+        if (user_id_out) *user_id_out = atoi(path + 1);
+        const char* slash = strchr(path + 1, '/');
+        sub = slash ? slash : "/";
+    }
+    if (path_contains_invalid_chars(sub)) {
+        path_sanitize(sub_path_out, sz, sub);
+        if (sub_path_out[0] == '\0') return -ENOENT;
+    } else {
+        strncpy(sub_path_out, sub, sz - 1);
+        sub_path_out[sz - 1] = '\0';
+    }
+    return 0;
+}
+
+/* 框架默认存储路径（无规则模块 / 模块未命中时的直通回退） */
+static void fw_default_real_path(int user_id, const char* sub_path, char* out, size_t sz) {
+    if (user_id >= 0) {
+        if (g_real_root[0])
+            snprintf(out, sz, "%s/%d%s", g_real_root, user_id, sub_path);
+        else
+            snprintf(out, sz, STORAGE_BASE "/%d%s", user_id, sub_path);
+    } else {
+        if (g_real_root[0])
+            snprintf(out, sz, "%s%s", g_real_root, sub_path);
+        else
+            snprintf(out, sz, STORAGE_BASE "%s", sub_path);
+    }
+}
+
+/* 虚拟目录判空（原 vfs_is_virtual_dir_empty 的分派器版）：
+   - 虚拟祖先 → 视为非空（拒绝删除）
+   - 否则扫描真实目录，跳过规则隐藏/重定向子项（与 readdir 过滤一致） */
+static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path, const char* current_pkg,
+                                 int path_user_id, uid_t uid) {
+    if (uid != 0) {
+        struct fuse_context* c = fuse_get_context();
+        NspQueryCtx q0 = { .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = sub_path };
+        NspProbeResult r0; memset(&r0, 0, sizeof r0);
+        if (module_dispatch_probe(&q0, &r0) == NSP_DISPATCH_OK && r0.valid && r0.is_virtual_ancestor)
+            return false;
+    }
+    struct stat st;
+    if (lstat(real_path, &st) == -1) return true;
+    DIR* dp = opendir(real_path);
+    if (!dp) return false;
+    bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
+    bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
+                        strcmp(current_pkg, "unknown") != 0);
+    bool is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
+    struct dirent* de;
+    bool empty = true;
+    while ((de = readdir(dp)) != nullptr) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (path_contains_invalid_chars(de->d_name)) continue;
+        char item_sub_path[2048];
+        if (is_root) snprintf(item_sub_path, 2047, "/%s", de->d_name);
+        else snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
+        if (uid != 0) {
+            /* 轻量探测；user_id 目录条目豁免 redirect_target（与 readdir 一致） */
+            bool uid_dir = (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1]) &&
+                            (item_sub_path[2] == '\0' || item_sub_path[2] == '/'));
+            struct fuse_context* c = fuse_get_context();
+            NspQueryCtx iq = { .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_sub_path };
+            NspProbeResult ir; memset(&ir, 0, sizeof ir);
+            if (module_dispatch_probe(&iq, &ir) == NSP_DISPATCH_OK && ir.valid) {
+                if (ir.hidden || (!uid_dir && ir.is_redirect_target)) continue;
+            }
+        }
+        if (hide_others && (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
+                            strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)) {
+            if (strcmp(de->d_name, current_pkg) != 0) continue;
+        }
+        empty = false;
+        break;
+    }
+    closedir(dp);
+    return empty;
 }
 
 static bool is_android_skel_dir(const char* sub_path) {
@@ -97,25 +181,113 @@ static bool is_android_skel_dir(const char* sub_path) {
     return false;
 }
 
+/* 分派器模式：FUSE 回调入口统一经 module_dispatch_resolve 决策。
+   - 有规则模块命中：用模块返回的 sub_path/real_path/ro/虚拟目录等
+   - 无模块/未命中：框架直通回退（fw_parse_path + fw_default_real_path）
+   - hidden 命中 → 返回 err_code；rr 各标志在回调体中以 rr.xxx 直接使用 */
 #define VFS_SETUP_CORE(path_val, err_code) \
-    char current_pkg[128] = "unknown"; \
     struct fuse_context* ctx = fuse_get_context(); \
     if (!ctx) return err_code; \
-    config_lock_read(); \
-    AppConfig* cfg = vfs_get_app_cfg(ctx->uid, ctx->pid, current_pkg); \
+    NspQueryCtx nsp_q = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val }; \
+    NspResolveResult rr; memset(&rr, 0, sizeof rr); \
+    bool nsp_ok = (module_dispatch_resolve(&nsp_q, &rr) == NSP_DISPATCH_OK && rr.valid); \
+    char current_pkg[128] = "unknown"; \
     int path_user_id = -1; \
-    char sub_path[PATH_MAX]; \
-    TrieMatch tm = { .valid = false }; \
-    if (vfs_sanitize_and_check_hidden(cfg, path_val, &path_user_id, sub_path, sizeof(sub_path), current_pkg, ctx->uid, &tm) != 0) { config_unlock_read(); return err_code; } \
-    char p[PATH_MAX]; \
+    char sub_path[PATH_MAX]; sub_path[0] = '\0'; \
+    char p[PATH_MAX]; p[0] = '\0'; \
     bool is_redir = false; \
-    if (vfs_to_real_path(cfg, sub_path, p, sizeof(p), path_user_id, &is_redir, current_pkg, &tm) != 0) { config_unlock_read(); return err_code; }
+    if (nsp_ok) { \
+        if (rr.hidden) return err_code; \
+        strncpy(current_pkg, rr.pkg[0] ? rr.pkg : "unknown", 127); current_pkg[127] = '\0'; \
+        path_user_id = rr.user_id; \
+        strncpy(sub_path, rr.sub_path, sizeof sub_path - 1); sub_path[sizeof sub_path - 1] = '\0'; \
+        strncpy(p, rr.real_path, sizeof p - 1); p[sizeof p - 1] = '\0'; \
+        is_redir = rr.is_redir; \
+    } else { \
+        if (fw_parse_path(path_val, &path_user_id, sub_path, sizeof sub_path) != 0) return err_code; \
+        fw_default_real_path(path_user_id, sub_path, p, sizeof p); \
+    } \
+    (void)is_redir; /* 部分回调不使用 is_redir，抑制未使用警告 */
 
 #define VFS_SETUP_LOG(path_val, err_code, op) \
     VFS_SETUP_CORE(path_val, err_code) \
-    vfs_log_io(cfg, current_pkg, ctx->uid, op, sub_path, p, is_redir);
+    vfs_log_io(current_pkg, ctx->uid, op, sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
 
-#define VFS_RETURN(val) do { config_unlock_read(); return val; } while(0)
+#define VFS_RETURN(val) do { return val; } while(0)
+
+/* 框架版 I/O 日志：monitor 状态由模块 resolve 结果提供（无模块时关闭） */
+static void vfs_log_io(const char* pkg, uid_t uid, const char* op, const char* sub_path,
+                       const char* real_path, bool is_redir, bool monitor_on) {
+    if (monitor_on) {
+        if (is_redir) {
+            log_internal(LOG_IO, "[%s(%u)] [%s] %s -> %s", pkg, uid, op, sub_path, real_path);
+        } else {
+            log_internal(LOG_IO, "[%s(%u)] [%s] %s", pkg, uid, op, sub_path);
+        }
+    }
+    if (is_redir && g_min_log_level == LOG_DEBUG) {
+        log_internal(LOG_DEBUG, "[MAP] %s: '%s' -> '%s'", op, sub_path, real_path);
+    }
+}
+
+static void vfs_log_io_err(const char* pkg, const char* op, const char* sub_path, const char* fmt, ...) {
+    char msg[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+    log_internal(LOG_IO, "[%s] [ERR] %s %s %s", pkg, op, sub_path, msg);
+}
+
+/* readdir 去重哈希（原 vfs_core 提供，框架保留） */
+#define HASH_BUCKETS 1024
+typedef struct HashNode { char* name; struct HashNode* next; } HashNode;
+typedef struct { HashNode* buckets[HASH_BUCKETS]; } DirHashTable;
+
+static void vfs_hash_init(DirHashTable* ht) { memset(ht->buckets, 0, sizeof(ht->buckets)); }
+
+static unsigned long hash_djb2(const char *str) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *str++)) hash = ((hash << 5) + hash) + c;
+    return hash;
+}
+
+static bool vfs_hash_insert(DirHashTable* ht, const char* name) {
+    unsigned long h = hash_djb2(name) % HASH_BUCKETS;
+    HashNode* node = ht->buckets[h];
+    while (node) { if (strcmp(node->name, name) == 0) return false; node = node->next; }
+    HashNode* new_node = malloc(sizeof(HashNode));
+    if (new_node) {
+        new_node->name = strdup(name);
+        if (!new_node->name) { free(new_node); return false; }
+        new_node->next = ht->buckets[h];
+        ht->buckets[h] = new_node;
+        return true;
+    }
+    return false;
+}
+
+static void vfs_hash_free(DirHashTable* ht) {
+    for (int i = 0; i < HASH_BUCKETS; i++) {
+        HashNode* node = ht->buckets[i];
+        while (node) {
+            HashNode* temp = node;
+            node = node->next;
+            free(temp->name);
+            free(temp);
+        }
+    }
+}
+
+/* 为合成目录 stat 生成非零 inode（原 vfs_core.h static inline） */
+static inline ino_t synthetic_inode(const char *path) {
+    if (!path) return 1;
+    unsigned long h = 5381;
+    int c;
+    while ((c = (unsigned char)*path++)) h = ((h << 5) + h) + c;
+    return (ino_t)(h | 1);
+}
 
 static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info *fi) {
     vfs_flush_pending_closes();
@@ -123,7 +295,7 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
     if (st == nullptr) VFS_RETURN(-EINVAL);
     if (lstat(p, st) == -1) {
         int err = errno;
-        if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path))) {
+        if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
             memset(st, 0, sizeof(struct stat)); st->st_ino = synthetic_inode(sub_path); st->st_mode = S_IFDIR | 0755; st->st_nlink = 2; st->st_uid = ctx->uid; st->st_gid = ctx->gid;
             VFS_RETURN(0);
         }
@@ -153,7 +325,7 @@ static int vfs_access(const char *path, int mask) {
     VFS_SETUP_CORE(path, -ENOENT);
     if (access(p, mask) == -1) {
         int err = errno; 
-        if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path))) {
+        if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
             VFS_RETURN(0);
         }
         log_fuse_err("ACCESS", path, err);
@@ -166,7 +338,7 @@ static int vfs_access(const char *path, int mask) {
 static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags flags) {
     vfs_flush_pending_closes();
     (void)offset; (void)flags; (void)fi; VFS_SETUP_CORE(path, -ENOENT);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "READDIR", sub_path, p, is_redir);
+    vfs_log_io(current_pkg, ctx->uid, "READDIR", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
     
     /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑 */
@@ -183,7 +355,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     
     if (!dp) {
         int err = errno;
-        if (!is_android_skel_dir(sub_path) && !(err == ENOENT && (vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path)))) {
+        if (!is_android_skel_dir(sub_path) && !(err == ENOENT && (rr.is_virtual_ancestor || rr.is_redirect_target))) {
             log_fuse_err("READDIR", path, err);
         }
     } else {
@@ -192,9 +364,20 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
             if (is_root) snprintf(item_sub_path, 2047, "/%s", de->d_name); else snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
             if (path_contains_invalid_chars(de->d_name)) continue;
-            char dummy_path[PATH_MAX];
-            if (ctx->uid != 0 && vfs_sanitize_and_check_hidden(cfg, item_sub_path, nullptr, dummy_path, sizeof(dummy_path), current_pkg, ctx->uid, nullptr) != 0) continue;
-            if (ctx->uid != 0 && vfs_is_redirect_target(cfg, item_sub_path)) continue;
+            /* 子项轻量探测（probe）：只判 hidden/redirect_target，不构建真实路径、
+               不触发 sandbox 目录创建（无模块时直通不过滤）。
+               user_id 目录条目（/0、/1...）旧语义用原始串判 redirect_target 恒 false
+               （Trie 无数字前缀规则）；剥离 /0/ 后会误判为根目录 sandbox 重定向目标，
+               故豁免其 redirect_target 检查（仅 hidden 生效） */
+            if (ctx->uid != 0) {
+                bool uid_dir = (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1]) &&
+                                (item_sub_path[2] == '\0' || item_sub_path[2] == '/'));
+                NspQueryCtx iq = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = item_sub_path };
+                NspProbeResult ir; memset(&ir, 0, sizeof ir);
+                if (module_dispatch_probe(&iq, &ir) == NSP_DISPATCH_OK && ir.valid) {
+                    if (ir.hidden || (!uid_dir && ir.is_redirect_target)) continue;
+                }
+            }
             if (is_root && strcmp(de->d_name, "Android") == 0) has_android = true;
             if (is_android_dir) {
                 if (strcmp(de->d_name, "data") == 0) has_data = true;
@@ -264,9 +447,25 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             }
         }
     }
-    if (!vfs_fill_virtual_dirs(cfg, sub_path, path_user_id, buf, filler, ctx->uid, ctx->gid, &ht, is_root, current_pkg)) {
-        vfs_hash_free(&ht);
-        VFS_RETURN(0);
+    /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler */
+    {
+        NspDirEntry virt[MAX_MODULES * 8];
+        NspQueryCtx vq = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = sub_path };
+        int vn = module_dispatch_readdir(&vq, sub_path, path_user_id, current_pkg, is_root, virt, MAX_MODULES * 8);
+        for (int vi = 0; vi < vn; vi++) {
+            if (virt[vi].name[0] == '\0') continue;
+            if (vfs_hash_insert(&ht, virt[vi].name)) {
+                struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir));
+                st_dir.st_ino = synthetic_inode(virt[vi].name);
+                st_dir.st_mode = S_IFDIR | 0755;
+                st_dir.st_uid = ctx->uid;
+                st_dir.st_gid = ctx->gid;
+                if (filler(buf, virt[vi].name, &st_dir, 0, 0) != 0) {
+                    vfs_hash_free(&ht);
+                    VFS_RETURN(0);
+                }
+            }
+        }
     }
     if (filler(buf, ".", nullptr, 0, 0) != 0) {
         vfs_hash_free(&ht);
@@ -303,9 +502,9 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
 static int vfs_open(const char *path, struct fuse_file_info *fi) {
     vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, -ENOENT);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "OPEN", sub_path, p, is_redir);
+    vfs_log_io(current_pkg, ctx->uid, "OPEN", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         int accmode = fi->flags & O_ACCMODE;
         if (accmode == O_WRONLY || accmode == O_RDWR || (fi->flags & O_CREAT) || (fi->flags & O_TRUNC) || (fi->flags & O_APPEND)) {
             log_fuse_err("OPEN_RO_DENIED", path, EROFS);
@@ -339,8 +538,8 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
 
 static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     VFS_SETUP_CORE(path, -EACCES);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "CREATE", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    vfs_log_io(current_pkg, ctx->uid, "CREATE", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("CREATE_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -380,8 +579,8 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
 
 static int vfs_mkdir(const char *path, mode_t mode) {
     VFS_SETUP_CORE(path, -EACCES);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "MKDIR", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    vfs_log_io(current_pkg, ctx->uid, "MKDIR", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("MKDIR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -405,8 +604,8 @@ static int vfs_mkdir(const char *path, mode_t mode) {
 
 static int vfs_unlink(const char *path) {
     VFS_SETUP_CORE(path, -EACCES);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "UNLINK", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    vfs_log_io(current_pkg, ctx->uid, "UNLINK", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("UNLINK_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -421,13 +620,13 @@ static int vfs_unlink(const char *path) {
 
 static int vfs_rmdir(const char *path) {
     VFS_SETUP_CORE(path, -EACCES);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "RMDIR", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    vfs_log_io(current_pkg, ctx->uid, "RMDIR", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("RMDIR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
-    if (vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path)) {
-        if (!vfs_is_virtual_dir_empty(cfg, sub_path, p, current_pkg)) {
+    if (rr.is_virtual_ancestor || rr.is_redirect_target) {
+        if (!fw_virtual_dir_empty(sub_path, p, current_pkg, path_user_id, ctx->uid)) {
             log_fuse_err("RMDIR_NOT_EMPTY", path, ENOTEMPTY);
             VFS_RETURN(-ENOTEMPTY);
         }
@@ -502,7 +701,7 @@ static int vfs_flush(const char *path, struct fuse_file_info *fi) {
 
 static int vfs_readlink(const char *path, char *buf, size_t size) {
     VFS_SETUP_CORE(path, -ENOENT);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "READLINK", sub_path, p, is_redir);
+    vfs_log_io(current_pkg, ctx->uid, "READLINK", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
     ssize_t res = readlink(p, buf, size - 1);
     if (res == -1) {
         log_fuse_err("READLINK", path, errno);
@@ -514,7 +713,7 @@ static int vfs_readlink(const char *path, char *buf, size_t size) {
 
 static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
     VFS_SETUP_CORE(path, -ENOENT);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "OPENDIR", sub_path, p, is_redir);
+    vfs_log_io(current_pkg, ctx->uid, "OPENDIR", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
     DIR* dp = opendir(p);
     if (dp) {
         closedir(dp);
@@ -522,7 +721,7 @@ static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
         VFS_RETURN(0);
     }
     int err = errno;
-    if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || vfs_is_virtual_ancestor(cfg, sub_path) || vfs_is_redirect_target(cfg, sub_path))) {
+    if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
         VFS_RETURN(0);
     }
     log_fuse_err("OPENDIR", path, err);
@@ -531,8 +730,8 @@ static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
 
 static int vfs_symlink(const char *target, const char *linkpath) {
     VFS_SETUP_CORE(linkpath, -EACCES);
-    vfs_log_io(cfg, current_pkg, ctx->uid, "SYMLINK", sub_path, p, is_redir);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    vfs_log_io(current_pkg, ctx->uid, "SYMLINK", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("SYMLINK_RO_DENIED", linkpath, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -693,28 +892,46 @@ static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* s
 }
 
 static int vfs_rename(const char *from, const char *to, unsigned int flags) {
-    char pkg_from[128], pkg_to[128]; 
     struct fuse_context* ctx = fuse_get_context();
     if (!ctx) return -EACCES;
-    config_lock_read();
-    AppConfig* cfg_from = vfs_get_app_cfg(ctx->uid, ctx->pid, pkg_from);
-    AppConfig* cfg_to = vfs_get_app_cfg(ctx->uid, ctx->pid, pkg_to);
+    /* from/to 各走一次分派器决策（无模块时直通回退） */
+    NspQueryCtx q1 = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = from };
+    NspQueryCtx q2 = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = to };
+    NspResolveResult r1, r2;
+    memset(&r1, 0, sizeof r1); memset(&r2, 0, sizeof r2);
+    bool ok1 = (module_dispatch_resolve(&q1, &r1) == NSP_DISPATCH_OK && r1.valid);
+    bool ok2 = (module_dispatch_resolve(&q2, &r2) == NSP_DISPATCH_OK && r2.valid);
+    if ((ok1 && r1.hidden) || (ok2 && r2.hidden)) return -ENOENT;
     char sub_from[PATH_MAX], sub_to[PATH_MAX], p_from[PATH_MAX], p_to[PATH_MAX];
-    int u_from, u_to;
+    int u_from = -1, u_to = -1;
     bool redir_from = false, redir_to = false;
-    TrieMatch tm_from = { .valid = false }, tm_to = { .valid = false };
-    if (vfs_sanitize_and_check_hidden(cfg_from, from, &u_from, sub_from, sizeof(sub_from), pkg_from, ctx->uid, &tm_from) != 0) { config_unlock_read(); return -ENOENT; }
-    if (vfs_sanitize_and_check_hidden(cfg_to, to, &u_to, sub_to, sizeof(sub_to), pkg_to, ctx->uid, &tm_to) != 0) { config_unlock_read(); return -ENOENT; }
-    if (ctx->uid != 0 && (vfs_is_path_ro(cfg_from, sub_from, pkg_from, &tm_from) || vfs_is_path_ro(cfg_to, sub_to, pkg_to, &tm_to))) {
+    char pkg_from[128] = "unknown", pkg_to[128] = "unknown";
+    if (ok1) {
+        strncpy(pkg_from, r1.pkg[0] ? r1.pkg : "unknown", 127); pkg_from[127] = '\0';
+        u_from = r1.user_id;
+        strncpy(sub_from, r1.sub_path, sizeof sub_from - 1); sub_from[sizeof sub_from - 1] = '\0';
+        strncpy(p_from, r1.real_path, sizeof p_from - 1); p_from[sizeof p_from - 1] = '\0';
+        redir_from = r1.is_redir;
+    } else {
+        if (fw_parse_path(from, &u_from, sub_from, sizeof sub_from) != 0) return -ENOENT;
+        fw_default_real_path(u_from, sub_from, p_from, sizeof p_from);
+    }
+    if (ok2) {
+        strncpy(pkg_to, r2.pkg[0] ? r2.pkg : "unknown", 127); pkg_to[127] = '\0';
+        u_to = r2.user_id;
+        strncpy(sub_to, r2.sub_path, sizeof sub_to - 1); sub_to[sizeof sub_to - 1] = '\0';
+        strncpy(p_to, r2.real_path, sizeof p_to - 1); p_to[sizeof p_to - 1] = '\0';
+        redir_to = r2.is_redir;
+    } else {
+        if (fw_parse_path(to, &u_to, sub_to, sizeof sub_to) != 0) return -ENOENT;
+        fw_default_real_path(u_to, sub_to, p_to, sizeof p_to);
+    }
+    if (ctx->uid != 0 && ((ok1 && r1.ro) || (ok2 && r2.ro))) {
         log_fuse_err("RENAME_RO_DENIED", from, EROFS);
-        config_unlock_read();
         return -EROFS;
     }
-    if (vfs_to_real_path(cfg_from, sub_from, p_from, sizeof(p_from), u_from, &redir_from, pkg_from, &tm_from) != 0) { config_unlock_read(); return -ENOENT; }
-    if (vfs_to_real_path(cfg_to, sub_to, p_to, sizeof(p_to), u_to, &redir_to, pkg_to, &tm_to) != 0) { config_unlock_read(); return -ENOENT; }
-    vfs_log_io(cfg_from, pkg_from, ctx->uid, "RENAME_FROM", sub_from, p_from, redir_from);
-    vfs_log_io(cfg_to, pkg_to, ctx->uid, "RENAME_TO", sub_to, p_to, redir_to);
-    config_unlock_read();
+    vfs_log_io(pkg_from, ctx->uid, "RENAME_FROM", sub_from, p_from, redir_from, ok1 ? r1.monitor_on : false);
+    vfs_log_io(pkg_to, ctx->uid, "RENAME_TO", sub_to, p_to, redir_to, ok2 ? r2.monitor_on : false);
 #ifdef SYS_renameat2
     if (flags && syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
 #endif
@@ -762,7 +979,7 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
 
 static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("CHMOD_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -777,7 +994,7 @@ static int vfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
 
 static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("CHOWN_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -792,7 +1009,7 @@ static int vfs_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_in
 
 static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("TRUNCATE_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -807,7 +1024,7 @@ static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
 
 static int vfs_utimens(const char *path, const struct timespec ts[2], struct fuse_file_info *fi) {
     (void)fi; VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("UTIMENS_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -864,7 +1081,7 @@ static int vfs_listxattr(const char *path, char *list, size_t size) {
 
 static int vfs_setxattr(const char *path, const char *name, const char *value, size_t size, int flags) {
     VFS_SETUP_CORE(path, -ENOENT);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("SETXATTR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -879,7 +1096,7 @@ static int vfs_setxattr(const char *path, const char *name, const char *value, s
 
 static int vfs_removexattr(const char *path, const char *name) {
     VFS_SETUP_CORE(path, -ENOENT);
-    if (ctx->uid != 0 && vfs_is_path_ro(cfg, sub_path, current_pkg, &tm)) {
+    if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("REMOVEXATTR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
@@ -1132,6 +1349,8 @@ int main(int argc, char *argv[]) {
             g_passthrough_disabled = true;
         } else if (strcmp(argv[i], "--media-fuse") == 0) {
             g_is_media_fuse = true;
+        } else if (strncmp(argv[i], "--modules-dir=", 14) == 0) {
+            strncpy(g_modules_dir_arg, argv[i] + 14, PATH_MAX - 1);
         } else if (strcmp(argv[i], "--disable-sandbox") == 0) {
             /* 解析并应用禁用沙盒指令 */
             g_disable_sandbox = true;
@@ -1151,7 +1370,9 @@ int main(int argc, char *argv[]) {
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
     install_crash_handlers();
-    vfs_core_init(rules_path);
+    /* 热插拔模块系统：扫描模块目录并启动监控线程（规则模块能力在此注册） */
+    uint32_t mod_flags = g_disable_sandbox ? NSP_FLAG_DISABLE_SANDBOX : 0;
+    module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL, mod_flags);
     
     if (g_disable_sandbox) {
         LOG("沙盒特性已强制禁用");

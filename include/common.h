@@ -25,6 +25,12 @@
 #define MONITOR_IGNORE_PATH CONFIG_DIR "/monitor_ignore.conf"
 #define APP_RULES_DIR CONFIG_DIR "/App-rules"
 #define INJECTOR_PID_PATH CONFIG_DIR "/injector.pid"
+/* 热插拔模块目录：模块 = 一个子目录，内含 <name>.so（规则/后端模块）与可选配置 */
+#ifdef TARGET_ANDROID
+#define MODULES_DIR CONFIG_DIR "/modules"
+#else
+#define MODULES_DIR "/var/fuse-proxy/modules"
+#endif
 
 // STORAGE_BASE: FUSE 内部读写使用的真实物理存储根目录
 #ifdef TARGET_ANDROID
@@ -65,6 +71,7 @@ void log_internal_ext(LogLevel level, const char* proc_name_override, const char
 char* get_self_dir();
 void set_self_dir(const char* path);
 int mkdir_recursive(const char *dir);
+int mkdir_recursive_p(const char *path, mode_t mode);
 int send_ipc_message(const char* message);
 int query_ipc_message(const char* command, char* out_buf, size_t buf_size);
 void escape_cgroup();
