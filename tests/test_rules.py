@@ -4,9 +4,12 @@ import subprocess,os,sys,time,shutil
 from pathlib import Path
 
 MNT="/tmp/fuse_rules_test/mnt"; STORAGE="/tmp/fuse_rules_test/storage"
+MODDIR="/tmp/fuse_rules_test/modules"
 CONF="/tmp/Namespace-Proxy/injector.conf"
 DAEMON=os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
+BASIC_RULES=os.environ.get("BASIC_RULES_SO") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "build_gnu", "basic_rules.so"))
 PASS=0; FAIL=0; ERRS=[]
 def log(m): print(f"  {m}")
 def ok(d): global PASS; PASS+=1; log(f"✅ {d}")
@@ -18,6 +21,12 @@ def setup():
     for d in ["0/Download/Pics","0/Download/Music","0/Download/Docs"]:
         os.makedirs(f"{STORAGE}/{d}",exist_ok=True)
     os.makedirs(MNT,exist_ok=True); os.makedirs("/tmp/Namespace-Proxy",exist_ok=True)
+    # 热插拔模块：把 basic_rules.so 放入模块目录（fuse_daemon 启动时 dlopen 加载）
+    os.makedirs(f"{MODDIR}/basic_rules",exist_ok=True)
+    if os.path.exists(BASIC_RULES):
+        shutil.copy(BASIC_RULES, f"{MODDIR}/basic_rules/basic_rules.so")
+    else:
+        print("  ⚠ basic_rules.so 未找到，规则模块不会加载（无规则直通）")
     (Path(STORAGE)/"0/Download/hi.txt").write_text("hello")
     (Path(STORAGE)/"0/Download/Pics/1.jpg").write_text("img1")
     (Path(STORAGE)/"0/Download/Music/song.mp3").write_text("music")
@@ -29,7 +38,8 @@ def setup():
 
 def wconf(t): open(CONF,"w").write(t.strip())
 def start():
-    p=subprocess.Popen([DAEMON,"--root="+STORAGE,"--rules="+CONF,"-f",MNT,"info"],
+    p=subprocess.Popen([DAEMON,"--root="+STORAGE,"--rules="+CONF,
+                        "--modules-dir="+MODDIR,"-f",MNT,"info"],
                        stdout=open("/tmp/fr.log","w"),stderr=subprocess.STDOUT)
     for _ in range(30):
         time.sleep(0.3)
