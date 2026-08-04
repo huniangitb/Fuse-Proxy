@@ -27,7 +27,6 @@ static void set_str(char* dst, size_t sz, const char* v) {
 
 int ftp_conf_load(const char* path, FtpServerList* out) {
     memset(out, 0, sizeof *out);
-    set_str(out->mount_base, sizeof out->mount_base, "/mnt/nsp_ftp");   /* 默认挂载基目录 */
     FILE* fp = fopen(path, "r");
     if (!fp) return -1;
 
@@ -71,9 +70,7 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
         if (!key[0]) continue;
 
         if (!cur) {
-            /* [GLOBAL] 段键 */
-            if (strcmp(key, "mount_base") == 0)
-                set_str(out->mount_base, sizeof out->mount_base, val);
+            /* [GLOBAL] 段键（虚拟前缀 = /段名，不再有 mount_base 语义） */
             continue;
         }
 

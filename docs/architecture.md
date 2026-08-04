@@ -77,7 +77,7 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 职责：实现 FUSE 操作回调，对被注入应用的每次文件操作应用规则。
 
 - **FUSE 回调层**（`fuse_daemon.c`）：实现约 27 个 `fuse_operations` 回调（getattr/readdir/open/read/write/rename/xattr…）。由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动。框架**零规则功能**：规则决策经模块分派（`module_dispatch_resolve`）交给 dlopen 的规则模块（basic_rules.so）完成；无规则模块时直通回退。
-- **后端分派**（`NSP_CAP_BACKEND_IO`）：FUSE 回调解析出 real_path 后经 `module_backend_lookup` 命中存储后端模块（如 ftp_module.so）的挂载前缀时，改调模块的 `backend_*` 方法完成文件操作——**模块不实现 FUSE，只提供目标功能的方法，最终执行仍由框架回调驱动**；无后端模块时本地文件系统直通（`module_backend_active()` 快速路径零开销）。
+- **后端分派**（`NSP_CAP_BACKEND_IO`）：FUSE 回调解析出 sub_path 后，若规则模块 resolve 命中 FTP 规则（`rr.is_ftp`，`FTP <虚拟前缀> <段名>`，作用域按规则所在段：GLOBAL=全局、应用段=仅该应用），则经 `module_backend_lookup` 定位后端模块（如 ftp_module.so）并改调其 `backend_*` 方法完成文件操作——**模块不实现 FUSE，只提供目标功能的方法，最终执行仍由框架回调驱动**；无后端模块或未命中 FTP 规则时本地文件系统直通（`module_backend_active()` 快速路径零开销）。
 - **规则匹配引擎**：已整体迁移为热插拔规则模块 `basic_rules.so`（`src/modules/basic_rules/`，dlopen 进 fuse_daemon 进程，函数指针调用），模块化后框架不含任何规则语义。
 - **uid→包名解析**（规则模块内 `br_get_pkg`）：uid<10000 直接判为 `system`；否则先查 `uid.map`、再读 `/proc/<tid>/status` 的 `Tgid`+`cmdline`；解析出 `<pre-`/`zygote`/长度<3 的进程视为不可解析，缓存为 nullptr。
 - **每个 metadata 操作的热路径**：`vfs_get_app_cfg`（uid→配置，2048 槽 mutex 缓存，命中 O(1)）→ `vfs_sanitize_and_check_hidden`（路径消毒 + 隐藏判定）→ `vfs_to_real_path`（重定向/沙箱解析）——以上均由 basic_rules 模块内实现，框架经一次 `resolve` 调用取回全部决策（含最终真实路径），保住"一次查询多路复用"的性能语义。

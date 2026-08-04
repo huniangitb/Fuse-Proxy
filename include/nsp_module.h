@@ -119,6 +119,11 @@ typedef struct NspResolveResult {
     bool is_virtual_ancestor; /* 路径是某 REDIRECT 前缀的祖先（合成目录） */
     bool is_redirect_target;  /* 路径本身是某 REDIRECT 的真实目标 */
     bool is_other_app_pkg;    /* 路径含其他应用包名（跨应用隔离隐藏） */
+    /* FTP 后端规则命中（injector.conf 的 `FTP <虚拟前缀> <段名>` 规则）：
+       规则所在段决定作用域（[GLOBAL]=全局，[应用段]=仅该应用）；
+       命中后框架将该路径操作分派给对应 FTP 后端模块 */
+    bool is_ftp;
+    char ftp_backend[64];     /* FTP 段名（ftp.conf [段名]，与虚拟前缀对应） */
     bool monitor_on;          /* 模块配置的 MONITOR 状态（框架 I/O 日志开关） */
 } NspResolveResult;
 

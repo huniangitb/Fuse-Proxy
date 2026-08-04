@@ -20,6 +20,7 @@ typedef struct {
     NspModuleInfo info;        /* 静态信息拷贝 */
     time_t mtime;              /* .so 文件 mtime，热重载检测 */
     bool active;
+    int backend_refs;          /* 后端 ops 在途引用计数（防热卸载 dlclose 悬垂） */
 } ModuleEntry;
 
 static ModuleEntry g_modules[MAX_MODULES];
@@ -197,6 +198,16 @@ static int module_unload_one(const char* name) {
     m->active = false;
     m->handle = NULL;
     pthread_rwlock_unlock(&g_module_lock);
+
+    /* 等待后端在途调用完成（防 ops 指针悬垂 SIGSEGV；最多 ~100ms） */
+    for (int i = 0; i < 100; i++) {
+        bool busy = false;
+        pthread_rwlock_rdlock(&g_module_lock);
+        busy = (m->backend_refs > 0);
+        pthread_rwlock_unlock(&g_module_lock);
+        if (!busy) break;
+        usleep(1000);
+    }
 
     if (info.exit) info.exit();
     dlclose(h);
@@ -457,12 +468,27 @@ int module_backend_lookup(const char* path, const NspModuleOps** ops_out) {
         if (!m->info.ops || !m->info.ops->backend_match) continue;
         if (m->info.ops->backend_match(path) == 1) {
             *ops_out = m->info.ops;
+            m->backend_refs++;   /* 在途引用：调用方须在 backend_* 完成后 put */
             pthread_rwlock_unlock(&g_module_lock);
             return 0;
         }
     }
     pthread_rwlock_unlock(&g_module_lock);
     return -1;
+}
+
+/* 释放 backend_* 在途引用（与 module_backend_lookup 配对；热卸载等待其归零） */
+void module_backend_put(const NspModuleOps* ops) {
+    if (!ops) return;
+    pthread_rwlock_wrlock(&g_module_lock);
+    for (int i = 0; i < g_module_count; i++) {
+        ModuleEntry* m = &g_modules[i];
+        if (m->active && m->info.ops == ops) {
+            if (m->backend_refs > 0) m->backend_refs--;
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&g_module_lock);
 }
 
 bool module_backend_active(void) {

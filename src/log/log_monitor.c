@@ -32,7 +32,7 @@
 #define DEFAULT_LIMIT 500
 #define MAX_EVENTS 256
 #define RING_CAP 16384
-#define OVERFLOW_DIR "/data/Namespace-Proxy/log/overflow"
+#define OVERFLOW_DIR CONFIG_DIR "/log/overflow"
 typedef struct AsyncCtx {
     int fd;
     int type;               /* 0=undef, 1=IO, 2=SYS, 3=LOGCAT */
@@ -770,7 +770,7 @@ int main(int argc, char *argv[]) {
             for (int i = 5; i < count; i++) unlink(files[i]);
         }
     }
-    if (g_persist_all_logs) mkdir("/data/Namespace-Proxy/log", 0755);
+    if (g_persist_all_logs) mkdir(LOG_DIR, 0755);
     load_ignore_rules();
     g_server_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un addr;

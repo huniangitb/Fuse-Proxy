@@ -14,25 +14,42 @@
 
 typedef struct FtpBackend {
     FtpServerCfg cfg;
-    char prefix[PATH_MAX];   /* 挂载前缀 = <mount_base>/<段名>（backend_match 依据） */
+    char prefix[PATH_MAX];   /* 虚拟前缀 = "/" + 段名（如 /云盘），backend_match 依据 */
 } FtpBackend;
 
 #define FTP_BACKEND_MAX 16
 static FtpBackend g_backends[FTP_BACKEND_MAX];
 static int g_backend_count = 0;
 
-int ftp_backend_add(const FtpServerCfg* cfg, const char* mount_base) {
-    if (!cfg || !mount_base || g_backend_count >= FTP_BACKEND_MAX) return -1;
+int ftp_backend_add(const FtpServerCfg* cfg) {
+    if (!cfg || !cfg->name[0] || g_backend_count >= FTP_BACKEND_MAX) return -1;
     FtpBackend* bk = &g_backends[g_backend_count];
     memset(bk, 0, sizeof *bk);
     bk->cfg = *cfg;
-    snprintf(bk->prefix, sizeof bk->prefix, "%s/%s", mount_base, cfg->name);
+    /* 虚拟前缀 = /段名：FUSE 剥离 /0/ 后的原始路径（/云盘/xxx）直接命中，
+       无需 REDIRECT 规则与变量 */
+    snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
     g_backend_count++;
     return 0;
 }
 
 void ftp_backend_clear(void) { g_backend_count = 0; }
 int  ftp_backend_count(void) { return g_backend_count; }
+
+/* 每分钟重连探活：对每个后端尝试 FTP 连接并登出。
+   FTP 每次操作新建连接，此函数用于服务器故障恢复后自动恢复可用性
+   （配合模块后台线程每 60s 调用），无需重启 fuse_daemon/模块。 */
+static int ftp_conn_open(FtpBackend* bk, FtpConn* c);   /* 定义见下（连接段） */
+void ftp_backend_retry_all(void) {
+    for (int i = 0; i < g_backend_count; i++) {
+        FtpConn c;
+        if (ftp_conn_open(&g_backends[i], &c) == 0) {
+            LOG("ftp_module: FTP %s:%d 连接恢复（server=%s）",
+                g_backends[i].cfg.host, g_backends[i].cfg.port, g_backends[i].cfg.name);
+            ftp_close(&c);
+        }
+    }
+}
 
 /* 找 path 命中的后端（前缀 + '/' 或精确相等） */
 static FtpBackend* ftp_backend_find(const char* path) {
@@ -51,7 +68,13 @@ static void ftp_remote_path(FtpBackend* bk, const char* path, char* out, size_t 
     while (*rel == '/') rel++;
     const char* base = bk->cfg.remote_dir;
     size_t blen = strlen(base);
-    if (blen > 1 && base[blen - 1] == '/') {
+    if (rel[0] == '\0') {
+        /* 后端根：remote_dir 去尾斜杠（部分 FTP 服务器对带斜杠路径的
+           LIST/文件操作返回 550，与 getattr 的 CWD 兜底行为不一致） */
+        size_t n = blen;
+        while (n > 1 && base[n - 1] == '/') n--;
+        snprintf(out, sz, "%.*s", (int)n, base);
+    } else if (blen > 1 && base[blen - 1] == '/') {
         snprintf(out, sz, "%s%s", base, rel);
     } else if (blen == 1 && base[0] == '/') {
         snprintf(out, sz, "/%s", rel);
@@ -139,10 +162,8 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     }
     /* 2. LIST 父目录查条目 */
     {
-        char rparent[1024], rbase[256];
-        char local_parent[1024], local_base[256];
+        char rparent[1024], local_base[256];
         split_parent_base(rpath, rparent, sizeof rparent, local_base, sizeof local_base);
-        (void)local_parent;
         char* list = NULL;
         if (ftp_list(&c, rparent, &list, NULL) == 0 && list) {
             FtpEntry e;
@@ -155,18 +176,17 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
             }
             free(list);
         }
-        /* 3. 目录判定用 CWD（LIST 对不存在路径可能返回空成功） */
+        /* 3. 目录判定用 CWD（LIST 对不存在路径可能返回空成功）；
+           判定后恢复回后端根目录：用 prefix 自身计算（不能传 "/"，
+           "/" 短于前缀会导致 ftp_remote_path 越界读） */
         if (rc != 0) {
             if (ftp_cmd(&c, "CWD", rpath) == 250) {
                 st->st_mode = S_IFDIR | 0755;
                 st->st_nlink = 2;
                 rc = 0;
                 char rroot[1024];
-                ftp_remote_path(bk, path, rroot, sizeof rroot);
-                char rroot2[1024];
-                ftp_remote_path(bk, "/", rroot2, sizeof rroot2);
-                (void)rroot;
-                ftp_cmd(&c, "CWD", rroot2);
+                ftp_remote_path(bk, bk->prefix, rroot, sizeof rroot);
+                ftp_cmd(&c, "CWD", rroot);
             }
         }
     }

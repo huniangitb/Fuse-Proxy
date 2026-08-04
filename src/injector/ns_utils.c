@@ -792,8 +792,8 @@ int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name) 
 }
 static int do_debug_log_mounts(void* raw_args) {
     struct DebugMountArgs* args = (struct DebugMountArgs*)raw_args;
-    mkdir_recursive("/data/Namespace-Proxy/log");
-    FILE* log_fp = fopen("/data/Namespace-Proxy/log/mount_debug.log", "ae");
+    mkdir_recursive(LOG_DIR);
+    FILE* log_fp = fopen(LOG_DIR "/mount_debug.log", "ae");
     if (!log_fp) return errno;
     time_t now = time(nullptr);
     struct tm tm_buf;

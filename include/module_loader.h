@@ -59,4 +59,8 @@ bool module_backend_active(void);
    完成文件操作（模块只提供方法，执行仍由框架 FUSE 回调驱动）。 */
 int module_backend_lookup(const char* path, const NspModuleOps** ops_out);
 
+/* 释放后端 ops 在途引用（与 module_backend_lookup 配对；调用方在
+   backend_* 方法完成后调用，防止热卸载 dlclose 造成函数指针悬垂） */
+void module_backend_put(const NspModuleOps* ops);
+
 #endif /* MODULE_LOADER_H */
