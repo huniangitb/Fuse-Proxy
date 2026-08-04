@@ -199,6 +199,31 @@ def main():
             ok("普通路径直通") if got == "local" else fail("普通路径", f"got='{got}'")
         except Exception as e: fail("普通路径", str(e))
 
+        # 10. 随机读写测试（参考 CurlFtpFS：REST+RETR 随机偏移）
+        try:
+            import random
+            big = "nsp_random_test.bin"
+            # 写入 1MB 随机数据（经 FUSE 写模式 → 临时文件 → STOR 上传）
+            data = bytes(random.randint(0,255) for _ in range(1024*1024))
+            (m/"0"/SERVER/big).write_bytes(data)
+            # 随机偏移 pread 校验 20 次（分段流式：每次 read 独立 RETR 连接）
+            fd = os.open(str(m/"0"/SERVER/big), os.O_RDONLY)
+            for i in range(20):
+                off = random.randint(0, len(data)-1)
+                sz = min(random.randint(1, 65536), len(data)-off)
+                got = os.pread(fd, sz, off)
+                if got != data[off:off+sz]:
+                    os.close(fd); raise AssertionError(f"随机读 #{i} 偏移 {off} 大小 {sz} 不匹配")
+            os.close(fd)
+            # 清理
+            (m/"0"/SERVER/big).unlink()
+            ok("随机读写 20 次偏移校验通过")
+        except Exception as e:
+            # 清理残留
+            for fp in [m/"0"/SERVER/big]: 
+                if fp.exists(): fp.unlink()
+            fail("随机读写", str(e))
+
     finally:
         stop_fuse(p)   # fuse_daemon 退出 → 模块 exit 清理后端
         # 清理测试残留
