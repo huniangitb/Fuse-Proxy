@@ -26,6 +26,14 @@
 #define CONFIG_DIR "/var/fuse-proxy"
 #endif
 #define LOG_DIR  CONFIG_DIR "/log"
+
+/* 编译期受控调试日志：仅当 Meson 传入 -Denable_debug=true（-DDEBUG=1）
+   时输出到 stderr（测试重定向的 fuse.log），生产构建完全消除 */
+#ifdef DEBUG
+#define FTP_DBG(...) fprintf(stderr, "[FTP-DBG] " __VA_ARGS__)
+#else
+#define FTP_DBG(...) do { } while (0)
+#endif
 #define ERROR_LOG_PATH LOG_DIR "/error.log"
 #define INJECTOR_CONFIG_PATH CONFIG_DIR "/injector.conf"
 #define MONITOR_IGNORE_PATH CONFIG_DIR "/monitor_ignore.conf"

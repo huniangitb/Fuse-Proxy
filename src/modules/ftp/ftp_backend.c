@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 /* ================= 后端注册表（挂载前缀 → FTP 配置） ================= */
 
@@ -83,6 +84,87 @@ static void ftp_remote_path(FtpBackend* bk, const char* path, char* out, size_t 
     }
 }
 
+/* ================= 路径信息缓存（TTL 最长 1 分钟） =================
+   getattr/readdir 结果缓存，减少 FTP 往返；创建/删除/重命名等路径变更
+   后由 ftp_cache_invalidate 立即失效 */
+
+#define FTP_CACHE_MAX 64
+#define FTP_CACHE_TTL_NS (60LL * 1000000000LL)
+
+typedef struct FtpPathCache {
+    char path[PATH_MAX];      /* 虚拟路径（sub_path，如 /云盘/xxx） */
+    struct stat st;           /* getattr 缓存 */
+    bool has_st;
+    NspDirEntry entries[256]; /* readdir 缓存 */
+    int entry_count;
+    struct timespec ts;       /* 缓存时间（CLOCK_MONOTONIC） */
+} FtpPathCache;
+
+static FtpPathCache g_path_cache[FTP_CACHE_MAX];
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool ftp_cache_get(const char* path, struct stat* st, NspDirEntry* entries, int max, int* count) {
+    pthread_mutex_lock(&g_cache_mutex);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (int i = 0; i < FTP_CACHE_MAX; i++) {
+        FtpPathCache* c = &g_path_cache[i];
+        if (c->path[0] && strcmp(c->path, path) == 0) {
+            if (now.tv_sec - c->ts.tv_sec > FTP_CACHE_TTL_NS / 1000000000LL) {
+                c->path[0] = '\0';   /* 过期 */
+                pthread_mutex_unlock(&g_cache_mutex);
+                return false;
+            }
+            /* 区分命中类型：getattr 请求须 has_st，readdir 请求须有条目
+               （否则 getattr 先缓存会令 readdir 误命中返回空） */
+            if (st && !c->has_st) { pthread_mutex_unlock(&g_cache_mutex); return false; }
+            if (entries && c->entry_count <= 0) { pthread_mutex_unlock(&g_cache_mutex); return false; }
+            if (st && c->has_st) *st = c->st;
+            if (entries && c->entry_count > 0) {
+                int n = c->entry_count < max ? c->entry_count : max;
+                memcpy(entries, c->entries, (size_t)n * sizeof(NspDirEntry));
+                if (count) *count = n;
+            } else if (count) *count = 0;
+            pthread_mutex_unlock(&g_cache_mutex);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+    return false;
+}
+
+static void ftp_cache_put(const char* path, const struct stat* st, const NspDirEntry* entries, int count) {
+    pthread_mutex_lock(&g_cache_mutex);
+    int slot = -1;
+    for (int i = 0; i < FTP_CACHE_MAX; i++) {
+        if (g_path_cache[i].path[0] && strcmp(g_path_cache[i].path, path) == 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < FTP_CACHE_MAX; i++) {
+            if (!g_path_cache[i].path[0]) { slot = i; break; }
+        }
+    }
+    if (slot < 0) slot = 0;   /* 满：覆盖第一个 */
+    FtpPathCache* c = &g_path_cache[slot];
+    memset(c, 0, sizeof *c);
+    strncpy(c->path, path, sizeof c->path - 1);
+    if (st) { c->st = *st; c->has_st = true; }
+    if (entries && count > 0) {
+        int n = count < 256 ? count : 256;
+        memcpy(c->entries, entries, (size_t)n * sizeof(NspDirEntry));
+        c->entry_count = n;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &c->ts);
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
+/* 路径变更后立即失效（unlink/mkdir/rmdir/rename/create/truncate 成功后调用） */
+void ftp_cache_invalidate(void) {
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < FTP_CACHE_MAX; i++) g_path_cache[i].path[0] = '\0';
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
 /* ================= 连接 ================= */
 
 static int ftp_conn_open(FtpBackend* bk, FtpConn* c) {
@@ -141,6 +223,8 @@ int ftp_backend_match(const char* path) {
 int ftp_backend_getattr(const char* path, struct stat* st) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
+    if (ftp_cache_get(path, st, NULL, 0, NULL)) { FTP_DBG("getattr: 缓存命中 path=%s\n", path); return 0; }
+    FTP_DBG("getattr: 缓存未命中 path=%s\n", path);
     memset(st, 0, sizeof *st);
 
     FtpConn c;
@@ -192,6 +276,7 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     }
 done:
     ftp_close(&c);
+    if (rc == 0) ftp_cache_put(path, st, NULL, 0);
     return rc;
 }
 
@@ -199,6 +284,8 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
     if (!entries || max <= 0) return 0;
+    int cached = 0;
+    if (ftp_cache_get(path, NULL, entries, max, &cached)) return cached;   /* 命中缓存 */
     FtpConn c;
     if (ftp_conn_open(bk, &c) != 0) return -EIO;
     char rpath[1024];
@@ -219,6 +306,7 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
         out_n++;
     }
     ftp_close(&c);
+    if (out_n > 0) ftp_cache_put(path, NULL, entries, out_n);
     return out_n;
 }
 
@@ -227,11 +315,48 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
 typedef struct FtpBackendFile {
     FtpBackend* bk;
     char ftp_path[PATH_MAX];   /* 远程路径（release 上传目标） */
-    int  tmp_fd;               /* 写模式临时文件 fd；读模式 -1 */
+    int  tmp_fd;               /* 写模式上传缓存 fd；-1=未建 */
+    bool writing;              /* true=写模式（release STOR 上传）；false=读模式（按需下载） */
+    /* 读模式：按需下载——缓冲 = read count（动态分配，用完释放，最低延迟）；
+       conn 为复用 FTP 连接（避免每次 read 新建连接被 vsftpd 限制 → EIO） */
+    FtpConn* conn;             /* 复用连接；NULL=未打开，read 时按需创建 */
 } FtpBackendFile;
 
-static uint64_t ftp_h_to_u64(FtpBackendFile* f) { return (uint64_t)(uintptr_t)f; }
-static FtpBackendFile* ftp_u64_to_h(uint64_t h) { return (FtpBackendFile*)(uintptr_t)h; }
+/* 句柄为小整数 ID（非指针）：Android tagged-pointer 检测会因 fi->fh 存
+   堆指针（MTE tag 非零）触发 "Pointer tag truncated" SIGABRT（用户指示：
+   FTP 路径不做 FD 透传等本地优化），故后端句柄一律用非指针 ID */
+#define FTP_HANDLE_MAX 256
+static FtpBackendFile* g_handles[FTP_HANDLE_MAX];
+static pthread_mutex_t g_handles_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* 分配句柄 ID（1..FTP_HANDLE_MAX-1），失败返回 0 */
+static uint64_t ftp_handle_alloc(FtpBackendFile* f) {
+    pthread_mutex_lock(&g_handles_mutex);
+    for (int i = 1; i < FTP_HANDLE_MAX; i++) {
+        if (!g_handles[i]) {
+            g_handles[i] = f;
+            pthread_mutex_unlock(&g_handles_mutex);
+            return (uint64_t)i;
+        }
+    }
+    pthread_mutex_unlock(&g_handles_mutex);
+    return 0;
+}
+
+static FtpBackendFile* ftp_handle_get(uint64_t id) {
+    if (id <= 0 || id >= FTP_HANDLE_MAX) return NULL;
+    pthread_mutex_lock(&g_handles_mutex);
+    FtpBackendFile* f = g_handles[id];
+    pthread_mutex_unlock(&g_handles_mutex);
+    return f;
+}
+
+static void ftp_handle_free(uint64_t id) {
+    if (id <= 0 || id >= FTP_HANDLE_MAX) return;
+    pthread_mutex_lock(&g_handles_mutex);
+    g_handles[id] = NULL;
+    pthread_mutex_unlock(&g_handles_mutex);
+}
 
 int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     FtpBackend* bk = ftp_backend_find(path);
@@ -245,14 +370,20 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     int accmode = flags & O_ACCMODE;
     bool writing = (accmode != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC));
     if (!writing) {
-        /* 读模式：验证存在，read 时直接 RETR */
+        /* 读模式：按需下载。open 仅验证存在并取文件大小，read 时按
+           count 动态分配缓冲 → RETR 指定偏移 → 返回 → 释放（最低延迟，
+           防大文件全量 malloc 爆内存，连接用完即关） */
         FtpConn c;
         if (ftp_conn_open(bk, &c) != 0) { free(f); return -EIO; }
         long long size;
-        int rc = ftp_size(&c, f->ftp_path, &size);
+        if (ftp_size(&c, f->ftp_path, &size) != 0 || size < 0) {
+            ftp_close(&c); free(f); return -ENOENT;
+        }
         ftp_close(&c);
-        if (rc != 0) { free(f); return -ENOENT; }
-        *h = ftp_h_to_u64(f);
+        f->writing = false;
+        FTP_DBG("open-read: 按需下载 path=%s ftp=%s size=%lld\n", path, f->ftp_path, size);
+        *h = ftp_handle_alloc(f);
+        if (*h == 0) { free(f); return -EIO; }
         return 0;
     }
 
@@ -281,8 +412,10 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
         }
     }
     f->tmp_fd = tfd;
+    f->writing = true;
     unlink(tpath);   /* 句柄持有，路径立即释放 */
-    *h = ftp_h_to_u64(f);
+    *h = ftp_handle_alloc(f);
+        if (*h == 0) { free(f); return -EIO; }
     return 0;
 }
 
@@ -298,28 +431,52 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
     int rc = ftp_stor(&c, rpath, "", 0);
     ftp_close(&c);
     if (rc != 0) return -EIO;
+    ftp_cache_invalidate();   /* 创建文件后立即失效缓存 */
     return ftp_backend_open(path, O_WRONLY | O_CREAT | O_TRUNC, h);
 }
 
 int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got) {
-    FtpBackendFile* f = ftp_u64_to_h(h);
+    FtpBackendFile* f = ftp_handle_get(h);
     if (!f || !buf || !got) return -EINVAL;
-    if (f->tmp_fd >= 0) {
-        /* 读改写：从本地临时文件读 */
+    if (f->writing) {
+        /* 写模式：本地临时文件读改写 */
         ssize_t n = pread(f->tmp_fd, buf, size, off);
         if (n < 0) return -errno;
         *got = (size_t)n;
         return 0;
     }
-    FtpConn c;
-    if (ftp_conn_open(f->bk, &c) != 0) return -EIO;
-    int rc = ftp_retr(&c, f->ftp_path, off, buf, size, got);
-    ftp_close(&c);
-    return rc == 0 ? 0 : -EIO;
+    /* 读模式：按需下载，复用连接，失败自动重试一次（防瞬断 EIO） */
+    if (!f->conn) {
+        f->conn = malloc(sizeof(FtpConn));
+        if (!f->conn) return -ENOMEM;
+        if (ftp_conn_open(f->bk, f->conn) != 0) { free(f->conn); f->conn = NULL; return -EIO; }
+    }
+    char* dbuf = malloc(size);
+    if (!dbuf) return -ENOMEM;
+    size_t dn = 0;
+    int rc = ftp_retr(f->conn, f->ftp_path, off, dbuf, size, &dn);
+    if (rc != 0) {
+        /* 首次失败：关闭旧连接，新建连接重试一次（安卓网络瞬断/超时） */
+        ftp_close(f->conn); free(f->conn); f->conn = NULL;
+        f->conn = malloc(sizeof(FtpConn));
+        if (f->conn && ftp_conn_open(f->bk, f->conn) == 0) {
+            dn = 0;
+            rc = ftp_retr(f->conn, f->ftp_path, off, dbuf, size, &dn);
+        }
+        if (rc != 0) {
+            if (f->conn) { ftp_close(f->conn); free(f->conn); f->conn = NULL; }
+            free(dbuf); return -EIO;
+        }
+    }
+    if (dn > 0) memcpy(buf, dbuf, dn);
+    free(dbuf);
+    *got = dn;
+    FTP_DBG("read: 按需下载 off=%lld req=%zu got=%zu\n", (long long)off, size, dn);
+    return 0;
 }
 
 int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote) {
-    FtpBackendFile* f = ftp_u64_to_h(h);
+    FtpBackendFile* f = ftp_handle_get(h);
     if (!f || !buf || !wrote) return -EINVAL;
     if (f->tmp_fd < 0) return -EBADF;   /* 只读句柄不可写 */
     ssize_t n = pwrite(f->tmp_fd, buf, size, off);
@@ -329,16 +486,16 @@ int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_
 }
 
 int ftp_backend_release(uint64_t h) {
-    FtpBackendFile* f = ftp_u64_to_h(h);
+    FtpBackendFile* f = ftp_handle_get(h);
     if (!f) return -EINVAL;
     int rc = 0;
-    if (f->tmp_fd >= 0) {
-        /* 读临时文件 → STOR 全量上传 */
+    if (f->writing) {
+        /* 写模式：读临时文件 → STOR 全量上传 */
         off_t sz = lseek(f->tmp_fd, 0, SEEK_END);
-        if (sz < 0) { close(f->tmp_fd); free(f); return -EIO; }
+        if (sz < 0) { close(f->tmp_fd); ftp_handle_free(h); free(f); return -EIO; }
         lseek(f->tmp_fd, 0, SEEK_SET);
         char* data = sz > 0 ? malloc((size_t)sz) : NULL;
-        if (sz > 0 && !data) { close(f->tmp_fd); free(f); return -ENOMEM; }
+        if (sz > 0 && !data) { close(f->tmp_fd); ftp_handle_free(h); free(f); return -ENOMEM; }
         size_t got = 0;
         if (sz > 0) {
             ssize_t n = read(f->tmp_fd, data, (size_t)sz);
@@ -353,7 +510,11 @@ int ftp_backend_release(uint64_t h) {
             } else rc = -EIO;
         }
         free(data);
+    } else {
+        /* 读模式：关闭复用连接 */
+        if (f->conn) { ftp_close(f->conn); free(f->conn); f->conn = NULL; }
     }
+    ftp_handle_free(h);
     free(f);
     return rc;
 }
@@ -367,6 +528,7 @@ int ftp_backend_unlink(const char* path) {
     ftp_remote_path(bk, path, rpath, sizeof rpath);
     int rc = (ftp_dele(&c, rpath) == 0) ? 0 : -ENOENT;
     ftp_close(&c);
+    if (rc == 0) ftp_cache_invalidate();   /* 删除路径后立即失效缓存 */
     return rc;
 }
 
@@ -380,6 +542,7 @@ int ftp_backend_mkdir(const char* path, mode_t mode) {
     ftp_remote_path(bk, path, rpath, sizeof rpath);
     int rc = (ftp_mkd(&c, rpath) == 0) ? 0 : -EIO;
     ftp_close(&c);
+    if (rc == 0) ftp_cache_invalidate();   /* 创建目录后立即失效缓存 */
     return rc;
 }
 
@@ -392,6 +555,7 @@ int ftp_backend_rmdir(const char* path) {
     ftp_remote_path(bk, path, rpath, sizeof rpath);
     int rc = (ftp_rmd(&c, rpath) == 0) ? 0 : -ENOTEMPTY;
     ftp_close(&c);
+    if (rc == 0) ftp_cache_invalidate();   /* 删除目录后立即失效缓存 */
     return rc;
 }
 
@@ -405,6 +569,7 @@ int ftp_backend_rename(const char* from, const char* to) {
     ftp_remote_path(bk, to, rto, sizeof rto);
     int rc = (ftp_rename(&c, rfrom, rto) == 0) ? 0 : -EIO;
     ftp_close(&c);
+    if (rc == 0) ftp_cache_invalidate();   /* 重命名后立即失效缓存 */
     return rc;
 }
 
@@ -431,6 +596,7 @@ int ftp_backend_truncate(const char* path, off_t size) {
                 free(data);
             }
         }
+        if (rc == 0) ftp_cache_invalidate();   /* 截断后立即失效缓存 */
     }
     ftp_close(&c);
     return rc;
