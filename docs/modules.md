@@ -2,7 +2,9 @@
 
 > 面向维护者与模块开发者的技术文档。说明 Fuse-Proxy 的模块化设计：
 > fuse_daemon 仅作为框架（回调骨架 + 模块调度 + 存储原语），规则能力
-> （REDIRECT / SANDBOX / HIDE / ALLOW 豁免 / RO）由热插拔模块提供。
+> （REDIRECT / SANDBOX / HIDE / ALLOW 豁免 / RO）由热插拔模块提供；
+> 存储后端（如 FTP）同样是模块——只提供目标功能的方法，FUSE 由框架
+> 统一实现，路径命中后端前缀时框架调用模块方法完成读写。
 
 ## 1. 设计目标
 
@@ -13,7 +15,9 @@
 - **热插拔**：模块放入模块目录即加载，删除即卸载，覆盖 `.so` 即重载，
   运行中不中断已挂载的 FUSE。
 - **扩展性**：ABI 版本化 + 能力位图（32 位）预留，新能力通过新增位 +
-  接口字段演进，不破坏旧模块；为 FTP 等存储后端模块（BACKEND 类型）预留。
+  接口字段演进，不破坏旧模块；FTP 等存储后端模块（BACKEND 类型）落地：
+  模块只提供目标功能方法（backend_*），不实现 FUSE（框架已实现），
+  框架在路径命中其挂载前缀时调用这些方法完成文件操作。
 
 ## 2. 模块目录约定
 
@@ -33,7 +37,7 @@
 | 类型 | 说明 |
 |------|------|
 | `NSP_MODULE_TYPE_RULES` | 规则模块：参与路径决策（REDIRECT/SANDBOX/HIDE/ALLOW/RO） |
-| `NSP_MODULE_TYPE_BACKEND` | 存储后端模块：提供新存储后端（如 FTP），预留 |
+| `NSP_MODULE_TYPE_BACKEND` | 存储后端模块：提供新存储后端（如 FTP）的操作方法，不实现 FUSE |
 
 ### 3.2 能力位图（模块自述能力）
 
@@ -46,8 +50,9 @@
 | 4 | `NSP_CAP_RO` | 支持 RO 只读 |
 | 5 | `NSP_CAP_READDIR_EXTRA` | 支持 readdir 虚拟目录补充 |
 | 6 | `NSP_CAP_VIRTUAL_DIR` | 支持虚拟目录合成 |
-| 10 | `NSP_CAP_MOUNT_POINT` | （后端）提供本地挂载点路径 |
+| 10 | `NSP_CAP_MOUNT_POINT` | （后端）提供挂载前缀路径 |
 | 11 | `NSP_CAP_VAR` | （后端）向框架注册变量（如 `FTP_云盘=/mnt/nsp_ftp/云盘`） |
+| 12 | `NSP_CAP_BACKEND_IO` | （后端）后端 I/O：路径命中时由框架调用模块方法完成文件操作 |
 
 ### 3.3 框架服务表（框架 → 模块）
 
@@ -70,6 +75,27 @@
   filler），不依赖 fuse 类型，便于解耦。
 - `reload()`：配置热重载通知。
 - `get_pkg(uid, pid, out)`：uid → 包名解析（框架日志用）。
+
+#### 后端 I/O 接口（`NSP_CAP_BACKEND_IO`，仅 BACKEND 模块）
+
+模块**不实现 FUSE**，只提供方法；框架 vfs 回调（getattr/readdir/open/create/
+read/write/release/unlink/mkdir/rmdir/rename/truncate 等）在解析出 real_path
+后经 `module_backend_lookup` 命中模块 `backend_match(path)==1` 时改调对应
+方法，最终执行仍由框架的 FUSE 回调驱动。路径参数为框架解析后的真实路径
+（如 `/mnt/nsp_ftp/云盘/xxx`），模块自行剥离前缀映射到目标存储。
+
+| 接口 | 说明 |
+|------|------|
+| `backend_match(path)` | 1=模块管理该路径（前缀匹配） 0=否 |
+| `backend_getattr(path, st)` | 元数据（SIZE/LIST/CWD 判定等） |
+| `backend_readdir(path, entries, max)` | 返回 `NspDirEntry` 条目数组（框架 filler） |
+| `backend_open(path, flags, &h)` / `backend_create(path, mode, &h)` | 打开/创建，`h` 为模块句柄（框架透传） |
+| `backend_read(h, buf, size, off, &got)` / `backend_write(h, buf, size, off, &wrote)` | 读写 |
+| `backend_release(h)` | 关闭（写路径：上传完成） |
+| `backend_unlink/mkdir/rmdir/rename/truncate(...)` | 删除/建目录/重命名/截断 |
+
+无后端模块时框架走本地文件系统直通，`module_backend_active()` 快速路径
+保证零额外开销（不产生函数指针调用）。
 
 ### 3.5 生命周期与导出
 
@@ -139,9 +165,14 @@ const NspModuleInfo nsp_module_info = {
 4. 规则类型为枚举位图；如需自定义规则类型，扩展 `nsp_module.h` 能力位
    （32 位预留）并同步 ABI 文档。
 
-> 存储后端模块（FTP 等）：type = BACKEND，注册 `MOUNT_POINT`/`VAR` 能力，
-> 由 injector fork 独立进程（挂载到本地路径后经 UDS 注册变量），
-> 规则模块（basic_rules）的 `REDIRECT` 目标指向其挂载点即可，框架零改动。
+> 后端模块（FTP 等，`src/modules/ftp/`）：type = BACKEND，caps =
+> `MOUNT_POINT`|`VAR`|`BACKEND_IO`，ops 实现 `backend_*` + `get_vars`。
+> 模块**不实现 FUSE、不挂载任何文件系统**——只注册"挂载前缀"
+> （`<mount_base>/<段名>`，mount_base 由 ftp.conf `[GLOBAL]` 配置，默认
+> `/mnt/nsp_ftp`）。框架 vfs 回调在 real_path 命中前缀时调用模块方法
+> （FTP 列目录/读/写/删/建/重命名等，写路径为本地临时文件缓存 +
+> release 时 STOR 全量上传）。变量 `FTP_<段名>=<前缀>` 经 `get_vars`
+> 注册，规则以 `REDIRECT /云盘 $FTP_云盘` 引用。
 
 ## 8. 构建与测试
 
@@ -151,14 +182,17 @@ meson setup build_gnu -Dtarget_os=gnu && ninja -C build_gnu
 # Android 交叉（basic_rules.so 不依赖 libfuse3，交叉编译已验证）
 meson setup build --cross-file android-aarch64.ini -Dfuse3_root=<静态库根>
 
-# 测试（测试脚本自动预置 basic_rules.so 到临时模块目录并传 --modules-dir）
+# 测试（测试脚本自动预置 basic_rules.so / ftp_module.so 到临时模块目录并传 --modules-dir）
 python3 tests/test_rules.py       # 规则边界 26 用例
 python3 tests/test_functional.py  # 功能 + SQLite + 并发 34 用例
 python3 tests/test_modules.py     # 热插拔 10 用例
+python3 tests/test_ftp.py         # FTP 后端端到端 10 用例（vsftpd 匿名服务 + $FTP_云盘 变量 + REDIRECT）
 ```
 
-产物：`fuse_daemon`（框架）、`basic_rules.so`（规则模块，安装到
-`bin/modules/basic_rules/`）、`injector`/`log_monitor`/`log_ctl` 不变。
+产物：`fuse_daemon`（框架，含后端分派）、`basic_rules.so`（规则模块，
+安装到 `bin/modules/basic_rules/`）、`ftp_module.so`（FTP 后端模块，无
+FUSE 依赖，安装到 `bin/modules/ftp_module/`）、`injector`/`log_monitor`/
+`log_ctl` 不变。
 
 ## 9. 相关文档
 

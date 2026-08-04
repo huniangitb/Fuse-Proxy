@@ -51,4 +51,12 @@ int module_snapshot(char names[][64], int max);
 /* 是否有任何活跃模块 */
 bool module_any_loaded(void);
 
+/* 是否有活跃后端 I/O 模块（快速路径：无后端时框架直接本地文件系统，零开销） */
+bool module_backend_active(void);
+
+/* 后端 I/O 分派：path（框架解析后的真实路径）命中 BACKEND+BACKEND_IO 模块
+   （backend_match==1）时返回其 ops，否则 -1。框架 vfs 回调据此改调模块方法
+   完成文件操作（模块只提供方法，执行仍由框架 FUSE 回调驱动）。 */
+int module_backend_lookup(const char* path, const NspModuleOps** ops_out);
+
 #endif /* MODULE_LOADER_H */

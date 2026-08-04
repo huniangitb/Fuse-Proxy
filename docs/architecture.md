@@ -76,10 +76,11 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 
 职责：实现 FUSE 操作回调，对被注入应用的每次文件操作应用规则。
 
-- **FUSE 回调层**（`fuse_daemon.c`）：实现约 27 个 `fuse_operations` 回调（getattr/readdir/open/read/write/rename/xattr…）。由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动。
-- **规则匹配引擎**（`vfs_core.c`）：每次操作的核心——将虚拟路径经规则匹配转换为真实路径，判定隐藏/只读/重定向/沙箱。
-- **uid→包名解析**（`vfs_core.c` 的 `vfs_get_app_cfg`）：uid<10000 直接判为 `system`；否则先查 `uid.map`、再读 `/proc/<tid>/status` 的 `Tgid`+`cmdline`；解析出 `<pre-`/`zygote`/长度<3 的进程视为不可解析，缓存为 nullptr。
-- **每个 metadata 操作的热路径**：`vfs_get_app_cfg`（uid→配置，2048 槽 mutex 缓存，命中 O(1)）→ `vfs_sanitize_and_check_hidden`（路径消毒 + 隐藏判定）→ `vfs_to_real_path`（重定向/沙箱解析）。
+- **FUSE 回调层**（`fuse_daemon.c`）：实现约 27 个 `fuse_operations` 回调（getattr/readdir/open/read/write/rename/xattr…）。由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动。框架**零规则功能**：规则决策经模块分派（`module_dispatch_resolve`）交给 dlopen 的规则模块（basic_rules.so）完成；无规则模块时直通回退。
+- **后端分派**（`NSP_CAP_BACKEND_IO`）：FUSE 回调解析出 real_path 后经 `module_backend_lookup` 命中存储后端模块（如 ftp_module.so）的挂载前缀时，改调模块的 `backend_*` 方法完成文件操作——**模块不实现 FUSE，只提供目标功能的方法，最终执行仍由框架回调驱动**；无后端模块时本地文件系统直通（`module_backend_active()` 快速路径零开销）。
+- **规则匹配引擎**：已整体迁移为热插拔规则模块 `basic_rules.so`（`src/modules/basic_rules/`，dlopen 进 fuse_daemon 进程，函数指针调用），模块化后框架不含任何规则语义。
+- **uid→包名解析**（规则模块内 `br_get_pkg`）：uid<10000 直接判为 `system`；否则先查 `uid.map`、再读 `/proc/<tid>/status` 的 `Tgid`+`cmdline`；解析出 `<pre-`/`zygote`/长度<3 的进程视为不可解析，缓存为 nullptr。
+- **每个 metadata 操作的热路径**：`vfs_get_app_cfg`（uid→配置，2048 槽 mutex 缓存，命中 O(1)）→ `vfs_sanitize_and_check_hidden`（路径消毒 + 隐藏判定）→ `vfs_to_real_path`（重定向/沙箱解析）——以上均由 basic_rules 模块内实现，框架经一次 `resolve` 调用取回全部决策（含最终真实路径），保住"一次查询多路复用"的性能语义。
 
 ### 2.3 log_monitor / log_ctl — 日志子系统
 
@@ -103,8 +104,12 @@ Fuse-Proxy/
 │   │   ├── config_parser.c # 规则文件解析、AppConfig 管理、Trie 构建、变量静态性分析
 │   │   └── path_vars.c     # 路径变量（$package 等）展开、真实目标分类
 │   ├── daemon/             # FUSE 守护进程
-│   │   ├── fuse_daemon.c   # FUSE 操作回调 + main
-│   │   └── vfs_core.c      # 规则匹配引擎（含 uid→包名解析、uid 缓存、sandbox、Trie 复用）
+│   │   └── fuse_daemon.c   # FUSE 操作回调 + main（框架零规则功能，含后端分派）
+│   ├── module/             # 热插拔模块加载器
+│   │   └── loader.c        # dlopen 加载/卸载、能力登记、resolve/probe/后端分派、inotify 热插拔监控
+│   ├── modules/            # 热插拔模块（.so，dlopen 进 fuse_daemon）
+│   │   ├── basic_rules/    # 基础规则引擎（原 vfs_core 迁移）：REDIRECT/SANDBOX/HIDE/ALLOW/RO
+│   │   └── ftp/            # FTP 存储后端（纯方法模块，无 FUSE 实现）：ftp_backend/ftp_client/ftp_conf/ftp_module
 │   ├── injector/           # 注入器
 │   │   ├── injector.c      # main + epoll 事件循环（含 inject_global_fuse/inject_media_fuse）
 │   │   ├── inject_target.c # 注入目标判定 + uid 映射维护
@@ -129,12 +134,17 @@ common_sources = core/common.c, config/config_parser.c, config/path_vars.c,
 
 | 可执行文件 | 专属源文件 | 说明 |
 |-----------|-----------|------|
-| `fuse_daemon` | daemon/fuse_daemon.c, daemon/vfs_core.c, core/crash_dump.c, core/fast_pid.c | FUSE 守护 |
+| `fuse_daemon` | daemon/fuse_daemon.c, module/loader.c, core/crash_dump.c, core/fast_pid.c | FUSE 守护（框架，零规则功能） |
 | `injector` | injector/*.c（injector, inject_target, mount_manager, ipc_server, config_publisher, ns_utils）, core/fast_pid.c | 注入器 |
 | `log_monitor` | log/log_monitor.c | 日志收集 |
 | `log_ctl` | log/log_ctl.c | 日志/配置 CLI |
 
-外部依赖：`libfuse3`（仅 fuse_daemon 直接用）、`json-c`（配置广播/日志 JSON 序列化）、`iconv`（字符编码）、`pthread`。
+| 共享库（模块，dlopen） | 源文件 | 说明 |
+|-----------------------|--------|------|
+| `basic_rules.so` | modules/basic_rules/*.c | 规则模块（原 vfs_core 迁移），安装到 `bin/modules/basic_rules/` |
+| `ftp_module.so` | modules/ftp/*.c, core/common.c | FTP 存储后端（纯方法模块，**不依赖 libfuse3**），安装到 `bin/modules/ftp_module/` |
+
+外部依赖：`libfuse3`（仅 fuse_daemon 直接用；规则/后端模块均不链接）、`json-c`（配置广播/日志 JSON 序列化）、`iconv`（字符编码）、`pthread`。
 
 编译：交叉编译到 `aarch64-linux-android35`，C23 标准，`warning_level=3`。Release 用 `-O3 -flto`。
 
