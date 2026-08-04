@@ -17,6 +17,7 @@ typedef struct FtpConn {
     int timeout_s;            /* 网络超时（秒） */
     int last_code;            /* 最近响应码（如 220/230/226/550） */
     char last_reply[2048];    /* 最近完整响应文本 */
+    char pasv_host[256];      /* 原服务器主机名（PASV 数据连接使用，防返回不可达 IP） */
 } FtpConn;
 
 /* 连接 + 登录（匿名 user="anonymous"）。返回 0 成功；负值失败。 */

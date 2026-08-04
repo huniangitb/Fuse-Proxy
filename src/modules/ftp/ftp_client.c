@@ -108,6 +108,8 @@ int ftp_connect(FtpConn* c, const char* host, int port,
     memset(c, 0, sizeof *c);
     c->ctrl_fd = -1;
     c->timeout_s = timeout_s > 0 ? timeout_s : 30;
+    strncpy(c->pasv_host, host, sizeof c->pasv_host - 1);
+    c->pasv_host[sizeof c->pasv_host - 1] = '\0';
     int fd = sock_connect_timeout(host, port, c->timeout_s);
     if (fd < 0) return -1;
     c->ctrl_fd = fd;
@@ -146,10 +148,11 @@ static int ftp_pasv_data_fd(FtpConn* c) {
     if (!p) return -1;
     int h1, h2, h3, h4, p1, p2;
     if (sscanf(p, "(%d,%d,%d,%d,%d,%d)", &h1, &h2, &h3, &h4, &p1, &p2) != 6) return -1;
-    char host[64];
-    snprintf(host, sizeof host, "%d.%d.%d.%d", h1, h2, h3, h4);
+    /* 用原服务器主机名（而非 PASV 返回的 IP）连接数据端口：
+       安卓设备可能无法到达 PASV 返回的 IP（NAT/防火墙），
+       但原主机名（控制连接已用）确定可达 */
     int port = p1 * 256 + p2;
-    return sock_connect_timeout(host, port, c->timeout_s);
+    return sock_connect_timeout(c->pasv_host, port, c->timeout_s);
 }
 
 int ftp_data_open(FtpConn* c, const char* cmd, const char* path, long long rest_off) {
