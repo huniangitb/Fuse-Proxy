@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <sys/stat.h>   /* struct stat（后端 getattr，系统类型与 fuse 无关） */
 #include <limits.h>
 
 /* ================= ABI 版本与魔数 ================= */
@@ -59,6 +60,8 @@ typedef enum {
 /* ---- 后端能力（NSP_MODULE_TYPE_BACKEND）---- */
 #define NSP_CAP_MOUNT_POINT     (1u << 10)  /* 提供本地挂载点路径 */
 #define NSP_CAP_VAR             (1u << 11)  /* 向框架注册变量（如 FTP_云盘=/mnt/nsp_ftp/云盘） */
+#define NSP_CAP_BACKEND_IO      (1u << 12)  /* 后端 I/O：路径命中时由框架调用模块方法
+                                               完成文件操作（模块不实现 FUSE，只提供方法） */
 
 /* ================= 框架服务表（框架 → 模块） =================
    模块 init 时收到该表，仅通过它使用框架设施。
@@ -156,6 +159,24 @@ typedef struct NspModuleOps {
     /* ---- 后端能力（NSP_MODULE_TYPE_BACKEND）---- */
     /* 变量注册：返回模块提供的变量（name=value 字符串数组）。 */
     int  (*get_vars)(const char*** names, const char*** values, int* count);
+
+    /* 后端 I/O（NSP_CAP_BACKEND_IO）：路径命中（backend_match 返回 1）时，
+       框架不再操作本地文件系统，改调模块方法。path 为框架解析后的真实路径
+       （如 /mnt/nsp_ftp/云盘/xxx），模块自行剥离前缀映射到目标存储。
+       句柄 h 由模块分配/释放（uint64_t），框架透传。返回 0 成功，负值 errno 风格。 */
+    int  (*backend_match)(const char* path);                       /* 1=管理该路径 0=否 */
+    int  (*backend_getattr)(const char* path, struct stat* st);
+    int  (*backend_readdir)(const char* path, NspDirEntry* entries, int max);
+    int  (*backend_open)(const char* path, int flags, uint64_t* h);
+    int  (*backend_read)(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
+    int  (*backend_write)(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);
+    int  (*backend_release)(uint64_t h);
+    int  (*backend_create)(const char* path, mode_t mode, uint64_t* h);
+    int  (*backend_unlink)(const char* path);
+    int  (*backend_mkdir)(const char* path, mode_t mode);
+    int  (*backend_rmdir)(const char* path);
+    int  (*backend_rename)(const char* from, const char* to);
+    int  (*backend_truncate)(const char* path, off_t size);
 
     /* ---- 通用 ---- */
     /* 配置热重载通知（框架检测到配置变更时调用，模块自行决定是否重建索引）。 */

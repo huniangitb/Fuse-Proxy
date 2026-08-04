@@ -293,6 +293,15 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
     vfs_flush_pending_closes();
     (void)fi; VFS_SETUP_CORE(path, -ENOENT);
     if (st == nullptr) VFS_RETURN(-EINVAL);
+    /* 后端分派：路径命中 BACKEND 模块时由模块方法提供元数据（模块不实现 FUSE） */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_getattr) {
+        memset(st, 0, sizeof *st);
+        int brc = bops->backend_getattr(p, st);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (!g_preserve_perms) { st->st_uid = ctx->uid; st->st_gid = ctx->gid; }
+        VFS_RETURN(0);
+    }
     if (lstat(p, st) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
@@ -323,6 +332,9 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
 static int vfs_access(const char *path, int mask) {
     vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, -ENOENT);
+    /* 后端路径：访问检查由后端语义决定，框架默认放行 */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0) VFS_RETURN(0);
     if (access(p, mask) == -1) {
         int err = errno; 
         if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
@@ -340,7 +352,22 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     (void)offset; (void)flags; (void)fi; VFS_SETUP_CORE(path, -ENOENT);
     vfs_log_io(current_pkg, ctx->uid, "READDIR", sub_path, p, is_redir, nsp_ok ? rr.monitor_on : false);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
-    
+
+    /* 后端分派：readdir 由模块方法返回条目，框架负责 filler */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_readdir) {
+        NspDirEntry entries[1024];
+        int n = bops->backend_readdir(p, entries, 1024);
+        if (n < 0) VFS_RETURN(n);
+        for (int i = 0; i < n; i++) {
+            struct stat st; memset(&st, 0, sizeof st);
+            st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+            if (!g_preserve_perms) { st.st_uid = ctx->uid; st.st_gid = ctx->gid; }
+            if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
+        }
+        VFS_RETURN(0);
+    }
+
     /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑 */
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
     
@@ -511,6 +538,15 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
             VFS_RETURN(-EROFS);
         }
     }
+    /* 后端分派：open 由模块方法打开，fi->fh 存后端句柄（read/write 经 match 复用） */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_open) {
+        uint64_t h = 0;
+        int brc = bops->backend_open(p, fi->flags, &h);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        fi->fh = h;
+        VFS_RETURN(0);
+    }
     int fd = open(p, fi->flags | O_CLOEXEC, is_redir ? 0666 : 0);
     if (fd == -1) { 
         int err = errno; 
@@ -544,6 +580,15 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
         VFS_RETURN(-EROFS);
     }
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
+    /* 后端分派：create 由模块方法创建，fi->fh 存后端句柄 */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_create) {
+        uint64_t h = 0;
+        int brc = bops->backend_create(p, mode, &h);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        fi->fh = h;
+        VFS_RETURN(0);
+    }
     int fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, is_redir ? 0666 : mode);
     if (fd == -1) {
         if (errno == ENOENT) {
@@ -584,6 +629,13 @@ static int vfs_mkdir(const char *path, mode_t mode) {
         log_fuse_err("MKDIR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
+    /* 后端分派：mkdir 由模块方法创建 */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_mkdir) {
+        int brc = bops->backend_mkdir(p, mode);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        VFS_RETURN(0);
+    }
     int ret = mkdir(p, is_redir ? 0775 : mode);
     if (ret == -1) {
         if (errno == ENOENT) {
@@ -608,6 +660,13 @@ static int vfs_unlink(const char *path) {
     if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("UNLINK_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
+    }
+    /* 后端分派：unlink 由模块方法删除 */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_unlink) {
+        int brc = bops->backend_unlink(p);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        VFS_RETURN(0);
     }
     int ret = unlink(p);
     if (ret == -1) {
@@ -638,6 +697,13 @@ static int vfs_rmdir(const char *path) {
         }
         VFS_RETURN(0);
     }
+    /* 后端分派：rmdir 由模块方法删除 */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_rmdir) {
+        int brc = bops->backend_rmdir(p);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        VFS_RETURN(0);
+    }
     int ret = rmdir(p);
     if (ret == -1) {
         int err = errno;
@@ -654,7 +720,15 @@ static int vfs_rmdir(const char *path) {
 }
 
 static int vfs_read(const char *path, char *buf, size_t size, off_t off, struct fuse_file_info *fi) {
-    (void)path;
+    if (module_backend_active()) {
+        VFS_SETUP_CORE(path, -ENOENT);
+        const NspModuleOps* bops = NULL;
+        if (module_backend_lookup(p, &bops) == 0 && bops->backend_read) {
+            size_t got = 0;
+            int rc = bops->backend_read(fi->fh, buf, size, off, &got);
+            return rc == 0 ? (int)got : (rc < 0 ? rc : -EIO);
+        }
+    }
     ssize_t ret = pread(fi->fh, buf, size, off);
     if (ret == -1) {
         int err = errno;
@@ -665,7 +739,15 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t off, struct 
 }
 
 static int vfs_write(const char *path, const char *buf, size_t size, off_t off, struct fuse_file_info *fi) {
-    (void)path;
+    if (module_backend_active()) {
+        VFS_SETUP_CORE(path, -ENOENT);
+        const NspModuleOps* bops = NULL;
+        if (module_backend_lookup(p, &bops) == 0 && bops->backend_write) {
+            size_t wrote = 0;
+            int rc = bops->backend_write(fi->fh, buf, size, off, &wrote);
+            return rc == 0 ? (int)wrote : (rc < 0 ? rc : -EIO);
+        }
+    }
     ssize_t ret = pwrite(fi->fh, buf, size, off);
     if (ret == -1) {
         int err = errno;
@@ -676,13 +758,24 @@ static int vfs_write(const char *path, const char *buf, size_t size, off_t off, 
 }
 
 static int vfs_release(const char *path, struct fuse_file_info *fi) {
-    (void)path;
+    if (module_backend_active()) {
+        VFS_SETUP_CORE(path, -ENOENT);
+        const NspModuleOps* bops = NULL;
+        if (module_backend_lookup(p, &bops) == 0 && bops->backend_release) {
+            int rc = bops->backend_release(fi->fh);
+            return rc < 0 ? rc : 0;
+        }
+    }
     close(fi->fh);
     return 0;
 }
 
 static int vfs_fsync(const char *path, int datasync, struct fuse_file_info *fi) {
-    (void)path;
+    if (module_backend_active()) {
+        VFS_SETUP_CORE(path, -ENOENT);
+        const NspModuleOps* bops = NULL;
+        if (module_backend_lookup(p, &bops) == 0) return 0;   /* 后端无 fsync 语义 */
+    }
     if (!fi || fi->fh <= 0) return 0;
     int ret = (datasync ? fdatasync(fi->fh) : fsync(fi->fh));
     if (ret == -1) {
@@ -932,6 +1025,18 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
     }
     vfs_log_io(pkg_from, ctx->uid, "RENAME_FROM", sub_from, p_from, redir_from, ok1 ? r1.monitor_on : false);
     vfs_log_io(pkg_to, ctx->uid, "RENAME_TO", sub_to, p_to, redir_to, ok2 ? r2.monitor_on : false);
+    /* 后端分派：from/to 命中后端时由模块方法重命名（两端须同一后端模块） */
+    const NspModuleOps* bf_ops = NULL;
+    const NspModuleOps* bt_ops = NULL;
+    bool bf_hit = (module_backend_lookup(p_from, &bf_ops) == 0);
+    bool bt_hit = (module_backend_lookup(p_to, &bt_ops) == 0);
+    if (bf_hit || bt_hit) {
+        if (bf_hit && bt_hit && bf_ops == bt_ops && bf_ops->backend_rename) {
+            int brc = bf_ops->backend_rename(p_from, p_to);
+            return brc < 0 ? brc : 0;
+        }
+        return -EXDEV;   /* 跨后端/后端↔本地重命名不支持 */
+    }
 #ifdef SYS_renameat2
     if (flags && syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
 #endif
@@ -1012,6 +1117,13 @@ static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
     if (ctx->uid != 0 && rr.ro) {
         log_fuse_err("TRUNCATE_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
+    }
+    /* 后端分派：truncate 由模块方法截断 */
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(p, &bops) == 0 && bops->backend_truncate) {
+        int brc = bops->backend_truncate(p, size);
+        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        VFS_RETURN(0);
     }
     int ret = truncate(p, size);
     if (ret == -1) {
