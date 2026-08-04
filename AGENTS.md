@@ -19,7 +19,7 @@ Android 13+ 用户态 FUSE 存储代理（KernelSU/Magisk 模块二进制核心�
 ## 架构与约定
 
 - 4 个独立进程经 Unix Domain Socket 协作：`injector`（主控：epoll + inotify + zygote fork 检测）启动 `fuse_daemon`（`--mode=redirect --root=... --rules=<conf>`，约 27 个 FUSE 回调 + 模块调度）；`log_monitor` 收集日志、`log_ctl` 查询。injector 维护全局 + 媒体模块两棵 FUSE 树，共用同一二进制与配置。
-- **模块化**：fuse_daemon 是零规则功能的框架——规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）由 dlopen 的 `basic_rules.so` 提供（原 `vfs_core.c` 迁移）；存储后端（如 FTP）由 `ftp_module.so` 提供：模块**不实现 FUSE**，只注册挂载前缀（`<mount_base>/<段名>`，默认 `/mnt/nsp_ftp`）并提供 `backend_*` 操作方法，框架 vfs 回调解析出 real_path 命中前缀时调用这些方法完成读写。模块目录 `/data/Namespace-Proxy/modules/<名>/<名>.so`，inotify 热插拔。详见 `docs/modules.md`。
+- **模块化**：fuse_daemon 是零规则功能的框架——规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）由 dlopen 的 `basic_rules.so` 提供（原 `vfs_core.c` 迁移）；存储后端（如 FTP）由 `ftp_module.so` 提供：模块**不实现 FUSE**，只提供 `backend_*` 操作方法；FTP 映射由 injector.conf 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`，写在 `[GLOBAL]`=全局生效、`[应用包名]`=仅该应用生效，与 REDIRECT 作用域一致），框架 vfs 回调经规则模块 resolve 命中 FTP 规则（`rr.is_ftp`）后调用模块方法完成读写。模块目录 `/data/Namespace-Proxy/modules/<名>/<名>.so`，inotify 热插拔。详见 `docs/modules.md`。
 - 规则为 INI 格式：`[GLOBAL]` 段含 `MONITOR ON/OFF`（inotify 热重载开关）、`SANDBOX ON/OFF`；规则关键字 `REDIRECT <虚拟> <真实>`、`ALLOW`、`HIDE`、`RO`；应用段用 `[包名]` 或 `[包名:userid]`。
 - 关键陷阱：配置中 REDIRECT 的虚拟前缀**不含 user_id**（如 `/云盘/`），测试经 `/0/云盘/...` 访问——FUSE 层剥离 `/0/` 后再匹配规则。修改路径匹配语义时勿破坏该约定。
 - 修改 `basic_rules` / `fuse_daemon.c` / `config_parser.c` 后必须跑 `tests/test_rules.py`（覆盖 ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀优先/沙盒/热重载）；修改 `modules/ftp/` 或框架后端分派后必须跑 `tests/test_ftp.py`。

@@ -16,8 +16,9 @@
   运行中不中断已挂载的 FUSE。
 - **扩展性**：ABI 版本化 + 能力位图（32 位）预留，新能力通过新增位 +
   接口字段演进，不破坏旧模块；FTP 等存储后端模块（BACKEND 类型）落地：
-  模块只提供目标功能方法（backend_*），不实现 FUSE（框架已实现），
-  框架在路径命中其挂载前缀时调用这些方法完成文件操作。
+  模块只提供目标功能方法（backend_*），不实现 FUSE（框架已实现）；
+  FTP 映射由规则模块的 `FTP <虚拟前缀> <段名>` 规则决定（作用域按规则
+  所在段：GLOBAL=全局、应用段=仅该应用），框架命中后调用这些方法。
 
 ## 2. 模块目录约定
 
@@ -50,7 +51,7 @@
 | 4 | `NSP_CAP_RO` | 支持 RO 只读 |
 | 5 | `NSP_CAP_READDIR_EXTRA` | 支持 readdir 虚拟目录补充 |
 | 6 | `NSP_CAP_VIRTUAL_DIR` | 支持虚拟目录合成 |
-| 10 | `NSP_CAP_MOUNT_POINT` | （后端）提供挂载前缀路径 |
+| 10 | `NSP_CAP_MOUNT_POINT` | （后端）提供虚拟前缀路径（`/<段名>`） |
 | 11 | `NSP_CAP_VAR` | （后端）向框架注册变量（如 `FTP_云盘=/mnt/nsp_ftp/云盘`） |
 | 12 | `NSP_CAP_BACKEND_IO` | （后端）后端 I/O：路径命中时由框架调用模块方法完成文件操作 |
 
@@ -81,8 +82,9 @@
 模块**不实现 FUSE**，只提供方法；框架 vfs 回调（getattr/readdir/open/create/
 read/write/release/unlink/mkdir/rmdir/rename/truncate 等）在解析出 real_path
 后经 `module_backend_lookup` 命中模块 `backend_match(path)==1` 时改调对应
-方法，最终执行仍由框架的 FUSE 回调驱动。路径参数为框架解析后的真实路径
-（如 `/mnt/nsp_ftp/云盘/xxx`），模块自行剥离前缀映射到目标存储。
+方法（作用域由规则模块 resolve 的 `rr.is_ftp` 控制——FTP 规则所在段决定
+哪些应用命中），最终执行仍由框架的 FUSE 回调驱动。路径参数为框架解析后的
+真实路径（如 `/mnt/nsp_ftp/云盘/xxx`），模块自行剥离前缀映射到目标存储。
 
 | 接口 | 说明 |
 |------|------|
@@ -167,12 +169,13 @@ const NspModuleInfo nsp_module_info = {
 
 > 后端模块（FTP 等，`src/modules/ftp/`）：type = BACKEND，caps =
 > `MOUNT_POINT`|`VAR`|`BACKEND_IO`，ops 实现 `backend_*` + `get_vars`。
-> 模块**不实现 FUSE、不挂载任何文件系统**——只注册"挂载前缀"
-> （`<mount_base>/<段名>`，mount_base 由 ftp.conf `[GLOBAL]` 配置，默认
-> `/mnt/nsp_ftp`）。框架 vfs 回调在 real_path 命中前缀时调用模块方法
-> （FTP 列目录/读/写/删/建/重命名等，写路径为本地临时文件缓存 +
-> release 时 STOR 全量上传）。变量 `FTP_<段名>=<前缀>` 经 `get_vars`
-> 注册，规则以 `REDIRECT /云盘 $FTP_云盘` 引用。
+> 模块**不实现 FUSE、不挂载任何文件系统**——只提供 `backend_*` 操作方法。
+> FTP 映射由 injector.conf 的 `FTP <虚拟前缀> <段名>` 规则决定（如
+> `FTP /云盘 云盘`）：规则所在段决定作用域（`[GLOBAL]`=全局，`[应用包名]`=
+> 仅该应用，与 REDIRECT 一致）。框架 vfs 回调经规则模块 resolve 命中
+> FTP 规则（`rr.is_ftp`）后调用模块方法（FTP 列目录/读/写/删/建/重命名等，
+> 写路径为本地临时文件缓存 + release 时 STOR 全量上传）。变量
+> `FTP_<段名>=/<段名>` 经 `get_vars` 注册（兼容旧规则引用）。
 
 ## 8. 构建与测试
 

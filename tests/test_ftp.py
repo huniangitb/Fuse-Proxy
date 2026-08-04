@@ -55,9 +55,6 @@ def setup():
     os.chmod(FTP_UPLOAD, 0o777)
     with open(CONF_FTP, "w") as fh:
         fh.write(f"""
-[GLOBAL]
-mount_base = {FTP_BASE}
-
 [{SERVER}]
 host = 127.0.0.1
 port = 21
@@ -80,12 +77,10 @@ def wait_ftp_ready(timeout=10.0):
     return False
 
 def start_fuse():
+    # FTP 规则：`FTP <虚拟前缀> <段名>` 写在 [GLOBAL]（全局生效）。
+    # /0/云盘 剥离 /0/ 后命中规则 → 框架分派给 ftp_module（段名=SERVER）
     with open(CONF, "w") as fh:
-        fh.write(f"""
-[GLOBAL]
-FTP_{SERVER}={SERVER}
-REDIRECT /{SERVER} $FTP_{SERVER}
-""".strip())
+        fh.write(f"[GLOBAL]\nFTP /{SERVER} {SERVER}\n")
     p = subprocess.Popen([DAEMON, "--root="+STORAGE, "--rules="+CONF,
                           "--modules-dir="+MODDIR, "-f", MNT, "info"],
                          stdout=open("/tmp/fuse_ftp_test/fuse.log", "w"),

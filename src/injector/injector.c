@@ -603,6 +603,7 @@ static bool is_parent_zygote(pid_t ppid) {
 int scan_zygote_children() {
     static bool first_scan = true;
     struct timespec ts_start, ts_zygote;
+    all_apps_prune();   /* 扫描前清理全量缓存中的已死进程 */
     if (first_scan) clock_gettime(CLOCK_MONOTONIC, &ts_start);
     find_zygotes();
     if (first_scan) {
@@ -654,7 +655,6 @@ int scan_zygote_children() {
             if (!isdigit((unsigned char)d->d_name[0])) continue;
             int pid = atoi(d->d_name);
             if (pid < 1000) continue;
-            if (is_tracked(pid)) continue;
             if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) continue;
             if (!is_process_safe_to_inject(cmdline)) continue;
             snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -678,6 +678,10 @@ int scan_zygote_children() {
             }
             if (!is_parent_zygote(ppid)) continue;
             if (is_isolated_uid(uid)) continue;
+            /* 全量应用 PID 缓存：无条件记录所有 zygote 子进程（含已停用/
+               未追踪应用），规则变化时可快速定位 pid 立即挂载 */
+            all_apps_upsert(pid, uid, cmdline);
+            if (is_tracked(pid)) continue;   /* 挂载候选仍跳过已追踪（避免重复处理） */
             strncpy(entries[entry_count].cmdline, cmdline, sizeof(entries[entry_count].cmdline) - 1);
             entries[entry_count].cmdline[sizeof(entries[entry_count].cmdline) - 1] = '\0';
             entries[entry_count].pid = pid;
@@ -750,6 +754,7 @@ void reap_zombies() {
 
 static void do_cleanup() {
     g_should_exit = 1;
+    all_apps_cleanup();   /* 释放全量应用 PID 缓存 */
     if (g_inotify_fd >= 0) {
         close(g_inotify_fd);
         g_inotify_fd = -1;

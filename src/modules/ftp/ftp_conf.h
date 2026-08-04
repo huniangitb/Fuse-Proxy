@@ -4,10 +4,6 @@
  * ftp_conf.h — ftp.conf 解析（FTP 服务器账号配置）
  *
  * 格式（INI 风格）：
- *   [GLOBAL]
- *   mount_base = /mnt/nsp_ftp
- *   timeout = 30
- *
  *   [云盘]
  *   host = ftp.example.com
  *   port = 21
@@ -15,8 +11,8 @@
  *   password = mypass
  *   remote_dir = /
  *
- * 每个 [server] 段定义一个 FTP 服务器；段名即挂载命名与变量名来源
- * （FTP_<段名>，挂载前缀 = <mount_base>/<段名>）。
+ * 每个 [server] 段定义一个 FTP 服务器；段名即虚拟前缀与变量名来源
+ * （FTP_<段名>，虚拟前缀 = /<段名>，FUSE 访问 /0/<段名>/... 直接命中）。
  * 支持 '#' 注释与空行；'=' 两侧允许空格。
  */
 #include <stdbool.h>
@@ -26,7 +22,7 @@
 
 /* FTP 服务器配置（FtpServerCfg：段名/连接/远程根） */
 typedef struct FtpServerCfg {
-    char name[64];          /* 服务器名（ftp.conf 段名）：挂载命名 + 变量名 FTP_<name> */
+    char name[64];          /* 服务器名（ftp.conf 段名）：虚拟前缀 /<name> + 变量名 FTP_<name> */
     char host[256];
     int port;
     char user[64];
@@ -37,7 +33,6 @@ typedef struct FtpServerCfg {
 typedef struct FtpServerList {
     FtpServerCfg servers[FTP_CONF_MAX_SERVERS];
     int count;
-    char mount_base[PATH_MAX];   /* [GLOBAL] mount_base（默认 /mnt/nsp_ftp） */
 } FtpServerList;
 
 /* 解析 ftp.conf。返回 0 成功；负值失败（文件不可读/无 server 段）。 */

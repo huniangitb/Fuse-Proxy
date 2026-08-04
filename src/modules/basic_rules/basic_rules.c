@@ -66,6 +66,9 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     out->is_virtual_ancestor = r.is_virtual_ancestor;
     out->is_redirect_target = r.is_redirect_target;
     out->is_other_app_pkg = r.is_other_app_pkg;
+    out->is_ftp = r.is_ftp;
+    strncpy(out->ftp_backend, r.ftp_backend, sizeof out->ftp_backend - 1);
+    out->ftp_backend[sizeof out->ftp_backend - 1] = '\0';
     return 0;
 }
 

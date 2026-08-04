@@ -13,6 +13,13 @@ typedef struct {
     bool is_allow;           // true=ALLOW 规则, false=REDIRECT 规则
 } RedirectRule;
 
+/* FTP 后端规则：`FTP <虚拟前缀> <段名>`（段名 = ftp.conf [段名]）。
+   规则所在段决定作用域：GLOBAL 段=全局，应用段=仅该应用。 */
+typedef struct {
+    char virtual_prefix[MAX_PATH_LEN];  /* 虚拟前缀（不含 user_id，如 /云盘） */
+    char backend_name[64];              /* FTP 段名（ftp.conf [段名]） */
+} FtpRule;
+
 typedef struct {
     char pkg_name[128];
     int user_id;         
@@ -33,6 +40,9 @@ typedef struct {
     RedirectRule* redir_rules;
     int redir_count;
     int redir_capacity;
+    FtpRule* ftp_rules;      /* FTP <虚拟前缀> <段名> 规则 */
+    int ftp_count;
+    int ftp_capacity;
     TrieNode* trie_root;
     char** var_names;
     char** var_values;      /* 原始值（含 $ 占位），动态变量运行时展开用 */
@@ -60,6 +70,10 @@ void config_lock_read();
 void config_unlock_read();
 void config_lock_write();
 void config_unlock_write();
+
+/* FTP 规则匹配（供规则模块 resolve 用）：sub_path 命中 FTP 规则虚拟前缀
+   （最长前缀优先）时输出 FTP 段名（ftp.conf [段名]），返回 true */
+bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_out, size_t sz);
 void scan_active_users();
 void load_config_rules(const char* main_conf_path);
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed);

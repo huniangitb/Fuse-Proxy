@@ -619,12 +619,26 @@ static bool br_is_virtual_ancestor(AppConfig* cfg, const char* sub_path) {
                 }
             }
         }
+        if (!res && cfg->ftp_rules) {
+            for (int i = 0; i < cfg->ftp_count; i++) {
+                if (strlen(sub_path) < strlen(cfg->ftp_rules[i].virtual_prefix)) {
+                    if (br_get_virtual_child(sub_path, cfg->ftp_rules[i].virtual_prefix, nullptr, 0)) { res = true; break; }
+                }
+            }
+        }
     }
     if (!res) {
         if (g_global_cfg.redir_rules) {
             for (int i = 0; i < g_global_cfg.redir_count; i++) {
                 if (strlen(sub_path) < strlen(g_global_cfg.redir_rules[i].virtual_prefix)) {
                     if (br_get_virtual_child(sub_path, g_global_cfg.redir_rules[i].virtual_prefix, nullptr, 0)) { res = true; break; }
+                }
+            }
+        }
+        if (!res && g_global_cfg.ftp_rules) {
+            for (int i = 0; i < g_global_cfg.ftp_count; i++) {
+                if (strlen(sub_path) < strlen(g_global_cfg.ftp_rules[i].virtual_prefix)) {
+                    if (br_get_virtual_child(sub_path, g_global_cfg.ftp_rules[i].virtual_prefix, nullptr, 0)) { res = true; break; }
                 }
             }
         }
@@ -709,6 +723,25 @@ void br_resolve(const BrQuery* q, BrResult* out) {
     }
     out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, sub_path);
     out->is_redirect_target = br_is_redirect_target(cfg, sub_path);
+    /* FTP 规则（`FTP <虚拟前缀> <段名>`）：应用段规则优先、GLOBAL 兜底
+       （与 REDIRECT 作用域语义一致）；命中后由框架分派给 FTP 后端模块 */
+    if (cfg && cfg != &g_global_cfg) {
+        char bk[64] = {0};
+        if (!config_ftp_match(cfg, sub_path, bk, sizeof bk))
+            config_ftp_match(&g_global_cfg, sub_path, bk, sizeof bk);
+        if (bk[0]) {
+            out->is_ftp = true;
+            strncpy(out->ftp_backend, bk, sizeof out->ftp_backend - 1);
+            out->ftp_backend[sizeof out->ftp_backend - 1] = '\0';
+        }
+    } else {
+        char bk[64] = {0};
+        if (config_ftp_match(cfg ? cfg : &g_global_cfg, sub_path, bk, sizeof bk) && bk[0]) {
+            out->is_ftp = true;
+            strncpy(out->ftp_backend, bk, sizeof out->ftp_backend - 1);
+            out->ftp_backend[sizeof out->ftp_backend - 1] = '\0';
+        }
+    }
     out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
     out->monitor_on = (cfg && cfg->monitor_explicit) ? cfg->monitor : g_global_cfg.monitor;
     config_unlock_read();
@@ -759,28 +792,49 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
    函数化替代宏：避免对 &g_global_cfg 这类常量地址判空触发 -Waddress */
 static int br_process_cfg_dirs(AppConfig* c, const char* sub_path, int user_id,
                                const char* pkg, bool is_root, NspDirEntry* out, int max, int n) {
-    if (!c || !c->redir_rules || n >= max) return n;
-    for (int i = 0; i < c->redir_count && n < max; i++) {
-        char name[256];
-        if (br_get_virtual_child(sub_path, c->redir_rules[i].virtual_prefix, name, sizeof(name))) {
-            char full_vpath[PATH_MAX];
-            if (is_root) snprintf(full_vpath, PATH_MAX, "/%s", name);
-            else snprintf(full_vpath, PATH_MAX, "%s/%s", sub_path, name);
-            if (strcmp(full_vpath, c->redir_rules[i].virtual_prefix) == 0) {
-                char dummy[PATH_MAX];
-                if (!build_real_base_from_target(c->redir_rules[i].real_target,
-                        (user_id >= 0 ? user_id : 0), dummy, sizeof dummy, c, &g_global_cfg,
-                        pkg && pkg[0] ? pkg : "unknown")) continue;
+    if (!c || n >= max) return n;
+    /* REDIRECT 虚拟目录合成 */
+    if (c->redir_rules) {
+        for (int i = 0; i < c->redir_count && n < max; i++) {
+            char name[256];
+            if (br_get_virtual_child(sub_path, c->redir_rules[i].virtual_prefix, name, sizeof(name))) {
+                char full_vpath[PATH_MAX];
+                if (is_root) snprintf(full_vpath, PATH_MAX, "/%s", name);
+                else snprintf(full_vpath, PATH_MAX, "%s/%s", sub_path, name);
+                if (strcmp(full_vpath, c->redir_rules[i].virtual_prefix) == 0) {
+                    char dummy[PATH_MAX];
+                    if (!build_real_base_from_target(c->redir_rules[i].real_target,
+                            (user_id >= 0 ? user_id : 0), dummy, sizeof dummy, c, &g_global_cfg,
+                            pkg && pkg[0] ? pkg : "unknown")) continue;
+                }
+                bool dup = false;
+                for (int k = 0; k < n; k++) {
+                    if (strcmp(out[k].name, name) == 0) { dup = true; break; }
+                }
+                if (!dup) {
+                    strncpy(out[n].name, name, sizeof out[n].name - 1);
+                    out[n].name[sizeof out[n].name - 1] = '\0';
+                    out[n].is_dir = true;
+                    n++;
+                }
             }
-            bool dup = false;
-            for (int k = 0; k < n; k++) {
-                if (strcmp(out[k].name, name) == 0) { dup = true; break; }
-            }
-            if (!dup) {
-                strncpy(out[n].name, name, sizeof out[n].name - 1);
-                out[n].name[sizeof out[n].name - 1] = '\0';
-                out[n].is_dir = true;
-                n++;
+        }
+    }
+    /* FTP 虚拟目录合成：FTP <虚拟前缀> <段名> 规则的前缀条目（如 /0/ 下显示"云盘"） */
+    if (c->ftp_rules) {
+        for (int i = 0; i < c->ftp_count && n < max; i++) {
+            char name[256];
+            if (br_get_virtual_child(sub_path, c->ftp_rules[i].virtual_prefix, name, sizeof name)) {
+                bool dup = false;
+                for (int k = 0; k < n; k++) {
+                    if (strcmp(out[k].name, name) == 0) { dup = true; break; }
+                }
+                if (!dup) {
+                    strncpy(out[n].name, name, sizeof out[n].name - 1);
+                    out[n].name[sizeof out[n].name - 1] = '\0';
+                    out[n].is_dir = true;
+                    n++;
+                }
             }
         }
     }
