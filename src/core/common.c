@@ -10,6 +10,9 @@
 #include <stdatomic.h>
 #include <sys/eventfd.h>
 #include <poll.h>
+#ifdef TARGET_ANDROID
+#include <sys/xattr.h>
+#endif
 #define FALLBACK_ERR_LOG ERROR_LOG_PATH
 
 LogLevel g_min_log_level = LOG_INFO;
@@ -182,6 +185,55 @@ int mkdir_recursive(const char *dir) {
         }
     }
     if (access(tmp, F_OK) != 0 && mkdir(tmp, 0755) != 0) return -1;
+    return 0;
+}
+
+/* 递归创建目录（带父目录属性继承，原 config_parser.c 提供，迁至公共工具） */
+static void sync_attributes(const char* source_parent, const char* target_path) {
+    struct stat st;
+    if (lstat(source_parent, &st) != 0) return;
+    if (lchown(target_path, st.st_uid, st.st_gid) != 0) {}
+    chmod(target_path, st.st_mode & 07777);
+#ifdef TARGET_ANDROID
+    char context[256];
+    ssize_t ctx_len = lgetxattr(source_parent, "security.selinux", context, sizeof(context));
+    if (ctx_len > 0) {
+        lsetxattr(target_path, "security.selinux", context, (size_t)ctx_len, 0);
+    } else if (strstr(target_path, STORAGE_BASE) == target_path) {
+        const char* default_ctx = "u:object_r:media_rw_data_file:s0";
+        lsetxattr(target_path, "security.selinux", default_ctx, strlen(default_ctx) + 1, 0);
+    }
+#endif
+}
+
+static void inherit_from_parent(const char* real_path) {
+    char parent[PATH_MAX]; strncpy(parent, real_path, PATH_MAX - 1);
+    char* last = strrchr(parent, '/');
+    if (last) {
+        if (last == parent) strcpy(parent, "/");
+        else *last = '\0';
+        sync_attributes(parent, real_path);
+    }
+}
+
+int mkdir_recursive_p(const char *path, mode_t mode) {
+    if (!path || !path[0]) return -1;
+    char tmp[PATH_MAX]; snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (access(tmp, F_OK) != 0) {
+                if (mkdir(tmp, mode) == 0) inherit_from_parent(tmp);
+                else if (errno != EEXIST) return -1;
+            }
+            *p = '/';
+        }
+    }
+    if (access(tmp, F_OK) != 0) {
+        if (mkdir(tmp, mode) == 0) inherit_from_parent(tmp);
+        else if (errno != EEXIST) return -1;
+    }
     return 0;
 }
 /* 核心修复：共享的无效 Unicode/控制字符检测逻辑。

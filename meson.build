@@ -3,7 +3,8 @@ project('ultimate_fuse_system', 'c',
   default_options: [
     'c_std=c23', 
     'warning_level=3', 
-    'strip=true'
+    'strip=true',
+    'b_lundef=false'  # 允许共享库引用主程序导出的公共符号（热插拔模块经 dlopen 解析）
   ]
 )
 
@@ -104,17 +105,20 @@ common_sources = [
     'src/core/uid_map.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/vfs_core.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c']
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c']
 injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
 install_bin_dir = 'bin'
 
+# fuse_daemon：纯框架（回调骨架 + 模块调度 + 存储原语），不链接规则引擎源，
+# 规则能力来自 dlopen 的热插拔模块（basic_rules.so 等）；common.c 为公共工具（日志/路径）。
 executable('fuse_daemon',
-  fuse_daemon_sources + common_sources,
+  fuse_daemon_sources + ['src/core/common.c'],
   include_directories: all_inc_dirs,
   dependencies: project_deps,
   c_args: ['-DFUSE_USE_VERSION=317'],
+  link_args: ['-Wl,--export-dynamic'],  # 导出公共符号，供 dlopen 的热插拔模块解析
   install: true,
   install_dir: install_bin_dir
 )
@@ -143,6 +147,29 @@ executable('log_ctl',
   dependencies: project_deps,
   install: true,
   install_dir: install_bin_dir
+)
+
+# ================= 热插拔模块 =================
+# basic_rules：基础规则模块（REDIRECT/SANDBOX/HIDE/ALLOW/RO），
+# 由 fuse_daemon 启动后 dlopen 热加载。决策引擎自包含，
+# 日志等公共符号经主程序导出表解析（fuse_daemon 需 -Wl,--export-dynamic）。
+basic_rules_sources = [
+    'src/modules/basic_rules/basic_rules.c',
+    'src/modules/basic_rules/br_rules.c',
+    'src/config/config_parser.c',
+    'src/config/path_vars.c',
+    'src/core/path_trie.c',
+    'src/core/uid_map.c',
+    'src/core/fast_pid.c',
+]
+
+shared_library('basic_rules',
+  basic_rules_sources,
+  include_directories: all_inc_dirs,
+  dependencies: [dependency('threads')],
+  name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
+  install: true,
+  install_dir: install_bin_dir + '/modules/basic_rules'
 )
 
 # ================= 测试 =================

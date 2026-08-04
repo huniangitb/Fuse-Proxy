@@ -107,50 +107,7 @@ void strip_trailing_slash(char* path) {
     size_t len = strlen(path);
     if (len > 1 && path[len - 1] == '/' && !(len == 2 && path[0] == '?')) path[len - 1] = '\0';
 }
-static void sync_attributes(const char* source_parent, const char* target_path) {
-    struct stat st;
-    if (lstat(source_parent, &st) != 0) return;
-    if (lchown(target_path, st.st_uid, st.st_gid) != 0) {}
-    chmod(target_path, st.st_mode & 07777);
-#ifdef TARGET_ANDROID
-    char context[256];
-    ssize_t ctx_len = lgetxattr(source_parent, "security.selinux", context, sizeof(context));
-    if (ctx_len > 0) {
-        lsetxattr(target_path, "security.selinux", context, (size_t)ctx_len, 0);
-    } else if (strstr(target_path, STORAGE_BASE) == target_path) {
-        const char* default_ctx = "u:object_r:media_rw_data_file:s0";
-        lsetxattr(target_path, "security.selinux", default_ctx, strlen(default_ctx) + 1, 0);
-    }
-#endif
-}
-static void inherit_from_parent(const char* real_path) {
-    char parent[PATH_MAX]; strncpy(parent, real_path, PATH_MAX - 1);
-    char* last = strrchr(parent, '/');
-    if (last) {
-        if (last == parent) strcpy(parent, "/"); 
-        else *last = '\0';
-        sync_attributes(parent, real_path);
-    }
-}
-int mkdir_recursive_p(const char *path, mode_t mode) {
-    char tmp[PATH_MAX]; char *p = nullptr; snprintf(tmp, sizeof(tmp), "%s", path);
-    size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = 0;
-            if (access(tmp, F_OK) != 0) {
-                if (mkdir(tmp, mode) == 0) inherit_from_parent(tmp);
-                else if (errno != EEXIST) return -1;
-            }
-            *p = '/';
-        }
-    }
-    if (access(tmp, F_OK) != 0) {
-        if (mkdir(tmp, mode) == 0) inherit_from_parent(tmp);
-        else if (errno != EEXIST) return -1;
-    }
-    return 0;
-}
+/* mkdir_recursive_p / inherit_from_parent / sync_attributes 已迁移至 common.c（公共工具） */
 static char* get_next_token(char** ptr) {
     char* p = *ptr;
     if (!p) return nullptr;

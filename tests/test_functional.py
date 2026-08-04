@@ -8,10 +8,13 @@ import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json
 from pathlib import Path
 
 MNT     = "/tmp/fuse_proxy_test/mnt"
+MODDIR  = "/tmp/fuse_proxy_test/modules"
 STORAGE = "/tmp/fuse_proxy_test/storage"
 CONF    = "/tmp/Namespace-Proxy/injector.conf"
 DAEMON  = os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
+BASIC_RULES = os.environ.get("BASIC_RULES_SO") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "build_gnu", "basic_rules.so"))
 TEST_ID = str(uuid.uuid4())[:8]
 PASS = 0
 FAIL = 0
@@ -57,6 +60,12 @@ def setup_env():
         os.makedirs(f"{STORAGE}/{d}", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
     os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
+    # 热插拔模块：basic_rules.so 放入模块目录（fuse_daemon 启动时 dlopen 加载）
+    os.makedirs(f"{MODDIR}/basic_rules", exist_ok=True)
+    if os.path.exists(BASIC_RULES):
+        shutil.copy(BASIC_RULES, f"{MODDIR}/basic_rules/basic_rules.so")
+    else:
+        print("  ⚠ basic_rules.so 未找到，规则模块不会加载")
     # 预置文件
     for f in ["hello.txt", "Pictures/photo1.jpg", "Documents/report.pdf", "Music/song.mp3"]:
         p = f"{STORAGE}/0/Download/{f}"
@@ -70,7 +79,7 @@ def setup_env():
 def start_daemon():
     proc = subprocess.Popen(
         [DAEMON, "--root=" + STORAGE, "--rules=" + CONF,
-         "-f", MNT, "info"],
+         "--modules-dir=" + MODDIR, "-f", MNT, "info"],
         stdout=open("/tmp/fuse_d.log", "w"),
         stderr=subprocess.STDOUT)
     for _ in range(15):
