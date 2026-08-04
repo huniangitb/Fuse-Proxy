@@ -316,10 +316,10 @@ typedef struct FtpBackendFile {
     FtpBackend* bk;
     char ftp_path[PATH_MAX];   /* 远程路径（release 上传目标） */
     int  tmp_fd;               /* 写模式上传缓存 fd；-1=未建 */
-    bool writing;              /* true=写模式（release STOR 上传）；false=读模式（按需下载） */
-    /* 读模式：按需下载——缓冲 = read count（动态分配，用完释放，最低延迟）；
-       conn 为复用 FTP 连接（避免每次 read 新建连接被 vsftpd 限制 → EIO） */
-    FtpConn* conn;             /* 复用连接；NULL=未打开，read 时按需创建 */
+    bool writing;              /* true=写模式（release STOR 上传）；false=读模式（内存分段流式） */
+    /* 读模式：内存分段下载——每段 = read count，分配 → 下载 → 传给应用 → 释放；
+       复用连接 + 失败重试，传完一段销毁一段（无缓冲上限，防爆内存） */
+    FtpConn* conn;             /* 复用连接；NULL=未打开 */
 } FtpBackendFile;
 
 /* 句柄为小整数 ID（非指针）：Android tagged-pointer 检测会因 fi->fh 存
@@ -370,9 +370,8 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     int accmode = flags & O_ACCMODE;
     bool writing = (accmode != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC));
     if (!writing) {
-        /* 读模式：按需下载。open 仅验证存在并取文件大小，read 时按
-           count 动态分配缓冲 → RETR 指定偏移 → 返回 → 释放（最低延迟，
-           防大文件全量 malloc 爆内存，连接用完即关） */
+        /* 读模式：内存分段流式——open 仅验证存在，
+           read 时按 count 分配 → RETR 下载 → 传给应用 → 释放 */
         FtpConn c;
         if (ftp_conn_open(bk, &c) != 0) { free(f); return -EIO; }
         long long size;
@@ -381,7 +380,7 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
         }
         ftp_close(&c);
         f->writing = false;
-        FTP_DBG("open-read: 按需下载 path=%s ftp=%s size=%lld\n", path, f->ftp_path, size);
+        FTP_DBG("open-read: 内存分段 path=%s ftp=%s size=%lld\n", path, f->ftp_path, size);
         *h = ftp_handle_alloc(f);
         if (*h == 0) { free(f); return -EIO; }
         return 0;
@@ -413,11 +412,13 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     }
     f->tmp_fd = tfd;
     f->writing = true;
-    unlink(tpath);   /* 句柄持有，路径立即释放 */
+    unlink(tpath);
     *h = ftp_handle_alloc(f);
         if (*h == 0) { free(f); return -EIO; }
     return 0;
 }
+
+
 
 int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
     (void)mode;
@@ -445,7 +446,14 @@ int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got)
         *got = (size_t)n;
         return 0;
     }
-    /* 读模式：按需下载，复用连接，失败自动重试一次（防瞬断 EIO） */
+    /* 读模式：内存分段——分配 → 下载 → 传应用 → 释放（传完一段销毁一段） */
+    if (f->writing) {
+        ssize_t n = pread(f->tmp_fd, buf, size, off);
+        if (n < 0) return -errno;
+        *got = (size_t)n;
+        return 0;
+    }
+    /* 读模式：复用连接，失败重试 */
     if (!f->conn) {
         f->conn = malloc(sizeof(FtpConn));
         if (!f->conn) return -ENOMEM;
@@ -456,12 +464,10 @@ int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got)
     size_t dn = 0;
     int rc = ftp_retr(f->conn, f->ftp_path, off, dbuf, size, &dn);
     if (rc != 0) {
-        /* 首次失败：关闭旧连接，新建连接重试一次（安卓网络瞬断/超时） */
         ftp_close(f->conn); free(f->conn); f->conn = NULL;
         f->conn = malloc(sizeof(FtpConn));
         if (f->conn && ftp_conn_open(f->bk, f->conn) == 0) {
-            dn = 0;
-            rc = ftp_retr(f->conn, f->ftp_path, off, dbuf, size, &dn);
+            dn = 0; rc = ftp_retr(f->conn, f->ftp_path, off, dbuf, size, &dn);
         }
         if (rc != 0) {
             if (f->conn) { ftp_close(f->conn); free(f->conn); f->conn = NULL; }
@@ -469,9 +475,9 @@ int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got)
         }
     }
     if (dn > 0) memcpy(buf, dbuf, dn);
-    free(dbuf);
+    free(dbuf);  /* 传完一段，销毁一段 */
     *got = dn;
-    FTP_DBG("read: 按需下载 off=%lld req=%zu got=%zu\n", (long long)off, size, dn);
+    FTP_DBG("read: 内存分段 off=%lld req=%zu got=%zu\n", (long long)off, size, dn);
     return 0;
 }
 

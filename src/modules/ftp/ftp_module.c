@@ -43,19 +43,7 @@ static volatile sig_atomic_t g_hotload_stop = 0;
 
 /* FTP 服务器不可用时每 1 分钟重连探活线程 */
 static pthread_t g_retry_tid = 0;
-static volatile sig_atomic_t g_retry_stop = 0;
-
-/* 每 60s 对全部后端重连探活：服务器故障恢复后自动恢复可用性。
-   分段 sleep（每 1s 检查退出标志），保证 exit 时最快 1s 内 join 返回 */
-static void* ftp_retry_thread(void* arg) {
-    (void)arg;
-    while (!g_retry_stop) {
-        for (int i = 0; i < 60 && !g_retry_stop; i++) sleep(1);
-        if (g_retry_stop) break;
-        ftp_backend_retry_all();
-    }
-    return NULL;
-}
+/* 持久化会话自动处理重连（ftp_session_ensure + NOOP 保活），无需 retry 线程 */
 
 /* get_vars：向框架注册 FTP_<段名>=<挂载前缀> 变量 */
 static int ftp_module_get_vars(const char*** names, const char*** values, int* count) {
@@ -176,12 +164,7 @@ static int ftp_module_init(const NspFrameworkApi* api) {
         LOG_WRN("ftp_module: 启动 ftp.conf 监控线程失败");
         g_hotload_tid = 0;
     }
-    /* 启动每 1 分钟重连探活线程 */
-    g_retry_stop = 0;
-    if (pthread_create(&g_retry_tid, NULL, ftp_retry_thread, NULL) != 0) {
-        LOG_WRN("ftp_module: 启动重连线程失败");
-        g_retry_tid = 0;
-    }
+    /* 持久化会话自动处理重连（ftp_session_ensure + NOOP 保活），无需 retry 线程 */
     return 0;
 }
 
@@ -191,11 +174,8 @@ static void ftp_module_exit(void) {
         pthread_join(g_hotload_tid, NULL);
         g_hotload_tid = 0;
     }
-    g_retry_stop = 1;
-    if (g_retry_tid) {
-        pthread_join(g_retry_tid, NULL);
-        g_retry_tid = 0;
-    }
+    /* 无 retry 线程 */
+    /* 无 retry 线程不需 join */
     ftp_backend_clear();
 }
 
