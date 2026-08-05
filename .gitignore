@@ -5,3 +5,5 @@ build
 .atomcode
 .mimocode
 fuse3-android
+__pycache__/
+*.pyc

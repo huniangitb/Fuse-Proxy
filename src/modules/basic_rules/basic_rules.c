@@ -55,6 +55,7 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     out->user_id = r.user_id;
     strncpy(out->sub_path, r.sub_path, sizeof out->sub_path - 1);
     strncpy(out->pkg, r.pkg, sizeof out->pkg - 1);
+    out->monitor_on = r.monitor_on;   /* 修复：漏拷贝导致全局 MONITOR ON 时 IO 监控失效 */
     out->hidden = r.hidden;
     out->ro = r.ro;
     out->has_redir = r.has_redir;
