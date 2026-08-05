@@ -41,7 +41,7 @@ if target_os == 'android'
   json_c = cc.find_library('json-c', dirs: [fuse3_root + '/lib'], static: true, required: true)
 else
   # 主线 libfuse3: 使用 pkg-config 或系统库
-  fuse3_dep = dependency('fuse3', version: '>=3.0', required: true)
+  fuse3_dep = dependency('fuse3', version: '>=3.6', required: true)
   fuse_inc = []
   fuse_lib = fuse3_dep
 
@@ -167,6 +167,7 @@ shared_library('basic_rules',
   basic_rules_sources,
   include_directories: all_inc_dirs,
   dependencies: [dependency('threads')],
+  c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
   install: true,
   install_dir: install_bin_dir + '/modules/basic_rules'
@@ -178,7 +179,6 @@ ftp_module_sources = [
     'src/modules/ftp/ftp_module.c',
     'src/modules/ftp/ftp_conf.c',
     'src/modules/ftp/ftp_backend_libcurl.c',
-    'src/core/common.c',
 ]
 
 if target_os == 'gnu'
@@ -223,6 +223,7 @@ shared_library('ftp_module',
   ftp_module_sources,
   include_directories: [all_inc_dirs, ftp_curl_inc],
   dependencies: [dependency('threads'), ftp_curl_dep],
+  c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,
   install_dir: install_bin_dir + '/modules/ftp_module'

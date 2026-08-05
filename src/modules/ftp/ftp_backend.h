@@ -32,6 +32,7 @@ int  ftp_backend_readdir(const char* path, NspDirEntry* entries, int max);
 int  ftp_backend_open(const char* path, int flags, uint64_t* h);
 int  ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
 int  ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);
+int  ftp_backend_flush(uint64_t h);
 int  ftp_backend_release(uint64_t h);
 int  ftp_backend_create(const char* path, mode_t mode, uint64_t* h);
 int  ftp_backend_unlink(const char* path);

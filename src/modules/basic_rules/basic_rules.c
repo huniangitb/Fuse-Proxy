@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "nsp_module.h"
 #include "module_loader.h"
-#include "common.h"
+#include "nsp_module.h"
 #include "br_rules.h"
 
 /*
