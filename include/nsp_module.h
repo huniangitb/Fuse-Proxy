@@ -175,6 +175,10 @@ typedef struct NspModuleOps {
     int  (*backend_open)(const char* path, int flags, uint64_t* h);
     int  (*backend_read)(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
     int  (*backend_write)(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);
+    /* 数据收尾（FUSE FLUSH，close() 同步等待）：写模式完成上传但**不销毁
+       句柄**（FLUSH 可因 dup/fork 多次调用，销毁须等 RELEASE）；可为 NULL
+       （NULL 时 FLUSH 仅做缓存失效）。返回 0 成功。 */
+    int  (*backend_flush)(uint64_t h);
     int  (*backend_release)(uint64_t h);
     int  (*backend_create)(const char* path, mode_t mode, uint64_t* h);
     int  (*backend_unlink)(const char* path);
@@ -206,5 +210,79 @@ typedef struct NspModuleInfo {
 
 /* 模块必须导出的符号名 */
 #define NSP_MODULE_INFO_SYMBOL "nsp_module_info"
+
+/* ================= 模块公共运行时 ABI =================
+   以下设施经主程序导出符号表（fuse_daemon 链接 -Wl,--export-dynamic）
+   在 dlopen 时解析：模块源码层面仅依赖本头（+ 标准库），不 include 任何
+   框架内部头、不编译框架源码——模块间仅 ABI 兼容，可互相独立源码开发。
+   log_internal 的 level 取值与框架 LogLevel 一致（0=DEBUG 1=INFO
+   2=WARN 3=ERROR），模块编译期无需框架枚举定义。 */
+
+/* 框架 TU（未定义 NSP_MODULE_BUILD）跳过本段：声明/宏以 common.h 为准，
+   避免 conflicting types 与宏重定义（与 include 顺序无关）；仅模块编译
+   （meson 模块 target 加 -DNSP_MODULE_BUILD）激活本 ABI 段。 */
+#ifdef NSP_MODULE_BUILD
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <signal.h>
+#include <limits.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <dirent.h>
+#include <libgen.h>
+
+#ifdef TARGET_ANDROID
+#define NSP_CONFIG_DIR    "/data/Namespace-Proxy"
+#define NSP_STORAGE_BASE  "/data/media"
+#else
+#define NSP_CONFIG_DIR    "/var/fuse-proxy"
+#define NSP_STORAGE_BASE  "/var/fuse-proxy/storage"
+#endif
+
+#define NSP_LOG_DIR  NSP_CONFIG_DIR "/log"
+
+/* 框架导出符号（模块经主程序导出表解析） */
+extern int g_min_log_level;
+extern char g_real_root[];
+extern _Atomic(bool) g_log_shutdown;
+
+void log_internal(int level, const char* format, ...);
+int  mkdir_recursive(const char* dir);
+int  mkdir_recursive_p(const char* path, unsigned int mode);
+void path_sanitize(char* out, size_t size, const char* path);
+int  path_contains_invalid_chars(const char* path);
+
+#define NSP_LOG_DBG(format, ...)    log_internal(0, format "\n" __VA_OPT__(,) __VA_ARGS__)
+#define NSP_LOG_DBG_PERF(format, ...) do { if (g_min_log_level == 0) log_internal(0, format "\n" __VA_OPT__(,) __VA_ARGS__); } while (0)
+#define NSP_LOG(format, ...)        log_internal(1, format "\n" __VA_OPT__(,) __VA_ARGS__)
+#define NSP_LOG_WRN(format, ...)    log_internal(2, format "\n" __VA_OPT__(,) __VA_ARGS__)
+#define NSP_LOG_ERR(format, ...)    log_internal(3, format "\n" __VA_OPT__(,) __VA_ARGS__)
+#define NSP_PERROR(msg)             NSP_LOG_ERR("%s: %s", msg, strerror(errno))
+
+/* 兼容别名：模块沿用原 LOG/LOG_ERR/LOG_DBG 宏名，仅改 include 即可迁移 */
+#define LOG_DBG     NSP_LOG_DBG
+#define LOG_DBG_PERF NSP_LOG_DBG_PERF
+#define LOG         NSP_LOG
+#define LOG_WRN     NSP_LOG_WRN
+#define LOG_ERR     NSP_LOG_ERR
+#define PERROR      NSP_PERROR
+#define CONFIG_DIR  NSP_CONFIG_DIR
+#define STORAGE_BASE NSP_STORAGE_BASE
+#define LOG_DIR     NSP_LOG_DIR
+
+#endif /* NSP_MODULE_BUILD（模块独立 ABI；框架 TU 用 common.h 声明） */
 
 #endif /* NSP_MODULE_H */

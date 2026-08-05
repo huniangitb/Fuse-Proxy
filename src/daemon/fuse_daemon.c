@@ -817,7 +817,8 @@ static int vfs_release(const char *path, struct fuse_file_info *fi) {
             if (module_backend_lookup(sub, &bops) == 0 && bops->backend_release) {
                 int rc = bops->backend_release(fi->fh & ~NSP_FH_BACKEND_FLAG);
                 module_backend_put(bops);
-                /* 句柄已在 FLUSH 中释放（上传+释放提前完成）：-EINVAL 视为成功 */
+                /* 句柄销毁唯一入口（FLUSH 只收尾数据不释放句柄）：
+                   -EINVAL 容忍作防御（模块异常/重复释放时避免传播错误） */
                 return (rc == -EINVAL) ? 0 : (rc < 0 ? rc : 0);
             }
         }
@@ -846,31 +847,39 @@ static int vfs_fsync(const char *path, int datasync, struct fuse_file_info *fi) 
 }
 
 static int vfs_flush(const char *path, struct fuse_file_info *fi) {
-    /* close() 同步等待 FLUSH 返回——写模式 STOR 上传必须在此完成！
-       release 是异步回调，close() 返回后立即读取会读到未上传完成的
-       旧数据/0 字节（32MB 大文件写后立即读必现）；backend_release
-       在此完成上传并释放句柄（读模式则停线程+释放） */
+    /* close() 同步等待 FLUSH 返回——写模式 STOR 上传必须在此完成（FLUSH
+       错误会传播给 close() → 应用读到 EIO）。backend_flush 只收尾数据、
+       **不销毁句柄**：FUSE 的 FLUSH 可因 dup/fork 对同一句柄调用多次，
+       销毁必须等 RELEASE（最后一个引用关闭后），否则存活 fd 的后续
+       读写会命中已销毁句柄（-EINVAL 确定性失败） */
     if ((fi->fh & NSP_FH_BACKEND_FLAG) && module_backend_active()) {
         int uid = -1; char sub[PATH_MAX];
         if (fw_parse_path(path, &uid, sub, sizeof sub) == 0) {
             const NspModuleOps* bops = NULL;
-            if (module_backend_lookup(sub, &bops) == 0 && bops->backend_release) {
-                int rc = bops->backend_release(fi->fh & ~NSP_FH_BACKEND_FLAG);
+            if (module_backend_lookup(sub, &bops) == 0) {
+                int rc = 0;
+                if (bops->backend_flush)
+                    rc = bops->backend_flush(fi->fh & ~NSP_FH_BACKEND_FLAG);
                 module_backend_put(bops);
                 if (rc == 0) {
-                    /* 上传完成：使路径缓存失效（attr_timeout=1.0 下旧大小/
-                       不存在缓存会让立即读取 getattr 命中旧值；libfuse3
-                       仅有 fuse_invalidate_path，同时失效 attr+entry） */
+                    /* 数据已落盘（上传完成）：使路径缓存失效。
+                       attr_timeout=1.0 下旧大小/不存在缓存会让立即读取
+                       getattr 命中旧值；libfuse3 仅有 fuse_invalidate_path
+                       （同时失效 attr+entry） */
                     struct fuse_context* ctx = fuse_get_context();
                     if (ctx && ctx->fuse) fuse_invalidate_path(ctx->fuse, path);
                 }
-                /* 句柄已释放（重复 FLUSH/RELEASE）：视为成功 */
-                return (rc == -EINVAL) ? 0 : (rc < 0 ? rc : 0);
+                return rc < 0 ? rc : 0;
             }
         }
         return 0;
     }
-    fsync(fi->fh);
+    /* 非后端文件：仅写模式 open 才在 close 时同步落盘（只读 open 无需
+       写回，避免每次 close 无条件 fsync 的热路径吞吐回归）；fsync 失败
+       传播给 close()（写回错误不再静默吞掉） */
+    if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+        if (fsync(fi->fh) == -1) return -errno;
+    }
     return 0;
 }
 

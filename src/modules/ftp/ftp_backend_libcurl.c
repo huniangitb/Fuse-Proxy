@@ -9,7 +9,7 @@
  */
 
 #include "nsp_module.h"
-#include "common.h"
+#include "nsp_module.h"
 #include "ftp_backend.h"
 #include <curl/curl.h>
 #include <pthread.h>
@@ -51,6 +51,7 @@ typedef struct FtpBackendFile {
     char ftp_path[PATH_MAX]; /* 远程路径 */
     int  tmp_fd;             /* 写模式本地缓存 fd */
     bool writing;            /* true=写模式（release 上传）；false=读模式 */
+    bool uploaded;           /* 写模式数据已 STOR 上传（FLUSH 置位，release 补传判定） */
     size_t file_size;        /* 文件大小（用于读模式边界检查） */
     CURL* read_curl;         /* 读模式独立句柄（下载线程专用，不复用共享 bk->curl） */
     /* 滑动读缓冲（下载线程持续填充，read 实时取，避免"等缓冲满一段才回传"） */
@@ -265,7 +266,10 @@ static int ensure_curl(FtpBackend* bk) {
         curl_easy_setopt(bk->curl, CURLOPT_USERNAME, bk->cfg.user);
         curl_easy_setopt(bk->curl, CURLOPT_PASSWORD, bk->cfg.pass);
         curl_easy_setopt(bk->curl, CURLOPT_CONNECTTIMEOUT, 30L);
-        curl_easy_setopt(bk->curl, CURLOPT_TIMEOUT, 60L);
+        /* 弱网适配：不用 CURLOPT_TIMEOUT 总超时（慢速大文件传输会被误杀），
+           改低速率判定——持续 30s 低于 1KB/s 才算卡死，数据在流动就不超时 */
+        curl_easy_setopt(bk->curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+        curl_easy_setopt(bk->curl, CURLOPT_LOW_SPEED_TIME, 30L);
         curl_easy_setopt(bk->curl, CURLOPT_FTP_RESPONSE_TIMEOUT, 30L);
         curl_easy_setopt(bk->curl, CURLOPT_FTP_SKIP_PASV_IP, 1L);
         curl_easy_setopt(bk->curl, CURLOPT_USE_SSL, CURLUSESSL_NONE);
@@ -520,7 +524,10 @@ static CURL* ftp_read_curl_new(const FtpBackend* bk) {
     curl_easy_setopt(rc, CURLOPT_USERNAME, bk->cfg.user);
     curl_easy_setopt(rc, CURLOPT_PASSWORD, bk->cfg.pass);
     curl_easy_setopt(rc, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(rc, CURLOPT_TIMEOUT, 60L);
+    /* 弱网适配：不用 CURLOPT_TIMEOUT 总超时（慢速大文件传输会被误杀），
+       改低速率判定——持续 30s 低于 1KB/s 才算卡死，数据在流动就不超时 */
+    curl_easy_setopt(rc, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(rc, CURLOPT_LOW_SPEED_TIME, 30L);
     curl_easy_setopt(rc, CURLOPT_FTP_RESPONSE_TIMEOUT, 30L);
     curl_easy_setopt(rc, CURLOPT_FTP_SKIP_PASV_IP, 1L);
     curl_easy_setopt(rc, CURLOPT_USE_SSL, CURLUSESSL_NONE);
@@ -561,7 +568,19 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     // 读模式：滑动缓冲 + 下载线程——FTP 数据持续拉取写入缓冲并实时广播，
     // read 拿到覆盖数据立即回传（不等缓冲满）；缓冲仅作慢速消费端背压粘合
     struct stat st;
-    if (ftp_backend_getattr(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+    int grc = ftp_backend_getattr(path, &st);
+    /* 写后立即读：FLUSH 的 fuse_invalidate_path 是异步通知，close() 返回后
+       立即 open 可能短暂命中内核 negative 缓存（并发多 FLUSH 时处理延迟），
+       导致刚上传成功的文件 ENOENT——短重试覆盖该 close-to-open 窗口；
+       文件真不存在时 5×20ms 后仍 ENOENT，正确性不变 */
+    if (grc != 0 || !S_ISREG(st.st_mode)) {
+        for (int retry = 0; retry < 5; retry++) {
+            usleep(20000);
+            grc = ftp_backend_getattr(path, &st);
+            if (grc == 0 && S_ISREG(st.st_mode)) break;
+        }
+    }
+    if (grc != 0 || !S_ISREG(st.st_mode)) {
         pthread_mutex_destroy(&f->f_lock);
         free(f);
         return -ENOENT;
@@ -653,6 +672,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
    调用方须确保 read_curl 有效（错误时线程内销毁，read 层重建）。 */
 static void* ftp_dl_thread(void* arg) {
     FtpBackendFile* f = arg;
+    int dl_backoff_ms = 500;   /* 弱网适配：错误退避指数增长（500ms→8s 封顶） */
     while (!f->dl_stop) {
         pthread_mutex_lock(&f->f_lock);
         /* 等待：未停止 且 未 restart，且（已 EOF 或 缓冲满不可扩）时挂起。
@@ -670,6 +690,7 @@ static void* ftp_dl_thread(void* arg) {
             f->rbuf_base = f->rbuf_off;
             f->rbuf_eof = false;
             f->dl_error = false;
+            dl_backoff_ms = 500;   /* 恢复信号：重置退避 */
         }
         if (f->rbuf_eof) {
             /* EOF 且无 restart：回到等待（release 置 dl_stop 或 read 置 restart 唤醒） */
@@ -716,12 +737,15 @@ static void* ftp_dl_thread(void* arg) {
         if (res == CURLE_OK || res == CURLE_REMOTE_FILE_NOT_FOUND) {
             f->rbuf_eof = true;   /* 读到文件尾 */
         } else if (res != CURLE_WRITE_ERROR) {
-            /* 真错误：保留句柄（curl 自动重连），短暂退避后重试，
-               避免忙循环；open/read 的等待由 cond_timedwait 超时兜底 */
+            /* 真错误：保留句柄（curl 自动重连），指数退避后重试——弱网下
+               瞬时失败（断连/超时）可能持续，固定 100ms 会忙循环且网络
+               未恢复时反复失败；500ms 起 ×2 封顶 8s，恢复后 restart 重置。
+               open/read 的等待由 cond_timedwait 超时兜底 */
             f->dl_error = true;
             pthread_cond_broadcast(&f->dl_cond);
             pthread_mutex_unlock(&f->f_lock);
-            usleep(100000);
+            usleep((useconds_t)dl_backoff_ms * 1000);
+            if (dl_backoff_ms < 8000) dl_backoff_ms *= 2;
             continue;
         }
         pthread_cond_broadcast(&f->dl_cond);
@@ -829,65 +853,97 @@ int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_
     return 0;
 }
 
+/* 写模式上传：读本地临时文件 → STOR 全量上传（带并发重试）。
+   成功置 uploaded；FLUSH（同步收尾）与 RELEASE（防御补传）共用。
+   f_lock 互斥：FLUSH 与延迟 RELEASE 可能并发进入（两阶段拆除后句柄
+   存活到 RELEASE），无锁会让两个线程同时 lseek/read/close(tmp_fd)
+   → 上传失败（写模式场景 f_lock 无其他竞争，read 只用于读模式）。
+   返回 0 成功，负值 errno 风格。 */
+static int ftp_backend_upload(FtpBackendFile* f) {
+    pthread_mutex_lock(&f->f_lock);
+    if (!f->writing || f->uploaded) {
+        pthread_mutex_unlock(&f->f_lock);
+        return 0;
+    }
+    off_t sz = lseek(f->tmp_fd, 0, SEEK_END);
+    if (sz < 0) { pthread_mutex_unlock(&f->f_lock); return -EIO; }
+    lseek(f->tmp_fd, 0, SEEK_SET);
+
+    char* data = sz > 0 ? malloc((size_t)sz) : NULL;
+    if (sz > 0 && !data) { pthread_mutex_unlock(&f->f_lock); return -ENOMEM; }
+
+    size_t got = 0;
+    if (sz > 0) {
+        /* 单次 read() 对 32MB 级大文件可能读不满（内核限制单次返回量），
+           必须循环读满——否则 got < sz，STOR 上传长度不匹配/失败，
+           FTP 服务器留下 0 字节文件（大文件写入静默丢失） */
+        while (got < (size_t)sz) {
+            ssize_t n = read(f->tmp_fd, data + got, (size_t)sz - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+    }
+    close(f->tmp_fd);
+    f->tmp_fd = -1;
+
+    int rc = 0;
+    if (ensure_curl(f->bk) == 0) {
+        struct ReadBuf rb = {data ? data : "", got, 0};
+        CURLcode res = CURLE_OK;
+        /* 上传失败自动重试：并发 STOR（多进程同时 close）或网络瞬态
+           会让共享句柄的 perform 返回 CURLE_BAD_FUNCTION_ARGUMENT 等
+           瞬时错误（已实测 res=43）；重试吸收竞争窗口，避免上传静默丢失
+           （FLUSH 错误会传播给 close() → 应用读到 EIO） */
+        int backoff_ms = 200;   /* 弱网适配：上传失败指数退避 200ms→3.2s 封顶 */
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (attempt > 0) {
+                usleep((useconds_t)backoff_ms * 1000);
+                if (backoff_ms < 3200) backoff_ms *= 2;
+            }
+            if (ensure_curl(f->bk) != 0) { res = CURLE_FAILED_INIT; break; }
+            rb.pos = 0;
+            pthread_mutex_lock(&f->bk->op_lock);
+            ftp_reset_opts(f->bk);
+            curl_easy_setopt(f->bk->curl, CURLOPT_URL, f->ftp_path);
+            curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 1L);
+            curl_easy_setopt(f->bk->curl, CURLOPT_INFILESIZE, (long)got);
+            curl_easy_setopt(f->bk->curl, CURLOPT_READFUNCTION, read_cb);
+            curl_easy_setopt(f->bk->curl, CURLOPT_READDATA, &rb);
+            res = curl_easy_perform(f->bk->curl);
+            curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
+            pthread_mutex_unlock(&f->bk->op_lock);
+            if (res == CURLE_OK) break;
+        }
+        if (res != CURLE_OK) {
+            reset_curl(f->bk);
+            rc = -EIO;
+        }
+    } else {
+        rc = -EIO;
+    }
+    free(data);
+    if (rc == 0) f->uploaded = true;
+    return rc;
+}
+
+/* FLUSH 数据收尾：写模式完成 STOR 上传但**保留句柄**——FUSE 的 FLUSH 在
+   每次 close() 调用（dup/fork 可多次），句柄销毁必须等 RELEASE（最后一个
+   引用关闭后），否则存活 fd 的后续读写会命中已销毁句柄（-EINVAL）；
+   读模式无操作。返回 0 成功。 */
+int ftp_backend_flush(uint64_t h) {
+    FtpBackendFile* f = ftp_handle_get(h);
+    if (!f) return -EINVAL;
+    return ftp_backend_upload(f);
+}
+
 int ftp_backend_release(uint64_t h) {
     FtpBackendFile* f = ftp_handle_get(h);
     if (!f) return -EINVAL;
     int rc = 0;
 
-    if (f->writing) {
-        // 写模式：读临时文件 → STOR 上传
-        off_t sz = lseek(f->tmp_fd, 0, SEEK_END);
-        if (sz < 0) { close(f->tmp_fd); f->tmp_fd = -1; ftp_handle_free(h); free(f); return -EIO; }
-        lseek(f->tmp_fd, 0, SEEK_SET);
-
-        char* data = sz > 0 ? malloc((size_t)sz) : NULL;
-        if (sz > 0 && !data) { close(f->tmp_fd); f->tmp_fd = -1; ftp_handle_free(h); free(f); return -ENOMEM; }
-
-        size_t got = 0;
-        if (sz > 0) {
-            /* 单次 read() 对 32MB 级大文件可能读不满（内核限制单次返回量），
-               必须循环读满——否则 got < sz，STOR 上传长度不匹配/失败，
-               FTP 服务器留下 0 字节文件（大文件写入静默丢失） */
-            while (got < (size_t)sz) {
-                ssize_t n = read(f->tmp_fd, data + got, (size_t)sz - got);
-                if (n <= 0) break;
-                got += (size_t)n;
-            }
-        }
-        close(f->tmp_fd);
-        f->tmp_fd = -1;
-
-        if (ensure_curl(f->bk) == 0) {
-            struct ReadBuf rb = {data ? data : "", got, 0};
-            CURLcode res = CURLE_OK;
-            /* 上传失败自动重试：并发 STOR（多进程同时 close）或网络瞬态
-               会让共享句柄的 perform 返回 CURLE_BAD_FUNCTION_ARGUMENT 等
-               瞬时错误（已实测 res=43）；重试吸收竞争窗口，避免上传静默丢失
-               （FLUSH 错误会传播给 close() → 应用读到 EIO） */
-            for (int attempt = 0; attempt < 3; attempt++) {
-                if (attempt > 0) usleep(50000);
-                if (ensure_curl(f->bk) != 0) { res = CURLE_FAILED_INIT; break; }
-                rb.pos = 0;
-                pthread_mutex_lock(&f->bk->op_lock);
-                ftp_reset_opts(f->bk);
-                curl_easy_setopt(f->bk->curl, CURLOPT_URL, f->ftp_path);
-                curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 1L);
-                curl_easy_setopt(f->bk->curl, CURLOPT_INFILESIZE, (long)got);
-                curl_easy_setopt(f->bk->curl, CURLOPT_READFUNCTION, read_cb);
-                curl_easy_setopt(f->bk->curl, CURLOPT_READDATA, &rb);
-                res = curl_easy_perform(f->bk->curl);
-                curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
-                pthread_mutex_unlock(&f->bk->op_lock);
-                if (res == CURLE_OK) break;
-            }
-            if (res != CURLE_OK) {
-                reset_curl(f->bk);
-                rc = -EIO;
-            }
-        } else {
-            rc = -EIO;
-        }
-        free(data);
+    if (f->writing && !f->uploaded) {
+        /* FLUSH 未完成上传（未调用/失败）时补传，随后统一销毁句柄 */
+        if (ftp_backend_upload(f) != 0) rc = -EIO;
     }
 
     // 读模式：停止并 join 下载线程 + 等待在途 read 完成 + 释放滑动缓冲 + 销毁独立读句柄

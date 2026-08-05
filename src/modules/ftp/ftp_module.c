@@ -2,7 +2,7 @@
 #include "ftp_conf.h"
 #include "ftp_backend.h"
 #include "nsp_module.h"
-#include "common.h"
+#include "nsp_module.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +186,7 @@ static const NspModuleOps ftp_module_ops = {
     .backend_open     = ftp_backend_open,
     .backend_read     = ftp_backend_read,
     .backend_write    = ftp_backend_write,
+    .backend_flush    = ftp_backend_flush,
     .backend_release  = ftp_backend_release,
     .backend_create   = ftp_backend_create,
     .backend_unlink   = ftp_backend_unlink,
