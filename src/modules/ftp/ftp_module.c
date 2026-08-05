@@ -42,7 +42,6 @@ static pthread_t g_hotload_tid = 0;
 static volatile sig_atomic_t g_hotload_stop = 0;
 
 /* FTP 服务器不可用时每 1 分钟重连探活线程 */
-static pthread_t g_retry_tid = 0;
 /* 持久化会话自动处理重连（ftp_session_ensure + NOOP 保活），无需 retry 线程 */
 
 /* get_vars：向框架注册 FTP_<段名>=<挂载前缀> 变量 */
