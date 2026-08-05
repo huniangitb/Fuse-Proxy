@@ -366,6 +366,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_readdir) {
         NspDirEntry entries[1024];
+        memset(entries, 0, sizeof entries);   /* 清零防御：防后端未填充字段残留栈垃圾 */
         int n = bops->backend_readdir(sub_path, entries, 1024);
         module_backend_put(bops);
         if (n < 0) VFS_RETURN(n);
@@ -816,7 +817,8 @@ static int vfs_release(const char *path, struct fuse_file_info *fi) {
             if (module_backend_lookup(sub, &bops) == 0 && bops->backend_release) {
                 int rc = bops->backend_release(fi->fh & ~NSP_FH_BACKEND_FLAG);
                 module_backend_put(bops);
-                return rc < 0 ? rc : 0;
+                /* 句柄已在 FLUSH 中释放（上传+释放提前完成）：-EINVAL 视为成功 */
+                return (rc == -EINVAL) ? 0 : (rc < 0 ? rc : 0);
             }
         }
         return 0;   /* 后端句柄未命中后端：不 close（非 fd），避免崩溃 */
@@ -844,8 +846,31 @@ static int vfs_fsync(const char *path, int datasync, struct fuse_file_info *fi) 
 }
 
 static int vfs_flush(const char *path, struct fuse_file_info *fi) {
-    (void)path;
-    (void)fi;
+    /* close() 同步等待 FLUSH 返回——写模式 STOR 上传必须在此完成！
+       release 是异步回调，close() 返回后立即读取会读到未上传完成的
+       旧数据/0 字节（32MB 大文件写后立即读必现）；backend_release
+       在此完成上传并释放句柄（读模式则停线程+释放） */
+    if ((fi->fh & NSP_FH_BACKEND_FLAG) && module_backend_active()) {
+        int uid = -1; char sub[PATH_MAX];
+        if (fw_parse_path(path, &uid, sub, sizeof sub) == 0) {
+            const NspModuleOps* bops = NULL;
+            if (module_backend_lookup(sub, &bops) == 0 && bops->backend_release) {
+                int rc = bops->backend_release(fi->fh & ~NSP_FH_BACKEND_FLAG);
+                module_backend_put(bops);
+                if (rc == 0) {
+                    /* 上传完成：使路径缓存失效（attr_timeout=1.0 下旧大小/
+                       不存在缓存会让立即读取 getattr 命中旧值；libfuse3
+                       仅有 fuse_invalidate_path，同时失效 attr+entry） */
+                    struct fuse_context* ctx = fuse_get_context();
+                    if (ctx && ctx->fuse) fuse_invalidate_path(ctx->fuse, path);
+                }
+                /* 句柄已释放（重复 FLUSH/RELEASE）：视为成功 */
+                return (rc == -EINVAL) ? 0 : (rc < 0 ? rc : 0);
+            }
+        }
+        return 0;
+    }
+    fsync(fi->fh);
     return 0;
 }
 
