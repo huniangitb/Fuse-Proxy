@@ -173,22 +173,57 @@ shared_library('basic_rules',
 )
 
 # ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库，无 FUSE 实现）。
-# 只提供 FTP 操作方法（backend_*），由 fuse_daemon 框架在路径命中时调用；
-# 不依赖 libfuse（Android 静态库带 GNU 符号版本无法链接共享库，且框架已
-# 实现 FUSE，模块无需重复）。fuse 无关头文件仅 libc。
+# 使用 libcurl（8.21.0+）处理所有 FTP 协议操作，模块仅负责转发。
 ftp_module_sources = [
     'src/modules/ftp/ftp_module.c',
     'src/modules/ftp/ftp_conf.c',
-    'src/modules/ftp/ftp_client.c',
-    'src/modules/ftp/ftp_backend.c',
+    'src/modules/ftp/ftp_backend_libcurl.c',
     'src/core/common.c',
 ]
 
+if target_os == 'gnu'
+  ftp_curl_dep = dependency('libcurl', version: '>=8.21.0', required: false)
+  if not ftp_curl_dep.found()
+    cc = meson.get_compiler('c')
+    ftp_curl_dep = cc.find_library('curl', required: true)
+    # find_library 不校验版本：运行时检查 curl_version_info >= 8.21.0，
+    # 防止系统旧 curl 绕过主查找的版本门槛（编译失败或行为不符）
+    curl_ver_check = cc.run('''
+      #include <curl/curl.h>
+      #include <stdio.h>
+      int main(void) {
+        curl_version_info_data *v = curl_version_info(CURLVERSION_NOW);
+        int maj = 0, min = 0, pat = 0;
+        if (sscanf(v->version, "%d.%d.%d", &maj, &min, &pat) != 3) return 1;
+        if (maj > 8 || (maj == 8 && (min > 21 || (min == 21 && pat >= 0)))) return 0;
+        fprintf(stderr, "libcurl %s 过旧，需要 >= 8.21.0\\n", v->version);
+        return 1;
+      }
+    ''', dependencies: ftp_curl_dep)
+    if not curl_ver_check.compiled() or curl_ver_check.returncode() != 0
+      error('系统 libcurl 版本过旧，需要 >= 8.21.0（fallback find_library 未通过版本校验）')
+    endif
+  endif
+  ftp_curl_inc = []
+else
+  curl_a_dir = '/tmp/curl-8.21.0/lib/.libs'
+  curl_inc_dir = '/tmp/curl-8.21.0/include'
+  ftp_curl_dep = meson.get_compiler('c').find_library('curl',
+    dirs: [curl_a_dir], required: true, static: true)
+  ftp_curl_inc = include_directories(curl_inc_dir)
+  # 编译期校验：确认预构建 libcurl 头文件含代码使用的新 API
+  # （CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，curl >= 7.55.0），防止误用旧库
+  if not meson.get_compiler('c').has_header_symbol('curl/curl.h',
+      'CURLINFO_CONTENT_LENGTH_DOWNLOAD_T', include_directories: ftp_curl_inc)
+    error('预构建 libcurl（/tmp/curl-8.21.0）头文件缺少 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，请确认使用 curl >= 8.21.0')
+  endif
+endif
+
 shared_library('ftp_module',
   ftp_module_sources,
-  include_directories: all_inc_dirs,
-  dependencies: [dependency('threads')],
-  name_prefix: '',  # 生成 ftp_module.so（加载器按 <模块名>.so 扫描，与目录名一致）
+  include_directories: [all_inc_dirs, ftp_curl_inc],
+  dependencies: [dependency('threads'), ftp_curl_dep],
+  name_prefix: '',
   install: true,
   install_dir: install_bin_dir + '/modules/ftp_module'
 )
