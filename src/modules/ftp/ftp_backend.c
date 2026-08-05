@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "ftp_backend.h"
 #include "ftp_client.h"
-#include "common.h"   /* CONFIG_DIR 与 mkdir_recursive */
+#include "nsp_module.h"   /* CONFIG_DIR 与 mkdir_recursive */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "br_rules.h"
-#include "common.h"       /* LOG_*、g_log_shutdown、g_real_root、STORAGE_BASE 等 */
+#include "nsp_module.h"       /* LOG_*、g_log_shutdown、g_real_root、STORAGE_BASE 等 */
 #include "path_vars.h"
 #include "uid_map.h"
 #include "fast_pid.h"
@@ -374,7 +374,14 @@ static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* p
                                         const char* current_pkg, uid_t uid, TrieMatch* tm_out) {
     if (!path) return -ENOENT;
     const char* sub_path_orig = path;
-    if (path[0] == '/' && isdigit((unsigned char)path[1])) {
+    /* 仅当完整 user_id 目录（/数字 或 /数字/...）才剥离数字前缀——与框架
+       vfs_readdir 的 uid_dir 判定一致。若数字后不是 '/' 或结尾（如 /1_abc.txt、
+       /12_34 这类普通文件/目录名），不得剥离：否则 sub_path 被截成 "/"，
+       规则判定（hidden/redirect_target）基于错误路径，沙盒+应用上下文中
+       数字前缀条目会被误过滤（用户报告：数字 x_ 前缀文件/文件夹不显示，
+       字母前缀正常） */
+    if (path[0] == '/' && isdigit((unsigned char)path[1]) &&
+        (path[2] == '\0' || path[2] == '/')) {
         if (path_user_id_out) *path_user_id_out = atoi(path + 1);
         const char* slash = strchr(path + 1, '/');
         sub_path_orig = slash ? slash : "/";
