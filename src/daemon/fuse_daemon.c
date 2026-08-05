@@ -655,14 +655,18 @@ static int vfs_mkdir(const char *path, mode_t mode) {
         log_fuse_err("MKDIR_RO_DENIED", path, EROFS);
         VFS_RETURN(-EROFS);
     }
-    /* 后端分派：mkdir 由模块方法创建 */
+    /* 后端分派：mkdir 由模块方法创建（rr.is_ftp 短路，避免非 FTP 路径付出
+       无条件 rwlock + backend_match 扫描） */
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_mkdir) {
+    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops && bops->backend_mkdir) {
         int brc = bops->backend_mkdir(sub_path, mode);
         module_backend_put(bops);
         if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
         VFS_RETURN(0);
     }
+    /* fallback：lookup 成功但未走后端分支时释放引用，防止 backend_refs 泄漏
+       导致模块无法热卸载（loader 等待 backend_refs == 0） */
+    if (bops) module_backend_put(bops);
     int ret = mkdir(p, is_redir ? 0775 : mode);
     if (ret == -1) {
         if (errno == ENOENT) {
