@@ -461,8 +461,12 @@ void log_internal(LogLevel level, const char* format, ...) {
     while (mlen > 0 && (msg_buf[mlen - 1] == '\n' || msg_buf[mlen - 1] == '\r'))
         msg_buf[--mlen] = '\0';
     if (level == LOG_IO) {
-        /* 监控日志始终落盘（MONITOR ON 时操作路径可查，见 persist_io_log） */
+#ifdef NSP_ENABLE_IO_LOG
+        /* 监控日志落盘（LOG_DIR/persistent_io.log）：仅调试/监控构建
+           （-DNSP_ENABLE_IO_LOG）启用——发布构建默认关闭该文件输出，
+           避免弱网/低端设备上频繁 I/O 落盘；log_ctl/UDS 查询不受影响 */
         persist_io_log(msg_buf);
+#endif
     } else if (g_persist_all_logs) {
         if (level == LOG_LOGCAT) persist_log_to_disk("logcat", msg_buf, true);
         else persist_log_to_disk("sys", msg_buf, true);
