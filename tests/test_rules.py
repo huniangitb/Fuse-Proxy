@@ -35,6 +35,11 @@ def setup():
     Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").parent.mkdir(parents=True,exist_ok=True)
     Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").write_text("deep")
     Path(f"{STORAGE}/0/Empty").mkdir(exist_ok=True)
+    # 多用户存储隔离：真实路径按 user_id 分区（storage/<uid>/...），
+    # 各用户独立数据——多用户用例验证 /1/ /2/ /10/ 命中各自分区
+    for uid, content in [("1", "hello-user1"), ("2", "hello-user2"), ("10", "hello-user10")]:
+        (Path(STORAGE)/uid/"Download").mkdir(parents=True, exist_ok=True)
+        (Path(STORAGE)/uid/"Download/hi.txt").write_text(content)
 
 def wconf(t): open(CONF,"w").write(t.strip())
 def start():
@@ -89,6 +94,16 @@ REDIRECT /云盘/ /Download/""", [
         ("R:目录可见","0/云盘","EXISTS"),
         ("R:读文件","0/云盘/hi.txt","hello"),
     ],"1.REDIRECT基本")
+
+    # ── 多用户路径剥离：/1/、/2/、/10/ 与 /0/ 等价——FUSE 剥离任意
+    # 数字 user_id 前缀后命中同一规则（Android 多用户 /user_id/...）──
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /云盘/ /Download/""", [
+        ("MU:user1目录可见","1/云盘","EXISTS"),
+        ("MU:user1读文件","1/云盘/hi.txt","hello-user1"),
+        ("MU:user2读文件","2/云盘/hi.txt","hello-user2"),
+        ("MU:user10读文件","10/云盘/hi.txt","hello-user10"),
+    ],"1b.多用户路径剥离")
 
     # ── 嵌套 REDIRECT ──
     run("""[GLOBAL] MONITOR OFF

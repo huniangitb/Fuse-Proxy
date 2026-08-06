@@ -101,9 +101,15 @@ static int fw_parse_path(const char* path, int* user_id_out, char* sub_path_out,
     if (!path) return -ENOENT;
     const char* sub = path;
     if (path[0] == '/' && isdigit((unsigned char)path[1])) {
-        if (user_id_out) *user_id_out = atoi(path + 1);
-        const char* slash = strchr(path + 1, '/');
-        sub = slash ? slash : "/";
+        /* 数字序列后是结尾或 '/' 才是完整 user_id 目录（/0、/10/...）；
+           普通数字前缀文件名（/1_abc.txt）不剥离（与规则层判定一致） */
+        const char* d = path + 1;
+        while (isdigit((unsigned char)*d)) d++;
+        if (*d == '\0' || *d == '/') {
+            if (user_id_out) *user_id_out = atoi(path + 1);
+            const char* slash = strchr(path + 1, '/');
+            sub = slash ? slash : "/";
+        }
     }
     if (path_contains_invalid_chars(sub)) {
         path_sanitize(sub_path_out, sz, sub);
@@ -160,8 +166,12 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path, co
         else snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
         if (uid != 0) {
             /* 轻量探测；user_id 目录条目豁免 redirect_target（与 readdir 一致） */
-            bool uid_dir = (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1]) &&
-                            (item_sub_path[2] == '\0' || item_sub_path[2] == '/'));
+            bool uid_dir = false;
+            if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
+                const char* d = item_sub_path + 1;
+                while (isdigit((unsigned char)*d)) d++;
+                uid_dir = (*d == '\0' || *d == '/');
+            }
             struct fuse_context* c = fuse_get_context();
             NspQueryCtx iq = { .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_sub_path };
             NspProbeResult ir; memset(&ir, 0, sizeof ir);
@@ -414,8 +424,12 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
                （Trie 无数字前缀规则）；剥离 /0/ 后会误判为根目录 sandbox 重定向目标，
                故豁免其 redirect_target 检查（仅 hidden 生效） */
             if (ctx->uid != 0) {
-                bool uid_dir = (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1]) &&
-                                (item_sub_path[2] == '\0' || item_sub_path[2] == '/'));
+                bool uid_dir = false;
+                if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
+                    const char* d = item_sub_path + 1;
+                    while (isdigit((unsigned char)*d)) d++;
+                    uid_dir = (*d == '\0' || *d == '/');
+                }
                 NspQueryCtx iq = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = item_sub_path };
                 NspProbeResult ir; memset(&ir, 0, sizeof ir);
                 if (module_dispatch_probe(&iq, &ir) == NSP_DISPATCH_OK && ir.valid) {

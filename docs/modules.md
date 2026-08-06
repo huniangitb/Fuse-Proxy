@@ -93,7 +93,8 @@ read/write/release/unlink/mkdir/rmdir/rename/truncate 等）在解析出 real_pa
 | `backend_readdir(path, entries, max)` | 返回 `NspDirEntry` 条目数组（框架 filler） |
 | `backend_open(path, flags, &h)` / `backend_create(path, mode, &h)` | 打开/创建，`h` 为模块句柄（框架透传） |
 | `backend_read(h, buf, size, off, &got)` / `backend_write(h, buf, size, off, &wrote)` | 读写 |
-| `backend_release(h)` | 关闭（写路径：上传完成） |
+| `backend_flush(h)` | FUSE FLUSH 数据收尾（写路径上传完成），**保留句柄**——FLUSH 可因 dup/fork 多次调用，销毁须等 RELEASE |
+| `backend_release(h)` | 关闭（句柄销毁唯一入口；写路径未上传则补传） |
 | `backend_unlink/mkdir/rmdir/rename/truncate(...)` | 删除/建目录/重命名/截断 |
 
 无后端模块时框架走本地文件系统直通，`module_backend_active()` 快速路径
@@ -117,6 +118,12 @@ const NspModuleInfo nsp_module_info = {
     .ops = &g_br_ops,
 };
 ```
+
+> **独立编译要求**：模块编译须定义 `-DNSP_MODULE_BUILD`（激活 `nsp_module.h`
+> 中的模块公共运行时 ABI 段：LOG 宏 / CONFIG_DIR / 框架导出符号声明）；
+> 源码只依赖 `nsp_module.h` + 标准库，不 include 框架内部头、不编译框架
+> 源码（日志/路径符号经主程序 export-dynamic 导出表解析）。完整开发指南
+> 见 `docs/module-dev.md`。
 
 ## 4. 加载流程
 
@@ -190,6 +197,9 @@ python3 tests/test_rules.py       # 规则边界 26 用例
 python3 tests/test_functional.py  # 功能 + SQLite + 并发 34 用例
 python3 tests/test_modules.py     # 热插拔 10 用例
 python3 tests/test_ftp.py         # FTP 后端端到端 10 用例（vsftpd 匿名服务 + $FTP_云盘 变量 + REDIRECT）
+
+# 模块独立编译（第三方模块：只依赖 include/nsp_module.h，须定义 NSP_MODULE_BUILD）
+cc -shared -fPIC -std=c23 -DNSP_MODULE_BUILD -Iinclude my_module.c -o my_module.so
 ```
 
 产物：`fuse_daemon`（框架，含后端分派）、`basic_rules.so`（规则模块，
@@ -203,4 +213,5 @@ FUSE 依赖，安装到 `bin/modules/ftp_module/`）、`injector`/`log_monitor`/
 - 配置规范：`docs/ai-config-guide.md`（injector.conf 语法）
 - 路径变量：`docs/path-variables.md`（`$package` / 用户变量展开）
 - 配置广播：`docs/config-broadcast.md`（UDS 广播 JSON）
+- 模块开发：`docs/module-dev.md`（ABI 兼容模块开发指南）
 - 测试说明：`tests/README.md`

@@ -35,6 +35,29 @@ static UidCacheSlot g_uid_cache[UID_CACHE_SIZE];
 static UidMapEntry *g_uid_maps = NULL;
 static int g_uid_map_count = 0;
 
+/* ============ readdir 目录级 probe 缓存 ============
+   br_probe 是 readdir 逐条目过滤的热路径：同一父目录的连续条目共享一次
+   「根→父目录」trie 下降与 uid→cfg 解析，命中后仅按最后一段查子节点，
+   避免每条目重复全路径 trie 遍历与 uid 缓存锁（大目录 O(n) 锁风暴）。
+   线程私有（FUSE 多线程各自独立，readdir 循环在单线程内顺序执行）；
+   配置重载（g_br_cfg_gen 递增，写锁内）后失效，杜绝 trie/cfg 悬垂。 */
+typedef struct {
+    bool valid;
+    uint64_t gen;              /* 配置代际（br_reload_config 递增） */
+    uid_t uid;
+    pid_t pid;
+    char dir[PATH_MAX];        /* 父目录 sub_path（"/" 或 "/a/b"） */
+    AppConfig* cfg;            /* 命中的应用段（可 NULL=system） */
+    char current_pkg[128];
+    const TrieNode* app_dir_node;   /* app trie 父目录最深节点（可 NULL） */
+    bool app_dir_hidden;            /* 根→父目录累积 hidden（app） */
+    const TrieNode* g_dir_node;     /* global trie 父目录最深节点（可 NULL） */
+    bool g_dir_hidden;              /* 根→父目录累积 hidden（global） */
+} BrProbeDirCache;
+
+static _Thread_local BrProbeDirCache g_probe_dir_cache;
+static uint64_t g_br_cfg_gen = 0;
+
 static void load_uid_map(void) {
     free(g_uid_maps);
     int cap = UID_MAP_INIT_CAPACITY;
@@ -77,6 +100,7 @@ void br_reload_config(void) {
     load_config_rules(g_br_rules_path);
     load_uid_map();
     clear_uid_cache();
+    g_br_cfg_gen++;   /* 使目录级 probe 缓存失效（trie/cfg 可能被 free） */
     config_unlock_write();
     LOG_DBG("br 已检测到配置变更，重新加载配置，全局监控状态: %s",
             g_global_cfg.monitor ? "开启" : "关闭");
@@ -279,30 +303,32 @@ static void br_trie_resolve(AppConfig* cfg, const char* sub_path, TrieMatch* out
     out->ro = false;
     out->has_redir = false;
     out->redir[0] = '\0';
+    out->app_node = NULL;
+    out->global_node = NULL;
     if (cfg && cfg->trie_root) {
         bool h = false, r = false;
         char redir[PATH_MAX]; redir[0] = '\0';
-        if (trie_lookup(cfg->trie_root, sub_path, &h, &r, redir, sizeof(redir))) {
-            if (h) out->hidden = true;
-            if (r) out->ro = true;
-            if (redir[0] != '\0') {
-                out->has_redir = true;
-                strncpy(out->redir, redir, sizeof(out->redir) - 1);
-                out->redir[sizeof(out->redir) - 1] = '\0';
-            }
+        /* trie_lookup_full：一次下降同时取得 hidden/ro/redir 与完整匹配节点，
+           供 resolve 复用判定 virtual_ancestor/redirect_target（省重复遍历） */
+        out->app_node = trie_lookup_full(cfg->trie_root, sub_path, &h, &r, redir, sizeof(redir));
+        if (h) out->hidden = true;
+        if (r) out->ro = true;
+        if (redir[0] != '\0') {
+            out->has_redir = true;
+            strncpy(out->redir, redir, sizeof(out->redir) - 1);
+            out->redir[sizeof(out->redir) - 1] = '\0';
         }
     }
     if (g_global_cfg.trie_root) {
         bool h = false, r = false;
         char redir[PATH_MAX]; redir[0] = '\0';
-        if (trie_lookup(g_global_cfg.trie_root, sub_path, &h, &r, redir, sizeof(redir))) {
-            if (h) out->hidden = true;
-            if (r) out->ro = true;
-            if (!out->has_redir && redir[0] != '\0') {
-                out->has_redir = true;
-                strncpy(out->redir, redir, sizeof(out->redir) - 1);
-                out->redir[sizeof(out->redir) - 1] = '\0';
-            }
+        out->global_node = trie_lookup_full(g_global_cfg.trie_root, sub_path, &h, &r, redir, sizeof(redir));
+        if (h) out->hidden = true;
+        if (r) out->ro = true;
+        if (!out->has_redir && redir[0] != '\0') {
+            out->has_redir = true;
+            strncpy(out->redir, redir, sizeof(out->redir) - 1);
+            out->redir[sizeof(out->redir) - 1] = '\0';
         }
     }
 }
@@ -369,9 +395,10 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, const char* sub_path, con
     return false;
 }
 
-static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out,
-                                        char* sub_path_out, size_t sub_path_size,
-                                        const char* current_pkg, uid_t uid, TrieMatch* tm_out) {
+/* 剥离 /<user_id>/ 前缀 + 非法字符清理，得到 sub_path。
+   返回 0 成功；-ENOENT 表示清理后为空（路径无效，调用方视为不可解析）。 */
+static int br_strip_and_sanitize(const char* path, int* path_user_id_out,
+                                 char* sub_path_out, size_t sub_path_size) {
     if (!path) return -ENOENT;
     const char* sub_path_orig = path;
     /* 仅当完整 user_id 目录（/数字 或 /数字/...）才剥离数字前缀——与框架
@@ -380,11 +407,16 @@ static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* p
        规则判定（hidden/redirect_target）基于错误路径，沙盒+应用上下文中
        数字前缀条目会被误过滤（用户报告：数字 x_ 前缀文件/文件夹不显示，
        字母前缀正常） */
-    if (path[0] == '/' && isdigit((unsigned char)path[1]) &&
-        (path[2] == '\0' || path[2] == '/')) {
-        if (path_user_id_out) *path_user_id_out = atoi(path + 1);
-        const char* slash = strchr(path + 1, '/');
-        sub_path_orig = slash ? slash : "/";
+    if (path[0] == '/' && isdigit((unsigned char)path[1])) {
+        /* 数字序列后必须是结尾或 '/' 才是完整 user_id 目录（/0、/10、
+           /100/...）；普通数字前缀文件名（/1_abc.txt、/12_34）不剥离 */
+        const char* d = path + 1;
+        while (isdigit((unsigned char)*d)) d++;
+        if (*d == '\0' || *d == '/') {
+            if (path_user_id_out) *path_user_id_out = atoi(path + 1);
+            const char* slash = strchr(path + 1, '/');
+            sub_path_orig = slash ? slash : "/";
+        }
     }
     if (path_contains_invalid_chars(sub_path_orig)) {
         path_sanitize(sub_path_out, sub_path_size, sub_path_orig);
@@ -393,6 +425,14 @@ static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* p
         strncpy(sub_path_out, sub_path_orig, sub_path_size - 1);
         sub_path_out[sub_path_size - 1] = '\0';
     }
+    return 0;
+}
+
+static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out,
+                                        char* sub_path_out, size_t sub_path_size,
+                                        const char* current_pkg, uid_t uid, TrieMatch* tm_out) {
+    if (br_strip_and_sanitize(path, path_user_id_out, sub_path_out, sub_path_size) != 0)
+        return -ENOENT;
     if (tm_out) br_trie_resolve(cfg, sub_path_out, tm_out);
     if (uid != 0 && br_is_path_hidden_internal(cfg, sub_path_out, current_pkg, tm_out)) return -ENOENT;
     return 0;
@@ -614,11 +654,11 @@ static bool br_get_virtual_child(const char* parent, const char* desc, char* nam
     return true;
 }
 
-static bool br_is_virtual_ancestor(AppConfig* cfg, const char* sub_path) {
+/* 虚拟祖先判定的线性规则部分（redir/ftp 前缀的祖先检查，不含 trie）——
+   readdir 目录级缓存命中时复用，避免每条目重复全路径 trie 遍历 */
+static bool br_virtual_ancestor_linear(AppConfig* cfg, const char* sub_path) {
     bool res = false;
-    if (cfg && cfg->trie_root) res = trie_is_ancestor(cfg->trie_root, sub_path);
-    if (!res && g_global_cfg.trie_root) res = trie_is_ancestor(g_global_cfg.trie_root, sub_path);
-    if (!res && cfg) {
+    if (cfg) {
         if (cfg->redir_rules) {
             for (int i = 0; i < cfg->redir_count; i++) {
                 if (strlen(sub_path) < strlen(cfg->redir_rules[i].virtual_prefix)) {
@@ -653,11 +693,10 @@ static bool br_is_virtual_ancestor(AppConfig* cfg, const char* sub_path) {
     return res;
 }
 
-static bool br_is_redirect_target(AppConfig* cfg, const char* sub_path) {
+/* redirect_target 判定的线性规则部分（redir 前缀精确匹配 + 根 sandbox），不含 trie */
+static bool br_redirect_target_linear(AppConfig* cfg, const char* sub_path) {
     bool res = false;
-    if (cfg && cfg->trie_root) res = trie_is_redirect_target(cfg->trie_root, sub_path);
-    if (!res && g_global_cfg.trie_root) res = trie_is_redirect_target(g_global_cfg.trie_root, sub_path);
-    if (!res && cfg) {
+    if (cfg) {
         if (cfg->redir_rules) {
             for (int i = 0; i < cfg->redir_count; i++) {
                 if (strcmp(sub_path, cfg->redir_rules[i].virtual_prefix) == 0) { res = true; break; }
@@ -673,6 +712,22 @@ static bool br_is_redirect_target(AppConfig* cfg, const char* sub_path) {
         }
         if (!res && !(cfg && cfg->sandbox_explicit) && g_global_cfg.sandbox && strcmp(sub_path, "/") == 0) res = true;
     }
+    return res;
+}
+
+static bool br_is_virtual_ancestor(AppConfig* cfg, const char* sub_path) {
+    bool res = false;
+    if (cfg && cfg->trie_root) res = trie_is_ancestor(cfg->trie_root, sub_path);
+    if (!res && g_global_cfg.trie_root) res = trie_is_ancestor(g_global_cfg.trie_root, sub_path);
+    if (!res) res = br_virtual_ancestor_linear(cfg, sub_path);
+    return res;
+}
+
+static bool br_is_redirect_target(AppConfig* cfg, const char* sub_path) {
+    bool res = false;
+    if (cfg && cfg->trie_root) res = trie_is_redirect_target(cfg->trie_root, sub_path);
+    if (!res && g_global_cfg.trie_root) res = trie_is_redirect_target(g_global_cfg.trie_root, sub_path);
+    if (!res) res = br_redirect_target_linear(cfg, sub_path);
     return res;
 }
 
@@ -728,8 +783,19 @@ void br_resolve(const BrQuery* q, BrResult* out) {
             }
         }
     }
-    out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, sub_path);
-    out->is_redirect_target = br_is_redirect_target(cfg, sub_path);
+    /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/global 完整匹配节点），
+       直接判定 virtual_ancestor / redirect_target，避免各自再全路径遍历：
+       - virtual_ancestor：最深节点下存在带规则子节点（trie_is_ancestor 语义）
+       - redirect_target：最深节点本身是重定向目标（trie_is_redirect_target 语义）
+       （节点为 NULL = 路径未完整命中，两语义均为 false，与 trie_* 一致） */
+    out->is_virtual_ancestor =
+        ((tm.app_node && trie_any_child_has_rules(tm.app_node)) ||
+         (tm.global_node && trie_any_child_has_rules(tm.global_node))) ||
+        br_virtual_ancestor_linear(cfg, sub_path);
+    out->is_redirect_target =
+        ((tm.app_node && tm.app_node->redir_target) ||
+         (tm.global_node && tm.global_node->redir_target)) ||
+        br_redirect_target_linear(cfg, sub_path);
     /* FTP 规则（`FTP <虚拟前缀> <段名>`）：应用段规则优先、GLOBAL 兜底
        （与 REDIRECT 作用域语义一致）；命中后由框架分派给 FTP 后端模块 */
     if (cfg && cfg != &g_global_cfg) {
@@ -773,10 +839,75 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
     memset(out, 0, sizeof *out);
     char current_pkg[128] = "unknown";
     config_lock_read();
-    AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, current_pkg);
+    uint64_t gen = g_br_cfg_gen;
+    AppConfig* cfg = NULL;
 
     int path_user_id = -1;
     char sub_path[PATH_MAX];
+    if (br_strip_and_sanitize(q->path, &path_user_id, sub_path, sizeof sub_path) != 0) {
+        config_unlock_read();   /* 无效路径：out->valid=false，框架不过滤 */
+        return;
+    }
+
+    /* 提取父目录与条目名："/a/b" → 父 "/a"、名 "b"；"/xxx" → 父 "/"、名 "xxx" */
+    char dir[PATH_MAX];
+    const char* name;
+    size_t name_len;
+    {
+        const char* last = strrchr(sub_path, '/');
+        if (!last) {                       /* 无 '/'（防御） */
+            strncpy(dir, "/", sizeof dir - 1); dir[sizeof dir - 1] = '\0';
+            name = sub_path;
+        } else if (last == sub_path) {     /* "/xxx" → 父目录 "/" */
+            strncpy(dir, "/", sizeof dir - 1); dir[sizeof dir - 1] = '\0';
+            name = last + 1;
+        } else {
+            size_t dlen = (size_t)(last - sub_path);
+            if (dlen >= sizeof dir) dlen = sizeof dir - 1;
+            memcpy(dir, sub_path, dlen);
+            dir[dlen] = '\0';
+            name = last + 1;
+        }
+        name_len = strlen(name);
+    }
+
+    BrProbeDirCache* pc = &g_probe_dir_cache;
+    /* 缓存命中：同线程同一 (uid,pid,父目录) 的连续条目共享一次
+       「根→父目录」trie 下降与 uid→cfg 解析，这里只按最后一段查子节点 */
+    if (pc->valid && pc->gen == gen && pc->uid == q->uid && pc->pid == q->pid &&
+        strcmp(pc->dir, dir) == 0) {
+        cfg = pc->cfg;
+        strncpy(current_pkg, pc->current_pkg, 127); current_pkg[127] = '\0';
+        const TrieNode* ca = trie_find_child(pc->app_dir_node, name, name_len);
+        const TrieNode* cg = trie_find_child(pc->g_dir_node, name, name_len);
+        bool trie_hidden = pc->app_dir_hidden || pc->g_dir_hidden;
+        if (ca && ca->is_hidden) trie_hidden = true;
+        if (cg && cg->is_hidden) trie_hidden = true;
+        TrieMatch tm; memset(&tm, 0, sizeof tm);
+        tm.valid = true;
+        tm.hidden = trie_hidden;
+        /* 完整隐藏判定（CONFIG_DIR/Android 骨架/其他应用/hide 规则），
+           trie 部分用缓存值（tm.valid 使其跳过内部 trie 查询） */
+        if (q->uid != 0 && br_is_path_hidden_internal(cfg, sub_path, current_pkg, &tm)) {
+            out->valid = true;
+            out->hidden = true;
+            config_unlock_read();
+            return;
+        }
+        out->valid = true;
+        out->hidden = trie_hidden;
+        out->is_redirect_target = ((ca && ca->redir_target) || (cg && cg->redir_target)) ||
+                                  br_redirect_target_linear(cfg, sub_path);
+        out->is_virtual_ancestor = ((ca && trie_any_child_has_rules(ca)) ||
+                                    (cg && trie_any_child_has_rules(cg))) ||
+                                   br_virtual_ancestor_linear(cfg, sub_path);
+        out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
+        config_unlock_read();
+        return;
+    }
+
+    /* 未命中：完整路径解析（原逻辑）+ 填充目录缓存 */
+    cfg = br_get_app_cfg(q->uid, q->pid, current_pkg);
     TrieMatch tm;
     if (br_sanitize_and_check_hidden(cfg, q->path, &path_user_id, sub_path, sizeof sub_path,
                                      current_pkg, q->uid, &tm) != 0) {
@@ -790,6 +921,24 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
     out->is_redirect_target = br_is_redirect_target(cfg, sub_path);
     out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, sub_path);
     out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
+
+    /* 填充目录缓存（trie 沿父目录一次下降，后续条目复用） */
+    memset(pc, 0, sizeof *pc);
+    pc->valid = true;
+    pc->gen = gen;
+    pc->uid = q->uid;
+    pc->pid = q->pid;
+    strncpy(pc->dir, dir, sizeof pc->dir - 1);
+    pc->dir[sizeof pc->dir - 1] = '\0';
+    pc->cfg = cfg;
+    strncpy(pc->current_pkg, current_pkg, sizeof pc->current_pkg - 1);
+    pc->current_pkg[sizeof pc->current_pkg - 1] = '\0';
+    bool h = false, r = false;
+    pc->app_dir_node = (cfg && cfg->trie_root) ? trie_walk_to(cfg->trie_root, dir, &h, &r) : NULL;
+    pc->app_dir_hidden = h;
+    h = false; r = false;
+    pc->g_dir_node = g_global_cfg.trie_root ? trie_walk_to(g_global_cfg.trie_root, dir, &h, &r) : NULL;
+    pc->g_dir_hidden = h;
     config_unlock_read();
 }
 
