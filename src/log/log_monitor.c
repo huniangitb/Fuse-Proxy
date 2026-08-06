@@ -26,9 +26,16 @@
 #include <dirent.h>
 #include "common.h"
 #define MAX_MSG_LEN 4096
-#define MAX_IO_LOGS 524288
-#define MAX_SYS_LOGS 200000
-#define MAX_LOGCAT_LOGS 200000
+/* 滑动日志缓冲：按字节上限控制（超出丢弃最旧日志）。
+   IO 日志最大 128MB，普通日志（sys/logcat）各 16MB。
+   条数上限 = 字节上限 / 单条固定大小（LogEntry ≈ MAX_MSG_LEN+16），
+   数组内存 ≈ 字节上限（取代旧版 52 万/20 万条 ≈ 2.1GB/800MB 的预分配）。 */
+#define MAX_IO_LOG_BYTES     (128u * 1024u * 1024u)
+#define MAX_SYS_LOG_BYTES    (16u * 1024u * 1024u)
+#define MAX_LOGCAT_LOG_BYTES (16u * 1024u * 1024u)
+#define MAX_IO_LOGS     (MAX_IO_LOG_BYTES / (MAX_MSG_LEN + 16))
+#define MAX_SYS_LOGS    (MAX_SYS_LOG_BYTES / (MAX_MSG_LEN + 16))
+#define MAX_LOGCAT_LOGS (MAX_LOGCAT_LOG_BYTES / (MAX_MSG_LEN + 16))
 #define DEFAULT_LIMIT 500
 #define MAX_EVENTS 256
 #define RING_CAP 16384
@@ -203,9 +210,9 @@ static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     broadcast_log(type, msg, level);
     time_t now = time(nullptr);
     if (buf->full) {
-        const char *type_str = (type == 1) ? "io" : (type == 3) ? "logcat" : "sys";
-        overflow_write(type_str, msg, level, now);
-        return;
+        /* 滑动缓冲：已满（达到字节/条数上限）时覆盖最旧——丢弃最旧日志，
+           tail 前进腾位，新条目覆盖原 head 位置（不再写溢出文件） */
+        buf->tail = (buf->tail + 1) % buf->max;
     }
     buf->data[buf->head].t = now;
     buf->data[buf->head].level = level;
