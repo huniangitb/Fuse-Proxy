@@ -22,6 +22,11 @@ typedef struct {
     bool ro;         /* app_ro || global_ro */
     bool has_redir;  /* 命中 redirect（app 优先，无则 global） */
     char redir[PATH_MAX];
+    /* trie 完整匹配的最深节点（由 trie_lookup_full 填充，可 NULL）：
+       供 br_resolve 复用一次遍历结果判定 virtual_ancestor / redirect_target，
+       避免各自再全路径遍历（FUSE 热路径每操作最多省 4 次 trie 下降） */
+    const TrieNode* app_node;
+    const TrieNode* global_node;
 } TrieMatch;
 
 /* 模块初始化：rules_path = --rules= 参数，disable_sandbox = --disable-sandbox 标志 */
