@@ -147,6 +147,14 @@ def main():
             ok("列目录（FTP 根内容可见）") if known_file in items or orig in items else fail("列目录", f"缺 {known_file}")
         except Exception as e: fail("列目录", str(e))
 
+        # 1b. 多用户：/1/云盘、/2/云盘 剥离 user_id 后同样命中 FTP 段名
+        try:
+            items1 = sorted(os.listdir(m/"1"/SERVER))
+            ok("多用户:user1(/1/云盘)列目录一致") if items1 == items else fail("多用户:user1列目录", f"{items1}")
+            got1 = (m/"2"/SERVER/orig).read_text().strip()
+            ok("多用户:user2(/2/云盘)读文件一致") if got1 == "ftp-original-content" else fail("多用户:user2读文件", f"got='{got1}'")
+        except Exception as e: fail("多用户FTP命中", str(e))
+
         # 2. 读现有 FTP 文件
         try:
             got = (m/"0"/SERVER/orig).read_text().strip()

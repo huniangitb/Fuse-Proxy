@@ -4,7 +4,7 @@ fuse_daemon 完整测试套件
 =======================
 测试场景: 基础文件操作 / SQLite 数据库 / 并发压力
 """
-import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json
+import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json, sqlite3
 from pathlib import Path
 
 MNT     = "/tmp/fuse_proxy_test/mnt"
@@ -282,8 +282,10 @@ def _worker_write(wid, ops):
         except Exception as e:
             fail(f"并发写入 w{wid} op{i}", str(e))
 
-def _worker_sqlite(wid, ops):
-    """SQLite 并发负载"""
+def _worker_sqlite(wid, ops, result_q=None):
+    """SQLite 并发负载（multiprocessing 子进程执行）。
+    result_q 非空时把 (wid, 成功与否, 错误详情) 回传父进程聚合——
+    子进程内修改的全局计数不会回传，若不回传则失败会被父进程统计漏掉。"""
     m = Path(MNT)
     db = m / f"{CONCUR_DIR}/concur_{wid}.db"
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -296,9 +298,15 @@ def _worker_sqlite(wid, ops):
             if i % 10 == 0: conn.commit()
         conn.commit()
         conn.close()
-        ok(f"并发SQLite worker {wid}: {ops} 操作")
+        if result_q is not None:
+            result_q.put((wid, True, ""))
+        else:
+            ok(f"并发SQLite worker {wid}: {ops} 操作")
     except Exception as e:
-        fail(f"并发SQLite worker {wid}", str(e))
+        if result_q is not None:
+            result_q.put((wid, False, str(e)))
+        else:
+            fail(f"并发SQLite worker {wid}", str(e))
 
 def test_concurrent():
     log("\n━━━ 模块3: 并发压力测试 ━━━")
@@ -344,15 +352,25 @@ def test_concurrent():
         try:
             import sqlite3
             n_sql_workers = 6
+            result_q = multiprocessing.Queue()
             sql_procs = []
             for i in range(n_sql_workers):
-                p = multiprocessing.Process(target=_worker_sqlite, args=(i, 30))
+                p = multiprocessing.Process(target=_worker_sqlite, args=(i, 30, result_q))
                 sql_procs.append(p)
             t0 = time.time()
             for p in sql_procs: p.start()
             for p in sql_procs: p.join()
             elapsed = time.time() - t0
-            ok(f"{n_sql_workers}进程 SQLite 并发: {n_sql_workers*30} 操作 {elapsed:.2f}s")
+            # 聚合子进程回传结果（子进程内的全局计数不回传，须在此处统一判定）
+            sql_errors = []
+            for _ in sql_procs:
+                wid, wok, wdetail = result_q.get(timeout=10)
+                if not wok:
+                    sql_errors.append(f"worker{wid}: {wdetail}")
+            if sql_errors:
+                fail(f"SQLite并发 ({n_sql_workers}进程)", "; ".join(sql_errors))
+            else:
+                ok(f"{n_sql_workers}进程 SQLite 并发: {n_sql_workers*30} 操作 {elapsed:.2f}s")
         except Exception as e:
             fail("SQLite并发", str(e))
 

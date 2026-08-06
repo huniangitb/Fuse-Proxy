@@ -22,6 +22,59 @@ void trie_free(TrieNode* node) {
     free(node);
 }
 
+/* 与 trie_lookup 相同的下降与累积语义，额外返回完整匹配到路径末尾的最深节点。
+   某段缺失（!child 或 seg_len==0）时返回 NULL，但 out_hidden/out_ro/out_redir
+   仍输出已匹配前缀的累积结果（与 trie_lookup 中途 break 语义一致）。 */
+const TrieNode* trie_lookup_full(const TrieNode* root, const char* path,
+                                 bool* out_hidden, bool* out_ro,
+                                 char* out_redir, size_t max_len) {
+    if (!root || !path) return NULL;
+    const TrieNode* curr = root;
+    const char* p = path;
+    while (*p == '/') p++;
+    bool hidden = root->is_hidden;
+    bool ro = root->is_ro;
+    const char* redir_base = root->redir_target;
+    const char* redir_suffix = p;
+    bool full = true;
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) { full = false; break; }
+        const TrieNode* child = NULL;
+        for (int i = 0; i < curr->child_count; i++) {
+            if (curr->children[i] && curr->children[i]->segment &&
+                strlen(curr->children[i]->segment) == seg_len &&
+                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
+                child = curr->children[i];
+                break;
+            }
+        }
+        if (!child) { full = false; break; }
+        curr = child;
+        if (curr->is_hidden) hidden = true;
+        if (curr->is_ro)     ro = true;
+        if (curr->redir_target) {
+            redir_base = curr->redir_target;
+            redir_suffix = next ? next : "";
+        }
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    if (out_hidden) *out_hidden = hidden;
+    if (out_ro)     *out_ro = ro;
+    if (redir_base && out_redir && max_len > 0) {
+        size_t blen = strlen(redir_base);
+        size_t slen = strlen(redir_suffix);
+        if (blen + slen < max_len) {
+            snprintf(out_redir, max_len, "%s%s", redir_base, redir_suffix);
+        }
+    }
+    /* 路径完整消耗到末尾（p 为 NULL 或指向 '\0'）才算完整匹配 */
+    if (full && p && *p) full = false;
+    return full ? curr : NULL;
+}
+
 /* 循环条件为 while (p && *p)，杜绝末尾 NULL 指针解引用 */
 void trie_insert(TrieNode* root, const char* path, const char* redir_target, bool is_hidden, bool is_ro) {
     if (!path || !root) return;
@@ -145,9 +198,60 @@ bool trie_is_redirect_target(const TrieNode* root, const char* path) {
     return (curr->redir_target != NULL);
 }
 
-static bool trie_node_has_rules(const TrieNode* node) {
+/* 节点子树（含自身）是否存在规则（hidden/ro/redir）——header 已声明为公开接口 */
+bool trie_node_has_rules(const TrieNode* node) {
     if (!node) return false;
     if (node->is_hidden || node->is_ro || node->redir_target) return true;
+    for (int i = 0; i < node->child_count; i++) {
+        if (trie_node_has_rules(node->children[i])) return true;
+    }
+    return false;
+}
+
+/* 在 node 的直接子节点中查找 segment 匹配的节点（线性扫描，与 trie_lookup 内联一致） */
+const TrieNode* trie_find_child(const TrieNode* node, const char* seg, size_t seg_len) {
+    if (!node || !seg) return NULL;
+    for (int i = 0; i < node->child_count; i++) {
+        const TrieNode* c = node->children[i];
+        if (c && c->segment && strlen(c->segment) == seg_len &&
+            strncmp(c->segment, seg, seg_len) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* 严格下降：path 每段都存在才返回最深节点；否则 NULL。
+   out_hidden/out_ro 输出根→最深已匹配段的累积标志（与 trie_lookup 中途
+   break 的累积语义一致，供 readdir 目录级缓存按段增量判定）。 */
+const TrieNode* trie_walk_to(const TrieNode* root, const char* path, bool* out_hidden, bool* out_ro) {
+    if (!root || !path) return NULL;
+    const TrieNode* curr = root;
+    const char* p = path;
+    while (*p == '/') p++;
+    bool hidden = root->is_hidden;
+    bool ro = root->is_ro;
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) break;
+        const TrieNode* child = trie_find_child(curr, p, seg_len);
+        if (!child) break;   /* 某段缺失：与 trie_lookup 语义一致，停在已匹配段 */
+        curr = child;
+        if (curr->is_hidden) hidden = true;
+        if (curr->is_ro)     ro = true;
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    if (out_hidden) *out_hidden = hidden;
+    if (out_ro)     *out_ro = ro;
+    /* 路径完整匹配到末尾（无剩余段）才视为命中节点 */
+    while (p && *p == '/') p++;
+    return (p && *p) ? NULL : curr;
+}
+
+bool trie_any_child_has_rules(const TrieNode* node) {
+    if (!node) return false;
     for (int i = 0; i < node->child_count; i++) {
         if (trie_node_has_rules(node->children[i])) return true;
     }
