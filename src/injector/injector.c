@@ -287,7 +287,10 @@ static void inject_global_fuse() {
         if (setns(fd, CLONE_NEWNS) != 0) { close(fd); _exit(11); }
         close(fd);
         if (mkdir(g_global_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
-        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+        /* fuse_crash.log 懒创建：不带 O_CREAT——文件不存在（无历史崩溃）
+           时不创建空文件、不重定向 stderr（正常日志走 log_internal）；仅当
+           已有历史文件（上次崩溃残留）时才打开追加 */
+        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_APPEND | O_CLOEXEC, 0666);
         if (log_fd >= 0) {
             dup2(log_fd, STDERR_FILENO);
             dup2(log_fd, STDOUT_FILENO);
@@ -392,7 +395,10 @@ static void inject_media_fuse() {
         if (setns(fd, CLONE_NEWNS) != 0) { close(fd); _exit(11); }
         close(fd);
         if (mkdir(g_media_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
-        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+        /* fuse_crash.log 懒创建：不带 O_CREAT——文件不存在（无历史崩溃）
+           时不创建空文件、不重定向 stderr（正常日志走 log_internal）；仅当
+           已有历史文件（上次崩溃残留）时才打开追加 */
+        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_APPEND | O_CLOEXEC, 0666);
         if (log_fd >= 0) {
             dup2(log_fd, STDERR_FILENO);
             dup2(log_fd, STDOUT_FILENO);
