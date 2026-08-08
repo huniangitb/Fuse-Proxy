@@ -63,7 +63,7 @@ static void load_uid_map(void) {
     int cap = UID_MAP_INIT_CAPACITY;
     g_uid_maps = malloc((size_t)cap * sizeof(UidMapEntry));
     if (!g_uid_maps) {
-        LOG_ERR("br load_uid_map: malloc(%d) 失败", cap);
+        LOG_ERR("load_uid_map: malloc(%d) 失败", cap);
         g_uid_map_count = 0;
         return;
     }
@@ -72,7 +72,7 @@ static void load_uid_map(void) {
         cap *= 2;
         UidMapEntry *new_maps = realloc(g_uid_maps, (size_t)cap * sizeof(UidMapEntry));
         if (!new_maps) {
-            LOG_ERR("br load_uid_map: realloc(%d) 失败", cap);
+            LOG_ERR("load_uid_map: realloc(%d) 失败", cap);
             free(g_uid_maps);
             g_uid_maps = NULL;
             g_uid_map_count = 0;
@@ -81,7 +81,7 @@ static void load_uid_map(void) {
         g_uid_maps = new_maps;
         g_uid_map_count = uid_map_load(g_uid_maps, cap);
     }
-    LOG_DBG("br uid.map 已加载: %d 条映射 (容量 %d)", g_uid_map_count, cap);
+    LOG_DBG("uid.map 已加载: %d 条映射 (容量 %d)", g_uid_map_count, cap);
 }
 
 static void clear_uid_cache(void) {
@@ -102,7 +102,7 @@ void br_reload_config(void) {
     clear_uid_cache();
     g_br_cfg_gen++;   /* 使目录级 probe 缓存失效（trie/cfg 可能被 free） */
     config_unlock_write();
-    LOG_DBG("br 已检测到配置变更，重新加载配置，全局监控状态: %s",
+    LOG_DBG("已检测到配置变更，重新加载配置，全局监控状态: %s",
             g_global_cfg.monitor ? "开启" : "关闭");
 }
 
@@ -498,7 +498,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
         char sandbox_target[MAX_PATH_LEN];
         int need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);
         if (need <= 0 || (size_t)need >= sizeof(sandbox_target)) {
-            LOG_WRN("br sandbox 路径过长（%d），放弃沙盒重定向: pkg=%s", need, current_pkg);
+            LOG_WRN("sandbox 路径过长（%d），放弃沙盒重定向: pkg=%s", need, current_pkg);
             return false;
         }
         snprintf(sandbox_target, sizeof(sandbox_target), STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);

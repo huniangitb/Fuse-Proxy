@@ -31,6 +31,10 @@ python3 tests/test_modules.py
 # FTP 后端端到端测试：FTP 读写 + $FTP_云盘 变量 + REDIRECT（需 vsftpd 匿名服务）
 python3 tests/test_ftp.py
 
+# rule_server 规则控制服务测试：PING/LIST/ADD/REMOVE/ENABLE/DISABLE/SET/STATUS/QUIT
+# + 模块动态类型（.rules 注册）、多语言 desc（lang 参数）、argc 约束、顺序任意与畸形声明
+python3 tests/test_rule_server.py
+
 # 指定 daemon 路径（默认使用 build_gnu/fuse_daemon）
 FUSE_DAEMON=/path/to/fuse_daemon python3 tests/test_rules.py
 ```
