@@ -43,6 +43,9 @@ typedef struct {
 static LogRingBuffer g_log_ring;
 static pthread_t     g_log_sender_tid;
 static int           g_log_event_fd = -1;
+/* 子进程日志转发 fd：run_in_mnt_ns_* fork 的子进程内 sender 线程不可达，
+   子进程经此管道回传日志，父进程读取后统一写入环形缓冲（默认 -1=未启用） */
+int g_log_forward_fd = -1;
 _Atomic(bool) g_log_shutdown = false;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 void init_timezone() {
@@ -460,6 +463,18 @@ void log_internal(LogLevel level, const char* format, ...) {
     size_t mlen = strlen(msg_buf);
     while (mlen > 0 && (msg_buf[mlen - 1] == '\n' || msg_buf[mlen - 1] == '\r'))
         msg_buf[--mlen] = '\0';
+    /* 子进程日志转发：fork 后的子进程内 sender 线程不可达（fork 不复制线程），
+       环形缓冲写了也没人消费；检测到 g_log_forward_fd 时把日志行写入管道，
+       由父进程读取后统一写入环形缓冲（保持行格式 [时间]|[进程]|msg） */
+    if (g_log_forward_fd >= 0) {
+        char fwd_buf[LOG_MSG_MAX_LEN + 96];
+        int flen = snprintf(fwd_buf, sizeof(fwd_buf), "%d|%s\n", (int)level, msg_buf);
+        if (flen > 0) {
+            ssize_t w = write(g_log_forward_fd, fwd_buf, (size_t)flen);
+            (void)w;
+        }
+        return;
+    }
     if (level == LOG_IO) {
 #ifdef NSP_ENABLE_IO_LOG
         /* 监控日志落盘（LOG_DIR/persistent_io.log）：仅调试/监控构建
