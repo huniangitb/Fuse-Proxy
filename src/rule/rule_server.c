@@ -70,12 +70,25 @@ typedef enum {
 } RuleFmt;
 
 #define MAX_RULE_TYPES 64
+/* 多语言描述槽：<lang, text> 对；lang 为语言代码（zh/en/ja/...，默认 zh） */
+#define MAX_DESC_LANGS 8
+typedef struct {
+    char lang[8];
+    char text[160];
+} DescEntry;
 typedef struct {
     char name[64];        /* 类型名（大写，如 HIDE / FTP） */
     RuleFmt fmt;          /* 值格式 */
     bool builtin;         /* 内置类型（不可随模块卸载移除） */
     bool global_only;     /* 仅全局作用域可用（如 GLOBAL_INJECT/SKIP_SYSTEM_APPS） */
     char module[64];      /* 来源模块名（内置为 "builtin"） */
+    /* 动态适配扩展：.rules 可选属性（argc=N / argc=N:M / global-only / desc[.lang]="..."）
+       argc_min/argc_max：pair/tokens 的参数数量约束（-1=不限制，默认：
+       pair=2:2、path=1:1、tokens=2:-1、switch=1:1），ADD 时按此校验 */
+    int argc_min;
+    int argc_max;
+    DescEntry descs[MAX_DESC_LANGS];  /* 多语言描述（desc=→zh，desc.en=→en，...） */
+    int desc_count;
 } RuleTypeDef;
 
 typedef int RuleType;     /* 动态表索引；RT_UNKNOWN 表示未知 */
@@ -84,8 +97,21 @@ typedef int RuleType;     /* 动态表索引；RT_UNKNOWN 表示未知 */
 static RuleTypeDef g_rule_types[MAX_RULE_TYPES];
 static int g_rule_type_count = 0;
 
+/* 按格式取默认参数数量约束：path=1、pair=2、tokens=2+（上限不限）、switch=1 */
+static void rule_fmt_default_argc(RuleFmt fmt, int *minp, int *maxp) {
+    switch (fmt) {
+        case RFT_PATH:   *minp = 1; *maxp = 1; break;
+        case RFT_PAIR:   *minp = 2; *maxp = 2; break;
+        case RFT_SWITCH: *minp = 1; *maxp = 1; break;
+        case RFT_TOKENS: *minp = 2; *maxp = -1; break;
+        default:         *minp = 1; *maxp = -1; break;
+    }
+}
+
 /* 内置类型初始化（与 basic_rules 能力一一对应） */
-static void rule_types_add(const char *name, RuleFmt fmt, bool builtin, bool global_only, const char *module) {
+static void rule_types_add_ex(const char *name, RuleFmt fmt, bool builtin, bool global_only,
+                              const char *module, int argc_min, int argc_max,
+                              const DescEntry *descs, int desc_count) {
     if (g_rule_type_count >= MAX_RULE_TYPES) return;
     RuleTypeDef *t = &g_rule_types[g_rule_type_count];
     strncpy(t->name, name, sizeof(t->name) - 1);
@@ -93,7 +119,23 @@ static void rule_types_add(const char *name, RuleFmt fmt, bool builtin, bool glo
     t->builtin = builtin;
     t->global_only = global_only;
     strncpy(t->module, module ? module : "builtin", sizeof(t->module) - 1);
+    if (argc_min < 0 && argc_max < 0) rule_fmt_default_argc(fmt, &argc_min, &argc_max);
+    t->argc_min = argc_min;
+    t->argc_max = argc_max;
+    /* 多语言描述：逐个槽复制（默认 zh 在前），多余截断 */
+    t->desc_count = 0;
+    for (int i = 0; i < desc_count && t->desc_count < MAX_DESC_LANGS; i++) {
+        if (!descs[i].text[0]) continue;
+        strncpy(t->descs[t->desc_count].lang, descs[i].lang, sizeof(t->descs[t->desc_count].lang) - 1);
+        strncpy(t->descs[t->desc_count].text, descs[i].text, sizeof(t->descs[t->desc_count].text) - 1);
+        t->desc_count++;
+    }
     g_rule_type_count++;
+}
+
+/* 兼容旧签名：argc/desc 取默认 */
+static void rule_types_add(const char *name, RuleFmt fmt, bool builtin, bool global_only, const char *module) {
+    rule_types_add_ex(name, fmt, builtin, global_only, module, -1, -1, nullptr, 0);
 }
 
 static void rule_types_init(void) {
@@ -111,6 +153,15 @@ static void rule_types_init(void) {
 }
 
 /* 按名查找类型（大小写不敏感），返回索引；未找到返回 RT_UNKNOWN */
+static RuleType rule_type_of(const char *name);
+
+/* 合并属性到已存在的类型（定义见 conf 解析段）：前向声明供旧行格式
+   rule_types_parse_line 使用（两种格式共用同一合并语义） */
+static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set,
+                             int argc_min, int argc_max, bool argc_set,
+                             bool global_only, bool global_only_set,
+                             const DescEntry *descs, int desc_count);
+
 static RuleType rule_type_of(const char *name) {
     if (!name) return RT_UNKNOWN;
     for (int i = 0; i < g_rule_type_count; i++) {
@@ -163,11 +214,319 @@ static void rule_types_parse_line(char *line, const char *module) {
     if (!type[0]) return;
     while (isspace((unsigned char)*p)) p++;
     RuleFmt fmt = RFT_PATH;
-    if (strcasecmp(p, "pair") == 0) fmt = RFT_PAIR;
-    else if (strcasecmp(p, "switch") == 0) fmt = RFT_SWITCH;
-    else if (strcasecmp(p, "tokens") == 0) fmt = RFT_TOKENS;
-    if (rule_type_of(type) != RT_UNKNOWN) return;   /* 已注册（内置或他模块） */
-    rule_types_add(type, fmt, false, false, module);
+    if (strncasecmp(p, "pair", 4) == 0)      { fmt = RFT_PAIR;   p += 4; }
+    else if (strncasecmp(p, "switch", 6) == 0) { fmt = RFT_SWITCH; p += 6; }
+    else if (strncasecmp(p, "tokens", 6) == 0) { fmt = RFT_TOKENS; p += 6; }
+    else if (strncasecmp(p, "path", 4) == 0)  { fmt = RFT_PATH;   p += 4; }
+    else return;                              /* 未知 FORMAT：跳过 */
+    /* 可选属性列（以空格分隔，顺序任意）：
+         argc=N          — 恰好 N 个参数
+         argc=N:M        — N~M 个参数（M 省略或 * 表示不限上界）
+         global-only     — 仅全局作用域可用
+         desc="..."      — 类型描述（中文，默认语言；引号内可含空格，最长 159 字符）
+         desc.xx="..."   — 指定语言的描述（xx=语言代码，如 desc.en="..."） */
+    int argc_min = -1, argc_max = -1;
+    bool global_only = false;
+    DescEntry descs[MAX_DESC_LANGS];
+    int desc_count = 0;
+    /* desc 语言代码缓冲：必须在循环外（函数作用域），否则 lang 指针在
+       if 块结束后悬垂，语言变体（desc.en=）会被覆盖为空 */
+    char langbuf[8] = "zh";
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        if (strncasecmp(p, "argc=", 5) == 0) {
+            /* 用 strtol 校验数字：atoi 无法区分解析失败与合法 0，
+               畸形声明（argc=abc / argc=2:abc）会静默生成 0:0 / N:0 约束，
+               使该类型所有 ADD 被拒且错误信息误导调用方。
+               畸形时跳过该属性（保持向前兼容），不注册错误约束 */
+            p += 5;
+            char *end = nullptr;
+            errno = 0;
+            long v1 = strtol(p, &end, 10);
+            if (end == p || errno == ERANGE) {   /* 非数字：跳过属性 */
+                while (*p && !isspace((unsigned char)*p)) p++;
+                continue;
+            }
+            argc_min = (int)v1;
+            p = end;
+            if (*p == ':') {
+                p++;
+                if (*p == '*' || *p == '\0' || isspace((unsigned char)*p)) {
+                    argc_max = -1;   /* 不限上界 */
+                    if (*p == '*') p++;
+                } else {
+                    char *end2 = nullptr;
+                    errno = 0;
+                    long v2 = strtol(p, &end2, 10);
+                    if (end2 == p || errno == ERANGE) {   /* 畸形上界：跳过属性 */
+                        while (*p && !isspace((unsigned char)*p)) p++;
+                        continue;
+                    }
+                    argc_max = (int)v2;
+                    p = end2;
+                }
+            } else {
+                argc_max = argc_min;
+            }
+            continue;
+        }
+        if (strncasecmp(p, "global-only", 11) == 0) {
+            global_only = true;
+            p += 11;
+            continue;
+        }
+        if (strncasecmp(p, "desc", 4) == 0) {
+            /* 每个 desc= 前重置为默认中文：保证属性顺序任意（文档约定
+               "顺序任意"）——desc.en= 出现在 desc= 之前时，默认描述
+               不会被错误标记为上一变体的语言 */
+            strncpy(langbuf, "zh", sizeof(langbuf) - 1);
+            const char *lang = langbuf;   /* 默认中文 */
+            p += 4;
+            if (*p == '.') {           /* desc.xx= 语言变体 */
+                p++;
+                size_t li = 0;
+                while (*p && *p != '=' && li < sizeof(langbuf) - 1) langbuf[li++] = *p++;
+                langbuf[li] = '\0';
+                if (li > 0) lang = langbuf;
+            }
+            if (*p == '=') p++;
+            char dtext[160] = {0};
+            if (*p == '"') {
+                p++;
+                size_t di = 0;
+                while (*p && *p != '"' && di < sizeof(dtext) - 1) dtext[di++] = *p++;
+                dtext[di] = '\0';
+                if (*p == '"') p++;
+            } else {
+                size_t di = 0;
+                while (*p && !isspace((unsigned char)*p) && di < sizeof(dtext) - 1)
+                    dtext[di++] = *p++;
+                dtext[di] = '\0';
+            }
+            if (dtext[0] && desc_count < MAX_DESC_LANGS) {
+                strncpy(descs[desc_count].lang, lang, sizeof(descs[desc_count].lang) - 1);
+                strncpy(descs[desc_count].text, dtext, sizeof(descs[desc_count].text) - 1);
+                desc_count++;
+            }
+            continue;
+        }
+        /* 未知属性：跳过该 token，保持向前兼容 */
+        while (*p && !isspace((unsigned char)*p)) p++;
+    }
+    /* 已注册（内置或他模块）的同名类型：合并补充属性（多语言 desc 等），
+       不覆盖类型名与 module 来源；否则作为新模块类型注册 */
+    RuleType existing = rule_type_of(type);
+    if (existing != RT_UNKNOWN) {
+        rule_types_merge(existing, fmt, true,
+                         argc_min, argc_max, (argc_min >= 0),
+                         global_only, global_only,
+                         descs, desc_count);
+    } else {
+        rule_types_add_ex(type, fmt, false, global_only, module,
+                          argc_min, argc_max, descs, desc_count);
+    }
+}
+
+/* ============ conf 格式解析（.rules 支持两种书写格式） ============
+   conf 段格式（推荐，易于编写）：
+     [FTP]
+     format = pair
+     argc = 2
+     global-only = false
+     desc = FTP 存储映射：<虚拟前缀>|<段名>
+     desc.en = FTP storage mapping: <virtual prefix>|<section>
+   旧行格式（兼容）：FTP pair argc=2 desc="..." desc.en="..."
+   解析器为状态机：遇到 [TYPE] 段头进入段模式收集 key=value 属性，
+   段内无 '=' 的行或段外行按旧行格式处理；文件尾刷新未结束的段。 */
+
+/* conf 段属性收集状态 */
+typedef struct {
+    char type[64];
+    bool active;          /* 是否处于 [TYPE] 段内 */
+    RuleFmt fmt;
+    bool fmt_set;         /* format 键是否显式声明（未声明不覆盖已有类型） */
+    int argc_min, argc_max;
+    bool argc_set;        /* argc 键是否显式声明 */
+    bool global_only;
+    bool global_only_set; /* global-only 键是否显式声明 */
+    DescEntry descs[MAX_DESC_LANGS];
+    int desc_count;
+    char langbuf[8];      /* desc 语言缓冲（函数级作用域防悬垂） */
+} ConfSection;
+
+static void conf_section_reset(ConfSection *cs) {
+    cs->active = false;
+    cs->type[0] = '\0';
+    cs->fmt = RFT_PATH;
+    cs->fmt_set = false;
+    cs->argc_min = -1;
+    cs->argc_max = -1;
+    cs->argc_set = false;
+    cs->global_only = false;
+    cs->global_only_set = false;
+    cs->desc_count = 0;
+}
+
+/* 合并属性到已存在的类型（内置或他模块注册的同名类型）：
+   .rules 中的补充声明（desc 多语言/argc/global-only 等）生效，
+   不覆盖内置类型名与 module 来源；显式声明的字段（*_set）才覆盖。 */
+static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set,
+                             int argc_min, int argc_max, bool argc_set,
+                             bool global_only, bool global_only_set,
+                             const DescEntry *descs, int desc_count) {
+    if (idx < 0 || idx >= g_rule_type_count) return;
+    RuleTypeDef *t = &g_rule_types[idx];
+    if (fmt_set) t->fmt = fmt;
+    if (argc_set) {
+        t->argc_min = argc_min;
+        t->argc_max = argc_max;
+    }
+    if (global_only_set) t->global_only = global_only;
+    /* desc 槽合并：已有同语言则覆盖文本，否则追加 */
+    for (int i = 0; i < desc_count; i++) {
+        bool replaced = false;
+        for (int d = 0; d < t->desc_count; d++) {
+            if (strcasecmp(t->descs[d].lang, descs[i].lang) == 0) {
+                strncpy(t->descs[d].text, descs[i].text, sizeof(t->descs[d].text) - 1);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced && t->desc_count < MAX_DESC_LANGS) {
+            strncpy(t->descs[t->desc_count].lang, descs[i].lang,
+                    sizeof(t->descs[t->desc_count].lang) - 1);
+            strncpy(t->descs[t->desc_count].text, descs[i].text,
+                    sizeof(t->descs[t->desc_count].text) - 1);
+            t->desc_count++;
+        }
+    }
+}
+
+/* 段结束时把收集的属性注册进类型表（同名内置类型改为合并补充） */
+static void conf_section_flush(ConfSection *cs, const char *module) {
+    if (cs->active && cs->type[0]) {
+        RuleType existing = rule_type_of(cs->type);
+        if (existing == RT_UNKNOWN) {
+            rule_types_add_ex(cs->type, cs->fmt, false, cs->global_only, module,
+                              cs->argc_min, cs->argc_max, cs->descs, cs->desc_count);
+        } else {
+            rule_types_merge(existing, cs->fmt, cs->fmt_set,
+                             cs->argc_min, cs->argc_max, cs->argc_set,
+                             cs->global_only, cs->global_only_set,
+                             cs->descs, cs->desc_count);
+        }
+    }
+    conf_section_reset(cs);
+}
+
+/* 解析 conf 键值属性（format/argc/global-only/desc[.lang]），写入段状态 */
+static void conf_section_apply_key(ConfSection *cs, const char *key, const char *val) {
+    if (strcasecmp(key, "format") == 0) {
+        if (strcasecmp(val, "pair") == 0) cs->fmt = RFT_PAIR;
+        else if (strcasecmp(val, "switch") == 0) cs->fmt = RFT_SWITCH;
+        else if (strcasecmp(val, "tokens") == 0) cs->fmt = RFT_TOKENS;
+        else cs->fmt = RFT_PATH;
+        cs->fmt_set = true;
+        return;
+    }
+    if (strcasecmp(key, "argc") == 0) {
+        char *end = nullptr;
+        errno = 0;
+        long v1 = strtol(val, &end, 10);
+        if (end == val || errno == ERANGE) return;   /* 畸形：跳过 */
+        cs->argc_min = (int)v1;
+        cs->argc_set = true;
+        if (*end == ':') {
+            const char *up = end + 1;
+            if (*up == '*' || *up == '\0' || isspace((unsigned char)*up)) {
+                cs->argc_max = -1;                   /* 不限上界 */
+            } else {
+                char *end2 = nullptr;
+                errno = 0;
+                long v2 = strtol(up, &end2, 10);
+                if (end2 == up || errno == ERANGE) return;
+                cs->argc_max = (int)v2;
+            }
+        } else {
+            cs->argc_max = cs->argc_min;
+        }
+        return;
+    }
+    if (strcasecmp(key, "global-only") == 0) {
+        cs->global_only = (strcasecmp(val, "true") == 0 || strcasecmp(val, "1") == 0 ||
+                           strcasecmp(val, "yes") == 0 || strcasecmp(val, "on") == 0);
+        cs->global_only_set = true;
+        return;
+    }
+    if (strncasecmp(key, "desc", 4) == 0) {
+        /* 每个 desc= 前重置默认中文（属性顺序任意） */
+        strncpy(cs->langbuf, "zh", sizeof(cs->langbuf) - 1);
+        const char *lang = cs->langbuf;
+        const char *dot = key + 4;
+        if (*dot == '.') {                           /* desc.xx= 语言变体 */
+            dot++;
+            size_t li = 0;
+            while (*dot && li < sizeof(cs->langbuf) - 1) cs->langbuf[li++] = *dot++;
+            cs->langbuf[li] = '\0';
+            if (li > 0) lang = cs->langbuf;
+        }
+        const char *v = val;
+        char dtext[160] = {0};
+        if (*v == '"') {                             /* 引号包裹（可含空格） */
+            v++;
+            size_t di = 0;
+            while (*v && *v != '"' && di < sizeof(dtext) - 1) dtext[di++] = *v++;
+        } else {
+            size_t di = 0;
+            while (*v && di < sizeof(dtext) - 1) dtext[di++] = *v++;
+        }
+        if (dtext[0] && cs->desc_count < MAX_DESC_LANGS) {
+            strncpy(cs->descs[cs->desc_count].lang, lang, sizeof(cs->descs[cs->desc_count].lang) - 1);
+            strncpy(cs->descs[cs->desc_count].text, dtext, sizeof(cs->descs[cs->desc_count].text) - 1);
+            cs->desc_count++;
+        }
+        return;
+    }
+    /* 未知键：忽略（向前兼容） */
+}
+
+/* 解析整个 .rules 文件（conf 段 + 旧行格式混合） */
+static void rule_types_parse_conf(FILE *fp, const char *module) {
+    char line[256];
+    ConfSection cs;
+    conf_section_reset(&cs);
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p || *p == '#') continue;              /* 空行/注释 */
+        if (*p == '[') {                             /* 段头：[TYPE] */
+            conf_section_flush(&cs, module);
+            p++;
+            size_t ti = 0;
+            while (*p && *p != ']' && ti < sizeof(cs.type) - 1) cs.type[ti++] = *p++;
+            cs.type[ti] = '\0';
+            cs.active = (ti > 0);
+            continue;
+        }
+        char *eq = strchr(p, '=');
+        if (cs.active && eq) {                       /* 段内 key=value */
+            *eq = '\0';
+            char *key = p;
+            while (key < eq && isspace((unsigned char)key[0])) key++;
+            char *kend = eq - 1;
+            while (kend >= key && isspace((unsigned char)*kend)) { *kend = '\0'; kend--; }
+            char *val = eq + 1;
+            while (isspace((unsigned char)*val)) val++;
+            conf_section_apply_key(&cs, key, val);
+            continue;
+        }
+        /* 旧行格式（兼容）：FTP pair argc=2 ... */
+        rule_types_parse_line(line, module);
+    }
+    conf_section_flush(&cs, module);                 /* 文件尾刷新未结束段 */
 }
 
 /* ==================== 模块规则类型缓存（避免每次命令全量扫描） ====================
@@ -178,14 +537,22 @@ static void rule_types_parse_line(char *line, const char *module) {
 #define MAX_CACHED_MODULES 32
 typedef struct {
     char name[64];        /* 模块名（目录名 = <name>.rules 前缀） */
-    time_t mtime;         /* 上次扫描时 <name>.rules 的 mtime */
+    long long mtime_ns;   /* 上次扫描时 <name>.rules 的 mtime（纳秒精度，
+                             避免同秒内写入被快速路径误判为未变化） */
     bool present;         /* 上次扫描时 .rules 是否存在 */
 } ModuleTypeCache;
 
 static ModuleTypeCache g_module_cache[MAX_CACHED_MODULES];
 static int g_module_cache_count = 0;
-static time_t g_modules_dir_mtime = 0;
+static long long g_modules_dir_mtime_ns = 0;
 static bool g_module_cache_valid = false;
+
+/* 取文件/目录 mtime（纳秒）：不存在返回 0 */
+static long long file_mtime_ns(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+}
 
 /* 扫描模块目录 <config_dir>/modules/<名>/<名>.rules，动态追加模块规则类型。
    与 fuse_daemon 加载约定一致（目录名=模块名）；模块卸载后其类型随扫描消失。 */
@@ -193,21 +560,19 @@ static void rule_types_refresh(void) {
     char modules_dir[PATH_MAX];
     snprintf(modules_dir, sizeof(modules_dir), "%s/modules", g_config_dir);
 
-    struct stat st;
-    bool dir_exists = (stat(modules_dir, &st) == 0);
-    time_t cur_dir_mtime = dir_exists ? st.st_mtime : 0;
+    long long cur_dir_mtime = file_mtime_ns(modules_dir);
 
     /* 快速路径：目录 mtime 未变 + 各 .rules 文件 mtime 未变 → 类型表无需重建 */
-    if (g_module_cache_valid && cur_dir_mtime == g_modules_dir_mtime) {
+    if (g_module_cache_valid && cur_dir_mtime == g_modules_dir_mtime_ns) {
         bool unchanged = true;
         for (int i = 0; i < g_module_cache_count; i++) {
             char rules_path[PATH_MAX];
             snprintf(rules_path, sizeof(rules_path), "%s/%s/%s.rules",
                      modules_dir, g_module_cache[i].name, g_module_cache[i].name);
-            struct stat fst;
-            bool present = (stat(rules_path, &fst) == 0);
+            long long cur = file_mtime_ns(rules_path);
+            bool present = (cur != 0);
             if (present != g_module_cache[i].present ||
-                (present && fst.st_mtime != g_module_cache[i].mtime)) {
+                (present && cur != g_module_cache[i].mtime_ns)) {
                 unchanged = false;
                 break;
             }
@@ -219,10 +584,10 @@ static void rule_types_refresh(void) {
     g_rule_type_count = 0;
     rule_types_init();
     g_module_cache_count = 0;
-    g_modules_dir_mtime = cur_dir_mtime;
+    g_modules_dir_mtime_ns = cur_dir_mtime;
     g_module_cache_valid = true;
 
-    if (!dir_exists) return;
+    if (cur_dir_mtime == 0) return;   /* 模块目录不存在 */
     DIR *d = opendir(modules_dir);
     if (!d) return;
     struct dirent *de;
@@ -232,24 +597,20 @@ static void rule_types_refresh(void) {
         if (strchr(mname, '/')) continue;
         char rules_path[PATH_MAX];
         snprintf(rules_path, sizeof(rules_path), "%s/%s/%s.rules", modules_dir, mname, mname);
-        struct stat fst;
-        bool present = (stat(rules_path, &fst) == 0);
+        long long r_mtime = file_mtime_ns(rules_path);
+        bool present = (r_mtime != 0);
         if (g_module_cache_count < MAX_CACHED_MODULES) {
             ModuleTypeCache *c = &g_module_cache[g_module_cache_count];
             strncpy(c->name, mname, sizeof(c->name) - 1);
             c->present = present;
-            c->mtime = present ? fst.st_mtime : 0;
+            c->mtime_ns = r_mtime;
             g_module_cache_count++;
         }
         if (!present) continue;
         FILE *fp = fopen(rules_path, "r");
         if (!fp) continue;
-        char line[256];
-        while (fgets(line, sizeof(line), fp)) {
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = '\0';
-            rule_types_parse_line(line, mname);
-        }
+        /* 支持 conf 段格式（[TYPE] + key=value）与旧行格式（TYPE FORMAT ...）混合 */
+        rule_types_parse_conf(fp, mname);
         fclose(fp);
     }
     closedir(d);
@@ -707,8 +1068,12 @@ static int find_rule_line(char **lines, int count, RuleType type, int index) {
 }
 
 /* ==================== 命令处理 ==================== */
-/* 构建当前支持规则类型列表（含动态模块类型），供 PING/LIST/STATUS 返回 */
-static json_object *build_rule_types_json(void) {
+/* 构建当前支持规则类型列表（含动态模块类型），供 PING/LIST/STATUS 返回。
+   lang：前端请求的语言（如 "en"），为空默认 "zh"；
+   每个类型回传匹配语言的 desc（找不到回退 zh），并附 desc_map 全语言映射
+   与 argc_min/argc_max 参数约束，供前端动态渲染任意模块的规则输入框 */
+static json_object *build_rule_types_json(const char *lang) {
+    if (!lang || !*lang) lang = "zh";
     json_object *arr = json_object_new_array();
     for (int i = 0; i < g_rule_type_count; i++) {
         json_object *t = json_object_new_object();
@@ -720,6 +1085,30 @@ static json_object *build_rule_types_json(void) {
         json_object_object_add(t, "format", json_object_new_string(fmt_s));
         json_object_object_add(t, "builtin", json_object_new_boolean(g_rule_types[i].builtin));
         json_object_object_add(t, "module", json_object_new_string(g_rule_types[i].module));
+        json_object_object_add(t, "global_only", json_object_new_boolean(g_rule_types[i].global_only));
+        json_object_object_add(t, "argc_min", json_object_new_int(g_rule_types[i].argc_min));
+        json_object_object_add(t, "argc_max", json_object_new_int(g_rule_types[i].argc_max));
+        /* 多语言描述：按请求语言选取（回退 zh），并附全语言 desc_map */
+        const char *match = nullptr;
+        for (int d = 0; d < g_rule_types[i].desc_count; d++) {
+            if (strcasecmp(g_rule_types[i].descs[d].lang, lang) == 0)
+                match = g_rule_types[i].descs[d].text;
+        }
+        if (!match) {
+            for (int d = 0; d < g_rule_types[i].desc_count; d++) {
+                if (strcasecmp(g_rule_types[i].descs[d].lang, "zh") == 0)
+                    match = g_rule_types[i].descs[d].text;
+            }
+        }
+        if (!match && g_rule_types[i].desc_count > 0) match = g_rule_types[i].descs[0].text;
+        json_object_object_add(t, "desc", json_object_new_string(match ? match : ""));
+        if (g_rule_types[i].desc_count > 0) {
+            json_object *dmap = json_object_new_object();
+            for (int d = 0; d < g_rule_types[i].desc_count; d++)
+                json_object_object_add(dmap, g_rule_types[i].descs[d].lang,
+                                       json_object_new_string(g_rule_types[i].descs[d].text));
+            json_object_object_add(t, "desc_map", dmap);
+        }
         json_object_array_add(arr, t);
     }
     return arr;
@@ -732,14 +1121,16 @@ static void handle_ping(int fd, json_object *req) {
     json_object_object_add(data, "version", json_object_new_string(RULE_VERSION));
     json_object_object_add(data, "config_dir", json_object_new_string(g_config_dir));
     json_object_object_add(data, "socket", json_object_new_string(g_socket_name));
-    json_object_object_add(data, "rule_types", build_rule_types_json());
+    const char *lang = json_object_get_string(json_object_object_get(req, "lang"));
+    json_object_object_add(data, "rule_types", build_rule_types_json(lang));
     reply_ok(fd, "PING", data);
 }
 
 static void handle_list(int fd, json_object *req) {
     (void)req;
     json_object *data = json_object_new_object();
-    json_object_object_add(data, "rule_types", build_rule_types_json());
+    const char *lang = json_object_get_string(json_object_object_get(req, "lang"));
+    json_object_object_add(data, "rule_types", build_rule_types_json(lang));
     json_object_object_add(data, "global", build_global_json());
     json_object_object_add(data, "apps", build_apps_json());
     reply_ok(fd, "LIST", data);
@@ -800,8 +1191,9 @@ static int build_rule_line(RuleType t, const char *value, char *line, size_t sz)
     if (fmt == RFT_PAIR || fmt == RFT_TOKENS) {
         /* pair/tokens：value 用 | 分隔多 token，写入时以空格拼行
            （REDIRECT /a|/b → "REDIRECT /a /b"；FTP /云盘|云盘 → "FTP /云盘 云盘"）。
-           pair 严格限制恰好 2 个 token（如 REDIRECT/FTP 均为固定双参数）；
-           tokens 允许 2 个以上任意数量。 */
+           参数数量按类型声明约束（argc=N / argc=N:M，见 rule_types_parse_line）：
+           pair 默认恰好 2 个 token，tokens 默认 2 个以上任意数量；
+           模块可在 .rules 中自定义（如 argc=3 / argc=2:4）。 */
         if (!value || !*value) return -1;
         char out[MAX_LINE];
         size_t olen = 0;
@@ -824,7 +1216,9 @@ static int build_rule_line(RuleType t, const char *value, char *line, size_t sz)
             if (*p == '|') p++;
         }
         if (first) return -1;
-        if (fmt == RFT_PAIR && tok_count != 2) return -1;   /* pair 恰好 2 参数 */
+        /* 按类型声明的 argc 约束校验（-1 表示不限制对应边界） */
+        if (g_rule_types[t].argc_min >= 0 && tok_count < g_rule_types[t].argc_min) return -1;
+        if (g_rule_types[t].argc_max >= 0 && tok_count > g_rule_types[t].argc_max) return -1;
         snprintf(line, sz, "%s %s\n", name, out);
         return 0;
     }

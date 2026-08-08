@@ -93,6 +93,11 @@ Injector 通过 `inotify` 监听配置文件变更，修改文件后**自动重�
 | `3` | ERROR |
 | `-1` | 全部（仅 search 有效） |
 
+`--level` 除数字外也支持级别名（大小写不敏感，映射到对应数字）：
+`debug`→`0`、`info`→`1`、`warn`/`warning`→`2`、`error`/`err`→`3`。
+示例：`log_ctl search-sys --level error '' 10 0` 等价于
+`log_ctl search-sys --level 3 '' 10 0`。
+
 ### 调用建议
 
 通过 `ProcessBuilder` 或 `Runtime.exec()` 调用，直接在命令行末尾添加 `api`：

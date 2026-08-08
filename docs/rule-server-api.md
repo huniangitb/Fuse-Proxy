@@ -84,19 +84,39 @@ rule_server -c '{"cmd":"LIST"}'
 
 ```json
 {"cmd":"PING"}
+{"cmd":"PING","lang":"en"}      // 可选：描述语言，默认中文（zh）
 ```
 
 响应 `data`：`pong`、`version`、`config_dir`、`socket`、`rule_types`。
 
+`lang` 请求参数（PING/LIST/STATUS 均支持）：控制 `rule_types` 中 `desc`
+字段的语言。不传或传未知语言时回退中文；`desc_map` 始终返回该类型的
+**全语言描述映射**，前端可据此渲染语言切换。
+
 `rule_types`：当前**全部可用规则类型**（内置 + 已加载模块动态注册），
-每项含 `type`（类型名）、`format`（`path`/`pair`/`switch`/`tokens`）、
-`builtin`（是否内置）、`module`（来源模块名，内置为 `builtin`）：
+每项含：
+
+| 字段 | 说明 |
+|------|------|
+| `type` | 类型名（如 HIDE / FTP） |
+| `format` | 值格式：`path`/`pair`/`switch`/`tokens` |
+| `builtin` | 是否内置类型 |
+| `module` | 来源模块名（内置为 `builtin`） |
+| `global_only` | 是否仅全局作用域可用（如 GLOBAL_INJECT/SKIP_SYSTEM_APPS） |
+| `argc_min` / `argc_max` | 参数数量约束（`-1`=不限制；pair 默认 2:2、tokens 默认 2:∞），由 `.rules` 声明 `argc=` 覆盖 |
+| `desc` | 按请求 `lang` 选取的描述文本（默认中文，未匹配回退 zh） |
+| `desc_map` | 全语言描述映射（如 `{"zh":"...","en":"..."}`），仅当模块声明多语言时存在 |
 
 ```json
 [
-  {"type":"HIDE","format":"path","builtin":true,"module":"builtin"},
-  {"type":"REDIRECT","format":"pair","builtin":true,"module":"builtin"},
-  {"type":"FTP","format":"pair","builtin":false,"module":"ftp_module"}
+  {"type":"HIDE","format":"path","builtin":true,"module":"builtin",
+   "global_only":false,"argc_min":1,"argc_max":1,"desc":"隐藏路径","desc_map":{"zh":"隐藏路径"}},
+  {"type":"REDIRECT","format":"pair","builtin":true,"module":"builtin",
+   "global_only":false,"argc_min":2,"argc_max":2,"desc":"路径重定向","desc_map":{"zh":"路径重定向"}},
+  {"type":"FTP","format":"pair","builtin":false,"module":"ftp_module",
+   "global_only":false,"argc_min":2,"argc_max":2,
+   "desc":"FTP 存储映射：<虚拟前缀>|<段名>",
+   "desc_map":{"zh":"FTP 存储映射：<虚拟前缀>|<段名>","en":"FTP storage mapping: <virtual prefix>|<section>"}}
 ]
 ```
 
@@ -104,6 +124,7 @@ rule_server -c '{"cmd":"LIST"}'
 
 ```json
 {"cmd":"LIST"}
+{"cmd":"LIST","lang":"en"}      // 可选：描述语言，默认中文（zh）
 ```
 
 响应 `data`：
@@ -111,8 +132,11 @@ rule_server -c '{"cmd":"LIST"}'
 ```json
 {
   "rule_types": [
-    {"type":"HIDE","format":"path","builtin":true,"module":"builtin"},
-    {"type":"FTP","format":"pair","builtin":false,"module":"ftp_module"}
+    {"type":"HIDE","format":"path","builtin":true,"module":"builtin",
+     "global_only":false,"argc_min":1,"argc_max":1,"desc":"隐藏路径"},
+    {"type":"FTP","format":"pair","builtin":false,"module":"ftp_module",
+     "global_only":false,"argc_min":2,"argc_max":2,
+     "desc":"FTP 存储映射：<虚拟前缀>|<段名>"}
   ],
   "global": {
     "file": "/var/fuse-proxy/injector.conf",
@@ -199,7 +223,11 @@ uid 合法范围 0~100000，超范围返回错误。
 | `RO` | 路径 | 只读规则 |
 | `MONITOR`/`SANDBOX` | `ON`/`OFF` | 开关（GLOBAL 段替换，应用段写应用文件） |
 | `INJECT_ENABLE` | `ON`/`OFF` | 仅应用作用域：启用/停用应用规则（见下） |
-| 模块注册类型 | 依 `rule_types[].format` | 动态追加：`path`=路径、`pair`=`\|` 分隔**恰好 2 值**（如 `FTP /云盘\|云盘`）、`tokens`=`\|` 分隔多值 |
+| 模块注册类型 | 依 `rule_types[].format` + `argc_min/argc_max` | 动态追加：`path`=路径、`pair`=`\|` 分隔**恰好 2 值**（如 `FTP /云盘\|云盘`）、`tokens`=`\|` 分隔多值；参数数量按类型声明的 `argc=` 约束校验（模块 `.rules` 可自定义，如 `argc=3` / `argc=2:4`），不满足返回错误 |
+
+模块类型由 `<模块名>.rules` 文件动态注册（详见 `docs/modules.md`），
+声明的属性（argc 参数约束、global-only 作用域、多语言 desc）全部由
+rule_server 在运行时解析并体现在 `rule_types` 中，前端无需硬编码任何模块类型。
 
 ### INJECT_ENABLE —— 应用规则启用/停用（`.disabled` 文件重命名）
 
@@ -337,4 +365,4 @@ Android Java 层标准 `LocalSocket` 不支持抽象命名空间地址，推荐�
 | `src/rule/rule_server.c` | 守护进程 + 客户端模式实现（单文件） |
 | `include/common.h` | `RULE_SOCKET_NAME` 常量 |
 | `meson.build` | `rule_server` 构建目标（Android/GNU 均构建） |
-| `tests/test_rule_server.py` | 端到端测试（PING/LIST/ADD/REMOVE/ENABLE/DISABLE/SET/STATUS/QUIT） |
+| `tests/test_rule_server.py` | 端到端测试（PING/LIST/ADD/REMOVE/ENABLE/DISABLE/SET/STATUS/QUIT + 模块动态类型、多语言 desc、argc 约束、顺序任意与畸形声明） |

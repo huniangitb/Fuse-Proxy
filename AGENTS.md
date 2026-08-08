@@ -12,7 +12,7 @@ Android 13+ 用户态 FUSE 存储代理（KernelSU/Magisk 模块二进制核心�
 
 ## 测试（纯 Python，无 C 测试目标）
 
-- `python3 tests/test_functional.py`；`python3 tests/test_rules.py`；`python3 tests/test_modules.py`（热插拔）；`python3 tests/test_ftp.py`（FTP 后端，需 vsftpd 匿名服务）；`python3 tests/test_rule_server.py`（rule_server 规则控制服务，覆盖内置+模块动态规则类型热更新）；有失败时退出码为 1（注意勿用管道吞掉退出码）。
+- `python3 tests/test_functional.py`；`python3 tests/test_rules.py`；`python3 tests/test_modules.py`（热插拔）；`python3 tests/test_ftp.py`（FTP 后端，需 vsftpd 匿名服务）；`python3 tests/test_rule_server.py`（rule_server 规则控制服务，覆盖内置+模块动态规则类型热更新、多语言 desc/argc 约束）；有失败时退出码为 1（注意勿用管道吞掉退出码）。
 - 前置：`fusermount3`、`/dev/fuse`、Python `sqlite3`；daemon 路径用 `FUSE_DAEMON` 环境变量覆盖（默认 `build_gnu/fuse_daemon`）。
 - 测试挂载 `/tmp/fuse_proxy_test/mnt` 与 `/tmp/fuse_rules_test/mnt`，规则写入 `/tmp/Namespace-Proxy/injector.conf`；失败残留的挂载点需 `fusermount3 -u` 清理后才能重跑。
 

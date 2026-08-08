@@ -1,5 +1,14 @@
 # ftp_module 模块注册的规则类型
-# 格式：每行 "<TYPE> <FORMAT>"；FORMAT 决定规则值如何解析/写入：
-#   pair — src|dst 双值（FTP <虚拟前缀>|<段名>，固定 2 参数），ADD 时 value 用 | 分隔
-# rule_server 启动及每次命令前扫描本文件，动态合并进支持的规则类型表
-FTP pair
+# conf 格式（推荐）：[类型名] 段 + key=value 属性行
+#   format       — 值格式：path / pair（src|dst 双值）/ switch / tokens
+#   argc=N       — 恰好 N 个参数；argc=N:M — N~M 个参数（M 用 * 或不写表示不限上界）
+#   global-only  — true/false：仅全局作用域可用
+#   desc         — 中文描述（默认语言）；desc.en / desc.ja 等为指定语言描述
+# rule_server 启动及每次命令前扫描本文件，动态合并进支持的规则类型表；
+# PING/LIST 回传 rule_types（含 desc 按请求 lang 选取 + desc_map 全语言映射）
+
+[FTP]
+format = pair
+argc = 2
+desc = FTP 存储映射：<虚拟前缀>|<段名>
+desc.en = FTP storage mapping: <virtual prefix>|<section>

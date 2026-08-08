@@ -98,10 +98,11 @@ def main():
 
     # 预置一个"已加载模块"的规则类型注册文件（模拟 ftp_module 的 FTP 类型），
     # 验证 rule_server 动态合并模块声明的规则类型
+    # （含多语言 desc 与 argc 参数约束属性）
     mod_dir = os.path.join(conf_dir, "modules", "ftp_module")
     os.makedirs(mod_dir, exist_ok=True)
     with open(os.path.join(mod_dir, "ftp_module.rules"), "w", encoding="utf-8") as f:
-        f.write("FTP pair\n")
+        f.write('[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射：<虚拟前缀>|<段名>\ndesc.en = FTP storage mapping: <virtual prefix>|<section>\n')
 
     # 预置第二用户（uid=10）空间：App-rules-10/ 目录 + 一个已停用应用
     user10_dir = os.path.join(conf_dir, "App-rules-10")
@@ -272,6 +273,57 @@ def check(proc, sock_name, conf_dir):
            and ftp_type["module"] == "ftp_module" and ftp_type["format"] == "pair", types)
     expect("PING 类型表含内置 HIDE", any(t["type"] == "HIDE" and t["builtin"] is True for t in types), types)
 
+    # 1.1 多语言描述：默认（不传 lang）回传中文 desc；lang=en 回传英文 desc；
+    #     同时含 desc_map 全语言映射与 argc 参数约束
+    expect("FTP desc 默认中文",
+           ftp_type is not None and ftp_type.get("desc") == "FTP 存储映射：<虚拟前缀>|<段名>",
+           ftp_type)
+    expect("FTP argc 约束", ftp_type is not None
+           and ftp_type.get("argc_min") == 2 and ftp_type.get("argc_max") == 2, ftp_type)
+    expect("FTP desc_map 全语言", ftp_type is not None
+           and ftp_type.get("desc_map", {}).get("en") == "FTP storage mapping: <virtual prefix>|<section>",
+           ftp_type)
+    r_en = send_cmd(proc, sock_name, {"cmd": "PING", "lang": "en"})
+    ftp_en = next((t for t in r_en["data"]["rule_types"] if t["type"] == "FTP"), None)
+    expect("FTP desc lang=en",
+           ftp_en is not None and ftp_en.get("desc") == "FTP storage mapping: <virtual prefix>|<section>",
+           ftp_en)
+    # 1.2 未知语言回退中文
+    r_xx = send_cmd(proc, sock_name, {"cmd": "PING", "lang": "ja"})
+    ftp_xx = next((t for t in r_xx["data"]["rule_types"] if t["type"] == "FTP"), None)
+    expect("FTP desc 未知语言回退中文",
+           ftp_xx is not None and ftp_xx.get("desc") == "FTP 存储映射：<虚拟前缀>|<段名>", ftp_xx)
+
+    # 1.3 属性顺序任意：desc.en= 出现在 desc= 之前，默认描述仍应标记为中文
+    mod_rules = os.path.join(conf_dir, "modules", "ftp_module", "ftp_module.rules")
+    with open(mod_rules, "w", encoding="utf-8") as f:
+        f.write('[FTP]\nformat = pair\nargc = 2\ndesc.en = EN FIRST\ndesc = 中文在后\n')
+    r_ord = send_cmd(proc, sock_name, {"cmd": "PING", "lang": "zh"})
+    ftp_ord = next((t for t in r_ord["data"]["rule_types"] if t["type"] == "FTP"), None)
+    dmap = ftp_ord.get("desc_map", {}) if ftp_ord else {}
+    expect("FTP desc 顺序任意(zh 在 en 后仍为中文)",
+           ftp_ord is not None and ftp_ord.get("desc") == "中文在后"
+           and dmap.get("zh") == "中文在后" and dmap.get("en") == "EN FIRST", ftp_ord)
+    # 恢复原预置声明（供后续用例使用）
+    with open(mod_rules, "w", encoding="utf-8") as f:
+        f.write('[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射：<虚拟前缀>|<段名>\ndesc.en = FTP storage mapping: <virtual prefix>|<section>\n')
+
+    # 1.4 畸形 argc 声明：argc=abc 应被跳过（不注册 0:0 错误约束），类型仍可用
+    with open(mod_rules, "w", encoding="utf-8") as f:
+        f.write('[FTP]\nformat = pair\nargc = abc\ndesc = 坏声明\n')
+    r_bad = send_cmd(proc, sock_name, {"cmd": "PING"})
+    ftp_bad = next((t for t in r_bad["data"]["rule_types"] if t["type"] == "FTP"), None)
+    expect("FTP 畸形 argc 声明被跳过(取默认 pair=2)",
+           ftp_bad is not None and ftp_bad.get("argc_min") == 2
+           and ftp_bad.get("argc_max") == 2, ftp_bad)
+    r_bad_add = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "GLOBAL", "type": "FTP", "value": "/a|/b"})
+    expect("FTP 畸形 argc 后 ADD 仍可用", r_bad_add.get("status") == "ok", r_bad_add)
+    if r_bad_add.get("status") == "ok":
+        send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": "GLOBAL", "type": "FTP", "index": 0})
+    # 恢复原预置声明
+    with open(mod_rules, "w", encoding="utf-8") as f:
+        f.write('[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射：<虚拟前缀>|<段名>\ndesc.en = FTP storage mapping: <virtual prefix>|<section>\n')
+
     # 2. ADD 模块类型规则（FTP <虚拟前缀>|<段名>）应成功
     r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "GLOBAL", "type": "FTP", "value": "/云盘|云盘"})
     expect("ADD 动态类型 FTP", r.get("status") == "ok", r)
@@ -308,7 +360,7 @@ def check(proc, sock_name, conf_dir):
 
     # 6. 恢复模块 → 类型重新可用（热更新）
     with open(os.path.join(conf_dir, "modules", "ftp_module", "ftp_module.rules"), "w", encoding="utf-8") as f:
-        f.write("FTP pair\n")
+        f.write("[FTP]\nformat = pair\n")
     r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "GLOBAL", "type": "FTP", "value": "/云盘|云盘"})
     expect("恢复后 ADD FTP 成功", r.get("status") == "ok", r)
     r = send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": "GLOBAL", "type": "FTP", "index": 0})
