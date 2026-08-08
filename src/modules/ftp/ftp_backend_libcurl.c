@@ -39,7 +39,41 @@ typedef struct FtpBackend {
     pthread_mutex_t op_lock; /* 操作锁：串行化 curl_easy_perform（句柄非线程安全） */
     bool connected;          /* 连接是否有效 */
     time_t last_used;        /* 最后使用时间（保活） */
+    int  fail_count;         /* 连续失败计数（熔断：无网络自动静默） */
+    bool silent;             /* 静默模式：熔断生效，操作快速失败、停止重试 */
+    time_t silent_at;        /* 进入静默的时间（探活恢复节奏参考） */
 } FtpBackend;
+
+/* 熔断阈值：连续失败达此值进入静默。8 次可在容忍正常偶发失败（连接抖动）
+   的同时，无网络时（connect 立即失败）毫秒级进入静默——过低（如 3）会
+   把正常瞬时失败误判为断网。 */
+#define FTP_SILENT_THRESHOLD 8
+static void mark_failure(FtpBackend* bk) {
+    pthread_mutex_lock(&bk->lock);
+    bk->fail_count++;
+    if (bk->fail_count >= FTP_SILENT_THRESHOLD && !bk->silent) {
+        bk->silent = true;
+        bk->silent_at = time(NULL);
+    }
+    pthread_mutex_unlock(&bk->lock);
+}
+static void mark_success(FtpBackend* bk) {
+    pthread_mutex_lock(&bk->lock);
+    bk->fail_count = 0;
+    bk->silent = false;
+    pthread_mutex_unlock(&bk->lock);
+}
+/* 静默熔断探测节奏：silent 时快速失败；每 FTP_SILENT_PROBE_INTERVAL 秒
+   放行一次真实连接尝试（探测）——网络恢复后由成功操作 mark_success 退出
+   静默（自动恢复，延迟 ≤ 探测间隔）。返回 true=应快速失败（不发起连接）。 */
+#define FTP_SILENT_PROBE_INTERVAL 2
+static bool silent_fast_fail(FtpBackend* bk) {
+    if (!bk->silent) return false;
+    time_t now = time(NULL);
+    if (now - bk->silent_at < FTP_SILENT_PROBE_INTERVAL) return true;
+    bk->silent_at = now;   /* 放行一次连接尝试（探测窗口） */
+    return false;
+}
 
 static FtpBackend g_backends[FTP_BACKEND_MAX];
 static int g_backend_count = 0;
@@ -296,6 +330,8 @@ static void reset_curl(FtpBackend* bk) {
     bk->connected = false;
     pthread_mutex_unlock(&bk->lock);
     pthread_mutex_unlock(&bk->op_lock);
+    /* 连接失败清理（各操作失败统一入口）：熔断计数，达阈值进入静默 */
+    mark_failure(bk);
 }
 
 /* 重置共享句柄的操作级选项（防跨操作残留：NOBODY 残留会吞掉 STOR 上传、
@@ -357,6 +393,7 @@ static void* ftp_dl_thread(void* arg);
 int ftp_backend_getattr(const char* path, struct stat* st) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
+    if (silent_fast_fail(bk)) return -ENOENT;   /* 静默熔断：快速失败（每 2s 放行一次探测） */
     memset(st, 0, sizeof *st);
 
     if (ensure_curl(bk) != 0) return -EIO;
@@ -398,6 +435,7 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
         st->st_nlink = 1;
         if (ft >= 0) st->st_mtime = (time_t)ft;
         free(wb.buf);
+        mark_success(bk);   /* 操作成功：清零熔断计数 */
         return 0;
     }
     free(wb.buf);
@@ -441,6 +479,7 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
     if (!entries || max <= 0) return 0;
+    if (silent_fast_fail(bk)) return -ENOENT;   /* 静默熔断：快速失败（每 2s 放行一次探测） */
 
     if (ensure_curl(bk) != 0) return -EIO;
 
@@ -513,6 +552,7 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
         line = nl + 1;
     }
     free(wb.buf);
+    mark_success(bk);   /* 操作成功：清零熔断计数 */
     return out_n;
 }
 
@@ -538,6 +578,7 @@ static CURL* ftp_read_curl_new(const FtpBackend* bk) {
 int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk || !h) return -ENOENT;
+    if (silent_fast_fail(bk)) return -ENOENT;   /* 静默熔断：快速失败（每 2s 放行一次探测） */
 
     if (ensure_curl(bk) != 0) return -EIO;
 
@@ -562,6 +603,7 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
         f->writing = true;
         *h = ftp_handle_alloc(f);
         if (*h == 0) { close(tfd); pthread_mutex_destroy(&f->f_lock); free(f); return -EIO; }
+        mark_success(bk);   /* 连接建立成功：清零熔断计数 */
         return 0;
     }
 
@@ -716,6 +758,13 @@ static void* ftp_dl_thread(void* arg) {
         wb.lock = &f->f_lock;
         pthread_mutex_unlock(&f->f_lock);
 
+        if (silent_fast_fail(f->bk)) {
+            /* 静默模式（无网络熔断）：空转等待，每 2s 放行一次连接探测，
+               网络恢复后 perform 成功 → mark_success 退出静默继续下载 */
+            usleep(500000);
+            continue;
+        }
+
         char range[32];
         snprintf(range, sizeof range, "%lld-", (long long)dl_off);
         curl_easy_setopt(f->read_curl, CURLOPT_URL, f->ftp_path);
@@ -736,6 +785,7 @@ static void* ftp_dl_thread(void* arg) {
         pthread_mutex_lock(&f->f_lock);
         if (res == CURLE_OK || res == CURLE_REMOTE_FILE_NOT_FOUND) {
             f->rbuf_eof = true;   /* 读到文件尾 */
+            mark_success(f->bk);  /* 连接成功：清零熔断计数（网络恢复退出静默） */
         } else if (res != CURLE_WRITE_ERROR) {
             /* 真错误：保留句柄（curl 自动重连），指数退避后重试——弱网下
                瞬时失败（断连/超时）可能持续，固定 100ms 会忙循环且网络
@@ -913,6 +963,7 @@ static int ftp_backend_upload(FtpBackendFile* f) {
             curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
             pthread_mutex_unlock(&f->bk->op_lock);
             if (res == CURLE_OK) break;
+            if (f->bk->silent) break;   /* 静默模式：失败后不再重试（无网络空转） */
         }
         if (res != CURLE_OK) {
             reset_curl(f->bk);
@@ -922,7 +973,10 @@ static int ftp_backend_upload(FtpBackendFile* f) {
         rc = -EIO;
     }
     free(data);
-    if (rc == 0) f->uploaded = true;
+    if (rc == 0) {
+        f->uploaded = true;
+        mark_success(f->bk);   /* 上传成功：清零熔断计数（网络恢复退出静默） */
+    }
     return rc;
 }
 

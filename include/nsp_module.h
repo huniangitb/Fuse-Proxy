@@ -21,6 +21,19 @@
  *     登记能力 → 调 init(api) → 注册完成；卸载流程：调 exit → dlclose
  *   - 模块名仅含 [a-z0-9_-]，目录名 = 模块名
  *
+ * 规则类型注册（rule_server 动态扩展）：
+ *   - 模块可在其目录放置 <模块名>.rules 文本文件，向 rule_server 声明
+ *     自己支持的规则类型，实现「支持的规则随加载模块动态追加」。
+ *   - 每行格式：<TYPE> <FORMAT>，FORMAT 取值：
+ *       path   — 单值路径（如 HIDE /x）
+ *       pair   — src|dst 双值（如 REDIRECT /a|/b）
+ *       switch — ON/OFF 开关（如 MONITOR ON）
+ *       tokens — 空格分隔多 token（ADD 时 value 用 | 分隔）
+ *   - rule_server 按需扫描模块目录下的 <模块名>.rules（目录/文件 mtime 缓存，
+ *     未变化时直接复用类型表），动态合并进规则类型表；不存在的类型无法
+ *     ADD/REMOVE/ENABLE/DISABLE。
+ *   - 无 .rules 文件的模块不影响加载（rule_server 仅跳过其类型注册）。
+ *
  * 规则类型说明（basic_rules 模块承载）：
  *   REDIRECT  — 路径重定向（虚拟前缀 → 真实目标，含 ALLOW 豁免的内部 ? 形式）
  *   SANDBOX   — 应用存储沙箱隔离（/Android/data/<pkg>/sandbox）

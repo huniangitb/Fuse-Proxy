@@ -149,6 +149,17 @@ executable('log_ctl',
   install_dir: install_bin_dir
 )
 
+# rule_server：规则控制守护进程（前端经 nsp_rule_socket 抽象 UDS 以 JSON 行协议
+# 动态增删/启停规则、重载配置、停止注入）。纯文件级操作，仅依赖 json-c，
+# 不链接 libfuse3；Android/GNU 均构建（路径经 CONFIG_DIR 宏适配）。
+executable('rule_server',
+  ['src/rule/rule_server.c'],
+  include_directories: all_inc_dirs,
+  dependencies: json_c,
+  install: true,
+  install_dir: install_bin_dir
+)
+
 # ================= 热插拔模块 =================
 # basic_rules：基础规则模块（REDIRECT/SANDBOX/HIDE/ALLOW/RO），
 # 由 fuse_daemon 启动后 dlopen 热加载。决策引擎自包含，
@@ -170,6 +181,11 @@ shared_library('basic_rules',
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
   install: true,
+  install_dir: install_bin_dir + '/modules/basic_rules'
+)
+
+# 模块规则类型注册文件：rule_server 扫描合并动态规则类型（格式见 nsp_module.h）
+install_data('src/modules/basic_rules/basic_rules.rules',
   install_dir: install_bin_dir + '/modules/basic_rules'
 )
 
@@ -226,6 +242,11 @@ shared_library('ftp_module',
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,
+  install_dir: install_bin_dir + '/modules/ftp_module'
+)
+
+# 模块规则类型注册文件：rule_server 扫描合并动态规则类型（格式见 nsp_module.h）
+install_data('src/modules/ftp/ftp_module.rules',
   install_dir: install_bin_dir + '/modules/ftp_module'
 )
 
