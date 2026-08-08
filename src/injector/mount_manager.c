@@ -550,6 +550,8 @@ int perform_app_restore(const char* pkg, int pid, uid_t uid) {
     if (ret == 0) {
         LOG_DBG("非目标应用已还原系统视图: %s(PID:%d, user=%d)", pkg, pid, user_id);
         invalidate_mount_cache(pid);
+    } else if (ret == 1) {
+        LOG_DBG("非目标应用还原跳过: %s(PID:%d, user=%d) 顶层非项目 FUSE", pkg, pid, user_id);
     } else {
         LOG_ERR("非目标应用还原失败: %s(PID:%d, user=%d)", pkg, pid, user_id);
     }

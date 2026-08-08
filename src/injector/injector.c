@@ -764,7 +764,7 @@ int scan_zygote_children() {
             if (g_global_replace_mode) {
                 /* 增量还原：还原成功（或已还原跳过）后标记追踪，
                    后续周期扫描经 is_tracked 直接跳过，避免反复检测 */
-                if (perform_app_restore(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid) == 0) {
+                if (perform_app_restore(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid) >= 0) {
                     add_tracked(m_tasks[i].pid);
                 }
             } else {

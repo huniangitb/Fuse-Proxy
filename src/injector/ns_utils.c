@@ -127,7 +127,9 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
         (void)w;
         close(status_pipe[1]);
         close(log_pipe[1]);
-        _exit(ret == 0 ? 0 : (ret > 0 ? ret : 1));
+        /* 退出码映射：0=成功, 正数=业务返回值(1=跳过), 255=负数(-1=失败)，
+           供父进程 fallback 分支（未读到 status 管道）还原返回值 */
+        _exit(ret == 0 ? 0 : (ret > 0 ? ret : 255));
     }
     close(status_pipe[1]);
     close(log_pipe[1]);
@@ -183,19 +185,29 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
             ret_val = child_ret;
             if (child_err) *child_err = child_ret; 
             if (ret_val != 0) {
-                LOG_DBG("ns操作 pid=%d 耗时: %ldms, 失败码: %d", target_pid, elapsed, ret_val);
+                if (ret_val == 1) {
+                    LOG_DBG("ns操作 pid=%d 耗时: %ldms, 结果: 跳过(1)", target_pid, elapsed);
+                } else {
+                    LOG_DBG("ns操作 pid=%d 耗时: %ldms, 失败码: %d", target_pid, elapsed, ret_val);
+                }
             } else if (elapsed > 50) {
                 LOG_DBG("ns操作 pid=%d 耗时: %ldms", target_pid, elapsed);
             }
         } else {
+            /* 子进程未写 status 管道（异常路径）：以退出码还原返回值。
+               func 退出码映射（见 fork 子进程 _exit）：0=成功, 正数=业务
+               返回值(1=跳过), 255=负数(-1=失败) */
             if (WIFEXITED(status)) {
                 int code = WEXITSTATUS(status);
                 if (child_err) *child_err = code;
-                LOG_WRN("ns操作子进程未写入管道异常退出, pid=%d, code: %d", target_pid, code);
+                ret_val = (code == 0) ? 0 : (code == 255 ? -1 : code);
+                LOG_WRN("ns操作子进程未写入管道异常退出, pid=%d, code: %d (ret=%d)", target_pid, code, ret_val);
             } else if (WIFSIGNALED(status)) {
                 LOG_WRN("ns操作子进程被信号杀死, pid=%d, signal=%d", target_pid, WTERMSIG(status));
+                ret_val = -1;
+            } else {
+                ret_val = -1;
             }
-            ret_val = -1;
         }
     } else {
         kill(child, SIGKILL);
@@ -206,7 +218,9 @@ static int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args,
     }
     close(status_pipe[0]);
     close(log_pipe[0]);
-    return ret_val == 0 ? 0 : -1;
+    /* 透传子进程业务返回值：0=成功, 1=跳过, -1=失败（不允许再折叠，否则
+       调用方无法区分"跳过"与"失败"） */
+    return ret_val == 0 ? 0 : (ret_val > 0 ? ret_val : -1);
 }
 static int run_in_mnt_ns(int target_pid, int (*func)(void*), void* args, int* child_err) {
     return run_in_mnt_ns_timeout(target_pid, func, args, child_err, 500);
@@ -1443,18 +1457,20 @@ static int do_restore_app_fuse(void* raw) {
     bool is_project = false;
     for (int i = 0; i < n; i++) {
         if (strcmp(all[i].mount_point, target) != 0) continue;
-        /* 顶层与 fuse_src 共享 superblock（dev 相同）或 fstype 含 fuse_daemon → 项目 FUSE 视图 */
+        /* 同挂载点可有多层叠加挂载（系统视图先挂载、项目视图经共享传播
+           后叠加），mountinfo 最后一条才是实际生效的最顶层视图：
+           必须遍历全部匹配，不能看到第一条就 break */
         if ((src_dev[0] && strcmp(all[i].dev, src_dev) == 0) ||
             fast_strstr(all[i].fstype, "fuse_daemon") != nullptr ||
             fast_strstr(all[i].source, "fuse_daemon") != nullptr) {
             is_project = true;
         }
-        break;
+        /* 不 break：继续遍历，以最后一条（最顶层）为准 */
     }
     if (!is_project) {
         LOG_DBG("应用还原: %s 顶层非项目 FUSE，跳过", target);
         free(all); free(sub);
-        return 0;
+        return 1;   /* 1=跳过（非项目 FUSE），区别于 0=成功还原 */
     }
     /* 先校验备份点有效，再执行任何卸载：备份无效时必须保留当前可用的代理视图，
        避免把应用置于既无代理视图也无系统视图的裸挂载态（后续扫描还会因顶层
@@ -1550,7 +1566,13 @@ int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_ro
     args.user_id = user_id;
     int child_err = 0;
     int ret = run_in_mnt_ns_timeout(app_pid, do_restore_app_fuse, &args, &child_err, 5000);
-    if (ret != 0) LOG_ERR("应用还原失败 (pid=%d, ret=%d, err=%d)", app_pid, ret, child_err);
+    if (ret == 0) {
+        LOG_DBG("应用还原成功 (pid=%d)", app_pid);
+    } else if (ret == 1) {
+        LOG_DBG("应用还原跳过 (pid=%d) 顶层非项目 FUSE", app_pid);
+    } else {
+        LOG_ERR("应用还原失败 (pid=%d, ret=%d, err=%d)", app_pid, ret, child_err);
+    }
     return ret;
 }
 

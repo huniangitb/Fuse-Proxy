@@ -21,6 +21,8 @@ void get_target_storage_path(uid_t uid, char* path, size_t size);
 void add_tracked(int pid);
 bool is_tracked(int pid);
 void remove_tracked(int pid);
+/* 生命周期清理：清除已退出应用的追踪缓存（被动模式由 IPC 通知路径触发） */
+void cleanup_stale_tracked(void);
 /*
  * 全量应用 PID 缓存（非被动模式每次扫描刷新，含已停用/未追踪应用）。
  * 目的：规则变化（如某应用重新启用）时快速定位运行中的 pid 立即挂载，

@@ -1232,7 +1232,14 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "错误: --level 需要指定一个级别\n");
                 usage(argv[0]);
             }
-            level_arg = argv[++i];
+            /* 支持级别名与数字：debug/info/warn/error（及大写）→ 0/1/2/3，
+               避免传名字时 atoi 解析为 0 导致过滤失效（显示全部日志） */
+            const char *lv = argv[++i];
+            if (strcasecmp(lv, "debug") == 0) lv = "0";
+            else if (strcasecmp(lv, "info") == 0) lv = "1";
+            else if (strcasecmp(lv, "warn") == 0 || strcasecmp(lv, "warning") == 0) lv = "2";
+            else if (strcasecmp(lv, "error") == 0 || strcasecmp(lv, "err") == 0) lv = "3";
+            level_arg = (char*)lv;
         } else if (strcmp(argv[i], "--uid") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "错误: --uid 需要指定用户 ID\n");
