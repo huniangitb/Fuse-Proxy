@@ -216,6 +216,12 @@ static void prune_stale_tracked() {
     pthread_mutex_unlock(&g_tracked_mutex);
 }
 
+/* 生命周期清理入口：清除已退出应用的追踪缓存（被动模式禁用周期扫描后，
+   prune_stale_tracked 无自动调用时机，由 IPC 通知路径主动触发） */
+void cleanup_stale_tracked(void) {
+    prune_stale_tracked();
+}
+
 /* ================= 全量应用 PID 缓存 =================
    非被动模式下每次扫描刷新：缓存所有 zygote 子进程（含已停用/未追踪
    的应用），便于规则变化时快速定位 pid 立即挂载，无需等待应用重启

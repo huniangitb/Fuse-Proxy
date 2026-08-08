@@ -61,20 +61,53 @@ typedef struct {
     char mnt_src[256];
 } IpcMountArg;
 
-/* 全局替换模式：非目标应用异步还原线程（卸载项目 FUSE，bind 回系统视图备份） */
+/* 全局替换模式：非目标应用异步还原线程（卸载项目 FUSE，bind 回系统视图备份）。
+   整个还原周期（派发→重试→完成）合并为单条汇总日志，方便调试、减少占用 */
 static void* ipc_restore_thread(void* raw) {
     IpcMountArg* arg = (IpcMountArg*)raw;
-    if (kill(arg->pid, 0) != 0) {
-        LOG_DBG("IPC还原线程: 进程已死 %s(PID:%d)", arg->pkg, arg->pid);
-        free(arg);
-        return NULL;
+    int ret = -1;
+    int attempts = 0;
+    /* IPC 通知时间非常早（应用 fork 后视图尚未就绪）：跳过(ret=1)表示
+       当前顶层还不是项目 FUSE，需等待共享传播完成。整个还原周期（含重试）
+       总预算 100ms，超预算仍跳过即判定为异常（传播未生效） */
+    struct timespec t0, tn;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* 整个挂载周期（含重试）的日志打包发送：begin 后 sender 累积日志，
+       pop 后一次性打包发送给 log_monitor（不丢日志、减少发送次数） */
+    log_batch_begin();
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (kill(arg->pid, 0) != 0) {
+            log_batch_end();
+            free(arg);
+            return NULL;
+        }
+        attempts++;
+        ret = perform_app_restore(arg->pkg, arg->pid, arg->uid);
+        if (ret != 1) break;   /* 0=成功 或 -1=失败：结束重试 */
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        long elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000 +
+                          (tn.tv_nsec - t0.tv_nsec) / 1000000;
+        if (elapsed_ms >= 100) break;   /* 总预算 100ms 耗尽 */
+        usleep(10000);   /* 10ms 间隔，配合 100ms 总预算 */
     }
-    int ret = perform_app_restore(arg->pkg, arg->pid, arg->uid);
+    log_batch_end();
     /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用 */
     if (ret == 0) {
         add_tracked(arg->pid);
     }
-    LOG_DBG("IPC还原完成: %s(PID:%d) ret=%d", arg->pkg, arg->pid, ret);
+    /* 单条汇总日志：一次还原周期仅输出一条（派发→重试→完成合并） */
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    long total_ms = (tn.tv_sec - t0.tv_sec) * 1000 +
+                    (tn.tv_nsec - t0.tv_nsec) / 1000000;
+    if (ret == 0) {
+        LOG("IPC还原: %s(PID:%d) 成功 (尝试%d次, %ldms)", arg->pkg, arg->pid, attempts, total_ms);
+    } else if (ret == 1) {
+        LOG_WRN("IPC还原异常: %s(PID:%d) %ldms内仍非项目 FUSE 视图 (尝试%d次)",
+                arg->pkg, arg->pid, total_ms, attempts);
+    } else {
+        LOG_ERR("IPC还原失败: %s(PID:%d) ret=%d (尝试%d次, %ldms)",
+                arg->pkg, arg->pid, ret, attempts, total_ms);
+    }
     free(arg);
     return NULL;
 }
@@ -241,6 +274,9 @@ void handle_ipc_client_readable(int client_fd) {
             g_passive_mode = true;
             LOG("已接收到IPC通知，切换到被动模式，停止周期扫描");
         }
+        /* 生命周期清理：清除已退出应用的追踪缓存（被动模式无周期扫描，
+           此路径是唯一可靠的清理时机） */
+        cleanup_stale_tracked();
         if (is_isolated_uid(uid) || strstr(pkg, "_zygote") != nullptr) {
             send(client_fd, "OK", 2, MSG_NOSIGNAL);
             close(client_fd);
@@ -272,7 +308,7 @@ void handle_ipc_client_readable(int client_fd) {
                     pthread_t tid;
                     if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
                         pthread_detach(tid);
-                        LOG_DBG("IPC派发异步还原线程(非目标应用): %s(PID:%d)", clean_pkg, pid);
+                        /* 派发日志已并入 ipc_restore_thread 的单条汇总，不再单独输出 */
                     } else {
                         LOG_ERR("IPC创建还原线程失败: %s(PID:%d)", clean_pkg, pid);
                         free(arg);

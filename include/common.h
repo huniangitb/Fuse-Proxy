@@ -76,6 +76,12 @@ typedef enum {
 } LogLevel;
 
 extern LogLevel g_min_log_level;
+/* 日志合并周期：batch_begin/batch_end 配对，期间 log_internal 将日志累积
+   到批量缓冲（不逐条写环形缓冲），batch_end 时把整个周期的日志合并为
+   单条写入，前端最终只显示一条日志（多个发送请求并入一个日志）。
+   原子嵌套计数 + 互斥锁，不阻塞日志路径 */
+void log_batch_begin(void);
+void log_batch_end(void);
 extern bool g_persist_all_logs;
 extern char g_real_root[PATH_MAX];
 extern bool g_strip_o_direct;

@@ -49,6 +49,20 @@ typedef struct AsyncCtx {
     volatile int head;
     volatile int tail;
     int notify_fd;
+    /* 粘包移交缓冲：主循环一次 read 读到首行 LOG_SYS 转 async 后，buf 中
+       剩余字节（如紧跟的 LOG_BATCH 帧）移交至此，async_log_thread 先处理。
+       在 process_line 内、pthread_create 之前填充，避免线程先跑读空 */
+    char pending[4096];
+    int pending_len;
+    /* 合并日志多槽队列：LOG_BATCH 合并内容可超过 entries.msg 的 512 上限，
+       且连续多个合并周期（背靠背 LOG_BATCH 帧）不能互相覆盖。
+       head 仅 async_log_thread 写、tail 仅主循环 drain_async 读（无锁环形）。
+       drain_async 将每槽 push 入 g_sys_buf（MAX_MSG_LEN=4096），
+       避免 UTF-8 截断乱码 */
+#define BATCH_Q_CAP 4
+    struct { char msg[MAX_MSG_LEN]; int len; } batch_q[BATCH_Q_CAP];
+    volatile int batch_q_head;
+    volatile int batch_q_tail;
     struct AsyncCtx *next;
 } AsyncCtx;
 
@@ -222,6 +236,16 @@ static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     if (buf->head == buf->tail) buf->full = true;
 }
 static void drain_async(AsyncCtx *ctx) {
+    /* 合并日志多槽队列：逐槽 push 入 g_sys_buf（整块可超过 entries.msg
+       512 上限，背靠背 LOG_BATCH 帧互不覆盖） */
+    while (ctx->batch_q_tail != ctx->batch_q_head) {
+        int slot = ctx->batch_q_tail % BATCH_Q_CAP;
+        if (ctx->batch_q[slot].len > 0) {
+            push_log(&g_sys_buf, ctx->batch_q[slot].msg, 2, LOG_DEBUG);
+        }
+        ctx->batch_q[slot].len = 0;
+        ctx->batch_q_tail++;
+    }
     while (ctx->tail != ctx->head) {
         char *msg = ctx->entries[ctx->tail].msg;
         int level = ctx->entries[ctx->tail].level;
@@ -250,8 +274,95 @@ static void cleanup_async(AsyncCtx *ctx) {
 static void *async_log_thread(void *arg) {
     AsyncCtx *ctx = arg;
     char buf[4096];
-    char line[512];
+    char line[MAX_MSG_LEN + 128];   /* 行缓冲须容纳完整合并日志（单行制表符），
+                                       否则 511 截断会切坏 UTF-8 中文产生乱码 */
     int pos = 0;
+    /* LOG_BATCH 合并包：整块（含多行）合并为一条日志入库，前端只显示一条 */
+    int batch_collect = 0;
+    char batch_msg[4096] = {0};
+    size_t batch_len = 0;
+    /* 先处理主循环移交的粘包剩余字节（如 LOG_BATCH 帧），再进入 read 循环 */
+    size_t pidx = 0;
+    while (pidx < (size_t)ctx->pending_len) {
+        char c = ctx->pending[pidx++];
+        if (c == '\n') {
+            line[pos] = '\0';
+            if (pos > 0) {
+                char *msg = line;
+                if (batch_collect && strncmp(msg, "LOG_BATCH_END", 13) == 0) {
+                    batch_collect = 0;
+                    if (batch_len > 0) {
+                        /* 合并日志入多槽队列（可超过 entries.msg 的 512 上限），
+                           背靠背帧互不覆盖，由主循环 drain_async 逐槽 push 入 g_sys_buf */
+                        int slot = ctx->batch_q_head % BATCH_Q_CAP;
+                        if ((ctx->batch_q_head - ctx->batch_q_tail) < BATCH_Q_CAP) {
+                            size_t copy = (batch_len < (int)sizeof(ctx->batch_q[slot].msg))
+                                        ? (size_t)batch_len : sizeof(ctx->batch_q[slot].msg) - 1;
+                            memcpy(ctx->batch_q[slot].msg, batch_msg, copy);
+                            ctx->batch_q[slot].msg[copy] = '\0';
+                            ctx->batch_q[slot].len = (int)copy;
+                            ctx->batch_q_head++;
+                            uint64_t val = 1;
+                            write(ctx->notify_fd, &val, sizeof(val));
+                        } else {
+                            overflow_write("sys", batch_msg, LOG_DEBUG, time(nullptr));
+                        }
+                    }
+                    pos = 0;
+                    continue;
+                }
+                if (!batch_collect && strncmp(msg, "LOG_BATCH", 9) == 0 &&
+                    msg[9] == '\0') {
+                    batch_collect = 1;
+                    batch_len = 0;
+                    batch_msg[0] = '\0';
+                    pos = 0;
+                    continue;
+                }
+                if (batch_collect) {
+                    size_t add = strlen(msg);
+                    if (batch_len + add + 2 < sizeof(batch_msg)) {
+                        memcpy(batch_msg + batch_len, msg, add);
+                        batch_len += add;
+                        batch_msg[batch_len++] = '\n';
+                        batch_msg[batch_len] = '\0';
+                    }
+                    pos = 0;
+                    continue;
+                }
+                int level = LOG_INFO;
+                if (strncmp(msg, "LOG_IO:", 7) == 0) {
+                    ctx->type = 1; msg += 7;
+                } else if (strncmp(msg, "LOG_SYS:", 8) == 0) {
+                    ctx->type = 2; msg += 8;
+                } else if (strncmp(msg, "LOG_LOGCAT:", 11) == 0) {
+                    ctx->type = 3; msg += 11;
+                }
+                if (ctx->type == 2 && msg[0] >= '0' && msg[0] <= '9') {
+                    level = msg[0] - '0';
+                    char *colon = strchr(msg, ':');
+                    if (colon) msg = colon + 1;
+                }
+                int next = (ctx->head + 1) & (RING_CAP - 1);
+                if (next != ctx->tail) {
+                    strncpy(ctx->entries[ctx->head].msg, msg, 511);
+                    ctx->entries[ctx->head].msg[511] = '\0';
+                    ctx->entries[ctx->head].level = level;
+                    ctx->entries[ctx->head].type = ctx->type;
+                    ctx->head = next;
+                    uint64_t val = 1;
+                    write(ctx->notify_fd, &val, sizeof(val));
+                } else {
+                    const char *type_str = (ctx->type == 1) ? "io" : (ctx->type == 3) ? "logcat" : "sys";
+                    overflow_write(type_str, msg, level, time(nullptr));
+                }
+            }
+            pos = 0;
+        } else if (pos < (int)sizeof(line) - 1) {
+            line[pos++] = c;
+        }
+    }
+    ctx->pending_len = 0;
     while (!ctx->disconnected) {
         ssize_t n = read(ctx->fd, buf, sizeof(buf));
         if (n <= 0) break;
@@ -260,6 +371,52 @@ static void *async_log_thread(void *arg) {
                 line[pos] = '\0';
                 if (pos > 0) {
                     char *msg = line;
+                    /* 合并包尾优先判断：LOG_BATCH_END 以 LOG_BATCH 开头，
+                       必须先匹配 END，否则会被头判断误吞导致内容永不入库 */
+                    if (batch_collect && strncmp(msg, "LOG_BATCH_END", 13) == 0) {
+                        batch_collect = 0;
+                        if (batch_len > 0) {
+                            /* 合并日志入多槽队列（可超过 entries.msg 的 512 上限），
+                               背靠背帧互不覆盖，由主循环 drain_async 逐槽 push 入 g_sys_buf */
+                            int slot = ctx->batch_q_head % BATCH_Q_CAP;
+                            if ((ctx->batch_q_head - ctx->batch_q_tail) < BATCH_Q_CAP) {
+                                size_t copy = (batch_len < (int)sizeof(ctx->batch_q[slot].msg))
+                                            ? (size_t)batch_len : sizeof(ctx->batch_q[slot].msg) - 1;
+                                memcpy(ctx->batch_q[slot].msg, batch_msg, copy);
+                                ctx->batch_q[slot].msg[copy] = '\0';
+                                ctx->batch_q[slot].len = (int)copy;
+                                ctx->batch_q_head++;
+                                uint64_t val = 1;
+                                write(ctx->notify_fd, &val, sizeof(val));
+                            } else {
+                                overflow_write("sys", batch_msg, LOG_DEBUG, time(nullptr));
+                            }
+                        }
+                        pos = 0;
+                        continue;
+                    }
+                    /* 合并包头：进入收集模式（要求第 10 字符为行尾，避免
+                       误匹配 LOG_BATCH_END） */
+                    if (!batch_collect && strncmp(msg, "LOG_BATCH", 9) == 0 &&
+                        msg[9] == '\0') {
+                        batch_collect = 1;
+                        batch_len = 0;
+                        batch_msg[0] = '\0';
+                        pos = 0;
+                        continue;
+                    }
+                    if (batch_collect) {
+                        /* 收集内容行（保留换行） */
+                        size_t add = strlen(msg);
+                        if (batch_len + add + 2 < sizeof(batch_msg)) {
+                            memcpy(batch_msg + batch_len, msg, add);
+                            batch_len += add;
+                            batch_msg[batch_len++] = '\n';
+                            batch_msg[batch_len] = '\0';
+                        }
+                        pos = 0;
+                        continue;
+                    }
                     int level = LOG_INFO;
                     if (strncmp(msg, "LOG_IO:", 7) == 0) {
                         ctx->type = 1; msg += 7;
@@ -288,7 +445,7 @@ static void *async_log_thread(void *arg) {
                     }
                 }
                 pos = 0;
-            } else if (pos < 511) {
+            } else if (pos < (int)sizeof(line) - 1) {
                 line[pos++] = buf[i];
             }
         }
@@ -502,7 +659,7 @@ static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level) 
     }
     (void)type;
 }
-static int process_line(ClientCtx* ctx, char* line) {
+static int process_line(ClientCtx* ctx, char* line, const char* leftover, int leftover_len) {
     int fd = ctx->fd;
     if (strncmp(line, "LOG_IO:", 7) == 0 ||
         strncmp(line, "LOG_SYS:", 8) == 0 ||
@@ -515,6 +672,14 @@ static int process_line(ClientCtx* ctx, char* line) {
         set_block(actx->fd);
         actx->notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         actx->disconnected = false;
+        /* 粘包剩余字节（如紧跟的 LOG_BATCH 帧）在创建线程前移交 pending，
+           避免 async_log_thread 先跑读到 pending_len==0 导致帧丢失 */
+        if (leftover && leftover_len > 0) {
+            int copy = leftover_len;
+            if (copy > (int)sizeof(actx->pending)) copy = (int)sizeof(actx->pending);
+            memcpy(actx->pending, leftover, (size_t)copy);
+            actx->pending_len = copy;
+        }
         char *msg = line;
         int level = LOG_INFO;
         int entry_type = 0;
@@ -853,7 +1018,9 @@ int main(int argc, char *argv[]) {
                             if (buf[j] == '\n') {
                                 ctx->line[ctx->pos] = '\0';
                                 if (ctx->pos > 0) {
-                                    if (process_line(ctx, ctx->line)) { consumed = true; break; }
+                                    if (process_line(ctx, ctx->line, buf + j + 1, (int)(n - (j + 1)))) {
+                                        consumed = true; break;
+                                    }
                                 }
                                 ctx->pos = 0;
                             } else if (ctx->pos < sizeof(ctx->line) - 1) ctx->line[ctx->pos++] = buf[j];

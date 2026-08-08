@@ -19,14 +19,26 @@ LogLevel g_min_log_level = LOG_INFO;
 char g_real_root[PATH_MAX] = {0};
 bool g_persist_all_logs = false;
 bool g_strip_o_direct = false;
+/* 日志合并周期：batch 期间 log_internal 将日志累积到批量缓冲（不逐条写
+   环形缓冲），log_batch_end 时把整个周期合并为单条日志写入，前端最终只
+   显示一条（多个发送请求并入一个日志）。原子嵌套计数 + 互斥锁保护缓冲 */
+static volatile sig_atomic_t g_log_batch_depth = 0;   /* >0 = 合并周期中 */
+static pthread_mutex_t g_log_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_log_batch_buf[65536];
+static size_t g_log_batch_len = 0;
+/* 合并日志标记：写入环形缓冲的合并单条以该前缀开头，sender 据此以
+   LOG_BATCH 分帧协议发送，log_monitor 整块接收合并为一条入库 */
+#define LOG_MERGED_MARK "\x01MERGED\x01"
 static char g_self_dir[PATH_MAX] = {0};
 static char g_proc_name[64] = "unknown";
 static bool g_log_inited = false;
 static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define LOG_BUF_CAPACITY 8192
+#define LOG_BUF_CAPACITY 2048
 #define LOG_BUF_MASK     (LOG_BUF_CAPACITY - 1)
-#define LOG_MSG_MAX_LEN  1024
+/* 日志条目容量与 log_monitor 消费端（MAX_MSG_LEN=4096）对齐，
+   避免合并日志在环形缓冲处被截断（总内存不变：2048×4096 ≈ 8192×1024） */
+#define LOG_MSG_MAX_LEN  4096
 
 typedef struct {
     char     msg[LOG_MSG_MAX_LEN];
@@ -41,13 +53,50 @@ typedef struct {
 } LogRingBuffer;
 
 static LogRingBuffer g_log_ring;
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t     g_log_sender_tid;
 static int           g_log_event_fd = -1;
+
+/* 日志合并周期控制：原子嵌套计数（>0 = 周期中），支持并发/嵌套 begin/end，
+   最后一个 end 把累积日志合并为单条写入环形缓冲 */
+void log_batch_begin(void) {
+    __sync_fetch_and_add(&g_log_batch_depth, 1);
+}
+void log_batch_end(void) {
+    /* __sync_fetch_and_sub 返回旧值：旧值 == 1 说明这是最后一个周期，
+       旧值 > 1 说明仍有外层周期（返回，不合并）。
+       注意：原子减已把计数归零（旧值 1 → 0），不得再用普通赋值清零，
+       否则会 clobber 并发线程的 log_batch_begin */
+    if (__sync_fetch_and_sub(&g_log_batch_depth, 1) > 1) return;
+    /* 取走累积内容 */
+    pthread_mutex_lock(&g_log_batch_mutex);
+    size_t n = g_log_batch_len;
+    char merged[LOG_MSG_MAX_LEN];
+    if (n >= sizeof(merged)) n = sizeof(merged) - 1;
+    memcpy(merged, g_log_batch_buf, n);
+    merged[n] = '\0';
+    g_log_batch_len = 0;
+    pthread_mutex_unlock(&g_log_batch_mutex);
+    if (n == 0 || !g_log_inited) return;
+    /* 合并为单条写入环形缓冲（带 LOG_MERGED_MARK 前缀）：sender 据此以
+       LOG_BATCH 分帧协议发送，log_monitor 整块接收合并为一条入库，
+       前端只显示一条（多个发送请求并入一个日志）。
+       单行输出：[proc] <条目1>\t<条目2>...
+       （条目间以制表符连接，不用换行，避免前端按行拆分导致截断/乱码） */
+    pthread_mutex_lock(&g_log_mutex);
+    int slot = atomic_fetch_add_explicit(&g_log_ring.head, 1, memory_order_relaxed) & LOG_BUF_MASK;
+    snprintf(g_log_ring.entries[slot].msg, LOG_MSG_MAX_LEN,
+             LOG_MERGED_MARK "[%s] %s", g_proc_name, merged);
+    g_log_ring.entries[slot].level = LOG_DEBUG;   /* 合并日志归为 debug 级别，
+                                                     --level >=1 查询时不显示 */
+    pthread_mutex_unlock(&g_log_mutex);
+    uint64_t val = 1;
+    if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
+}
 /* 子进程日志转发 fd：run_in_mnt_ns_* fork 的子进程内 sender 线程不可达，
    子进程经此管道回传日志，父进程读取后统一写入环形缓冲（默认 -1=未启用） */
 int g_log_forward_fd = -1;
 _Atomic(bool) g_log_shutdown = false;
-static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 void init_timezone() {
     const char *tz = getenv("TZ");
     if (tz && tz[0] != '\0') {
@@ -348,15 +397,21 @@ static void *log_sender_thread(void *arg) {
             /* 持锁读取并打包：与 log_internal 的写入互斥，杜绝 sender 读到撕裂的半写字符串 */
             pthread_mutex_lock(&g_log_mutex);
             LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
-            char packet[LOG_MSG_MAX_LEN + 128];
+            char packet[LOG_MSG_MAX_LEN * 2 + 128];
             int len;
-            if (e->level == LOG_IO)
+            if (strncmp(e->msg, LOG_MERGED_MARK, sizeof(LOG_MERGED_MARK) - 1) == 0) {
+                /* 合并单条日志：以 LOG_BATCH 分帧协议发送（头+内容+尾），
+                   log_monitor 整块接收合并为一条入库，前端只显示一条 */
+                const char* content = e->msg + sizeof(LOG_MERGED_MARK) - 1;
+                len = snprintf(packet, sizeof(packet), "LOG_BATCH\n%s\nLOG_BATCH_END\n", content);
+            } else if (e->level == LOG_IO) {
                 len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
-            else if (e->level == LOG_LOGCAT)
+            } else if (e->level == LOG_LOGCAT) {
                 len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
-            else
+            } else {
                 len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
                                e->level, g_proc_name, e->msg);
+            }
             pthread_mutex_unlock(&g_log_mutex);
             ssize_t sent = send(sock, packet, len, MSG_NOSIGNAL);
             if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -487,6 +542,20 @@ void log_internal(LogLevel level, const char* format, ...) {
         else persist_log_to_disk("sys", msg_buf, true);
     }
     if (!g_log_inited) return;
+    /* 合并周期内：累积到批量缓冲（不逐条写环形缓冲），由 log_batch_end
+       合并为单条日志，前端最终只显示一条（多个发送请求并入一个日志）。
+       只累积内容本身（不带 [proc] 前缀），条目间以制表符连接（不用换行，
+       避免前端按行拆分导致长内容截断/中文乱码），标签由合并单条统一带 */
+    if (g_log_batch_depth > 0) {
+        pthread_mutex_lock(&g_log_batch_mutex);
+        int w = snprintf(g_log_batch_buf + g_log_batch_len,
+                         sizeof(g_log_batch_buf) - g_log_batch_len,
+                         "%s\t", msg_buf);
+        if (w > 0 && g_log_batch_len + (size_t)w < sizeof(g_log_batch_buf))
+            g_log_batch_len += (size_t)w;
+        pthread_mutex_unlock(&g_log_batch_mutex);
+        return;
+    }
     pthread_mutex_lock(&g_log_mutex);
     int slot = atomic_fetch_add_explicit(&g_log_ring.head, 1, memory_order_relaxed) & LOG_BUF_MASK;
     strncpy(g_log_ring.entries[slot].msg, msg_buf, LOG_MSG_MAX_LEN - 1);
