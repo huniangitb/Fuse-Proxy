@@ -470,7 +470,7 @@ int module_backend_lookup(const char* path, const NspModuleOps** ops_out) {
         if (m->info.ops->backend_match(path) == 1) {
             *ops_out = m->info.ops;
             /* 在途引用：原子自增（调用方须在 backend_* 完成后 put） */
-            __atomic_fetch_add(&m->backend_refs, 1, __ATOMIC_ACQ_REL);
+            atomic_fetch_add_explicit(&m->backend_refs, 1, memory_order_acq_rel);
             pthread_rwlock_unlock(&g_module_lock);
             return 0;
         }
@@ -488,9 +488,9 @@ void module_backend_put(const NspModuleOps* ops) {
     for (int i = 0; i < g_module_count; i++) {
         ModuleEntry* m = &g_modules[i];
         if (m->active && m->info.ops == ops) {
-            int prev = __atomic_fetch_sub(&m->backend_refs, 1, __ATOMIC_ACQ_REL);
+            int prev = atomic_fetch_sub_explicit(&m->backend_refs, 1, memory_order_acq_rel);
             if (prev <= 0) /* 防御：不出现负数（正常配对下不会发生） */
-                __atomic_store_n(&m->backend_refs, 0, __ATOMIC_RELAXED);
+                atomic_store_explicit(&m->backend_refs, 0, memory_order_relaxed);
             break;
         }
     }

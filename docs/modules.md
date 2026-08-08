@@ -24,12 +24,35 @@
 
 ```
 <MODULES_DIR>/<模块名>/<模块名>.so      # 规则模块（dlopen 进 fuse_daemon）
+<MODULES_DIR>/<模块名>/<模块名>.rules   # 可选：规则类型注册（rule_server 读取）
 <MODULES_DIR>/<模块名>/...               # 模块可选资源（配置等）
 ```
 
 - **Android**：`/data/Namespace-Proxy/modules`
 - **GNU**：`/var/fuse-proxy/modules`（测试可用 `--modules-dir=` 覆盖）
 - 模块名仅含 `[a-z0-9_-]`，目录名 = 模块名 = `.so` 文件名（`<name>.so`）
+
+### 2.1 规则类型注册（`.rules`，前端动态能力）
+
+模块可在自己的目录放置 `<模块名>.rules` 文本文件，向 **rule_server** 声明
+自己支持的规则类型，实现「前端可操作的规则随加载模块动态追加」：
+
+- 每行格式：`<TYPE> <FORMAT>`，`FORMAT` 取值：
+
+| FORMAT | 说明 | 示例 |
+|--------|------|------|
+| `path` | 单值路径 | `HIDE /x` |
+| `pair` | src\|dst 双值，**恰好 2 参数** | `REDIRECT /a|/b`、`FTP /云盘|云盘` |
+| `switch` | ON/OFF 开关 | `MONITOR ON` |
+| `tokens` | 空格分隔多 token（ADD 时 value 用 \| 分隔，2 个以上任意数量） | 自定义多参数类型 |
+
+- rule_server 按需扫描 `modules/*/<模块名>.rules`，动态合并进规则类型表：
+  带目录/文件 mtime 缓存，模块目录与 .rules 未变化时直接复用类型表（零扫描）；
+  放入/删除/修改 `.rules`（mtime 变化）即热更新，无需重启（内置 HIDE/RO/REDIRECT/ALLOW/
+  MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT 始终存在，与 basic_rules 对应）。
+- 未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE；LIST/PING 返回的
+  `rule_types` 数组即当前全部可用类型（含 `builtin`/`module`/`format` 字段）。
+- 无 `.rules` 文件的模块不影响加载（rule_server 仅跳过其类型注册）。
 
 ## 3. 模块 ABI（`include/nsp_module.h`）
 

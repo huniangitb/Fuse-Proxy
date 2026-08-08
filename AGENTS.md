@@ -7,12 +7,12 @@ Android 13+ 用户态 FUSE 存储代理（KernelSU/Magisk 模块二进制核心�
 - 本机 GNU 构建（主线 libfuse3，pkg-config 查找）：`meson setup build_gnu -Dtarget_os=gnu && ninja -C build_gnu`
 - 陷阱：`meson_options.txt` 中 `target_os` **默认是 `android`**。不带 `-Dtarget_os=gnu` 配置会走 Android 分支（依赖 NDK clang 与 `fuse3_root` 静态库），在普通 Linux 上必然失败。
 - Android 交叉构建：`meson setup build --cross-file android-aarch64.ini -Dfuse3_root=<静态库根>`。
-- 产物：`fuse_daemon`（全部平台，框架）、`injector`（仅 Android）、`log_monitor`、`log_ctl`、`basic_rules.so`（规则模块）、`ftp_module.so`（FTP 后端模块）。仅 `fuse_daemon` 带 `-DFUSE_USE_VERSION=317` 宏；模块均不链接 libfuse3。
+- 产物：`fuse_daemon`（全部平台，框架）、`injector`（仅 Android）、`log_monitor`、`log_ctl`、`rule_server`（规则控制守护进程，Android/GNU 均构建）、`basic_rules.so`（规则模块）、`ftp_module.so`（FTP 后端模块）。仅 `fuse_daemon` 带 `-DFUSE_USE_VERSION=317` 宏；模块与 `rule_server` 均不链接 libfuse3。
 - 调试：`-Denable_debug=true`（可叠加 `-Dwith_asan=true` / `-Dwith_ubsan=true`）；默认 `-O3 -flto -Wl,-s`。
 
 ## 测试（纯 Python，无 C 测试目标）
 
-- `python3 tests/test_functional.py`；`python3 tests/test_rules.py`；`python3 tests/test_modules.py`（热插拔）；`python3 tests/test_ftp.py`（FTP 后端，需 vsftpd 匿名服务）；有失败时退出码为 1（注意勿用管道吞掉退出码）。
+- `python3 tests/test_functional.py`；`python3 tests/test_rules.py`；`python3 tests/test_modules.py`（热插拔）；`python3 tests/test_ftp.py`（FTP 后端，需 vsftpd 匿名服务）；`python3 tests/test_rule_server.py`（rule_server 规则控制服务，覆盖内置+模块动态规则类型热更新）；有失败时退出码为 1（注意勿用管道吞掉退出码）。
 - 前置：`fusermount3`、`/dev/fuse`、Python `sqlite3`；daemon 路径用 `FUSE_DAEMON` 环境变量覆盖（默认 `build_gnu/fuse_daemon`）。
 - 测试挂载 `/tmp/fuse_proxy_test/mnt` 与 `/tmp/fuse_rules_test/mnt`，规则写入 `/tmp/Namespace-Proxy/injector.conf`；失败残留的挂载点需 `fusermount3 -u` 清理后才能重跑。
 
@@ -26,4 +26,4 @@ Android 13+ 用户态 FUSE 存储代理（KernelSU/Magisk 模块二进制核心�
 
 ## 文档索引
 
-- 设计总览：`docs/architecture.md`；模块架构：`docs/modules.md`；配置广播：`docs/config-broadcast.md`；路径变量：`docs/path-variables.md`；测试说明：`tests/README.md`。
+- 设计总览：`docs/architecture.md`；模块架构：`docs/modules.md`；配置广播：`docs/config-broadcast.md`；路径变量：`docs/path-variables.md`；规则控制服务：`docs/rule-server-api.md`；测试说明：`tests/README.md`。
