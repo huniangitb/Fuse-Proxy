@@ -87,6 +87,24 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 - **log_monitor**：常驻日志收集服务，通过 AF_UNIX 流式 socket（抽象地址 `nsp_log_socket`，`SOCK_STREAM`）接收各进程 `log_internal` 发来的日志，落盘/转发；同时提供 `search`/`stream`/`clear`/`count` 等查询服务。
 - **log_ctl**：CLI 客户端，用于查询日志、流式输出、规则编辑（`set-rule`/`remove-rule`/`validate-rules`）、以及拉取配置广播（`get-config` / `stream-config`）。详见 `log_ctl-api.md`。
 
+#### 挂载周期日志合并（LOG_BATCH 协议）
+
+应用还原等"一条日志对应整个挂载周期"的场景，周期内中间日志（bind/f2fs
+等）由 `log_batch_begin/end` 在 `log_internal` 层累积，`log_batch_end`
+合并为**单条**多行日志写入环形缓冲（带不可见 `LOG_MERGED_MARK` 前缀）：
+
+- sender 检测到 `LOG_MERGED_MARK` 即按 `LOG_BATCH\n<内容>\nLOG_BATCH_END`
+  分帧发送；普通日志（LOG_IO/LOGCAT/SYS）逐条逻辑不变
+- log_monitor 的 `async_log_thread` 收集 LOG_BATCH 帧，`LOG_BATCH_END`
+  整块合并为**一条**入库（前端最终只显示一条，多个发送请求并入一个日志）
+- 合并日志为**单行输出**：`[injector] <条目1>\t<条目2>...`，条目间以
+  制表符连接（不用换行，避免前端按行拆分导致 UTF-8 截断乱码）
+- 合并日志级别固定为 `LOG_DEBUG`（`--level >=1` 查询时不显示）
+- 粘包/竞态处理：主循环首行 LOG_SYS 转 async 前把剩余字节移交
+  `AsyncCtx.pending`（在 `pthread_create` 之前填充）；背靠背 LOG_BATCH
+  帧写入多槽队列 `batch_q`（BATCH_Q_CAP=4），由 `drain_async` 逐槽
+  push 入 g_sys_buf，互不覆盖
+
 ## 3. 模块与源码布局
 
 ```

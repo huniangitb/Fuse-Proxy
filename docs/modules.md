@@ -35,23 +35,45 @@
 ### 2.1 规则类型注册（`.rules`，前端动态能力）
 
 模块可在自己的目录放置 `<模块名>.rules` 文本文件，向 **rule_server** 声明
-自己支持的规则类型，实现「前端可操作的规则随加载模块动态追加」：
+自己支持的规则类型，实现「前端可操作的规则随加载模块动态追加」。
 
-- 每行格式：`<TYPE> <FORMAT>`，`FORMAT` 取值：
+**conf 段格式（推荐，易于编写）**——`[类型名]` 段 + `key=value` 属性行：
 
-| FORMAT | 说明 | 示例 |
-|--------|------|------|
-| `path` | 单值路径 | `HIDE /x` |
-| `pair` | src\|dst 双值，**恰好 2 参数** | `REDIRECT /a|/b`、`FTP /云盘|云盘` |
-| `switch` | ON/OFF 开关 | `MONITOR ON` |
-| `tokens` | 空格分隔多 token（ADD 时 value 用 \| 分隔，2 个以上任意数量） | 自定义多参数类型 |
+```ini
+[FTP]
+format = pair
+argc = 2
+desc = FTP 存储映射：<虚拟前缀>|<段名>
+desc.en = FTP storage mapping: <virtual prefix>|<section>
+```
+
+| 键 | 说明 | 示例 |
+|----|------|------|
+| `format` | 值格式：`path`（单值路径）/ `pair`（src\|dst 双值）/ `switch`（ON/OFF 开关）/ `tokens`（多 token，默认 2 个以上任意数量） | `format = pair` |
+| `argc=N` | 恰好 N 个参数（覆盖 format 默认约束：path=1、pair=2、tokens=2+） | `argc = 3` |
+| `argc=N:M` | N~M 个参数（M 用 `*` 或不写表示不限上界） | `argc = 2:4`、`argc = 2:*` |
+| `global-only` | `true`/`false`：仅全局作用域可用（应用作用域 ADD 报错） | `global-only = true` |
+| `desc` | 中文描述（默认语言） | `desc = 隐藏路径` |
+| `desc.xx` | 指定语言的描述（xx=语言代码，如 `en`/`ja`） | `desc.en = Hide path` |
+
+**旧行格式（兼容）**：`<TYPE> <FORMAT> [属性...]`，如
+`FTP pair argc=2 desc="..." desc.en="..."`。解析器为状态机，两种格式
+可在同一 `.rules` 文件中混合使用；段内无 `=` 的行或段外行按旧行格式处理，
+文件尾自动刷新未结束的段。
+
+rule_server 按声明解析属性并体现在 `rule_types` 中：`argc_min/argc_max`
+用于 ADD 时参数数量校验；`global_only` 限制作用域；多语言 `desc` 按
+PING/LIST 请求的 `lang` 参数回传（默认中文，未知语言回退 zh），并附
+`desc_map` 全语言映射供前端渲染语言切换。畸形声明（如 `argc=abc`）
+被跳过，不注册错误约束。
 
 - rule_server 按需扫描 `modules/*/<模块名>.rules`，动态合并进规则类型表：
   带目录/文件 mtime 缓存，模块目录与 .rules 未变化时直接复用类型表（零扫描）；
   放入/删除/修改 `.rules`（mtime 变化）即热更新，无需重启（内置 HIDE/RO/REDIRECT/ALLOW/
   MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT 始终存在，与 basic_rules 对应）。
 - 未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE；LIST/PING 返回的
-  `rule_types` 数组即当前全部可用类型（含 `builtin`/`module`/`format` 字段）。
+  `rule_types` 数组即当前全部可用类型（含 `builtin`/`module`/`format`/
+  `global_only`/`argc_min`/`argc_max`/`desc`/`desc_map` 字段）。
 - 无 `.rules` 文件的模块不影响加载（rule_server 仅跳过其类型注册）。
 
 ## 3. 模块 ABI（`include/nsp_module.h`）
