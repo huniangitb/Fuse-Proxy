@@ -61,6 +61,24 @@ typedef struct {
     char mnt_src[256];
 } IpcMountArg;
 
+/* 全局替换模式：非目标应用异步还原线程（卸载项目 FUSE，bind 回系统视图备份） */
+static void* ipc_restore_thread(void* raw) {
+    IpcMountArg* arg = (IpcMountArg*)raw;
+    if (kill(arg->pid, 0) != 0) {
+        LOG_DBG("IPC还原线程: 进程已死 %s(PID:%d)", arg->pkg, arg->pid);
+        free(arg);
+        return NULL;
+    }
+    int ret = perform_app_restore(arg->pkg, arg->pid, arg->uid);
+    /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用 */
+    if (ret == 0) {
+        add_tracked(arg->pid);
+    }
+    LOG_DBG("IPC还原完成: %s(PID:%d) ret=%d", arg->pkg, arg->pid, ret);
+    free(arg);
+    return NULL;
+}
+
 static void* ipc_mount_thread(void* raw) {
     IpcMountArg* arg = (IpcMountArg*)raw;
     struct timespec ts_start, ts_end;
@@ -239,7 +257,30 @@ void handle_ipc_client_readable(int client_fd) {
 
         /* 核心修复：使用 clean_pkg 而非原始 pkg 进行配置匹配，
            避免带 ':process' 后缀的包名误判为未配置应用 */
-        if (!is_target_app(clean_pkg, uid, pid, true)) return;
+        if (!is_target_app(clean_pkg, uid, pid, true)) {
+            /* 全局替换模式：非目标应用需主动卸载项目 FUSE 并还原系统视图
+               （IPC 通知是最常见的应用启动路径，必须覆盖，否则非目标应用
+               永远停留在项目 FUSE 视图上） */
+            if (g_global_replace_mode) {
+                IpcMountArg* arg = malloc(sizeof(IpcMountArg));
+                if (arg) {
+                    strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
+                    arg->pkg[sizeof(arg->pkg) - 1] = '\0';
+                    arg->pid = pid;
+                    arg->uid = uid;
+                    arg->mnt_src[0] = '\0';
+                    pthread_t tid;
+                    if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
+                        pthread_detach(tid);
+                        LOG_DBG("IPC派发异步还原线程(非目标应用): %s(PID:%d)", clean_pkg, pid);
+                    } else {
+                        LOG_ERR("IPC创建还原线程失败: %s(PID:%d)", clean_pkg, pid);
+                        free(arg);
+                    }
+                }
+            }
+            return;
+        }
         if (access("/storage/emulated/", F_OK) != 0) return;
 
         /* 异步线程挂载：不阻塞主循环，子进程在后台完成 */

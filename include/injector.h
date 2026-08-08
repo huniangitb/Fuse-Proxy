@@ -23,6 +23,8 @@ extern volatile sig_atomic_t g_passive_mode;
 extern volatile sig_atomic_t g_fuse_ready;
 extern int g_epoll_fd;
 extern int g_global_root_fd;  /* 追加根目录 fd 的全局外部引用 */
+/* 全局替换式挂载方案开关（--global-replace）：true 时以卸载优先替代逐应用挂载 */
+extern bool g_global_replace_mode;
 
 const char* get_active_mnt_src(void);
 const char* get_media_mnt_src(void);

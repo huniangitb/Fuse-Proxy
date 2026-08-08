@@ -527,3 +527,31 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         return -1;
     }
 }
+
+/*
+ * 全局替换模式（--global-replace）下的非目标应用还原：
+ * 进入应用命名空间，卸载项目 FUSE 并 bind 回该用户备份的系统视图。
+ * 幂等：仅当 /storage/emulated 顶层源为项目 FUSE（nsp_global 或 fuse_daemon）
+ * 时才操作；非目标应用已还原/未受影响时直接跳过。
+ */
+int perform_app_restore(const char* pkg, int pid, uid_t uid) {
+    if (kill(pid, 0) != 0) {
+        LOG_DBG("目标进程已退出，跳过还原: %s(PID:%d)", pkg, pid);
+        invalidate_mount_cache(pid);
+        return -1;
+    }
+    const char* active_src = get_active_mnt_src();
+    if (!active_src) {
+        LOG_ERR("全局 FUSE 实例不可用，%s(PID:%d) 还原跳过", pkg, pid);
+        return -1;
+    }
+    int user_id = (int)(uid / 100000);
+    int ret = ns_restore_app_fuse(pid, active_src, GLOBAL_BACKUP_ROOT, user_id);
+    if (ret == 0) {
+        LOG_DBG("非目标应用已还原系统视图: %s(PID:%d, user=%d)", pkg, pid, user_id);
+        invalidate_mount_cache(pid);
+    } else {
+        LOG_ERR("非目标应用还原失败: %s(PID:%d, user=%d)", pkg, pid, user_id);
+    }
+    return ret;
+}
