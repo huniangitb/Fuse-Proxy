@@ -76,4 +76,53 @@ int ns_global_mount(int pid, const char* pkg, const char* source, const char* ta
  */
 int ns_force_umount_stale(int pid, const char* target);
 
+/* ================= 全局替换式挂载方案（--global-replace，卸载优先） =================
+ * 对应 scripts/global.sh 的 status/replace/restore，但改为 injector 内建能力：
+ *  - 替换：在 init 命名空间（pid=1）中，将 installer/androidwritable/user 三族
+ *    所有用户的 emulated 族根替换为项目 FUSE 源（fuse_src），使所有应用默认
+ *    看到代理视图；仅备份一个族（优先级 user > androidwritable > installer）。
+ *  - 恢复：从备份还原三族所有用户的系统视图。
+ *  - 应用还原：进入非目标应用命名空间，卸载项目 FUSE 并 bind 回备份视图。
+ * 关键约束：目标设备不支持 MS_REC，备份/替换/恢复全部改为逐节点枚举
+ * mountinfo 后单个 MS_BIND（父先子后 bind、最深优先 MNT_DETACH 卸载），
+ * 确保不遗漏系统子挂载节点（f2fs 直通 data/obb、嵌套跨用户 fuse 视图）。
+ */
+
+/* 全局替换状态枚举 */
+enum {
+    NSP_GLOBAL_STATUS_UNKNOWN   = 0,  /* 未找到任何族根 */
+    NSP_GLOBAL_STATUS_NORMAL    = 1,  /* 全部族根均为系统视图 */
+    NSP_GLOBAL_STATUS_REPLACED  = 2,  /* 全部族根均为项目 FUSE */
+    NSP_GLOBAL_STATUS_MIXED     = 3,  /* 部分替换 */
+};
+
+/*
+ * 收集 base_path 前缀下的全部挂载点（含自身与子挂载，含嵌套 fuse 视图），
+ * 从 /proc/<pid>/mountinfo 读取（无需进入命名空间），返回路径列表。
+ * 结果按路径深度降序（最深优先）排列，便于逆序卸载。
+ */
+int ns_collect_mounts_under(int pid, const char* base_path, int include_self, int include_fuse,
+                            char mount_points[][PATH_MAX], int max_count);
+
+/*
+ * 在 mnt_ns_pid 命名空间内执行全局替换（对应 global.sh replace）：
+ * 仅备份一个族（user > androidwritable > installer）到 backup_root/user_<id>/emulated
+ * （逐节点 MS_BIND，不依赖 MS_REC），随后三族全部替换为 fuse_src 并置 MS_SHARED。
+ * 备份点污染（源为 /dev/fuse 或 fuse_src）时拒绝操作。
+ */
+int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* backup_root);
+
+/* 在 mnt_ns_pid 命名空间内从备份恢复三族所有用户视图（对应 global.sh restore） */
+int ns_global_restore_system(int mnt_ns_pid, const char* backup_root);
+
+/*
+ * 在应用命名空间内卸载项目 FUSE 并 bind 回该用户备份的系统视图（幂等）：
+ * 仅当 /storage/emulated 顶层源为 fuse_src（或 fuse_daemon 类型）时才操作，
+ * 否则视为已还原/非项目视图，直接跳过。
+ */
+int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_root, int user_id);
+
+/* 查询 mnt_ns_pid 命名空间内全局替换状态（对应 global.sh status，返回枚举值） */
+int ns_global_status(int mnt_ns_pid, const char* fuse_src);
+
 #endif /* NS_UTILS_H */

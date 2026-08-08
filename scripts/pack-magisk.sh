@@ -69,8 +69,10 @@ echo "== 构建目录: $BUILD_DIR"
 echo "== 输出:     $OUT_ZIP"
 
 # ============================ 1. 同步二进制 ============================
+# 主二进制（rule_server/injector/fuse_daemon/log_*）与模块 so 一并同步，
+# 与第 5 步"关键二进制齐全"验证清单保持一致，避免骨架残留旧产物
 echo "== 同步 Android 产物到 bin/ ..."
-for bin in rule_server basic_rules.so ftp_module.so; do
+for bin in rule_server injector fuse_daemon log_monitor log_ctl basic_rules.so ftp_module.so; do
     src="$BUILD_DIR/$bin"
     if [[ -f "$src" ]]; then
         case "$bin" in

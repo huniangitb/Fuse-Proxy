@@ -41,6 +41,10 @@ int g_config_pub_fd = -1;
 static int seconds_until_next_scan = 1; 
 static int g_scan_interval_seconds = 30;   
 static bool g_last_scan_found = false;          
+/* 全局替换模式首次兜底扫描标志：FUSE 就绪后仅执行一次扫描，
+   还原存量非目标应用；之后生命周期内不再反复周期检测（新应用
+   由 zygisk IPC 通知即时还原） */
+static bool g_global_replace_scanned_once = false;
 struct GlobalFuseInfo g_global_fuse = {
     .pid = 1, .fuse_pid = 0, .mnt_path = "/mnt/nsp_global",
     .crash_count = 0, .last_crash_time = 0, .disabled = false
@@ -49,6 +53,9 @@ struct GlobalFuseInfo g_media_fuse = {
     .pid = 1, .fuse_pid = 0, .mnt_path = "/mnt/nsp_media",
     .crash_count = 0, .last_crash_time = 0, .disabled = false
 };
+
+/* 全局替换式挂载方案开关（--global-replace）：默认关闭，沿用逐应用挂载 */
+bool g_global_replace_mode = false;
 
 /* 重入保护：防止并发调用 inject_global_fuse() */
 static volatile int g_fuse_starting = 0;
@@ -220,6 +227,13 @@ void handle_fuse_ready_event(void *ptr) {
             } else {
                 g_fuse_ready = 1;
                 LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
+                /* 全局替换模式：FUSE 就绪后立即将 emulated 族根替换为代理视图 */
+                if (g_global_replace_mode) {
+                    LOG("全局替换模式: 执行 emulated 全局替换 (fuse_src=%s)", g_global_fuse.mnt_path);
+                    if (ns_global_replace_system(g_global_fuse.pid, g_global_fuse.mnt_path, GLOBAL_BACKUP_ROOT) != 0) {
+                        LOG_ERR("全局替换失败，系统视图可能处于混合状态");
+                    }
+                }
             }
         }
         if (g_pending_first_scan) {
@@ -514,6 +528,12 @@ static void check_and_recover_fuse() {
         g_global_fuse.last_crash_time = now;
         if (g_global_fuse.crash_count > 5) {
             g_global_fuse.disabled = true;
+            /* 全局替换模式：崩溃超限禁用 FUSE 前必须恢复系统 emulated 视图，
+               避免系统停留在失效的代理 bind 上 */
+            if (g_global_replace_mode) {
+                LOG("FUSE 崩溃超限，恢复系统 emulated 视图");
+                ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT);
+            }
             return;
         }
         force_recover_tracked_mounts();
@@ -713,7 +733,18 @@ int scan_zygote_children() {
     
     config_lock_read();
     for (int i = 0; i < entry_count && m_count < MAX_ASYNC_MOUNTS_LOCAL; i++) {
-        if (is_target_app_locked(entries[i].cmdline, entries[i].uid, entries[i].pid, false)) {
+        bool is_target = is_target_app_locked(entries[i].cmdline, entries[i].uid, entries[i].pid, false);
+        if (g_global_replace_mode) {
+            /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
+               非目标应用需主动卸载项目 FUSE 并还原系统视图（卸载优先） */
+            if (!is_target) {
+                m_tasks[m_count].pid = entries[i].pid;
+                m_tasks[m_count].uid = entries[i].uid;
+                strncpy(m_tasks[m_count].cmdline, entries[i].cmdline, sizeof(m_tasks[m_count].cmdline) - 1);
+                m_tasks[m_count].cmdline[sizeof(m_tasks[m_count].cmdline) - 1] = '\0';
+                m_count++;
+            }
+        } else if (is_target) {
             m_tasks[m_count].pid = entries[i].pid;
             m_tasks[m_count].uid = entries[i].uid;
             strncpy(m_tasks[m_count].cmdline, entries[i].cmdline, sizeof(m_tasks[m_count].cmdline) - 1);
@@ -730,14 +761,24 @@ int scan_zygote_children() {
             struct timespec ts_mnt;
             if (first_scan) clock_gettime(CLOCK_MONOTONIC, &ts_mnt);
             
-            perform_app_mount(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid, nullptr, "主动扫描");
+            if (g_global_replace_mode) {
+                /* 增量还原：还原成功（或已还原跳过）后标记追踪，
+                   后续周期扫描经 is_tracked 直接跳过，避免反复检测 */
+                if (perform_app_restore(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid) == 0) {
+                    add_tracked(m_tasks[i].pid);
+                }
+            } else {
+                perform_app_mount(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid, nullptr, "主动扫描");
+            }
             
             if (first_scan) {
                 struct timespec ts_mnt_end;
                 clock_gettime(CLOCK_MONOTONIC, &ts_mnt_end);
                 long el = (ts_mnt_end.tv_sec - ts_mnt.tv_sec) * 1000 +
                           (ts_mnt_end.tv_nsec - ts_mnt.tv_nsec) / 1000000;
-                LOG("初次扫描 - 挂载 %s(PID:%d) 完成, 耗时: %ldms", m_tasks[i].cmdline, m_tasks[i].pid, el);
+                LOG_DBG("初次扫描 - %s %s(PID:%d) 完成, 耗时: %ldms",
+                    g_global_replace_mode ? "还原" : "挂载",
+                    m_tasks[i].cmdline, m_tasks[i].pid, el);
             }
         }
     }
@@ -766,6 +807,11 @@ static void do_cleanup() {
         g_inotify_fd = -1;
     }
     force_recover_tracked_mounts();
+    /* 全局替换模式：退出前先恢复系统 emulated 视图，再终结 FUSE */
+    if (g_global_replace_mode && g_fuse_ready) {
+        LOG("退出前恢复系统 emulated 视图");
+        ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT);
+    }
     if (g_global_fuse.fuse_pid > 0) {
         kill(g_global_fuse.fuse_pid, SIGTERM);
         int status;
@@ -836,6 +882,7 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "warn") == 0 || strcmp(argv[i], "warning") == 0) g_min_log_level = LOG_WARN;
         else if (strcmp(argv[i], "--strip-o-direct") == 0) g_strip_o_direct = true;
         else if (strcmp(argv[i], "--passive") == 0 || strcmp(argv[i], "passive") == 0) start_passive = true;
+        else if (strcmp(argv[i], "--global-replace") == 0) g_global_replace_mode = true;
     }
     g_global_root_fd = open("/", O_RDONLY | O_PATH | O_CLOEXEC);
     escape_cgroup();
@@ -950,12 +997,18 @@ int main(int argc, char *argv[]) {
                 if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
                     check_and_recover_fuse();
                     reap_zombies();
-                    if (!g_passive_mode) {
+                    if (!g_passive_mode || (g_global_replace_mode && !g_global_replace_scanned_once)) {
+                        /* 被动模式下禁用周期扫描（新应用由 zygisk IPC 通知即时还原）；
+                           全局替换模式仅在程序生命周期开始时执行一次兜底扫描，
+                           还原存量非目标应用，之后不再反复周期检测 */
                         if (seconds_until_next_scan > 0) {
                             seconds_until_next_scan--;
                         }
                         if (seconds_until_next_scan == 0) {
                             int found_now = scan_zygote_children();
+                            if (g_global_replace_mode) {
+                                g_global_replace_scanned_once = true;
+                            }
                             if (found_now > 0) {
                                 g_last_scan_found = true;
                                 g_scan_interval_seconds = 30;          

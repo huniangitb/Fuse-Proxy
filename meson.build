@@ -131,6 +131,18 @@ if target_os == 'android'
     install: true,
     install_dir: install_bin_dir
   )
+else
+  # 全局替换式挂载方案测试驱动（仅 GNU 构建）：injector 本体仅 Android 交叉构建，
+  # GNU 测试无法直接运行它；本驱动链接 ns_utils 的全局替换原语并以 CLI 暴露，
+  # 供 tests/test_global_replace.py 在私有挂载命名空间中模拟安卓视图验证。
+  executable('global_replace_ctl',
+    ['src/injector/global_replace_ctl.c', 'src/injector/ns_utils.c',
+     'src/injector/inject_target.c', 'src/injector/mount_manager.c',
+     'src/core/fast_pid.c'] + common_sources,
+    include_directories: all_inc_dirs,
+    dependencies: project_deps,
+    install: false
+  )
 endif
 
 executable('log_monitor',

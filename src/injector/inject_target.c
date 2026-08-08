@@ -553,19 +553,25 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
 }
 
 void force_recover_tracked_mounts() {
-    for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry *e = g_tracked_hash[i];
-        while (e) {
-            int pid = e->pid;
-            if (kill(pid, 0) == 0) {
-                uid_t uid = get_app_uid(pid);
-                char target_path[128];
-                get_target_storage_path(uid, target_path, sizeof(target_path));
-                char backup_path[PATH_MAX];
-                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                cleanup_app_mounts(pid, target_path, backup_path, uid);
+    if (g_global_replace_mode) {
+        /* 全局替换模式：系统 emulated 视图由 ns_global_restore_system 统一还原，
+           逐应用旧式 cleanup_app_mounts 会造成重复/冲突卸载，此处仅清理追踪表 */
+        LOG_DBG("全局替换模式: force_recover 跳过逐应用卸载，由全局恢复统一处理");
+    } else {
+        for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
+            TrackedEntry *e = g_tracked_hash[i];
+            while (e) {
+                int pid = e->pid;
+                if (kill(pid, 0) == 0) {
+                    uid_t uid = get_app_uid(pid);
+                    char target_path[128];
+                    get_target_storage_path(uid, target_path, sizeof(target_path));
+                    char backup_path[PATH_MAX];
+                    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+                    cleanup_app_mounts(pid, target_path, backup_path, uid);
+                }
+                e = e->next;
             }
-            e = e->next;
         }
     }
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
@@ -599,14 +605,24 @@ void audit_tracked_apps() {
             get_target_storage_path(uid, target_path, sizeof(target_path));
             bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
             if (!is_target && has_fuse) {
-                char backup_path[PATH_MAX];
-                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                cleanup_app_mounts(pid, target_path, backup_path, uid);
+                if (g_global_replace_mode) {
+                    /* 全局替换模式：非目标应用需卸载项目 FUSE 并还原系统视图备份 */
+                    perform_app_restore(cmd, pid, uid);
+                } else {
+                    char backup_path[PATH_MAX];
+                    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+                    cleanup_app_mounts(pid, target_path, backup_path, uid);
+                }
                 LOG_DBG("配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。", cmd, pid);
             } else if (is_target && !has_fuse) {
-                const char* mnt_src = get_active_mnt_src();
-                if (mnt_src) {
-                    perform_app_mount(cmd, pid, uid, mnt_src, "配置审查重新挂载");
+                if (g_global_replace_mode) {
+                    /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载 */
+                    LOG_DBG("配置审查: %s (PID: %d) 全局替换模式，目标应用无需逐应用挂载。", cmd, pid);
+                } else {
+                    const char* mnt_src = get_active_mnt_src();
+                    if (mnt_src) {
+                        perform_app_mount(cmd, pid, uid, mnt_src, "配置审查重新挂载");
+                    }
                 }
             }
             // 绝不在此处释放物理存活的追踪节点，始终沿链表后移
@@ -641,17 +657,28 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                 }
             }
             if (matched) {
-                char target_path[128];
-                get_target_storage_path(uid, target_path, sizeof(target_path));
-                char backup_path[PATH_MAX];
-                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                cleanup_app_mounts(pid, target_path, backup_path, uid);
                 bool is_target = is_target_app(cmd, uid, pid, false);
-                if (is_target && mnt_src) {
-                    LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 进行重新挂载。", cmd, pid);
-                    perform_app_mount(cmd, pid, uid, mnt_src, "局部规则变动重新挂载");
+                if (g_global_replace_mode) {
+                    /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
+                       非目标应用需主动卸载项目 FUSE 并还原系统视图备份 */
+                    if (is_target) {
+                        LOG_DBG("局部规则审查: 全局替换模式，目标应用 %s (PID: %d) 无需逐应用挂载。", cmd, pid);
+                    } else {
+                        perform_app_restore(cmd, pid, uid);
+                        LOG_DBG("局部规则审查: 全局替换模式，非目标应用 %s (PID: %d) 已还原系统视图。", cmd, pid);
+                    }
                 } else {
-                    LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 已清空还原物理挂载，保持物理追踪监听。", cmd, pid);
+                    char target_path[128];
+                    get_target_storage_path(uid, target_path, sizeof(target_path));
+                    char backup_path[PATH_MAX];
+                    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+                    cleanup_app_mounts(pid, target_path, backup_path, uid);
+                    if (is_target && mnt_src) {
+                        LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 进行重新挂载。", cmd, pid);
+                        perform_app_mount(cmd, pid, uid, mnt_src, "局部规则变动重新挂载");
+                    } else {
+                        LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 已清空还原物理挂载，保持物理追踪监听。", cmd, pid);
+                    }
                 }
             }
             // 安全保留追踪节点。由于 add_tracked 的无副作用性（若 PID 重复则不改变任何链表指针），

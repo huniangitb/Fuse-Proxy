@@ -61,6 +61,8 @@
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 #define CONFIG_BROADCAST_SOCKET "nsp_config_broadcast"
 #define RULE_SOCKET_NAME "nsp_rule_socket"
+/* 全局替换式挂载方案（--global-replace）的备份根目录：位于项目配置路径下 */
+#define GLOBAL_BACKUP_ROOT BACKUP_DIR "/global_emulated"
 
 typedef enum {
     LOG_DEBUG   = 0,
@@ -78,6 +80,9 @@ extern bool g_persist_all_logs;
 extern char g_real_root[PATH_MAX];
 extern bool g_strip_o_direct;
 extern _Atomic(bool) g_log_shutdown;  
+/* 子进程日志转发 fd：run_in_mnt_ns_* fork 的子进程内环形缓冲/sender 线程
+   不可达（fork 不复制线程），经此管道把子进程日志回传父进程统一入缓冲 */
+extern int g_log_forward_fd;
 
 void log_init(const char* process_name);
 void log_close();
