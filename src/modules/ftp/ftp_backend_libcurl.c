@@ -315,8 +315,12 @@ static int ensure_curl(FtpBackend* bk) {
     return 0;
 }
 
-/* 重置 curl 句柄（断开后重建） */
-static void reset_curl(FtpBackend* bk) {
+/* 重置 curl 句柄（断开后重建）。
+   count_failure=false 表示本次失败是正常业务结果（如文件/目录不存在，
+   FTP 550 → CURLE_REMOTE_FILE_NOT_FOUND），不计入熔断——否则应用对缺失
+   路径的存在性检查（os.path.exists / readdir 多个缺失条目）会连续计数，
+   把健康连接误判为断网进入静默 */
+static void reset_curl(FtpBackend* bk, bool count_failure) {
     /* 必须先持 op_lock 再清理：各操作在 op_lock 内 setopt/perform 共享
        bk->curl，若此处只持 bk->lock 清理，并发线程可能正用已 cleanup 的
        句柄 → UAF（0x18 NULL 解引用崩溃）。所有调用点均在 op_lock 释放后，
@@ -331,7 +335,7 @@ static void reset_curl(FtpBackend* bk) {
     pthread_mutex_unlock(&bk->lock);
     pthread_mutex_unlock(&bk->op_lock);
     /* 连接失败清理（各操作失败统一入口）：熔断计数，达阈值进入静默 */
-    mark_failure(bk);
+    if (count_failure) mark_failure(bk);
 }
 
 /* 重置共享句柄的操作级选项（防跨操作残留：NOBODY 残留会吞掉 STOR 上传、
@@ -471,7 +475,10 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     free(dir_wb.buf);
 
     // 都不是
-    reset_curl(bk);
+    /* 文件与目录均不存在（FTP 550 → CURLE_REMOTE_FILE_NOT_FOUND）是正常
+       业务结果，不计入熔断；连接/传输类错误才累计（避免 exists 检查
+       连续命中缺失路径把健康连接误判为断网） */
+    reset_curl(bk, res != CURLE_REMOTE_FILE_NOT_FOUND);
     return -ENOENT;
 }
 
@@ -505,7 +512,9 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
     pthread_mutex_unlock(&bk->op_lock);
     if (res != CURLE_OK) {
         free(wb.buf);
-        reset_curl(bk);
+        /* 目录不存在（FTP 550 → CURLE_REMOTE_FILE_NOT_FOUND）是正常业务
+           结果，不计入熔断；连接/传输类错误才累计 */
+        reset_curl(bk, res != CURLE_REMOTE_FILE_NOT_FOUND);
         return -ENOENT;
     }
 
@@ -697,7 +706,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
     curl_easy_setopt(bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
     pthread_mutex_unlock(&bk->op_lock);
     if (res != CURLE_OK) {
-        reset_curl(bk);
+        reset_curl(bk, true);   /* 传输失败：计入熔断 */
         return -EIO;
     }
     return ftp_backend_open(path, O_WRONLY | O_CREAT | O_TRUNC, h);
@@ -966,7 +975,7 @@ static int ftp_backend_upload(FtpBackendFile* f) {
             if (f->bk->silent) break;   /* 静默模式：失败后不再重试（无网络空转） */
         }
         if (res != CURLE_OK) {
-            reset_curl(f->bk);
+            reset_curl(f->bk, true);   /* 上传失败：计入熔断 */
             rc = -EIO;
         }
     } else {
@@ -1088,7 +1097,7 @@ static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int 
     /* 失败：按 ok_code 映射预期错误（rmdir 非空目录 → -ENOTEMPTY），
        未指定（unlink/mkdir）则统一 -EPERM（curlftpfs 方式） */
     if (res != CURLE_OK) {
-        reset_curl(bk);
+        reset_curl(bk, true);   /* 命令失败：计入熔断 */
         return ok_code ? -ok_code : -EPERM;
     }
     return 0;
@@ -1134,7 +1143,7 @@ int ftp_backend_rename(const char* from, const char* to) {
     curl_easy_setopt(bk->curl, CURLOPT_POSTQUOTE, NULL);  /* 锁内清理，防并发竞争句柄 */
     pthread_mutex_unlock(&bk->op_lock);
     curl_slist_free_all(slist);
-    if (res != CURLE_OK) { reset_curl(bk); return -EIO; }
+    if (res != CURLE_OK) { reset_curl(bk, true); return -EIO; }   /* 重命名失败：计入熔断 */
     return 0;
 }
 
@@ -1164,7 +1173,7 @@ int ftp_backend_truncate(const char* path, off_t size) {
         CURLcode res = curl_easy_perform(bk->curl);
         curl_easy_setopt(bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
         pthread_mutex_unlock(&bk->op_lock);
-        if (res != CURLE_OK) { reset_curl(bk); return -EIO; }
+        if (res != CURLE_OK) { reset_curl(bk, true); return -EIO; }   /* 截断失败：计入熔断 */
         return 0;
     }
     return -EIO;  // 非零截断暂不支持
