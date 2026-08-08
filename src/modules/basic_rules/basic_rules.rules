@@ -1,0 +1,15 @@
+# basic_rules 模块注册的规则类型
+# 格式：每行 "<TYPE> <FORMAT>"；FORMAT 决定规则值如何解析/写入：
+#   path    — 单值路径（HIDE/RO/ALLOW）
+#   pair    — src|dst 双值（REDIRECT）
+#   switch  — ON/OFF 开关（MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT/SKIP_SYSTEM_APPS）
+# rule_server 启动及每次命令前扫描本文件，动态合并进支持的规则类型表
+REDIRECT pair
+ALLOW path
+HIDE path
+RO path
+SANDBOX switch
+MONITOR switch
+GLOBAL_INJECT switch
+FUSE_DIRECT switch
+SKIP_SYSTEM_APPS switch

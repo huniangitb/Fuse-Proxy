@@ -443,7 +443,7 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     g_app_cfgs[g_app_cfg_count] = calloc(1, sizeof(AppConfig));
     strncpy(g_app_cfgs[g_app_cfg_count]->pkg_name, pkg, 127);
     g_app_cfgs[g_app_cfg_count]->user_id = user_id;
-    g_app_cfgs[g_app_cfg_count]->inject_enable = true; 
+    g_app_cfgs[g_app_cfg_count]->inject_enable = false; 
     g_app_cfgs[g_app_cfg_count]->trie_root = trie_create_node(NULL); 
     return g_app_cfgs[g_app_cfg_count++];
 }

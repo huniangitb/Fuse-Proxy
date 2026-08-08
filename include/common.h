@@ -60,6 +60,7 @@
 #define LOG_SOCKET_NAME "nsp_log_socket"
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 #define CONFIG_BROADCAST_SOCKET "nsp_config_broadcast"
+#define RULE_SOCKET_NAME "nsp_rule_socket"
 
 typedef enum {
     LOG_DEBUG   = 0,
