@@ -344,18 +344,6 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 if (*p == '/') p++;
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
             }
-            else if (g_fuse_mount_point[0] &&
-                     strncmp(v2, g_fuse_mount_point, strlen(g_fuse_mount_point)) == 0 &&
-                     v2[strlen(g_fuse_mount_point)] == '/') {
-                /* 规则 target 指向当前 FUSE 挂载点镜像：parse 阶段即剥离
-                   挂载点前缀转相对 user 存储（? 前缀），运行时按访问 user_id
-                   动态拼接——从源头上防止挂载点根下出现额外虚拟目录，
-                   且不硬编码挂载路径，FUSE 挂到任意路径均正常 */
-                const char* p = v2 + strlen(g_fuse_mount_point);
-                while (*p && isdigit((unsigned char)*p)) p++;
-                if (*p == '/') p++;
-                snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
-            }
             else if (is_system_abs_path(v2)) {
                 strncpy(real_target, v2, MAX_PATH_LEN - 1);
                 real_target[MAX_PATH_LEN - 1] = '\0';
@@ -621,6 +609,29 @@ void load_config_rules(const char* path) {
                                 if (cur) parse_config_line(cur, p, uid, app_line_num, app_conf_path);
                             }
                             fclose(afp);
+                        }
+                    } else if (ext && strcmp(ext, ".disabled") == 0) {
+                        /* 停用状态识别：<pkg>.conf.disabled = 该应用规则被停用
+                           （rule_server INJECT_ENABLE OFF 重命名而来）。
+                           仅当无对应 <pkg>.conf（未被启用）时创建 cfg 并置
+                           inject_enable=false——使 is_target_app 能识别停用
+                           状态并触发热卸载（此前 cfg 消失导致有通配符/全局
+                           注入时停用应用仍被判为目标无法卸载） */
+                        size_t nlen = strlen(de->d_name);
+                        const char* suffix = ".conf.disabled";
+                        size_t slen = strlen(suffix);
+                        if (nlen > slen && strcmp(de->d_name + nlen - slen, suffix) == 0) {
+                            char pkg[128];
+                            size_t len = nlen - slen;
+                            if (len >= sizeof(pkg)) len = sizeof(pkg) - 1;
+                            strncpy(pkg, de->d_name, len);
+                            pkg[len] = '\0';
+                            char conf_path[PATH_MAX];
+                            snprintf(conf_path, sizeof(conf_path), "%s/%s.conf", app_rules_dir, pkg);
+                            if (access(conf_path, F_OK) != 0) {
+                                AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
+                                file_cur->inject_enable = false;   /* 明确停用 */
+                            }
                         }
                     }
                 }

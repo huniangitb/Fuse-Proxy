@@ -128,6 +128,15 @@ static void* ipc_mount_thread(void* raw) {
         }
     }
 
+    /* 防御性短路：全局替换模式下目标应用无需逐应用挂载
+       （全局 FUSE 已提供代理视图），即使被误调也直接跳过挂载操作 */
+    if (g_global_replace_mode) {
+        add_tracked(arg->pid);
+        print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
+        free(arg);
+        return NULL;
+    }
+
     //LOG("IPC线程开始异步挂载: %s(PID:%d)", arg->pkg, arg->pid);
 
     /* 先加入追踪列表，防止并发重入（幂等操作） */
@@ -318,6 +327,17 @@ void handle_ipc_client_readable(int client_fd) {
             return;
         }
         if (access("/storage/emulated/", F_OK) != 0) return;
+
+        if (g_global_replace_mode) {
+            /* 新挂载方案（全局替换模式）：全局 FUSE 已挂载 /storage/emulated，
+               目标应用自动继承代理视图，无需 injector 逐应用挂载——
+               仅标记追踪并打印规则即可（避免 perform_app_mount 的
+               mountinfo 全量读取等 20ms+ 耗时）；非目标应用还原走上方分支 */
+            add_tracked(pid);
+            print_active_rules(clean_pkg, pid, uid, "IPC通知");
+            LOG_DBG("全局替换模式: 目标应用 %s(PID:%d) 无需挂载，已由全局 FUSE 提供代理视图", clean_pkg, pid);
+            return;
+        }
 
         /* 异步线程挂载：不阻塞主循环，子进程在后台完成 */
         IpcMountArg* arg = malloc(sizeof(IpcMountArg));

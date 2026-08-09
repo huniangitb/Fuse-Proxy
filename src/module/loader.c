@@ -3,6 +3,7 @@
 #include "common.h"
 #include <dlfcn.h>
 #include <dirent.h>
+#include <ctype.h>
 #include <sys/inotify.h>
 #include <poll.h>
 #include <pthread.h>
@@ -14,6 +15,17 @@
 #include <stdatomic.h>
 
 /* ================= 注册表 ================= */
+
+/* 路径是否含 <uid>/ 用户层（如 /0/foo、/10/、或 /0 本身）：
+   FUSE 挂载点根（/、/obb 等非 uid 顶层）不进行任何规则合成，
+   仅 <uid>/ 之后的路径才允许规则模块响应——从框架源头规避
+   挂载点根下出现额外虚拟目录（如 FTP 前缀条目被合到根下） */
+static bool path_has_uid_layer(const char* path) {
+    if (!path || path[0] != '/' || path[1] < '0' || path[1] > '9') return false;
+    const char* d = path + 1;
+    while (*d >= '0' && *d <= '9') d++;
+    return (*d == '\0' || *d == '/');
+}
 
 typedef struct {
     char name[64];
@@ -381,8 +393,12 @@ void module_system_shutdown(void) {
 
 int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     if (!q || !out) return NSP_DISPATCH_NONE;
-    /* 快速路径：无规则模块注册，零开销回退默认路径 */
+    /* 快速路径：无规则模块注册，零开销回退默认路径（先于 uid 层判断，
+       避免无规则模块时每个请求都做路径扫描） */
     if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
+    /* 框架源头规避：无 <uid>/ 用户层（挂载点根）不进行任何规则合成，
+       仅 <uid>/ 之后的路径才允许规则模块响应 */
+    if (!path_has_uid_layer(q->path)) return NSP_DISPATCH_NONE;
 
     pthread_rwlock_rdlock(&g_module_lock);
     bool any = false;
@@ -433,6 +449,8 @@ int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out) {
     if (!q || !out) return NSP_DISPATCH_NONE;
     /* 快速路径：无规则模块注册，零开销回退（不过滤任何条目） */
     if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
+    /* 框架源头规避：无 <uid>/ 用户层（挂载点根）不进行任何规则探测 */
+    if (!path_has_uid_layer(q->path)) return NSP_DISPATCH_NONE;
 
     pthread_rwlock_rdlock(&g_module_lock);
     bool any = false;
@@ -515,6 +533,11 @@ bool module_backend_active(void) {
 int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max) {
     if (!q || !out || max <= 0) return 0;
+    /* 框架源头规避：无 <uid>/ 用户层（挂载点根，user_id<0）不合成任何模块
+       虚拟目录条目，仅 <uid>/ 之后的路径才允许模块 readdir_extra 响应。
+       注意：此处用 user_id 判断而非 q->path——vfs_readdir 传入的 q->path 是
+       剥离 <uid>/ 后的 sub_path（如 /0/ → /），不能反映是否在用户层内 */
+    if (user_id < 0) return 0;
     if (g_module_count == 0) return 0;
     pthread_rwlock_rdlock(&g_module_lock);
     int n = 0;
