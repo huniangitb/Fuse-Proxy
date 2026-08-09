@@ -273,8 +273,9 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
         t = expanded;
     }
     /* ===== 前缀剥离：统一得到"相对 user 存储"的剩余路径 =====
-       根目录（剥离后剩余为空，如 ? 后无路径 / 挂载点本身 / 仅 user_id 层）
-       不允许任何规则插入——FUSE 挂载点根下不得出现额外虚拟目录；
+       根目录（剥离后剩余为空，如 ? 后无路径 / 仅 user_id 层）
+       不允许任何规则插入——FUSE 挂载点根下不得出现额外虚拟目录
+       （由框架 loader.c 的 path_has_uid_layer 拦截兜底）；
        仅允许 <uid>/ 之后的路径（与其他目录合成逻辑分开，避免混淆） */
     const char* rest = nullptr;
     if (t[0] == '?') {
@@ -284,15 +285,6 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
         if (*rest == '/') rest++;
     } else if (strncmp(t, "/storage/emulated/", 18) == 0) {
         rest = t + 18;
-        while (*rest && isdigit((unsigned char)*rest)) rest++;
-        if (*rest == '/') rest++;
-    } else if (g_fuse_mount_point[0] &&
-               strncmp(t, g_fuse_mount_point, strlen(g_fuse_mount_point)) == 0) {
-        /* 规则 target 指向当前 FUSE 挂载点镜像（含变量/延迟解析路径在运行时
-           走到这里）：剥离挂载点前缀并按访问 user_id 动态拼接，不硬编码
-           挂载路径，FUSE 挂到任意路径均正常 */
-        rest = t + strlen(g_fuse_mount_point);
-        while (*rest == '/') rest++;
         while (*rest && isdigit((unsigned char)*rest)) rest++;
         if (*rest == '/') rest++;
     } else if (is_system_abs_path(t)) {

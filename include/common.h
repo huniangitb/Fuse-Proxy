@@ -84,7 +84,6 @@ void log_batch_begin(void);
 void log_batch_end(void);
 extern bool g_persist_all_logs;
 extern char g_real_root[PATH_MAX];
-extern char g_fuse_mount_point[PATH_MAX];   /* FUSE 挂载点（fuse_daemon 设置） */
 extern bool g_strip_o_direct;
 extern _Atomic(bool) g_log_shutdown;  
 /* 子进程日志转发 fd：run_in_mnt_ns_* fork 的子进程内环形缓冲/sender 线程
