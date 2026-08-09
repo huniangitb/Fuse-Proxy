@@ -344,6 +344,18 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 if (*p == '/') p++;
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
             }
+            else if (g_fuse_mount_point[0] &&
+                     strncmp(v2, g_fuse_mount_point, strlen(g_fuse_mount_point)) == 0 &&
+                     v2[strlen(g_fuse_mount_point)] == '/') {
+                /* 规则 target 指向当前 FUSE 挂载点镜像：parse 阶段即剥离
+                   挂载点前缀转相对 user 存储（? 前缀），运行时按访问 user_id
+                   动态拼接——从源头上防止挂载点根下出现额外虚拟目录，
+                   且不硬编码挂载路径，FUSE 挂到任意路径均正常 */
+                const char* p = v2 + strlen(g_fuse_mount_point);
+                while (*p && isdigit((unsigned char)*p)) p++;
+                if (*p == '/') p++;
+                snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
+            }
             else if (is_system_abs_path(v2)) {
                 strncpy(real_target, v2, MAX_PATH_LEN - 1);
                 real_target[MAX_PATH_LEN - 1] = '\0';
@@ -571,6 +583,10 @@ void load_config_rules(const char* path) {
                         strncpy(pkg, de->d_name, len);
                         pkg[len] = '\0';
                         AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
+                        /* 存在 <pkg>.conf（未被重命名 .disabled）即启用该应用注入：
+                           与 rule-server-api 文档语义一致，不依赖段头 ON。
+                           文件内若含 [pkg] OFF 段头会在下方解析时覆盖为 false */
+                        file_cur->inject_enable = true;
                         AppConfig* cur = file_cur; 
                         char app_conf_path[PATH_MAX];
                         snprintf(app_conf_path, sizeof(app_conf_path), "%s/%s", app_rules_dir, de->d_name);
