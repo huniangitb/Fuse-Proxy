@@ -17,6 +17,10 @@
 
 LogLevel g_min_log_level = LOG_INFO;
 char g_real_root[PATH_MAX] = {0};
+/* FUSE 挂载点（fuse_daemon 从 argv 提取，如 /mnt/nsp_global）：
+   供规则路径解析动态判断"target 是否指向挂载点镜像"使用，
+   不硬编码具体路径，FUSE 挂载到任意路径均正常 */
+char g_fuse_mount_point[PATH_MAX] = {0};
 bool g_persist_all_logs = false;
 bool g_strip_o_direct = false;
 /* 日志合并周期：batch 期间 log_internal 将日志累积到批量缓冲（不逐条写

@@ -1588,7 +1588,12 @@ int main(int argc, char *argv[]) {
             g_min_log_level = LOG_WARN;
         } else if (strcmp(argv[i], "error") == 0) {
             g_min_log_level = LOG_ERROR;
-        } else { 
+        } else {
+            /* 非选项位置参数：第一个即 FUSE 挂载点（injector 传 g_global_fuse.mnt_path）。
+               记录到 g_fuse_mount_point 供规则路径解析动态判断（不硬编码挂载路径，
+               FUSE 挂载到任意路径均正常） */
+            if (!g_fuse_mount_point[0] && argv[i][0] == '/')
+                strncpy(g_fuse_mount_point, argv[i], PATH_MAX - 1);
             fuse_argv[fuse_argc++] = argv[i]; 
         }
     }
