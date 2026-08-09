@@ -100,11 +100,11 @@ static void log_fuse_err(const char* op, const char* path, int err_code) {
 static int fw_parse_path(const char* path, int* user_id_out, char* sub_path_out, size_t sz) {
     if (!path) return -ENOENT;
     const char* sub = path;
-    if (path[0] == '/' && isdigit((unsigned char)path[1])) {
+    if (path[0] == '/' && path[1] >= '0' && path[1] <= '9') {
         /* 数字序列后是结尾或 '/' 才是完整 user_id 目录（/0、/10/...）；
            普通数字前缀文件名（/1_abc.txt）不剥离（与规则层判定一致） */
         const char* d = path + 1;
-        while (isdigit((unsigned char)*d)) d++;
+        while (*d >= '0' && *d <= '9') d++;
         if (*d == '\0' || *d == '/') {
             if (user_id_out) *user_id_out = atoi(path + 1);
             const char* slash = strchr(path + 1, '/');
@@ -1588,12 +1588,7 @@ int main(int argc, char *argv[]) {
             g_min_log_level = LOG_WARN;
         } else if (strcmp(argv[i], "error") == 0) {
             g_min_log_level = LOG_ERROR;
-        } else {
-            /* 非选项位置参数：第一个即 FUSE 挂载点（injector 传 g_global_fuse.mnt_path）。
-               记录到 g_fuse_mount_point 供规则路径解析动态判断（不硬编码挂载路径，
-               FUSE 挂载到任意路径均正常） */
-            if (!g_fuse_mount_point[0] && argv[i][0] == '/')
-                strncpy(g_fuse_mount_point, argv[i], PATH_MAX - 1);
+        } else { 
             fuse_argv[fuse_argc++] = argv[i]; 
         }
     }
