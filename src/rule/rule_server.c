@@ -248,27 +248,30 @@ static void rule_types_parse_line(char *line, const char *module) {
                 while (*p && !isspace((unsigned char)*p)) p++;
                 continue;
             }
-            argc_min = (int)v1;
+            /* 先完整解析 N 或 N:M（含畸形上界），全部成功后才提交：
+               argc=2:abc 的畸形上界使整个属性被跳过，不注册 2:∞ */
+            int new_min = (int)v1;
+            int new_max = new_min;
             p = end;
             if (*p == ':') {
                 p++;
                 if (*p == '*' || *p == '\0' || isspace((unsigned char)*p)) {
-                    argc_max = -1;   /* 不限上界 */
+                    new_max = -1;   /* 不限上界 */
                     if (*p == '*') p++;
                 } else {
                     char *end2 = nullptr;
                     errno = 0;
                     long v2 = strtol(p, &end2, 10);
-                    if (end2 == p || errno == ERANGE) {   /* 畸形上界：跳过属性 */
+                    if (end2 == p || errno == ERANGE) {   /* 畸形上界：整体跳过属性 */
                         while (*p && !isspace((unsigned char)*p)) p++;
                         continue;
                     }
-                    argc_max = (int)v2;
+                    new_max = (int)v2;
                     p = end2;
                 }
-            } else {
-                argc_max = argc_min;
             }
+            argc_min = new_min;
+            argc_max = new_max;
             continue;
         }
         if (strncasecmp(p, "global-only", 11) == 0) {
@@ -431,26 +434,30 @@ static void conf_section_apply_key(ConfSection *cs, const char *key, const char 
         return;
     }
     if (strcasecmp(key, "argc") == 0) {
+        /* 先完整解析 N 或 N:M（含畸形上界），全部成功后才提交到段状态：
+           argc=2:abc 的畸形上界会使整个属性被跳过，而不是注册 2:∞
+           错误约束（与文档"畸形声明被跳过"语义一致） */
         char *end = nullptr;
         errno = 0;
         long v1 = strtol(val, &end, 10);
         if (end == val || errno == ERANGE) return;   /* 畸形：跳过 */
-        cs->argc_min = (int)v1;
-        cs->argc_set = true;
+        int new_min = (int)v1;
+        int new_max = new_min;
         if (*end == ':') {
             const char *up = end + 1;
             if (*up == '*' || *up == '\0' || isspace((unsigned char)*up)) {
-                cs->argc_max = -1;                   /* 不限上界 */
+                new_max = -1;                        /* 不限上界 */
             } else {
                 char *end2 = nullptr;
                 errno = 0;
                 long v2 = strtol(up, &end2, 10);
-                if (end2 == up || errno == ERANGE) return;
-                cs->argc_max = (int)v2;
+                if (end2 == up || errno == ERANGE) return;   /* 畸形上界：整体跳过 */
+                new_max = (int)v2;
             }
-        } else {
-            cs->argc_max = cs->argc_min;
         }
+        cs->argc_min = new_min;
+        cs->argc_max = new_max;
+        cs->argc_set = true;
         return;
     }
     if (strcasecmp(key, "global-only") == 0) {

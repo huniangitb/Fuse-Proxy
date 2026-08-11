@@ -709,6 +709,39 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         pthread_detach(actx->tid);
         ctx->fd = -1;
         return 1;
+    } else if (strncmp(line, "LOG_BATCH", 9) == 0 && line[9] == '\0') {
+        /* LOG_BATCH 合并帧作为连接首个数据包（重连/重启后稳态、全局替换
+           模式下环形缓冲首条即合并摘要）：不能像普通日志行解析入 entries
+           （无级别/类型前缀），整帧（头行 + 粘包剩余字节）移交给 async
+           线程按帧协议收集——否则主循环逐行处理时每行返回 0，帧被丢弃 */
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->fd, nullptr);
+        AsyncCtx *actx = calloc(1, sizeof(AsyncCtx));
+        actx->fd = ctx->fd;
+        set_block(actx->fd);
+        actx->notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        actx->disconnected = false;
+        /* pending：LOG_BATCH 头行 + 剩余字节（可能含帧内容/END/后续 LOG_* 行） */
+        int plen = 0;
+        static const char head[] = "LOG_BATCH\n";
+        memcpy(actx->pending + plen, head, sizeof(head) - 1);
+        plen += (int)sizeof(head) - 1;
+        if (leftover && leftover_len > 0) {
+            int copy = leftover_len;
+            if (copy > (int)sizeof(actx->pending) - plen) copy = (int)sizeof(actx->pending) - plen;
+            memcpy(actx->pending + plen, leftover, (size_t)copy);
+            plen += copy;
+        }
+        actx->pending_len = plen;
+        actx->type = 2;
+        actx->head = 0; actx->tail = 0;
+        actx->next = g_async_clients;
+        g_async_clients = actx;
+        struct epoll_event ev = { .events = EPOLLIN, .data.fd = actx->notify_fd };
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, actx->notify_fd, &ev);
+        pthread_create(&actx->tid, nullptr, async_log_thread, actx);
+        pthread_detach(actx->tid);
+        ctx->fd = -1;
+        return 1;
     } else if (strncmp(line, "QUERY_IO:", 9) == 0 || strncmp(line, "QUERY_SYS:", 10) == 0 ||
                strncmp(line, "QUERY_LOGCAT:", 13) == 0) {
         bool is_io = (strstr(line, "IO") != nullptr);

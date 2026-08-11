@@ -360,6 +360,23 @@ void path_sanitize(char* out, size_t size, const char* path) {
     }
     out[o] = '\0';
 }
+/* 日志条目 → 发送包格式（主 drain 与关闭 drain 共用，保证分帧协议一致）：
+   - 合并单条（LOG_MERGED_MARK 前缀）：以 LOG_BATCH 分帧发送（头+内容+尾），
+     log_monitor 整块接收合并为一条入库，前端只显示一条
+   - 普通条目：LOG_IO:/LOG_LOGCAT:/LOG_SYS:<level>:[proc] 前缀 */
+static int log_entry_packet(const LogEntry* e, char* packet, size_t sz) {
+    if (strncmp(e->msg, LOG_MERGED_MARK, sizeof(LOG_MERGED_MARK) - 1) == 0) {
+        const char* content = e->msg + sizeof(LOG_MERGED_MARK) - 1;
+        return snprintf(packet, sz, "LOG_BATCH\n%s\nLOG_BATCH_END\n", content);
+    }
+    if (e->level == LOG_IO)
+        return snprintf(packet, sz, "LOG_IO:%s\n", e->msg);
+    if (e->level == LOG_LOGCAT)
+        return snprintf(packet, sz, "LOG_LOGCAT:%s\n", e->msg);
+    return snprintf(packet, sz, "LOG_SYS:%d:[%s] %s\n",
+                    e->level, g_proc_name, e->msg);
+}
+
 static void *log_sender_thread(void *arg) {
     (void)arg;
     int sock = -1;
@@ -398,20 +415,7 @@ static void *log_sender_thread(void *arg) {
             pthread_mutex_lock(&g_log_mutex);
             LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
             char packet[LOG_MSG_MAX_LEN * 2 + 128];
-            int len;
-            if (strncmp(e->msg, LOG_MERGED_MARK, sizeof(LOG_MERGED_MARK) - 1) == 0) {
-                /* 合并单条日志：以 LOG_BATCH 分帧协议发送（头+内容+尾），
-                   log_monitor 整块接收合并为一条入库，前端只显示一条 */
-                const char* content = e->msg + sizeof(LOG_MERGED_MARK) - 1;
-                len = snprintf(packet, sizeof(packet), "LOG_BATCH\n%s\nLOG_BATCH_END\n", content);
-            } else if (e->level == LOG_IO) {
-                len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
-            } else if (e->level == LOG_LOGCAT) {
-                len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
-            } else {
-                len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
-                               e->level, g_proc_name, e->msg);
-            }
+            int len = log_entry_packet(e, packet, sizeof(packet));
             pthread_mutex_unlock(&g_log_mutex);
             ssize_t sent = send(sock, packet, len, MSG_NOSIGNAL);
             if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -454,15 +458,8 @@ static void *log_sender_thread(void *arg) {
     while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
         pthread_mutex_lock(&g_log_mutex);
         LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
-        char packet[LOG_MSG_MAX_LEN + 128];
-        int len;
-        if (e->level == LOG_IO)
-            len = snprintf(packet, sizeof(packet), "LOG_IO:%s\n", e->msg);
-        else if (e->level == LOG_LOGCAT)
-            len = snprintf(packet, sizeof(packet), "LOG_LOGCAT:%s\n", e->msg);
-        else
-            len = snprintf(packet, sizeof(packet), "LOG_SYS:%d:[%s] %s\n",
-                           e->level, g_proc_name, e->msg);
+        char packet[LOG_MSG_MAX_LEN * 2 + 128];
+        int len = log_entry_packet(e, packet, sizeof(packet));
         pthread_mutex_unlock(&g_log_mutex);
         if (sock >= 0) send(sock, packet, len, MSG_NOSIGNAL);
         g_log_ring.tail++;
@@ -545,8 +542,11 @@ void log_internal(LogLevel level, const char* format, ...) {
     /* 合并周期内：累积到批量缓冲（不逐条写环形缓冲），由 log_batch_end
        合并为单条日志，前端最终只显示一条（多个发送请求并入一个日志）。
        只累积内容本身（不带 [proc] 前缀），条目间以制表符连接（不用换行，
-       避免前端按行拆分导致长内容截断/中文乱码），标签由合并单条统一带 */
-    if (g_log_batch_depth > 0) {
+       避免前端按行拆分导致长内容截断/中文乱码），标签由合并单条统一带。
+       原子读 depth：log_batch_end 用 __sync_fetch_and_sub 归零，若此处
+       用普通读可能看到陈旧值 1，在 batch 已结束归零后仍追加内容到已
+       重置缓冲，造成消息丢失且残留字节并入下一周期 */
+    if (__sync_fetch_and_add(&g_log_batch_depth, 0) > 0) {
         pthread_mutex_lock(&g_log_batch_mutex);
         int w = snprintf(g_log_batch_buf + g_log_batch_len,
                          sizeof(g_log_batch_buf) - g_log_batch_len,
