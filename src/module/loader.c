@@ -449,8 +449,10 @@ int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out) {
     if (!q || !out) return NSP_DISPATCH_NONE;
     /* 快速路径：无规则模块注册，零开销回退（不过滤任何条目） */
     if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
-    /* 框架源头规避：无 <uid>/ 用户层（挂载点根）不进行任何规则探测 */
-    if (!path_has_uid_layer(q->path)) return NSP_DISPATCH_NONE;
+    /* 注意：不做 path_has_uid_layer 拦截——vfs_readdir 的条目级 probe 传入
+       的是剥离 <uid>/ 后的条目路径（如 /secret.txt），拦截会误伤隐藏判定；
+       probe 只判 hidden/redirect_target，不合成虚拟目录，挂载点根由
+       resolve/readdir_extra 的拦截兜底 */
 
     pthread_rwlock_rdlock(&g_module_lock);
     bool any = false;
