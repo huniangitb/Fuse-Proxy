@@ -57,6 +57,11 @@ struct GlobalFuseInfo g_media_fuse = {
 /* 全局替换式挂载方案开关（--global-replace）：默认关闭，沿用逐应用挂载 */
 bool g_global_replace_mode = false;
 
+/* 权限完全镜像开关（--preserve-perms）：injector 命令行解析，启动
+   fuse_daemon 时传递 --preserve-perms，使 FUSE 保留底层真实文件的
+   uid/gid/权限（不伪造为访问者权限） */
+static bool g_preserve_perms_flag = false;
+
 /* 重入保护：防止并发调用 inject_global_fuse() */
 static volatile int g_fuse_starting = 0;
 /* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
@@ -334,6 +339,7 @@ static void inject_global_fuse() {
         args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
+        if (g_preserve_perms_flag) args[ai++] = "--preserve-perms";
         args[ai++] = arg_ready;
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
@@ -442,6 +448,7 @@ static void inject_media_fuse() {
         args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
+        if (g_preserve_perms_flag) args[ai++] = "--preserve-perms";
         args[ai++] = arg_ready;
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
@@ -881,6 +888,7 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "info") == 0) g_min_log_level = LOG_INFO;
         else if (strcmp(argv[i], "warn") == 0 || strcmp(argv[i], "warning") == 0) g_min_log_level = LOG_WARN;
         else if (strcmp(argv[i], "--strip-o-direct") == 0) g_strip_o_direct = true;
+        else if (strcmp(argv[i], "--preserve-perms") == 0) g_preserve_perms_flag = true;
         else if (strcmp(argv[i], "--passive") == 0 || strcmp(argv[i], "passive") == 0) start_passive = true;
         else if (strcmp(argv[i], "--global-replace") == 0) g_global_replace_mode = true;
     }

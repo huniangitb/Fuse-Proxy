@@ -431,10 +431,13 @@ static int br_strip_and_sanitize(const char* path, int* path_user_id_out,
 static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out,
                                         char* sub_path_out, size_t sub_path_size,
                                         const char* current_pkg, uid_t uid, TrieMatch* tm_out) {
+    (void)uid;
     if (br_strip_and_sanitize(path, path_user_id_out, sub_path_out, sub_path_size) != 0)
         return -ENOENT;
     if (tm_out) br_trie_resolve(cfg, sub_path_out, tm_out);
-    if (uid != 0 && br_is_path_hidden_internal(cfg, sub_path_out, current_pkg, tm_out)) return -ENOENT;
+    /* 隐藏判定对所有访问者生效（含 root，与 vfs_readdir probe 过滤一致）：
+       HIDE 规则配置后，root ls 也不应看到被隐藏条目 */
+    if (br_is_path_hidden_internal(cfg, sub_path_out, current_pkg, tm_out)) return -ENOENT;
     return 0;
 }
 
@@ -887,8 +890,10 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
         tm.valid = true;
         tm.hidden = trie_hidden;
         /* 完整隐藏判定（CONFIG_DIR/Android 骨架/其他应用/hide 规则），
-           trie 部分用缓存值（tm.valid 使其跳过内部 trie 查询） */
-        if (q->uid != 0 && br_is_path_hidden_internal(cfg, sub_path, current_pkg, &tm)) {
+           trie 部分用缓存值（tm.valid 使其跳过内部 trie 查询）。
+           对所有访问者生效（含 root）：与 br_sanitize_and_check_hidden
+           及 vfs_readdir probe 过滤语义一致，HIDE 后 root ls 也看不见 */
+        if (br_is_path_hidden_internal(cfg, sub_path, current_pkg, &tm)) {
             out->valid = true;
             out->hidden = true;
             config_unlock_read();

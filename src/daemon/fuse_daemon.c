@@ -319,12 +319,50 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
         module_backend_put(bops);
         if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
         if (!g_preserve_perms) { st->st_uid = ctx->uid; st->st_gid = ctx->gid; }
+        else if (st->st_uid == 0 && st->st_gid == 0) {
+            /* 权限完全镜像：FTP 后端未提供真实属主（uid/gid=0），FTP 虚拟目录
+               （如前缀"云盘"及其子项）权限继承其本地上级——用户存储根
+               /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录
+               lstat 必失败，故取用户存储根的真实属主，而非固定 root） */
+            int root_uid = (path_user_id >= 0) ? path_user_id : 0;
+            char root_path[PATH_MAX];
+            if (g_real_root[0])
+                snprintf(root_path, sizeof(root_path), "%s/%d", g_real_root, root_uid);
+            else
+                snprintf(root_path, sizeof(root_path), STORAGE_BASE "/%d", root_uid);
+            struct stat pst;
+            if (lstat(root_path, &pst) == 0) {
+                st->st_uid = pst.st_uid;
+                st->st_gid = pst.st_gid;
+            }
+        }
         VFS_RETURN(0);
     }
     if (lstat(p, st) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) && (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
-            memset(st, 0, sizeof(struct stat)); st->st_ino = synthetic_inode(sub_path); st->st_mode = S_IFDIR | 0755; st->st_nlink = 2; st->st_uid = ctx->uid; st->st_gid = ctx->gid;
+            /* 虚拟目录（无真实底层文件，如 FTP 前缀/重定向祖先）：权限继承
+               上级目录（父路径的真实 mode/uid/gid），而非固定 root/访问者 */
+            memset(st, 0, sizeof(struct stat));
+            st->st_ino = synthetic_inode(sub_path);
+            st->st_mode = S_IFDIR;
+            st->st_nlink = 2;
+            char parent[PATH_MAX];
+            strncpy(parent, p, sizeof(parent) - 1);
+            parent[sizeof(parent) - 1] = '\0';
+            char* last = strrchr(parent, '/');
+            if (last && last != parent) *last = '\0';
+            else if (last == parent) strcpy(parent, "/");
+            struct stat pst;
+            if (lstat(parent, &pst) == 0) {
+                st->st_mode |= (pst.st_mode & 07777);
+                st->st_uid = pst.st_uid;
+                st->st_gid = pst.st_gid;
+            } else {
+                st->st_mode |= 0755;
+                st->st_uid = ctx->uid;
+                st->st_gid = ctx->gid;
+            }
             VFS_RETURN(0);
         }
         log_fuse_err("GETATTR", path, err);
@@ -337,13 +375,19 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
     if (!g_preserve_perms && !is_data_or_obb) { 
         st->st_uid = ctx->uid; 
         st->st_gid = ctx->gid; 
-    } else if (is_redir && S_ISDIR(st->st_mode)) {
+    } else if (!g_preserve_perms && is_redir && S_ISDIR(st->st_mode)) {
+        /* 权限完全镜像模式下（--preserve-perms）保留底层真实目录权限，
+           不强制 0777；仅伪造模式才放开重定向目录写权限 */
         st->st_mode = (st->st_mode & ~07777) | 0777;
     }
     if (is_android_skel_dir(sub_path)) {
-        st->st_mode = (st->st_mode & ~07777) | S_IFDIR | 0755;
-        st->st_uid = ctx->uid;
-        st->st_gid = ctx->gid;
+        if (!g_preserve_perms) {
+            /* 伪造模式：skel 骨架目录统一 0755 + 访问者属主 */
+            st->st_mode = (st->st_mode & ~07777) | S_IFDIR | 0755;
+            st->st_uid = ctx->uid;
+            st->st_gid = ctx->gid;
+        }
+        /* 权限完全镜像模式（--preserve-perms）：保留底层真实目录权限与属主 */
     }
     VFS_RETURN(0);
 }
@@ -422,8 +466,10 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
                不触发 sandbox 目录创建（无模块时直通不过滤）。
                user_id 目录条目（/0、/1...）旧语义用原始串判 redirect_target 恒 false
                （Trie 无数字前缀规则）；剥离 /0/ 后会误判为根目录 sandbox 重定向目标，
-               故豁免其 redirect_target 检查（仅 hidden 生效） */
-            if (ctx->uid != 0) {
+               故豁免其 redirect_target 检查（仅 hidden 生效）。
+               hidden 过滤对所有访问者生效（含 root，与 getattr 的 hidden 拒绝一致）：
+               否则 root ls 时被 HIDE 的条目仍出现在列表（stat 却失败），隐藏不彻底 */
+            {
                 bool uid_dir = false;
                 if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
                     const char* d = item_sub_path + 1;
@@ -505,19 +551,41 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             }
         }
     }
-    /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler */
+    /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler。
+       虚拟条目（如 FTP 前缀目录）权限继承其本地上级——用户存储根
+       /data/media/<uid>/（FTP 虚拟路径本地不存在，直接父目录 lstat 必失败），
+       而非固定 root/访问者属主 */
     {
         NspDirEntry virt[MAX_MODULES * 8];
         NspQueryCtx vq = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = sub_path };
+        struct stat parent_st; memset(&parent_st, 0, sizeof(parent_st));
+        bool have_parent = false;
+        {
+            int root_uid = (path_user_id >= 0) ? path_user_id : 0;
+            char root_path[PATH_MAX];
+            if (g_real_root[0])
+                snprintf(root_path, sizeof(root_path), "%s/%d", g_real_root, root_uid);
+            else
+                snprintf(root_path, sizeof(root_path), STORAGE_BASE "/%d", root_uid);
+            have_parent = (lstat(root_path, &parent_st) == 0);
+        }
         int vn = module_dispatch_readdir(&vq, sub_path, path_user_id, current_pkg, is_root, virt, MAX_MODULES * 8);
         for (int vi = 0; vi < vn; vi++) {
             if (virt[vi].name[0] == '\0') continue;
             if (vfs_hash_insert(&ht, virt[vi].name)) {
                 struct stat st_dir; memset(&st_dir, 0, sizeof(st_dir));
                 st_dir.st_ino = synthetic_inode(virt[vi].name);
-                st_dir.st_mode = S_IFDIR | 0755;
-                st_dir.st_uid = ctx->uid;
-                st_dir.st_gid = ctx->gid;
+                st_dir.st_mode = S_IFDIR;
+                if (have_parent) {
+                    /* 继承用户存储根：属主/组与权限位取自真实存储根目录 */
+                    st_dir.st_mode |= (parent_st.st_mode & 07777);
+                    st_dir.st_uid = parent_st.st_uid;
+                    st_dir.st_gid = parent_st.st_gid;
+                } else {
+                    st_dir.st_mode |= 0755;
+                    st_dir.st_uid = ctx->uid;
+                    st_dir.st_gid = ctx->gid;
+                }
                 if (filler(buf, virt[vi].name, &st_dir, 0, 0) != 0) {
                     vfs_hash_free(&ht);
                     VFS_RETURN(0);

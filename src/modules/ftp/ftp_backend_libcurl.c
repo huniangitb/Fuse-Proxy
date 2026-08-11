@@ -394,6 +394,173 @@ int ftp_backend_match(const char* path) {
 /* 前置声明：读下载线程（定义在 ftp_backend_read 前，open 读模式启动） */
 static void* ftp_dl_thread(void* arg);
 
+/* 解析 Unix-style LIST 行的时间列并转 time_t：
+   行格式：`drwxr-xr-x 1 user group 4096 Mon DD HH:MM name`（当年）
+   或      `drwxr-xr-x 1 user group 4096 Mon DD  YYYY name`（往年）。
+   FTP 协议规定服务器 LIST 时间为 GMT/UTC（vsftpd 默认 use_localtime=NO
+   即输出 GMT），故用 timegm 按 UTC 解释，避免本地时区偏移。
+   返回 0 成功、-1 解析失败（保持调用方默认 mtime）。 */
+static int ftp_parse_list_time(const char* line, const char* nl, time_t* out) {
+    /* 跳过前 5 列（权限/链接/属主/组/大小） */
+    const char* p = line;
+    int col = 0;
+    while (p < nl && col < 5) {
+        if (*p == ' ' || *p == '\t') { p++; continue; }
+        col++;
+        while (p < nl && *p != ' ' && *p != '\t') p++;
+    }
+    while (p < nl && (*p == ' ' || *p == '\t')) p++;
+    if (p >= nl) return -1;
+    /* 第 6 列：月份缩写 */
+    char mon[8]; int mi = 0;
+    while (p < nl && *p != ' ' && *p != '\t' && mi < 7) mon[mi++] = *p++;
+    mon[mi] = '\0';
+    while (p < nl && (*p == ' ' || *p == '\t')) p++;
+    if (mi == 0) return -1;
+    /* 第 7 列：日 */
+    int day = 0;
+    while (p < nl && *p >= '0' && *p <= '9') { day = day * 10 + (*p - '0'); p++; }
+    while (p < nl && (*p == ' ' || *p == '\t')) p++;
+    if (day <= 0 || day > 31) return -1;
+    /* 第 8 列：HH:MM 或 YYYY */
+    char tok[16]; int ti = 0;
+    while (p < nl && *p != ' ' && *p != '\t' && ti < 15) tok[ti++] = *p++;
+    tok[ti] = '\0';
+    if (ti == 0) return -1;
+    struct tm tmv; memset(&tmv, 0, sizeof tmv);
+    tmv.tm_mday = day;
+    tmv.tm_isdst = -1;
+    /* 月名映射（Jan..Dec） */
+    static const char* months[] = { "Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec" };
+    int found = -1;
+    for (int i = 0; i < 12; i++) {
+        if (strncasecmp(mon, months[i], 3) == 0) { found = i; break; }
+    }
+    if (found < 0) return -1;
+    tmv.tm_mon = found;
+    if (strchr(tok, ':') != NULL) {
+        /* 当年时间 HH:MM */
+        int hh = 0, mm = 0, i = 0;
+        while (tok[i] >= '0' && tok[i] <= '9') { hh = hh * 10 + (tok[i] - '0'); i++; }
+        if (tok[i] != ':') return -1;
+        i++;
+        while (tok[i] >= '0' && tok[i] <= '9') { mm = mm * 10 + (tok[i] - '0'); i++; }
+        if (hh > 23 || mm > 59) return -1;
+        tmv.tm_hour = hh; tmv.tm_min = mm;
+        time_t now = time(NULL);
+        struct tm* nt = localtime(&now);
+        if (nt) tmv.tm_year = nt->tm_year;
+    } else {
+        /* 往年 YYYY */
+        long yr = strtol(tok, NULL, 10);
+        if (yr < 1970 || yr > 2100) return -1;
+        tmv.tm_year = (int)yr - 1900;
+    }
+    time_t mt = timegm(&tmv);
+    if (mt < 0) return -1;
+    *out = mt;
+    return 0;
+}
+
+/* 获取 FTP 目录自身 mtime：FTP 无目录 MDTM 标准命令（vsftpd 不支持），
+   通过对父目录 LIST 并解析目标目录行的时间列实现。
+   返回 0 成功、-1 失败（调用方保持默认 mtime）。 */
+static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
+    if (!bk || !path || !out) return -1;
+    if (ensure_curl(bk) != 0) return -EIO;
+    /* 用 build_url 得到 FTP 端完整 URL（含 remote_dir 映射），
+       从 URL 路径部分取父路径与目标目录名——不能按虚拟 path 切分，
+       否则 remote_dir（如 /upload）映射后父路径会算错 */
+    char url[2048];
+    build_url(bk, path, url, sizeof url);
+    char* pathpart = strchr(url + strlen("ftp://"), '/');
+    if (!pathpart) return -1;
+    /* 去尾斜杠（FTP 目录 URL 常以 / 结尾） */
+    size_t pplen = strlen(pathpart);
+    while (pplen > 1 && pathpart[pplen - 1] == '/') pathpart[--pplen] = '\0';
+    if (pplen == 0) return -1;   /* 根目录自身：无父级可 LIST 解析 */
+    /* 目标目录名 = 最后一段 */
+    const char* slash = strrchr(pathpart, '/');
+    const char* target = slash ? slash + 1 : pathpart;
+    if (!target[0]) return -1;
+    /* 父路径 = 去掉最后一段；根时父为空 → LIST "/" */
+    char parent[2048];
+    if (slash) {
+        size_t plen = (size_t)(slash - pathpart);
+        memcpy(parent, pathpart, plen);
+        parent[plen] = '\0';
+        if (plen == 0) strcpy(parent, "/");
+    } else {
+        strcpy(parent, "/");
+    }
+    /* 拼接父路径 FTP URL（同一 bk 的 host/port/remote_dir 已含在 pathpart 计算中，
+       这里直接基于原 url 前缀重建） */
+    size_t urllen = strlen(url);
+    char list_url[2048];
+    if (strcmp(parent, "/") == 0) {
+        /* 父为 FTP 根：remote_dir 的父级 = remote_dir 去掉最后一段或空 */
+        const char* rd = bk->cfg.remote_dir;
+        size_t rdl = strlen(rd);
+        while (rdl > 1 && rd[rdl-1] == '/') rdl--;
+        const char* rdslash = NULL;
+        for (size_t i = 0; i < rdl; i++) if (rd[i] == '/') rdslash = rd + i;
+        if (rdslash && rdslash > rd) {
+            size_t plen2 = (size_t)(rdslash - rd);
+            snprintf(list_url, sizeof list_url, "ftp://%s:%d%.*s/", bk->cfg.host, bk->cfg.port, (int)plen2, rd);
+        } else {
+            snprintf(list_url, sizeof list_url, "ftp://%s:%d/", bk->cfg.host, bk->cfg.port);
+        }
+    } else {
+        /* 父路径在 remote_dir 之下：url 前缀（host:port）+ parent */
+        snprintf(list_url, sizeof list_url, "%.*s%s/", (int)(urllen - pplen), url, parent);
+    }
+
+    struct WriteBuf wb = {0};
+    wb.auto_grow = true;
+    pthread_mutex_lock(&bk->op_lock);
+    ftp_reset_opts(bk);
+    curl_easy_setopt(bk->curl, CURLOPT_URL, list_url);
+    curl_easy_setopt(bk->curl, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(bk->curl, CURLOPT_CUSTOMREQUEST, NULL);
+    curl_easy_setopt(bk->curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(bk->curl, CURLOPT_WRITEDATA, &wb);
+    CURLcode res = curl_easy_perform(bk->curl);
+    pthread_mutex_unlock(&bk->op_lock);
+    if (res != CURLE_OK) { free(wb.buf); return -1; }
+
+    /* 逐行匹配目标目录名，取时间列 */
+    int rc = -1;
+    char* line = wb.buf;
+    char* end = wb.buf + wb.len;
+    while (line < end) {
+        while (line < end && (*line == '\n' || *line == '\r')) line++;
+        if (line >= end) break;
+        char* nl = memchr(line, '\n', end - line);
+        if (!nl) nl = end;
+        /* 跳过前 8 列取文件名（与 readdir 解析一致） */
+        char* p = line;
+        int col = 0;
+        while (p < nl && col < 8) {
+            if (*p == ' ' || *p == '\t') { p++; continue; }
+            col++;
+            while (p < nl && *p != ' ' && *p != '\t') p++;
+        }
+        while (p < nl && (*p == ' ' || *p == '\t')) p++;
+        char* nm = p;
+        char* ne = nl;
+        if (ne > nm && *(ne-1) == '\r') ne--;
+        size_t nlen = (size_t)(ne - nm);
+        if (nlen == strlen(target) && memcmp(nm, target, nlen) == 0) {
+            if (ftp_parse_list_time(line, nl, out) == 0) rc = 0;
+            break;
+        }
+        line = nl + 1;
+    }
+    free(wb.buf);
+    return rc;
+}
+
 int ftp_backend_getattr(const char* path, struct stat* st) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
@@ -469,6 +636,11 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
         // LIST 成功即视为目录（空目录返回 0 字节，不能用 len>0 判断）
         st->st_mode = S_IFDIR | 0755;
         st->st_nlink = 2;
+        /* 同步服务器目录时间：FTP 无目录 MDTM 标准命令（vsftpd 不支持），
+           通过父目录 LIST 解析目标目录行的时间列；解析失败保持默认 */
+        time_t dmtime = 0;
+        if (ftp_dir_mtime(bk, path, &dmtime) == 0 && dmtime > 0)
+            st->st_mtime = dmtime;
         free(dir_wb.buf);
         return 0;
     }
