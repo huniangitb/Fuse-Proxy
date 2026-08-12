@@ -44,6 +44,12 @@ typedef struct {
     int ftp_count;
     int ftp_capacity;
     TrieNode* trie_root;
+    /* 动态规则标志：redir/hide/ro 规则中存在通配符或路径变量（未入 trie，
+       须运行时线性匹配）。全静态时 trie 为完整决策源，resolve/probe 可跳过
+       线性兜底（热路径）——br_probe 目录缓存命中路径据此实现无锁读取 */
+    bool dyn_redir;
+    bool dyn_hide;
+    bool dyn_ro;
     char** var_names;
     char** var_values;      /* 原始值（含 $ 占位），动态变量运行时展开用 */
     char** var_resolved;    /* 静态变量的预计算展开值；动态变量为 NULL */
@@ -70,6 +76,18 @@ void config_lock_read();
 void config_unlock_read();
 void config_lock_write();
 void config_unlock_write();
+
+/* S1 无锁快照协议（热路径 br_resolve/br_probe 使用，替代 config_lock_read）：
+   读者 config_read_begin() 返回稳定代际（偶数）并持槽；config_read_end(gen)
+   释放槽并返回代际是否未变（false = 读期间发生发布，调用方须重试）。
+   写者 config_publish_begin() 返回旧代际并置奇数（封锁新读者）；
+   config_drain_readers(old_gen) 等待旧代际读者归零（交换前调用，防撕裂读）；
+   config_publish_end(old_gen) 放行并等待旧代际读者归零（之后方可释放旧配置）。 */
+uint64_t config_read_begin(void);
+bool config_read_end(uint64_t gen);
+uint64_t config_publish_begin(void);
+void config_drain_readers(uint64_t old_gen);
+void config_publish_end(uint64_t old_gen);
 
 /* FTP 规则匹配（供规则模块 resolve 用）：sub_path 命中 FTP 规则虚拟前缀
    （最长前缀优先）时输出 FTP 段名（ftp.conf [段名]），返回 true */

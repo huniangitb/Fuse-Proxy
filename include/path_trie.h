@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * 路径前缀树（多叉 Trie）。
@@ -15,11 +16,13 @@
  */
 typedef struct TrieNode {
     char *segment;              /* 本节点对应的路径段（不含 '/'） */
-    struct TrieNode **children;
+    uint16_t seg_len;           /* segment 长度缓存（查找避免每段 strlen） */
+    struct TrieNode **children; /* 按 segment 字典序有序，查找可二分 */
     int child_count;
     bool is_hidden;
     bool is_ro;
     char *redir_target;         /* 非 NULL 表示该节点是重定向目标 */
+    char *ftp_backend;          /* 非 NULL 表示该节点是 FTP 虚拟前缀（段名） */
 } TrieNode;
 
 /* 创建节点。segment 可为 NULL（根节点）；内部 strdup 拷贝。 */
@@ -31,6 +34,10 @@ void trie_free(TrieNode* node);
 /* 插入一条路径规则。redir_target 可为 NULL（仅设置 hidden/ro 标记）。 */
 void trie_insert(TrieNode* root, const char* path, const char* redir_target, bool is_hidden, bool is_ro);
 
+/* 插入一条 FTP 虚拟前缀规则：prefix 沿段下降，终点节点记录后端段名
+   （最长前缀优先 = 下降过程中最深带 ftp_backend 的节点命中） */
+void trie_insert_ftp(TrieNode* root, const char* prefix, const char* backend);
+
 /*
  * 查询 path 命中的规则。沿路径逐段下降，累积 hidden/ro（含祖先继承），
  * redirect 取最深命中节点的目标并拼接剩余后缀写入 out_redir。
@@ -41,11 +48,13 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
 
 /* 与 trie_lookup 相同的累积语义（hidden/ro 含祖先继承、redir 取最深命中并拼接后缀），
    额外返回**完整匹配**到路径末尾的最深节点（某段缺失返回 NULL）。
-   供 br_resolve 一次性取得 trie 判定所需节点，复用 hidden/ro/redir 结果，
+   out_ftp 输出下降过程中最深命中节点的 ftp_backend（FTP 最长前缀优先，
+   可 NULL），供 resolve 一次性取得 trie 判定所需节点，复用 hidden/ro/redir 结果，
    避免 virtual_ancestor / redirect_target 各自再全路径遍历。 */
 const TrieNode* trie_lookup_full(const TrieNode* root, const char* path,
                                  bool* out_hidden, bool* out_ro,
-                                 char* out_redir, size_t max_len);
+                                 char* out_redir, size_t max_len,
+                                 char* out_ftp, size_t ftp_max_len);
 
 /* path 对应节点是否本身就是一个 redirect 目标。 */
 bool trie_is_redirect_target(const TrieNode* root, const char* path);

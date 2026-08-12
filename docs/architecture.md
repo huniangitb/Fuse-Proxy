@@ -23,7 +23,7 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 
 ## 2. 进程架构
 
-项目编译产出 4 个独立可执行文件，各自是一个进程，通过 Unix Domain Socket 协作：
+项目编译产出 6 个独立可执行文件，各自是一个进程，通过 Unix Domain Socket 协作（rule_server 为规则控制守护进程，见 `rule-server-api.md`；global_replace_ctl 仅 GNU 构建、供测试驱动全局替换挂载原语）：
 
 ```
                          ┌─────────────────────────────────────────┐
@@ -43,8 +43,9 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
                     │  fuse_daemon        │      │  管理器 App /       │
                     │  FUSE 操作回调       │      │  log_ctl (CLI)     │
                     │  ┌───────────────┐  │      └────────────────────┘
-                    │  │ vfs_core      │  │
-                    │  │ (规则匹配引擎)│  │
+                    │  │ 规则模块       │  │
+                    │  │ basic_rules   │  │
+                    │  │ (dlopen 决策)  │  │
                     │  └───────┬───────┘  │
                     └──────────┼──────────┘
                                │ 读 config_parser 解析的规则
@@ -80,7 +81,7 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 - **后端分派**（`NSP_CAP_BACKEND_IO`）：FUSE 回调解析出 sub_path 后，若规则模块 resolve 命中 FTP 规则（`rr.is_ftp`，`FTP <虚拟前缀> <段名>`，作用域按规则所在段：GLOBAL=全局、应用段=仅该应用），则经 `module_backend_lookup` 定位后端模块（如 ftp_module.so）并改调其 `backend_*` 方法完成文件操作——**模块不实现 FUSE，只提供目标功能的方法，最终执行仍由框架回调驱动**；无后端模块或未命中 FTP 规则时本地文件系统直通（`module_backend_active()` 快速路径零开销）。
 - **规则匹配引擎**：已整体迁移为热插拔规则模块 `basic_rules.so`（`src/modules/basic_rules/`，dlopen 进 fuse_daemon 进程，函数指针调用），模块化后框架不含任何规则语义。
 - **uid→包名解析**（规则模块内 `br_get_pkg`）：uid<10000 直接判为 `system`；否则先查 `uid.map`、再读 `/proc/<tid>/status` 的 `Tgid`+`cmdline`；解析出 `<pre-`/`zygote`/长度<3 的进程视为不可解析，缓存为 nullptr。
-- **每个 metadata 操作的热路径**：`vfs_get_app_cfg`（uid→配置，2048 槽 mutex 缓存，命中 O(1)）→ `vfs_sanitize_and_check_hidden`（路径消毒 + 隐藏判定）→ `vfs_to_real_path`（重定向/沙箱解析）——以上均由 basic_rules 模块内实现，框架经一次 `resolve` 调用取回全部决策（含最终真实路径），保住"一次查询多路复用"的性能语义。
+- **每个 metadata 操作的热路径**：`br_get_app_cfg`（uid→配置，2048 槽 seqlock 无锁读缓存，命中 O(1)；写者 wlock+seq 翻转，读者零原子写）→ `br_sanitize_and_check_hidden`（路径消毒 + 隐藏判定）→ `br_to_real_path`（重定向/沙箱解析）——以上均由 basic_rules 模块内实现，框架经一次 `module_dispatch_resolve` 调用取回全部决策（含最终真实路径），保住"一次查询多路复用"的性能语义。
 
 ### 2.3 log_monitor / log_ctl — 日志子系统
 
@@ -154,6 +155,8 @@ common_sources = core/common.c, config/config_parser.c, config/path_vars.c,
 |-----------|-----------|------|
 | `fuse_daemon` | daemon/fuse_daemon.c, module/loader.c, core/crash_dump.c, core/fast_pid.c | FUSE 守护（框架，零规则功能） |
 | `injector` | injector/*.c（injector, inject_target, mount_manager, ipc_server, config_publisher, ns_utils）, core/fast_pid.c | 注入器 |
+| `rule_server` | rule/rule_server.c | 规则控制守护进程（Android/GNU 均构建），详见 `rule-server-api.md` |
+| `global_replace_ctl` | injector/global_replace_ctl.c, injector/ns_utils.c | 全局替换式挂载测试驱动（仅 GNU 构建，供 tests/test_global_replace.py 使用） |
 | `log_monitor` | log/log_monitor.c | 日志收集 |
 | `log_ctl` | log/log_ctl.c | 日志/配置 CLI |
 
@@ -168,7 +171,7 @@ common_sources = core/common.c, config/config_parser.c, config/path_vars.c,
 
 ## 5. 规则系统设计（核心）
 
-规则系统是 fuse_daemon 的心脏，位于 `config_parser.c`（解析与存储）+ `vfs_core.c`（匹配与应用）。
+规则系统由 `config_parser.c`（解析与存储，共享库编译进各进程）+ 规则模块 `basic_rules.so`（匹配与应用，dlopen 进 fuse_daemon）组成；框架 fuse_daemon 不含任何规则语义。
 
 ### 5.1 规则类型
 
@@ -205,29 +208,29 @@ common_sources = core/common.c, config/config_parser.c, config/path_vars.c,
 
 ```
 FUSE 回调（如 getattr）
-  └─ VFS_SETUP_CORE 宏：
-       ① vfs_get_app_cfg(uid) ────────── uid→AppConfig（2048 槽缓存，命中 O(1)）
-       ② vfs_sanitize_and_check_hidden ─ 路径消毒 + Trie 一次性解析（填 TrieMatch）+ 隐藏判定
-       ③ vfs_to_real_path ────────────── 复用 TrieMatch 的 redirect 结果 → 真实路径
-  └─ 写操作额外：vfs_is_path_ro ───────── 复用 TrieMatch 的 ro 结果
+  └─ VFS_SETUP_CORE 宏：经 module_dispatch_resolve 一次调用取回全部决策
+       ① br_get_app_cfg(uid) ──────────── uid→AppConfig（2048 槽 seqlock 无锁读缓存，命中 O(1)）
+       ② br_sanitize_and_check_hidden ─── 路径消毒 + Trie 一次性解析（填 TrieMatch）+ 隐藏判定
+       ③ br_to_real_path ──────────────── 复用 TrieMatch 的 redirect 结果 → 真实路径
+  └─ 写操作额外：br_is_path_ro ────────── 复用 TrieMatch 的 ro 结果
 ```
 
-`TrieMatch` 缓存使单次操作对两棵 Trie（app + global）的遍历从 6 次降到 2 次。
+`TrieMatch` 缓存使单次操作对两棵 Trie（app + global）的遍历从 6 次降到 2 次（`trie_lookup_full` 一次下降同时取 hidden/ro/redir/ftp 命中）。
 
 ### 5.5 真实目标分类与 sandbox
 
-`vfs_to_real_path` 解析真实路径时按以下优先级：
+`br_to_real_path` 解析真实路径时按以下优先级：
 
 1. **Trie 静态 redirect 命中**（复用 `TrieMatch`）：若目标以 `?` 开头，转换为 `STORAGE_BASE/<user_id><后缀>`。
 2. **线性 redir_rules**：app 优先、global 兜底；目标经 `build_real_base_from_target` 分类——`?` 前缀或相对路径→当前用户存储；`/storage/emulated/X/...`→归一为当前用户存储；`/data`、`/mnt`、`/storage`→绝对路径原样；其他以 `/` 开头→当前用户存储。
 3. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data/<pkg>`、`/Android/obb/<pkg>` 外的 `/Android/data`、`/Android/obb` 访问重定向到 `/Android/data/<pkg>/sandbox`。应用段显式 `SANDBOX OFF` 可覆盖全局 `ON`（靠 `sandbox_explicit` 标记）。
 4. **fallback**：无任何命中则默认 `STORAGE_BASE/<user_id><sub_path>`。
 
-> `?` 前缀是项目内部标记，由 parse 阶段对 ALLOW 和相对路径 REDIRECT 自动生成，表示"相对当前用户存储"，运行时由 `vfs_to_real_path`/`build_real_base_from_target` 还原为 `STORAGE_BASE/<user_id>`。配置文件中一般无需手写。
+> `?` 前缀是项目内部标记，由 parse 阶段对 ALLOW 和相对路径 REDIRECT 自动生成，表示"相对当前用户存储"，运行时由 `br_to_real_path`/`build_real_base_from_target` 还原为 `STORAGE_BASE/<user_id>`。配置文件中一般无需手写。
 
 ### 5.6 跨应用隔离
 
-- `vfs_is_other_app_pkg`：应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用，由 `is_path_hidden_internal` 返回隐藏（ENOENT）。
+- `br_is_other_app_pkg`：应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用，由 `br_is_path_hidden_internal` 返回隐藏（ENOENT）。
 - `CONFIG_DIR`（`/data/Namespace-Proxy`）路径下的所有访问无条件隐藏，防止应用窥探配置本身。
 
 ## 6. 进程间协作与数据流
@@ -238,12 +241,12 @@ FUSE 回调（如 getattr）
 2. injector 通过检测 zygote 子进程（`fast_pid` + `/proc` 扫描，周期由 timerfd 驱动）发现新启动的应用。
 3. `inject_target` 判定该进程是否为配置的目标应用（含 `SKIP_SYSTEM_APPS` 默认过滤 uid<10000、隔离进程过滤）。
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace，挂载 fuse_daemon 提供的 FUSE 文件系统。`FUSE_DIRECT` 开启时走快速路径：跳过 bind mount 备份/还原，直接追加挂载；首启动应用可免读 mountinfo。
-5. 此后该应用对 `/sdcard` 等的访问经 FUSE → vfs_core 规则匹配。
+5. 此后该应用对 `/sdcard` 等的访问经 FUSE → 规则模块（basic_rules）匹配。
 
 ### 6.2 配置热重载
 
 - injector 用 inotify 监听 `injector.conf` 与 `App-rules/*.conf` 变更。
-- fuse_daemon 独立用 inotify 监听规则目录（`vfs_core.c` 的 `config_monitor_thread`），变更后 `reload_config` 重建 AppConfig 与 Trie、清空 uid 缓存、重读 `uid.map`。
+- fuse_daemon 内的规则模块（basic_rules）独立用 inotify 监听规则目录（`config_monitor_thread`，br_rules.c），变更后 `reload_config` 重建 AppConfig 与 Trie、清空 uid 缓存、重读 `uid.map`。
 - 变更后 injector 通过 `config_publisher` 向订阅者广播新配置；若 `global_inject` 切换则广播"全量变更"（`changed_count=-1`）触发全应用重挂载，否则仅通知受影响包。
 
 ### 6.3 IPC 与广播（UDS）
@@ -259,11 +262,11 @@ FUSE 回调（如 getattr）
 | 全局 | 归属 | 保护 | 说明 |
 |------|------|------|------|
 | `g_global_cfg` / `g_app_cfgs` | config_parser | `g_rules_lock`（rwlock） | 规则配置，读多写少，reload 时持写锁 |
-| `g_uid_maps` / `g_uid_map_count` | vfs_core | 同上 rwlock | uid→包名 映射（`uid.map` 加载，二分查询） |
-| `g_uid_cache[2048]` | vfs_core | per-slot mutex | uid→AppConfig 缓存，slot = `uid % 2048` |
+| `g_uid_maps` / `g_uid_map_count` | basic_rules | 同上 rwlock | uid→包名 映射（`uid.map` 加载，二分查询） |
+| `g_uid_cache[2048]` | basic_rules | seqlock（写者 wlock+seq 翻转，读者无锁） | uid→AppConfig 缓存，slot = `uid % 2048`，带配置代际校验（重载仅作废 cfg、保留 pkg） |
 | `g_global_fuse` / `g_media_fuse` | injector | 各自字段 | 全局/媒体 FUSE 实例状态（pid/mnt_path/disabled/crash_count） |
 
-并发要点：FUSE 回调多线程并发执行，读规则前必须 `config_lock_read()`，且**所有返回路径必须解锁**（`VFS_RETURN` 宏统一处理，切勿裸 `return`）。uid 缓存槽用 `uid % UID_CACHE_SIZE` 取模，未命中时回退到 `/proc/<tid>/status`+`cmdline` 解析。
+并发要点：FUSE 回调多线程并发执行，读规则前必须 `config_lock_read()`，且**所有返回路径必须解锁**（`VFS_RETURN` 宏统一处理，切勿裸 `return`）。uid 缓存槽用 `uid % UID_CACHE_SIZE` 取模，未命中时回退到 `/proc/<tid>/status`+`cmdline` 解析；seqlock 读侧零原子写，多线程并发读不产生缓存行颠簸。
 
 ## 8. 维护规范
 

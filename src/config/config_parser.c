@@ -15,9 +15,121 @@ AppConfig g_global_cfg;
 AppConfig** g_app_cfgs = nullptr;
 int g_app_cfg_count = 0;
 int g_app_cfg_capacity = 0;
+/* S1 COW 暂存区：load_config_rules 构建的新配置（发布后成为 live，
+   旧 live 延迟释放——无锁读者可能正读旧 trie/cfg） */
+static AppConfig g_global_cfg_stage;
+static AppConfig** g_app_cfgs_stage = nullptr;
+static int g_app_cfg_count_stage = 0;
+static int g_app_cfg_capacity_stage = 0;
 int g_active_users[MAX_USERS];
 int g_active_user_count = 0;
 static pthread_rwlock_t g_rules_lock;
+#include <sched.h>
+#include <stdatomic.h>
+
+/* ============ 配置代际 + 读者计数（S1 无锁快照，per-thread 计数） ============
+   热路径（br_resolve/br_probe）不再取 rwlock 读锁，改走 seqlock：
+   - g_cfg_gen：偶数 = 稳定代际；奇数 = 写者进行中（读者自旋等待）
+   - g_cfg_readers[i][slot]：per-thread 读者计数，按代际奇偶分槽
+     (slot = (gen>>1)&1)。每行 64B 缓存行对齐、每线程独占一行（首次调用
+     经 g_cfg_reader_next 原子分配槽位）——8+ 线程并发时读者各自 RMW
+     自己的缓存行，消除共享原子上的缓存行颠簸（原 g_cfg_readers[2] 在
+     多线程下是热路径竞争点）。
+   协议：
+     读者 config_read_begin()：循环读 gen（偶数）→ 本线程行槽自增 →
+     二次读 gen 相等即持槽成功（若写者插队则回滚重试）；持槽期间旧配置
+     不会被写者释放，可无锁读 trie/cfg。
+     读者 config_read_end(gen)：本线程行槽自减；返回 gen 是否未变（false =
+     读期间发生发布 → 调用方必须重试整个 resolve）。
+     写者 config_publish_begin()：返回旧 gen 并置奇数（封锁新读者）。
+     写者 config_publish_end(old_gen)：置偶数（放行）+ 扫描全部读者行
+     等旧槽归零（热重载极低频，O(读者行数) 可接受）。
+   注意：冷路径（log_ctl/config_publisher 查询）仍走 rwlock 读锁；
+   写者仍持 rwlock 写锁（互斥 + 冷读者保护），无锁协议只叠加于热路径。 */
+#define CFG_READER_MAX 64
+typedef struct {
+    _Atomic int cnt[2];      /* 按代际奇偶分槽 */
+    char _pad[56];           /* 补齐到 64B，每行独占缓存行（免假共享） */
+} CfgReaderCell;
+static _Alignas(64) CfgReaderCell g_cfg_readers[CFG_READER_MAX];
+static _Atomic(int) g_cfg_reader_next = 0;   /* 下一个可分配读者槽位 */
+static _Thread_local int g_cfg_reader_slot = -1;  /* 本线程读者槽（首次调用分配） */
+static _Atomic(uint64_t) g_cfg_gen = 0;
+
+/* 获取本线程读者槽：首次调用经 fetch_add 分配（热路径此后只读 TLS）。
+   槽位耗尽时共享最后一个槽（正确性不变，仅退化回有竞争——实际线程数
+   （FUSE 线程池 + 监控线程）远小于 CFG_READER_MAX） */
+static int cfg_reader_slot(void) {
+    int s = g_cfg_reader_slot;
+    if (s < 0) {
+        s = atomic_fetch_add_explicit(&g_cfg_reader_next, 1, memory_order_acq_rel);
+        if (s >= CFG_READER_MAX) s = CFG_READER_MAX - 1;
+        g_cfg_reader_slot = s;
+    }
+    return s;
+}
+
+uint64_t config_read_begin(void) {
+    int s = cfg_reader_slot();
+    for (;;) {
+        uint64_t g1 = atomic_load_explicit(&g_cfg_gen, memory_order_acquire);
+        if (g1 & 1) { sched_yield(); continue; }   /* 写者进行中 */
+        int slot = (int)((g1 >> 1) & 1);
+        atomic_fetch_add_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_acq_rel);
+        if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1)
+            return g1;                             /* 稳定快照，持槽 */
+        atomic_fetch_sub_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_release);
+    }
+}
+
+bool config_read_end(uint64_t gen) {
+    int slot = (int)((gen >> 1) & 1);
+    atomic_fetch_sub_explicit(&g_cfg_readers[cfg_reader_slot()].cnt[slot], 1, memory_order_release);
+    return atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == gen;
+}
+
+uint64_t config_publish_begin(void) {
+    uint64_t g = atomic_load_explicit(&g_cfg_gen, memory_order_relaxed);
+    atomic_store_explicit(&g_cfg_gen, g + 1, memory_order_release);
+    return g;
+}
+
+/* 等待旧代际读者归零（写者交换前调用）：gen 已置奇数封锁新读者，
+   旧代际读者读完自动归零；归零后无读者在途，方可安全执行非原子交换。
+   新读者进新槽（(new_gen>>1)&1 ≠ old_slot）不阻塞写者——无饥饿。 */
+void config_drain_readers(uint64_t old_gen) {
+    int old_slot = (int)((old_gen >> 1) & 1);
+    for (;;) {
+        bool busy = false;
+        for (int i = 0; i < CFG_READER_MAX; i++) {
+            if (atomic_load_explicit(&g_cfg_readers[i].cnt[old_slot], memory_order_acquire) != 0) {
+                busy = true;
+                break;
+            }
+        }
+        if (!busy) break;
+        sched_yield();
+    }
+}
+
+void config_publish_end(uint64_t old_gen) {
+    atomic_store_explicit(&g_cfg_gen, old_gen + 2, memory_order_release);
+    int old_slot = (int)((old_gen >> 1) & 1);
+    /* 扫描全部读者行等旧代际槽归零（无条件扫 MAX 行，规避槽位分配
+       可见性竞态；热重载极低频，64×acquire load 开销可忽略）。
+       新读者进新槽（(new_gen>>1)&1 ≠ old_slot）不阻塞写者——无饥饿。 */
+    for (;;) {
+        bool busy = false;
+        for (int i = 0; i < CFG_READER_MAX; i++) {
+            if (atomic_load_explicit(&g_cfg_readers[i].cnt[old_slot], memory_order_acquire) != 0) {
+                busy = true;
+                break;
+            }
+        }
+        if (!busy) break;
+        sched_yield();
+    }
+}
 static bool is_wildcard_string(const char *str) {
     /* `?` 作为首字符是项目自定义的"相对当前 user 存储"前缀，非 fnmatch 通配；
        仅从第二字符起检测真正的通配符 * ? [ ]，避免 ALLOW/REDIRECT 的 ? 前缀路径被误判跳过 trie */
@@ -85,18 +197,39 @@ static void free_app_config_rules(AppConfig* cfg) {
     cfg->var_count = 0;
     cfg->var_capacity = 0;
 }
-static void free_config_rules() {
-    free_app_config_rules(&g_global_cfg);
-    if (g_app_cfgs) {
-        for (int i = 0; i < g_app_cfg_count; i++) {
-            free_app_config_rules(g_app_cfgs[i]);
-            free(g_app_cfgs[i]);
+/* COW 发布：把暂存区构建的新配置整体换入 live（g_global_cfg/g_app_cfgs），
+   旧配置在旧代际读者归零后延迟释放。调用方须持 config_lock_write。 */
+static void config_publish(void) {
+    uint64_t old_gen = config_publish_begin();
+    /* P1 修复：封锁新读者后先排空旧代际读者，再做非原子交换——
+       否则读者可能观察到半换入的指针/count 配对（新数组+旧 count 越界读，
+       或新 trie+旧规则的错误决策窗口）。config_publish_end 的排空仅用于
+       延迟释放判定，无法撤销已发生的撕裂读 */
+    config_drain_readers(old_gen);
+    /* 快照旧 live（浅拷贝结构体，指针指向待释放内存） */
+    AppConfig old_global = g_global_cfg;
+    AppConfig** old_apps = g_app_cfgs;
+    int old_count = g_app_cfg_count;
+    /* 换入新配置 */
+    g_global_cfg = g_global_cfg_stage;
+    g_app_cfgs = g_app_cfgs_stage;
+    g_app_cfg_count = g_app_cfg_count_stage;
+    g_app_cfg_capacity = g_app_cfg_capacity_stage;
+    /* 重置暂存区（指针已移交 live，不得再触碰） */
+    memset(&g_global_cfg_stage, 0, sizeof(AppConfig));
+    g_app_cfgs_stage = nullptr;
+    g_app_cfg_count_stage = 0;
+    g_app_cfg_capacity_stage = 0;
+    config_publish_end(old_gen);
+    /* 旧代际读者已归零：释放旧配置 */
+    free_app_config_rules(&old_global);
+    if (old_apps) {
+        for (int i = 0; i < old_count; i++) {
+            free_app_config_rules(old_apps[i]);
+            free(old_apps[i]);
         }
-        free(g_app_cfgs);
-        g_app_cfgs = nullptr;
+        free(old_apps);
     }
-    g_app_cfg_count = 0;
-    g_app_cfg_capacity = 0;
 }
 char* clean_path_string(char* str) {
     if (!str) return nullptr;
@@ -247,6 +380,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             cur->hide_count++;
             if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, true, false);
+            } else {
+                cur->dyn_hide = true;   /* 通配/变量规则未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "RO") == 0) {
@@ -274,6 +409,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             cur->ro_count++;
             if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, false, true);
+            } else {
+                cur->dyn_ro = true;     /* 通配/变量规则未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "ALLOW") == 0) {
@@ -289,14 +426,12 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                     virtual_prefix[MAX_PATH_LEN - 1] = '\0';
                 }
             }
-            strip_trailing_slash(virtual_prefix);
-            if (is_wildcard_string(virtual_prefix)) {
-                LOG_WRN("ALLOW 不支持通配符，规则已忽略；如需放行该目录请去掉 '*' (行 %d, 文件 %s): %s", line_num, file_path, val);
-                return;
-            }
+            /* 通配规则（含 * ? [ ]）不 strip 尾斜杠：尾斜杠是通配模式的组成部分
+               （如 /Download/*.mp3/ 与 /Download/*.mp3 语义不同），与 HIDE/RO 一致 */
+            if (strpbrk(virtual_prefix, "*?[]") == nullptr) strip_trailing_slash(virtual_prefix);
             char real_target[MAX_PATH_LEN];
             snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
-            strip_trailing_slash(real_target);
+            if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
             if (cur->redir_count >= cur->redir_capacity) {
                 int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
                 RedirectRule *new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
@@ -315,6 +450,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             r->is_allow = true;
             if (!is_wildcard_string(virtual_prefix) && !has_path_var(virtual_prefix)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
+            } else {
+                cur->dyn_redir = true;  /* 通配/变量 redir 未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "REDIRECT") == 0) {
@@ -331,7 +468,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                     virtual_prefix[MAX_PATH_LEN - 1] = '\0';
                 }
             }
-            strip_trailing_slash(virtual_prefix);
+            /* 通配规则（含 * ? [ ]）不 strip 尾斜杠（尾斜杠是模式组成部分） */
+            if (strpbrk(virtual_prefix, "*?[]") == nullptr) strip_trailing_slash(virtual_prefix);
             char real_target[MAX_PATH_LEN];
             if (has_path_var(v2)) {
                 /* 含变量：原样存入，路径分类延迟到运行时 build_real_base_from_target */
@@ -351,7 +489,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             else {
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
             }
-            strip_trailing_slash(real_target);
+            if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
             if (cur->redir_count >= cur->redir_capacity) {
                 int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
                 RedirectRule *new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
@@ -370,6 +508,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             r->is_allow = false;
             if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) && !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
+            } else {
+                cur->dyn_redir = true;  /* 通配/变量 redir 未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "FTP") == 0) {
@@ -399,6 +539,11 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         fr->virtual_prefix[sizeof fr->virtual_prefix - 1] = '\0';
         strncpy(fr->backend_name, v2, sizeof fr->backend_name - 1);
         fr->backend_name[sizeof fr->backend_name - 1] = '\0';
+        /* 同时入 trie：resolve 热路径经 trie 下降一次取得 FTP 命中
+           （替代 config_ftp_match 每请求 O(N) 线性扫描）；
+           FTP 前缀为静态字面段（无通配/变量），与线性匹配语义一致 */
+        if (cur->trie_root)
+            trie_insert_ftp(cur->trie_root, virtual_prefix, v2);
     } else {
         LOG_WRN("不支持的规则 \"%s\" (行 %d, 文件 %s)", tok, line_num, file_path);
     }
@@ -425,27 +570,28 @@ bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_
     return best != NULL;
 }
 static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
-    if (strcmp(pkg, "GLOBAL") == 0) return &g_global_cfg;
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        if (g_app_cfgs[i]->user_id == user_id && strcmp(g_app_cfgs[i]->pkg_name, pkg) == 0) 
-            return g_app_cfgs[i];
+    /* S1：构建进暂存区（live 由 config_publish 一次性换入） */
+    if (strcmp(pkg, "GLOBAL") == 0) return &g_global_cfg_stage;
+    for (int i = 0; i < g_app_cfg_count_stage; i++) {
+        if (g_app_cfgs_stage[i]->user_id == user_id && strcmp(g_app_cfgs_stage[i]->pkg_name, pkg) == 0) 
+            return g_app_cfgs_stage[i];
     }
-    if (g_app_cfg_count >= g_app_cfg_capacity) {
-        int new_cap = g_app_cfg_capacity == 0 ? 8 : g_app_cfg_capacity * 2;
-        AppConfig **new_cfgs = realloc(g_app_cfgs, new_cap * sizeof(AppConfig*));
+    if (g_app_cfg_count_stage >= g_app_cfg_capacity_stage) {
+        int new_cap = g_app_cfg_capacity_stage == 0 ? 8 : g_app_cfg_capacity_stage * 2;
+        AppConfig **new_cfgs = realloc(g_app_cfgs_stage, new_cap * sizeof(AppConfig*));
         if (!new_cfgs) {
             LOG_ERR("realloc g_app_cfgs 失败，跳过应用 %s", pkg);
             return nullptr;
         }
-        g_app_cfgs = new_cfgs;
-        g_app_cfg_capacity = new_cap;
+        g_app_cfgs_stage = new_cfgs;
+        g_app_cfg_capacity_stage = new_cap;
     }
-    g_app_cfgs[g_app_cfg_count] = calloc(1, sizeof(AppConfig));
-    strncpy(g_app_cfgs[g_app_cfg_count]->pkg_name, pkg, 127);
-    g_app_cfgs[g_app_cfg_count]->user_id = user_id;
-    g_app_cfgs[g_app_cfg_count]->inject_enable = false; 
-    g_app_cfgs[g_app_cfg_count]->trie_root = trie_create_node(NULL); 
-    return g_app_cfgs[g_app_cfg_count++];
+    g_app_cfgs_stage[g_app_cfg_count_stage] = calloc(1, sizeof(AppConfig));
+    strncpy(g_app_cfgs_stage[g_app_cfg_count_stage]->pkg_name, pkg, 127);
+    g_app_cfgs_stage[g_app_cfg_count_stage]->user_id = user_id;
+    g_app_cfgs_stage[g_app_cfg_count_stage]->inject_enable = false; 
+    g_app_cfgs_stage[g_app_cfg_count_stage]->trie_root = trie_create_node(NULL); 
+    return g_app_cfgs_stage[g_app_cfg_count_stage++];
 }
 void scan_active_users() {
     g_active_user_count = 0;
@@ -497,10 +643,13 @@ void scan_active_users() {
         LOG_DBG("  活跃用户[%d]: uid=%d", i, g_active_users[i]);
 }
 void load_config_rules(const char* path) {
-    free_config_rules();
-    memset(&g_global_cfg, 0, sizeof(AppConfig)); 
-    g_global_cfg.trie_root = trie_create_node(NULL);
-    g_global_cfg.skip_system_apps = true; /* 默认跳过系统应用 */
+    /* S1 COW：构建进暂存区，末尾 config_publish 整体换入 live 并延迟释放旧配置 */
+    memset(&g_global_cfg_stage, 0, sizeof(AppConfig)); 
+    g_global_cfg_stage.trie_root = trie_create_node(NULL);
+    g_global_cfg_stage.skip_system_apps = true; /* 默认跳过系统应用 */
+    g_app_cfgs_stage = nullptr;
+    g_app_cfg_count_stage = 0;
+    g_app_cfg_capacity_stage = 0;
     scan_active_users();
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
@@ -514,7 +663,7 @@ void load_config_rules(const char* path) {
     }
     FILE* fp = fopen(path, "r");
     if (fp) {
-        AppConfig* cur = &g_global_cfg; char line[2048];
+        AppConfig* cur = &g_global_cfg_stage; char line[2048];
         int current_user_id = -1;
         int line_num = 0;
         while (fgets(line, sizeof(line), fp)) {
@@ -539,7 +688,7 @@ void load_config_rules(const char* path) {
                     }
                     strncpy(pkg, sec, sizeof(pkg)-1);
                     if (strcmp(pkg, "GLOBAL") == 0) {
-                        cur = &g_global_cfg;
+                        cur = &g_global_cfg_stage;
                     } else {
                         cur = get_or_create_app_cfg(pkg, current_user_id);
                         if (cur) cur->inject_enable = enabled;
@@ -601,7 +750,7 @@ void load_config_rules(const char* path) {
                                         char* colon = strchr(sec, ':');
                                         if (colon) { *colon = '\0'; sub_uid = atoi(colon + 1); }
                                         strncpy(sub_pkg, sec, sizeof(sub_pkg)-1);
-                                        if (strcmp(sub_pkg, "GLOBAL") == 0) cur = &g_global_cfg;
+                                        if (strcmp(sub_pkg, "GLOBAL") == 0) cur = &g_global_cfg_stage;
                                         else { cur = get_or_create_app_cfg(sub_pkg, sub_uid); if (cur) cur->inject_enable = enabled; }
                                     }
                                     continue;
@@ -639,48 +788,58 @@ void load_config_rules(const char* path) {
             closedir(dir);
         }
     }
-    qsort(g_global_cfg.redir_rules, g_global_cfg.redir_count, sizeof(RedirectRule), cmp_redir);
-    qsort(g_global_cfg.hide_rules, g_global_cfg.hide_count, sizeof(char*), cmp_hide);
-    qsort(g_global_cfg.ro_rules, g_global_cfg.ro_count, sizeof(char*), cmp_hide);
-    for(int i = 0; i < g_app_cfg_count; i++) {
-        qsort(g_app_cfgs[i]->redir_rules, g_app_cfgs[i]->redir_count, sizeof(RedirectRule), cmp_redir);
-        qsort(g_app_cfgs[i]->hide_rules, g_app_cfgs[i]->hide_count, sizeof(char*), cmp_hide);
-        qsort(g_app_cfgs[i]->ro_rules, g_app_cfgs[i]->ro_count, sizeof(char*), cmp_hide);
+    qsort(g_global_cfg_stage.redir_rules, g_global_cfg_stage.redir_count, sizeof(RedirectRule), cmp_redir);
+    qsort(g_global_cfg_stage.hide_rules, g_global_cfg_stage.hide_count, sizeof(char*), cmp_hide);
+    qsort(g_global_cfg_stage.ro_rules, g_global_cfg_stage.ro_count, sizeof(char*), cmp_hide);
+    for(int i = 0; i < g_app_cfg_count_stage; i++) {
+        qsort(g_app_cfgs_stage[i]->redir_rules, g_app_cfgs_stage[i]->redir_count, sizeof(RedirectRule), cmp_redir);
+        qsort(g_app_cfgs_stage[i]->hide_rules, g_app_cfgs_stage[i]->hide_count, sizeof(char*), cmp_hide);
+        qsort(g_app_cfgs_stage[i]->ro_rules, g_app_cfgs_stage[i]->ro_count, sizeof(char*), cmp_hide);
     }
-    analyze_var_staticness(&g_global_cfg, NULL);
-    for (int i = 0; i < g_app_cfg_count; i++) {
-        analyze_var_staticness(g_app_cfgs[i], &g_global_cfg);
+    analyze_var_staticness(&g_global_cfg_stage, NULL);
+    for (int i = 0; i < g_app_cfg_count_stage; i++) {
+        analyze_var_staticness(g_app_cfgs_stage[i], &g_global_cfg_stage);
     }
+    /* S1 COW 发布：暂存区 → live，旧配置延迟释放 */
+    config_publish();
 }
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
-    AppConfig old_global_cfg;
-    memcpy(&old_global_cfg, &g_global_cfg, sizeof(AppConfig));
-    AppConfig** old_app_cfgs = g_app_cfgs;
-    int old_app_cfg_count = g_app_cfg_count;
-    memset(&g_global_cfg, 0, sizeof(AppConfig));
-    g_global_cfg.trie_root = trie_create_node(NULL);
-    g_global_cfg.skip_system_apps = true; /* 默认跳过系统应用 */
-    g_app_cfgs = nullptr;
-    g_app_cfg_count = 0;
-    g_app_cfg_capacity = 0;
+    /* S1：load_config_rules 内部完成 COW 发布（旧配置在发布后即被释放），
+       diff 所需旧字段须在加载前快照（旧 AppConfig 指针发布后悬垂） */
+    bool old_global_inject = g_global_cfg.global_inject;
+    typedef struct { char pkg[128]; int user_id; bool inject_enable; } OldAppSnap;
+    int old_count = g_app_cfg_count;
+    OldAppSnap* old_snap = old_count > 0 ? calloc((size_t)old_count, sizeof(OldAppSnap)) : NULL;
+    if (old_snap) {
+        for (int i = 0; i < old_count; i++) {
+            if (!g_app_cfgs[i]) continue;
+            strncpy(old_snap[i].pkg, g_app_cfgs[i]->pkg_name, 127);
+            old_snap[i].pkg[127] = '\0';
+            old_snap[i].user_id = g_app_cfgs[i]->user_id;
+            old_snap[i].inject_enable = g_app_cfgs[i]->inject_enable;
+        }
+    }
+    /* COW 发布：换入新配置并释放旧配置（含旧 g_app_cfgs 数组） */
     load_config_rules(path);
     // 遵循设计：injector不处理单个挂载树内的文件规则变化，仅处理全局挂载ON/OFF与应用开关
-    bool global_changed = (old_global_cfg.global_inject != g_global_cfg.global_inject);
+    bool global_changed = (old_global_inject != g_global_cfg.global_inject);
     int changed_count = 0;
     if (global_changed) {
         changed_count = -1;
     } else {
         for (int i = 0; i < g_app_cfg_count; i++) {
             AppConfig* new_cfg = g_app_cfgs[i];
-            AppConfig* old_cfg = nullptr;
-            for (int j = 0; j < old_app_cfg_count; j++) {
-                if (old_app_cfgs[j] && old_app_cfgs[j]->user_id == new_cfg->user_id && 
-                    strcmp(old_app_cfgs[j]->pkg_name, new_cfg->pkg_name) == 0) {
-                    old_cfg = old_app_cfgs[j];
+            bool found = false;
+            bool old_inject = false;
+            for (int j = 0; j < old_count; j++) {
+                if (old_snap && old_snap[j].user_id == new_cfg->user_id &&
+                    strcmp(old_snap[j].pkg, new_cfg->pkg_name) == 0) {
+                    found = true;
+                    old_inject = old_snap[j].inject_enable;
                     break;
                 }
             }
-            if (!old_cfg || old_cfg->inject_enable != new_cfg->inject_enable) {
+            if (!found || old_inject != new_cfg->inject_enable) {
                 if (changed_count < max_changed) {
                     strncpy(out_changed[changed_count].pkg_name, new_cfg->pkg_name, 127);
                     out_changed[changed_count].pkg_name[127] = '\0';
@@ -689,37 +848,27 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
                 }
             }
         }
-        for (int j = 0; j < old_app_cfg_count; j++) {
-            AppConfig* old_cfg = old_app_cfgs[j];
-            if (!old_cfg) continue;
+        for (int j = 0; j < old_count; j++) {
+            if (!old_snap) continue;
             bool found = false;
             for (int i = 0; i < g_app_cfg_count; i++) {
-                if (g_app_cfgs[i]->user_id == old_cfg->user_id && 
-                    strcmp(g_app_cfgs[i]->pkg_name, old_cfg->pkg_name) == 0) {
+                if (g_app_cfgs[i]->user_id == old_snap[j].user_id &&
+                    strcmp(g_app_cfgs[i]->pkg_name, old_snap[j].pkg) == 0) {
                     found = true;
                     break;
                 }
             }
             if (!found) {
                 if (changed_count < max_changed) {
-                    strncpy(out_changed[changed_count].pkg_name, old_cfg->pkg_name, 127);
+                    strncpy(out_changed[changed_count].pkg_name, old_snap[j].pkg, 127);
                     out_changed[changed_count].pkg_name[127] = '\0';
-                    out_changed[changed_count].user_id = old_cfg->user_id;
+                    out_changed[changed_count].user_id = old_snap[j].user_id;
                     changed_count++;
                 }
             }
         }
     }
-    if (old_app_cfgs) {
-        for (int i = 0; i < old_app_cfg_count; i++) {
-            if (old_app_cfgs[i]) {
-                free_app_config_rules(old_app_cfgs[i]);
-                free(old_app_cfgs[i]);
-            }
-        }
-        free(old_app_cfgs);
-    }
-    free_app_config_rules(&old_global_cfg);
+    free(old_snap);
     return changed_count;
 }
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id) {

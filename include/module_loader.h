@@ -35,6 +35,14 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out);
    无模块时返回 NSP_DISPATCH_NONE）。 */
 int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out);
 
+/* readdir 批量过滤：循环外取一次模块读锁（module_probe_lock），循环内复用
+   locked 版本逐条目探测，结束时 unlock——大目录省 O(n) 次 rwlock 往返。
+   module_probe_lock 返回 0 成功（调用方须配对 unlock）；-1 = 无规则模块，
+   调用方可跳过探测（不须 unlock）。 */
+int module_probe_lock(void);
+void module_probe_unlock(void);
+int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out);
+
 /* readdir 虚拟目录补充：遍历声明 READDIR_EXTRA 的模块合并条目，返回总条目数 */
 int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max);
@@ -59,8 +67,22 @@ bool module_backend_active(void);
    完成文件操作（模块只提供方法，执行仍由框架 FUSE 回调驱动）。 */
 int module_backend_lookup(const char* path, const NspModuleOps** ops_out);
 
-/* 释放后端 ops 在途引用（与 module_backend_lookup 配对；调用方在
-   backend_* 方法完成后调用，防止热卸载 dlclose 造成函数指针悬垂） */
+/* 后端查找变体：额外输出命中模块的槽位索引（open/create 绑定 fh 用，
+   fh 高位编码槽位后，后续 read/write 经 module_backend_acquire_slot 免
+   路径解析/线性扫描/backend_match 前缀比较）。返回 0 且 *ops_out 有效
+   （调用方须在 backend_* 完成后 module_backend_put）。 */
+int module_backend_lookup_slot(const char* path, int* slot_out, const NspModuleOps** ops_out);
+
+/* 释放后端 ops 在途引用（与 module_backend_lookup / module_backend_lookup_slot
+   配对；调用方在 backend_* 方法完成后调用，防止热卸载 dlclose 造成函数指针悬垂） */
 void module_backend_put(const NspModuleOps* ops);
+
+/* 槽位快速分派（open 绑定槽位后 read/write/flush/release/fsync 热路径用）：
+   无锁读原子槽位快照 + 在途引用，等价 module_backend_lookup 的引用语义但
+   免路径解析与线性扫描。返回 0 且 *ops_out 有效（配对 module_backend_release_slot），
+   -1 = 槽位无效 / 模块已卸载。热卸载安全性：unload 先原子置空槽位快照再等待
+   引用归零，acquire 二次确认快照未变，保证不会在 dlclose 后调用函数指针。 */
+int module_backend_acquire_slot(int slot, const NspModuleOps** ops_out);
+void module_backend_release_slot(int slot);
 
 #endif /* MODULE_LOADER_H */

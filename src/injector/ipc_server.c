@@ -69,7 +69,7 @@ static void* ipc_restore_thread(void* raw) {
     int attempts = 0;
     /* IPC 通知时间非常早（应用 fork 后视图尚未就绪）：跳过(ret=1)表示
        当前顶层还不是项目 FUSE，需等待共享传播完成。整个还原周期（含重试）
-       总预算 100ms，超预算仍跳过即判定为异常（传播未生效） */
+       总预算 300ms，超预算仍跳过即判定为异常（传播未生效） */
     struct timespec t0, tn;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     /* 整个挂载周期（含重试）的日志打包发送：begin 后 sender 累积日志，
@@ -87,8 +87,8 @@ static void* ipc_restore_thread(void* raw) {
         clock_gettime(CLOCK_MONOTONIC, &tn);
         long elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000 +
                           (tn.tv_nsec - t0.tv_nsec) / 1000000;
-        if (elapsed_ms >= 100) break;   /* 总预算 100ms 耗尽 */
-        usleep(10000);   /* 10ms 间隔，配合 100ms 总预算 */
+        if (elapsed_ms >= 300) break;   /* 总预算 300ms 耗尽 */
+        usleep(10000);   /* 10ms 间隔，配合 300ms 总预算 */
     }
     log_batch_end();
     /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用 */

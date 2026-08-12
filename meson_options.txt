@@ -3,5 +3,6 @@ option('enable_debug', type: 'boolean', value: false, description: 'Enable debug
 option('with_asan', type: 'boolean', value: false, description: 'Enable AddressSanitizer')
 option('with_ubsan', type: 'boolean', value: false, description: 'Enable UndefinedBehaviorSanitizer')
 option('fuse3_root', type: 'string', value: '/data/user/0/com.termux/files/home/build-install', description: 'Path to fuse3 static lib + headers root (android only)')
+option('curl_dir', type: 'string', value: '/home/bdy/curl-8.21.0', description: 'Path to prebuilt libcurl root (android only, 含 lib/.libs/libcurl.a 与 include/)')
 option('target_os', type: 'combo', choices: ['android', 'gnu'], value: 'android',
        description: 'Target OS: android=Android NDK with passthrough, gnu=GNU/Linux with mainline libfuse3')

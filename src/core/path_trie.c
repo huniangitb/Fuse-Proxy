@@ -2,11 +2,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+
+/* 字典序比较两个路径段（seg 可能非 '\0' 结尾；node->segment 恒 '\0' 结尾）：
+   先比较共同前缀字节，前缀相同则短段在前（与 strcmp 的字典序语义一致） */
+static int seg_cmp(const char* a, size_t alen, const char* b, size_t blen) {
+    size_t m = alen < blen ? alen : blen;
+    int c = memcmp(a, b, m);
+    if (c != 0) return c;
+    return (alen < blen) ? -1 : (alen > blen) ? 1 : 0;
+}
+
+/* children 按 segment 字典序有序（trie_insert 维护），二分查找段：O(log n)
+   替代原线性扫描 + 每段 strlen，规则量越大收益越明显 */
+static const TrieNode* find_child_bin(const TrieNode* node, const char* seg, size_t seg_len) {
+    if (!node || !seg) return NULL;
+    int lo = 0, hi = node->child_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const TrieNode* c = node->children[mid];
+        int cmp = seg_cmp(seg, seg_len, c->segment, c->seg_len);
+        if (cmp < 0) hi = mid;
+        else if (cmp > 0) lo = mid + 1;
+        else return c;
+    }
+    return NULL;
+}
 
 TrieNode* trie_create_node(const char* segment) {
     TrieNode* node = calloc(1, sizeof(TrieNode));
     if (node && segment) {
         node->segment = strdup(segment);
+        node->seg_len = (uint16_t)strlen(segment);
     }
     return node;
 }
@@ -19,15 +46,18 @@ void trie_free(TrieNode* node) {
     free(node->children);
     free(node->segment);
     free(node->redir_target);
+    free(node->ftp_backend);
     free(node);
 }
 
 /* 与 trie_lookup 相同的下降与累积语义，额外返回完整匹配到路径末尾的最深节点。
    某段缺失（!child 或 seg_len==0）时返回 NULL，但 out_hidden/out_ro/out_redir
-   仍输出已匹配前缀的累积结果（与 trie_lookup 中途 break 语义一致）。 */
+   仍输出已匹配前缀的累积结果（与 trie_lookup 中途 break 语义一致）。
+   out_ftp 输出下降过程中最深带 ftp_backend 节点的段名（FTP 最长前缀优先）。 */
 const TrieNode* trie_lookup_full(const TrieNode* root, const char* path,
                                  bool* out_hidden, bool* out_ro,
-                                 char* out_redir, size_t max_len) {
+                                 char* out_redir, size_t max_len,
+                                 char* out_ftp, size_t ftp_max_len) {
     if (!root || !path) return NULL;
     const TrieNode* curr = root;
     const char* p = path;
@@ -36,20 +66,13 @@ const TrieNode* trie_lookup_full(const TrieNode* root, const char* path,
     bool ro = root->is_ro;
     const char* redir_base = root->redir_target;
     const char* redir_suffix = p;
+    const char* ftp_bk = root->ftp_backend;
     bool full = true;
     while (p && *p) {
         const char* next = strchr(p, '/');
         size_t seg_len = next ? (size_t)(next - p) : strlen(p);
         if (seg_len == 0) { full = false; break; }
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
+        const TrieNode* child = find_child_bin(curr, p, seg_len);
         if (!child) { full = false; break; }
         curr = child;
         if (curr->is_hidden) hidden = true;
@@ -58,11 +81,16 @@ const TrieNode* trie_lookup_full(const TrieNode* root, const char* path,
             redir_base = curr->redir_target;
             redir_suffix = next ? next : "";
         }
+        if (curr->ftp_backend) ftp_bk = curr->ftp_backend;
         p = next;
         while (p && *p == '/') p++;
     }
     if (out_hidden) *out_hidden = hidden;
     if (out_ro)     *out_ro = ro;
+    if (out_ftp && ftp_max_len > 0 && ftp_bk) {
+        strncpy(out_ftp, ftp_bk, ftp_max_len - 1);
+        out_ftp[ftp_max_len - 1] = '\0';
+    }
     if (redir_base && out_redir && max_len > 0) {
         size_t blen = strlen(redir_base);
         size_t slen = strlen(redir_suffix);
@@ -86,15 +114,19 @@ void trie_insert(TrieNode* root, const char* path, const char* redir_target, boo
         size_t seg_len = next ? (size_t)(next - p) : strlen(p);
         if (seg_len == 0) break;
         TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
+        /* 二分定位插入位置（保持 children 字典序，查找方可二分）；
+           段已存在则复用节点（后续仅叠加标志） */
+        int lo = 0, hi = curr->child_count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            TrieNode* c = curr->children[mid];
+            if (seg_cmp(p, seg_len, c->segment, c->seg_len) > 0) lo = mid + 1;
+            else hi = mid;
         }
-        if (!child) {
+        if (lo < curr->child_count && curr->children[lo] &&
+            seg_cmp(p, seg_len, curr->children[lo]->segment, curr->children[lo]->seg_len) == 0) {
+            child = curr->children[lo];
+        } else {
             child = trie_create_node(NULL);
             if (!child) return;
             child->segment = malloc(seg_len + 1);
@@ -104,6 +136,7 @@ void trie_insert(TrieNode* root, const char* path, const char* redir_target, boo
             }
             memcpy(child->segment, p, seg_len);
             child->segment[seg_len] = '\0';
+            child->seg_len = (uint16_t)seg_len;
             TrieNode** new_children = realloc(curr->children, sizeof(TrieNode*) * (curr->child_count + 1));
             if (!new_children) {
                 free(child->segment);
@@ -111,7 +144,10 @@ void trie_insert(TrieNode* root, const char* path, const char* redir_target, boo
                 return;
             }
             curr->children = new_children;
-            curr->children[curr->child_count++] = child;
+            memmove(&curr->children[lo + 1], &curr->children[lo],
+                    sizeof(TrieNode*) * (size_t)(curr->child_count - lo));
+            curr->children[lo] = child;
+            curr->child_count++;
         }
         curr = child;
         p = next;
@@ -123,6 +159,60 @@ void trie_insert(TrieNode* root, const char* path, const char* redir_target, boo
         free(curr->redir_target);
         curr->redir_target = strdup(redir_target);
     }
+}
+
+/* FTP 虚拟前缀插入：沿 prefix 逐段下降（缺段则创建），终点节点记录后端段名。
+   最长前缀优先由 trie_lookup_full 下降过程中取最深 ftp_backend 保证；
+   prefix 为 "/" 或空时设置在根节点（兜底任意路径命中）。 */
+void trie_insert_ftp(TrieNode* root, const char* prefix, const char* backend) {
+    if (!root || !prefix || !backend || !backend[0]) return;
+    TrieNode* curr = root;
+    const char* p = prefix;
+    while (*p == '/') p++;
+    while (p && *p) {
+        const char* next = strchr(p, '/');
+        size_t seg_len = next ? (size_t)(next - p) : strlen(p);
+        if (seg_len == 0) break;
+        TrieNode* child = NULL;
+        int lo = 0, hi = curr->child_count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            TrieNode* c = curr->children[mid];
+            if (seg_cmp(p, seg_len, c->segment, c->seg_len) > 0) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < curr->child_count && curr->children[lo] &&
+            seg_cmp(p, seg_len, curr->children[lo]->segment, curr->children[lo]->seg_len) == 0) {
+            child = curr->children[lo];
+        } else {
+            child = trie_create_node(NULL);
+            if (!child) return;
+            child->segment = malloc(seg_len + 1);
+            if (!child->segment) {
+                free(child);
+                return;
+            }
+            memcpy(child->segment, p, seg_len);
+            child->segment[seg_len] = '\0';
+            child->seg_len = (uint16_t)seg_len;
+            TrieNode** new_children = realloc(curr->children, sizeof(TrieNode*) * (curr->child_count + 1));
+            if (!new_children) {
+                free(child->segment);
+                free(child);
+                return;
+            }
+            curr->children = new_children;
+            memmove(&curr->children[lo + 1], &curr->children[lo],
+                    sizeof(TrieNode*) * (size_t)(curr->child_count - lo));
+            curr->children[lo] = child;
+            curr->child_count++;
+        }
+        curr = child;
+        p = next;
+        while (p && *p == '/') p++;
+    }
+    free(curr->ftp_backend);
+    curr->ftp_backend = strdup(backend);
 }
 
 bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool* out_ro, char* out_redir, size_t max_len) {
@@ -138,15 +228,7 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
         const char* next = strchr(p, '/');
         size_t seg_len = next ? (size_t)(next - p) : strlen(p);
         if (seg_len == 0) break;
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
+        const TrieNode* child = find_child_bin(curr, p, seg_len);
         if (!child) break;
         curr = child;
         if (curr->is_hidden) hidden = true;
@@ -181,15 +263,7 @@ bool trie_is_redirect_target(const TrieNode* root, const char* path) {
         const char* next = strchr(p, '/');
         size_t seg_len = next ? (size_t)(next - p) : strlen(p);
         if (seg_len == 0) break;
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
+        const TrieNode* child = find_child_bin(curr, p, seg_len);
         if (!child) return false;
         curr = child;
         p = next;
@@ -198,27 +272,19 @@ bool trie_is_redirect_target(const TrieNode* root, const char* path) {
     return (curr->redir_target != NULL);
 }
 
-/* 节点子树（含自身）是否存在规则（hidden/ro/redir）——header 已声明为公开接口 */
+/* 节点子树（含自身）是否存在规则（hidden/ro/redir/ftp）——header 已声明为公开接口 */
 bool trie_node_has_rules(const TrieNode* node) {
     if (!node) return false;
-    if (node->is_hidden || node->is_ro || node->redir_target) return true;
+    if (node->is_hidden || node->is_ro || node->redir_target || node->ftp_backend) return true;
     for (int i = 0; i < node->child_count; i++) {
         if (trie_node_has_rules(node->children[i])) return true;
     }
     return false;
 }
 
-/* 在 node 的直接子节点中查找 segment 匹配的节点（线性扫描，与 trie_lookup 内联一致） */
+/* 在 node 的直接子节点中查找 segment 匹配的节点（children 有序，二分查找） */
 const TrieNode* trie_find_child(const TrieNode* node, const char* seg, size_t seg_len) {
-    if (!node || !seg) return NULL;
-    for (int i = 0; i < node->child_count; i++) {
-        const TrieNode* c = node->children[i];
-        if (c && c->segment && strlen(c->segment) == seg_len &&
-            strncmp(c->segment, seg, seg_len) == 0) {
-            return c;
-        }
-    }
-    return NULL;
+    return find_child_bin(node, seg, seg_len);
 }
 
 /* 严格下降：path 每段都存在才返回最深节点；否则 NULL。
@@ -273,15 +339,7 @@ bool trie_is_ancestor(const TrieNode* root, const char* path) {
         const char* next = strchr(p, '/');
         size_t seg_len = next ? (size_t)(next - p) : strlen(p);
         if (seg_len == 0) break;
-        const TrieNode* child = NULL;
-        for (int i = 0; i < curr->child_count; i++) {
-            if (curr->children[i] && curr->children[i]->segment &&
-                strlen(curr->children[i]->segment) == seg_len &&
-                strncmp(curr->children[i]->segment, p, seg_len) == 0) {
-                child = curr->children[i];
-                break;
-            }
-        }
+        const TrieNode* child = find_child_bin(curr, p, seg_len);
         if (!child) return false;
         curr = child;
         p = next;

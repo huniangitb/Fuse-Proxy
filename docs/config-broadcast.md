@@ -501,7 +501,7 @@ allow <app_domain> nsp_config_broadcast_socket:sock_file { write read };
 | 文件 | 说明 |
 |------|------|
 | `include/config_publisher.h` | 广播服务 API 声明 |
-| `src/injector/config_publisher.c` | 核心实现（~687 行） |
+| `src/injector/config_publisher.c` | 核心实现（~543 行） |
 | `src/injector/injector.c` | 集成：初始化、epoll 处理、重载广播、清理 |
 | `src/log/log_ctl.c` | CLI 客户端：`get-config` / `get-config --static` / `stream-config` |
 | `include/common.h` | `CONFIG_BROADCAST_SOCKET` 常量 |

@@ -43,6 +43,8 @@ static char g_config_dir[PATH_MAX] = CONFIG_DIR;
 static char g_socket_name[64] = RULE_SOCKET_NAME;
 static volatile sig_atomic_t g_should_exit = 0;
 static bool g_foreground = false;   /* --foreground：前台运行（测试/调试用） */
+static struct timespec g_start_mono;  /* 启动时刻（CLOCK_MONOTONIC，运行时长基准） */
+static time_t g_start_wall = 0;       /* 启动时刻（墙钟，started_at 展示） */
 
 /* 日志开关：DEBUG 构建输出到 stderr（Android 由 logcat 捕获） */
 #ifdef DEBUG
@@ -1133,6 +1135,28 @@ static void handle_ping(int fd, json_object *req) {
     reply_ok(fd, "PING", data);
 }
 
+/* UPTIME：查询本守护进程运行时长（CLOCK_MONOTONIC 单调时钟，不受系统
+   改时间影响）。data：uptime_seconds（整数秒）、uptime（人类可读时长）、
+   started_at（启动墙钟时间戳，epoch 秒） */
+static void handle_uptime(int fd, json_object *req) {
+    (void)req;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long secs = (long long)(now.tv_sec - g_start_mono.tv_sec);
+    if (secs < 0) secs = 0;   /* 时钟异常兜底 */
+    json_object *data = json_object_new_object();
+    json_object_object_add(data, "uptime_seconds", json_object_new_int64(secs));
+    char human[64];
+    long long d = secs / 86400, h = (secs % 86400) / 3600,
+              m = (secs % 3600) / 60, s = secs % 60;
+    if (d > 0)      snprintf(human, sizeof human, "%lld天%lld小时%lld分%lld秒", d, h, m, s);
+    else if (h > 0) snprintf(human, sizeof human, "%lld小时%lld分%lld秒", h, m, s);
+    else            snprintf(human, sizeof human, "%lld分%lld秒", m, s);
+    json_object_object_add(data, "uptime", json_object_new_string(human));
+    json_object_object_add(data, "started_at", json_object_new_int64((int64_t)g_start_wall));
+    reply_ok(fd, "UPTIME", data);
+}
+
 static void handle_list(int fd, json_object *req) {
     (void)req;
     json_object *data = json_object_new_object();
@@ -2041,6 +2065,7 @@ static void dispatch(int fd, json_object *req) {
     /* 每次命令前刷新规则类型表：模块 .rules 增删即动态追加/回收类型（热更新） */
     rule_types_refresh();
     if (strcasecmp(cmd, "PING") == 0)             handle_ping(fd, req);
+    else if (strcasecmp(cmd, "UPTIME") == 0)      handle_uptime(fd, req);
     else if (strcasecmp(cmd, "LIST") == 0)        handle_list(fd, req);
     else if (strcasecmp(cmd, "USERS") == 0)       handle_users(fd, req);
     else if (strcasecmp(cmd, "GET") == 0)         handle_get(fd, req);
@@ -2113,6 +2138,10 @@ static void sig_handler(int sig) {
 }
 
 static int run_server(void) {
+    /* 记录启动时刻：UPTIME 查询基准（单调时钟，不受系统改时间影响） */
+    clock_gettime(CLOCK_MONOTONIC, &g_start_mono);
+    g_start_wall = time(NULL);
+
     struct sigaction sa = { .sa_handler = sig_handler };
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);

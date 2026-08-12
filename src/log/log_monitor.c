@@ -716,9 +716,22 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
            线程按帧协议收集——否则主循环逐行处理时每行返回 0，帧被丢弃 */
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->fd, nullptr);
         AsyncCtx *actx = calloc(1, sizeof(AsyncCtx));
+        if (!actx) {
+            /* OOM：无法移交 async 线程，丢弃该连接（帧数据不可恢复，
+               至少不崩溃、不泄漏 fd） */
+            close(ctx->fd);
+            ctx->fd = -1;
+            return 1;
+        }
         actx->fd = ctx->fd;
         set_block(actx->fd);
         actx->notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (actx->notify_fd < 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            free(actx);
+            return 1;
+        }
         actx->disconnected = false;
         /* pending：LOG_BATCH 头行 + 剩余字节（可能含帧内容/END/后续 LOG_* 行） */
         int plen = 0;
@@ -737,8 +750,20 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         actx->next = g_async_clients;
         g_async_clients = actx;
         struct epoll_event ev = { .events = EPOLLIN, .data.fd = actx->notify_fd };
-        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, actx->notify_fd, &ev);
-        pthread_create(&actx->tid, nullptr, async_log_thread, actx);
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, actx->notify_fd, &ev) != 0) {
+            /* notify_fd 注册失败：drain_async 永不触发，帧静默丢弃；
+               cleanup_async 从链表移除并关闭 fd/释放 actx */
+            ctx->fd = -1;   /* 防止主循环 close 已接管 fd */
+            cleanup_async(actx);
+            return 1;
+        }
+        if (pthread_create(&actx->tid, nullptr, async_log_thread, actx) != 0) {
+            /* 线程创建失败：actx 留在链表但无消费者，阻塞 fd 泄漏；
+               移除并清理 */
+            ctx->fd = -1;
+            cleanup_async(actx);
+            return 1;
+        }
         pthread_detach(actx->tid);
         ctx->fd = -1;
         return 1;
