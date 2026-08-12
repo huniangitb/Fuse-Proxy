@@ -710,9 +710,12 @@ static int do_combined_mount(void* raw_args) {
    // log_ns_error("[combined] Step E: mount(target->backup) target=%s backup=%s\n", target, backup);
     if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
+        /* 降级处理：backup 仅是保留原生子视图的优化步骤（Step J preserve 用），
+           其失败不应中止主挂载——尤其 ENOENT（目标应用命名空间里源/目标路径
+           不可见，特定设备/ROM 命名空间差异，见 do_global_mount 同场景注释）。
+           记录 WRN 后继续 Step H/I 主挂载 */
         log_ns_error("[ns_error] [%s] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)\n", pkg, target, backup, err, strerror(err));
-        log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount backup failed: mount(%s -> %s) errno=%d (%s)", pkg, target, backup, err, strerror(err));
-        return err;
+        log_internal(LOG_WARN, "[ns_error] [%s] Combined mount backup failed(降级): mount(%s -> %s) errno=%d (%s)", pkg, target, backup, err, strerror(err));
     }
   //  log_ns_error("[combined] Step F: umount2 sub-target mounts, count=%d\n", target_count);
     for (int i = target_count - 1; i >= 0; i--) {
@@ -760,6 +763,12 @@ static int do_combined_mount(void* raw_args) {
 }
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
                       char preserve_paths[][256], int preserve_count) {
+    /* 父进程命名空间先行 mkdir backup：确保目标目录在宿主存在——
+       子进程 do_combined_mount 的 mkdir 在目标应用命名空间执行，
+       若 /data/Namespace-Proxy 在该命名空间不可见会连带 mount 目标失败 */
+    if (backup && backup[0]) {
+        mkdir_recursive(backup);
+    }
     struct CombinedMountArgs args = { pkg, source, target, backup, preserve_paths, preserve_count };
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_combined_mount, &args, &child_err);

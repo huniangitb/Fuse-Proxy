@@ -145,6 +145,23 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "PING"})
     expect("PING", r.get("status") == "ok" and r["data"]["pong"] is True, r)
 
+    # ---- UPTIME：运行时长查询 ----
+    r = send_cmd(proc, sock_name, {"cmd": "UPTIME"})
+    ok_ut = (r.get("status") == "ok"
+             and isinstance(r["data"].get("uptime_seconds"), int)
+             and r["data"]["uptime_seconds"] >= 0
+             and isinstance(r["data"].get("uptime"), str)
+             and r["data"]["uptime"]
+             and isinstance(r["data"].get("started_at"), int)
+             and r["data"]["started_at"] > 0
+             and abs(r["data"]["uptime_seconds"] - (time.time() - r["data"]["started_at"])) < 60)
+    expect("UPTIME", ok_ut, r)
+    # UPTIME 数值随时间单调递增（间隔 1.1s 后再查应更大）
+    time.sleep(1.1)
+    r2 = send_cmd(proc, sock_name, {"cmd": "UPTIME"})
+    expect("UPTIME 单调递增", r2.get("status") == "ok"
+           and r2["data"]["uptime_seconds"] > r["data"]["uptime_seconds"], r2)
+
     # ---- LIST：GLOBAL 段 ----
     r = send_cmd(proc, sock_name, {"cmd": "LIST"})
     expect("LIST status", r.get("status") == "ok", r)

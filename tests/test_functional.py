@@ -85,7 +85,9 @@ def start_daemon():
     for _ in range(15):
         time.sleep(0.3)
         try:
-            if "网盘" in os.listdir(MNT):
+            # 就绪判定：虚拟目录在 <uid>/ 层之下生效（架构约定，见 AGENTS.md），
+            # 挂载点根仅含 uid 目录，须检查 /0/ 下的虚拟目录
+            if "网盘" in os.listdir(MNT + "/0"):
                 return proc
         except: pass
         if proc.poll() is not None:
@@ -106,17 +108,18 @@ def test_basic_operations():
     log("\n━━━ 模块1: 基础文件操作 ━━━")
     m = Path(MNT)
 
-    # 1.1 根目录虚拟条目
-    root = sorted(os.listdir(m))
-    targets = ["网盘", "照片", "文档", "音乐", "应用数据", "0"]
+    # 1.1 用户存储根（/0/ 层）虚拟条目：虚拟目录在 <uid>/ 层之下生效，
+    #     挂载点根仅含 uid 目录（见 AGENTS.md 路径约定）
+    root = sorted(os.listdir(m / "0"))
+    targets = ["网盘", "照片", "文档", "音乐", "应用数据", "Download"]
     for t in targets:
-        ok(f"根目录可见 '{t}'") if t in root else fail(f"根目录缺少 '{t}'", f"entries={root}")
+        ok(f"/0/ 可见 '{t}'") if t in root else fail(f"/0/ 缺少 '{t}'", f"entries={root}")
 
-    # 1.2 通过虚拟路径读取预置文件
-    for vpath, fname in [("网盘/hello.txt", "hello.txt"),
-                          ("照片/photo1.jpg", "photo1.jpg"),
-                          ("文档/report.pdf", "report.pdf"),
-                          ("音乐/song.mp3", "song.mp3")]:
+    # 1.2 通过虚拟路径读取预置文件（虚拟目录在 /0/ 层之下）
+    for vpath, fname in [("0/网盘/hello.txt", "hello.txt"),
+                          ("0/照片/photo1.jpg", "photo1.jpg"),
+                          ("0/文档/report.pdf", "report.pdf"),
+                          ("0/音乐/song.mp3", "song.mp3")]:
         p = m / vpath
         exp = f"content_{fname}_{TEST_ID}"
         if p.exists() and p.read_text().strip() == exp:
@@ -125,45 +128,45 @@ def test_basic_operations():
             fail(f"读取 {vpath}", f"exists={p.exists()}")
 
     # 1.3 通过虚拟路径创建新文件
-    (m / "网盘/new_file.txt").write_text(f"new_content_{TEST_ID}")
+    (m / "0/网盘/new_file.txt").write_text(f"new_content_{TEST_ID}")
     # 验证真实存储存在
     real = Path(f"{STORAGE}/0/Download/new_file.txt")
     ok("虚拟写入 → 真实存储") if real.exists() and TEST_ID in real.read_text() else fail("写入验证", str(real.exists()))
 
     # 1.4 通过虚拟路径创建深层次目录
-    (m / "网盘/Projects/2026/report.md").parent.mkdir(parents=True, exist_ok=True)
-    (m / "网盘/Projects/2026/report.md").write_text("# Report")
+    (m / "0/网盘/Projects/2026/report.md").parent.mkdir(parents=True, exist_ok=True)
+    (m / "0/网盘/Projects/2026/report.md").write_text("# Report")
     ok("深层目录创建") if Path(f"{STORAGE}/0/Download/Projects/2026/report.md").exists() else fail("深层目录")
 
     # 1.5 删除文件
-    (m / "网盘/new_file.txt").unlink(missing_ok=True)
+    (m / "0/网盘/new_file.txt").unlink(missing_ok=True)
     ok("删除文件") if not Path(f"{STORAGE}/0/Download/new_file.txt").exists() else fail("删除验证")
 
     # 1.6 重命名文件
-    (m / "网盘/Projects/2026/report.md").rename(m / "网盘/Projects/2026/final.md")
+    (m / "0/网盘/Projects/2026/report.md").rename(m / "0/网盘/Projects/2026/final.md")
     renamed = Path(f"{STORAGE}/0/Download/Projects/2026/final.md")
     old = Path(f"{STORAGE}/0/Download/Projects/2026/report.md")
     ok("重命名文件") if renamed.exists() and not old.exists() else fail("重命名验证")
 
     # 1.7 大文件写入
     big_data = b"x" * (1024 * 1024)  # 1MB
-    (m / "网盘/bigfile.bin").write_bytes(big_data)
+    (m / "0/网盘/bigfile.bin").write_bytes(big_data)
     big = Path(f"{STORAGE}/0/Download/bigfile.bin")
     ok("1MB 大文件") if big.stat().st_size == 1024*1024 else fail("大文件", f"size={big.stat().st_size}")
 
     # 1.8 追加写入
-    with open(m / "网盘/bigfile.bin", "ab") as f:
+    with open(m / "0/网盘/bigfile.bin", "ab") as f:
         f.write(b"append_data")
     ok("追加写入") if big.stat().st_size == 1024*1024 + 11 else fail("追加验证")
 
     # 1.9 stat / 权限
-    st = (m / "网盘/bigfile.bin").stat()
+    st = (m / "0/网盘/bigfile.bin").stat()
     ok("stat 有大小") if st.st_size > 0 else fail("stat 大小", str(st.st_size))
     ok("stat 有 mtime") if st.st_mtime > 0 else fail("stat mtime")
 
     # 1.10 目录列表（虚拟目录内容）
-    for vdir, expect in [("网盘", ["hello.txt", "Projects", "bigfile.bin"]),
-                          ("照片", ["photo1.jpg"])]:
+    for vdir, expect in [("0/网盘", ["hello.txt", "Projects", "bigfile.bin"]),
+                          ("0/照片", ["photo1.jpg"])]:
         items = sorted(os.listdir(m / vdir))
         missing = [e for e in expect if e not in items]
         ok(f"{vdir}/ 列表含预期文件") if not missing else fail(f"{vdir}/ 列表", f"missing={missing} items={items}")
@@ -180,7 +183,7 @@ def test_sqlite():
         return
 
     m = Path(MNT)
-    db_virtual = m / "应用数据/com.example.app/database.db"
+    db_virtual = m / "0/应用数据/com.example.app/database.db"
     db_real = Path(f"{STORAGE}/0/Download/AppData/database.db")
 
     # 2.1 创建数据库（通过虚拟路径）
@@ -232,7 +235,7 @@ def test_sqlite():
     conn2.close()
 
     # 2.7 二进制数据 (BLOB)
-    blob_v = m / "应用数据/com.example.app/avatar.db"
+    blob_v = m / "0/应用数据/com.example.app/avatar.db"
     conn3 = sqlite3.connect(str(blob_v))
     conn3.execute("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)")
     bin_data = bytes(range(256))
@@ -244,7 +247,7 @@ def test_sqlite():
 
     # 2.8 FTS 全文搜索（如支持）
     try:
-        fts_v = m / "应用数据/com.example.app/search.db"
+        fts_v = m / "0/应用数据/com.example.app/search.db"
         conn4 = sqlite3.connect(str(fts_v))
         conn4.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)")
         conn4.execute("INSERT INTO docs VALUES ('测试标题', '这是一段测试内容')")
@@ -259,7 +262,7 @@ def test_sqlite():
 # ═══════════════════════════════════════════════════════
 # 模块 3：并发压力测试
 # ═══════════════════════════════════════════════════════
-CONCUR_DIR = "网盘/concurrent_test"
+CONCUR_DIR = "0/网盘/concurrent_test"
 
 def _worker_read(wid, ops):
     """读取线程/进程工作负载"""
@@ -389,7 +392,7 @@ def test_concurrent():
                     p.write_text(f"data_{i}")
                 else:
                     # listdir
-                    _ = os.listdir(m / "网盘")
+                    _ = os.listdir(m / "0/网盘")
             except: pass
     mix_threads = [threading.Thread(target=_mixed_load, args=(i, 20))
                    for i in range(16)]
@@ -403,8 +406,8 @@ def test_concurrent():
     log("  stat 风暴（50线程同时 stat 100次）...")
     def _stat_storm(wid, count):
         m = Path(MNT)
-        names = ["网盘", "照片", "文档", "音乐", "应用数据",
-                 "网盘/hello.txt", "照片/photo1.jpg", "文档/report.pdf"]
+        names = ["0/网盘", "0/照片", "0/文档", "0/音乐", "0/应用数据",
+                 "0/网盘/hello.txt", "0/照片/photo1.jpg", "0/文档/report.pdf"]
         for i in range(count):
             n = names[i % len(names)]
             try: _ = (m / n).stat()

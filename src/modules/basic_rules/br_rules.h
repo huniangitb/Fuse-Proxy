@@ -22,6 +22,9 @@ typedef struct {
     bool ro;         /* app_ro || global_ro */
     bool has_redir;  /* 命中 redirect（app 优先，无则 global） */
     char redir[PATH_MAX];
+    /* FTP 最长前缀命中（trie 下降过程输出）：app 段优先，global 兜底 */
+    char ftp_app[64];     /* app trie 命中段名（可空） */
+    char ftp_global[64];  /* global trie 命中段名（可空） */
     /* trie 完整匹配的最深节点（由 trie_lookup_full 填充，可 NULL）：
        供 br_resolve 复用一次遍历结果判定 virtual_ancestor / redirect_target，
        避免各自再全路径遍历（FUSE 热路径每操作最多省 4 次 trie 下降） */

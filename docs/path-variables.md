@@ -4,7 +4,7 @@ Fuse-Proxy 的 `REDIRECT` / `HIDE` / `RO` / `ALLOW` 规则路径支持变量，�
 
 ## 系统变量
 
-- `$package`：当前命中 uid 对应的包名（运行时由 `vfs_get_app_cfg` 按 uid 解析，已去掉 `:process` 后缀）。
+- `$package`：当前命中 uid 对应的包名（运行时由 `br_get_app_cfg` 按 uid 解析，已去掉 `:process` 后缀）。
   - uid<10000 直接判为 `system`，不解析。
   - 解析顺序：`uid.map` 二分查询 → `/proc/<tid>/status` 的 `Tgid`（取主进程 PID）→ `proc_get_cmdline` 读 `cmdline` 去掉 `:` 后缀。
   - 解析出 `zygote`、`<pre-`、长度<3 的进程名视为不可解析，缓存为 `unknown`。
@@ -49,7 +49,7 @@ REDIRECT /ext     $MNT_BASE
 
 ## ALLOW 的 `?` 内部前缀
 
-`ALLOW <path>` 在 parse 阶段被等价转换为一条 redirect：虚拟前缀 `<path>`、真实目标 `?<path>`。`?` 是项目内部标记，表示"相对当前用户存储"，运行时由 `vfs_to_real_path` / `build_real_base_from_target` 还原为 `STORAGE_BASE/<user_id><后缀>`。配置文件中一般无需手写 `?`。
+`ALLOW <path>` 在 parse 阶段被等价转换为一条 redirect：虚拟前缀 `<path>`、真实目标 `?<path>`。`?` 是项目内部标记，表示"相对当前用户存储"，运行时由 `br_to_real_path` / `build_real_base_from_target` 还原为 `STORAGE_BASE/<user_id><后缀>`。配置文件中一般无需手写 `?`。
 
 同样地，REDIRECT 的相对路径 target（不以 `/` 开头、非系统绝对路径）也会在 parse 阶段被转换为 `?/<原值>` 形式，统一走运行时分类。
 
@@ -73,7 +73,7 @@ REDIRECT /ext     $MNT_BASE
 - 包名为 `system`（uid<10000）或 `unknown`（cmdline 解析失败）。
 - 包名为空。
 
-> 注：`vfs_get_app_cfg` 解析出含 `zygote`、`<pre-`、长度<3 的进程名时会直接缓存为 nullptr 并返回，此时 `current_pkg` 被填为该字面值（如 `unknown`），后续 `pkg_resolvable` 判为不可解析。
+> 注：`br_get_app_cfg` 解析出含 `zygote`、`<pre-`、长度<3 的进程名时会直接缓存为 nullptr 并返回，此时 `current_pkg` 被填为该字面值（如 `unknown`），后续 `pkg_resolvable` 判为不可解析。
 
 ## 静态/动态自动优化
 
