@@ -142,6 +142,19 @@ read/write/release/unlink/mkdir/rmdir/rename/truncate 等）在解析出 real_pa
 | `backend_release(h)` | 关闭（句柄销毁唯一入口；写路径未上传则补传） |
 | `backend_unlink/mkdir/rmdir/rename/truncate(...)` | 删除/建目录/重命名/截断 |
 
+**句柄编码（fh，框架↔模块透传）**：模块 `backend_open/create` 返回的句柄
+`h`（模块分配的小整数）由框架编码进 FUSE `fi->fh` 高位，供 read/write/
+release/fsync/flush 无锁快速分派（免每 IO 解析路径、线性扫描模块）：
+
+- `bit40`：后端句柄标志（`NSP_FH_BACKEND_FLAG`，与本地 fd 区分）
+- `bit41-47`：模块槽位（`MAX_MODULES=16`，7 位足够）
+- `bit0-39`：后端句柄 ID（模块分配，经 `NSP_FH_HANDLE_MASK` 还原）
+
+`module_backend_acquire_slot(slot)` 原子槽位快照取模块 ops 指针，用完
+`module_backend_release_slot` 归还——热路径无锁竞争。**模块侧须保证**
+句柄 ID 在 bit0-39 范围内（Android tagged-pointer 对 top byte 会 SIGABRT，
+故高位一律保留给框架标志/槽位）。
+
 无后端模块时框架走本地文件系统直通，`module_backend_active()` 快速路径
 保证零额外开销（不产生函数指针调用）。
 
@@ -238,10 +251,10 @@ meson setup build_gnu -Dtarget_os=gnu && ninja -C build_gnu
 meson setup build --cross-file android-aarch64.ini -Dfuse3_root=<静态库根>
 
 # 测试（测试脚本自动预置 basic_rules.so / ftp_module.so 到临时模块目录并传 --modules-dir）
-python3 tests/test_rules.py       # 规则边界 26 用例
+python3 tests/test_rules.py       # 规则边界 36 用例
 python3 tests/test_functional.py  # 功能 + SQLite + 并发 34 用例
-python3 tests/test_modules.py     # 热插拔 10 用例
-python3 tests/test_ftp.py         # FTP 后端端到端 10 用例（vsftpd 匿名服务 + $FTP_云盘 变量 + REDIRECT）
+python3 tests/test_modules.py     # 热插拔 11 用例
+python3 tests/test_ftp.py         # FTP 后端端到端 13 用例（vsftpd 匿名服务 + $FTP_云盘 变量 + REDIRECT）
 
 # 模块独立编译（第三方模块：只依赖 include/nsp_module.h，须定义 NSP_MODULE_BUILD）
 cc -shared -fPIC -std=c23 -DNSP_MODULE_BUILD -Iinclude my_module.c -o my_module.so

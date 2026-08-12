@@ -63,6 +63,7 @@ rule_server -c '{"cmd":"LIST"}'
 | 命令 | 用途 |
 |------|------|
 | `PING` | 存活探测 |
+| `UPTIME` | 查询本守护进程运行时长（单调时钟） |
 | `LIST` | 全量规则（全局 + 所有用户空间的应用） |
 | `USERS` | 列出全部已配置用户（uid + 目录 + 应用数） |
 | `GET` | 查询全局 / 单个应用 / 按 uid 过滤的用户应用 |
@@ -119,6 +120,28 @@ rule_server -c '{"cmd":"LIST"}'
    "desc_map":{"zh":"FTP 存储映射：<虚拟前缀>|<段名>","en":"FTP storage mapping: <virtual prefix>|<section>"}}
 ]
 ```
+
+### 1.1 UPTIME —— 运行时长查询
+
+```json
+{"cmd":"UPTIME"}
+```
+
+响应 `data`（基于 `CLOCK_MONOTONIC` 单调时钟，系统改时间不影响）：
+
+```json
+{
+  "uptime_seconds": 3600,
+  "uptime": "1小时0分0秒",
+  "started_at": 1718000000
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `uptime_seconds` | 自守护进程启动起的整数秒数 |
+| `uptime` | 人类可读时长（X天X小时X分X秒，按需省略高位） |
+| `started_at` | 启动时刻墙钟时间戳（epoch 秒） |
 
 ### 2. LIST —— 全量规则
 

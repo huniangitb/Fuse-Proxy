@@ -28,8 +28,32 @@
 #define FTP_STREAM_BUF_SIZE (64 * 1024)  /* 流式读缓冲 64KB */
 #define FTP_RBUF_MIN (64 * 1024)         /* 预取缓冲最小容量（随机读/初始） */
 #define FTP_RBUF_MAX (8 * 1024 * 1024)   /* 预取缓冲最大容量（顺序读 8MB，减少 REST 往返） */
+#define FTP_READ_POOL_MAX 4              /* 每后端空闲读句柄池上限（S3：open 复用连接） */
+#define FTP_UP_CHUNK   (1 * 1024 * 1024) /* 流式上传每块 1MB（读 tmp → STOR/APPE） */
+#define FTP_UP_WINDOW  (8 * 1024 * 1024) /* 背压：未上传窗口上限（限 tmp 膨胀 + close 快速） */
 
 /* ================= 后端（每个 FTP 服务器一个） ================= */
+typedef struct FtpBackendFile FtpBackendFile;   /* 前向声明：线程池槽引用 */
+
+/* ================= stat 缓存（FUSE getattr 高频路径） =================
+   目录/文件 stat 在 FTP 上需 2~3 次网络往返（SIZE+MDTM → LIST → 父 LIST），
+   FUSE 对 getattr 极频繁；缓存命中（TTL 内）零网络直出。
+   一致性：任何写操作（STOR 上传/DELE/MKD/RMD/RNFR/RNTO/TRUNCATE）成功后
+   整表失效——写操作低频（相对 getattr），全清成本可忽略且杜绝
+   "close 后立即 stat 命中旧值"的 close-to-open 窗口错误。 */
+#define FTP_STAT_CACHE_SLOTS 16
+#define FTP_STAT_CACHE_TTL   30
+#define FTP_STAT_PATH_MAX    512   /* 超长虚拟路径不缓存（罕见） */
+
+typedef struct {
+    bool valid;
+    time_t ts;
+    char path[FTP_STAT_PATH_MAX];
+    int  err;          /* 0=存在；-ENOENT=缓存不存在 */
+    bool is_dir;
+    off_t size;
+    time_t mtime;
+} FtpStatCacheEntry;
 
 typedef struct FtpBackend {
     FtpServerCfg cfg;
@@ -42,7 +66,95 @@ typedef struct FtpBackend {
     int  fail_count;         /* 连续失败计数（熔断：无网络自动静默） */
     bool silent;             /* 静默模式：熔断生效，操作快速失败、停止重试 */
     time_t silent_at;        /* 进入静默的时间（探活恢复节奏参考） */
+    /* 目录 mtime TTL 缓存：FTP 无目录 MDTM，需父目录 LIST 解析（一次网络
+       往返 + 全量列表）；FUSE 对目录 getattr 极频繁，缓存避免每次 stat
+       都触发一次额外 LIST。路径匹配 + TTL 内直接返回缓存值 */
+    char mtime_cache_path[PATH_MAX];
+    time_t mtime_cache_val;
+    time_t mtime_cache_ts;
+    /* 完整 stat 缓存（文件/目录/不存在，TTL 内零网络直出）：
+       getattr 命中免 SIZE+MDTM→LIST 的 2~3 次网络往返 */
+    FtpStatCacheEntry stat_cache[FTP_STAT_CACHE_SLOTS];
+    pthread_mutex_t stat_lock;   /* stat 缓存锁（P2#3：多 FUSE 线程并发
+                                    getattr/readdir 读写同一数组，无锁会撕裂
+                                    条目 → 错误 st_size/陈旧 ENOENT） */
+    /* S3 读句柄池：读模式 open 复用空闲句柄（FTP 控制连接保持，免每次
+       open 新建连接 + USER/PASS 登录）；release 归还，池满才销毁。
+       bk->curl 为共享控制句柄（op_lock 串行化），读句柄为每文件独立
+       （下载线程专用），二者互不干扰 */
+    CURL* read_pool[FTP_READ_POOL_MAX];
+    int read_pool_count;
+    pthread_mutex_t pool_lock;   /* 读句柄池锁（仅 open/release/clear 触碰） */
 } FtpBackend;
+
+/* 目录 mtime 缓存 TTL：目录时间变化不频繁，30s 内复用缓存足够 */
+#define FTP_MTIME_CACHE_TTL 30
+
+static unsigned ftp_stat_cache_hash(const char* path) {
+    unsigned h = 5381;
+    for (const unsigned char* p = (const unsigned char*)path; *p; p++)
+        h = h * 33 + *p;
+    return h;
+}
+
+/* 开放寻址槽位：同 path 命中或首个空槽；表满且无匹配返回 NULL */
+static FtpStatCacheEntry* ftp_stat_cache_slot(FtpBackend* bk, const char* path) {
+    unsigned start = ftp_stat_cache_hash(path) % FTP_STAT_CACHE_SLOTS;
+    unsigned i = start;
+    do {
+        FtpStatCacheEntry* e = &bk->stat_cache[i];
+        if (!e->valid || strcmp(e->path, path) == 0) return e;
+        i = (i + 1) % FTP_STAT_CACHE_SLOTS;
+    } while (i != start);
+    return NULL;
+}
+
+static void ftp_stat_cache_clear(FtpBackend* bk) {
+    pthread_mutex_lock(&bk->stat_lock);
+    for (int i = 0; i < FTP_STAT_CACHE_SLOTS; i++)
+        bk->stat_cache[i].valid = false;
+    pthread_mutex_unlock(&bk->stat_lock);
+}
+
+static void ftp_stat_cache_fill(FtpBackend* bk, const char* path, int err,
+                                bool is_dir, off_t size, time_t mtime) {
+    size_t plen = strlen(path);
+    if (plen == 0 || plen >= FTP_STAT_PATH_MAX) return;   /* 超长不缓存 */
+    pthread_mutex_lock(&bk->stat_lock);
+    FtpStatCacheEntry* e = ftp_stat_cache_slot(bk, path);
+    if (!e) {
+        /* 表满无匹配：覆盖哈希起始槽（简单淘汰，写操作低频影响可忽略） */
+        e = &bk->stat_cache[ftp_stat_cache_hash(path) % FTP_STAT_CACHE_SLOTS];
+    }
+    memcpy(e->path, path, plen + 1);
+    e->valid = true;
+    e->ts = time(NULL);
+    e->err = err;
+    e->is_dir = is_dir;
+    e->size = size;
+    e->mtime = mtime;
+    pthread_mutex_unlock(&bk->stat_lock);
+}
+
+/* stat 缓存查找：命中返回 0 并填充输出；未命中返回 1（调用方走网络）。
+   超长路径不查（与 fill 的拒绝条件一致）。 */
+static int ftp_stat_cache_lookup(FtpBackend* bk, const char* path,
+                                 int* err_out, bool* is_dir_out,
+                                 off_t* size_out, time_t* mtime_out) {
+    if (strlen(path) >= FTP_STAT_PATH_MAX) return 1;
+    pthread_mutex_lock(&bk->stat_lock);
+    FtpStatCacheEntry* e = ftp_stat_cache_slot(bk, path);
+    int hit = (e && e->valid && strcmp(e->path, path) == 0 &&
+               time(NULL) - e->ts < FTP_STAT_CACHE_TTL);
+    if (hit) {
+        if (err_out) *err_out = e->err;
+        if (is_dir_out) *is_dir_out = e->is_dir;
+        if (size_out) *size_out = e->size;
+        if (mtime_out) *mtime_out = e->mtime;
+    }
+    pthread_mutex_unlock(&bk->stat_lock);
+    return hit ? 0 : 1;
+}
 
 /* 熔断阈值：连续失败达此值进入静默。8 次可在容忍正常偶发失败（连接抖动）
    的同时，无网络时（connect 立即失败）毫秒级进入静默——过低（如 3）会
@@ -88,6 +200,8 @@ typedef struct FtpBackendFile {
     bool uploaded;           /* 写模式数据已 STOR 上传（FLUSH 置位，release 补传判定） */
     size_t file_size;        /* 文件大小（用于读模式边界检查） */
     CURL* read_curl;         /* 读模式独立句柄（下载线程专用，不复用共享 bk->curl） */
+    CURL* write_curl;        /* 写模式独立句柄（upload 专用，不复用共享 bk->curl，
+                                避免并发 STOR 竞争共享句柄 → 消除 op_lock 串行） */
     /* 滑动读缓冲（下载线程持续填充，read 实时取，避免"等缓冲满一段才回传"） */
     char* rbuf;              /* 滑动缓冲 */
     off_t rbuf_off;          /* 缓冲中首个有效字节的文件偏移 */
@@ -105,6 +219,19 @@ typedef struct FtpBackendFile {
     bool dl_released;        /* release 已置位：read 应立即退出，不再 cond_wait */
     int  n_readers;          /* 在途 read 计数（f_lock 保护，release 等待归零） */
     off_t dl_grow_off;       /* 上次扩容时的 rbuf_off（验证读侧消费后才扩容） */
+    /* ---- S4 流式上传（写模式）----
+       写数据先落数据分区 tmp 文件（免 tmpfs ENOSPC），后台上传线程
+       增量 STOR/APPE 推送（write 期间即上传，close 只等尾部追平）；
+       背压限制未上传窗口，乱序改写已上传前缀时置 retransmit 转全量重传。 */
+    pthread_t up_tid;        /* 上传线程 */
+    pthread_cond_t up_cond;  /* 上传线程：新数据/停止通知（f_lock 保护） */
+    bool up_started;         /* 上传线程已启动 */
+    bool up_stop;            /* flush/release 请求停止并追平 */
+    bool up_error;           /* 流式上传出错（转全量重传兜底） */
+    bool retransmit;         /* 乱序改写已上传前缀：全量重传 */
+    bool up_first;           /* 下一块用 STOR（首块截断）而非 APPE（追加） */
+    off_t up_upto;           /* 已流式上传字节数（f_lock 保护） */
+    off_t file_end;          /* 已写最大偏移（写模式跟踪，f_lock 保护） */
 } FtpBackendFile;
 
 static FtpBackendFile* g_handles[FTP_HANDLE_MAX];
@@ -227,6 +354,8 @@ int ftp_backend_add(const FtpServerCfg* cfg) {
     snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
     pthread_mutex_init(&bk->lock, NULL);
     pthread_mutex_init(&bk->op_lock, NULL);
+    pthread_mutex_init(&bk->pool_lock, NULL);
+    pthread_mutex_init(&bk->stat_lock, NULL);
     bk->curl = curl_easy_init();
     g_backend_count++;
     return 0;
@@ -239,8 +368,15 @@ void ftp_backend_clear(void) {
             curl_easy_cleanup(bk->curl);
             bk->curl = NULL;
         }
+        /* 释放池中空闲读句柄（在途句柄由各自 release 归还/销毁） */
+        for (int p = 0; p < bk->read_pool_count; p++) {
+            if (bk->read_pool[p]) curl_easy_cleanup(bk->read_pool[p]);
+        }
+        bk->read_pool_count = 0;
         pthread_mutex_destroy(&bk->lock);
         pthread_mutex_destroy(&bk->op_lock);
+        pthread_mutex_destroy(&bk->pool_lock);
+        pthread_mutex_destroy(&bk->stat_lock);
     }
     g_backend_count = 0;
 }
@@ -340,19 +476,23 @@ static void reset_curl(FtpBackend* bk, bool count_failure) {
 
 /* 重置共享句柄的操作级选项（防跨操作残留：NOBODY 残留会吞掉 STOR 上传、
    WRITEDATA 残留指向已失效的栈缓冲）。各操作在 setopt 前调用，然后设置自己所需选项。 */
+static void ftp_reset_opts_curl(CURL* c) {
+    curl_easy_setopt(c, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(c, CURLOPT_UPLOAD, 0L);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, NULL);
+    curl_easy_setopt(c, CURLOPT_RESUME_FROM, 0L);
+    curl_easy_setopt(c, CURLOPT_FILETIME, 0L);
+    curl_easy_setopt(c, CURLOPT_HEADER, 0L);
+    curl_easy_setopt(c, CURLOPT_POSTQUOTE, NULL);
+    curl_easy_setopt(c, CURLOPT_QUOTE, NULL);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, NULL);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, NULL);
+    curl_easy_setopt(c, CURLOPT_READFUNCTION, NULL);
+    curl_easy_setopt(c, CURLOPT_READDATA, NULL);
+}
+
 static void ftp_reset_opts(FtpBackend* bk) {
-    curl_easy_setopt(bk->curl, CURLOPT_NOBODY, 0L);
-    curl_easy_setopt(bk->curl, CURLOPT_UPLOAD, 0L);
-    curl_easy_setopt(bk->curl, CURLOPT_CUSTOMREQUEST, NULL);
-    curl_easy_setopt(bk->curl, CURLOPT_RESUME_FROM, 0L);
-    curl_easy_setopt(bk->curl, CURLOPT_FILETIME, 0L);
-    curl_easy_setopt(bk->curl, CURLOPT_HEADER, 0L);
-    curl_easy_setopt(bk->curl, CURLOPT_POSTQUOTE, NULL);
-    curl_easy_setopt(bk->curl, CURLOPT_QUOTE, NULL);
-    curl_easy_setopt(bk->curl, CURLOPT_WRITEFUNCTION, NULL);
-    curl_easy_setopt(bk->curl, CURLOPT_WRITEDATA, NULL);
-    curl_easy_setopt(bk->curl, CURLOPT_READFUNCTION, NULL);
-    curl_easy_setopt(bk->curl, CURLOPT_READDATA, NULL);
+    ftp_reset_opts_curl(bk->curl);
 }
 
 /* ================= 文件句柄管理 ================= */
@@ -468,6 +608,18 @@ static int ftp_parse_list_time(const char* line, const char* nl, time_t* out) {
    返回 0 成功、-1 失败（调用方保持默认 mtime）。 */
 static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
     if (!bk || !path || !out) return -1;
+    /* TTL 缓存命中：同路径 + 缓存新鲜（30s）直接返回，避免每次 FUSE
+       getattr 都触发一次父目录 LIST 网络往返 */
+    pthread_mutex_lock(&bk->lock);
+    if (bk->mtime_cache_path[0] &&
+        strcmp(bk->mtime_cache_path, path) == 0 &&
+        time(NULL) - bk->mtime_cache_ts < FTP_MTIME_CACHE_TTL &&
+        bk->mtime_cache_val > 0) {
+        *out = bk->mtime_cache_val;
+        pthread_mutex_unlock(&bk->lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&bk->lock);
     if (ensure_curl(bk) != 0) return -EIO;
     /* 用 build_url 得到 FTP 端完整 URL（含 remote_dir 映射），
        从 URL 路径部分取父路径与目标目录名——不能按虚拟 path 切分，
@@ -480,10 +632,22 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
     size_t pplen = strlen(pathpart);
     while (pplen > 1 && pathpart[pplen - 1] == '/') pathpart[--pplen] = '\0';
     if (pplen == 0) return -1;   /* 根目录自身：无父级可 LIST 解析 */
-    /* 目标目录名 = 最后一段 */
+    /* 目标目录名 = 最后一段（URL 路径部分经 curl_easy_escape 百分号编码，
+       如空格/中文 → my%20dir / %E4%BA%91，须解码后才能与 LIST 响应的
+       真实名匹配） */
     const char* slash = strrchr(pathpart, '/');
-    const char* target = slash ? slash + 1 : pathpart;
-    if (!target[0]) return -1;
+    const char* enc_target = slash ? slash + 1 : pathpart;
+    if (!enc_target[0]) return -1;
+    char target[PATH_MAX];
+    char* dec = curl_easy_unescape(NULL, enc_target, 0, NULL);
+    if (dec) {
+        strncpy(target, dec, sizeof(target) - 1);
+        target[sizeof(target) - 1] = '\0';
+        curl_free(dec);
+    } else {
+        strncpy(target, enc_target, sizeof(target) - 1);
+        target[sizeof(target) - 1] = '\0';
+    }
     /* 父路径 = 去掉最后一段；根时父为空 → LIST "/" */
     char parent[2048];
     if (slash) {
@@ -517,7 +681,12 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
     }
 
     struct WriteBuf wb = {0};
-    wb.auto_grow = true;
+    /* 只需匹配目标目录行：限制 LIST 缓冲容量（256KB 固定、不自动扩容），
+       避免大父目录全量列表导致内存随条目数无界增长 */
+    wb.cap = 256 * 1024;
+    wb.buf = malloc(wb.cap);
+    if (!wb.buf) return -1;
+    wb.auto_grow = false;
     pthread_mutex_lock(&bk->op_lock);
     ftp_reset_opts(bk);
     curl_easy_setopt(bk->curl, CURLOPT_URL, list_url);
@@ -527,7 +696,7 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
     curl_easy_setopt(bk->curl, CURLOPT_WRITEDATA, &wb);
     CURLcode res = curl_easy_perform(bk->curl);
     pthread_mutex_unlock(&bk->op_lock);
-    if (res != CURLE_OK) { free(wb.buf); return -1; }
+    if (res != CURLE_OK && res != CURLE_WRITE_ERROR) { free(wb.buf); return -1; }
 
     /* 逐行匹配目标目录名，取时间列 */
     int rc = -1;
@@ -552,7 +721,16 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
         if (ne > nm && *(ne-1) == '\r') ne--;
         size_t nlen = (size_t)(ne - nm);
         if (nlen == strlen(target) && memcmp(nm, target, nlen) == 0) {
-            if (ftp_parse_list_time(line, nl, out) == 0) rc = 0;
+            if (ftp_parse_list_time(line, nl, out) == 0) {
+                rc = 0;
+                /* 写入 TTL 缓存：后续 getattr 直接命中，免父目录 LIST */
+                pthread_mutex_lock(&bk->lock);
+                strncpy(bk->mtime_cache_path, path, sizeof(bk->mtime_cache_path) - 1);
+                bk->mtime_cache_path[sizeof(bk->mtime_cache_path) - 1] = '\0';
+                bk->mtime_cache_val = *out;
+                bk->mtime_cache_ts = time(NULL);
+                pthread_mutex_unlock(&bk->lock);
+            }
             break;
         }
         line = nl + 1;
@@ -564,6 +742,22 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
 int ftp_backend_getattr(const char* path, struct stat* st) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
+    /* stat 缓存优先：TTL 内零网络直出（含"不存在"负缓存，exists 检查高频；
+       写操作成功后整表失效，故不会命中写后旧值）。命中不发起网络，
+       静默熔断/弱网下已缓存路径仍可快速响应 */
+    int c_err = 0;
+    bool c_dir = false;
+    off_t c_size = 0;
+    time_t c_mtime = 0;
+    if (ftp_stat_cache_lookup(bk, path, &c_err, &c_dir, &c_size, &c_mtime) == 0) {
+        if (c_err != 0) return c_err;
+        memset(st, 0, sizeof *st);
+        st->st_mode = c_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+        st->st_size = c_size;
+        st->st_nlink = c_dir ? 2 : 1;
+        st->st_mtime = c_mtime;
+        return 0;
+    }
     if (silent_fast_fail(bk)) return -ENOENT;   /* 静默熔断：快速失败（每 2s 放行一次探测） */
     memset(st, 0, sizeof *st);
 
@@ -606,6 +800,8 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
         st->st_nlink = 1;
         if (ft >= 0) st->st_mtime = (time_t)ft;
         free(wb.buf);
+        ftp_stat_cache_fill(bk, path, 0, false, (off_t)cl,
+                            ft >= 0 ? (time_t)ft : 0);
         mark_success(bk);   /* 操作成功：清零熔断计数 */
         return 0;
     }
@@ -642,6 +838,7 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
         if (ftp_dir_mtime(bk, path, &dmtime) == 0 && dmtime > 0)
             st->st_mtime = dmtime;
         free(dir_wb.buf);
+        ftp_stat_cache_fill(bk, path, 0, true, 0, st->st_mtime);
         return 0;
     }
     free(dir_wb.buf);
@@ -651,6 +848,10 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
        业务结果，不计入熔断；连接/传输类错误才累计（避免 exists 检查
        连续命中缺失路径把健康连接误判为断网） */
     reset_curl(bk, res != CURLE_REMOTE_FILE_NOT_FOUND);
+    /* 负缓存：exists 检查（os.path.exists）高频，TTL 内免 2~3 次网络往返；
+       写操作成功后整表失效，不会命中写后旧 ENOENT */
+    if (res == CURLE_REMOTE_FILE_NOT_FOUND)
+        ftp_stat_cache_fill(bk, path, -ENOENT, false, 0, 0);
     return -ENOENT;
 }
 
@@ -700,15 +901,22 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
         if (line >= end) break;
         char* nl = memchr(line, '\n', end - line);
         if (!nl) nl = end;
-        // 简单解析：跳过日期/权限字段，取最后一列作为文件名
+        // 简单解析：跳过日期/权限字段，取最后一列作为文件名；
+        // 同时捕获第 5 列（size）用于子项 stat 缓存预取
+        //（优化 3：readdir 后 getattr 子项零网络；时间列由
+        //  ftp_parse_list_time 对整行解析，此处不重复捕获）
         char* name = NULL;
         char* p = line;
+        char size_str[32] = {0};
         // 跳过类似 "drwxr-xr-x 1 user group 0 Jan 1 00:00 name" 的前 8 列
         int col = 0;
         while (p < nl && col < 8) {
             if (*p == ' ' || *p == '\t') { p++; continue; }
             col++;
+            char* cstart = p;
             while (p < nl && *p != ' ' && *p != '\t') p++;
+            size_t clen = (size_t)(p - cstart);
+            if (col == 5) { size_t n = clen < sizeof size_str - 1 ? clen : sizeof size_str - 1; memcpy(size_str, cstart, n); size_str[n] = '\0'; }
         }
         // 跳过空格
         while (p < nl && (*p == ' ' || *p == '\t')) p++;
@@ -727,6 +935,20 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
                 memcpy(entries[out_n].name, name, cp);
                 entries[out_n].name[cp] = '\0';
                 entries[out_n].is_dir = (line[0] == 'd');
+                /* 优化 3：预取填充子项 stat 缓存（getattr 命中免 SIZE+MDTM→LIST
+                   网络往返）。key 为虚拟路径（path + "/" + name），与
+                   getattr 查询一致；mtime 由整行解析，失败兜底 0 */
+                size_t plen = strlen(path);
+                if (plen > 0 && plen + 1 + cp < FTP_STAT_PATH_MAX) {
+                    char child[FTP_STAT_PATH_MAX];
+                    memcpy(child, path, plen);
+                    child[plen] = '/';
+                    memcpy(child + plen + 1, entries[out_n].name, cp + 1);
+                    time_t mt = 0;
+                    if (ftp_parse_list_time(line, nl, &mt) != 0) mt = 0;
+                    ftp_stat_cache_fill(bk, child, 0, entries[out_n].is_dir,
+                                        size_str[0] ? (off_t)atoll(size_str) : 0, mt);
+                }
                 out_n++;
             }
         }
@@ -756,6 +978,36 @@ static CURL* ftp_read_curl_new(const FtpBackend* bk) {
     return rc;
 }
 
+/* S3 读句柄池：获取读模式句柄——优先复用池中空闲句柄（libcurl 句柄保留
+   FTP 控制连接，open-close 循环免重建连接 + USER/PASS 登录），池空才新建。
+   返回的句柄已重置操作选项（下载线程 perform 前也会自设），可直接使用。 */
+static CURL* ftp_read_curl_acquire(FtpBackend* bk) {
+    pthread_mutex_lock(&bk->pool_lock);
+    if (bk->read_pool_count > 0) {
+        CURL* c = bk->read_pool[--bk->read_pool_count];
+        pthread_mutex_unlock(&bk->pool_lock);
+        ftp_reset_opts_curl(c);   /* 清残留操作选项，防 RANGE/WRITEDATA 泄漏 */
+        return c;
+    }
+    pthread_mutex_unlock(&bk->pool_lock);
+    return ftp_read_curl_new(bk);
+}
+
+/* S3 读句柄池：归还空闲句柄（release/错误路径调用）。句柄须已无在途
+   perform（下载线程已 join/未启动）。池满则直接销毁。 */
+static void ftp_read_curl_release(FtpBackend* bk, CURL* c) {
+    if (!c) return;
+    ftp_reset_opts_curl(c);   /* 清残留，防下次 acquire 拿到脏选项 */
+    pthread_mutex_lock(&bk->pool_lock);
+    if (bk->read_pool_count < FTP_READ_POOL_MAX) {
+        bk->read_pool[bk->read_pool_count++] = c;
+        pthread_mutex_unlock(&bk->pool_lock);
+        return;
+    }
+    pthread_mutex_unlock(&bk->pool_lock);
+    curl_easy_cleanup(c);
+}
+
 int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk || !h) return -ENOENT;
@@ -774,16 +1026,29 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     bool writing = (accmode != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC));
 
     if (writing) {
-        // 写模式：本地临时文件，release 时上传
-        char tpath[128];
-        snprintf(tpath, sizeof tpath, "/tmp/nsp_ftp_XXXXXX");
+        // 写模式：数据分区 tmp 文件（S4 流式上传：边写边传，release 追平尾部）
+        // tmpfs（/tmp）容量小，大文件（视频）会 ENOSPC——mkstemp 优先走
+        // TMPDIR（Android 常为数据分区 /data/local/tmp），失败回退 /tmp
+        char tpath[PATH_MAX];
+        const char* td = getenv("TMPDIR");
+        if (td && td[0] && strlen(td) + 32 < sizeof tpath)
+            snprintf(tpath, sizeof tpath, "%s/nsp_ftp_XXXXXX", td);
+        else
+            snprintf(tpath, sizeof tpath, "/tmp/nsp_ftp_XXXXXX");
         int tfd = mkstemp(tpath);
+        if (tfd < 0 && strncmp(tpath, "/tmp/", 5) != 0) {
+            /* TMPDIR 不可写回退 /tmp */
+            snprintf(tpath, sizeof tpath, "/tmp/nsp_ftp_XXXXXX");
+            tfd = mkstemp(tpath);
+        }
         if (tfd < 0) { pthread_mutex_destroy(&f->f_lock); free(f); return -EIO; }
         unlink(tpath);
         f->tmp_fd = tfd;
         f->writing = true;
+        f->up_first = true;
+        pthread_cond_init(&f->up_cond, NULL);
         *h = ftp_handle_alloc(f);
-        if (*h == 0) { close(tfd); pthread_mutex_destroy(&f->f_lock); free(f); return -EIO; }
+        if (*h == 0) { close(tfd); pthread_cond_destroy(&f->up_cond); pthread_mutex_destroy(&f->f_lock); free(f); return -EIO; }
         mark_success(bk);   /* 连接建立成功：清零熔断计数 */
         return 0;
     }
@@ -795,10 +1060,11 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     /* 写后立即读：FLUSH 的 fuse_invalidate_path 是异步通知，close() 返回后
        立即 open 可能短暂命中内核 negative 缓存（并发多 FLUSH 时处理延迟），
        导致刚上传成功的文件 ENOENT——短重试覆盖该 close-to-open 窗口；
-       文件真不存在时 5×20ms 后仍 ENOENT，正确性不变 */
+       文件真不存在时 2×10ms 后仍 ENOENT，正确性不变（重试降频：原 5×20ms
+       =100ms 同步阻塞 FUSE open 线程，对缺失路径的存在性检查是热路径） */
     if (grc != 0 || !S_ISREG(st.st_mode)) {
-        for (int retry = 0; retry < 5; retry++) {
-            usleep(20000);
+        for (int retry = 0; retry < 2; retry++) {
+            usleep(10000);
             grc = ftp_backend_getattr(path, &st);
             if (grc == 0 && S_ISREG(st.st_mode)) break;
         }
@@ -812,20 +1078,20 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     f->writing = false;
 
     // 每文件独立读句柄（下载线程专用，不复用共享 bk->curl，避免与 STOR 上传并发竞争）
-    CURL* rc = ftp_read_curl_new(bk);
+    CURL* rc = ftp_read_curl_acquire(bk);   /* S3：优先复用池中句柄（连接保持） */
     if (!rc) { pthread_mutex_destroy(&f->f_lock); free(f); return -EIO; }
     f->read_curl = rc;
 
     // 初始化滑动缓冲并启动下载线程
     f->rbuf_cap = FTP_RBUF_MIN;
     f->rbuf = malloc(f->rbuf_cap);
-    if (!f->rbuf) { curl_easy_cleanup(f->read_curl); pthread_mutex_destroy(&f->f_lock); free(f); return -ENOMEM; }
+    if (!f->rbuf) { ftp_read_curl_release(bk, f->read_curl); pthread_mutex_destroy(&f->f_lock); free(f); return -ENOMEM; }
     pthread_cond_init(&f->dl_cond, NULL);
     f->dl_stop = false;
     f->dl_restart = false;
     f->dl_error = false;
     if (pthread_create(&f->dl_tid, NULL, ftp_dl_thread, f) != 0) {
-        curl_easy_cleanup(f->read_curl);
+        ftp_read_curl_release(bk, f->read_curl);
         free(f->rbuf);
         pthread_cond_destroy(&f->dl_cond);
         pthread_mutex_destroy(&f->f_lock);
@@ -844,7 +1110,7 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
         pthread_cond_broadcast(&f->dl_cond);
         pthread_mutex_unlock(&f->f_lock);
         pthread_join(f->dl_tid, NULL);
-        curl_easy_cleanup(rc);
+        ftp_read_curl_release(bk, rc);
         free(f->rbuf);
         pthread_cond_destroy(&f->dl_cond);
         pthread_mutex_destroy(&f->f_lock);
@@ -881,6 +1147,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
         reset_curl(bk, true);   /* 传输失败：计入熔断 */
         return -EIO;
     }
+    ftp_stat_cache_clear(bk);   /* 空文件已创建：整表失效 */
     return ftp_backend_open(path, O_WRONLY | O_CREAT | O_TRUNC, h);
 }
 
@@ -1074,14 +1341,138 @@ out:
     return rc;
 }
 
+/* S4 流式上传前向声明（实现位于 ftp_backend_upload 之前，write 先于其调用） */
+static int ftp_stream_chunk(FtpBackendFile* f, const char* data, size_t len, bool append);
+static void* ftp_up_thread(void* arg);
+
 int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote) {
     FtpBackendFile* f = ftp_handle_get(h);
     if (!f || !buf || !wrote) return -EINVAL;
     if (f->tmp_fd < 0) return -EBADF;
+    pthread_mutex_lock(&f->f_lock);
+    /* S4 乱序检测：改写已流式上传的前缀（off < up_upto）→ 已传字节作废，
+       流式无法覆盖，置 retransmit 转全量重传（flush STOR 覆盖）；
+       off >= up_upto 的随机写仍由 tmp_fd 兜底（未上传区域可继续 APPE） */
+    if (off < f->up_upto) f->retransmit = true;
+    /* 懒启动上传线程（首个写才建线程；失败退化为全量上传兜底） */
+    if (!f->up_started && !f->retransmit && !f->up_stop) {
+        if (pthread_create(&f->up_tid, NULL, ftp_up_thread, f) == 0)
+            f->up_started = true;
+    }
+    pthread_mutex_unlock(&f->f_lock);
+
     ssize_t n = pwrite(f->tmp_fd, buf, size, off);
     if (n < 0) return -errno;
     *wrote = (size_t)n;
+
+    pthread_mutex_lock(&f->f_lock);
+    off_t end = off + (off_t)n;
+    if (end > f->file_end) f->file_end = end;
+    pthread_cond_broadcast(&f->up_cond);   /* 唤醒上传线程推新数据 */
+    /* 背压：顺序写快于网络时，未上传窗口超过 FTP_UP_WINDOW 则等待上传
+       线程追平（限 tmp 膨胀 + close 时尾部小）；retransmit/error 不等待
+       （走全量重传兜底，等也无意义） */
+    if (f->up_started && !f->retransmit && !f->up_error) {
+        while (f->file_end - f->up_upto > (off_t)FTP_UP_WINDOW && !f->retransmit && !f->up_error)
+            pthread_cond_wait(&f->up_cond, &f->f_lock);
+    }
+    pthread_mutex_unlock(&f->f_lock);
     return 0;
+}
+
+/* ============ S4 流式上传（写模式） ============
+   写数据先落数据分区 tmp 文件（mkstemp 走 TMPDIR，免 tmpfs ENOSPC），
+   后台上传线程把已写内容增量推送（首块 STOR 截断、后续 APPE 追加），
+   write 期间即上传——close/FLUSH 只等尾部追平，不再全量同步 STOR。
+   背压：write 侧未上传窗口超过 FTP_UP_WINDOW 时阻塞等待，限 tmp 膨胀。
+   乱序（改写已上传前缀 off < up_upto）置 retransmit：流式无法覆盖已传
+   字节，转全量重传（ftp_backend_upload STOR 覆盖）；FUSE 顺序写（视频/
+   大文件）为常态，乱序（sqlite 随机页/原地改写）为少数回退路径。 */
+
+/* 单块上传：append=false 用 STOR（首块，截断创建），true 用 APPE（追加）。
+   独立 write_curl 句柄（不复用共享 bk->curl，避免并发 STOR 竞争 op_lock）；
+   失败指数退避重试（吸收网络瞬态），仍失败置 up_error 转全量重传兜底。
+   调用方不持 f_lock（curl perform 可能长时间阻塞）。 */
+static int ftp_stream_chunk(FtpBackendFile* f, const char* data, size_t len, bool append) {
+    if (!f->write_curl) f->write_curl = ftp_read_curl_new(f->bk);
+    if (!f->write_curl) return -EIO;
+    struct ReadBuf rb = {data, len, 0};
+    CURLcode res = CURLE_OK;
+    int backoff_ms = 200;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (attempt > 0) {
+            usleep((useconds_t)backoff_ms * 1000);
+            if (backoff_ms < 3200) backoff_ms *= 2;
+        }
+        rb.pos = 0;
+        ftp_reset_opts_curl(f->write_curl);
+        curl_easy_setopt(f->write_curl, CURLOPT_URL, f->ftp_path);
+        curl_easy_setopt(f->write_curl, CURLOPT_UPLOAD, 1L);
+        curl_easy_setopt(f->write_curl, CURLOPT_APPEND, append ? 1L : 0L);
+        curl_easy_setopt(f->write_curl, CURLOPT_INFILESIZE, (long)len);
+        curl_easy_setopt(f->write_curl, CURLOPT_READFUNCTION, read_cb);
+        curl_easy_setopt(f->write_curl, CURLOPT_READDATA, &rb);
+        res = curl_easy_perform(f->write_curl);
+        curl_easy_setopt(f->write_curl, CURLOPT_UPLOAD, 0L);
+        curl_easy_setopt(f->write_curl, CURLOPT_APPEND, 0L);
+        if (res == CURLE_OK) return 0;
+        if (f->bk->silent) break;   /* 静默模式：无网络空转，不再重试 */
+    }
+    curl_easy_cleanup(f->write_curl);   /* 失败句柄可能已半损坏，重建 */
+    f->write_curl = NULL;
+    mark_failure(f->bk);
+    return -EIO;
+}
+
+/* 上传线程：追平已写内容（tmp_fd 读 → STOR/APPE 推送到 up_upto == file_end）。
+   up_stop 置位后追平剩余尾部即退出（flush/release 等待 join）；
+   retransmit/up_error 时立即退出（flush 转全量重传兜底）。 */
+static void* ftp_up_thread(void* arg) {
+    FtpBackendFile* f = arg;
+    char* buf = malloc(FTP_UP_CHUNK);
+    if (!buf) {
+        pthread_mutex_lock(&f->f_lock);
+        f->up_error = true;
+        pthread_cond_broadcast(&f->up_cond);
+        pthread_mutex_unlock(&f->f_lock);
+        return NULL;
+    }
+    bool first = true;   /* 首块 STOR（截断），后续 APPE（追加） */
+    for (;;) {
+        pthread_mutex_lock(&f->f_lock);
+        /* 等待：有未上传数据（up_upto < file_end）或停止/回退信号 */
+        while (!f->up_stop && !f->retransmit && !f->up_error && f->up_upto >= f->file_end)
+            pthread_cond_wait(&f->up_cond, &f->f_lock);
+        if (f->retransmit || f->up_error) { pthread_mutex_unlock(&f->f_lock); break; }
+        if (f->up_upto >= f->file_end) { pthread_mutex_unlock(&f->f_lock); break; }  /* 追平（含 up_stop） */
+        off_t off = f->up_upto;
+        size_t want = (size_t)(f->file_end - off);
+        if (want > FTP_UP_CHUNK) want = FTP_UP_CHUNK;
+        pthread_mutex_unlock(&f->f_lock);
+
+        ssize_t got = pread(f->tmp_fd, buf, want, off);
+        if (got <= 0) {
+            pthread_mutex_lock(&f->f_lock);
+            f->up_error = true;
+            pthread_cond_broadcast(&f->up_cond);
+            pthread_mutex_unlock(&f->f_lock);
+            break;
+        }
+        if (ftp_stream_chunk(f, buf, (size_t)got, !first) != 0) {
+            pthread_mutex_lock(&f->f_lock);
+            f->up_error = true;
+            pthread_cond_broadcast(&f->up_cond);
+            pthread_mutex_unlock(&f->f_lock);
+            break;
+        }
+        first = false;
+        pthread_mutex_lock(&f->f_lock);
+        f->up_upto = off + (off_t)got;
+        pthread_cond_broadcast(&f->up_cond);   /* 背压解除 / flush 追平通知 */
+        pthread_mutex_unlock(&f->f_lock);
+    }
+    free(buf);
+    return NULL;
 }
 
 /* 写模式上传：读本地临时文件 → STOR 全量上传（带并发重试）。
@@ -1118,12 +1509,15 @@ static int ftp_backend_upload(FtpBackendFile* f) {
     f->tmp_fd = -1;
 
     int rc = 0;
-    if (ensure_curl(f->bk) == 0) {
+    /* 独立写句柄（选项同读句柄：用户名/密码/弱网超时）：不复用共享 bk->curl，
+       并发多文件 STOR 不再竞争 op_lock（此前 res=43 的竞争窗口由此根除）；
+       句柄缓存在文件上，同文件多次 FLUSH/补传复用连接池 */
+    if (!f->write_curl) f->write_curl = ftp_read_curl_new(f->bk);
+    if (f->write_curl) {
         struct ReadBuf rb = {data ? data : "", got, 0};
         CURLcode res = CURLE_OK;
-        /* 上传失败自动重试：并发 STOR（多进程同时 close）或网络瞬态
-           会让共享句柄的 perform 返回 CURLE_BAD_FUNCTION_ARGUMENT 等
-           瞬时错误（已实测 res=43）；重试吸收竞争窗口，避免上传静默丢失
+        /* 上传失败自动重试：网络瞬态让 perform 返回 CURLE_BAD_FUNCTION_ARGUMENT
+           等瞬时错误（已实测 res=43）；重试吸收竞争窗口，避免上传静默丢失
            （FLUSH 错误会传播给 close() → 应用读到 EIO） */
         int backoff_ms = 200;   /* 弱网适配：上传失败指数退避 200ms→3.2s 封顶 */
         for (int attempt = 0; attempt < 5; attempt++) {
@@ -1131,23 +1525,22 @@ static int ftp_backend_upload(FtpBackendFile* f) {
                 usleep((useconds_t)backoff_ms * 1000);
                 if (backoff_ms < 3200) backoff_ms *= 2;
             }
-            if (ensure_curl(f->bk) != 0) { res = CURLE_FAILED_INIT; break; }
             rb.pos = 0;
-            pthread_mutex_lock(&f->bk->op_lock);
-            ftp_reset_opts(f->bk);
-            curl_easy_setopt(f->bk->curl, CURLOPT_URL, f->ftp_path);
-            curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 1L);
-            curl_easy_setopt(f->bk->curl, CURLOPT_INFILESIZE, (long)got);
-            curl_easy_setopt(f->bk->curl, CURLOPT_READFUNCTION, read_cb);
-            curl_easy_setopt(f->bk->curl, CURLOPT_READDATA, &rb);
-            res = curl_easy_perform(f->bk->curl);
-            curl_easy_setopt(f->bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
-            pthread_mutex_unlock(&f->bk->op_lock);
+            ftp_reset_opts_curl(f->write_curl);
+            curl_easy_setopt(f->write_curl, CURLOPT_URL, f->ftp_path);
+            curl_easy_setopt(f->write_curl, CURLOPT_UPLOAD, 1L);
+            curl_easy_setopt(f->write_curl, CURLOPT_INFILESIZE, (long)got);
+            curl_easy_setopt(f->write_curl, CURLOPT_READFUNCTION, read_cb);
+            curl_easy_setopt(f->write_curl, CURLOPT_READDATA, &rb);
+            res = curl_easy_perform(f->write_curl);
+            curl_easy_setopt(f->write_curl, CURLOPT_UPLOAD, 0L);
             if (res == CURLE_OK) break;
             if (f->bk->silent) break;   /* 静默模式：失败后不再重试（无网络空转） */
         }
         if (res != CURLE_OK) {
-            reset_curl(f->bk, true);   /* 上传失败：计入熔断 */
+            curl_easy_cleanup(f->write_curl);   /* 失败句柄可能已半损坏，重建 */
+            f->write_curl = NULL;
+            mark_failure(f->bk);   /* 计入熔断 */
             rc = -EIO;
         }
     } else {
@@ -1157,18 +1550,39 @@ static int ftp_backend_upload(FtpBackendFile* f) {
     if (rc == 0) {
         f->uploaded = true;
         mark_success(f->bk);   /* 上传成功：清零熔断计数（网络恢复退出静默） */
+        ftp_stat_cache_clear(f->bk);   /* STOR 完成：整表失效，杜绝写后旧 stat */
     }
     return rc;
 }
 
-/* FLUSH 数据收尾：写模式完成 STOR 上传但**保留句柄**——FUSE 的 FLUSH 在
+/* FLUSH 数据收尾：写模式完成上传但**保留句柄**——FUSE 的 FLUSH 在
    每次 close() 调用（dup/fork 可多次），句柄销毁必须等 RELEASE（最后一个
    引用关闭后），否则存活 fd 的后续读写会命中已销毁句柄（-EINVAL）；
    读模式无操作。返回 0 成功。 */
 int ftp_backend_flush(uint64_t h) {
     FtpBackendFile* f = ftp_handle_get(h);
     if (!f) return -EINVAL;
-    return ftp_backend_upload(f);
+    if (!f->writing) return 0;
+    /* S4 流式收尾：请求上传线程追平并等待其完成；
+       乱序/出错时线程已退出，走全量重传兜底 */
+    if (f->up_started) {
+        pthread_mutex_lock(&f->f_lock);
+        f->up_stop = true;                 /* 追平剩余尾部后退出 */
+        pthread_cond_broadcast(&f->up_cond);
+        while (f->up_upto < f->file_end && !f->retransmit && !f->up_error)
+            pthread_cond_wait(&f->up_cond, &f->f_lock);
+        pthread_mutex_unlock(&f->f_lock);
+        pthread_join(f->up_tid, NULL);
+        pthread_mutex_lock(&f->f_lock);
+        f->up_started = false;
+        pthread_mutex_unlock(&f->f_lock);
+    }
+    if (f->retransmit || f->up_error || f->up_upto < f->file_end)
+        return ftp_backend_upload(f);      /* 乱序/出错/未追平：全量重传覆盖 */
+    f->uploaded = true;
+    mark_success(f->bk);
+    ftp_stat_cache_clear(f->bk);           /* 流式 STOR/APPE 完成：整表失效 */
+    return 0;
 }
 
 int ftp_backend_release(uint64_t h) {
@@ -1176,8 +1590,19 @@ int ftp_backend_release(uint64_t h) {
     if (!f) return -EINVAL;
     int rc = 0;
 
+    /* S4：写模式先停止并 join 流式上传线程（追平尾部或线程已因
+       retransmit/error 退出），确保后续 upload 兜底不再有并发读 tmp_fd */
+    if (f->up_started) {
+        pthread_mutex_lock(&f->f_lock);
+        f->up_stop = true;
+        pthread_cond_broadcast(&f->up_cond);
+        pthread_mutex_unlock(&f->f_lock);
+        pthread_join(f->up_tid, NULL);
+        f->up_started = false;
+    }
+
     if (f->writing && !f->uploaded) {
-        /* FLUSH 未完成上传（未调用/失败）时补传，随后统一销毁句柄 */
+        /* FLUSH 未完成上传（未调用/失败/乱序重传）时补传，随后统一销毁句柄 */
         if (ftp_backend_upload(f) != 0) rc = -EIO;
     }
 
@@ -1200,11 +1625,17 @@ int ftp_backend_release(uint64_t h) {
     }
     if (f->tmp_fd >= 0) close(f->tmp_fd);
     if (f->read_curl) {
-        curl_easy_cleanup(f->read_curl);
+        /* S3：归还句柄池（FTP 控制连接保持，供下次 open 复用） */
+        ftp_read_curl_release(f->bk, f->read_curl);
         f->read_curl = NULL;
+    }
+    if (f->write_curl) {
+        curl_easy_cleanup(f->write_curl);
+        f->write_curl = NULL;
     }
     free(f->rbuf);
     f->rbuf = NULL;
+    if (f->writing) pthread_cond_destroy(&f->up_cond);   /* 写模式 open 时 init */
     pthread_mutex_destroy(&f->f_lock);
 
     ftp_handle_free(h);
@@ -1272,6 +1703,7 @@ static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int 
         reset_curl(bk, true);   /* 命令失败：计入熔断 */
         return ok_code ? -ok_code : -EPERM;
     }
+    ftp_stat_cache_clear(bk);   /* DELE/MKD/RMD 成功：整表失效 */
     return 0;
 }
 
@@ -1316,6 +1748,7 @@ int ftp_backend_rename(const char* from, const char* to) {
     pthread_mutex_unlock(&bk->op_lock);
     curl_slist_free_all(slist);
     if (res != CURLE_OK) { reset_curl(bk, true); return -EIO; }   /* 重命名失败：计入熔断 */
+    ftp_stat_cache_clear(bk);   /* RNFR/RNTO 成功：整表失效（from/to 均可能被缓存） */
     return 0;
 }
 
@@ -1346,6 +1779,7 @@ int ftp_backend_truncate(const char* path, off_t size) {
         curl_easy_setopt(bk->curl, CURLOPT_UPLOAD, 0L);   /* 锁内清理，防并发竞争句柄 */
         pthread_mutex_unlock(&bk->op_lock);
         if (res != CURLE_OK) { reset_curl(bk, true); return -EIO; }   /* 截断失败：计入熔断 */
+        ftp_stat_cache_clear(bk);   /* STOR 空文件截断成功：整表失效 */
         return 0;
     }
     return -EIO;  // 非零截断暂不支持

@@ -32,6 +32,10 @@ def setup():
     (Path(STORAGE)/"0/Download/Music/song.mp3").write_text("music")
     (Path(STORAGE)/"0/Download/中文.txt").write_text("zh")
     (Path(STORAGE)/"0/Download/a b.txt").write_text("spaces")
+    # 精确文件重定向 fixture：report.pdf 与其 .bak 共存，验证只重定向特定文件
+    (Path(STORAGE)/"0/Download/report.pdf").write_text("pdf-orig")
+    (Path(STORAGE)/"0/Download/report.pdf.bak").write_text("bak-orig")
+    (Path(STORAGE)/"0/Download/Docs/report.pdf").write_text("pdf-redir")
     Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").parent.mkdir(parents=True,exist_ok=True)
     Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").write_text("deep")
     Path(f"{STORAGE}/0/Empty").mkdir(exist_ok=True)
@@ -196,6 +200,32 @@ REDIRECT /国际/ /Download/""", [
 REDIRECT /特殊/ /Download/""", [
         ("空格","0/特殊/a b.txt","spaces"),
     ],"13.特殊字符")
+
+    # ── REDIRECT 通配符 ──
+    # /Download/*.mp3 匹配任意 .mp3 文件，重定向到 /Download/Music/ 下同名文件，
+    # 非 .mp3 文件不误伤
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /Download/*.mp3 /Download/Music/""", [
+        ("R通配:mp3重定向","0/Download/song.mp3","music"),
+        ("R通配:非mp3不误伤","0/Download/hi.txt","hello"),
+    ],"13b.REDIRECT通配")
+
+    # ── REDIRECT 精确文件不误伤 ──
+    # 完整文件路径重定向：只重定向 report.pdf，同目录 report.pdf.bak 不受影响
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /Download/report.pdf /Download/Docs/report.pdf""", [
+        ("R精确:pdf重定向","0/Download/report.pdf","pdf-redir"),
+        ("R精确:bak不误伤","0/Download/report.pdf.bak","bak-orig"),
+    ],"13c.REDIRECT精确文件")
+
+    # ── ALLOW 通配符 ──
+    # 通配 ALLOW 不再被拒绝（旧实现 LOG_WRN 丢弃规则），豁免命中路径自身存储，
+    # 其他路径不受影响
+    run("""[GLOBAL] MONITOR OFF
+ALLOW /Download/Music/*.mp3""", [
+        ("A通配:mp3可见","0/Download/Music/song.mp3","music"),
+        ("A通配:其他不受影响","0/Download/hi.txt","hello"),
+    ],"13d.ALLOW通配")
 
     # ── 深层路径 ──
     run("""[GLOBAL] MONITOR OFF

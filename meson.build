@@ -234,8 +234,12 @@ if target_os == 'gnu'
   endif
   ftp_curl_inc = []
 else
-  curl_a_dir = '/home/bdy/curl-8.21.0/lib/.libs'
-  curl_inc_dir = '/home/bdy/curl-8.21.0/include'
+  curl_root = get_option('curl_dir')
+  if curl_root == ''
+    error('Android 构建需要预构建 libcurl，请用 -Dcurl_dir=<根目录> 指定（含 lib/.libs/libcurl.a 与 include/）')
+  endif
+  curl_a_dir = curl_root + '/lib/.libs'
+  curl_inc_dir = curl_root + '/include'
   ftp_curl_dep = meson.get_compiler('c').find_library('curl',
     dirs: [curl_a_dir], required: true, static: true)
   ftp_curl_inc = include_directories(curl_inc_dir)
@@ -243,7 +247,7 @@ else
   # （CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，curl >= 7.55.0），防止误用旧库
   if not meson.get_compiler('c').has_header_symbol('curl/curl.h',
       'CURLINFO_CONTENT_LENGTH_DOWNLOAD_T', include_directories: ftp_curl_inc)
-    error('预构建 libcurl（/home/bdy/curl-8.21.0）头文件缺少 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，请确认使用 curl >= 8.21.0')
+    error('预构建 libcurl（' + curl_root + '）头文件缺少 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，请确认使用 curl >= 8.21.0')
   endif
 endif
 
