@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <unistd.h>
 #ifdef TARGET_ANDROID
 #include <sys/system_properties.h>
 #endif
@@ -238,6 +239,45 @@ char* get_self_dir() {
     } else { strncpy(g_self_dir, "/data/local/tmp", sizeof(g_self_dir) - 1); g_self_dir[sizeof(g_self_dir) - 1] = '\0'; }
     return g_self_dir;
 }
+/* 读取整个文件到堆内存（动态扩容，尾随 NUL）：injector 的 mount_manager
+   与 ns_utils 原各自实现一份，现统一为公共工具（见 common.h 声明） */
+char* read_file_dynamic(const char* path, size_t* out_size) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    size_t capacity = 65536;
+    size_t size = 0;
+    char* buf = malloc(capacity);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    while (1) {
+        ssize_t r = read(fd, buf + size, capacity - size - 1);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        if (r == 0) break;
+        size += r;
+        if (size >= capacity - 1) {
+            capacity *= 2;
+            char* nb = realloc(buf, capacity);
+            if (!nb) {
+                free(buf);
+                close(fd);
+                return NULL;
+            }
+            buf = nb;
+        }
+    }
+    close(fd);
+    buf[size] = '\0';
+    if (out_size) *out_size = size;
+    return buf;
+}
+
 int mkdir_recursive(const char *dir) {
     if (!dir) return -1;
     size_t in_len = strlen(dir);

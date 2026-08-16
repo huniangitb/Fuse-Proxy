@@ -16,42 +16,8 @@
 #include <sys/system_properties.h>
 #endif
 
-static char* read_file_dynamic(const char* path, size_t* out_size) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return NULL;
-    size_t capacity = 65536;
-    size_t size = 0;
-    char* buf = malloc(capacity);
-    if (!buf) {
-        close(fd);
-        return NULL;
-    }
-    while (1) {
-        ssize_t r = read(fd, buf + size, capacity - size - 1);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            free(buf);
-            close(fd);
-            return NULL;
-        }
-        if (r == 0) break;
-        size += r;
-        if (size >= capacity - 1) {
-            capacity *= 2;
-            char* new_buf = realloc(buf, capacity);
-            if (!new_buf) {
-                free(buf);
-                close(fd);
-                return NULL;
-            }
-            buf = new_buf;
-        }
-    }
-    buf[size] = '\0';
-    close(fd);
-    if (out_size) *out_size = size;
-    return buf;
-}
+/* read_file_dynamic 已抽取至 src/core/common.c（公共工具，见 common.h），
+   此处不再重复实现 */
 
 bool app_has_active_rules(const char* pkg, uid_t uid) {
     int user_id = uid / 100000;
@@ -372,6 +338,10 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         return 0;
     }
     
+    /* preserve 目标收集：combined 挂载保留 target 下原生子视图（如
+       Android/data）时使用。备份复制已弃用（不再 mount target→backup），
+       恢复源改为直接 bind /mnt/ 下系统视图（多用户族根）——收集的仍是
+       target 下的原生子挂载清单（规则非冲突项） */
     char preserve_paths[16][256];
     int preserve_count = 0;
     if (mnt.target_is_mounted && has_rules && !is_bpf_fuse_running()) {
