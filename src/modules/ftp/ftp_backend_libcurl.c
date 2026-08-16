@@ -13,6 +13,7 @@
 #include "ftp_backend.h"
 #include <curl/curl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -85,6 +86,9 @@ typedef struct FtpBackend {
     CURL* read_pool[FTP_READ_POOL_MAX];
     int read_pool_count;
     pthread_mutex_t pool_lock;   /* 读句柄池锁（仅 open/release/clear 触碰） */
+    bool mutex_inited;           /* 每后端互斥锁是否已初始化（槽位复用：clear
+                                    不再 destroy，add 仅首次 init，杜绝在途
+                                    操作使用已销毁锁 → SIGSEGV） */
 } FtpBackend;
 
 /* 目录 mtime 缓存 TTL：目录时间变化不频繁，30s 内复用缓存足够 */
@@ -189,6 +193,13 @@ static bool silent_fast_fail(FtpBackend* bk) {
 
 static FtpBackend g_backends[FTP_BACKEND_MAX];
 static int g_backend_count = 0;
+/* 后端数组全局锁 + 热重载标志：
+   - g_backend_glock：保护 g_backend_count 与 g_backends 数组的增删扫描
+     （find/add/clear/retry_all），杜绝热重载清表与在途查找的数组撕裂
+   - g_backend_clearing：ftp.conf 热重载（ftp_backend_clear）期间置位，
+     find 立即拒绝新调用，保证 clear 之后不会有新操作触碰已清理的后端 */
+static pthread_mutex_t g_backend_glock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool g_backend_clearing = false;
 
 /* ================= 文件句柄（每个打开的文件一个） ================= */
 
@@ -347,23 +358,39 @@ static size_t read_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
 /* ================= 后端管理 ================= */
 
 int ftp_backend_add(const FtpServerCfg* cfg) {
-    if (!cfg || !cfg->name[0] || g_backend_count >= FTP_BACKEND_MAX) return -1;
+    if (!cfg || !cfg->name[0]) return -1;
+    pthread_mutex_lock(&g_backend_glock);
+    if (g_backend_count >= FTP_BACKEND_MAX) {
+        pthread_mutex_unlock(&g_backend_glock);
+        return -1;
+    }
     FtpBackend* bk = &g_backends[g_backend_count];
     memset(bk, 0, sizeof *bk);
     bk->cfg = *cfg;
     snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
-    pthread_mutex_init(&bk->lock, NULL);
-    pthread_mutex_init(&bk->op_lock, NULL);
-    pthread_mutex_init(&bk->pool_lock, NULL);
-    pthread_mutex_init(&bk->stat_lock, NULL);
+    /* 互斥锁仅首次初始化：clear 不再 destroy，槽位复用不重复 init
+       （对已初始化 mutex 重复 pthread_mutex_init 属未定义行为） */
+    if (!bk->mutex_inited) {
+        pthread_mutex_init(&bk->lock, NULL);
+        pthread_mutex_init(&bk->op_lock, NULL);
+        pthread_mutex_init(&bk->pool_lock, NULL);
+        pthread_mutex_init(&bk->stat_lock, NULL);
+        bk->mutex_inited = true;
+    }
     bk->curl = curl_easy_init();
     g_backend_count++;
+    pthread_mutex_unlock(&g_backend_glock);
     return 0;
 }
 
 void ftp_backend_clear(void) {
+    atomic_store_explicit(&g_backend_clearing, true, memory_order_release);
+    pthread_mutex_lock(&g_backend_glock);
     for (int i = 0; i < g_backend_count; i++) {
         FtpBackend* bk = &g_backends[i];
+        /* 在途 curl 操作持 op_lock：先取锁再清理，串行化 curl_easy_cleanup，
+           避免与在途 curl_easy_perform 竞态（句柄 UAF → SIGSEGV） */
+        pthread_mutex_lock(&bk->op_lock);
         if (bk->curl) {
             curl_easy_cleanup(bk->curl);
             bk->curl = NULL;
@@ -373,25 +400,32 @@ void ftp_backend_clear(void) {
             if (bk->read_pool[p]) curl_easy_cleanup(bk->read_pool[p]);
         }
         bk->read_pool_count = 0;
-        pthread_mutex_destroy(&bk->lock);
-        pthread_mutex_destroy(&bk->op_lock);
-        pthread_mutex_destroy(&bk->pool_lock);
-        pthread_mutex_destroy(&bk->stat_lock);
+        pthread_mutex_unlock(&bk->op_lock);
+        /* 不再 pthread_mutex_destroy：槽位复用，互斥锁生命周期与模块一致，
+           杜绝在途操作 pthread_mutex_lock 已销毁锁 → UB/SIGSEGV */
     }
     g_backend_count = 0;
+    pthread_mutex_unlock(&g_backend_glock);
+    atomic_store_explicit(&g_backend_clearing, false, memory_order_release);
 }
 
 int ftp_backend_count(void) { return g_backend_count; }
 
 /* 找 path 命中的后端 */
 static FtpBackend* ftp_backend_find(const char* path) {
+    if (atomic_load_explicit(&g_backend_clearing, memory_order_acquire)) return NULL;
+    pthread_mutex_lock(&g_backend_glock);
+    FtpBackend* r = NULL;
     for (int i = 0; i < g_backend_count; i++) {
         size_t plen = strlen(g_backends[i].prefix);
         if (strncmp(g_backends[i].prefix, path, plen) == 0 &&
-            (path[plen] == '\0' || path[plen] == '/'))
-            return &g_backends[i];
+            (path[plen] == '\0' || path[plen] == '/')) {
+            r = &g_backends[i];
+            break;
+        }
     }
-    return NULL;
+    pthread_mutex_unlock(&g_backend_glock);
+    return r;
 }
 
 /* 构建 FTP URL（不编码 /，FTP 协议路径直接使用） */

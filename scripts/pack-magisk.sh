@@ -6,11 +6,12 @@
 #   1. 从 Android 交叉构建目录同步最新二进制到模块骨架目录
 #   2. 同步模块 .rules 规则类型注册文件与 conf 配置
 #   3. 设置可执行权限（0755）
-#   4. 打包为 Magisk 模块 zip（保留可执行权限位，无系统 zip 依赖）
-#   5. 打包后自动验证（文件数/关键文件/权限位）
+#   4. 自动写入版本号到 module.prop（默认 2.0，-v 可覆盖）
+#   5. 打包为 Magisk 模块 zip（保留可执行权限位，无系统 zip 依赖）
+#   6. 打包后自动验证（文件数/关键文件/权限位）
 #
 # 用法：
-#   scripts/pack-magisk.sh                        # 使用默认路径
+#   scripts/pack-magisk.sh                        # 使用默认路径（版本自动为 2.0）
 #   scripts/pack-magisk.sh -m <模块目录> -b <构建目录> -o <输出zip>
 #
 # 选项：
@@ -18,8 +19,8 @@
 #   -b, --build-dir <dir>    Android 交叉构建目录（默认 $REPO/build_android）
 #   -r, --rules-dir <dir>    模块 .rules 注册文件源目录（默认 $REPO/src/modules）
 #   -c, --conf-dir <dir>     conf 配置源目录（默认 $REPO/conf）
-#   -o, --out <file>         输出 zip 路径（默认 /home/bdy/ftp/upload/Namespace-Proxy-v2.0-test.zip）
-#   -v, --version <str>      版本号（用于重命名输出，可选）
+#   -o, --out <file>         输出 zip 路径（默认 /home/bdy/ftp/upload/Namespace-Proxy-<版本>.zip）
+#   -v, --version <str>      版本号（默认 2.0；打包时自动写入 module.prop 并用于输出文件名）
 #   -h, --help               显示本帮助
 # =============================================================================
 set -euo pipefail
@@ -32,8 +33,8 @@ MODULE_DIR="${MODULE_DIR:-/tmp/nsp_module}"
 BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build_android}"
 RULES_DIR="${RULES_DIR:-$REPO_DIR/src/modules}"
 CONF_DIR_SRC="${CONF_DIR_SRC:-$REPO_DIR/conf}"
-OUT_ZIP="${OUT_ZIP:-/home/bdy/ftp/upload/Namespace-Proxy-v2.0-test.zip}"
-VERSION_STR=""
+OUT_ZIP="${OUT_ZIP:-}"               # 输出 zip 路径（未指定时按版本号自动生成）
+MODULE_VERSION="${MODULE_VERSION:-2.0}"  # 模块版本号：自动写入 module.prop 并用于输出命名
 
 usage() {
     sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -47,16 +48,14 @@ while [[ $# -gt 0 ]]; do
         -r|--rules-dir)  RULES_DIR="$2";  shift 2 ;;
         -c|--conf-dir)   CONF_DIR_SRC="$2"; shift 2 ;;
         -o|--out)        OUT_ZIP="$2";    shift 2 ;;
-        -v|--version)    VERSION_STR="$2"; shift 2 ;;
+        -v|--version)    MODULE_VERSION="$2"; shift 2 ;;
         -h|--help)       usage ;;
         *) echo "未知参数: $1" >&2; usage ;;
     esac
 done
 
-# 版本号：若指定则输出文件名带版本
-if [[ -n "$VERSION_STR" ]]; then
-    OUT_ZIP="$(dirname "$OUT_ZIP")/Namespace-Proxy-$VERSION_STR.zip"
-fi
+# 版本号：默认 2.0（-v 可覆盖），未显式指定 -o 时输出文件名带版本号
+OUT_ZIP="${OUT_ZIP:-/home/bdy/ftp/upload/Namespace-Proxy-$MODULE_VERSION.zip}"
 
 # ============================ 前置校验 ============================
 for d in "$MODULE_DIR" "$BUILD_DIR" "$RULES_DIR" "$CONF_DIR_SRC"; do
@@ -66,6 +65,7 @@ done
 
 echo "== 模块骨架: $MODULE_DIR"
 echo "== 构建目录: $BUILD_DIR"
+echo "== 版本号:   $MODULE_VERSION"
 echo "== 输出:     $OUT_ZIP"
 
 # ============================ 1. 同步二进制 ============================
@@ -118,6 +118,20 @@ chmod 755 "$MODULE_DIR"/bin/* 2>/dev/null || true
 chmod 755 "$MODULE_DIR"/bin/modules/*/*.so 2>/dev/null || true
 chmod 755 "$MODULE_DIR"/customize.sh "$MODULE_DIR"/service.sh \
          "$MODULE_DIR"/uninstall.sh "$MODULE_DIR"/zygisk/*.so 2>/dev/null || true
+
+# ============================ 3.5 自动写入版本号 ============================
+echo "== 自动设置模块版本号: $MODULE_VERSION ..."
+sed -i "s#^version=.*#version=$MODULE_VERSION#" "$MODULE_DIR/module.prop"
+grep -q '^version=' "$MODULE_DIR/module.prop" || { echo "错误: module.prop 缺少 version 行" >&2; exit 1; }
+
+# versionCode 实时跟随仓库提交数量（git rev-list --count HEAD），缺失则追加
+VERCODE="$(git -C "$REPO_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
+if grep -q '^versionCode=' "$MODULE_DIR/module.prop"; then
+    sed -i "s#^versionCode=.*#versionCode=$VERCODE#" "$MODULE_DIR/module.prop"
+else
+    echo "versionCode=$VERCODE" >> "$MODULE_DIR/module.prop"
+fi
+echo "== versionCode=$VERCODE (仓库提交数)"
 
 # ============================ 4. 打包 ============================
 echo "== 打包 zip ..."
