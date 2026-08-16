@@ -36,10 +36,16 @@
 #include "crash_dump.h"
 #include "module_loader.h"
 #include <fuse3/fuse_log.h>
+/* 透传 ABI：Android 用定制 libfuse 的 fuse_kernel.h（含 V0/V1/V2 旧式 ioctl 与
+   fuse_passthrough_out_v0）；GNU 用系统官方 libfuse——fuse_kernel.h 不随系统包安装，
+   改引内核 UAPI <linux/fuse.h>（提供 FUSE_DEV_IOC_BACKING_OPEN/BACKING_CLOSE 与
+   fuse_backing_map）。 */
 #ifdef TARGET_ANDROID
 #include <fuse3/fuse_kernel.h>
-#include <sys/ioctl.h>
+#else
+#include <linux/fuse.h>
 #endif
+#include <sys/ioctl.h>
 
 bool g_passthrough_enabled = false;
 bool g_preserve_perms = false;
@@ -47,10 +53,24 @@ bool g_disable_sandbox = false; /* 新增：禁用沙盒功能标志 */
 
 static int g_ready_fd = -1;
 static int g_global_root_fd = -1;
+/* 崩溃触发测试：--crash-test[=segv|abrt|bus]，验证崩溃日志捕获链路 */
+static int g_crash_test = 0;   /* 0=无 1=SIGSEGV 2=SIGABRT 3=SIGBUS */
 #ifdef TARGET_ANDROID
 static int g_bpf_fd = -1;           /* BPF program fd, -1 = disabled */
 #endif
 static bool g_passthrough_disabled = false; /* --no-passthrough 显式禁用 */
+/* 透传方法：init 阶段一次探测确认，open 阶段直连对应 ioctl，避免每次 open 走回退链。
+   GNU 构建同样启用（本机内核支持时经 BACKING_OPEN 协商） */
+typedef enum {
+    PT_METHOD_NONE = 0,     /* 未启用透传 */
+    PT_METHOD_UPSTREAM,     /* 上游 BACKING_OPEN（6.9+/GKI 6.12；老内核上同号即 V0） */
+    PT_METHOD_ANDROID_V2,   /* Android V2 旧式 ioctl */
+    PT_METHOD_ANDROID_V1,   /* Android V1 旧式 ioctl */
+    PT_METHOD_ANDROID_V0,   /* Android V0 旧式 ioctl */
+} passthrough_method_t;
+static passthrough_method_t g_pt_method = PT_METHOD_NONE;
+static bool g_pt_probe_pending = false;  /* GNU：init 无会话 fd，探测推迟到首次 open */
+static int passthrough_enable_fixed_method(int fd);  /* 实现见文件后部 */
 static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
 static char g_modules_dir_arg[PATH_MAX] = {0}; /* --modules-dir: 热插拔模块目录覆盖 */
 
@@ -781,20 +801,21 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
         VFS_RETURN(-err); 
     }
     fi->fh = fd;
-#ifdef TARGET_ANDROID
     if (g_passthrough_enabled) {
-        fuse_req_t req = fuse_get_context()->req;
-        int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
+        int backing_id = passthrough_enable_fixed_method(fd);
         if (backing_id > 0) {
-            fi->passthrough_fh = (uint32_t)backing_id;
-            LOG_DBG_PERF("FUSE Passthrough: ✅ %s -> passthrough_fh=%d (backing_id=%d)",
-                    sub_path, fi->passthrough_fh, backing_id);
+#ifdef TARGET_ANDROID
+            fi->passthrough_fh = (uint32_t)backing_id;   /* 定制 libfuse 的透传句柄字段 */
+#else
+            fi->backing_id = (int32_t)backing_id;        /* 系统 libfuse 官方高层透传字段 */
+#endif
+            LOG_DBG_PERF("FUSE Passthrough: ✅ %s -> backing_id=%d",
+                    sub_path, backing_id);
         } else {
             LOG_DBG_PERF("FUSE Passthrough: ❌ %s -> %s (errno=%d)",
                     sub_path, strerror(errno), errno);
         }
     }
-#endif
     VFS_RETURN(0);
 }
 
@@ -834,20 +855,21 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     }
     inherit_parent_attributes(p, S_IFREG);
     fi->fh = fd;
-#ifdef TARGET_ANDROID
     if (g_passthrough_enabled) {
-        fuse_req_t req = fuse_get_context()->req;
-        int backing_id = fuse_passthrough_enable(req, (unsigned int)fd);
+        int backing_id = passthrough_enable_fixed_method(fd);
         if (backing_id > 0) {
-            fi->passthrough_fh = (uint32_t)backing_id;
-            LOG_DBG_PERF("FUSE Passthrough: ✅ %s -> passthrough_fh=%d (backing_id=%d)",
-                    sub_path, fi->passthrough_fh, backing_id);
+#ifdef TARGET_ANDROID
+            fi->passthrough_fh = (uint32_t)backing_id;   /* 定制 libfuse 的透传句柄字段 */
+#else
+            fi->backing_id = (int32_t)backing_id;        /* 系统 libfuse 官方高层透传字段 */
+#endif
+            LOG_DBG_PERF("FUSE Passthrough: ✅ %s -> backing_id=%d",
+                    sub_path, backing_id);
         } else {
             LOG_DBG_PERF("FUSE Passthrough: ❌ %s -> %s (errno=%d)",
                     sub_path, strerror(errno), errno);
         }
     }
-#endif
     VFS_RETURN(0);
 }
 
@@ -1545,76 +1567,108 @@ static void vfs_destroy(void *private_data) {
     char msg[256]; snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid()); send_ipc_message(msg);
 }
 
-static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
-    cfg->use_ino = 1; cfg->entry_timeout = 1.0; cfg->attr_timeout = 1.0; cfg->negative_timeout = 0.5;
-    signal(SIGPIPE, SIG_IGN);
-    g_passthrough_enabled = false;
-    
-#ifdef TARGET_ANDROID
-    if (g_passthrough_disabled) {
-        LOG("FUSE Passthrough: 已被 --no-passthrough 参数禁用");
-        goto skip_passthrough;
-    }
-    
-    if (conn->capable & FUSE_CAP_PASSTHROUGH)
-        LOG_DBG("FUSE Passthrough: 内核能力标志包含passthrough (capable=0x%x)", conn->capable);
-    else
-        LOG_DBG("FUSE Passthrough: 内核能力标志未包含passthrough, 尝试直接ioctl探测");
-        
+/* 透传会话 fd：经 fuse_get_context()->fuse → fuse_get_session → fuse_session_fd 解析
+   （不依赖 conn->fd——系统 libfuse 的 fuse_conn_info 无该成员，GNU 下同样可用） */
+static int passthrough_session_fd(void) {
+    struct fuse_context *ctx = fuse_get_context();
+    if (!ctx || !ctx->fuse) return -1;
+    struct fuse_session *se = fuse_get_session(ctx->fuse);
+    if (!se) return -1;
+    return fuse_session_fd(se);
+}
+
+/* 透传方法探测：用普通文件测试 BACKING_OPEN（上游/新内核；老内核上同号即 V0），
+   V2/V1/V0 仅 Android 旧式 ioctl 兜底。结果写入 g_passthrough_enabled/g_pt_method。
+   探测fd必须用普通文件：BACKING_OPEN 要求 d_is_reg，字符设备会被内核拒绝并返回
+   EINVAL(errno=22)——这正是 6.12 设备上报「协商失败 errno=22」的根因。 */
+static void passthrough_probe(int dev_fd) {
     int backing_id = -1;
     int saved_errno = 0;
-    bool ioctl_exists = false;  
-    int test_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    bool ioctl_exists = false;
+    passthrough_method_t method = PT_METHOD_NONE;
+    char probe_path[64];
+#ifdef TARGET_ANDROID
+    snprintf(probe_path, sizeof(probe_path), "/data/local/tmp/.fuse_pt_probe.%d", getpid());
+#else
+    snprintf(probe_path, sizeof(probe_path), "/tmp/.fuse_pt_probe.%d", getpid());
+#endif
+    int test_fd = open(probe_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (test_fd < 0) {
-        LOG_ERR("FUSE Passthrough: ❌ 无法打开/dev/null测试fd: %s", strerror(errno));
-        goto ioctl_probe_done;
+        LOG_ERR("FUSE Passthrough: ❌ 无法创建探测文件 %s: %s", probe_path, strerror(errno));
+        return;
     }
-    
-    backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &test_fd);
+
+    /* 1) 上游/新内核: FUSE_DEV_IOC_BACKING_OPEN(229/1, fuse_backing_map)。
+          老式 Android 内核上该 ioctl 号恰好也是 PASSTHROUGH_OPEN(V0), flags=0/padding=0
+          等价于旧式的 len=0/vec=NULL 调用, 两种内核都能命中。 */
+    struct fuse_backing_map map = { .fd = test_fd, .flags = 0, .padding = 0 };
+    backing_id = (int)ioctl(dev_fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
     if (backing_id > 0) {
         ioctl_exists = true;
+        method = PT_METHOD_UPSTREAM;
     } else {
         saved_errno = errno;
         if (saved_errno == EPERM) {
             ioctl_exists = true;
-        } else if (saved_errno == ENOTTY) {
-            struct fuse_passthrough_out_v0 out = { .fd = (uint32_t)test_fd, .len = 0, .vec = NULL };
-            errno = 0;
-            backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1, &out);
+            method = PT_METHOD_UPSTREAM;
+        }
+#ifdef TARGET_ANDROID
+        else if (saved_errno == ENOTTY || saved_errno == EINVAL) {
+            /* 2) Android V2/V1/V0 旧式 ioctl 兜底 */
+            backing_id = (int)ioctl(dev_fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &test_fd);
             if (backing_id > 0) {
                 ioctl_exists = true;
+                method = PT_METHOD_ANDROID_V2;
             } else {
                 saved_errno = errno;
                 if (saved_errno == EPERM) {
                     ioctl_exists = true;
-                } else if (saved_errno == ENOTTY) {
+                    method = PT_METHOD_ANDROID_V2;
+                } else if (saved_errno == ENOTTY || saved_errno == EINVAL) {
+                    struct fuse_passthrough_out_v0 out = { .fd = (uint32_t)test_fd, .len = 0, .vec = NULL };
                     errno = 0;
-                    backing_id = (int)ioctl(conn->fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0, &out);
+                    backing_id = (int)ioctl(dev_fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1, &out);
                     if (backing_id > 0) {
                         ioctl_exists = true;
+                        method = PT_METHOD_ANDROID_V1;
                     } else {
                         saved_errno = errno;
                         if (saved_errno == EPERM) {
                             ioctl_exists = true;
+                            method = PT_METHOD_ANDROID_V1;
+                        } else if (saved_errno == ENOTTY || saved_errno == EINVAL) {
+                            errno = 0;
+                            backing_id = (int)ioctl(dev_fd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0, &out);
+                            if (backing_id > 0) {
+                                ioctl_exists = true;
+                                method = PT_METHOD_ANDROID_V0;
+                            } else {
+                                saved_errno = errno;
+                                if (saved_errno == EPERM) {
+                                    ioctl_exists = true;
+                                    method = PT_METHOD_ANDROID_V0;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+#endif
     }
-    
+    unlink(probe_path);
+
     if (ioctl_exists) {
         g_passthrough_enabled = true;
+        g_pt_method = method;   /* 记录已确认的透传方法，per-open 直连使用 */
         if (backing_id > 0) {
-            LOG("FUSE Passthrough: ✅ 协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
-            int close_ret = ioctl(conn->fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
+            LOG("FUSE Passthrough: ✅ ioctl协商成功! backing_id=%d, 文件I/O将走直通加速", backing_id);
+            int close_ret = ioctl(dev_fd, FUSE_DEV_IOC_BACKING_CLOSE, &backing_id);
             if (close_ret < 0)
                 LOG_DBG("FUSE Passthrough: 关闭测试backing_id=%d: %s", backing_id, strerror(errno));
         } else {
-            LOG_DBG("FUSE Passthrough: ioctl 已确认, 通过INIT请求启用...");
+            LOG_DBG("FUSE Passthrough: ioctl 已确认(EPERM), 交由 per-open 协商启用");
         }
-        conn->want |= FUSE_CAP_PASSTHROUGH;
-        LOG_DBG("FUSE Passthrough: ✅ 检测到内核支持, 已请求启用 (want=0x%x)", conn->want);
     } else {
         int err = saved_errno;
         switch (err) {
@@ -1630,18 +1684,98 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         }
     }
     close(test_fd);
+}
 
-ioctl_probe_done:
-skip_passthrough:
-#else
-    LOG("主线FUSE: passthrough 不可用，走标准用户态路径");
+/* 按 init 阶段已确认的透传方法执行单次 ioctl（open/create 直连，不走回退链），
+   返回 backing_id(>0) 或 <=0 */
+static int passthrough_enable_fixed_method(int fd) {
+    int sfd = passthrough_session_fd();
+    if (sfd < 0) return -1;
+    /* GNU：init 阶段无会话 fd，探测推迟到首次 open 时补执行一次 */
+    if (g_pt_probe_pending) {
+        g_pt_probe_pending = false;
+        passthrough_probe(sfd);
+    }
+    if (!g_passthrough_enabled) return -1;
+    int backing_id;
+    switch (g_pt_method) {
+    case PT_METHOD_UPSTREAM: {
+        struct fuse_backing_map map = { .fd = fd, .flags = 0, .padding = 0 };
+        backing_id = (int)ioctl(sfd, FUSE_DEV_IOC_BACKING_OPEN, &map);
+        break;
+    }
+#ifdef TARGET_ANDROID
+    case PT_METHOD_ANDROID_V2:
+        backing_id = (int)ioctl(sfd, FUSE_DEV_IOC_PASSTHROUGH_OPEN_V2, &fd);
+        break;
+    case PT_METHOD_ANDROID_V1:
+    case PT_METHOD_ANDROID_V0: {
+        struct fuse_passthrough_out_v0 out = { .fd = (uint32_t)fd, .len = 0, .vec = NULL };
+        backing_id = (int)ioctl(sfd,
+            (g_pt_method == PT_METHOD_ANDROID_V1) ? FUSE_DEV_IOC_PASSTHROUGH_OPEN_V1
+                                                  : FUSE_DEV_IOC_PASSTHROUGH_OPEN_V0,
+            &out);
+        break;
+    }
 #endif
+    default:
+        return -1;
+    }
+    return backing_id;
+}
+
+static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+    cfg->use_ino = 1; cfg->entry_timeout = 1.0; cfg->attr_timeout = 1.0; cfg->negative_timeout = 0.5;
+    signal(SIGPIPE, SIG_IGN);
+    g_passthrough_enabled = false;
+    
+    if (g_passthrough_disabled) {
+        LOG("FUSE Passthrough: 已被 --no-passthrough 参数禁用");
+        goto skip_passthrough;
+    }
+
+    /* —— 高版本内核(6.9+/GKI 6.12)的新协商方式, 与 AOSP FuseDaemon 的 pf_init 一致: ——
+     * 上游内核在 INIT 回包 capable 中直接上报 FUSE_PASSTHROUGH 能力(flags2 bit37/1ULL<<37,
+     * 老式 Android 内核为 flags bit31), libfuse 折算到 FUSE_CAP_PASSTHROUGH 位。
+     * 内核说支持就直接请求启用, 不再盲试 ioctl。 */
+    if (conn->capable & FUSE_CAP_PASSTHROUGH) {
+        conn->want |= FUSE_CAP_PASSTHROUGH;
+        g_passthrough_enabled = true;
+        g_pt_method = PT_METHOD_UPSTREAM;   /* 能力协商内核的透传 open 即 cmd1（BACKING_OPEN 号） */
+        LOG("FUSE Passthrough: ✅ 内核INIT能力协商成功 (capable=0x%x), 直接启用", conn->capable);
+        goto passthrough_done;
+    }
+    LOG_DBG("FUSE Passthrough: 内核INIT未上报passthrough能力, 回退ioctl探测 (capable=0x%x)", conn->capable);
+
+#ifdef TARGET_ANDROID
+    passthrough_probe(conn->fd);   /* Android：conn->fd 即会话 fd，init 直接探测 */
+    /* 注意：探测成功（BACKING_OPEN/V2/V1/V0 ioctl 直通）≠ 内核 INIT 上报了透传
+       能力（capable_ext 无 FUSE_CAP_PASSTHROUGH）。此时绝不置 want 位——否则
+       libfuse want_flags_valid 拒绝（unknown want flags: 0x20000000）→ EPROTO
+       → 连接终止。ioctl 直通透传不依赖 INIT 协商位，per-open 仍可正常工作。 */
+#else
+    /* GNU：init 回调拿不到会话 fd（高层 fuse_main），探测推迟到首次文件 open，
+       per-open 经 fuse_get_context 取会话 fd 后补执行一次 */
+    g_pt_probe_pending = true;
+    LOG_DBG("FUSE Passthrough: GNU 下 ioctl 探测推迟到首次文件 open");
+#endif
+
+passthrough_done:
+skip_passthrough:
     if (g_passthrough_enabled) {
         LOG("FUSE Passthrough: 🟢 启用成功");
+    } else if (g_pt_probe_pending) {
+        LOG("FUSE Passthrough: 透传探测已延迟，将在首次文件 open 时确认");
     } else {
         LOG_WRN("FUSE Passthrough: 所有文件I/O将走标准FUSE用户态路径 (性能较低)");
     }
     char msg[512]; snprintf(msg, 511, "FUSE_ALIVE Global %d", getpid()); send_ipc_message(msg);
+    /* 协商详情：内核上报能力与本端请求位——若后续就绪验证失败(内核 conn_error)，
+       据此可定位是哪个请求位被内核拒绝（如 DAX 设备把回包 legacy bit31 误读为
+       FUSE_MAP_ALIGNMENT 而拒绝回包） */
+    LOG("FUSE 协商详情: 内核 capable=0x%x, 本端 want=0x%x, 透传=%s",
+        (unsigned)conn->capable, (unsigned)conn->want,
+        g_passthrough_enabled ? "启用" : (g_pt_probe_pending ? "延迟探测" : "标准FUSE回退"));
     if (g_ready_fd >= 0) { write(g_ready_fd, "1", 1); close(g_ready_fd); g_ready_fd = -1; }
     return nullptr;
 }
@@ -1773,6 +1907,14 @@ int main(int argc, char *argv[]) {
 #endif
         } else if (strcmp(argv[i], "--no-passthrough") == 0) {
             g_passthrough_disabled = true;
+        } else if (strncmp(argv[i], "--crash-test", 12) == 0) {
+            /* 崩溃触发测试：--crash-test[=segv|abrt|bus]（默认 segv） */
+            const char* t = argv[i] + 12;
+            g_crash_test = 1;
+            if (*t == '=') {
+                if (strcmp(t + 1, "abrt") == 0) g_crash_test = 2;
+                else if (strcmp(t + 1, "bus") == 0) g_crash_test = 3;
+            }
         } else if (strcmp(argv[i], "--media-fuse") == 0) {
             g_is_media_fuse = true;
         } else if (strncmp(argv[i], "--modules-dir=", 14) == 0) {
@@ -1796,6 +1938,26 @@ int main(int argc, char *argv[]) {
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
     install_crash_handlers();
+    /* 崩溃触发测试：验证 error.log 记录与 stderr→fuse_crash.log 的 backtrace 捕获链路。
+       崩溃发生在挂载/模块初始化前，可独立运行（无需挂载）。 */
+    if (g_crash_test != 0) {
+        const char* what = g_crash_test == 1 ? "SIGSEGV" : g_crash_test == 2 ? "SIGABRT" : "SIGBUS";
+        LOG_ERR("崩溃触发测试(--crash-test): 即将触发 %s，请检查 error.log 与 fuse_crash.log 是否捕获完整 backtrace", what);
+        if (g_crash_test == 1) {
+            volatile int* p = NULL;
+            *p = 1;                       /* 空指针解引用 → SIGSEGV */
+        } else if (g_crash_test == 2) {
+            abort();                      /* → SIGABRT */
+        } else {
+#if defined(__aarch64__)
+            volatile char base[8] = {0};
+            /* 未对齐 8 字节原子存储：aarch64 的 STXR 要求对齐 → 真实 SIGBUS */
+            __atomic_store_n((volatile uint64_t*)(base + 1), 0x1122334455667788ULL, __ATOMIC_SEQ_CST);
+#else
+            raise(SIGBUS);                /* x86 无未对齐故障，直接 raise */
+#endif
+        }
+    }
     /* 热插拔模块系统：扫描模块目录并启动监控线程（规则模块能力在此注册） */
     uint32_t mod_flags = g_disable_sandbox ? NSP_FLAG_DISABLE_SANDBOX : 0;
     module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL, mod_flags);
