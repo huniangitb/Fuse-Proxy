@@ -106,7 +106,7 @@ common_sources = [
 ]
 
 fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c']
-injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/core/fast_pid.c']
+injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
 install_bin_dir = 'bin'
@@ -136,7 +136,7 @@ else
   # GNU 测试无法直接运行它；本驱动链接 ns_utils 的全局替换原语并以 CLI 暴露，
   # 供 tests/test_global_replace.py 在私有挂载命名空间中模拟安卓视图验证。
   executable('global_replace_ctl',
-    ['src/injector/global_replace_ctl.c', 'src/injector/ns_utils.c',
+    ['src/injector/global_replace_ctl.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c',
      'src/injector/inject_target.c', 'src/injector/mount_manager.c',
      'src/core/fast_pid.c'] + common_sources,
     include_directories: all_inc_dirs,
