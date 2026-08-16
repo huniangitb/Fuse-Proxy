@@ -557,9 +557,12 @@ static int do_restore_app_fuse(void* raw) {
         free(all); free(sub);
         return -1;
     }
-    int bind_failed = 0;   /* 任一 bind/mkdir 失败计数：返回非零让调用方记录错误
+    int bind_failed = 0;   /* 任一 bind/mkdir 失败计数：返回 -1 让调用方记录错误
                               （mount_manager 不失效缓存、保留重扫资格），避免
-                              部分还原被误报成功 */
+                              部分还原被误报成功。注意重试门槛：仅当顶层仍为
+                              项目 FUSE 视图时下一次扫描才可再次还原（is_project
+                              判定）；顶层 bind 已成功的子节点/f2fs 补充失败时
+                              顶层已是系统视图，本 -1 仅作诊断信号 */
     for (int k = 0; k < bn; k++) {
         const char* rel = sub[k].mount_point + strlen(backup_top);   /* "" 或 "/0/Android/data" */
         char tgt[PATH_MAX];
@@ -605,7 +608,8 @@ static int do_restore_app_fuse(void* raw) {
     }
     free(all); free(sub);
     if (bind_failed > 0) {
-        LOG_ERR("应用还原: %d 个节点 bind 失败，视图可能不完整，调用方可重试", bind_failed);
+        LOG_ERR("应用还原: %d 个节点 bind 失败，视图可能不完整（仅诊断信号：顶层若已"
+                "切换为系统视图，下一次扫描将跳过，不再重试；仅当顶层仍为项目 FUSE 时才可重试）", bind_failed);
         return -1;
     }
     return 0;

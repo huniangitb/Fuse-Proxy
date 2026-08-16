@@ -62,6 +62,12 @@ bool g_global_replace_mode = false;
    uid/gid/权限（不伪造为访问者权限） */
 static bool g_preserve_perms_flag = false;
 
+/* 回退处理标记：INIT 回包被内核拒绝（就绪验证 ECONNREFUSED 且 daemon 进程存活）时置位，
+   之后启动 fuse_daemon 一律附加 --no-passthrough，以标准 FUSE 模式规避透传协商位被拒 */
+static bool g_no_passthrough_fallback = false;
+/* 崩溃触发测试：--crash-test 传递给 fuse_daemon，验证崩溃日志捕获链路 */
+static bool g_crash_test = false;
+
 /* 重入保护：防止并发调用 inject_global_fuse() */
 static volatile int g_fuse_starting = 0;
 /* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
@@ -229,6 +235,39 @@ void handle_fuse_ready_event(void *ptr) {
         } else {
             if (faccessat(g_global_root_fd, g_global_fuse.mnt_path + 1, F_OK, 0) != 0) {
                 LOG_ERR("FUSE 就绪验证失败: stat(%s) → %s", g_global_fuse.mnt_path, strerror(errno));
+                /* ECONNREFUSED(=fc->conn_error)/ENOTCONN(=fc->connected 断开)：
+                   区分两类根因——daemon 进程死亡(崩溃/被杀) vs 进程存活但连接被内核中止(INIT 回包被拒) */
+                if (errno == ECONNREFUSED || errno == ENOTCONN) {
+                    if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) != 0) {
+                        /* ① daemon 已退出：连接随进程死亡而中止 */
+                        LOG_ERR("fuse_daemon(pid=%d) 已退出，连接随之中止（崩溃或被杀）", g_global_fuse.fuse_pid);
+                        dump_crash_log_tail();
+                    } else {
+                        /* ② daemon 存活但连接死亡：内核拒绝了 INIT 回包（fc->conn_error）。
+                           典型：DAX 内核把回包 legacy bit31 误读为 FUSE_MAP_ALIGNMENT，
+                           或回包请求了内核无法兑现的能力位——可对照 fuse_daemon 的
+                           “FUSE 协商详情 (capable/want)”日志定位具体位 */
+                        LOG_ERR("fuse_daemon 进程存活但 FUSE 连接被内核中止（fc->conn_error）");
+                        LOG_ERR("→ 判定: 内核拒绝了 INIT 回包（DAX 内核误读 legacy bit31 为 FUSE_MAP_ALIGNMENT，或请求位不被接受）");
+                        /* 回退处理：杀掉存活 daemon，后续以 --no-passthrough 标准 FUSE 模式重启，
+                           规避透传协商位导致回包再次被拒 */
+                        g_no_passthrough_fallback = true;
+                        LOG("回退处理: 透传协商异常，改用 --no-passthrough 标准 FUSE 模式重启");
+                        if (g_global_fuse.fuse_pid > 0) {
+                            kill(g_global_fuse.fuse_pid, SIGTERM);
+                            for (int w = 0; w < 50; w++) {
+                                if (kill(g_global_fuse.fuse_pid, 0) != 0) break;
+                                usleep(20000);
+                            }
+                            if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) == 0)
+                                kill(g_global_fuse.fuse_pid, SIGKILL);
+                        }
+                        dump_crash_log_tail();
+                    }
+                    g_fuse_ready = 0;
+                    g_pending_remount = 1;
+                    seconds_until_next_scan = 0;
+                }
             } else {
                 g_fuse_ready = 1;
                 LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
@@ -306,10 +345,12 @@ static void inject_global_fuse() {
         if (setns(fd, CLONE_NEWNS) != 0) { close(fd); _exit(11); }
         close(fd);
         if (mkdir(g_global_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
-        /* fuse_crash.log 懒创建：不带 O_CREAT——文件不存在（无历史崩溃）
-           时不创建空文件、不重定向 stderr（正常日志走 log_internal）；仅当
-           已有历史文件（上次崩溃残留）时才打开追加 */
-        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_APPEND | O_CLOEXEC, 0666);
+        /* fuse_crash.log 始终创建（O_CREAT）：确保首次崩溃即捕获完整
+           backtrace——daemon 的 stderr 重定向到此文件（crash_handler 的
+           backtrace 帧写 stderr），崩溃后 injector 的 dump_crash_log_tail()
+           读取其尾部。此前不带 O_CREAT 导致文件从不创建、stderr 不重定向，
+           backtrace 全部丢失（设备上 fuse_crash.log 从未出现即此原因） */
+        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
         if (log_fd >= 0) {
             dup2(log_fd, STDERR_FILENO);
             dup2(log_fd, STDOUT_FILENO);
@@ -340,6 +381,8 @@ static void inject_global_fuse() {
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
         if (g_preserve_perms_flag) args[ai++] = "--preserve-perms";
+        if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
+        if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
@@ -377,6 +420,7 @@ static void inject_global_fuse() {
 }
 
 static void inject_media_fuse() {
+    if (g_global_replace_mode) return;  /* 新挂载方案（全局替换）无需媒体专属 FUSE */
     if (g_media_fuse.disabled) return;
     if (g_media_fuse.fuse_pid > 0) {
         kill(g_media_fuse.fuse_pid, SIGTERM);
@@ -415,10 +459,12 @@ static void inject_media_fuse() {
         if (setns(fd, CLONE_NEWNS) != 0) { close(fd); _exit(11); }
         close(fd);
         if (mkdir(g_media_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
-        /* fuse_crash.log 懒创建：不带 O_CREAT——文件不存在（无历史崩溃）
-           时不创建空文件、不重定向 stderr（正常日志走 log_internal）；仅当
-           已有历史文件（上次崩溃残留）时才打开追加 */
-        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_APPEND | O_CLOEXEC, 0666);
+        /* fuse_crash.log 始终创建（O_CREAT）：确保首次崩溃即捕获完整
+           backtrace——daemon 的 stderr 重定向到此文件（crash_handler 的
+           backtrace 帧写 stderr），崩溃后 injector 的 dump_crash_log_tail()
+           读取其尾部。此前不带 O_CREAT 导致文件从不创建、stderr 不重定向，
+           backtrace 全部丢失（设备上 fuse_crash.log 从未出现即此原因） */
+        int log_fd = open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
         if (log_fd >= 0) {
             dup2(log_fd, STDERR_FILENO);
             dup2(log_fd, STDOUT_FILENO);
@@ -449,6 +495,8 @@ static void inject_media_fuse() {
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
         if (g_preserve_perms_flag) args[ai++] = "--preserve-perms";
+        if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
+        if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
         args[ai++] = arg_global;
         args[ai++] = (char*)log_lvl;
@@ -541,6 +589,10 @@ static void check_and_recover_fuse() {
                 LOG("FUSE 崩溃超限，恢复系统 emulated 视图");
                 ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT);
             }
+            /* 崩溃超限仍无法恢复正常：核心 FUSE 已不可用，injector 自动退出
+               （主循环退出后 do_cleanup 会终结残留 daemon 并完成卸载） */
+            LOG_ERR("FUSE 连续崩溃 %d 次仍无法恢复，injector 自动退出", g_global_fuse.crash_count);
+            g_should_exit = 1;
             return;
         }
         force_recover_tracked_mounts();
@@ -551,6 +603,11 @@ static void check_and_recover_fuse() {
         }
     }
     
+    /* 新挂载方案（全局替换模式）：媒体专属 FUSE 仅传统逐应用挂载方案需要。
+       全局替换下 /storage/emulated 已整体由全局 FUSE 提供代理视图，媒体模块
+       自动继承，无需专属 FUSE——整体跳过启动/崩溃恢复/热重载终结管理。 */
+    if (g_global_replace_mode) return;
+
     /* 
      * 媒体 FUSE 专属崩溃恢复：
      * 只有当 com.android.providers.media.module 仍是注入目标时才拉起。
@@ -889,6 +946,7 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "warn") == 0 || strcmp(argv[i], "warning") == 0) g_min_log_level = LOG_WARN;
         else if (strcmp(argv[i], "--strip-o-direct") == 0) g_strip_o_direct = true;
         else if (strcmp(argv[i], "--preserve-perms") == 0) g_preserve_perms_flag = true;
+        else if (strcmp(argv[i], "--crash-test") == 0) g_crash_test = true;
         else if (strcmp(argv[i], "--passive") == 0 || strcmp(argv[i], "passive") == 0) start_passive = true;
         else if (strcmp(argv[i], "--global-replace") == 0) g_global_replace_mode = true;
     }
