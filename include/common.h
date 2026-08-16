@@ -98,6 +98,9 @@ char* get_self_dir();
 void set_self_dir(const char* path);
 int mkdir_recursive(const char *dir);
 int mkdir_recursive_p(const char *path, mode_t mode);
+/* 读取整个文件到堆内存（动态扩容，尾随 NUL）。失败返回 NULL。
+   公共工具：injector 的 mount_manager/ns_utils 共用，避免重复实现 */
+char* read_file_dynamic(const char* path, size_t* out_size);
 int send_ipc_message(const char* message);
 int query_ipc_message(const char* command, char* out_buf, size_t buf_size);
 void escape_cgroup();
