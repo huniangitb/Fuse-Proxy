@@ -105,7 +105,7 @@ common_sources = [
     'src/core/uid_map.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c']
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/core/sha256.c']
 injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
@@ -113,10 +113,28 @@ install_bin_dir = 'bin'
 
 # fuse_daemon：纯框架（回调骨架 + 模块调度 + 存储原语），不链接规则引擎源，
 # 规则能力来自 dlopen 的热插拔模块（basic_rules.so 等）；common.c 为公共工具（日志/路径）。
+# SHA-256 硬件加速静态库：按目标平台启用对应 ISA 扩展
+# （Android aarch64: armv8-a+sha2 启用 sha256h；GNU x86_64: -msha 启用 SHA-NI）。
+# 运行时能力检测 + 已知向量自校验（sha256_hw.c 内部），不可用/校验失败
+# 自动回退纯软件实现——ISA 标志仅作用于本文件，不影响其他目标。
+if target_os == 'android'
+  sha_hw_args = ['-march=armv8-a+sha2']
+else
+  # SHA-NI 需 SSSE3（字节交换）+ SSE4.1（_mm_blend_epi16 状态重排）
+  sha_hw_args = ['-msha', '-mssse3', '-msse4.1']
+endif
+sha256_hw_lib = static_library('sha256_hw',
+  'src/core/sha256_hw.c',
+  include_directories: all_inc_dirs,
+  c_args: sha_hw_args,
+)
+sha256_hw_dep = declare_dependency(link_with: sha256_hw_lib,
+                                   include_directories: all_inc_dirs)
+
 executable('fuse_daemon',
   fuse_daemon_sources + ['src/core/common.c'],
   include_directories: all_inc_dirs,
-  dependencies: project_deps,
+  dependencies: project_deps + [sha256_hw_dep],
   c_args: ['-DFUSE_USE_VERSION=317'],
   link_args: ['-Wl,--export-dynamic'],  # 导出公共符号，供 dlopen 的热插拔模块解析
   install: true,
@@ -184,12 +202,14 @@ basic_rules_sources = [
     'src/core/path_trie.c',
     'src/core/uid_map.c',
     'src/core/fast_pid.c',
+    'src/core/sha256.c',
+    'src/modules/nsp_self_hash.c',
 ]
 
 shared_library('basic_rules',
   basic_rules_sources,
   include_directories: all_inc_dirs,
-  dependencies: [dependency('threads')],
+  dependencies: [dependency('threads'), cc.find_library('dl', required: false), sha256_hw_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
   install: true,
@@ -207,6 +227,8 @@ ftp_module_sources = [
     'src/modules/ftp/ftp_module.c',
     'src/modules/ftp/ftp_conf.c',
     'src/modules/ftp/ftp_backend_libcurl.c',
+    'src/core/sha256.c',
+    'src/modules/nsp_self_hash.c',
 ]
 
 if target_os == 'gnu'
@@ -254,7 +276,7 @@ endif
 shared_library('ftp_module',
   ftp_module_sources,
   include_directories: [all_inc_dirs, ftp_curl_inc],
-  dependencies: [dependency('threads'), ftp_curl_dep],
+  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), sha256_hw_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,

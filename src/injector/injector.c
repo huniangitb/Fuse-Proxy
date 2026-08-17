@@ -31,7 +31,6 @@
 
 volatile sig_atomic_t g_should_exit = 0;
 volatile sig_atomic_t g_reload_config = 0;
-volatile sig_atomic_t g_module_changed = 0;  /* fuse_daemon 热插拔模块变更（需全量重挂） */
 volatile sig_atomic_t g_passive_mode = 0;
 volatile sig_atomic_t g_fuse_ready = 0;
 int g_global_root_fd = -1;
@@ -1217,12 +1216,6 @@ int main(int argc, char *argv[]) {
             } else if (changed_count > 0) {
                 audit_and_remount_specific_apps(out_changed, changed_count);
             }
-        }
-        /* 热插拔模块变更：规则能力变化影响所有追踪应用，全量重挂 */
-        if (g_module_changed && !g_should_exit) {
-            g_module_changed = 0;
-            LOG("检测到热插拔模块变更，全量重挂追踪应用...");
-            audit_tracked_apps();
         }
     }
     do_cleanup();

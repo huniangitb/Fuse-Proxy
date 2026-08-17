@@ -246,6 +246,10 @@ typedef struct FtpBackendFile {
 } FtpBackendFile;
 
 static FtpBackendFile* g_handles[FTP_HANDLE_MAX];
+/* 活跃文件句柄计数：热重载 quiescence 门控用——框架在卸载/重载模块前
+   查询（nsp_module_active_handles），确保没有任何应用仍持有本模块的
+   open 文件时才执行热重载（避免热重载竞态崩溃） */
+static _Atomic int g_active_handles = 0;
 static pthread_mutex_t g_handles_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ================= 写缓冲回调 ================= */
@@ -536,6 +540,7 @@ static uint64_t ftp_handle_alloc(FtpBackendFile* f) {
     for (int i = 1; i < FTP_HANDLE_MAX; i++) {
         if (!g_handles[i]) {
             g_handles[i] = f;
+            atomic_fetch_add_explicit(&g_active_handles, 1, memory_order_release);
             pthread_mutex_unlock(&g_handles_mutex);
             return (uint64_t)i;
         }
@@ -555,8 +560,16 @@ static FtpBackendFile* ftp_handle_get(uint64_t id) {
 static void ftp_handle_free(uint64_t id) {
     if (id <= 0 || id >= FTP_HANDLE_MAX) return;
     pthread_mutex_lock(&g_handles_mutex);
-    g_handles[id] = NULL;
+    if (g_handles[id]) {
+        g_handles[id] = NULL;
+        atomic_fetch_sub_explicit(&g_active_handles, 1, memory_order_acq_rel);
+    }
     pthread_mutex_unlock(&g_handles_mutex);
+}
+
+/* 框架热重载 quiescence 查询：当前活跃 open 句柄数（0 = 无应用持有文件） */
+int nsp_module_active_handles(void) {
+    return atomic_load_explicit(&g_active_handles, memory_order_acquire);
 }
 
 /* ================= 后端操作 ================= */
