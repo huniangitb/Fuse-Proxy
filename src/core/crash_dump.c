@@ -84,6 +84,46 @@ void safe_printf(int fd, const char* fmt, ...) {
         write(fd, buf, len);
     }
 }
+/* 崩溃时转储 /proc/self/maps 的可执行映射基址，并计算每帧相对偏移：
+   PIE 二进制地址是 ASLR 随机的，仅凭绝对地址无法定位符号；
+   输出 base + offset 后可用 addr2line -e <elf> <offset> 直接定位函数。
+   全部使用 open/read/write/sscanf 等无锁系统调用级操作（信号安全）。 */
+static void dump_maps_and_offsets(int fd, void* const* bt, int nframes) {
+    int mfd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (mfd < 0) return;
+    char maps[16384];
+    ssize_t total = 0, got;
+    while ((got = read(mfd, maps + total, sizeof(maps) - 1 - total)) > 0)
+        total += got;
+    close(mfd);
+    if (total <= 0) return;
+    maps[total] = '\0';
+
+    safe_printf(fd, "Memory map (backtrace 解析用基址 + 偏移):\n");
+    char* line = maps;
+    while (line && *line) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        unsigned long start = 0, end = 0;
+        char perms[8] = {0};
+        char path[256] = {0};
+        if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255s",
+                   &start, &end, perms, path) >= 3 && perms[2] == 'x') {
+            /* 可执行段：打印基址，并对落在该段的 backtrace 帧计算偏移 */
+            safe_printf(fd, "  base 0x%lx %s\n", start, path[0] ? path : "(anon)");
+            for (int i = 0; i < nframes; i++) {
+                uintptr_t pc = (uintptr_t)bt[i];
+                if (pc >= start && pc < end)
+                    safe_printf(fd, "    #%02d pc 0x%lx -> offset +0x%lx in %s\n",
+                                i, (unsigned long)pc, (unsigned long)(pc - start),
+                                path[0] ? path : "(anon)");
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    safe_printf(fd, "End memory map\n");
+}
+
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     signal(sig, SIG_DFL);
     const char* sig_name = "UNKNOWN";
@@ -133,6 +173,8 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     safe_printf(out_fd, "Backtrace (%d frames):\n", actual_frames);
     if (actual_frames > 0) {
         backtrace_symbols_fd(bt, actual_frames, out_fd);
+        /* 输出可执行映射基址 + 每帧相对偏移，供 addr2line 定位符号 */
+        dump_maps_and_offsets(out_fd, bt, actual_frames);
     }
     write(out_fd, sep, sizeof(sep) - 1);
     raise(sig);

@@ -15,7 +15,7 @@
 #   scripts/pack-magisk.sh -m <模块目录> -b <构建目录> -o <输出zip>
 #
 # 选项：
-#   -m, --module-dir <dir>   模块骨架目录（含 bin/ conf/ zygisk/ 等，默认 /tmp/nsp_module）
+#   -m, --module-dir <dir>   模块骨架目录（含 bin/ conf/ zygisk/ 等，默认 /home/bdy/nsp_module）
 #   -b, --build-dir <dir>    Android 交叉构建目录（默认 $REPO/build_android）
 #   -r, --rules-dir <dir>    模块 .rules 注册文件源目录（默认 $REPO/src/modules）
 #   -c, --conf-dir <dir>     conf 配置源目录（默认 $REPO/conf）
@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---- 默认参数 ----
-MODULE_DIR="${MODULE_DIR:-/tmp/nsp_module}"
+MODULE_DIR="${MODULE_DIR:-/home/bdy/nsp_module}"
 BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build_android}"
 RULES_DIR="${RULES_DIR:-$REPO_DIR/src/modules}"
 CONF_DIR_SRC="${CONF_DIR_SRC:-$REPO_DIR/conf}"

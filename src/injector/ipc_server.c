@@ -368,14 +368,6 @@ void handle_ipc_client_readable(int client_fd) {
         close(client_fd);
         return;
     }
-    if (strncmp(buf, "MODULE_CHANGED", 14) == 0) {
-        /* fuse_daemon 热插拔模块变更通知：置标志，主循环全量重挂 */
-        extern volatile sig_atomic_t g_module_changed;
-        g_module_changed = 1;
-        send(client_fd, "OK", 2, MSG_NOSIGNAL);
-        close(client_fd);
-        return;
-    }
     if (strncmp(buf, "FUSE_ALIVE", 10) == 0 || strncmp(buf, "FUSE_EXIT", 9) == 0) { 
         close(client_fd); 
         return; 

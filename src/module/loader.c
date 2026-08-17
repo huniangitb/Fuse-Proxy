@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "module_loader.h"
 #include "common.h"
+#include "../core/sha256.h"
 #include <dlfcn.h>
 #include <dirent.h>
 #include <ctype.h>
@@ -34,6 +35,10 @@ typedef struct {
     time_t mtime;              /* .so 文件 mtime，热重载检测 */
     bool active;
     _Atomic int backend_refs;  /* 后端 ops 在途引用计数（防热卸载 dlclose 悬垂） */
+    int (*active_handles_fn)(void);  /* 可选：活跃句柄查询（模块导出 nsp_module_active_handles），
+                                        热重载 quiescence 门控——有应用 open 时延迟卸载/重载 */
+    char hash[65];                   /* 已加载 .so 文件的 SHA-256（框架计算，加载时存入）：
+                                        热重载时与磁盘哈希比对——一致则内容未变化，跳过热加载 */
 } ModuleEntry;
 
 static ModuleEntry g_modules[MAX_MODULES];
@@ -61,6 +66,10 @@ static _Atomic(int) g_backend_slot_refs[MAX_MODULES];  /* 槽位在途引用（a
    调用方 acquire 在途引用 → 二次确认快照未变 → 调用 ops → release。 */
 static _Atomic(const NspModuleOps*) g_rule_slot_ops[MAX_MODULES];
 static _Atomic(int) g_rule_slot_refs[MAX_MODULES];
+/* 模块重载串行化标志：module_notify_reload 期间置位，分派（resolve/probe/
+   backend）取引用后检查——重载中放弃本次调用，杜绝模块内部表重建与在途
+   分派读取竞态（热加载 SIGSEGV 根因：basic_rules .plt RVA 被当绝对指针调用） */
+static _Atomic int g_reload_in_progress = 0;
 /* 初始扫描是否完成：完成前不向 injector 上报模块变更（避免启动时误触发全量重挂） */
 static volatile sig_atomic_t g_boot_scan_done = 0;
 
@@ -146,28 +155,36 @@ static void chain_remove(int slot) {
 
 /* ================= 加载 / 卸载 ================= */
 
-static int module_load_one(const char* name) {
-    if (!is_valid_module_name(name)) {
-        LOG_WRN("模块名非法，跳过: %s", name);
-        return -1;
-    }
-    /* 卸载回滚防御：module_unload_one 在途引用未归零时回滚（模块仍 active），
-       module_scan_diff 随即会再调 load_one——若已存在同名活跃槽位则跳过，
-       避免重复加载（重复 resolve/backend 分派）。仅更新 mtime 供后续热重载。 */
-    pthread_rwlock_wrlock(&g_module_lock);
-    int existing = find_slot(name);
-    if (existing >= 0 && g_modules[existing].active) {
-        char so_path0[PATH_MAX];
-        snprintf(so_path0, sizeof so_path0, "%s/%s/%s.so", g_modules_dir, name, name);
-        struct stat st0;
-        if (stat(so_path0, &st0) == 0) g_modules[existing].mtime = st0.st_mtime;
-        pthread_rwlock_unlock(&g_module_lock);
-        LOG_WRN("模块 %s 已加载（上次卸载延迟回滚），跳过重复加载", name);
-        return 0;
-    }
-    pthread_rwlock_unlock(&g_module_lock);
+/* 加载并校验新模块（不注册）：0.5s 稳定性校验 + 框架文件哈希 + dlopen +
+   ABI/自哈希校验 + init。全部通过才返回（h_out/info_out/hash_out 有效，
+   调用方负责 dlclose 或 module_commit）；任一失败返回负值（已 dlclose）。
+   设计：热重载"先验后换"——先加载校验新模块，通过才卸载旧模块并登记，
+   校验失败保留内存中的旧模块。 */
+static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_out,
+                          char hash_out[65]) {
     char so_path[PATH_MAX];
     snprintf(so_path, sizeof so_path, "%s/%s/%s.so", g_modules_dir, name, name);
+    /* 热加载防御：dlopen 前校验 .so 文件稳定性（两次 stat 大小/时间一致）。
+       模块 .so 正在被替换/拷贝时（inotify 触发扫描与文件写入竞态），
+       dlopen 可能加载半写入的文件 → NspModuleInfo/init/ops 指针为垃圾值
+       → 间接调用跳转未映射地址 → SIGSEGV（热加载崩溃现场 PC=垃圾地址）。
+       校验窗口 0.5s：使用场景不要求低延迟热加载，稳定性优先——半写入
+       窗口内一律延迟加载（延迟到下一次扫描）。 */
+    struct stat st1, st2;
+    if (stat(so_path, &st1) == 0) {
+        usleep(500000);
+        if (stat(so_path, &st2) != 0 || st1.st_size != st2.st_size ||
+            st1.st_mtime != st2.st_mtime) {
+            LOG_WRN("模块 %s 的 .so 正在写入（大小/时间不稳定），延迟加载", name);
+            return -1;
+        }
+    }
+    /* 框架计算文件 SHA-256（open/read/close，fd 用后即关，不长期持有
+       磁盘模块文件句柄）；失败仅告警，不阻断加载 */
+    if (sha256_file_hex(so_path, hash_out) != 0) {
+        LOG_WRN("模块 %s 文件哈希计算失败，跳过哈希校验", name);
+        hash_out[0] = '\0';
+    }
     void* h = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     if (!h) {
         LOG_ERR("模块加载失败 %s: %s", so_path, dlerror());
@@ -190,6 +207,21 @@ static int module_load_one(const char* name) {
         dlclose(h);
         return -4;
     }
+    /* 模块加载兼容性 API（可选）：框架计算的文件哈希 vs 模块上报的自哈希——
+       不一致（加载窗口内文件被写入/替换/篡改）→ 拒绝加载；模块未导出该
+       符号时跳过校验（兼容旧模块）。 */
+    if (hash_out[0] != '\0') {
+        const char* (*self_hash)(void) = (const char* (*)(void))dlsym(h, "nsp_module_self_hash");
+        if (self_hash) {
+            const char* mh = self_hash();
+            if (!mh || strcmp(mh, hash_out) != 0) {
+                LOG_ERR("模块 %s 自哈希与文件哈希不一致（文件被修改/替换？），拒绝加载",
+                        name);
+                dlclose(h);
+                return -7;
+            }
+        }
+    }
     /* init 在锁外调用，成功后才登记 */
     if (info->init) {
         if (info->init(&g_api) != 0) {
@@ -198,6 +230,16 @@ static int module_load_one(const char* name) {
             return -5;
         }
     }
+    *h_out = h;
+    *info_out = *info;
+    return 0;
+}
+
+/* 登记已校验模块到槽位（写锁内发布原子快照/链），并存入文件哈希 */
+static int module_commit(const char* name, void* h, const NspModuleInfo* info,
+                         const char* hash) {
+    char so_path[PATH_MAX];
+    snprintf(so_path, sizeof so_path, "%s/%s/%s.so", g_modules_dir, name, name);
     pthread_rwlock_wrlock(&g_module_lock);
     if (g_module_count >= MAX_MODULES) {
         pthread_rwlock_unlock(&g_module_lock);
@@ -212,6 +254,9 @@ static int module_load_one(const char* name) {
     strncpy(m->name, name, sizeof m->name - 1);
     m->handle = h;
     m->info = *info;          /* 浅拷贝：info->ops 指针有效 */
+    /* 可选活跃句柄查询（热重载 quiescence 门控）：模块导出则使用，缺省视为 0 */
+    m->active_handles_fn = (int (*)(void))dlsym(h, "nsp_module_active_handles");
+    if (hash && hash[0]) strncpy(m->hash, hash, sizeof m->hash - 1);
     m->active = true;
     struct stat st;
     if (stat(so_path, &st) == 0) m->mtime = st.st_mtime;
@@ -231,6 +276,34 @@ static int module_load_one(const char* name) {
     LOG("模块已加载: %s v%s (类型=%u caps=0x%x)", name,
         info->version ? info->version : "?", info->type, info->caps);
     return 0;
+}
+
+static int module_load_one(const char* name) {
+    if (!is_valid_module_name(name)) {
+        LOG_WRN("模块名非法，跳过: %s", name);
+        return -1;
+    }
+    /* 卸载回滚防御：module_unload_one 在途引用未归零时回滚（模块仍 active），
+       module_scan_diff 随即会再调 load_one——若已存在同名活跃槽位则跳过，
+       避免重复加载（重复 resolve/backend 分派）。仅更新 mtime 供后续热重载。 */
+    pthread_rwlock_wrlock(&g_module_lock);
+    int existing = find_slot(name);
+    if (existing >= 0 && g_modules[existing].active) {
+        char so_path0[PATH_MAX];
+        snprintf(so_path0, sizeof so_path0, "%s/%s/%s.so", g_modules_dir, name, name);
+        struct stat st0;
+        if (stat(so_path0, &st0) == 0) g_modules[existing].mtime = st0.st_mtime;
+        pthread_rwlock_unlock(&g_module_lock);
+        LOG_WRN("模块 %s 已加载（上次卸载延迟回滚），跳过重复加载", name);
+        return 0;
+    }
+    pthread_rwlock_unlock(&g_module_lock);
+    void* h = NULL;
+    NspModuleInfo info;
+    char hash[65] = {0};
+    if (module_prepare(name, &h, &info, hash) != 0)
+        return -1;
+    return module_commit(name, h, &info, hash);
 }
 
 static int module_unload_one(const char* name) {
@@ -302,12 +375,8 @@ static int module_unload_one(const char* name) {
     return 0;
 }
 
-/* 通知 injector 模块变更（热插拔事件，经 IPC socket 上报） */
-static void notify_module_changed(const char* name) {
-    char msg[256];
-    snprintf(msg, sizeof msg, "MODULE_CHANGED %s", name ? name : "?");
-    send_ipc_message(msg);
-}
+/* 模块热插拔变更由 fuse_daemon 自动处理（原子快照分派实时生效），
+   不再通知 injector 全量重挂追踪应用 */
 
 /* ================= 全量扫描（启动 + 热插拔差异） ================= */
 
@@ -342,9 +411,16 @@ static void module_scan_diff(void) {
             if (strcmp(present[p], g_modules[i].name) == 0) { found = true; break; }
         }
         if (!found) {
+            /* quiescence 门控：模块仍有活跃句柄（应用 open 中）则延迟卸载，
+               等下次扫描（无应用持有）再执行——避免热重载竞态崩溃 */
+            if (g_modules[i].active_handles_fn &&
+                g_modules[i].active_handles_fn() > 0) {
+                LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟卸载",
+                        g_modules[i].name);
+                continue;
+            }
             LOG("检测到模块目录移除: %s", g_modules[i].name);
             module_unload_one(g_modules[i].name);
-            if (g_boot_scan_done) notify_module_changed(g_modules[i].name);
         }
     }
     /* 2. 加载新增 / 重载文件更新的模块 */
@@ -353,16 +429,45 @@ static void module_scan_diff(void) {
         if (slot < 0) {
             LOG("检测到新模块: %s", present[p]);
             module_load_one(present[p]);
-            if (g_boot_scan_done) notify_module_changed(present[p]);
         } else {
             char so[PATH_MAX];
             snprintf(so, sizeof so, "%s/%s/%s.so", g_modules_dir, present[p], present[p]);
             struct stat st;
             if (stat(so, &st) == 0 && st.st_mtime != g_modules[slot].mtime) {
+                /* quiescence 门控：模块仍有活跃句柄（应用 open 中）则延迟
+                   热重载，等下次扫描再执行——"无应用 open、写入完成后才热加载" */
+                if (g_modules[slot].active_handles_fn &&
+                    g_modules[slot].active_handles_fn() > 0) {
+                    LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟热重载",
+                            present[p]);
+                    continue;
+                }
+                /* 哈希判定：磁盘内容与已加载模块哈希一致（mtime 变化但内容
+                   未变——chmod/触摸/重复复制同一文件）→ 跳过热加载 */
+                char fhash[65];
+                if (sha256_file_hex(so, fhash) == 0 && g_modules[slot].hash[0] &&
+                    strcmp(fhash, g_modules[slot].hash) == 0) {
+                    LOG_DBG("模块 %s 文件内容未变化（哈希一致），跳过热重载", present[p]);
+                    g_modules[slot].mtime = st.st_mtime;
+                    continue;
+                }
                 LOG("模块文件已更新，热重载: %s", present[p]);
-                module_unload_one(present[p]);
-                module_load_one(present[p]);
-                if (g_boot_scan_done) notify_module_changed(present[p]);
+                /* 先验后换：先加载校验新模块，通过才卸载旧模块——
+                   校验失败/旧模块在途调用未归零时保留内存中的旧模块 */
+                void* nh = NULL;
+                NspModuleInfo ninfo;
+                char nhash[65] = {0};
+                if (module_prepare(present[p], &nh, &ninfo, nhash) != 0) {
+                    LOG_ERR("模块 %s 校验未通过，保留内存中的旧模块", present[p]);
+                    continue;
+                }
+                if (module_unload_one(present[p]) != 0) {
+                    dlclose(nh);   /* 旧模块在途引用未归零（回滚保留旧）→ 放弃新模块 */
+                    LOG_WRN("模块 %s 旧实例仍有在途调用，热重载放弃（保留旧模块）",
+                            present[p]);
+                    continue;
+                }
+                module_commit(present[p], nh, &ninfo, nhash);
             }
         }
     }
@@ -514,6 +619,11 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
+        /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
+        if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
+            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
+            continue;
+        }
         if (first) {
             /* 单/首模块：直接写入调用方 out——免每模块 16KB 局部缓冲 +
                16KB 整结构拷贝（*out = r）。out 先按需初始化，保证模块
@@ -597,6 +707,11 @@ int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
+        /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
+        if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
+            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
+            continue;
+        }
         NspProbeResult r;
         memset(&r, 0, sizeof r);
         int rc = ops->probe(q, &r);
@@ -632,6 +747,11 @@ static int backend_scan_match(const char* path, int* slot_out, const NspModuleOp
             atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
+        /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
+        if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
+            atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
+            continue;
+        }
         if (ops->backend_match(path) == 1) {
             if (slot_out) *slot_out = i;
             *ops_out = ops;
@@ -661,6 +781,11 @@ int module_backend_acquire_slot(int slot, const NspModuleOps** ops_out) {
     atomic_fetch_add_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
     if (atomic_load_explicit(&g_backend_slot_ops[slot], memory_order_acquire) != ops) {
         /* 快照刚被 unload 置空：放弃引用，不调用 ops */
+        atomic_fetch_sub_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
+        return -1;
+    }
+    /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
+    if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
         atomic_fetch_sub_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
         return -1;
     }
@@ -727,6 +852,32 @@ int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user
 }
 
 void module_notify_reload(void) {
+    /* 重载串行化：置标志 → 排空在途分派引用 → 调 reload → 清标志。
+       分派（resolve/probe/backend 无锁持引用调用）在取引用后检查标志，
+       重载中放弃本次调用——杜绝模块内部表重建与在途分派读取竞态
+       （热加载 SIGSEGV 根因：basic_rules .plt RVA 被当绝对函数指针调用） */
+    atomic_store_explicit(&g_reload_in_progress, 1, memory_order_release);
+    bool drained = false;
+    for (int w = 0; w < 2000; w++) {
+        bool busy = false;
+        for (int i = 0; i < MAX_MODULES; i++) {
+            if (atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) > 0 ||
+                atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) > 0) {
+                busy = true;
+                break;
+            }
+        }
+        if (!busy) { drained = true; break; }
+        usleep(1000);
+    }
+    if (!drained) {
+        /* 在途分派未归零（超时 2s）：放弃本次 reload——与 module_unload_one
+           的回滚策略一致：宁可延迟重载，绝不在分派读取模块内部表时重建。
+           若此时仍强行 reload，模块表重建与在途分派竞态依然存在 */
+        atomic_store_explicit(&g_reload_in_progress, 0, memory_order_release);
+        LOG_WRN("模块重载有在途分派（refs 未归零），跳过本次 reload");
+        return;
+    }
     pthread_rwlock_rdlock(&g_module_lock);
     for (int i = 0; i < g_module_count; i++) {
         ModuleEntry* m = &g_modules[i];
@@ -734,6 +885,7 @@ void module_notify_reload(void) {
             m->info.ops->reload();
     }
     pthread_rwlock_unlock(&g_module_lock);
+    atomic_store_explicit(&g_reload_in_progress, 0, memory_order_release);
 }
 
 int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {
