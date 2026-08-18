@@ -120,6 +120,7 @@ typedef struct StreamClient {
     int type;       /* 0=ALL, 1=IO, 2=SYS, 3=LOGCAT */
     int min_level;
     bool level_tag; /* true = SYS 消息前插 LEVEL| 标签（api 模式） */
+    bool with_ts;   /* true = 推送行前缀时间戳（STREAM_*:<level>:1 启用） */
     struct StreamClient *next;
 } StreamClient;
 static LogBuffer g_io_buf, g_sys_buf, g_logcat_buf;
@@ -140,9 +141,10 @@ static void init_buf(LogBuffer* buf, int max) {
 static void destroy_buf(LogBuffer* buf) {
     if (buf->data) { free(buf->data); buf->data = nullptr; }
 }
-static void add_stream_client(int fd, int type, int min_level, bool level_tag) {
+static void add_stream_client(int fd, int type, int min_level, bool level_tag, bool with_ts) {
     StreamClient *c = malloc(sizeof(StreamClient));
     c->fd = fd; c->type = type; c->min_level = min_level; c->level_tag = level_tag;
+    c->with_ts = with_ts;
     c->next = g_stream_clients; g_stream_clients = c;
 }
 static void remove_stream_client(int fd) {
@@ -154,33 +156,52 @@ static void remove_stream_client(int fd) {
         pp = &(*pp)->next;
     }
 }
-static void broadcast_log(int type, const char *line, int level) {
+/* 解析 STREAM_* 可选参数 "<level>[:<with_ts>]"：返回 level，with_ts 出参（1=附带时间戳） */
+static int parse_stream_args(const char *p, bool *with_ts) {
+    *with_ts = false;
+    int level = atoi(p);
+    const char *ts_p = strchr(p, ':');
+    if (ts_p) *with_ts = (atoi(ts_p + 1) > 0);
+    return level;
+}
+
+static void broadcast_log(int type, const char *line, int level, time_t t) {
     size_t len = strlen(line);
     char nl = '\n';
     char level_pref[4]; /* "0|", "1|", "2|", "3|" */
+    char ts_buf[32] = {0};
+    if (t > 0) {
+        struct tm tm_buf;
+        localtime_r(&t, &tm_buf);
+        strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    }
     StreamClient *c = g_stream_clients;
     while (c) {
         if (c->fd > 0 && (c->type == 0 || c->type == type)) {
             if (level >= c->min_level) {
-                struct iovec iov[3];
-                int iovlen;
+                struct iovec iov[5];
+                int iovlen = 0;
+                if (c->with_ts && ts_buf[0]) {
+                    iov[iovlen].iov_base = ts_buf;
+                    iov[iovlen].iov_len = 19; /* "YYYY-MM-DD HH:MM:SS" */
+                    iovlen++;
+                    iov[iovlen].iov_base = (void *)"|";
+                    iov[iovlen].iov_len = 1;
+                    iovlen++;
+                }
                 if (type == 2 && c->level_tag) {  /* SYS + api: 前插等级标签 */
                     level_pref[0] = '0' + (level % 10);
                     level_pref[1] = '|';
-                    iov[0].iov_base = level_pref;
-                    iov[0].iov_len = 2;
-                    iov[1].iov_base = (void *)line;
-                    iov[1].iov_len = len;
-                    iov[2].iov_base = &nl;
-                    iov[2].iov_len = 1;
-                    iovlen = 3;
-                } else {
-                    iov[0].iov_base = (void *)line;
-                    iov[0].iov_len = len;
-                    iov[1].iov_base = &nl;
-                    iov[1].iov_len = 1;
-                    iovlen = 2;
+                    iov[iovlen].iov_base = level_pref;
+                    iov[iovlen].iov_len = 2;
+                    iovlen++;
                 }
+                iov[iovlen].iov_base = (void *)line;
+                iov[iovlen].iov_len = len;
+                iovlen++;
+                iov[iovlen].iov_base = &nl;
+                iov[iovlen].iov_len = 1;
+                iovlen++;
                 struct msghdr msg = { .msg_iov = iov, .msg_iovlen = iovlen };
                 ssize_t ret = sendmsg(c->fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
                 if (ret <= 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) { close(c->fd); c->fd = -1; }
@@ -221,8 +242,8 @@ static void overflow_write(const char *log_type, const char *msg, int level, tim
     }
 }
 static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
-    broadcast_log(type, msg, level);
     time_t now = time(nullptr);
+    broadcast_log(type, msg, level, now);
     if (buf->full) {
         /* 滑动缓冲：已满（达到字节/条数上限）时覆盖最旧——丢弃最旧日志，
            tail 前进腾位，新条目覆盖原 head 位置（不再写溢出文件） */
@@ -641,18 +662,27 @@ static void remove_active_client(ClientCtx *ctx) {
         ctx->next->prev = ctx->prev;
     }
 }
-static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level) {
-    char line_buf[MAX_MSG_LEN + 2]; /* msg + \n */
+static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level, bool with_ts) {
+    char line_buf[MAX_MSG_LEN + 64]; /* ts(20) + msg + \n */
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
     int idx = buf->tail;
     for (int i = 0; i < total_in_buf; i++) {
         if (buf->data[idx].level >= min_level) {
             size_t msg_len = strnlen(buf->data[idx].msg, MAX_MSG_LEN);
             if (msg_len > MAX_MSG_LEN - 1) msg_len = MAX_MSG_LEN - 1;
-            memcpy(line_buf, buf->data[idx].msg, msg_len);
-            line_buf[msg_len] = '\n';
-            line_buf[msg_len + 1] = '\0';
-            ssize_t ret = send(fd, line_buf, msg_len + 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+            int off = 0;
+            if (with_ts && buf->data[idx].t > 0) {
+                struct tm tm_info;
+                localtime_r(&buf->data[idx].t, &tm_info);
+                char time_buf[32];
+                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+                int tl = snprintf(line_buf, sizeof(line_buf), "%s|", time_buf);
+                off = tl;
+            }
+            memcpy(line_buf + off, buf->data[idx].msg, msg_len);
+            line_buf[off + msg_len] = '\n';
+            line_buf[off + msg_len + 1] = '\0';
+            ssize_t ret = send(fd, line_buf, off + msg_len + 1, MSG_NOSIGNAL | MSG_DONTWAIT);
             if (ret <= 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) break;
         }
         idx = (idx + 1) % buf->max;
@@ -808,45 +838,50 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         write(fd, "OK\n", 3);
         return 1; 
     } else if (strncmp(line, "STREAM_IO", 9) == 0) {
+        bool with_ts = false;
         int min_level = 0;
-        if (line[9] == ':') min_level = atoi(line + 10);
+        if (line[9] == ':') min_level = parse_stream_args(line + 10, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_io_buf, 1, min_level);
-        add_stream_client(fd, 1, min_level, false);
+        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts);
+        add_stream_client(fd, 1, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_SYS_API", 14) == 0) {
+        bool with_ts = false;
         int min_level = 0;
-        if (line[14] == ':') min_level = atoi(line + 15);
+        if (line[14] == ':') min_level = parse_stream_args(line + 15, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level);
-        add_stream_client(fd, 2, min_level, true);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts);
+        add_stream_client(fd, 2, min_level, true, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_SYS", 10) == 0) {
+        bool with_ts = false;
         int min_level = 0;
-        if (line[10] == ':') min_level = atoi(line + 11);
+        if (line[10] == ':') min_level = parse_stream_args(line + 11, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level);
-        add_stream_client(fd, 2, min_level, false);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts);
+        add_stream_client(fd, 2, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_LOGCAT", 13) == 0) {
+        bool with_ts = false;
         int min_level = 0;
-        if (line[13] == ':') min_level = atoi(line + 14);
+        if (line[13] == ':') min_level = parse_stream_args(line + 14, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level);
-        add_stream_client(fd, 3, min_level, false);
+        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts);
+        add_stream_client(fd, 3, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_ALL", 10) == 0) {
+        bool with_ts = false;
         int min_level = 0;
-        if (line[10] == ':') min_level = atoi(line + 11);
+        if (line[10] == ':') min_level = parse_stream_args(line + 11, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_io_buf, 1, min_level);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level);
-        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level);
-        add_stream_client(fd, 0, min_level, false);
+        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts);
+        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts);
+        add_stream_client(fd, 0, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STOP_STREAM", 11) == 0) {
