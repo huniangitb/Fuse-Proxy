@@ -88,7 +88,6 @@ static void build_templates_json(json_object *root) {
     json_object_object_add(global, "enable_sandbox", json_object_new_boolean(g_global_cfg.sandbox));
     /* 全局注入状态强制关闭，不再跟随 g_global_cfg.global_inject 规则改变 */
     json_object_object_add(global, "global_inject", json_object_new_boolean(false));
-    json_object_object_add(global, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
     
     json_object *hide_paths = json_object_new_array();
     append_str_array_json(hide_paths, g_global_cfg.hide_rules, g_global_cfg.hide_count);
@@ -328,9 +327,6 @@ static void handle_static_request(int sock_fd, struct sockaddr_un *cli_addr,
                 else if (sscanf(tok, "SANDBOX = %4095s", val) == 1 ||
                          sscanf(tok, "SANDBOX %4095s", val) == 1)
                     json_object_object_add(switches, "sandbox", json_object_new_string(val));
-                else if (sscanf(tok, "FUSE_DIRECT = %4095s", val) == 1 ||
-                         sscanf(tok, "FUSE_DIRECT %4095s", val) == 1)
-                    json_object_object_add(switches, "fuse_direct", json_object_new_string(val));
                 else if (strncmp(tok, "RO ", 3) == 0 || strncmp(tok, "RO\t", 2) == 0) {
                     char *path = tok + 3;
                     while (*path == ' ' || *path == '\t') path++;

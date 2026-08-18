@@ -168,33 +168,8 @@ static void* ipc_mount_thread(void* raw) {
     }
 
     int ret = -1;
-    bool fast_path = false;
-
-    /*
-     * 快速路径（fuse_direct）：跳过 /proc/pid/mountinfo 读取，直接发起异步 bind mount。
-     * 对于首次启动的应用，目标路径几乎一定未被挂载，无需提前检查挂载状态，
-     * 显著减少延迟，避免目标进程抢先创建文件。
-     */
-    if (g_global_cfg.fuse_direct) {
-        char target_path[128];
-        get_target_storage_path(arg->uid, target_path, sizeof(target_path));
-
-        ret = ns_global_mount_async(arg->pid, arg->pkg, mnt_src, target_path);
-        if (ret == 0) {
-            fast_path = true;
-            /* 快速路径成功：手动处理追踪标记与日志 */
-            add_tracked(arg->pid);
-            print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
-        }
-    }
-
-    /*
-     * 慢速路径：回退到完整的 perform_app_mount（含 mountinfo 读取）。
-     * 命中场景：非 fuse_direct 模式、或快速路径 mount 失败（需诊断挂载状态）。
-     */
-    if (!fast_path) {
-        ret = perform_app_mount(arg->pkg, arg->pid, arg->uid, NULL, "IPC通知");
-    }
+    /* 完整 perform_app_mount（含 mountinfo 读取） */
+    ret = perform_app_mount(arg->pkg, arg->pid, arg->uid, NULL, "IPC通知");
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     long elapsed_us = (ts_end.tv_sec - ts_start.tv_sec) * 1000000L +
@@ -202,7 +177,7 @@ static void* ipc_mount_thread(void* raw) {
 
     if (ret == 0) {
         LOG("IPC挂载完成: %s(PID:%d)%s 耗时: %ldus",
-            arg->pkg, arg->pid, fast_path ? " [快速路径]" : "", elapsed_us);
+            arg->pkg, arg->pid, "", elapsed_us);
     } else {
         LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
         remove_tracked(arg->pid);

@@ -21,8 +21,8 @@ desc.en = Read-only path
 [REDIRECT]
 format = pair
 argc = 2
-desc = 路径重定向：<虚拟路径>|<真实路径>
-desc.en = Path redirect: <virtual path>|<real path>
+desc = 路径重定向
+desc.en = Path redirect
 
 [ALLOW]
 format = path
@@ -32,28 +32,22 @@ desc.en = Allow path
 
 [MONITOR]
 format = switch
-desc = 监控开关
+desc = 监控
 desc.en = Monitor switch
 
 [SANDBOX]
 format = switch
-desc = 沙盒开关
+desc = 沙盒
 desc.en = Sandbox switch
 
 [GLOBAL_INJECT]
 format = switch
 global-only = true
-desc = 全局注入开关
+desc = 全局注入
 desc.en = Global injection switch
 
 [SKIP_SYSTEM_APPS]
 format = switch
 global-only = true
-desc = 跳过系统应用开关
+desc = 跳过系统应用
 desc.en = Skip system apps switch
-
-[FUSE_DIRECT]
-format = switch
-global-only = true
-desc = FUSE 直通开关
-desc.en = FUSE direct pass-through switch

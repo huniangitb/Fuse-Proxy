@@ -336,9 +336,6 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
     } else if (strcmp(tok, "GLOBAL_INJECT") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
-    } else if (strcmp(tok, "FUSE_DIRECT") == 0) {
-        char* val = get_next_token(&p_ptr);
-        cur->fuse_direct = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
     } else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0) {
         char* val = get_next_token(&p_ptr);
         cur->skip_system_apps = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));

@@ -70,7 +70,7 @@ PING/LIST 请求的 `lang` 参数回传（默认中文，未知语言回退 zh�
 - rule_server 按需扫描 `modules/*/<模块名>.rules`，动态合并进规则类型表：
   带目录/文件 mtime 缓存，模块目录与 .rules 未变化时直接复用类型表（零扫描）；
   放入/删除/修改 `.rules`（mtime 变化）即热更新，无需重启（内置 HIDE/RO/REDIRECT/ALLOW/
-  MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT 始终存在，与 basic_rules 对应）。
+  MONITOR/SANDBOX/GLOBAL_INJECT 始终存在，与 basic_rules 对应）。
 - 未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE；LIST/PING 返回的
   `rule_types` 数组即当前全部可用类型（含 `builtin`/`module`/`format`/
   `global_only`/`argc_min`/`argc_max`/`desc`/`desc_map` 字段）。
