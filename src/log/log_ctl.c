@@ -1046,7 +1046,7 @@ static void handle_list_injected(bool api_mode) {
     write(sock, "LIST_INJECTED", 13);
     shutdown(sock, SHUT_WR);
     struct pollfd pfd = { .fd = sock, .events = POLLIN };
-    if (poll(&pfd, 1, 1000) <= 0) {
+    if (poll(&pfd, 1, 5000) <= 0) {
         if (!api_mode) fprintf(stderr, "未获取到响应\n");
         close(sock);
         return;

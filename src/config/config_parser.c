@@ -952,15 +952,6 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             g_global_cfg.monitor ? "ON" : "OFF",
             g_global_cfg.sandbox ? "ON" : "OFF",
             g_global_cfg.redir_count, g_global_cfg.hide_count, g_global_cfg.ro_count);
-        for (int i = 0; i < g_global_cfg.redir_count; i++) {
-            LOG_DBG("  [全局重定向通配] %s -> %s", g_global_cfg.redir_rules[i].virtual_prefix, g_global_cfg.redir_rules[i].real_target);
-        }
-        for (int i = 0; i < g_global_cfg.hide_count; i++) {
-            LOG_DBG("  [全局隐藏通配]   %s", g_global_cfg.hide_rules[i]);
-        }
-        for (int i = 0; i < g_global_cfg.ro_count; i++) {
-            LOG_DBG("  [全局只读通配]   %s", g_global_cfg.ro_rules[i]);
-        }
     }
     config_unlock_read();
 }

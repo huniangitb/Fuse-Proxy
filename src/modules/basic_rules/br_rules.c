@@ -412,8 +412,12 @@ static void br_trie_resolve(AppConfig* cfg, const char* sub_path, TrieMatch* out
 
 /* 隐藏判定的静态部分（不触碰 cfg/g_global_cfg 数据，锁外安全）：
    CONFIG_DIR 前缀恒隐藏；Android 骨架目录恒不隐藏（is_skel_out 输出）；
-   跨应用隔离（br_is_other_app_pkg 纯字符串）；tm.hidden（trie 结果）。
-   动态 hide 线性扫描（访问 hide_rules 数组）不在此列。 */
+   tm.hidden（trie 结果）。
+   动态 hide 线性扫描（访问 hide_rules 数组）不在此列。
+   注意：跨应用隔离（br_is_other_app_pkg）不在本函数判定——resolve
+   （getattr/open）不得隐藏其他应用的 /Android/data 路径，否则列表可见
+   但打开报 ENOENT（MT 管理器访问 /Android/data/<他包>/ 场景）；该隔离
+   只由 br_probe（readdir 条目过滤）显式追加，实现"限制列举、不限制打开"。 */
 static bool br_hidden_static_part(const char* sub_path, const char* current_pkg,
                                   const TrieMatch* tm, bool* is_skel_out) {
     if (is_skel_out) *is_skel_out = false;
@@ -424,7 +428,6 @@ static bool br_hidden_static_part(const char* sub_path, const char* current_pkg,
         if (is_skel_out) *is_skel_out = true;
         return false;
     }
-    if (br_is_other_app_pkg(sub_path, current_pkg)) return true;
     if (tm && tm->valid && tm->hidden) return true;
     return false;
 }
@@ -1090,7 +1093,11 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
             tm.valid = true;
             tm.hidden = pc->app_dir_hidden || pc->g_dir_hidden;
             bool is_skel = false;
-            bool hidden = br_hidden_static_part(sub_path, current_pkg, &tm, &is_skel);
+            /* 跨应用隔离仅在此（probe/readdir 列举过滤）显式生效：
+               resolve 不再判 hidden（见 br_hidden_static_part 注释），
+               保证 /Android/data/<他包>/ 下列表可见、打开可访问 */
+            bool hidden = br_hidden_static_part(sub_path, current_pkg, &tm, &is_skel) ||
+                          br_is_other_app_pkg(sub_path, current_pkg);
             out->valid = true;
             out->hidden = hidden;
             out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
@@ -1105,18 +1112,21 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
         TrieMatch tm;
         tm.valid = true;
         tm.hidden = trie_hidden;
-        /* 完整隐藏判定（CONFIG_DIR/Android 骨架/其他应用/hide 规则），
+        /* 完整隐藏判定（CONFIG_DIR/Android 骨架/跨应用/hide 规则），
            trie 部分用缓存值（tm.valid 使其跳过内部 trie 查询）。
            对所有访问者生效（含 root）：与 br_sanitize_and_check_hidden
-           及 vfs_readdir probe 过滤语义一致，HIDE 后 root ls 也看不见 */
-        if (br_is_path_hidden_internal(cfg, sub_path, current_pkg, &tm)) {
+           及 vfs_readdir probe 过滤语义一致，HIDE 后 root ls 也看不见。
+           跨应用隔离在此显式叠加（resolve 不再判 hidden，见
+           br_hidden_static_part 注释） */
+        if (br_is_path_hidden_internal(cfg, sub_path, current_pkg, &tm) ||
+            br_is_other_app_pkg(sub_path, current_pkg)) {
             out->valid = true;
             out->hidden = true;
             if (config_read_end(cfg_gen)) return;
             continue;
         }
         out->valid = true;
-        out->hidden = trie_hidden;
+        out->hidden = trie_hidden || br_is_other_app_pkg(sub_path, current_pkg);
         bool dyn_any = (cfg && cfg->dyn_redir) || g_global_cfg.dyn_redir;
         out->is_redirect_target = ((ca && ca->redir_target) || (cg && cg->redir_target)) ||
                                   (dyn_any && br_redirect_target_linear(cfg, sub_path));
@@ -1132,14 +1142,15 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
     cfg = br_get_app_cfg(q->uid, q->pid, current_pkg);
     TrieMatch tm;
     if (br_sanitize_and_check_hidden(cfg, q->path, &path_user_id, sub_path, sizeof sub_path,
-                                     current_pkg, q->uid, &tm) != 0) {
+                                     current_pkg, q->uid, &tm) != 0 ||
+        br_is_other_app_pkg(sub_path, current_pkg)) {
         out->valid = true;
         out->hidden = true;
         if (config_read_end(cfg_gen)) return;
         continue;
     }
     out->valid = true;
-    out->hidden = tm.hidden;
+    out->hidden = tm.hidden || br_is_other_app_pkg(sub_path, current_pkg);
     out->is_redirect_target = br_is_redirect_target(cfg, sub_path);
     out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, sub_path);
     out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
