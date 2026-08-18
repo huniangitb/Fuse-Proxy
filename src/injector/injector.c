@@ -321,9 +321,7 @@ static void inject_global_fuse() {
             break;
         usleep(20000);
     }
-    if (!g_global_cfg.fuse_direct) {
-        ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
-    }
+    ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
     int ready_pipe[2];
     if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) { __sync_lock_release(&g_fuse_starting); return; }
     pid_t child = fork();
@@ -439,9 +437,7 @@ static void inject_media_fuse() {
         if (ns_is_mounted(g_media_fuse.pid, g_media_fuse.mnt_path, nullptr) <= 0) break;
         usleep(20000);
     }
-    if (!g_global_cfg.fuse_direct) {
-        ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
-    }
+    ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
     int ready_pipe[2];
     if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) return;
     pid_t child = fork();
@@ -896,9 +892,7 @@ static void do_cleanup() {
             }
         }
         ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
-        if (!g_global_cfg.fuse_direct) {
-            ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
-        }
+        ns_umount_and_rmdir(g_global_fuse.pid, g_global_fuse.mnt_path);
     }
     if (g_media_fuse.fuse_pid > 0) {
         kill(g_media_fuse.fuse_pid, SIGTERM);
@@ -916,9 +910,7 @@ static void do_cleanup() {
             g_media_fuse.fuse_pid = 0;
         }
         ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
-        if (!g_global_cfg.fuse_direct) {
-            ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
-        }
+        ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
     }
     config_publisher_cleanup(g_config_pub_fd);
     g_config_pub_fd = -1;

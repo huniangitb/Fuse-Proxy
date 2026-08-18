@@ -175,8 +175,7 @@ data class GlobalRules(
 data class Switches(
     @SerialName("global_inject") val globalInject: String = "OFF",
     val monitor: String = "ON",
-    val sandbox: String = "OFF",
-    @SerialName("fuse_direct") val fuseDirect: String = "OFF"
+    val sandbox: String = "OFF"
 )
 
 @Serializable
@@ -387,7 +386,6 @@ class ConfigSubscriptionService : Service() {
       "apply_to_app": ["*"],
       "enable_sandbox": false,
       "global_inject": true,
-      "fuse_direct": false,
       "hide_paths": [],
       "read_only_path": [],
       "redirect_rules": [
@@ -418,7 +416,6 @@ class ConfigSubscriptionService : Service() {
 | `templates[].apply_to_app` | List\<String\> | 该模板作用的应用列表 |
 | `templates[].enable_sandbox` | Boolean | 沙盒模式开关 |
 | `templates[].global_inject` | Boolean | 全局注入开关（仅 GLOBAL 模板） |
-| `templates[].fuse_direct` | Boolean | FUSE 直通开关（仅 GLOBAL 模板） |
 | `templates[].monitor` | Boolean | 监控开关（仅应用模板） |
 | `templates[].inject_enable` | Boolean | 注入使能（仅应用模板） |
 | `templates[].hide_paths` | List\<String\> | 隐藏路径列表 |
@@ -437,8 +434,7 @@ class ConfigSubscriptionService : Service() {
     "switches": {
       "global_inject": "OFF",
       "monitor": "ON",
-      "sandbox": "OFF",
-      "fuse_direct": "OFF"
+      "sandbox": "OFF"
     },
     "ro_rules": ["/123 云盘/Cache/", "/HyperOS_Sandbox/"],
     "hide_rules": [],
@@ -459,7 +455,7 @@ class ConfigSubscriptionService : Service() {
 }
 ```
 
-- `global.switches`：全局开关（`global_inject`、`monitor`、`sandbox`、`fuse_direct`，值为 `"ON"` / `"OFF"`）
+- `global.switches`：全局开关（`global_inject`、`monitor`、`sandbox`，值为 `"ON"` / `"OFF"`）
 - `global.ro_rules` / `hide_rules` / `redirect_rules` / `allow_rules`：各类型规则列表
 - `apps[].inject_enable`：应用注入开关（`"ON"` / `"OFF"`）
 - `app_rules[].content`：规则文件原始内容（JSON 转义字符串）

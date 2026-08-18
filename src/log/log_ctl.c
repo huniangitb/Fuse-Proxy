@@ -55,7 +55,7 @@ void usage(const char* prog) {
     printf("  status [api]               全面系统状态概览（JSON）\n");
     printf("  set-rule <pkg> <type> <value> [--uid uid] [api]\n");
     printf("                             添加/更新规则到文件\n");
-    printf("                              type: HIDE|RO|REDIRECT|ALLOW|MONITOR|SANDBOX|GLOBAL_INJECT|FUSE_DIRECT\n");
+    printf("                              type: HIDE|RO|REDIRECT|ALLOW|MONITOR|SANDBOX|GLOBAL_INJECT\n");
     printf("  remove-rule <pkg> <type> <index> [--uid uid] [api]\n");
     printf("                             删除指定索引的规则\n");
     printf("\n选项:\n");
@@ -129,7 +129,6 @@ static json_object *build_parsed_rules_json(void) {
     json_object *global = json_object_new_object();
     json_object_object_add(global, "sandbox", json_object_new_boolean(g_global_cfg.sandbox));
     json_object_object_add(global, "global_inject", json_object_new_boolean(g_global_cfg.global_inject));
-    json_object_object_add(global, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
     json_object_object_add(global, "monitor", json_object_new_boolean(g_global_cfg.monitor));
     json_object_object_add(global, "inject_enable", json_object_new_boolean(true));
     json_object_object_add(global, "hide_count", json_object_new_int(g_global_cfg.hide_count));
@@ -146,7 +145,6 @@ static json_object *build_parsed_rules_json(void) {
         json_object_object_add(app, "inject_enable", json_object_new_boolean(cfg->inject_enable));
         json_object_object_add(app, "monitor", json_object_new_boolean(cfg->monitor));
         json_object_object_add(app, "sandbox", json_object_new_boolean(cfg->sandbox));
-        json_object_object_add(app, "fuse_direct", json_object_new_boolean(cfg->fuse_direct));
         json_object_object_add(app, "hide_count", json_object_new_int(cfg->hide_count));
         json_object_object_add(app, "ro_count", json_object_new_int(cfg->ro_count));
         json_object_object_add(app, "redir_count", json_object_new_int(cfg->redir_count));
@@ -206,7 +204,6 @@ static void handle_get_global_rules(bool api_mode) {
         json_object_object_add(switches, "global_inject", json_object_new_boolean(g_global_cfg.global_inject));
         json_object_object_add(switches, "monitor", json_object_new_boolean(g_global_cfg.monitor));
         json_object_object_add(switches, "sandbox", json_object_new_boolean(g_global_cfg.sandbox));
-        json_object_object_add(switches, "fuse_direct", json_object_new_boolean(g_global_cfg.fuse_direct));
         json_object_object_add(root, "switches", switches);
 
         /* hide_rules */
@@ -264,7 +261,6 @@ static void handle_get_global_rules(bool api_mode) {
         printf("  GLOBAL_INJECT %s\n", g_global_cfg.global_inject ? "ON" : "OFF");
         printf("  MONITOR       %s\n", g_global_cfg.monitor ? "ON" : "OFF");
         printf("  SANDBOX       %s\n", g_global_cfg.sandbox ? "ON" : "OFF");
-        printf("  FUSE_DIRECT   %s\n", g_global_cfg.fuse_direct ? "ON" : "OFF");
         printf("\n--- HIDE 规则 (%d 条) ---\n", g_global_cfg.hide_count);
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
             printf("  [%d] HIDE %s\n", i, g_global_cfg.hide_rules[i]);
@@ -330,7 +326,6 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         json_object_object_add(switches, "inject_enable", json_object_new_boolean(cfg->inject_enable));
         json_object_object_add(switches, "monitor", json_object_new_boolean(cfg->monitor));
         json_object_object_add(switches, "sandbox", json_object_new_boolean(cfg->sandbox));
-        json_object_object_add(switches, "fuse_direct", json_object_new_boolean(cfg->fuse_direct));
         json_object_object_add(root, "switches", switches);
 
         json_object *hide_rules = json_object_new_array();
@@ -383,7 +378,6 @@ static void handle_get_app_rules(bool api_mode, const char *pkg, int user_id) {
         printf("  INJECT_ENABLE %s\n", cfg->inject_enable ? "ON" : "OFF");
         printf("  MONITOR       %s\n", cfg->monitor ? "ON" : "OFF");
         printf("  SANDBOX       %s\n", cfg->sandbox ? "ON" : "OFF");
-        printf("  FUSE_DIRECT   %s\n", cfg->fuse_direct ? "ON" : "OFF");
         printf("\n--- HIDE 规则 (%d 条) ---\n", cfg->hide_count);
         for (int i = 0; i < cfg->hide_count; i++) {
             printf("  [%d] HIDE %s\n", i, cfg->hide_rules[i]);
@@ -680,8 +674,7 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         snprintf(line, sizeof(line), "RO %s\n", value);
     } else if (strcmp(type, "MONITOR") == 0 ||
                strcmp(type, "SANDBOX") == 0 ||
-               strcmp(type, "GLOBAL_INJECT") == 0 ||
-               strcmp(type, "FUSE_DIRECT") == 0) {
+               strcmp(type, "GLOBAL_INJECT") == 0) {
         snprintf(line, sizeof(line), "%s %s\n", type, value);
     } else {
         char err_buf[128];
@@ -692,8 +685,7 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
     
     bool is_global_switch = (strcmp(type, "MONITOR") == 0 ||
                              strcmp(type, "SANDBOX") == 0 ||
-                             strcmp(type, "GLOBAL_INJECT") == 0 ||
-                             strcmp(type, "FUSE_DIRECT") == 0);
+                             strcmp(type, "GLOBAL_INJECT") == 0);
     if (strcmp(pkg, "GLOBAL") == 0) {
         int line_count = 0, line_cap = 0;
         char **lines = read_file_lines(rule_path, &line_count, &line_cap);

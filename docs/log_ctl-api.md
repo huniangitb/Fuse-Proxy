@@ -213,7 +213,7 @@ log_ctl get-config api
 返回结构（格式化展示）：
 
 ```json
-{"timestamp":1719523200,"injector":{"pid":1234,"passive":false,"mode":"active"},"global_fuse":{"fuse_pid":5678,"disabled":false},"templates":[{"template_name":"GLOBAL","hook_operation":["query","insert"],"apply_to_app":["*"],"enable_sandbox":false,"global_inject":true,"fuse_direct":false,"hide_paths":["/sdcard/secret"],"read_only_path":[],"redirect_rules":[]}]}
+{"timestamp":1719523200,"injector":{"pid":1234,"passive":false,"mode":"active"},"global_fuse":{"fuse_pid":5678,"disabled":false},"templates":[{"template_name":"GLOBAL","hook_operation":["query","insert"],"apply_to_app":["*"],"enable_sandbox":false,"global_inject":true,"hide_paths":["/sdcard/secret"],"read_only_path":[],"redirect_rules":[]}]}
 ```
 
 ---
@@ -231,14 +231,14 @@ log_ctl get-config --static api
 ### 响应 (data)
 
 ```json
-{"timestamp":1719523200,"type":"static","global":{"switches":{"global_inject":"OFF","monitor":"ON","sandbox":"OFF","fuse_direct":"OFF"},"ro_rules":["/123 云盘/Cache/","/HyperOS_Sandbox/"],"hide_rules":[],"redirect_rules":["/sdcard/src /sdcard/dst"],"allow_rules":[]},"apps":[{"pkg":"com.termux","user_id":0,"inject_enable":"OFF"},{"pkg":"com.tencent.mobileqq","user_id":0,"inject_enable":"ON"}],"app_rules":[{"file":"com.tencent.mobileqq.conf","user_dir":"App-rules","content":"SANDBOX ON\n"}]}
+{"timestamp":1719523200,"type":"static","global":{"switches":{"global_inject":"OFF","monitor":"ON","sandbox":"OFF"},"ro_rules":["/123 云盘/Cache/","/HyperOS_Sandbox/"],"hide_rules":[],"redirect_rules":["/sdcard/src /sdcard/dst"],"allow_rules":[]},"apps":[{"pkg":"com.termux","user_id":0,"inject_enable":"OFF"},{"pkg":"com.tencent.mobileqq","user_id":0,"inject_enable":"ON"}],"app_rules":[{"file":"com.tencent.mobileqq.conf","user_dir":"App-rules","content":"SANDBOX ON\n"}]}
 ```
 
 ### 字段说明
 
 | 路径 | 类型 | 说明 |
 |------|------|------|
-| `global.switches` | object | 全局开关值：`global_inject`、`monitor`、`sandbox`、`fuse_direct`（`"ON"` / `"OFF"`） |
+| `global.switches` | object | 全局开关值：`global_inject`、`monitor`、`sandbox`（`"ON"` / `"OFF"`） |
 | `global.ro_rules` | string[] | 全局 RO 规则路径列表 |
 | `global.hide_rules` | string[] | 全局 HIDE 规则路径列表 |
 | `global.redirect_rules` | string[] | 全局 REDIRECT 规则列表 |
@@ -313,7 +313,6 @@ log_ctl parse-rules api
   "global": {
     "sandbox": false,
     "global_inject": true,
-    "fuse_direct": false,
     "monitor": false,
     "inject_enable": true,
     "hide_count": 3,
@@ -327,7 +326,6 @@ log_ctl parse-rules api
       "inject_enable": true,
       "monitor": false,
       "sandbox": true,
-      "fuse_direct": false,
       "hide_count": 2,
       "ro_count": 0,
       "redir_count": 1
@@ -353,14 +351,14 @@ log_ctl get-global-rules api
 ### 响应 (data)
 
 ```json
-{"switches":{"global_inject":false,"monitor":true,"sandbox":true,"fuse_direct":false},"hide_rules":["/sdcard/secret"],"ro_rules":["/123 云盘/Cache/","/HyperOS_Sandbox/"],"redirect_rules":[{"virtual_prefix":"/sdcard/A","real_target":"/data/B"}],"allow_rules":[],"fuse_extra_args":"","counts":{"hide":1,"ro":2,"redirect":1,"allow":0}}
+{"switches":{"global_inject":false,"monitor":true,"sandbox":true},"hide_rules":["/sdcard/secret"],"ro_rules":["/123 云盘/Cache/","/HyperOS_Sandbox/"],"redirect_rules":[{"virtual_prefix":"/sdcard/A","real_target":"/data/B"}],"allow_rules":[],"fuse_extra_args":"","counts":{"hide":1,"ro":2,"redirect":1,"allow":0}}
 ```
 
 ### 字段说明
 
 | 路径 | 类型 | 说明 |
 |------|------|------|
-| `switches` | object | 全局开关：`global_inject`、`monitor`、`sandbox`、`fuse_direct` |
+| `switches` | object | 全局开关：`global_inject`、`monitor`、`sandbox` |
 | `hide_rules` | string[] | HIDE 路径列表 |
 | `ro_rules` | string[] | RO 路径列表 |
 | `redirect_rules` | object[] | REDIRECT 规则列表（含 `virtual_prefix` 和 `real_target`） |
@@ -399,7 +397,7 @@ log_ctl get-app-rules com.tencent.mobileqq   # 纯文本模式
 ### 响应 (data) — api 模式
 
 ```json
-{"pkg":"com.tencent.mobileqq","user_id":0,"switches":{"inject_enable":true,"monitor":false,"sandbox":true,"fuse_direct":false},"hide_rules":["/sdcard/secret"],"ro_rules":[],"redirect_rules":[],"allow_rules":[],"counts":{"hide":1,"ro":0,"redirect":0,"allow":0}}
+{"pkg":"com.tencent.mobileqq","user_id":0,"switches":{"inject_enable":true,"monitor":false,"sandbox":true},"hide_rules":["/sdcard/secret"],"ro_rules":[],"redirect_rules":[],"allow_rules":[],"counts":{"hide":1,"ro":0,"redirect":0,"allow":0}}
 ```
 
 ### 响应 (data) — 文本模式
@@ -411,7 +409,6 @@ log_ctl get-app-rules com.tencent.mobileqq   # 纯文本模式
   INJECT_ENABLE ON
   MONITOR       OFF
   SANDBOX       ON
-  FUSE_DIRECT   OFF
 
 --- HIDE 规则 (1 条) ---
   [0] HIDE /sdcard/secret
@@ -427,7 +424,6 @@ log_ctl get-app-rules com.tencent.mobileqq   # 纯文本模式
 | `switches.inject_enable` | bool | 是否启用注入 |
 | `switches.monitor` | bool | 是否启用监控 |
 | `switches.sandbox` | bool | 是否启用沙箱 |
-| `switches.fuse_direct` | bool | 是否启用 FUSE 直通 |
 | `hide_rules` | string[] | HIDE 路径列表 |
 | `ro_rules` | string[] | RO 路径列表 |
 | `redirect_rules` | object[] | REDIRECT 规则列表 |
@@ -496,7 +492,6 @@ log_ctl set-rule <pkg> <type> <value> [--uid uid] [api]
 | `MONITOR` | `ON` 或 `OFF` | `App-rules/<pkg>.conf` |
 | `SANDBOX` | `ON` 或 `OFF` | `App-rules/<pkg>.conf` |
 | `GLOBAL_INJECT` | `ON` 或 `OFF` | 仅 `pkg=GLOBAL` 时写入 `injector.conf` `[GLOBAL]` 段 |
-| `FUSE_DIRECT` | `ON` 或 `OFF` | 仅 `pkg=GLOBAL` 时写入 `injector.conf` `[GLOBAL]` 段 |
 
 ### 示例
 
