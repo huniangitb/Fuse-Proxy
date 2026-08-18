@@ -621,14 +621,15 @@ static void check_and_recover_fuse() {
             g_media_fuse.disabled = true;
             return;
         }
-        if (is_media_module_injected_target()) {
+        if (!g_global_replace_mode && is_media_module_injected_target()) {
             LOG("专用媒体 FUSE 异常退出，执行重新拉起任务");
             inject_media_fuse();
         }
-    } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready) {
+    } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready && !g_global_replace_mode) {
         /* 
          * 媒体 FUSE 惰性启动：
          * 初始时未启动，在定时轮询中检测到 com.android.providers.media.module 变动为注入目标时，惰性启动媒体 FUSE。
+         * 全局替换模式下无需媒体专属 FUSE（全局 FUSE 已提供代理视图）。
          */
         if (is_media_module_injected_target()) {
             LOG("惰性启动媒体 FUSE 实例 (com.android.providers.media.module 专属)");
@@ -1005,6 +1006,11 @@ int main(int argc, char *argv[]) {
     g_config_pub_fd = config_publisher_init();
     strcpy(g_real_root, STORAGE_BASE);
     mkdir_recursive(BACKUP_DIR);
+    /* 应用规则目录创建权归属 injector 单一进程：显式开启后，后续所有
+       load_config_rules 调用（启动 + 热重载 reload_config_rules_diff）均
+       允许 mkdir App-rules / App-rules-<uid>；fuse_daemon/log_ctl 等
+       只读加载方保持默认 false，杜绝伪用户目录固化 */
+    config_set_allow_app_rules_mkdir(true);
     reload_injector_config();
     int wait_count = 0;
     while (faccessat(g_global_root_fd, "data/media/0", F_OK, 0) != 0 && wait_count < 120 && !g_should_exit) {
@@ -1013,8 +1019,8 @@ int main(int argc, char *argv[]) {
     }
     inject_global_fuse();
     if (g_global_fuse.fuse_pid <= 0) exit(1);
-    
-    if (is_media_module_injected_target()) {
+
+    if (!g_global_replace_mode && is_media_module_injected_target()) {
         LOG("检测到 com.android.providers.media.module 在注入目标之列，正在启动专用媒体 FUSE 实例。");
         inject_media_fuse();
     } else {
@@ -1200,7 +1206,8 @@ int main(int argc, char *argv[]) {
                 waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
                 g_media_fuse.fuse_pid = 0;
                 ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
-            } else if (g_media_fuse.fuse_pid <= 0 && is_media_module_injected_target() && g_fuse_ready) {
+            } else if (g_media_fuse.fuse_pid <= 0 && !g_global_replace_mode &&
+                       is_media_module_injected_target() && g_fuse_ready) {
                 LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
                 inject_media_fuse();
             }
