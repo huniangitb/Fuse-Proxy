@@ -202,6 +202,13 @@ int br_rules_init(const char* rules_path, bool disable_sandbox) {
     strncpy(g_br_rules_path, rules_path ? rules_path : "", sizeof(g_br_rules_path) - 1);
     g_br_disable_sandbox = disable_sandbox;
     g_br_stop = false;
+    /* 只读加固：fuse_daemon 侧不创建 App-rules 目录、不做 pm 探测——
+       pm list users 需 binder 通信 system_server，在 fuse_daemon 受限
+       环境会挂起，而 load_config_rules 在写锁内执行（br_rules_init 位于
+       fuse_main 之前同步调用），popen 阻塞将导致 FUSE 会话永不启动；
+       热重载（config_monitor_thread → br_reload_config）同理会卡死 */
+    config_set_allow_app_rules_mkdir(false);
+    config_set_scan_users_skip_pm(true);
     config_init_lock();
     for (int i = 0; i < UID_CACHE_SIZE; i++) {
         pthread_mutex_init(&g_uid_cache[i].wlock, nullptr);
