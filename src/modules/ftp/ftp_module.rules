@@ -10,5 +10,5 @@
 [FTP]
 format = pair
 argc = 2
-desc = FTP 存储映射：<虚拟前缀>|<段名>
-desc.en = FTP storage mapping: <virtual prefix>|<section>
+desc = FTP 存储映射
+desc.en = FTP storage mapping

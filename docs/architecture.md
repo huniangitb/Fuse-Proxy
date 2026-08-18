@@ -17,7 +17,7 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 | 路径隐藏（HIDE） | 对特定应用隐藏文件/目录（返回 ENOENT）；含跨应用隔离——应用访问 `/Android/data/<其他包名>/` 自动隐藏 |
 | 只读保护（RO） | 指定路径对应用只读（写操作返回 EROFS） |
 | 沙箱隔离（SANDBOX） | 为应用创建独立存储沙箱（`/Android/data/<pkg>/sandbox`），隔离 `/Android/data`、`/Android/obb` |
-| 命名空间注入 | 检测 zygote fork，自动为目标应用注入 FUSE 挂载；支持 `FUSE_DIRECT` 直挂模式跳过 bind mount 备份还原 |
+| 命名空间注入 | 检测 zygote fork，自动为目标应用注入 FUSE 挂载 |
 | 专属媒体 FUSE | 为 `com.android.providers.media.module` 单独起一个 FUSE 实例（惰性启动/退出） |
 | 配置广播 | 通过 UDS 实时对外发布当前配置（供管理器 App 消费） |
 
@@ -69,7 +69,7 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 
 - **事件循环**：`epoll` 统一管理 inotify（配置文件变更）、IPC socket、异步挂载完成管道、FUSE ready 管道、定时器（周期扫描）。
 - **目标判定**（`inject_target.c`）：判断一个进程是否为注入目标——依据包名匹配配置、系统应用过滤、隔离进程过滤等。
-- **挂载注入**（`mount_manager.c` + `ns_utils.c`）：进入目标进程的 mount namespace，挂载 FUSE 并做 bind mount 恢复。支持 `FUSE_DIRECT` 直挂模式——跳过备份/还原，直接追加挂载，首启动应用可走快速路径免读 mountinfo。
+- **挂载注入**（`mount_manager.c` + `ns_utils.c`）：进入目标进程的 mount namespace，挂载 FUSE 并做 bind mount 恢复。
 - **IPC 服务**（`ipc_server.c`）：接收外部（如管理器 App）的查询/控制命令。
 - **配置广播**（`config_publisher.c`）：以 JSON 通过 UDS 实时发布配置，支持 GET / STATIC / SUBSCRIBE。详见 `config-broadcast.md`。
 
@@ -132,9 +132,9 @@ Fuse-Proxy/
 │   ├── injector/           # 注入器
 │   │   ├── injector.c      # main + epoll 事件循环（含 inject_global_fuse/inject_media_fuse）
 │   │   ├── inject_target.c # 注入目标判定 + uid 映射维护
-│   │   ├── mount_manager.c # FUSE 挂载管理（含 FUSE_DIRECT 直挂快速路径）
+│   │   ├── mount_manager.c # FUSE 挂载管理
 │   │   ├── ns_utils.c      # mount namespace 操作（含 do_force_umount_stale 预清理）
-│   │   ├── ipc_server.c    # IPC 服务端（含 FUSE_DIRECT 快速路径首启动免读 mountinfo）
+│   │   ├── ipc_server.c    # IPC 服务端
 │   │   └── config_publisher.c # 配置广播 UDS 服务
 │   └── log/                # 日志子系统
 │       ├── log_monitor.c   # 日志收集服务（AF_UNIX SOCK_STREAM，抽象地址 nsp_log_socket）
@@ -185,7 +185,7 @@ common_sources = core/common.c, config/config_parser.c, config/path_vars.c,
 
 作用域：`[GLOBAL]` 段为全局规则（所有应用共享）；`[包名:用户ID]` 段为应用专属。应用规则也可放在 `App-rules/包名.conf` 独立文件。多用户场景使用 `App-rules-<uid>/<包名>.conf`。
 
-> 注：`SANDBOX` / `MONITOR` / `FUSE_DIRECT` 等开关既可写在 `[GLOBAL]` 段作全局默认，也可写在应用段覆盖全局；应用段显式写一次即标记 `*_explicit`，此后以应用段值为准——不存在"继承全局后再覆盖"的中间态。
+> 注：`SANDBOX` / `MONITOR` 等开关既可写在 `[GLOBAL]` 段作全局默认，也可写在应用段覆盖全局；应用段显式写一次即标记 `*_explicit`，此后以应用段值为准——不存在"继承全局后再覆盖"的中间态。
 
 ### 5.2 双通道存储：Trie + 线性数组
 
@@ -240,7 +240,7 @@ FUSE 回调（如 getattr）
 1. injector 启动时先 `inject_global_fuse`：在 `/mnt/nsp_global` 挂载全局 FUSE 实例（fuse_daemon 以 `--root=/data/media --rules=<injector.conf>` 启动）。若 `com.android.providers.media.module` 在注入目标之列，再惰性 `inject_media_fuse` 起一个专用 FUSE 实例。
 2. injector 通过检测 zygote 子进程（`fast_pid` + `/proc` 扫描，周期由 timerfd 驱动）发现新启动的应用。
 3. `inject_target` 判定该进程是否为配置的目标应用（含 `SKIP_SYSTEM_APPS` 默认过滤 uid<10000、隔离进程过滤）。
-4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace，挂载 fuse_daemon 提供的 FUSE 文件系统。`FUSE_DIRECT` 开启时走快速路径：跳过 bind mount 备份/还原，直接追加挂载；首启动应用可免读 mountinfo。
+4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace，挂载 fuse_daemon 提供的 FUSE 文件系统。
 5. 此后该应用对 `/sdcard` 等的访问经 FUSE → 规则模块（basic_rules）匹配。
 
 ### 6.2 配置热重载

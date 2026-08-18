@@ -1742,7 +1742,7 @@ static void* vfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
         conn->want |= FUSE_CAP_PASSTHROUGH;
         g_passthrough_enabled = true;
         g_pt_method = PT_METHOD_UPSTREAM;   /* 能力协商内核的透传 open 即 cmd1（BACKING_OPEN 号） */
-        LOG("FUSE Passthrough: ✅ 内核INIT能力协商成功 (capable=0x%x), 直接启用", conn->capable);
+        LOG_DBG("FUSE Passthrough: ✅ 内核INIT能力协商成功 (capable=0x%x), 直接启用", conn->capable);
         goto passthrough_done;
     }
     LOG_DBG("FUSE Passthrough: 内核INIT未上报passthrough能力, 回退ioctl探测 (capable=0x%x)", conn->capable);
@@ -1773,7 +1773,7 @@ skip_passthrough:
     /* 协商详情：内核上报能力与本端请求位——若后续就绪验证失败(内核 conn_error)，
        据此可定位是哪个请求位被内核拒绝（如 DAX 设备把回包 legacy bit31 误读为
        FUSE_MAP_ALIGNMENT 而拒绝回包） */
-    LOG("FUSE 协商详情: 内核 capable=0x%x, 本端 want=0x%x, 透传=%s",
+    LOG_DBG("FUSE 协商详情: 内核 capable=0x%x, 本端 want=0x%x, 透传=%s",
         (unsigned)conn->capable, (unsigned)conn->want,
         g_passthrough_enabled ? "启用" : (g_pt_probe_pending ? "延迟探测" : "标准FUSE回退"));
     if (g_ready_fd >= 0) { write(g_ready_fd, "1", 1); close(g_ready_fd); g_ready_fd = -1; }

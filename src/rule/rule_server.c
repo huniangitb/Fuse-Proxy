@@ -8,7 +8,7 @@
  *   ADD                           动态新增规则（REDIRECT/ALLOW/HIDE/RO/开关）
  *   REMOVE                        按 (类型, 索引) 删除规则
  *   ENABLE / DISABLE              启用/停用规则（# 注释切换，解析器自动跳过）
- *   SET                           设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT/INJECT_ENABLE）
+ *   SET                           设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/INJECT_ENABLE）
  *   RELOAD                        向 injector 发送 SIGHUP 触发配置重载
  *   STOP                          向 injector 发送 SIGTERM 停止注入服务
  *   STATUS                        系统状态概览
@@ -56,7 +56,7 @@ static time_t g_start_wall = 0;       /* 启动时刻（墙钟，started_at 展�
 /* ==================== 规则类型（动态注册表） ====================
    类型来源两类：
    1. 内置类型（rule_types_init 填充）：HIDE/RO/REDIRECT/ALLOW/MONITOR/
-      SANDBOX/GLOBAL_INJECT/FUSE_DIRECT，与 basic_rules 模块能力对应；
+      SANDBOX/GLOBAL_INJECT，与 basic_rules 模块能力对应；
    2. 模块类型（rule_types_refresh 扫描）：加载模块目录下 <模块名>.rules
       声明的类型（如 ftp_module 的 FTP），实现「支持的规则随加载模块动态追加」。
    值格式决定 ADD 时如何解析 value、写入文件时如何拼行：
@@ -151,7 +151,6 @@ static void rule_types_init(void) {
     /* 全局专属：仅 [GLOBAL] 段可用，应用配置中不允许出现 */
     rule_types_add("GLOBAL_INJECT", RFT_SWITCH, true, true, "builtin");
     rule_types_add("SKIP_SYSTEM_APPS", RFT_SWITCH, true, true, "builtin");
-    rule_types_add("FUSE_DIRECT", RFT_SWITCH, true, true, "builtin");
 }
 
 /* 按名查找类型（大小写不敏感），返回索引；未找到返回 RT_UNKNOWN */
@@ -1353,7 +1352,7 @@ static void handle_add(int fd, json_object *req) {
         reply_error(fd, "ADD", "未知规则类型: %s", type_s);
         return;
     }
-    /* 全局专属类型（GLOBAL_INJECT/SKIP_SYSTEM_APPS/FUSE_DIRECT）：仅 [GLOBAL] 段可用 */
+    /* 全局专属类型（GLOBAL_INJECT/SKIP_SYSTEM_APPS）：仅 [GLOBAL] 段可用 */
     if (!is_global && g_rule_types[t].global_only) {
         reply_error(fd, "ADD", "规则类型 %s 仅可在全局规则中使用，不能配置到应用 %s",
                     type_s, pkg);
@@ -1723,7 +1722,7 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
     reply_ok(fd, cmd, data);
 }
 
-/* SET：设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT）或应用注入开关，
+/* SET：设置开关（MONITOR/SANDBOX/GLOBAL_INJECT）或应用注入开关，
    复用 ADD 的写入逻辑 */
 static void handle_set(int fd, json_object *req) {
     handle_add(fd, req);

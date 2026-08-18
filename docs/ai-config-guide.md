@@ -43,7 +43,6 @@
 | `MONITOR` | 应用段 | 监控该应用的文件访问；应用段显式写一次即覆盖全局（`monitor_explicit`） |
 | `SANDBOX` | 应用段 | 为该应用启用独立沙箱；应用段显式写一次即覆盖全局（`sandbox_explicit`） |
 | `GLOBAL_INJECT` | 全局段 | 全局注入开关 |
-| `FUSE_DIRECT` | 全局段 + 应用段 | FUSE 直挂开关：跳过 bind mount 备份/还原，直接追加挂载。应用段值优先于全局段 |
 | `SKIP_SYSTEM_APPS` | 全局段 | 是否跳过系统应用，默认 **ON**（`load_config_rules` 初始化为 true）。判定走 `pm list packages -s` 缓存（`load_system_pkg_cache`，命中即系统应用）；`pm` 不可用时回退到 `uid < 10000` |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外命令行参数（读取行尾原样内容，不做分词；上限 512 字节） |
 
@@ -58,7 +57,6 @@ FUSE_EXTRA_ARGS --strip-o-direct
 [com.tencent.mm]
 MONITOR ON
 SANDBOX OFF
-FUSE_DIRECT ON
 ```
 
 > 注：`FUSE_EXTRA_ARGS` 的值是 `=` 后行尾原样内容（含内部空格），解析器不剥离行内注释——如 `FUSE_EXTRA_ARGS --foo # bar` 的值是 `--foo # bar`。
@@ -247,7 +245,6 @@ HIDE /sdcard/Tencent/MicroMsg/999/private
 
 [GLOBAL]
 GLOBAL_INJECT ON
-FUSE_DIRECT OFF
 SKIP_SYSTEM_APPS ON
 
 DATA_BASE=/sdcard/Android/data/$package
@@ -273,7 +270,7 @@ RO   /system/fonts
 
 - [ ] 段头格式正确：`[GLOBAL]` / `[<pkg>]` / `[<pkg>:<uid>]`，段头缺省 ON/OFF 时默认 ON
 - [ ] 开关值只用 `ON` / `1`（开）或省略/其他（关）
-- [ ] `FUSE_EXTRA_ARGS` 仅写在 `[GLOBAL]` 段；`FUSE_DIRECT` 可全局可应用段（应用段优先）
+- [ ] `FUSE_EXTRA_ARGS` 仅写在 `[GLOBAL]` 段
 - [ ] `HIDE` / `RO` / `ALLOW` / `REDIRECT` 关键字拼写无误
 - [ ] `REDIRECT` 第二参数含 `$package` 时，第一参数（虚拟前缀）不含 `$package`
 - [ ] 变量定义紧凑：`NAME=VALUE`，`=` 两侧无空格（`parse_var_assignment`）

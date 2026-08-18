@@ -70,7 +70,7 @@ rule_server -c '{"cmd":"LIST"}'
 | `ADD` | 动态新增规则 / 开关 / 应用注入开关 |
 | `REMOVE` | 按 (类型, 索引) 删除规则 |
 | `ENABLE` / `DISABLE` | 启用 / 停用规则（`#` 注释切换） |
-| `SET` | 设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/FUSE_DIRECT/INJECT_ENABLE） |
+| `SET` | 设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/INJECT_ENABLE） |
 | `RELOAD` | 向 injector 发送 SIGHUP 触发配置重载 |
 | `STOP` | 向 injector 发送 SIGTERM 停止注入服务 |
 | `SERVICE` | 服务状态查询与启停控制（log_monitor/injector/fuse_daemon） |
@@ -163,7 +163,7 @@ rule_server -c '{"cmd":"LIST"}'
   ],
   "global": {
     "file": "/var/fuse-proxy/injector.conf",
-    "switches": {"MONITOR": true, "SANDBOX": false, "GLOBAL_INJECT": false, "FUSE_DIRECT": false},
+    "switches": {"MONITOR": true, "SANDBOX": false, "GLOBAL_INJECT": false},
     "rules": [
       {"index": 0, "type": "HIDE", "value": "/sdcard/secret", "enabled": true},
       {"index": 0, "type": "REDIRECT", "value": "/sdcard/a /sdcard/b", "enabled": true}
@@ -174,7 +174,7 @@ rule_server -c '{"cmd":"LIST"}'
       "pkg": "com.example.app", "uid": 0,
       "file": "/var/fuse-proxy/App-rules/com.example.app.conf",
       "inject_enable": true,
-      "switches": {"MONITOR": true, "SANDBOX": false, "GLOBAL_INJECT": false, "FUSE_DIRECT": false},
+      "switches": {"MONITOR": true, "SANDBOX": false, "GLOBAL_INJECT": false},
       "rules": [{"index": 0, "type": "HIDE", "value": "/sdcard/app_secret", "enabled": false}]
     }
   ]
@@ -269,7 +269,6 @@ rule_server 在运行时解析并体现在 `rule_types` 中，前端无需硬编
 
 - `GLOBAL_INJECT`（全局注入）
 - `SKIP_SYSTEM_APPS`（跳过系统应用）
-- `FUSE_DIRECT`（FUSE 直通）
 
 应用配置文件（`App-rules/<pkg>.conf`）中不允许出现上述类型。
 
