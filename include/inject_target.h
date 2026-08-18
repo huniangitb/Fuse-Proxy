@@ -21,6 +21,13 @@ void get_target_storage_path(uid_t uid, char* path, size_t size);
 void add_tracked(int pid);
 bool is_tracked(int pid);
 void remove_tracked(int pid);
+/* 注入状态稳定公共函数：add_tracked 仅表示已跟踪（含还原的非目标应用），
+   是否确实已注入由显式标志维护——注入成功路径调 mark_injected，
+   还原/卸载路径调 unmark_injected，list-injected/快照经 is_injected 判定，
+   不再依赖 mountinfo 挂载状态探测（GLOBAL_INJECT 下探测不可靠） */
+void mark_injected(int pid);
+void unmark_injected(int pid);
+bool is_injected(int pid);
 /* 生命周期清理：清除已退出应用的追踪缓存（被动模式由 IPC 通知路径触发） */
 void cleanup_stale_tracked(void);
 /*

@@ -22,6 +22,9 @@
 #define TRACKED_HASH_SIZE 2048
 typedef struct TrackedEntry {
     int pid;
+    bool injected;              /* 注入状态显式标志：注入成功路径置位，
+                                   restore/卸载路径清除（稳定公共函数维护，
+                                   列表不再依赖挂载状态探测） */
     struct TrackedEntry *next;
 } TrackedEntry;
 
@@ -166,6 +169,69 @@ void add_tracked(int pid) {
         g_tracked_hash[h] = e;
     }
     pthread_mutex_unlock(&g_tracked_mutex);
+
+    /* 预热挂载状态缓存（尽力而为，容错）：注入/跟踪建立时立即为该应用建立
+       挂载状态缓存，LIST_INJECTED 首次请求即可 O(1) 命中，无需逐个扫描 mountinfo。
+       解锁后执行——read_mount_state 扫描开销不应持锁；进程可能已退出或
+       /proc 读取失败，任何失败静默忽略，不影响 add_tracked 主流程 */
+    char target_path[128];
+    uid_t uid = get_app_uid(pid);
+    get_target_storage_path(uid, target_path, sizeof(target_path));
+    (void)is_project_fuse_cached(pid, target_path);
+}
+
+/* ============ 注入状态稳定公共函数 ============
+   add_tracked 仅表示"已处理/已跟踪"（含还原后的非目标应用）；是否确实
+   **已注入**由显式标志维护，list-injected/快照据此判定，不再重新探测
+   mountinfo——GLOBAL_INJECT 下全局替换无逐应用挂载、异步挂载时序、
+   系统应用命名空间差异都会让挂载状态探测误判，导致刚注入的应用被过滤 */
+
+/* 标记 pid 为已注入（注入成功路径调用，幂等） */
+void mark_injected(int pid) {
+    add_tracked(pid);   /* 确保条目存在（幂等） */
+    pthread_mutex_lock(&g_tracked_mutex);
+    unsigned int h = hash_pid(pid);
+    TrackedEntry *e = g_tracked_hash[h];
+    while (e) {
+        if (e->pid == pid) {
+            e->injected = true;
+            break;
+        }
+        e = e->next;
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+}
+
+/* 清除注入标志（还原/卸载路径调用，幂等；条目仍保留以便继续追踪） */
+void unmark_injected(int pid) {
+    pthread_mutex_lock(&g_tracked_mutex);
+    unsigned int h = hash_pid(pid);
+    TrackedEntry *e = g_tracked_hash[h];
+    while (e) {
+        if (e->pid == pid) {
+            e->injected = false;
+            break;
+        }
+        e = e->next;
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+}
+
+/* 注入状态查询：返回 pid 是否处于已注入状态（tracked 且 injected） */
+bool is_injected(int pid) {
+    bool injected = false;
+    pthread_mutex_lock(&g_tracked_mutex);
+    unsigned int h = hash_pid(pid);
+    TrackedEntry *e = g_tracked_hash[h];
+    while (e) {
+        if (e->pid == pid) {
+            injected = e->injected;
+            break;
+        }
+        e = e->next;
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+    return injected;
 }
 
 bool is_tracked(int pid) {
@@ -539,6 +605,8 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
         snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
         ns_bind_mount(pid, init_src, target_path);
     }
+    /* 卸载/还原即解除注入状态（显式标志清除，列表不再误报） */
+    unmark_injected(pid);
 }
 
 void force_recover_tracked_mounts() {
@@ -592,7 +660,7 @@ void audit_tracked_apps() {
             bool is_target = is_target_app(cmd, uid, pid, false);
             char target_path[128];
             get_target_storage_path(uid, target_path, sizeof(target_path));
-            bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
+            bool has_fuse = is_project_fuse_cached(pid, target_path);
             if (!is_target && has_fuse) {
                 if (g_global_replace_mode) {
                     /* 全局替换模式：非目标应用需卸载项目 FUSE 并还原系统视图备份 */
@@ -689,8 +757,7 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
         if (!is_target_app(cmd, uid, pid, false)) continue;
         char target_path[128];
         get_target_storage_path(uid, target_path, sizeof target_path);
-        bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 ||
-                         ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
+        bool has_fuse = is_project_fuse_cached(pid, target_path);
         if (has_fuse) continue;
         if (mnt_src) {
             add_tracked(pid);
@@ -701,7 +768,11 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
 }
 
 void handle_list_injected(int client_fd) {
-    char reply[4096];
+    /* 动态缓冲：tracked 应用可达数百，固定 4096 会截断后段 APP 行与 DONE 行，
+       导致 log_ctl 端"共计 0 个"误报（DONE 解析失败） */
+    size_t cap = 4096;
+    char* reply = malloc(cap);
+    if (!reply) { send(client_fd, "DONE|0\n", 7, MSG_NOSIGNAL); return; }
     int offset = 0;
     int total = 0;
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
@@ -712,14 +783,13 @@ void handle_list_injected(int client_fd) {
             char cmdline[256] = {0};
             if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) { e = e->next; continue; }
             uid_t uid = get_app_uid(pid);
-            // 状态过滤机制：穿透目标命名空间，验证是否真实处于 FUSE 挂载状态
-            char target_path[128];
-            get_target_storage_path(uid, target_path, sizeof(target_path));
-            bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || 
-                             ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
-            if (!has_fuse) {
+            /* 注入状态以显式标志为权威：不再探测 mountinfo（GLOBAL_INJECT
+               下全局替换无逐应用挂载/异步挂载时序会导致 is_project_fuse_cached
+               误判），也不再二次跑 is_target_app（注入路径已判定过）——
+               mark_injected 只在注入成功路径置位，还原/卸载路径已清除 */
+            if (!is_injected(pid)) {
                 e = e->next;
-                continue; // 物理卸载后代表应用处于逻辑停止状态，过滤不汇报
+                continue;
             }
             char base_pkg[256];
             strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
@@ -737,16 +807,31 @@ void handle_list_injected(int client_fd) {
             int total_hide = app_hide + g_global_cfg.hide_count;
             int total_ro = app_ro + g_global_cfg.ro_count;
             config_unlock_read();
-            int n = snprintf(reply + offset, sizeof(reply) - offset, "APP|%s|%d|%u|%d|%d|%d\n",
+            int n = snprintf(nullptr, 0, "APP|%s|%d|%u|%d|%d|%d\n",
                              base_pkg, pid, uid, total_redir, total_hide, total_ro);
-            if (n > 0 && offset + n < (int)sizeof(reply))
-                offset += n;
+            if (n > 0) {
+                if ((size_t)offset + n + 1 > cap) {
+                    cap = ((size_t)offset + n + 1) * 2;
+                    char* nr = realloc(reply, cap);
+                    if (!nr) break;
+                    reply = nr;
+                }
+                offset += snprintf(reply + offset, cap - offset, "APP|%s|%d|%u|%d|%d|%d\n",
+                                   base_pkg, pid, uid, total_redir, total_hide, total_ro);
+            }
             total++;
             e = e->next;
         }
     }
-    snprintf(reply + offset, sizeof(reply) - offset, "DONE|%d\n", total);
+    int dn = snprintf(nullptr, 0, "DONE|%d\n", total);
+    if ((size_t)offset + dn + 1 > cap) {
+        cap = (size_t)offset + dn + 1;
+        char* nr = realloc(reply, cap);
+        if (nr) reply = nr;
+    }
+    snprintf(reply + offset, cap - offset, "DONE|%d\n", total);
     send(client_fd, reply, strlen(reply), MSG_NOSIGNAL);
+    free(reply);
 }
 
 int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids, int max_count) {
@@ -759,12 +844,9 @@ int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids,
             char cmdline[256] = {0};
             if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) { e = e->next; continue; }
             uid_t uid = get_app_uid(pid);
-            // 状态过滤机制：仅当系统挂载了 FUSE 文件系统时才捕获快照
-            char target_path[128];
-            get_target_storage_path(uid, target_path, sizeof(target_path));
-            bool has_fuse = (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || 
-                             ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
-            if (!has_fuse) {
+            /* 与 handle_list_injected 一致：以显式注入标志为权威，
+               不再探测 mountinfo（GLOBAL_INJECT 下挂载状态不可靠） */
+            if (!is_injected(pid)) {
                 e = e->next;
                 continue;
             }

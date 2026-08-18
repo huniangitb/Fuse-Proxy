@@ -91,9 +91,11 @@ static void* ipc_restore_thread(void* raw) {
         usleep(10000);   /* 10ms 间隔，配合 300ms 总预算 */
     }
     log_batch_end();
-    /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用 */
+    /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用；
+       还原即解除注入状态（显式标志清除，列表不再误报） */
     if (ret == 0) {
         add_tracked(arg->pid);
+        unmark_injected(arg->pid);
     }
     /* 单条汇总日志：一次还原周期仅输出一条（派发→重试→完成合并） */
     clock_gettime(CLOCK_MONOTONIC, &tn);
@@ -131,7 +133,7 @@ static void* ipc_mount_thread(void* raw) {
     /* 防御性短路：全局替换模式下目标应用无需逐应用挂载
        （全局 FUSE 已提供代理视图），即使被误调也直接跳过挂载操作 */
     if (g_global_replace_mode) {
-        add_tracked(arg->pid);
+        mark_injected(arg->pid);
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
         free(arg);
         return NULL;
@@ -306,9 +308,9 @@ void handle_ipc_client_readable(int client_fd) {
         if (g_global_replace_mode) {
             /* 新挂载方案（全局替换模式）：全局 FUSE 已挂载 /storage/emulated，
                目标应用自动继承代理视图，无需 injector 逐应用挂载——
-               仅标记追踪并打印规则即可（避免 perform_app_mount 的
+               仅标记注入状态并打印规则即可（避免 perform_app_mount 的
                mountinfo 全量读取等 20ms+ 耗时）；非目标应用还原走上方分支 */
-            add_tracked(pid);
+            mark_injected(pid);
             print_active_rules(clean_pkg, pid, uid, "IPC通知");
             LOG_DBG("全局替换模式: 目标应用 %s(PID:%d) 无需挂载，已由全局 FUSE 提供代理视图", clean_pkg, pid);
             return;
