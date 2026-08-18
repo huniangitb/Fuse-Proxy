@@ -616,10 +616,13 @@ static int do_restore_app_fuse(void* raw) {
 }
 
 int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_root, int user_id) {
-    if (!fuse_src || !backup_root) return -1;
+    /* fuse_src（全局 FUSE 挂载源）仅用于精确 dev 匹配，允许为空：
+       为空时 do_restore_app_fuse 回退到 fstype/source 特征判断目标顶层
+       是否为项目 FUSE——还原不要求全局 FUSE 实例存在 */
+    if (!backup_root) return -1;
     struct AppRestoreArgs args;
     memset(&args, 0, sizeof(args));
-    strncpy(args.fuse_src, fuse_src, sizeof(args.fuse_src) - 1);
+    strncpy(args.fuse_src, fuse_src ? fuse_src : "", sizeof(args.fuse_src) - 1);
     strncpy(args.backup_root, backup_root, sizeof(args.backup_root) - 1);
     args.user_id = user_id;
     int child_err = 0;

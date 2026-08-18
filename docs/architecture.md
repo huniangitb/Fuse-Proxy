@@ -230,7 +230,7 @@ FUSE 回调（如 getattr）
 
 ### 5.6 跨应用隔离
 
-- `br_is_other_app_pkg`：应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用，由 `br_is_path_hidden_internal` 返回隐藏（ENOENT）。
+- `br_is_other_app_pkg`：应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用。隔离只作用于**列举**——readdir 条目级 probe 过滤（`br_probe` 返回 hidden，列表不显示其他应用目录内容）；resolve（getattr/open）**不再**判隐藏，已知路径的文件可正常打开/stat（修复 MT 管理器跨应用列表可见但打开 ENOENT 的问题）。
 - `CONFIG_DIR`（`/data/Namespace-Proxy`）路径下的所有访问无条件隐藏，防止应用窥探配置本身。
 
 ## 6. 进程间协作与数据流

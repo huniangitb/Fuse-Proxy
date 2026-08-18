@@ -85,6 +85,20 @@ static void invalidate_mount_cache(int pid) {
     }
 }
 
+static bool read_mount_state(int pid, const char* target, const char* backup, MountState* st);
+
+/* 注入状态检查（跨文件）：复用挂载状态缓存，避免每次扫描 mountinfo——
+   缓存未命中时读取一次并写入缓存（挂载/还原/卸载路径均会失效缓存，
+   inject_target 的 handle_list_injected/get_injected_snapshot 等高频调用受益） */
+bool is_project_fuse_cached(int pid, const char* target_path) {
+    MountState mnt;
+    if (!lookup_mount_cache(pid, &mnt)) {
+        if (!read_mount_state(pid, target_path, "", &mnt)) return false;
+        update_mount_cache(pid, &mnt);
+    }
+    return mnt.target_has_fuse || mnt.target_has_fuse_daemon;
+}
+
 static bool read_mount_state(int pid, const char* target, const char* backup, MountState* st) {
     memset(st, 0, sizeof(*st));
     char path[64];
@@ -94,6 +108,25 @@ static bool read_mount_state(int pid, const char* target, const char* backup, Mo
     if (!buf) return false;
     size_t tlen = strlen(target);
     size_t blen = strlen(backup);
+    /* 全局替换共享传播视图：fstype 可能不含 fuse_daemon（mountinfo source 是
+       devname/fsname），需以 dev（major:minor，bind/共享视图与源同 superblock）
+       判定。先收集全局 FUSE 源挂载点在该命名空间内的 dev */
+    char src_dev[64] = {0};
+    const char* src = get_active_mnt_src();
+    if (src) {
+        char* l = buf;
+        while (l < buf + nread) {
+            char* nl = strchr(l, '\n');
+            char devbuf[64] = {0}, mpbuf[PATH_MAX] = {0};
+            if (sscanf(l, "%*d %*d %63s %*s %4095s", devbuf, mpbuf) == 2 &&
+                strcmp(mpbuf, src) == 0) {
+                strncpy(src_dev, devbuf, sizeof(src_dev) - 1);
+                break;
+            }
+            if (!nl) break;
+            l = nl + 1;
+        }
+    }
     char* line = buf;
     while (line < buf + nread) {
         char* next_line = strchr(line, '\n');
@@ -121,7 +154,12 @@ static bool read_mount_state(int pid, const char* target, const char* backup, Mo
                         bool has_fuse_daemon = (fast_strstr(line, "fuse_daemon") != nullptr);
                         if (target_match) {
                             st->target_is_mounted = true;
-                            if (has_fuse) st->target_has_fuse = true;
+                            /* dev 匹配：全局替换共享传播视图（fstype 不含 fuse_daemon
+                               时仅 dev 与全局 FUSE 源一致可判定为项目视图） */
+                            char devbuf[64] = {0};
+                            sscanf(line, "%*d %*d %63s", devbuf);
+                            if (has_fuse || (src_dev[0] && strcmp(devbuf, src_dev) == 0))
+                                st->target_has_fuse = true;
                             if (has_fuse_daemon) st->target_has_fuse_daemon = true;
                         }
                         if (backup_match) {
@@ -224,9 +262,6 @@ static inline bool is_bpf_fuse_running(void) {
 #endif
 }
 
-/* FUSE 挂载源可用性缓存，进程生命周期内不会变化 */
-static bool g_fuse_src_verified = false;
-
 int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, const char* trigger) {
     if (kill(pid, 0) != 0) {
         LOG_DBG("目标进程已退出，跳过挂载: %s(PID:%d)", pkg, pid);
@@ -271,7 +306,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
     if (mnt.target_has_fuse || mnt.target_has_fuse_daemon) {
         LOG_DBG("挂载跳过: %s (PID: %d, %s) - 已经存在程序自身的 FUSE 挂载", target_path, pid, pkg);
         if (uid >= 10000) update_uid_map(uid, pkg);
-        add_tracked(pid);
+        mark_injected(pid);
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
     }
@@ -319,7 +354,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
     }
     if (ns_combined_mount_async(pid, pkg, mnt_src, target_path, backup_path, preserve_paths, preserve_count) == 0) {
         if (uid >= 10000) update_uid_map(uid, pkg);
-        add_tracked(pid);
+        mark_injected(pid);
         invalidate_mount_cache(pid);
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
@@ -431,20 +466,24 @@ int perform_app_restore(const char* pkg, int pid, uid_t uid) {
         invalidate_mount_cache(pid);
         return -1;
     }
-    const char* active_src = get_active_mnt_src();
-    if (!active_src) {
-        LOG_ERR("全局 FUSE 实例不可用，%s(PID:%d) 还原跳过", pkg, pid);
-        return -1;
-    }
+    /* 还原不依赖全局 FUSE 实例是否存在：目标顶层是否为项目 FUSE（fuse_daemon）
+       由 ns_restore_app_fuse 基于目标挂载状态判断（fstype/source 特征），
+       fuse_src 仅用于精确 dev 匹配，可为空（全局 FUSE 不可用时走特征兜底） */
     int user_id = (int)(uid / 100000);
-    int ret = ns_restore_app_fuse(pid, active_src, GLOBAL_BACKUP_ROOT, user_id);
+    int ret = ns_restore_app_fuse(pid, get_active_mnt_src(), GLOBAL_BACKUP_ROOT, user_id);
     if (ret == 0) {
         LOG_DBG("非目标应用已还原系统视图: %s(PID:%d, user=%d)", pkg, pid, user_id);
         invalidate_mount_cache(pid);
+        unmark_injected(pid);   /* 还原即解除注入状态（显式标志清除） */
     } else if (ret == 1) {
         LOG_DBG("非目标应用还原跳过: %s(PID:%d, user=%d) 顶层非项目 FUSE", pkg, pid, user_id);
+        /* 还原跳过（顶层非项目 FUSE）：缓存可能残留旧的 target_has_fuse=true，
+           须失效重建，否则 list-injected 会误判该应用仍已注入 */
+        invalidate_mount_cache(pid);
+        unmark_injected(pid);
     } else {
         LOG_ERR("非目标应用还原失败: %s(PID:%d, user=%d)", pkg, pid, user_id);
+        invalidate_mount_cache(pid);
     }
     return ret;
 }
