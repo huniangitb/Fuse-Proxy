@@ -23,6 +23,17 @@ static int g_app_cfg_count_stage = 0;
 static int g_app_cfg_capacity_stage = 0;
 int g_active_users[MAX_USERS];
 int g_active_user_count = 0;
+/* 应用规则目录创建权限：默认只读（false）——只有 injector 能创建
+   App-rules / App-rules-<uid>（经 config_set_allow_app_rules_mkdir 开启）；
+   fuse_daemon（经 basic_rules 模块）、log_ctl 等进程加载配置时只读，
+   避免将 scan_active_users 误判出的伪用户固化为目录 */
+static bool g_allow_app_rules_mkdir = false;
+/* pm 探测开关：scan_active_users 默认经 popen("pm list users") 枚举活跃
+   用户——该命令需 binder 通信 system_server，在 fuse_daemon 等受限环境
+   可能长时间挂起（启动/热重载持写锁阻塞 → FUSE 无响应）。只读加载方
+   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 跳过，仅用
+   /data/media 本地目录扫描（无 popen，不会阻塞） */
+static bool g_scan_users_skip_pm = false;
 static pthread_rwlock_t g_rules_lock;
 #include <sched.h>
 #include <stdatomic.h>
@@ -593,18 +604,23 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
 void scan_active_users() {
     g_active_user_count = 0;
 
-    // 优先通过 pm list users 获取真实用户列表
-    FILE* fp = popen("pm list users 2>/dev/null", "r");
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp)) {
-            int uid = -1;
-            if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
-                if (uid >= 0 && g_active_user_count < MAX_USERS)
-                    g_active_users[g_active_user_count++] = uid;
+    // 优先通过 pm list users 获取真实用户列表（跳过模式：只读加载方
+    // 不执行 popen——pm 需 binder 通信 system_server，受限环境会挂起）
+    if (!g_scan_users_skip_pm) {
+        FILE* fp = popen("pm list users 2>/dev/null", "r");
+        if (fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                int uid = -1;
+                if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
+                    if (uid >= 0 && g_active_user_count < MAX_USERS)
+                        g_active_users[g_active_user_count++] = uid;
+                }
             }
+            pclose(fp);
         }
-        pclose(fp);
+    } else {
+        LOG_DBG("scan_active_users: 只读模式跳过 pm 探测，仅扫描 /data/media");
     }
 
     // pm 失败时回退到 /data/media/ 扫描
@@ -639,6 +655,27 @@ void scan_active_users() {
     for (int i = 0; i < g_active_user_count; i++)
         LOG_DBG("  活跃用户[%d]: uid=%d", i, g_active_users[i]);
 }
+
+/* 应用规则目录创建权限开关：仅 injector 应开启（true）——App-rules 目录的
+   创建权归属 injector 单一进程；fuse_daemon（basic_rules 模块）、log_ctl 等
+   只读加载方保持默认 false，加载配置时不得 mkdir（防止伪用户目录固化） */
+void config_set_allow_app_rules_mkdir(bool allow) {
+    g_allow_app_rules_mkdir = allow;
+    LOG_DBG("应用规则目录创建权限: %s", allow ? "允许(仅injector)" : "只读");
+}
+
+/* pm 探测开关：只读加载方（fuse_daemon 经 basic_rules 模块、log_ctl）置
+   true——scan_active_users 跳过 popen("pm list users")，仅扫 /data/media。
+   pm 需 binder 通信 system_server，在 fuse_daemon 受限环境（SELinux/
+   命名空间）可能长时间挂起，而 load_config_rules 在 config_lock_write
+   写锁内执行：启动（br_rules_init，fuse_main 之前）与热重载（inotify
+   线程）都会因 popen 阻塞而卡死 → FUSE 会话无响应。injector 保持默认
+   false（主控进程有 pm 环境，需要完整用户列表） */
+void config_set_scan_users_skip_pm(bool skip) {
+    g_scan_users_skip_pm = skip;
+    LOG_DBG("活跃用户 pm 探测: %s", skip ? "跳过(仅/data/media)" : "启用(pm list users)");
+}
+
 void load_config_rules(const char* path) {
     /* S1 COW：构建进暂存区，末尾 config_publish 整体换入 live 并延迟释放旧配置 */
     memset(&g_global_cfg_stage, 0, sizeof(AppConfig)); 
@@ -654,6 +691,12 @@ void load_config_rules(const char* path) {
         if (uid == 0) snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
         else snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
         if (access(app_rules_dir, F_OK) != 0) {
+            if (!g_allow_app_rules_mkdir) {
+                /* 只读加固：本进程（如 fuse_daemon/log_ctl）无权创建应用规则目录，
+                   缺失目录由 injector 负责创建——仅记录反馈，不 mkdir */
+                LOG_DBG("只读模式跳过创建应用规则目录: %s（由 injector 创建）", app_rules_dir);
+                continue;
+            }
             mkdir(app_rules_dir, 0755);
             LOG("自动为多用户 %d 创建应用规则目录: %s", uid, app_rules_dir);
         }
