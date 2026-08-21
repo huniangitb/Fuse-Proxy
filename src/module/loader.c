@@ -66,10 +66,6 @@ static _Atomic(int) g_backend_slot_refs[MAX_MODULES];  /* 槽位在途引用（a
    调用方 acquire 在途引用 → 二次确认快照未变 → 调用 ops → release。 */
 static _Atomic(const NspModuleOps*) g_rule_slot_ops[MAX_MODULES];
 static _Atomic(int) g_rule_slot_refs[MAX_MODULES];
-/* 模块重载串行化标志：module_notify_reload 期间置位，分派（resolve/probe/
-   backend）取引用后检查——重载中放弃本次调用，杜绝模块内部表重建与在途
-   分派读取竞态（热加载 SIGSEGV 根因：basic_rules .plt RVA 被当绝对指针调用） */
-static _Atomic int g_reload_in_progress = 0;
 /* 初始扫描是否完成：完成前不向 injector 上报模块变更（避免启动时误触发全量重挂） */
 static volatile sig_atomic_t g_boot_scan_done = 0;
 
@@ -619,11 +615,6 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
-        /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
-        if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
-            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
         if (first) {
             /* 单/首模块：直接写入调用方 out——免每模块 16KB 局部缓冲 +
                16KB 整结构拷贝（*out = r）。out 先按需初始化，保证模块
@@ -707,11 +698,6 @@ int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
-        /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
-        if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
-            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
         NspProbeResult r;
         memset(&r, 0, sizeof r);
         int rc = ops->probe(q, &r);
@@ -747,11 +733,6 @@ static int backend_scan_match(const char* path, int* slot_out, const NspModuleOp
             atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
-        /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
-        if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
-            atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
         if (ops->backend_match(path) == 1) {
             if (slot_out) *slot_out = i;
             *ops_out = ops;
@@ -781,11 +762,6 @@ int module_backend_acquire_slot(int slot, const NspModuleOps** ops_out) {
     atomic_fetch_add_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
     if (atomic_load_explicit(&g_backend_slot_ops[slot], memory_order_acquire) != ops) {
         /* 快照刚被 unload 置空：放弃引用，不调用 ops */
-        atomic_fetch_sub_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
-        return -1;
-    }
-    /* 模块重载串行化：reload 期间放弃本次调用（避免与模块内部表重建竞态） */
-    if (atomic_load_explicit(&g_reload_in_progress, memory_order_acquire)) {
         atomic_fetch_sub_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
         return -1;
     }
@@ -849,43 +825,6 @@ int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user
     }
     pthread_rwlock_unlock(&g_module_lock);
     return n;
-}
-
-void module_notify_reload(void) {
-    /* 重载串行化：置标志 → 排空在途分派引用 → 调 reload → 清标志。
-       分派（resolve/probe/backend 无锁持引用调用）在取引用后检查标志，
-       重载中放弃本次调用——杜绝模块内部表重建与在途分派读取竞态
-       （热加载 SIGSEGV 根因：basic_rules .plt RVA 被当绝对函数指针调用） */
-    atomic_store_explicit(&g_reload_in_progress, 1, memory_order_release);
-    bool drained = false;
-    for (int w = 0; w < 2000; w++) {
-        bool busy = false;
-        for (int i = 0; i < MAX_MODULES; i++) {
-            if (atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) > 0 ||
-                atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) > 0) {
-                busy = true;
-                break;
-            }
-        }
-        if (!busy) { drained = true; break; }
-        usleep(1000);
-    }
-    if (!drained) {
-        /* 在途分派未归零（超时 2s）：放弃本次 reload——与 module_unload_one
-           的回滚策略一致：宁可延迟重载，绝不在分派读取模块内部表时重建。
-           若此时仍强行 reload，模块表重建与在途分派竞态依然存在 */
-        atomic_store_explicit(&g_reload_in_progress, 0, memory_order_release);
-        LOG_WRN("模块重载有在途分派（refs 未归零），跳过本次 reload");
-        return;
-    }
-    pthread_rwlock_rdlock(&g_module_lock);
-    for (int i = 0; i < g_module_count; i++) {
-        ModuleEntry* m = &g_modules[i];
-        if (m->active && m->info.ops && m->info.ops->reload)
-            m->info.ops->reload();
-    }
-    pthread_rwlock_unlock(&g_module_lock);
-    atomic_store_explicit(&g_reload_in_progress, 0, memory_order_release);
 }
 
 int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {

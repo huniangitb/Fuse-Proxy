@@ -493,6 +493,14 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
 static int vfs_access(const char *path, int mask) {
     vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, -ENOENT);
+    /* 与 open/create 等写路径的 RO 拦截保持语义一致：access(W_OK) 在 RO
+       规则路径上必须报不可写，否则应用预检通过后真实写入却收 EROFS。
+       POSIX 对 access 明确允许返回 EROFS（只读文件系统请求写访问）；
+       与 vfs_open 相同先于后端分派检查（root 调用者豁免） */
+    if (ctx->uid != 0 && rr.ro && (mask & W_OK)) {
+        log_fuse_err("ACCESS_RO_DENIED", path, EROFS);
+        VFS_RETURN(-EROFS);
+    }
     /* 后端路径：访问检查由后端语义决定，框架默认放行 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) { module_backend_put(bops); VFS_RETURN(0); }

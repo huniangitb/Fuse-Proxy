@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <fnmatch.h>
 #include <stdlib.h>
+#include <pthread.h>
 #ifdef TARGET_ANDROID
 #include <sys/system_properties.h>
 #endif
@@ -44,45 +45,64 @@ typedef struct {
     bool backup_is_mounted;
 } MountState;
 
-/* MountState 缓存：避免为同一 PID 重复读取 /proc/<pid>/mountinfo */
+/* MountState 缓存：避免为同一 PID 重复读取 /proc/<pid>/mountinfo
+
+   互斥保护：主 epoll 线程（handle_list_injected、主动扫描）与 detach 的
+   ipc_mount_thread / ipc_restore_thread（perform_app_mount/restore 的查询与
+   失效）会并发读写本缓存。无锁时除撕裂读外，update 的"检查后自增"还会让
+   计数越过 MOUNT_STATE_CACHE_SIZE 造成越界写。锁仅覆盖数组访问本身——
+   read_mount_state 的 /proc 扫描一律在锁外执行（竞态下最多重复读一次
+   mountinfo，不影响正确性），且三个函数都不再调用其它加锁子系统，无嵌套风险 */
 #define MOUNT_STATE_CACHE_SIZE 64
 static struct {
     int pid;
     MountState st;
 } g_mount_cache[MOUNT_STATE_CACHE_SIZE];
 static int g_mount_cache_count;
+static pthread_mutex_t g_mount_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool lookup_mount_cache(int pid, MountState* st) {
+    bool found = false;
+    pthread_mutex_lock(&g_mount_cache_mutex);
     for (int i = 0; i < g_mount_cache_count; i++) {
         if (g_mount_cache[i].pid == pid) {
-            *st = g_mount_cache[i].st;
-            return true;
+            *st = g_mount_cache[i].st;   /* 值拷贝：调用方拿到快照，不持有数组指针 */
+            found = true;
+            break;
         }
     }
-    return false;
+    pthread_mutex_unlock(&g_mount_cache_mutex);
+    return found;
 }
 
 static void update_mount_cache(int pid, const MountState* st) {
+    pthread_mutex_lock(&g_mount_cache_mutex);
     for (int i = 0; i < g_mount_cache_count; i++) {
         if (g_mount_cache[i].pid == pid) {
             g_mount_cache[i].st = *st;
+            pthread_mutex_unlock(&g_mount_cache_mutex);
             return;
         }
     }
-    if (g_mount_cache_count < MOUNT_STATE_CACHE_SIZE) {
-        g_mount_cache[g_mount_cache_count].pid = pid;
-        g_mount_cache[g_mount_cache_count].st = *st;
-        g_mount_cache_count++;
+    /* 槽位先快照到局部变量：边界检查与下标使用之间不再重读全局计数 */
+    int slot = g_mount_cache_count;
+    if (slot >= 0 && slot < MOUNT_STATE_CACHE_SIZE) {
+        g_mount_cache[slot].pid = pid;
+        g_mount_cache[slot].st = *st;
+        g_mount_cache_count = slot + 1;
     }
+    pthread_mutex_unlock(&g_mount_cache_mutex);
 }
 
 static void invalidate_mount_cache(int pid) {
+    pthread_mutex_lock(&g_mount_cache_mutex);
     for (int i = 0; i < g_mount_cache_count; i++) {
         if (g_mount_cache[i].pid == pid) {
             g_mount_cache[i] = g_mount_cache[--g_mount_cache_count];
-            return;
+            break;
         }
     }
+    pthread_mutex_unlock(&g_mount_cache_mutex);
 }
 
 static bool read_mount_state(int pid, const char* target, const char* backup, MountState* st);
