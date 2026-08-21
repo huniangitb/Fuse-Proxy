@@ -1051,14 +1051,31 @@ static void handle_list_injected(bool api_mode) {
         close(sock);
         return;
     }
-    char resp[8192];
-    ssize_t n = read(sock, resp, sizeof(resp) - 1);
+    /* 循环读到 EOF + 动态增长：注入应用可达数百，固定 8192 的单次 read 会截断
+       末尾 APP 行与 DONE 行，DONE 解析失败即"共计 0 个"误报（injector 侧
+       781fc94 已改为动态缓冲，此处是同一问题的接收端）；且 SOCK_STREAM 上
+       单次 read 本身不保证读全，内核可分段投递——与本文件其它 IPC 读取同范式 */
+    size_t cap = 65536;
+    char *resp = malloc(cap);
+    if (!resp) { close(sock); return; }
+    size_t nread = 0;
+    ssize_t n;
+    while ((n = read(sock, resp + nread, cap - 1 - nread)) > 0) {
+        nread += (size_t)n;
+        if (nread >= cap - 1) {
+            cap *= 2;
+            char *tmp = realloc(resp, cap);
+            if (!tmp) { free(resp); close(sock); return; }
+            resp = tmp;
+        }
+    }
     close(sock);
-    if (n <= 0) {
+    if (nread == 0) {
         if (!api_mode) fprintf(stderr, "未获取到响应\n");
+        free(resp);
         return;
     }
-    resp[n] = '\0';
+    resp[nread] = '\0';
     if (api_mode) {
         char *done_line = NULL;
         int done_total = 0;
@@ -1083,6 +1100,7 @@ static void handle_list_injected(bool api_mode) {
         }
         json_api_finish(true, "\"list-injected\"", json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
         json_object_put(root);
+        free(resp);
         return;
     }
     int total = 0;
@@ -1105,9 +1123,15 @@ static void handle_list_injected(bool api_mode) {
         line = strtok(nullptr, "\n");
     }
     printf("\n共计 %d 个应用已注入\n", total);
+    free(resp);
 }
 
 static void handle_list_users(bool api_mode) {
+    /* 与其它 handler 一致：先加载配置——load_config_rules 内部调用
+       scan_active_users 填充 g_active_users，否则本进程内恒为 0 */
+    config_lock_write();
+    load_config_rules(INJECTOR_CONFIG_PATH);
+    config_unlock_write();
     config_lock_read();
     int count = g_active_user_count;
     if (api_mode) {
@@ -1140,6 +1164,7 @@ static void handle_list_users(bool api_mode) {
             printf("  UID %-8d  %d 个应用配置\n", uid, app_cnt);
         }
     }
+    config_unlock_read();
 }
 
 static void stream_logs(const char* stream_cmd) {
@@ -1248,6 +1273,14 @@ int main(int argc, char *argv[]) {
         }
     }
     if (pos_idx < 1) usage(argv[0]);
+
+    /* 只读加载方：跳过 scan_active_users 的 popen("pm list users")——log_ctl
+       是短命 CLI，parse-rules/validate-rules/get-global-rules/get-app-rules
+       每次调用都会 load_config_rules，管理端轮询 JSON API 时每次都要付一次
+       binder 通信 system_server 的开销。用户列表退化为扫 /data/media 与
+       App-rules-* 目录，对只读查询足够（App-rules 目录创建权本就不在 log_ctl，
+       g_allow_app_rules_mkdir 保持默认 false） */
+    config_set_scan_users_skip_pm(true);
     
     if (strcmp(pos_args[0], "parse-rules") == 0) {
         handle_parse_rules(api_mode);

@@ -12,6 +12,9 @@
 #include <time.h>
 #include <stdarg.h>
 #include <poll.h>
+#include <signal.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <sys/epoll.h>
 #include "common.h"
 #include "ns_utils.h"
@@ -597,7 +600,43 @@ struct CombinedMountArgs {
     const char* backup;
     char (*preserve_paths)[256];
     int preserve_count;
+    pid_t target_pid;      /* 就绪等待期间的存活检查目标 */
+    bool readiness_gate;   /* 进程生命周期首次注入：挂载前先等 /storage/emulated 出现 */
 };
+
+/* 就绪门控记录（父进程侧）：同一 pid 仅首次注入执行存在性等待，后续
+   重试注入直接卸载+bind。必须记在父进程——fork 后子进程写内存因 COW
+   不会回传；与 mount_manager 的 g_mount_cache 同口径（固定槽位、pid 复用
+   由槽位淘汰自然覆盖）。溢出时淘汰最旧条目保证新进程仍能获得门控 */
+#define NS_READINESS_SLOTS 64
+static pid_t g_readiness_done[NS_READINESS_SLOTS];
+static int g_readiness_count = 0;
+static pthread_mutex_t g_readiness_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool ns_readiness_done(pid_t pid) {
+    bool done = false;
+    pthread_mutex_lock(&g_readiness_mutex);
+    for (int i = 0; i < g_readiness_count; i++) {
+        if (g_readiness_done[i] == pid) { done = true; break; }
+    }
+    pthread_mutex_unlock(&g_readiness_mutex);
+    return done;
+}
+
+static void ns_readiness_mark(pid_t pid) {
+    pthread_mutex_lock(&g_readiness_mutex);
+    for (int i = 0; i < g_readiness_count; i++) {
+        if (g_readiness_done[i] == pid) { pthread_mutex_unlock(&g_readiness_mutex); return; }
+    }
+    if (g_readiness_count < NS_READINESS_SLOTS) {
+        g_readiness_done[g_readiness_count++] = pid;
+    } else {
+        memmove(g_readiness_done, g_readiness_done + 1,
+                sizeof(pid_t) * (NS_READINESS_SLOTS - 1));
+        g_readiness_done[NS_READINESS_SLOTS - 1] = pid;
+    }
+    pthread_mutex_unlock(&g_readiness_mutex);
+}
 
 /* NsMountEntry 类型、NS_MOUNTINFO_MAX、mountinfo 枚举与族根工具
    （read_mountinfo_pid/is_family_root/parse_family_root 等）已拆至
@@ -610,6 +649,30 @@ static int do_combined_mount(void* raw_args) {
     const char* backup = args->backup;
     char (*preserve_paths)[256] = args->preserve_paths;
     int preserve_count = args->preserve_count;
+    /* 就绪门控（仅进程生命周期首次注入，先于任何 umount2）：ColorOS 等
+       ROM 的应用命名空间可能尚未建立 /storage/emulated 条目且 /storage
+       tmpfs 只读——旧实现此处 mkdir_recursive 触发 EROFS 降级。现改为等
+       待 vold 完成装配：100ms 步进、总上限 ~1s，期间进程死亡立即放弃；
+       超时返回 ENOENT 交由重试队列按指数退避接管。全程不主动创建目录，
+       且失败发生在任何卸载之前，应用原生视图零污染 */
+    if (args->readiness_gate && access(target, F_OK) != 0) {
+        bool ready = false;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            if (kill(args->target_pid, 0) != 0) {
+                log_ns_error("[ns_error] [%s] 等待 %s 出现期间目标进程退出\n", pkg, target);
+                log_internal(LOG_WARN, "[ns_error] [%s] 等待 %s 出现期间目标进程退出", pkg, target);
+                return ESRCH;
+            }
+            usleep(100 * 1000);
+            if (access(target, F_OK) == 0) { ready = true; break; }
+        }
+        if (!ready) {
+            log_ns_error("[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列\n", pkg, target);
+            log_internal(LOG_WARN, "[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列", pkg, target);
+            return ENOENT;
+        }
+        LOG_DBG("[%s] %s 已就绪（等待后出现），继续合并挂载", pkg, target);
+    }
     size_t tlen = strlen(target);
     size_t blen = strlen(backup);
     //log_ns_error("[combined] Step A: read mountinfo for pkg=%s\n", pkg);
@@ -689,16 +752,10 @@ static int do_combined_mount(void* raw_args) {
     for (int t = 0; t < 8; t++) {
         if (umount2(target, MNT_DETACH) == 0) break;
     }
-  //  log_ns_error("[combined] Step H: mkdir_recursive target=%s\n", target);
-    if (mkdir_recursive(target) != 0) {
-        int err = errno;
-        /* 降级处理：target（如 /storage/emulated）在目标应用命名空间可能
-           不可见/父级只读（EROFS，特定设备/ROM 命名空间差异，同 Step E
-           场景），mkdir 失败不应中止主挂载——target 已存在（只读挂载点）
-           时 bind mount 依然可成功；继续 Step I 由 mount 结果做真实裁决 */
-        log_ns_error("[ns_error] [%s] Combined mount mkdir_recursive target failed(降级): mkdir_recursive(%s) errno=%d (%s)\n", pkg, target, err, strerror(err));
-        log_internal(LOG_WARN, "[ns_error] [%s] Combined mount mkdir_recursive target failed(降级): mkdir_recursive(%s) errno=%d (%s)", pkg, target, err, strerror(err));
-    }
+    /* Step H（mkdir_recursive target）已移除：不再主动创建 /storage/emulated。
+       就绪性由函数头部门控保证——首次注入在卸载前等待条目出现；重试注入
+       时目录通常已存在（裸挂载点可直接 bind）。此处若仍缺失，Step I 的
+       mount 以 ENOENT 真实裁决 */
   //  log_ns_error("[combined] Step I: mount(source->target) source=%s target=%s\n", source, target);
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
@@ -774,9 +831,15 @@ int ns_combined_mount(int pid, const char* pkg, const char* source, const char* 
     if (backup && backup[0]) {
         mkdir_recursive(backup);
     }
-    struct CombinedMountArgs args = { pkg, source, target, backup, preserve_paths, preserve_count };
+    bool gate = !ns_readiness_done(pid);
+    if (gate) ns_readiness_mark(pid);
+    struct CombinedMountArgs args = { pkg, source, target, backup,
+                                      preserve_paths, preserve_count, pid, gate };
     int child_err = 0;
-    int ret = run_in_mnt_ns(pid, do_combined_mount, &args, &child_err);
+    /* 门控最坏等待 ~1s（就绪性检查在子进程内）：默认 500ms 预算会在等待中
+       SIGKILL 子进程，此处放宽到 2s——健康路径门控仅一次 access(<µs) 无感，
+       仅 ColorOS 型缺失场景才真正消耗预算 */
+    int ret = run_in_mnt_ns_timeout(pid, do_combined_mount, &args, &child_err, 2000);
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
 }
@@ -816,6 +879,9 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
     args->backup = NULL;
     args->preserve_paths = NULL;
     args->preserve_count = 0;
+    /* 全局注入为纯追加 bind，无卸载前置流程，无需就绪门控 */
+    args->target_pid = pid;
+    args->readiness_gate = false;
     int ret = run_in_mnt_ns_async(pid, pkg, do_global_mount, args, args);
     if (ret < 0) {
         free((void*)args->source);
@@ -827,7 +893,7 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
 
 /* 同步版全局挂载：挂载完成才返回，用于 IPC 线程 */
 int ns_global_mount(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs args = { pkg, source, target, NULL, NULL, 0 };
+    struct CombinedMountArgs args = { pkg, source, target, NULL, NULL, 0, pid, false };
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_global_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -848,6 +914,11 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     if (args->preserve_paths && preserve_count > 0) {
         memcpy(args->preserve_paths, preserve_paths, sizeof(char[256]) * (size_t)preserve_count);
     }
+    /* 就绪门控标记在父进程侧（fork COW 子进程写不回传）：无论本次成败，
+       进过一次即视为已完成首次判断，同 pid 后续注入/重试跳过等待 */
+    args->target_pid = pid;
+    args->readiness_gate = !ns_readiness_done(pid);
+    if (args->readiness_gate) ns_readiness_mark(pid);
     int ret = run_in_mnt_ns_async(pid, pkg, do_combined_mount, args, args);
     if (ret < 0) {
         free((void*)args->pkg);

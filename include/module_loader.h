@@ -47,9 +47,6 @@ int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out);
 int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max);
 
-/* 配置热重载通知：遍历声明 reload 的模块（框架配置变更时调用） */
-void module_notify_reload(void);
-
 /* uid → 包名解析（框架日志用）：遍历声明 get_pkg 的模块，第一个成功返回 0 */
 int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
 

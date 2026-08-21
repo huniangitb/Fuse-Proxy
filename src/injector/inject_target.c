@@ -162,22 +162,31 @@ void add_tracked(int pid) {
         }
         e = e->next;
     }
-    e = malloc(sizeof(TrackedEntry));
+    /* calloc 而非 malloc：injected 必须零初始化——add_tracked 仅表示"已跟踪"，
+       未注入是唯一正确的初始状态。挂载保留分支、缓存快速响应路径等只调
+       add_tracked 而不跟 mark_injected 的调用点若拿到堆上残值，
+       is_injected 会把未注入应用误报为已注入（list-injected 是其唯一权威） */
+    e = calloc(1, sizeof(TrackedEntry));
     if (e) {
         e->pid = pid;
+        e->injected = false;
         e->next = g_tracked_hash[h];
         g_tracked_hash[h] = e;
     }
     pthread_mutex_unlock(&g_tracked_mutex);
 
-    /* 预热挂载状态缓存（尽力而为，容错）：注入/跟踪建立时立即为该应用建立
-       挂载状态缓存，LIST_INJECTED 首次请求即可 O(1) 命中，无需逐个扫描 mountinfo。
-       解锁后执行——read_mount_state 扫描开销不应持锁；进程可能已退出或
-       /proc 读取失败，任何失败静默忽略，不影响 add_tracked 主流程 */
-    char target_path[128];
-    uid_t uid = get_app_uid(pid);
-    get_target_storage_path(uid, target_path, sizeof(target_path));
-    (void)is_project_fuse_cached(pid, target_path);
+    /* 此处不再预热挂载状态缓存（080fcd2 引入，现已无收益且有害）：
+       1) 收益消失——预热的唯一目的是让 LIST_INJECTED 首次请求命中缓存，
+          但注入状态改为显式标志维护后，handle_list_injected /
+          get_injected_snapshot 已完全不查挂载缓存；
+       2) 主动有害——预热走 is_project_fuse_cached，其 read_mount_state 传的是
+          空 backup 路径，blen==0 使 backup_match 恒为 false，写入缓存的条目里
+          backup_* 三个字段一律为 false（与真实状态无关）。传统模式下
+          ipc_mount_thread 先 add_tracked 再 perform_app_mount，后者命中该条目
+          即跳过 backup 的解挂与回绑——残留备份挂载不会被清理；
+       3) 开销在热路径——全局替换模式下该调用位于 injector 主 epoll 线程，
+          每次应用启动同步付一次 /proc/<pid>/mountinfo 全量读取。
+       需要挂载状态的调用方各自按自身查询形状调 read_mount_state 即可。 */
 }
 
 /* ============ 注入状态稳定公共函数 ============
@@ -661,6 +670,16 @@ void audit_tracked_apps() {
             char target_path[128];
             get_target_storage_path(uid, target_path, sizeof(target_path));
             bool has_fuse = is_project_fuse_cached(pid, target_path);
+            /* 注入标志与"是否仍为目标应用"对齐：解挂动作依赖 has_fuse 探测，
+               而该探测在全局替换模式下可能误判（dev 匹配失败、挂载缓存过期）。
+               若只在 has_fuse 为真的分支里 unmark，GLOBAL_INJECT ON→OFF 后
+               一旦探测失手，标志就永远清不掉——list-injected 以显式标志为唯一
+               权威，会把早已非目标的应用一直报成已注入。故先按配置判定无条件
+               校正标志，再按探测结果执行实际解挂/挂载 */
+            if (!is_target && is_injected(pid)) {
+                unmark_injected(pid);
+                LOG_DBG("配置审查: %s (PID: %d) 已非注入目标，清除注入标志。", cmd, pid);
+            }
             if (!is_target && has_fuse) {
                 if (g_global_replace_mode) {
                     /* 全局替换模式：非目标应用需卸载项目 FUSE 并还原系统视图备份 */

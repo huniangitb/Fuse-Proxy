@@ -28,8 +28,7 @@ typedef struct {
     bool monitor_explicit; /* true = 显式设置过 MONITOR ON/OFF，可覆盖全局 */
     bool sandbox;
     bool sandbox_explicit; /* true = 显式设置过 SANDBOX ON/OFF，可覆盖全局 */
-    bool global_inject;   
-    bool fuse_direct;
+    bool global_inject;
     bool skip_system_apps; /* 默认跳过 Android 系统应用 (uid < 10000)，配置 SKIP_SYSTEM_APPS OFF 可关闭 */
     char** hide_rules;
     int hide_count;
@@ -97,9 +96,10 @@ void scan_active_users();
    basic_rules 模块）、log_ctl 等只读加载方保持默认 false，加载配置时
    不得 mkdir App-rules / App-rules-<uid>（防止伪用户目录固化） */
 void config_set_allow_app_rules_mkdir(bool allow);
-/* 活跃用户 pm 探测开关：fuse_daemon/log_ctl 等只读加载方置 true——
-   scan_active_users 跳过 popen("pm list users")（该命令需 binder 通信
-   system_server，受限环境会挂起阻塞配置加载），仅扫 /data/media */
+/* 活跃用户 pm 探测开关：fuse_daemon（经 basic_rules 模块）、log_ctl 等只读
+   加载方置 true——scan_active_users 跳过 popen("pm list users")（该命令需
+   binder 通信 system_server，受限环境会挂起阻塞配置加载），改由 /data/media
+   与已存在的 App-rules-<uid> 目录推导用户列表 */
 void config_set_scan_users_skip_pm(bool skip);
 void load_config_rules(const char* main_conf_path);
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed);
