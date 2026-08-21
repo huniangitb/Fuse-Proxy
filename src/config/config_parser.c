@@ -31,8 +31,8 @@ static bool g_allow_app_rules_mkdir = false;
 /* pm 探测开关：scan_active_users 默认经 popen("pm list users") 枚举活跃
    用户——该命令需 binder 通信 system_server，在 fuse_daemon 等受限环境
    可能长时间挂起（启动/热重载持写锁阻塞 → FUSE 无响应）。只读加载方
-   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 跳过，仅用
-   /data/media 本地目录扫描（无 popen，不会阻塞） */
+   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 跳过，改由
+   /data/media 与已存在的 App-rules-<uid> 目录推导（无 popen，不会阻塞） */
 static bool g_scan_users_skip_pm = false;
 static pthread_rwlock_t g_rules_lock;
 #include <sched.h>
@@ -601,6 +601,43 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     g_app_cfgs_stage[g_app_cfg_count_stage]->trie_root = trie_create_node(NULL); 
     return g_app_cfgs_stage[g_app_cfg_count_stage++];
 }
+/* 由磁盘上已存在的 App-rules-<uid> 目录补齐活跃用户列表。
+
+   跳过 pm 探测的只读加载方（fuse_daemon 经 basic_rules、log_ctl）若某用户的
+   /data/media/<uid> 不可读，该用户不会出现在 pm / /data/media 两轮扫描里，
+   load_config_rules 后续的 App-rules-<uid>/*.conf 扫描就整段跳过——injector
+   仍把这些应用当注入目标，而真正执行 HIDE/RO/REDIRECT 的进程却没有对应规则，
+   静默失效且无任何报错。以磁盘上真实存在的规则目录为准可消除这一分叉，
+   且纯只读、不 mkdir、不依赖 pm/binder。injector 侧同样执行以保持两端一致
+   （目录既已存在，mkdir 分支不会触发） */
+static void merge_users_from_app_rules_dirs(void) {
+    DIR* dir = opendir(CONFIG_DIR);
+    if (!dir) return;
+    struct dirent* de;
+    while ((de = readdir(dir)) != nullptr) {
+        if (de->d_type != DT_DIR && de->d_type != DT_LNK) continue;
+        if (strncmp(de->d_name, "App-rules-", 10) != 0) continue;
+        const char* s = de->d_name + 10;
+        if (!*s) continue;
+        bool is_num = true;
+        for (int i = 0; s[i]; i++) {
+            if (!isdigit((unsigned char)s[i])) { is_num = false; break; }
+        }
+        if (!is_num) continue;
+        int uid = atoi(s);
+        if (uid < 0 || uid >= MAX_REASONABLE_UID) continue;
+        bool seen = false;
+        for (int i = 0; i < g_active_user_count; i++) {
+            if (g_active_users[i] == uid) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (g_active_user_count >= MAX_USERS) break;
+        g_active_users[g_active_user_count++] = uid;
+        LOG_DBG("scan_active_users: 由规则目录补入用户 uid=%d", uid);
+    }
+    closedir(dir);
+}
+
 void scan_active_users() {
     g_active_user_count = 0;
 
@@ -645,6 +682,10 @@ void scan_active_users() {
         }
     }
 
+    /* 无论 pm 是否成功都补扫规则目录：磁盘上有 App-rules-<uid> 就说明该用户
+       有规则要加载，不能因 /data/media/<uid> 不可读而整段漏掉 */
+    merge_users_from_app_rules_dirs();
+
     // 确保至少有 user 0
     if (g_active_user_count == 0) {
         g_active_users[0] = 0;
@@ -665,12 +706,14 @@ void config_set_allow_app_rules_mkdir(bool allow) {
 }
 
 /* pm 探测开关：只读加载方（fuse_daemon 经 basic_rules 模块、log_ctl）置
-   true——scan_active_users 跳过 popen("pm list users")，仅扫 /data/media。
+   true——scan_active_users 跳过 popen("pm list users")，改由 /data/media 与
+   已存在的 App-rules-<uid> 目录推导用户列表。
    pm 需 binder 通信 system_server，在 fuse_daemon 受限环境（SELinux/
    命名空间）可能长时间挂起，而 load_config_rules 在 config_lock_write
    写锁内执行：启动（br_rules_init，fuse_main 之前）与热重载（inotify
-   线程）都会因 popen 阻塞而卡死 → FUSE 会话无响应。injector 保持默认
-   false（主控进程有 pm 环境，需要完整用户列表） */
+   线程）都会因 popen 阻塞而卡死 → FUSE 会话无响应。log_ctl 虽是短命 CLI
+   不至于死锁，但每次 JSON API 调用都付一次 binder 开销同样无必要。
+   injector 保持默认 false（主控进程有 pm 环境，需要完整用户列表） */
 void config_set_scan_users_skip_pm(bool skip) {
     g_scan_users_skip_pm = skip;
     LOG_DBG("活跃用户 pm 探测: %s", skip ? "跳过(仅/data/media)" : "启用(pm list users)");
