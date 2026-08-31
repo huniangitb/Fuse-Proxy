@@ -630,7 +630,15 @@ static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit,
             else {
                 struct tm tm_info; localtime_r(&buf->data[idx].t, &tm_info);
                 char time_buf[32]; strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
-                int len = snprintf(line, sizeof(line), "%s|%s\n", time_buf, buf->data[idx].msg);
+                int len;
+                if (log_type && strcmp(log_type, "sys") == 0) {
+                    /* SYS 查询行附带等级（与 overflow 行/STREAM_SYS_API 格式一致）：
+                       客户端据此执行等级阈值过滤 */
+                    len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf,
+                                   buf->data[idx].level % 10, buf->data[idx].msg);
+                } else {
+                    len = snprintf(line, sizeof(line), "%s|%s\n", time_buf, buf->data[idx].msg);
+                }
                 write(fd, line, len); sent_count++;
             }
         }
@@ -662,7 +670,10 @@ static void remove_active_client(ClientCtx *ctx) {
         ctx->next->prev = ctx->prev;
     }
 }
-static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level, bool with_ts) {
+/* 历史转储：逐条输出缓冲内容。with_level 时为 SYS 条目附加 "<level>|" 等级前缀
+ * （与 STREAM_SYS_API 实时推送 broadcast_log 的行格式一致：ts|<lvl>|msg），
+ * 使客户端能对历史数据执行等级阈值过滤 */
+static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level, bool with_ts, bool with_level) {
     char line_buf[MAX_MSG_LEN + 64]; /* ts(20) + msg + \n */
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
     int idx = buf->tail;
@@ -679,6 +690,10 @@ static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level, 
                 int tl = snprintf(line_buf, sizeof(line_buf), "%s|", time_buf);
                 off = tl;
             }
+            if (with_level && type == 2) {
+                line_buf[off++] = (char)('0' + (buf->data[idx].level % 10));
+                line_buf[off++] = '|';
+            }
             memcpy(line_buf + off, buf->data[idx].msg, msg_len);
             line_buf[off + msg_len] = '\n';
             line_buf[off + msg_len + 1] = '\0';
@@ -687,7 +702,6 @@ static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level, 
         }
         idx = (idx + 1) % buf->max;
     }
-    (void)type;
 }
 static int process_line(ClientCtx* ctx, char* line, const char* leftover, int leftover_len) {
     int fd = ctx->fd;
@@ -842,7 +856,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[9] == ':') min_level = parse_stream_args(line + 10, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts);
+        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts, false);
         add_stream_client(fd, 1, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
@@ -851,7 +865,8 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[14] == ':') min_level = parse_stream_args(line + 15, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts);
+        /* API 模式：历史转储附带等级前缀，与其自身实时推送行格式一致 */
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts, true);
         add_stream_client(fd, 2, min_level, true, with_ts);
         ctx->is_streaming = true;
         return 0;
@@ -860,7 +875,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[10] == ':') min_level = parse_stream_args(line + 11, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts, false);
         add_stream_client(fd, 2, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
@@ -869,7 +884,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[13] == ':') min_level = parse_stream_args(line + 14, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts);
+        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts, false);
         add_stream_client(fd, 3, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
@@ -878,9 +893,9 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[10] == ':') min_level = parse_stream_args(line + 11, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts);
-        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts);
+        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts, false);
+        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts, false);
+        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts, false);
         add_stream_client(fd, 0, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
