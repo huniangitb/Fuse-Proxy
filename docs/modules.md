@@ -265,6 +265,75 @@ cc -shared -fPIC -std=c23 -DNSP_MODULE_BUILD -Iinclude my_module.c -o my_module.
 FUSE 依赖，安装到 `bin/modules/ftp_module/`）、`injector`/`log_monitor`/
 `log_ctl` 不变。
 
+## 8.1 模块错误日志与熔断（框架层防护）
+
+框架对全部模块调用（`resolve`/`probe`/`readdir_extra`/`get_pkg`/
+`backend_*`/`init`/`exit`）做了三层防护，**模块错误不会带崩 fuse_daemon**
+（同进程隔离，覆盖栈上野指针/return 地址踩踏/除零/非法指令/abort；
+堆损坏的延迟爆发是残留边界——见下）。
+
+### 三层防护
+
+1. **调用围栏（`src/module/fault_fence.c`）**：每 FUSE worker 线程一套
+   `sigsetjmp` 围栏 + 全局 `sigaltstack`（256KB）。模块调用窗口内崩溃
+   （SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 信号处理器归因到肇事线程
+   正在调用的模块槽位 → `siglongjmp` 恢复框架执行——**daemon 存活，
+   该次请求按 `-EIO` 失败**；归因失败（如堆损坏延迟到框架代码爆发）
+   走原 `crash_dump` 链路（dump + 死亡 + injector 重启兜底）。
+2. **输出校验（`src/module/module_guard.c`）**：`NspResolveResult`
+   前后 canary 哨兵（防整块越界写）+ 全部字符串字段 NUL 终止检查 +
+   `user_id` 值域检查 + readdir 条目名校验。
+3. **熔断器**：每模块滑动窗口（默认 **10 秒内 5 次错误**，env 可覆盖
+   `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX`）→ 触发即
+   `module_fault_poison`：**槽位快照置空 = 该模块全部规则立即失效**
+   （后续请求走框架直通回退）+ `.so` 卸载 + **ban 落盘**。
+   崩溃（围栏恢复）单次即置毒（模块内存状态不可信，无需计数）。
+
+### ban 机制（防崩溃-重载震荡）
+
+- ban 记录：`<MODULES_DIR>/.banned`，每行 `模块名|SHA256|原因|时间戳`；
+- 热插拔扫描线程见 .so 哈希与 ban 记录一致 → **跳过加载**；
+- 哈希变化（发布新 .so 版本）→ 记录失效，允许重新加载（**版本更新自愈**）；
+- daemon 重启后 ban 依然有效（文件持久化），直到换版本或手动删除文件。
+
+### MOD_ERR 日志（`log_ctl` 可查）
+
+所有模块错误统一结构化前缀，`log_ctl search-sys --level 2 MOD_ERR <模块名>`
+按模块过滤（单条错误 WARN 级，**熔断/崩溃/置毒为 ERR 级**）：
+
+```
+[MOD_ERR] module=<模块名> op=<resolve|probe|readdir_extra|get_pkg|backend_*> \
+          rc=<模块返回码> path=<路径> detail=<原因>
+```
+
+detail 取值示例：`sub_path 未终止` / `输出 canary 破坏(越界写)` /
+`user_id 值域非法` / `模块返回异常` / `熔断触发(...)` /
+`模块崩溃(SIGSEGV/...)被调用围栏恢复,立即卸载:规则全部失效`。
+
+**日志限流**：窗口内前 5 条明细全打，之后每 100 条打 1 条汇总
+（`已抑制 N 条同类错误`）——坏模块错误风暴不会淹没日志环。
+
+**高危事件落盘**：熔断触发/崩溃恢复两类低频高危事件无条件追加到
+`<LOG_DIR>/module_errors.log`（log_monitor/UDS 链路中断时仍可事后查）。
+
+**崩溃转储归因行**：`error.log`/stderr 的 backtrace 前附带
+`Crash attribution: module=<名> slot=<N> op=<op> (in module call window)`。
+
+### 健康快照
+
+`module_health_snapshot()`（`NspModuleHealth`）输出每模块：
+`err_count`（当前窗口）/`err_total`（本周期累计）/`banned`/
+`ban_reason`/`last_err_time`——前端模块列表可展示健康度与 ban 原因。
+
+### 模块开发者须知（契约）
+
+- ops 回调返回值：`0` 成功 / **负值 errno** 失败（返回正数非 0 会被计为错误）；
+- 输出字符串字段**必须 NUL 终止**，越界写会破坏 canary 触发置毒；
+- 回调内**不得阻塞**（无锁/短耗时）：围栏调用窗口内框架线程不可恢复地
+  持锁会破坏 longjmp 安全性（框架侧已保证分派路径不持锁）；
+- 崩溃不会连累框架，但模块进程级资源（句柄/连接）需自行保证幂等——
+  置毒时框架**不调用** `exit()`（崩溃模块代码不可信）。
+
 ## 9. 相关文档
 
 - 总体设计：`docs/architecture.md`（进程协作、命名空间注入）
