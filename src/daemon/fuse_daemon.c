@@ -34,6 +34,8 @@
 #include <ctype.h>
 #include "common.h"
 #include "crash_dump.h"
+#include "fault_fence.h"
+#include "module_guard.h"
 #include "module_loader.h"
 #include <fuse3/fuse_log.h>
 /* 透传 ABI：Android 用定制 libfuse 的 fuse_kernel.h（含 V0/V1/V2 旧式 ioctl 与
@@ -73,6 +75,7 @@ static bool g_pt_probe_pending = false;  /* GNU：init 无会话 fd，探测推�
 static int passthrough_enable_fixed_method(int fd);  /* 实现见文件后部 */
 static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
 static char g_modules_dir_arg[PATH_MAX] = {0}; /* --modules-dir: 热插拔模块目录覆盖 */
+static int g_fuse_threads = -1;                 /* --fuse-threads: FUSE worker 线程数（-1=libfuse 默认 10） */
 
 #define MAX_PENDING_CLOSE 64
 #define PENDING_CLOSE_MASK (MAX_PENDING_CLOSE - 1)
@@ -250,36 +253,62 @@ static bool is_android_skel_dir(const char* sub_path) {
     return false;
 }
 
-/* 分派器模式：FUSE 回调入口统一经 module_dispatch_resolve 决策。
-   - 有规则模块命中：用模块返回的 sub_path/real_path/ro/虚拟目录等
-   - 无模块/未命中：框架直通回退（fw_parse_path + fw_default_real_path）
-   - hidden 命中 → 返回 err_code；rr 各标志在回调体中以 rr.xxx 直接使用 */
+/* ================= 三层数据路径（Phase 2 重构） =================
+ *   FUSE 节点（内核）→ FUSE 守护进程：
+ *     ① 路由层   fw_route()：FUSE 上下文 + 原始路径 → 路由决策
+ *                （user_id 剥离 / 模块分派 / 直通回退 / hidden 拦截）
+ *     ② 模块层   module_dispatch_resolve / module_backend_*（loader）：
+ *                原子槽位快照 + 在途引用（S2 无锁分派）+ 调用围栏
+ *                （崩溃→longjmp 恢复）+ 输出校验 + 熔断（错误→卸载）
+ *     ③ FUSE 输出层  各 vfs_* 回调体：消费路由决策，执行真实系统操作
+ *                （lstat/open/read/filler...）并返回 FUSE 语义
+ * VFS_SETUP_CORE 是①③之间的薄胶水：声明回调体使用的局部变量并调用
+ * 路由层（局部变量名保持与原实现一致，回调体零改动）。
+ * 线程安全：三层全部无全局可变状态依赖（路由层纯函数 + 模块层原子
+ * 快照），FUSE 多线程（fuse_session_loop_mt）下任意 worker 并发进入。 */
+static int fw_route(struct fuse_context* ctx, const char* path_val,
+                    NspResolveResult* rr, bool* nsp_ok,
+                    char* current_pkg, int* user_id,
+                    char* sub_path, char* real_path, bool* is_redir) {
+    *nsp_ok = false;
+    *user_id = -1;
+    *is_redir = false;
+    sub_path[0] = '\0';
+    real_path[0] = '\0';
+    strcpy(current_pkg, "unknown");
+    /* 免 16KB 全量 memset：module_dispatch_resolve 返回 OK 前已用 memset 过的
+       局部 r 完整拷贝 out（聚合路径亦从已初始化 out 累积），返回 NONE 时
+       调用方 `*nsp_ok` 短路不读 rr 其它字段——只需保证 valid 有定义值 */
+    rr->valid = false;
+    NspQueryCtx nsp_q = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val };
+    if (module_dispatch_resolve(&nsp_q, rr) == NSP_DISPATCH_OK && rr->valid) {
+        *nsp_ok = true;
+        if (rr->hidden) return -EPERM;   /* 调用方（宏）映射为各自 err_code */
+        if (rr->pkg[0]) { strncpy(current_pkg, rr->pkg, 128 - 1); current_pkg[128 - 1] = '\0'; }
+        *user_id = rr->user_id;
+        strcpy(sub_path, rr->sub_path);
+        strcpy(real_path, rr->real_path);
+        *is_redir = rr->is_redir;
+        return 0;
+    }
+    /* 框架直通回退（无规则模块 / 模块未命中） */
+    if (fw_parse_path(path_val, user_id, sub_path, PATH_MAX) != 0) return -ENOENT;
+    fw_default_real_path(*user_id, sub_path, real_path, PATH_MAX);
+    return 0;
+}
+
 #define VFS_SETUP_CORE(path_val, err_code) \
     struct fuse_context* ctx = fuse_get_context(); \
     if (!ctx) return err_code; \
-    NspQueryCtx nsp_q = { .uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val }; \
-    /* 免 16KB 全量 memset：module_dispatch_resolve 返回 OK 前已用 memset 过的
-       局部 r 完整拷贝 out（聚合路径亦从已初始化 out 累积），返回 NONE 时
-       下方 `&& rr.valid` 短路不读 rr——只需保证 valid 有定义值（未命中回退
-       分支亦不读 rr 其它字段） */ \
-    NspResolveResult rr; rr.valid = false; \
-    bool nsp_ok = (module_dispatch_resolve(&nsp_q, &rr) == NSP_DISPATCH_OK && rr.valid); \
-    char current_pkg[128] = "unknown"; \
-    int path_user_id = -1; \
-    char sub_path[PATH_MAX]; sub_path[0] = '\0'; \
-    char p[PATH_MAX]; p[0] = '\0'; \
-    bool is_redir = false; \
-    if (nsp_ok) { \
-        if (rr.hidden) return err_code; \
-        strcpy(current_pkg, rr.pkg[0] ? rr.pkg : "unknown"); \
-        path_user_id = rr.user_id; \
-        strcpy(sub_path, rr.sub_path); \
-        strcpy(p, rr.real_path); \
-        is_redir = rr.is_redir; \
-    } else { \
-        if (fw_parse_path(path_val, &path_user_id, sub_path, sizeof sub_path) != 0) return err_code; \
-        fw_default_real_path(path_user_id, sub_path, p, sizeof p); \
-    } \
+    NspResolveResult rr; \
+    bool nsp_ok = false; \
+    char current_pkg[128]; \
+    int path_user_id; \
+    char sub_path[PATH_MAX]; \
+    char p[PATH_MAX]; \
+    bool is_redir; \
+    if (fw_route(ctx, path_val, &rr, &nsp_ok, current_pkg, &path_user_id, \
+                 sub_path, p, &is_redir) != 0) return err_code; \
     (void)is_redir; /* 部分回调不使用 is_redir，抑制未使用警告 */
 
 #define VFS_SETUP_LOG(path_val, err_code, op) \
@@ -413,9 +442,14 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_getattr) {
         memset(st, 0, sizeof *st);
-        int brc = bops->backend_getattr(sub_path, st);
+        int bslot = module_ops_slot(bops);
+        int brc = nsp_fence_backend_getattr(bslot, "backend_getattr", bops->backend_getattr, sub_path, st);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_getattr", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_getattr", brc, sub_path, "getattr 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         if (!g_preserve_perms) { st->st_uid = ctx->uid; st->st_gid = ctx->gid; }
         else if (st->st_uid == 0 && st->st_gid == 0) {
             /* 权限完全镜像：FTP 后端未提供真实属主（uid/gid=0），FTP 虚拟目录
@@ -547,9 +581,20 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
            FUSE 分页续读），减半降低每请求堆分配开销 */
         NspDirEntry* entries = calloc(512, sizeof(NspDirEntry));
         if (!entries) VFS_RETURN(-ENOMEM);
-        int n = bops->backend_readdir(sub_path, entries, 512);
+        int bslot = module_ops_slot(bops);
+        int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir, sub_path, entries, 512);
         module_backend_put(bops);
-        if (n < 0) { free(entries); VFS_RETURN(n); }
+        if (n == NSP_FENCE_FAULT) {
+            module_guard_fault(bslot, "backend_readdir", sub_path);
+            free(entries);
+            VFS_RETURN(-EIO);
+        }
+        if (n == NSP_FENCE_BADFN) { free(entries); VFS_RETURN(-EIO); }
+        if (n < 0) {
+            module_guard_error(bslot, "backend_readdir", n, sub_path, "readdir 返回异常");
+            free(entries);
+            VFS_RETURN(n);
+        }
         /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致） */
         struct stat dirst; memset(&dirst, 0, sizeof dirst);
         dirst.st_mode = S_IFDIR | 0755;
@@ -783,9 +828,13 @@ static int vfs_open(const char *path, struct fuse_file_info *fi) {
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup_slot(sub_path, &bslot, &bops) == 0 && bops->backend_open) {
         uint64_t h = 0;
-        int brc = bops->backend_open(sub_path, fi->flags, &h);
+        int brc = nsp_fence_backend_open(bslot, "backend_open", bops->backend_open, sub_path, fi->flags, &h);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_open", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_open", brc, sub_path, "open 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         /* FTP 路径：句柄为模块小整数 ID（非 fd），不设 FD 透传等本地
            文件系统才可用的优化（passthrough 仅对下方本地 open 的 fd）；
            设 direct_io 绕过内核 page cache——FUSE 内核在 close 后可能
@@ -840,9 +889,13 @@ static int vfs_create(const char *path, mode_t mode, struct fuse_file_info *fi) 
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup_slot(sub_path, &bslot, &bops) == 0 && bops->backend_create) {
         uint64_t h = 0;
-        int brc = bops->backend_create(sub_path, mode, &h);
+        int brc = nsp_fence_backend_create(bslot, "backend_create", bops->backend_create, sub_path, mode, &h);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_create", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_create", brc, sub_path, "create 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         fi->fh = h | NSP_FH_BACKEND_FLAG |
                  ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
         VFS_RETURN(0);
@@ -892,9 +945,14 @@ static int vfs_mkdir(const char *path, mode_t mode) {
        无条件 rwlock + backend_match 扫描） */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops && bops->backend_mkdir) {
-        int brc = bops->backend_mkdir(sub_path, mode);
+        int bslot = module_ops_slot(bops);
+        int brc = nsp_fence_backend_mkdir(bslot, "backend_mkdir", bops->backend_mkdir, sub_path, mode);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_mkdir", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_mkdir", brc, sub_path, "mkdir 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         VFS_RETURN(0);
     }
     /* fallback：lookup 成功但未走后端分支时释放引用，防止 backend_refs 泄漏
@@ -928,9 +986,14 @@ static int vfs_unlink(const char *path) {
     /* 后端分派：unlink 由模块方法删除 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_unlink) {
-        int brc = bops->backend_unlink(sub_path);
+        int bslot = module_ops_slot(bops);
+        int brc = nsp_fence_backend_simple(bslot, "backend_unlink", bops->backend_unlink, sub_path);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_unlink", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_unlink", brc, sub_path, "unlink 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         VFS_RETURN(0);
     }
     int ret = unlink(p);
@@ -965,9 +1028,14 @@ static int vfs_rmdir(const char *path) {
     /* 后端分派：rmdir 由模块方法删除 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_rmdir) {
-        int brc = bops->backend_rmdir(sub_path);
+        int bslot = module_ops_slot(bops);
+        int brc = nsp_fence_backend_simple(bslot, "backend_rmdir", bops->backend_rmdir, sub_path);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_rmdir", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_rmdir", brc, sub_path, "rmdir 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         VFS_RETURN(0);
     }
     int ret = rmdir(p);
@@ -997,9 +1065,12 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t off, struct 
         if (module_backend_acquire_slot(slot, &bops) == 0) {
             if (bops->backend_read) {
                 size_t got = 0;
-                int rc = bops->backend_read(fi->fh & NSP_FH_HANDLE_MASK, buf, size, off, &got);
+                int rc = nsp_fence_backend_read(slot, "backend_read", bops->backend_read,
+                                                fi->fh & NSP_FH_HANDLE_MASK, (char*)buf, size, off, &got);
                 module_backend_release_slot(slot);
+                if (rc == NSP_FENCE_FAULT) { module_guard_fault(slot, "backend_read", path); FTP_DBG("vfs_read: 后端围栏恢复\n"); return -EIO; }
                 FTP_DBG("vfs_read: 后端返回 rc=%d got=%zu\n", rc, got);
+                if (rc != 0 && rc != NSP_FENCE_BADFN) module_guard_error(slot, "backend_read", rc, path, "read 返回异常");
                 return rc == 0 ? (int)got : (rc < 0 ? rc : -EIO);
             }
             /* 模块未提供 read 回调：释放引用后按未命中处理 */
@@ -1028,8 +1099,11 @@ static int vfs_write(const char *path, const char *buf, size_t size, off_t off, 
         if (module_backend_acquire_slot(slot, &bops) == 0) {
             if (bops->backend_write) {
                 size_t wrote = 0;
-                int rc = bops->backend_write(fi->fh & NSP_FH_HANDLE_MASK, buf, size, off, &wrote);
+                int rc = nsp_fence_backend_write(slot, "backend_write", bops->backend_write,
+                                                 fi->fh & NSP_FH_HANDLE_MASK, (const char*)buf, size, off, &wrote);
                 module_backend_release_slot(slot);
+                if (rc == NSP_FENCE_FAULT) { module_guard_fault(slot, "backend_write", path); return -EIO; }
+                if (rc != 0 && rc != NSP_FENCE_BADFN) module_guard_error(slot, "backend_write", rc, path, "write 返回异常");
                 return rc == 0 ? (int)wrote : (rc < 0 ? rc : -EIO);
             }
             module_backend_release_slot(slot);
@@ -1055,8 +1129,11 @@ static int vfs_release(const char *path, struct fuse_file_info *fi) {
         const NspModuleOps* bops = NULL;
         if (module_backend_acquire_slot(slot, &bops) == 0) {
             if (bops->backend_release) {
-                int rc = bops->backend_release(fi->fh & NSP_FH_HANDLE_MASK);
+                int rc = nsp_fence_backend_release(slot, "backend_release", bops->backend_release,
+                                                   fi->fh & NSP_FH_HANDLE_MASK);
                 module_backend_release_slot(slot);
+                if (rc == NSP_FENCE_FAULT) { module_guard_fault(slot, "backend_release", path); rc = -EIO; }
+                else if (rc != 0 && rc != NSP_FENCE_BADFN) module_guard_error(slot, "backend_release", rc, path, "release 返回异常");
                 /* 句柄销毁唯一入口（FLUSH 只收尾数据不释放句柄）：
                    -EINVAL 容忍作防御（模块异常/重复释放时避免传播错误） */
                 return (rc == -EINVAL) ? 0 : (rc < 0 ? rc : 0);
@@ -1102,8 +1179,11 @@ static int vfs_flush(const char *path, struct fuse_file_info *fi) {
         if (module_backend_acquire_slot(slot, &bops) == 0) {
             int rc = 0;
             if (bops->backend_flush)
-                rc = bops->backend_flush(fi->fh & NSP_FH_HANDLE_MASK);
+                rc = nsp_fence_backend_flush(slot, "backend_flush", bops->backend_flush,
+                                             fi->fh & NSP_FH_HANDLE_MASK);
             module_backend_release_slot(slot);
+            if (rc == NSP_FENCE_FAULT) { module_guard_fault(slot, "backend_flush", path); rc = -EIO; }
+            else if (rc != 0 && rc != NSP_FENCE_BADFN) module_guard_error(slot, "backend_flush", rc, path, "flush 返回异常");
             if (rc == 0) {
                 /* 数据已落盘（上传完成）：使路径缓存失效。
                    attr_timeout=1.0 下旧大小/不存在缓存会让立即读取
@@ -1464,9 +1544,14 @@ static int vfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
     /* 后端分派：truncate 由模块方法截断 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_truncate) {
-        int brc = bops->backend_truncate(sub_path, size);
+        int bslot = module_ops_slot(bops);
+        int brc = nsp_fence_backend_truncate(bslot, "backend_truncate", bops->backend_truncate, sub_path, size);
         module_backend_put(bops);
-        if (brc != 0) VFS_RETURN(brc < 0 ? brc : -EIO);
+        if (brc == NSP_FENCE_FAULT) { module_guard_fault(bslot, "backend_truncate", sub_path); VFS_RETURN(-EIO); }
+        if (brc != 0) {
+            if (brc != NSP_FENCE_BADFN) module_guard_error(bslot, "backend_truncate", brc, sub_path, "truncate 返回异常");
+            VFS_RETURN(brc < 0 ? brc : -EIO);
+        }
         VFS_RETURN(0);
     }
     int ret = truncate(p, size);
@@ -1930,6 +2015,12 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--disable-sandbox") == 0) {
             /* 解析并应用禁用沙盒指令 */
             g_disable_sandbox = true;
+        } else if (strncmp(argv[i], "--fuse-threads=", 15) == 0) {
+            /* FUSE 多线程 worker 数（libfuse fuse_session_loop_mt）。
+               默认 -1 = libfuse 默认（10）；显式 0/负值 = 单线程（-s 语义，
+               fuse_new 内 clamp）。注入器按宿主 CPU 核数下发调优。 */
+            g_fuse_threads = atoi(argv[i] + 15);
+            if (g_fuse_threads < -1) g_fuse_threads = -1;
         } else if (strcmp(argv[i], "debug") == 0 || strcmp(argv[i], "--debug") == 0) { 
             g_min_log_level = LOG_DEBUG; fuse_argv[fuse_argc++] = "-d"; 
         } else if (strcmp(argv[i], "info") == 0) {
@@ -1945,7 +2036,14 @@ int main(int argc, char *argv[]) {
     fuse_argv[fuse_argc] = nullptr; 
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
+    /* 崩溃处理器安装顺序（关键）：先装 crash_handler（内层/dump+re-raise），
+       再装 fault_fence 处理器（外层/活动处理器）——后安装者生效。fence 在
+       模块调用窗口内崩溃时 siglongjmp 恢复（daemon 存活，模块置毒卸载）；
+       归因失败（窗口外/非模块崩溃）委托 crash_handler 走原 dump 链路。
+       顺序颠倒（先 fence 后 crash）会使 fence 被覆盖而失效。 */
     install_crash_handlers();
+    fault_fence_set_orig_handler(crash_handler);
+    fault_fence_init();
     /* 崩溃触发测试：验证 error.log 记录与 stderr→fuse_crash.log 的 backtrace 捕获链路。
        崩溃发生在挂载/模块初始化前，可独立运行（无需挂载）。 */
     if (g_crash_test != 0) {
@@ -1966,6 +2064,9 @@ int main(int argc, char *argv[]) {
 #endif
         }
     }
+    /* 模块守卫（校验+熔断+MOD_ERR 日志限流）：须在模块系统初始化前
+       就绪——模块加载/init 调用可能立即触发错误上报 */
+    module_guard_init();
     /* 热插拔模块系统：扫描模块目录并启动监控线程（规则模块能力在此注册） */
     uint32_t mod_flags = g_disable_sandbox ? NSP_FLAG_DISABLE_SANDBOX : 0;
     module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL, mod_flags);
@@ -1989,5 +2090,71 @@ int main(int argc, char *argv[]) {
         g_bpf_fd = -1;
     }
 #endif
-    return fuse_main(fuse_argc, fuse_argv, &vfs_ops, nullptr);
+    /* Phase 3：显式 FUSE 会话，复刻 libfuse fuse_main_real_versioned
+       （3.18）的完整 7 步序列，仅将最后一步的 worker 线程数变为可控
+       （--fuse-threads=N；-1 = libfuse 默认 10；0/负值 = 单线程 -s 语义）。
+       注意 fuse_new 本身**不做** cmdline 解析/挂载/信号注册——这些是
+       fuse_main 的独立步骤，缺了 fuse_session_new 会把 -f/挂载点当
+       unknown option 拒绝。
+       三层数据路径（路由/模块/输出）全部无全局可变状态——任意 worker
+       线程并发进入安全（见文件头 fw_route 注释）。 */
+    struct fuse_args fa = FUSE_ARGS_INIT(fuse_argc, fuse_argv);
+    struct fuse_cmdline_opts fopts = { 0 };
+    int fmain_rc = 0;
+    struct fuse* f = NULL;
+    struct fuse_loop_config* lcfg = NULL;
+    if (fuse_parse_cmdline(&fa, &fopts) != 0)
+        fmain_rc = 1;                       /* 与 fuse_main 错误码对齐 */
+    else if (!fopts.show_help && !fopts.mountpoint) {
+        LOG_ERR("FUSE: 缺少挂载点");
+        fmain_rc = 2;
+    } else if ((f = fuse_new(&fa, &vfs_ops, sizeof(struct fuse_operations), nullptr)) == NULL) {
+        LOG_ERR("FUSE 会话创建失败（fuse_new）");
+        fmain_rc = 3;
+    } else if (fuse_mount(f, fopts.mountpoint) != 0) {
+        LOG_ERR("FUSE 挂载失败: %s", fopts.mountpoint);
+        fmain_rc = 4;
+    } else if (fuse_daemonize(fopts.foreground) != 0) {
+        LOG_ERR("FUSE 后台化失败");
+        fmain_rc = 5;
+    } else {
+        struct fuse_session* se = fuse_get_session(f);
+        if (fuse_set_signal_handlers(se) != 0) {
+            LOG_ERR("FUSE 信号处理器安装失败");
+            fmain_rc = 6;
+        } else {
+            /* 关键：libfuse 刚接管故障信号（SIGSEGV/SIGBUS/SIGFPE/SIGILL/
+               SIGABRT），须重新武装围栏使其成为活动处理器——否则模块
+               崩溃将走 libfuse 处理器（记日志后退出）带崩框架，围栏
+               longjmp 恢复链路失效。SIGINT/SIGTERM 仍归 libfuse。 */
+            fault_fence_rearm();
+            LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint,
+                (fopts.singlethread || g_fuse_threads <= 0) ? "单线程" :
+                (g_fuse_threads == -1 ? "libfuse 默认(10)" : "自定义"));
+            if (fopts.singlethread || g_fuse_threads <= 0) {
+                fmain_rc = fuse_loop(f);   /* 单线程（-s / --fuse-threads=0） */
+            } else {
+                lcfg = fuse_loop_cfg_create();   /* 默认: max_threads=10, idle=无上限 */
+                if (!lcfg) {
+                    LOG_ERR("FUSE loop 配置创建失败（fuse_loop_cfg_create）");
+                    fmain_rc = 7;
+                } else {
+                    if (g_fuse_threads > 0)
+                        fuse_loop_cfg_set_max_threads(lcfg, (unsigned)g_fuse_threads);
+                    /* g_fuse_threads == -1：保留默认 10，不覆盖 */
+                    fmain_rc = fuse_loop_mt(f, lcfg);
+                    if (fmain_rc) fmain_rc = 8;
+                }
+            }
+            fuse_remove_signal_handlers(se);
+        }
+        fuse_unmount(f);
+        fuse_destroy(f);
+    }
+    if (lcfg) fuse_loop_cfg_destroy(lcfg);
+    free(fopts.mountpoint);
+    fuse_opt_free_args(&fa);
+    if (fmain_rc && fmain_rc != 8)
+        LOG_ERR("FUSE 会话退出: rc=%d", fmain_rc);
+    return fmain_rc;
 }

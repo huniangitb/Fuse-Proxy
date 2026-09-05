@@ -124,7 +124,11 @@ static void dump_maps_and_offsets(int fd, void* const* bt, int nframes) {
     safe_printf(fd, "End memory map\n");
 }
 
-static void crash_handler(int sig, siginfo_t *info, void *ctx) {
+/* crash_handler：崩溃转储原处理器。
+   fault_fence 启用后由 fence 处理器包在外层：模块调用窗口内的崩溃被
+   longjmp 恢复（本处理器不执行）；归因失败的崩溃仍走到这里做完整
+   dump + re-raise（原有 injector 兜底链行为不变）。 */
+void crash_handler(int sig, siginfo_t *info, void *ctx) {
     signal(sig, SIG_DFL);
     const char* sig_name = "UNKNOWN";
     switch (sig) {
@@ -134,6 +138,19 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
         case SIGFPE:  sig_name = "SIGFPE (arithmetic exception)"; break;
         case SIGILL:  sig_name = "SIGILL (illegal instruction)"; break;
         case SIGSYS:  sig_name = "SIGSYS (bad syscall)"; break;
+    }
+    /* 模块归因行（Phase 1c）：即使归因失败走到这里，也尝试查询肇事
+       线程的模块调用窗口——"归因失败"仅指不在窗口内，窗口查询本身
+       是零成本只读；命中（如 SIGABRT 在 __stack_chk_fail 路径但窗口
+       已注销）则输出模块上下文，配合 backtrace 定位。信号安全。 */
+    {
+        extern void fault_fence_attribution(int*, const char**, const char**);
+        int a_slot = -1; const char* a_op = NULL, *a_name = NULL;
+        fault_fence_attribution(&a_slot, &a_op, &a_name);
+        if (a_slot >= 0)
+            safe_printf(STDERR_FILENO,
+                "Crash attribution: module=%s slot=%d op=%s (in module call window)\n",
+                a_name ? a_name : "(unknown)", a_slot, a_op ? a_op : "(null)");
     }
     int err_fd = open(ERROR_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
     if (err_fd >= 0) {
