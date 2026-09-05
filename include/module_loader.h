@@ -53,8 +53,32 @@ int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size
 /* 已加载模块快照（供 IPC LIST_MODULES）：填充 names，返回数量 */
 int module_snapshot(char names[][64], int max);
 
+/* 模块健康快照（Phase 1c：前端模块列表展示健康度/ban 原因）。
+   填充 info（动态数组，调用方 free），返回数量；含非活跃槽位的
+   banned 模块（规则已失效但仍需展示 ban 状态），active 标志区分。 */
+typedef struct {
+    char name[64];
+    char version[32];       /* 模块自述版本字符串（NspModuleInfo.version） */
+    uint32_t caps;
+    bool active;
+    unsigned err_count;     /* 当前滑动窗口内错误数 */
+    unsigned err_total;     /* 本加载周期累计错误数 */
+    bool banned;
+    char ban_reason[96];
+    time_t last_err_time;
+} NspModuleHealth;
+int module_health_snapshot(NspModuleHealth** info_out);
+
 /* 是否有任何活跃模块 */
 bool module_any_loaded(void);
+
+/* 槽位模块名查询（module_guard 日志用；无锁读，槽位无效返回 "slotN"） */
+const char* module_slot_name(int slot);
+
+/* 模块置毒（崩溃恢复/熔断触发的强制卸载）：槽位快照置空（规则立即失效）
+   → 等在途引用归零 → dlclose → 落盘 ban 记录（同哈希 .so 不再重载）。
+   幂等；由 module_guard 在确认故障后调用。0 成功，-1 槽位无效。 */
+int module_fault_poison(int slot, const char* reason);
 
 /* 是否有活跃后端 I/O 模块（快速路径：无后端时框架直接本地文件系统，零开销） */
 bool module_backend_active(void);
@@ -81,5 +105,9 @@ void module_backend_put(const NspModuleOps* ops);
    引用归零，acquire 二次确认快照未变，保证不会在 dlclose 后调用函数指针。 */
 int module_backend_acquire_slot(int slot, const NspModuleOps** ops_out);
 void module_backend_release_slot(int slot);
+
+/* ops 指针 → 槽位索引反查（module_guard 围栏上报用；快照匹配则返回槽位号，
+   否则 -1。无锁原子读，O(MAX_MODULES)——仅日志/上报路径调用，不在热路径） */
+int module_ops_slot(const NspModuleOps* ops);
 
 #endif /* MODULE_LOADER_H */

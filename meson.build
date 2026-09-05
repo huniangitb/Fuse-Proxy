@@ -105,7 +105,7 @@ common_sources = [
     'src/core/uid_map.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/core/sha256.c']
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c']
 injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
