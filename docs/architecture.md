@@ -85,16 +85,16 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
 
 ### 2.3 log_monitor / log_ctl — 日志子系统
 
-- **log_monitor**：常驻日志收集服务，通过 AF_UNIX 流式 socket（抽象地址 `nsp_log_socket`，`SOCK_STREAM`）接收各进程 `log_internal` 发来的日志，落盘/转发；同时提供 `search`/`stream`/`clear`/`count` 等查询服务。
+- **log_monitor**：常驻日志收集服务，通过 AF_UNIX 流式 socket（抽象地址 `nsp_log_socket`，`SOCK_STREAM`）接收各进程 `log_internal` 发来的日志，落盘/转发；同时提供 `search`/`stream`/`clear`/`count` 等查询服务。io/sys 自动落盘 `LOG_DIR/io.log`、`sys.log`（`push_log` 单漏斗暂存 64KB，stage 满 / 500ms tick 脏超 1s / 退出时刷盘；单文件超 2MB 轮转为 `.1` 单备份，logcat 不落盘）。启动时把落盘文件加载进只读独立缓冲（`.1`→cur，每类上限 2048 条，解析失败跳过），`search`/`STREAM` 历史/`COUNT` 按"磁盘在前、内存在后"拼接（内存启动时为空故无重叠）。
 - **log_ctl**：CLI 客户端，用于查询日志、流式输出、规则编辑（`set-rule`/`remove-rule`/`validate-rules`）、以及拉取配置广播（`get-config` / `stream-config`）。详见 `log_ctl-api.md`。
 
 #### 挂载周期日志合并（LOG_BATCH 协议）
 
 应用还原等"一条日志对应整个挂载周期"的场景，周期内中间日志（bind/f2fs
 等）由 `log_batch_begin/end` 在 `log_internal` 层累积，`log_batch_end`
-合并为**单条**多行日志写入环形缓冲（带不可见 `LOG_MERGED_MARK` 前缀）：
+合并为**单条**经 comm 线程发送（`LOG_KIND_MERGED` 载荷）：
 
-- sender 检测到 `LOG_MERGED_MARK` 即按 `LOG_BATCH\n<内容>\nLOG_BATCH_END`
+- comm 线程的 LOG 后端按 `LOG_BATCH\n<内容>\nLOG_BATCH_END`
   分帧发送；普通日志（LOG_IO/LOGCAT/SYS）逐条逻辑不变
 - log_monitor 的 `async_log_thread` 收集 LOG_BATCH 帧，`LOG_BATCH_END`
   整块合并为**一条**入库（前端最终只显示一条，多个发送请求并入一个日志）
@@ -270,7 +270,14 @@ FUSE 回调（如 getattr）
 
 ## 8. 维护规范
 
-- **公共工具归属**：跨进程复用的工具函数放 `src/core/common.c`（声明在 `common.h`）。路径/字符串处理、mkdir、SELinux 上下文继承等应集中一处，避免各文件各写一份。
+- **公共工具归属**：跨进程复用的工具有两层——①纯 libc、无全局依赖的放 `src/core/nsp_util.c`（声明在 `nsp_util.h`）：UDS 抽象地址填充（`nsp_uds_abstract_addr`）、全量发送（`nsp_send_all`）、去空白（`nsp_str_trim`）、`nsp_mkdir_p`、后台化（`nsp_daemonize`）、cgroup 逃逸（`nsp_escape_cgroup`），各二进制与 dlopen 模块均可链接，**禁止私刻副本**（`rule_server` 的 `mkdir_p`/`send_all`、`ftp_conf` 的 `trim`、`injector`/`rule_server` 的 fork 样板已删除）；②依赖项目全局（`g_real_root`、日志、SELinux）的放 `src/core/common.c`（声明在 `common.h`，模块侧经 `nsp_module.h` 导出表解析）。路径/字符串处理、mkdir 等应集中一处，避免各文件各写一份。
+- **存储路径合成唯一出口**：禁止裸拼 `STORAGE_BASE "/%d…"` `snprintf`——默认真实路径走 `common_default_real_path()`、用户存储根走 `common_storage_root()`、沙盒目标走 `common_sandbox_path()`（`MAX_PATH_LEN` 放不下时返回 -1，调用方放弃重定向而非截断）。三函数在 `common.c` 实现、`nsp_module.h` 向模块导出。
+- **函数命名前缀**：`br_*`（基础规则）、`config_*`（配置锁/发布）、`module_*/nsp_guard_*/nsp_fence_*`（模块框架）、`ftp_*`（FTP 后端）、`trie_*`、`sha256_*/uid_map_*/fast_pid_*`、`vfs_*/fw_*`（FUSE 回调/框架）、`ns_*`（mount namespace 操作，含 `ns_global_replace.c/h` 跨文件 helper）、`nsp_*`（`nsp_util` 轻量公共库）、`common_*`（存储路径合成等）。新增跨文件函数必须带域前缀；`inject_target.c` 的 `is_*/add_*/all_apps_*` 裸名是已知历史包袱（改动面大，后续单独治理）。
+- **头文件职责**：`mkdir_recursive_p` 权威声明只在 `common.h`（`config_parser.h` 不得重复声明）；`_locked` 后缀函数（须持有读写锁）不得进公共头；`is_media_provider` 权威声明在 `common.h`。`crash_dump.c` 的 `backtrace/backtrace_symbols*` 是**故意**的静态实现（满足 `libfuse3.a` 对 `execinfo.h` 符号的链接依赖），不得改名。
+- **初始化契约**：`log_init` 内部调用 `init_timezone`；`log_monitor` 因不走 `log_init`（自身即日志服务端）才直接调 `init_timezone`，其余进程不得手动补调。
+- **统一通讯线程**：所有发后即忘 socket 发送经 `nsp_comm_post(ch, data, len)`（`nsp_comm.h`，全进程唯一入口），调用线程永不阻塞、永不碰 socket。`LOG`/`IPC` 后端常驻于 `log_init`（common.c）；`BCAST` 后端由 `injector`（订阅集合归 comm 线程，`SUB/UNSUB` 经控制消息）、`log_monitor`（STREAM 客户端集合归 comm 线程，`ADD/DEL` 经控制消息，主线程只 `shutdown` 不断号 `close`）各自注册。同步 query 类（`LIST/COUNT/QUERY/rule -c`）与 `log_ctl` 短命 CLI 保持阻塞原样，不进 comm 模型。
+- **背压与顺序**：满环覆盖最旧 + `dropped` 计数（drain 轮结束经 report 钩子发一行 SYS 可查，计数以 `nsp_comm_dropped()` 为准）；单生产者保序、多生产者允许乱序。drain 优先级 `IPC > LOG > BCAST`，生命线信号优先。
+- **fd 归属铁律**：谁拥有集合，谁 `close`。comm 线程拥有的客户端 fd，主线程只允许 `shutdown` + 投递控制消息，禁止直接 `close`（不断号，杜绝复用竞态）；进程退出时先 `nsp_comm_fini()` 再集中关闭。
 - **数据结构独立**：内聚、零业务依赖的数据结构（如 Trie）应自成模块（`.c`+`.h`），可独立单元测试。`path_trie.c` 不引用 AppConfig 或任何配置全局。
 - **规则匹配语义等价**：修改 Trie 或线性通道时，务必保持二者对同一规则的优先级一致——app trie 优先于 global trie；redirect 取 app 命中优先、global 仅兜底；hidden/ro 取 app+global **并集**（任一命中即生效）。
 - **Trie matched 语义**：`trie_lookup` 的返回值表示"命中至少一条真实规则（hidden/ro/redirect，含祖先继承）"，而非"路径途经了无规则的中间节点"——否则 `/Android/data/<未配置包>` 会误判。修改时务必保留此语义。

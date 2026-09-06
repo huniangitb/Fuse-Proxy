@@ -1,4 +1,6 @@
 #include "common.h"
+#include "nsp_comm.h"
+#include "nsp_util.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <pthread.h>
@@ -9,8 +11,6 @@
 #include <sys/system_properties.h>
 #endif
 #include <stdatomic.h>
-#include <sys/eventfd.h>
-#include <poll.h>
 #ifdef TARGET_ANDROID
 #include <sys/xattr.h>
 #endif
@@ -27,36 +27,31 @@ static volatile sig_atomic_t g_log_batch_depth = 0;   /* >0 = 合并周期中 */
 static pthread_mutex_t g_log_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_log_batch_buf[65536];
 static size_t g_log_batch_len = 0;
-/* 合并日志标记：写入环形缓冲的合并单条以该前缀开头，sender 据此以
-   LOG_BATCH 分帧协议发送，log_monitor 整块接收合并为一条入库 */
-#define LOG_MERGED_MARK "\x01MERGED\x01"
+
 static char g_self_dir[PATH_MAX] = {0};
 static char g_proc_name[64] = "unknown";
 static bool g_log_inited = false;
 static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define LOG_BUF_CAPACITY 2048
-#define LOG_BUF_MASK     (LOG_BUF_CAPACITY - 1)
-/* 日志条目容量与 log_monitor 消费端（MAX_MSG_LEN=4096）对齐，
-   避免合并日志在环形缓冲处被截断（总内存不变：2048×4096 ≈ 8192×1024） */
 #define LOG_MSG_MAX_LEN  4096
 
-typedef struct {
-    char     msg[LOG_MSG_MAX_LEN];
-    LogLevel level;
-} LogEntry;
-
-typedef struct {
-    LogEntry      entries[LOG_BUF_CAPACITY];
-    _Atomic(int)  head;
-    int           tail;
-    _Atomic(int)  dropped;
-} LogRingBuffer;
-
-static LogRingBuffer g_log_ring;
-static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t     g_log_sender_tid;
-static int           g_log_event_fd = -1;
+/* LOG 通道载荷组帧（与 log_monitor 行协议对齐，旧 log_entry_packet 语义）：
+   kind=0 普通：level==LOG_IO → "LOG_IO:%s\n"；LOG_LOGCAT → "LOG_LOGCAT:%s\n"；
+     否则 "LOG_SYS:<level>:[proc] <msg>\n"
+   kind=1 合并： "LOG_BATCH\n<content>\nLOG_BATCH_END\n"（level 字节忽略） */
+#define LOG_KIND_NORMAL 0
+#define LOG_KIND_MERGED 1
+static int log_frame_packet(uint8_t kind, uint8_t level, const char *msg,
+                            char *packet, size_t sz) {
+    if (kind == LOG_KIND_MERGED)
+        return snprintf(packet, sz, "LOG_BATCH\n%s\nLOG_BATCH_END\n", msg);
+    if (level == LOG_IO)
+        return snprintf(packet, sz, "LOG_IO:%s\n", msg);
+    if (level == LOG_LOGCAT)
+        return snprintf(packet, sz, "LOG_LOGCAT:%s\n", msg);
+    return snprintf(packet, sz, "LOG_SYS:%d:[%s] %s\n",
+                    level, g_proc_name, msg);
+}
 
 /* 日志合并周期控制：原子嵌套计数（>0 = 周期中），支持并发/嵌套 begin/end，
    最后一个 end 把累积日志合并为单条写入环形缓冲 */
@@ -79,20 +74,17 @@ void log_batch_end(void) {
     g_log_batch_len = 0;
     pthread_mutex_unlock(&g_log_batch_mutex);
     if (n == 0 || !g_log_inited) return;
-    /* 合并为单条写入环形缓冲（带 LOG_MERGED_MARK 前缀）：sender 据此以
-       LOG_BATCH 分帧协议发送，log_monitor 整块接收合并为一条入库，
-       前端只显示一条（多个发送请求并入一个日志）。
-       单行输出：[proc] <条目1>\t<条目2>...
-       （条目间以制表符连接，不用换行，避免前端按行拆分导致截断/乱码） */
-    pthread_mutex_lock(&g_log_mutex);
-    int slot = atomic_fetch_add_explicit(&g_log_ring.head, 1, memory_order_relaxed) & LOG_BUF_MASK;
-    snprintf(g_log_ring.entries[slot].msg, LOG_MSG_MAX_LEN,
-             LOG_MERGED_MARK "[%s] %s", g_proc_name, merged);
-    g_log_ring.entries[slot].level = LOG_DEBUG;   /* 合并日志归为 debug 级别，
-                                                     --level >=1 查询时不显示 */
-    pthread_mutex_unlock(&g_log_mutex);
-    uint64_t val = 1;
-    if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
+    /* 合并为单条经 comm 线程发送（kind=MERGED，log_monitor 整块接收合并为
+       一条入库，前端只显示一条）。单行输出：[proc] <条目1>\t<条目2>...
+       （条目间以制表符连接，不用换行，避免前端按行拆分导致长内容截断/中文乱码） */
+    char line[LOG_MSG_MAX_LEN];
+    snprintf(line, sizeof(line), "[%s] %s", g_proc_name, merged);
+    uint8_t buf[2 + LOG_MSG_MAX_LEN];
+    buf[0] = LOG_KIND_MERGED;
+    buf[1] = (uint8_t)LOG_DEBUG;   /* 合并日志归为 debug 级别，--level>=1 不显示 */
+    size_t llen = strlen(line);
+    memcpy(buf + 2, line, llen + 1);
+    nsp_comm_post(NSP_CH_LOG, buf, llen + 3);
 }
 /* 子进程日志转发 fd：run_in_mnt_ns_* fork 的子进程内 sender 线程不可达，
    子进程经此管道回传日志，父进程读取后统一写入环形缓冲（默认 -1=未启用） */
@@ -188,45 +180,41 @@ void escape_cgroup() {
         }
     }
 }
-/* 抽取的 IPC 连接 helper：send_ipc_message / query_ipc_message 共用，
-   统一 500ms 收发超时与 abstract namespace 绑定逻辑 */
-static int connect_ipc() {
+/* IPC 短连接 helper（500ms 收发超时 + abstract namespace）：
+   仅 comm 线程的 IPC 后端使用，调用线程一律 nsp_comm_post(NSP_CH_IPC) */
+static int connect_ipc(void) {
     int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock_fd < 0) return -1;
     struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
     setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    struct sockaddr_un server_addr = {0};
-    server_addr.sun_family = AF_UNIX;
-    server_addr.sun_path[0] = '\0';
-    strncpy(server_addr.sun_path + 1, IPC_SOCKET_NAME, sizeof(server_addr.sun_path) - 2);
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(IPC_SOCKET_NAME);
+    struct sockaddr_un server_addr;
+    socklen_t len = nsp_uds_abstract_addr(&server_addr, IPC_SOCKET_NAME);
     if (connect(sock_fd, (struct sockaddr*)&server_addr, len) < 0) {
         close(sock_fd); return -1;
     }
     return sock_fd;
 }
-int send_ipc_message(const char* message) {
-    int sock_fd = connect_ipc();
-    if (sock_fd < 0) return -1;
-    send(sock_fd, message, strlen(message), MSG_NOSIGNAL);
-    close(sock_fd);
-    return 0;
-}
-int query_ipc_message(const char* command, char* out_buf, size_t buf_size) {
-    int sock_fd = connect_ipc();
-    if (sock_fd < 0) return -1;
-    send(sock_fd, command, strlen(command), MSG_NOSIGNAL);
-    shutdown(sock_fd, SHUT_WR);
-    ssize_t total = 0;
-    ssize_t n;
-    while (buf_size > 0 && (n = read(sock_fd, out_buf, buf_size)) > 0) {
-        out_buf += n;
-        buf_size -= n;
-        total += n;
+
+/* IPC 后端（comm 线程）：每条消息独立短连接（与 injector ipc_server 短连接
+   语义一致：send 后即关，不读回包） */
+static int nsp_ipc_emit(void *ctx, const void *data, size_t len) {
+    (void)ctx;
+    int fd = connect_ipc();
+    if (fd < 0) return -1;
+    const char *p = data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR)) continue;
+            close(fd);
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
     }
-    close(sock_fd);
-    return (int)total;
+    close(fd);
+    return 0;
 }
 void set_self_dir(const char* path) { if (path && *path) strncpy(g_self_dir, path, sizeof(g_self_dir) - 1); }
 char* get_self_dir() {
@@ -400,148 +388,114 @@ void path_sanitize(char* out, size_t size, const char* path) {
     }
     out[o] = '\0';
 }
-/* 日志条目 → 发送包格式（主 drain 与关闭 drain 共用，保证分帧协议一致）：
-   - 合并单条（LOG_MERGED_MARK 前缀）：以 LOG_BATCH 分帧发送（头+内容+尾），
-     log_monitor 整块接收合并为一条入库，前端只显示一条
-   - 普通条目：LOG_IO:/LOG_LOGCAT:/LOG_SYS:<level>:[proc] 前缀 */
-static int log_entry_packet(const LogEntry* e, char* packet, size_t sz) {
-    if (strncmp(e->msg, LOG_MERGED_MARK, sizeof(LOG_MERGED_MARK) - 1) == 0) {
-        const char* content = e->msg + sizeof(LOG_MERGED_MARK) - 1;
-        return snprintf(packet, sz, "LOG_BATCH\n%s\nLOG_BATCH_END\n", content);
+/* LOG 通道载荷：[kind:1][level:1][msg...]（调用线程组帧头，发送组包） */
+typedef struct {
+    int sock;   /* -1=未建链（仅 comm 线程触碰） */
+} log_be_ctx_t;
+static log_be_ctx_t g_log_be = { .sock = -1 };
+
+static bool nsp_log_ensure_link(void *ctx) {
+    log_be_ctx_t *c = ctx;
+    if (c->sock >= 0) return true;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_un addr;
+    socklen_t len = nsp_uds_abstract_addr(&addr, LOG_SOCKET_NAME);
+    if (connect(fd, (struct sockaddr*)&addr, len) < 0) {
+        close(fd);
+        return false;
     }
-    if (e->level == LOG_IO)
-        return snprintf(packet, sz, "LOG_IO:%s\n", e->msg);
-    if (e->level == LOG_LOGCAT)
-        return snprintf(packet, sz, "LOG_LOGCAT:%s\n", e->msg);
-    return snprintf(packet, sz, "LOG_SYS:%d:[%s] %s\n",
-                    e->level, g_proc_name, e->msg);
+    c->sock = fd;
+    return true;
 }
 
-static void *log_sender_thread(void *arg) {
-    (void)arg;
-    int sock = -1;
-    struct timespec retry_after = {0, 0};
-
-    while (!atomic_load_explicit(&g_log_shutdown, memory_order_relaxed)) {
-        if (sock < 0) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (now.tv_sec > retry_after.tv_sec ||
-                (now.tv_sec == retry_after.tv_sec && now.tv_nsec >= retry_after.tv_nsec)) {
-                sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-                if (sock >= 0) {
-                    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-                    strncpy(addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-                    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
-                    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
-                    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-                    if (connect(sock, (struct sockaddr*)&addr, len) < 0) {
-                        close(sock); sock = -1;
-                        clock_gettime(CLOCK_MONOTONIC, &retry_after);
-                        retry_after.tv_nsec += 100000000;
-                        if (retry_after.tv_nsec >= 1000000000) {
-                            retry_after.tv_sec++;
-                            retry_after.tv_nsec -= 1000000000;
-                        }
-                    }
-                }
-            }
+static int nsp_log_emit(void *ctx, const void *data, size_t len) {
+    log_be_ctx_t *c = ctx;
+    if (len < 2 || c->sock < 0) return -1;
+    const uint8_t *p = data;
+    char packet[LOG_MSG_MAX_LEN * 2 + 128];
+    /* msg 段以 NUL 截断防越界（post 载荷恒以 NUL 结尾，见 log_internal） */
+    size_t mlen = len - 2;
+    if (mlen >= LOG_MSG_MAX_LEN) mlen = LOG_MSG_MAX_LEN - 1;
+    char msg[LOG_MSG_MAX_LEN];
+    memcpy(msg, p + 2, mlen);
+    msg[mlen] = '\0';
+    int plen = log_frame_packet(p[0], p[1], msg, packet, sizeof(packet));
+    if (plen <= 0) return 0;
+    const char *q = packet;
+    size_t left = (size_t)plen;
+    while (left > 0) {
+        ssize_t n = send(c->sock, q, left, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            close(c->sock);
+            c->sock = -1;
+            return -1;
         }
-
-        int consumed = 0;
-        while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
-            if (sock < 0) break;  /* 未连接：保留 ring 数据等待重连，避免丢弃式消耗（tail++/consumed++）导致空转 */
-            /* 持锁读取并打包：与 log_internal 的写入互斥，杜绝 sender 读到撕裂的半写字符串 */
-            pthread_mutex_lock(&g_log_mutex);
-            LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
-            char packet[LOG_MSG_MAX_LEN * 2 + 128];
-            int len = log_entry_packet(e, packet, sizeof(packet));
-            pthread_mutex_unlock(&g_log_mutex);
-            ssize_t sent = send(sock, packet, len, MSG_NOSIGNAL);
-            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                close(sock); sock = -1;
-                clock_gettime(CLOCK_MONOTONIC, &retry_after);
-                retry_after.tv_nsec += 100000000;
-                if (retry_after.tv_nsec >= 1000000000) {
-                    retry_after.tv_sec++;
-                    retry_after.tv_nsec -= 1000000000;
-                }
-                break;
-            }
-            if (sent < 0) break;
-            g_log_ring.tail++;
-            consumed++;
-        }
-
-        if (!consumed) {
-            /* sock 未就绪且 ring 非空时也等待 retry_after，避免紧密空转；
-               ring 为空时靠 eventfd 唤醒，sock 未就绪时靠 retry_after 节流重连 */
-            struct pollfd pfd = { .fd = g_log_event_fd, .events = POLLIN };
-            int poll_ms = 100;
-            if (sock < 0) {
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                int retry_ms = (int)(retry_after.tv_sec - now.tv_sec) * 1000
-                            + (int)(retry_after.tv_nsec - now.tv_nsec) / 1000000;
-                if (retry_ms > 0 && retry_ms < poll_ms) poll_ms = retry_ms;
-            }
-            poll(&pfd, 1, poll_ms);
-            /* eventfd 为非 semaphore 模式：计数器只能靠 read 清零。poll 返回后必须读空，
-               否则计数器永久 ≥1 → POLLIN 永久就绪 → poll 立即返回形成紧密空转（100% 单核） */
-            if (pfd.revents & POLLIN) {
-                uint64_t val;
-                while (read(g_log_event_fd, &val, sizeof(val)) > 0) { }
-            }
-        }
+        q += n;
+        left -= (size_t)n;
     }
+    return 0;
+}
 
-    while (g_log_ring.tail != atomic_load_explicit(&g_log_ring.head, memory_order_acquire)) {
-        pthread_mutex_lock(&g_log_mutex);
-        LogEntry *e = &g_log_ring.entries[g_log_ring.tail & LOG_BUF_MASK];
-        char packet[LOG_MSG_MAX_LEN * 2 + 128];
-        int len = log_entry_packet(e, packet, sizeof(packet));
-        pthread_mutex_unlock(&g_log_mutex);
-        if (sock >= 0) send(sock, packet, len, MSG_NOSIGNAL);
-        g_log_ring.tail++;
-    }
-    if (sock >= 0) close(sock);
-    return NULL;
+static void nsp_log_fini(void *ctx) {
+    log_be_ctx_t *c = ctx;
+    if (c->sock >= 0) { close(c->sock); c->sock = -1; }
+}
+
+/* 拥塞上报：本 drain 轮有覆盖丢弃时经 LOG 通道发一行 SYS 可查
+   （post 永不阻塞；LOG 自身拥塞时该行亦可能被覆盖，计数以 API 为准。
+   若本进程未注册 LOG 后端（如 log_monitor），该行计 dropped，无限循环） */
+void nsp_log_report(nsp_ch_t ch, uint64_t n, void *ctx) {
+    (void)ctx;
+    /* 限频 5s：LOG 自身拥塞时报告回注会加剧拥塞、下轮再报，限频后每轮
+       最多一条；精确计数以 nsp_comm_dropped() 为准 */
+    static uint64_t last_ms = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    if (now - last_ms < 5000) return;
+    last_ms = now;
+    static const char *names[NSP_CH__N] = { "LOG", "IPC", "BCAST" };
+    char msg[128];
+    int mlen = snprintf(msg, sizeof(msg), "comm: %s 通道拥塞，覆盖旧数据 %llu 条",
+                        names[ch], (unsigned long long)n);
+    if (mlen <= 0) return;
+    uint8_t buf[2 + 128];
+    buf[0] = LOG_KIND_NORMAL;
+    buf[1] = (uint8_t)LOG_WARN;
+    memcpy(buf + 2, msg, (size_t)mlen + 1);
+    nsp_comm_post(NSP_CH_LOG, buf, (size_t)mlen + 3);
 }
 
 void log_init(const char* process_name) {
     init_timezone();
     strncpy(g_proc_name, process_name, sizeof(g_proc_name) - 1);
     mkdir_recursive(LOG_DIR);
-    atomic_store_explicit(&g_log_ring.head, 0, memory_order_relaxed);
-    g_log_ring.tail = 0;
-    atomic_store_explicit(&g_log_ring.dropped, 0, memory_order_relaxed);
     atomic_store_explicit(&g_log_shutdown, false, memory_order_relaxed);
-    g_log_event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (g_log_event_fd < 0) {
-        /* eventfd 失败：日志子系统降级为仅落盘模式，不派 sender 线程 */
-        LOG_ERR("log_init: eventfd 创建失败: %s", strerror(errno));
+    /* 统一通讯线程：LOG + IPC 后端常驻（调用线程只 post，永不碰 socket） */
+    if (nsp_comm_init() != 0) {
         g_log_inited = false;
         return;
     }
-    if (pthread_create(&g_log_sender_tid, NULL, log_sender_thread, NULL) != 0) {
-        /* sender 线程派失败：日志将堆积于 ring buffer 但永不被发送，
-           关闭 eventfd 避免后续无效写入 */
-        LOG_ERR("log_init: sender 线程创建失败: %s", strerror(errno));
-        close(g_log_event_fd);
-        g_log_event_fd = -1;
-        g_log_inited = false;
-        return;
-    }
+    nsp_comm_backend_t log_be = {
+        .ctx = &g_log_be, .ensure_link = nsp_log_ensure_link,
+        .emit = nsp_log_emit, .fini = nsp_log_fini, .report = nsp_log_report,
+    };
+    nsp_comm_register(NSP_CH_LOG, &log_be);
+    nsp_comm_backend_t ipc_be = {
+        .ctx = NULL, .ensure_link = NULL, .emit = nsp_ipc_emit,
+        .fini = NULL, .report = nsp_log_report,
+    };
+    nsp_comm_register(NSP_CH_IPC, &ipc_be);
     g_log_inited = true;
 }
 
-void log_close() {
+void log_close(void) {
     if (!g_log_inited) return;
-    atomic_store_explicit(&g_log_shutdown, true, memory_order_release);
-    uint64_t val = 1;
-    if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
-    pthread_join(g_log_sender_tid, NULL);
-    if (g_log_event_fd >= 0) { close(g_log_event_fd); g_log_event_fd = -1; }
+    nsp_comm_fini();   /* 最尽力 drain + join */
     g_log_inited = false;
 }
 
@@ -596,16 +550,75 @@ void log_internal(LogLevel level, const char* format, ...) {
         pthread_mutex_unlock(&g_log_batch_mutex);
         return;
     }
-    pthread_mutex_lock(&g_log_mutex);
-    int slot = atomic_fetch_add_explicit(&g_log_ring.head, 1, memory_order_relaxed) & LOG_BUF_MASK;
-    strncpy(g_log_ring.entries[slot].msg, msg_buf, LOG_MSG_MAX_LEN - 1);
-    g_log_ring.entries[slot].msg[LOG_MSG_MAX_LEN - 1] = '\0';
-    g_log_ring.entries[slot].level = level;
-    pthread_mutex_unlock(&g_log_mutex);
-    uint64_t val = 1;
-    if (g_log_event_fd >= 0) write(g_log_event_fd, &val, sizeof(val));
+    /* 调用线程仅组帧头 + post（永不碰 socket/mutex 长临界区/eventfd 细则） */
+    uint8_t buf[2 + LOG_MSG_MAX_LEN];
+    buf[0] = LOG_KIND_NORMAL;
+    buf[1] = (uint8_t)level;
+    size_t mlen2 = strlen(msg_buf);
+    memcpy(buf + 2, msg_buf, mlen2 + 1);
+    nsp_comm_post(NSP_CH_LOG, buf, mlen2 + 3);
 }
 
 bool is_media_provider(const char* pkg) {
     return (strstr(pkg, "com.android.providers.media") != nullptr);
+}
+
+/* 存储路径合成统一出口：fuse_daemon fw_default_real_path、br_rules 回退分支、
+ * path_vars build_real_base 尾部分支原各写一份 STORAGE_BASE snprintf，现收敛至此。
+ * 语义与原手写逻辑逐分支一致（g_real_root 非空则用测试/注入指定的真实根）。
+ * 截断可观测：保持 void 签名（不断模块 ABI）。P3：每展开点独立计数、前 3 次
+ * 带调用点告警（不同场景不再被一次性标志屏蔽），之后每 1024 次补一行抑制计数。
+ * 输入恒受 MAX_PATH_LEN/PATH_MAX 约束，实际不可达；一旦出现即排查。 */
+#define PATH_SNPRINTF(out, sz, ...) do { \
+    int _pn = snprintf(out, sz, __VA_ARGS__); \
+    if (_pn < 0 || (size_t)_pn >= (sz)) { \
+        static _Atomic unsigned _pwarn_n = 0; \
+        unsigned _n0 = atomic_fetch_add(&_pwarn_n, 1); \
+        if (_n0 < 3) \
+            LOG_WRN("路径合成截断[%s:%d]（需 %d/限 %zu），请排查超长输入", \
+                    __func__, __LINE__, _pn, (size_t)(sz)); \
+        else if (_n0 % 1024 == 0) \
+            LOG_WRN("路径合成截断[%s:%d]已累计 %u 次（抑制中）", __func__, __LINE__, _n0); \
+    } \
+} while (0)
+
+void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz) {
+    if (!out || sz == 0) return;
+    if (!sub_path) sub_path = "/";
+    if (user_id >= 0) {
+        if (g_real_root[0])
+            PATH_SNPRINTF(out, sz, "%s/%d%s", g_real_root, user_id, sub_path);
+        else
+            PATH_SNPRINTF(out, sz, STORAGE_BASE "/%d%s", user_id, sub_path);
+    } else {
+        if (g_real_root[0])
+            PATH_SNPRINTF(out, sz, "%s%s", g_real_root, sub_path);
+        else
+            PATH_SNPRINTF(out, sz, STORAGE_BASE "%s", sub_path);
+    }
+}
+
+void common_storage_root(int user_id, char* out, size_t sz) {
+    if (!out || sz == 0) return;
+    if (user_id < 0) user_id = 0;
+    if (g_real_root[0])
+        PATH_SNPRINTF(out, sz, "%s/%d", g_real_root, user_id);
+    else
+        PATH_SNPRINTF(out, sz, STORAGE_BASE "/%d", user_id);
+}
+
+int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz) {
+    if (!pkg || !pkg[0] || !out || sz == 0) return -1;
+    if (uid < 0) uid = 0;
+    int need;
+    if (g_real_root[0])
+        need = snprintf(nullptr, 0, "%s/%d/Android/data/%s/sandbox", g_real_root, uid, pkg);
+    else
+        need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/sandbox", uid, pkg);
+    if (need <= 0 || (size_t)need >= sz) return -1;
+    if (g_real_root[0])
+        snprintf(out, sz, "%s/%d/Android/data/%s/sandbox", g_real_root, uid, pkg);
+    else
+        snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/sandbox", uid, pkg);
+    return 0;
 }

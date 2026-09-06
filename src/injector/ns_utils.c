@@ -639,7 +639,7 @@ static void ns_readiness_mark(pid_t pid) {
 }
 
 /* NsMountEntry 类型、NS_MOUNTINFO_MAX、mountinfo 枚举与族根工具
-   （read_mountinfo_pid/is_family_root/parse_family_root 等）已拆至
+   （ns_read_mountinfo_pid/ns_is_family_root/ns_parse_family_root 等）已拆至
    src/injector/ns_global_replace.c/.h（见头部 include） */
 static int do_combined_mount(void* raw_args) {
     struct CombinedMountArgs* args = (struct CombinedMountArgs*)raw_args;
@@ -776,10 +776,10 @@ static int do_combined_mount(void* raw_args) {
         NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
         NsMountEntry* roots = malloc(128 * sizeof(NsMountEntry));
         if (all && roots) {
-            int n = read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
+            int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
             int root_count = 0;
             for (int i = 0; i < n && root_count < 128; i++) {
-                if (is_family_root(all[i].mount_point)) roots[root_count++] = all[i];
+                if (ns_is_family_root(all[i].mount_point)) roots[root_count++] = all[i];
             }
             for (int i = 0; i < preserve_count; i++) {
                 const char* mp = preserve_paths[i];
@@ -788,8 +788,8 @@ static int do_combined_mount(void* raw_args) {
                 while (*rel == '/') rel++;
                 /* 解析 rel 首段 user id（如 /0/Android/data → 0） */
                 int user = 0;
-                if (is_digit_char(*rel)) {
-                    while (is_digit_char(*rel)) { user = user * 10 + (*rel - '0'); rel++; }
+                if (ns_is_digit_char(*rel)) {
+                    while (ns_is_digit_char(*rel)) { user = user * 10 + (*rel - '0'); rel++; }
                     while (*rel == '/') rel++;
                 }
                 /* 匹配该 user 的族根（优先 user 族，其次 androidwritable/installer） */
@@ -797,7 +797,7 @@ static int do_combined_mount(void* raw_args) {
                 for (int fam = 2; fam >= 0 && !sys_src; fam--) {
                     for (int k = 0; k < root_count; k++) {
                         int ruid = 0;
-                        if (parse_family_root(roots[k].mount_point, &ruid) == fam && ruid == user) {
+                        if (ns_parse_family_root(roots[k].mount_point, &ruid) == fam && ruid == user) {
                             sys_src = roots[k].mount_point;
                             break;
                         }

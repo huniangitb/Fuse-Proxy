@@ -1,6 +1,6 @@
 /* ================= 全局替换式挂载方案共享接口 =================
  * 本头声明 ns_global_replace.c（原 ns_utils.c 全局替换区拆出）的
- * 跨文件符号：mountinfo 枚举与族根工具（read_mountinfo_pid 等）同时供
+ * 跨文件符号：mountinfo 枚举与族根工具（ns_read_mountinfo_pid 等）同时供
  * ns_utils.c 的 combined mount Step J preserve 恢复使用；log_ns_error
  * 定义于 ns_utils.c（非 static 导出）。
  */
@@ -33,19 +33,20 @@ void log_ns_error(const char* format, ...);
    全局替换方案在目标命名空间内执行 replace/restore 时共用 */
 int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* child_err, int timeout_ms);
 
-/* ---- mountinfo 枚举与族根工具（原 ns_utils.c static，拆分后跨文件共享） ---- */
-int read_mountinfo_pid(int pid, NsMountEntry* out, int max);
-bool is_digit_char(char c);
-bool is_family_root(const char* mp);
-int parse_family_root(const char* mp, int* user_id);
-int collect_mounts_under(const NsMountEntry* all, int n, const char* base,
-                         bool include_self, bool include_fuse,
-                         NsMountEntry* out, int max);
-int count_mounts_under(const NsMountEntry* all, int n, const char* base,
-                       bool include_self, bool include_fuse);
-void sort_deepest_first(NsMountEntry* arr, int n);
-void sort_shallowest_first(NsMountEntry* arr, int n);
-int backup_point_state(int pid, const char* path);
+/* ---- mountinfo 枚举与族根工具（原 ns_utils.c static，拆分后跨文件共享） ----
+   命名统一 ns_ 前缀（mount namespace 操作域），禁裸通用名污染全局命名空间 */
+int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max);
+bool ns_is_digit_char(char c);
+bool ns_is_family_root(const char* mp);
+int ns_parse_family_root(const char* mp, int* user_id);
+int ns_gather_mounts_under(const NsMountEntry* all, int n, const char* base,
+                           bool include_self, bool include_fuse,
+                           NsMountEntry* out, int max);
+int ns_count_mounts_under(const NsMountEntry* all, int n, const char* base,
+                          bool include_self, bool include_fuse);
+void ns_sort_deepest_first(NsMountEntry* arr, int n);
+void ns_sort_shallowest_first(NsMountEntry* arr, int n);
+int ns_backup_point_state(int pid, const char* path);
 
 /* ---- 全局替换方案导出入口（injector / global_replace_ctl / mount_manager 调用） ---- */
 int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* backup_root);

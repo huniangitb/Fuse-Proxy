@@ -277,6 +277,10 @@ int  mkdir_recursive(const char* dir);
 int  mkdir_recursive_p(const char* path, unsigned int mode);
 void path_sanitize(char* out, size_t size, const char* path);
 int  path_contains_invalid_chars(const char* path);
+/* 存储路径合成统一出口（common.c 实现，经主程序导出表解析；语义见 common.h） */
+void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz);
+void common_storage_root(int user_id, char* out, size_t sz);
+int  common_sandbox_path(int uid, const char* pkg, char* out, size_t sz);
 
 #define NSP_LOG_DBG(format, ...)    log_internal(0, format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define NSP_LOG_DBG_PERF(format, ...) do { if (g_min_log_level == 0) log_internal(0, format "\n" __VA_OPT__(,) __VA_ARGS__); } while (0)

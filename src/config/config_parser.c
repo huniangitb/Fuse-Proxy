@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "config_parser.h"
 #include "common.h"
+#include "nsp_util.h"
 #include "path_vars.h"
 #include "inject_target.h"
 #include <sys/stat.h>
@@ -243,12 +244,12 @@ static void config_publish(void) {
     }
 }
 char* clean_path_string(char* str) {
+    /* 首尾空白经 nsp_util 公共库复用（nsp_str_trim，禁手写去空白循环）；
+       \r\n 行尾截断为本函数特有语义（配置文件行处理） */
     if (!str) return nullptr;
-    while(isspace((unsigned char)*str)) str++; if(*str == 0) return str;
-    char* end = str + strlen(str) - 1; while(end > str && isspace((unsigned char)*end)) end--;
-    *(end+1) = 0;
-    for (int i = 0; str[i]; i++) { if (str[i] == '\r' || str[i] == '\n') { str[i] = '\0'; break; } }
-    return str;
+    char* s = nsp_str_trim(str);
+    for (int i = 0; s[i]; i++) { if (s[i] == '\r' || s[i] == '\n') { s[i] = '\0'; break; } }
+    return s;
 }
 void strip_trailing_slash(char* path) {
     /* 剥尾随 '/'，但保留 "?/"——'?' 后必跟 '/' 是内部前缀语义（见 docs/path-variables.md），

@@ -575,10 +575,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
                    不能经 build_real_base_from_target 展开），直接构造默认路径
                    STORAGE_BASE/<uid><sub_path>——语义 = 不重定向（与静态 ALLOW
                    经 trie 自引用命中后的效果一致） */
-                if (user_id >= 0)
-                    snprintf(temp, temp_size, "%s/%d%s", g_real_root, user_id, sub_path);
-                else
-                    snprintf(temp, temp_size, "%s%s", g_real_root, sub_path);
+                common_default_real_path(user_id, sub_path, temp, temp_size);
                 matched = true;
                 break;
             }
@@ -639,12 +636,11 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
         }
         if (effective_uid < 0) effective_uid = 0;
         char sandbox_target[MAX_PATH_LEN];
-        int need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);
-        if (need <= 0 || (size_t)need >= sizeof(sandbox_target)) {
-            LOG_WRN("sandbox 路径过长（%d），放弃沙盒重定向: pkg=%s", need, current_pkg);
+        if (common_sandbox_path(effective_uid, current_pkg,
+                                sandbox_target, sizeof(sandbox_target)) != 0) {
+            LOG_WRN("sandbox 路径过长，放弃沙盒重定向: pkg=%s", current_pkg);
             return false;
         }
-        snprintf(sandbox_target, sizeof(sandbox_target), STORAGE_BASE "/%d/Android/data/%s/sandbox", effective_uid, current_pkg);
         if (access(sandbox_target, F_OK) != 0) mkdir_recursive_p(sandbox_target, 0775);
         snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
         return true;
@@ -683,10 +679,7 @@ static int br_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, 
     if (redir && temp[0] == '?') {
         int effective_uid = user_id >= 0 ? user_id : 0;
         char real_base[1024];
-        if (g_real_root[0])
-            snprintf(real_base, sizeof(real_base), "%s/%d%s", g_real_root, effective_uid, temp + 1);
-        else
-            snprintf(real_base, sizeof(real_base), STORAGE_BASE "/%d%s", effective_uid, temp + 1);
+        common_default_real_path(effective_uid, temp + 1, real_base, sizeof(real_base));
         strncpy(temp, real_base, sizeof(temp) - 1);
         temp[sizeof(temp) - 1] = '\0';
     }
@@ -706,17 +699,7 @@ static int br_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, 
         if (!app_sandbox_off) redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp), uid);
     }
     if (!redir) {
-        if (user_id >= 0) {
-            if (g_real_root[0])
-                snprintf(temp, sizeof(temp), "%s/%d%s", g_real_root, user_id, sub_path);
-            else
-                snprintf(temp, sizeof(temp), STORAGE_BASE "/%d%s", user_id, sub_path);
-        } else {
-            if (g_real_root[0])
-                snprintf(temp, sizeof(temp), "%s%s", g_real_root, sub_path);
-            else
-                snprintf(temp, sizeof(temp), STORAGE_BASE "%s", sub_path);
-        }
+        common_default_real_path(user_id, sub_path, temp, sizeof(temp));
     }
     strncpy(out_buf, temp, size - 1);
     out_buf[size - 1] = '\0';
