@@ -15,6 +15,12 @@ Fuse-Proxy 的模块系统允许**第三方独立开发**功能模块（规则�
 - **运行时符号**：日志/路径等框架符号经主程序（fuse_daemon）
   `-Wl,--export-dynamic` 导出表在 dlopen 时解析，模块无需链接框架
 - **不编译框架源码**：模块不得把 `src/core/common.c` 等框架源编入自身
+- **可借用的公共抽象**：通用 INI 段式存储（`nsp_ini_open/close/get/set/
+  del_key/del_section/save`，声明经 `nsp_module.h` 代含 `nsp_ini_store.h`，
+  实现逐源编入 `fuse_daemon` 常驻导出表）——模块自有配置文件（如类
+  `ftp.conf` 的服务器账号）可直接调用，注释保留 + 原子落盘，与
+  `rule_server` 的 `FTP_*` 命令同实现；语义见 `include/nsp_ini_store.h`
+  头注释（含 ON/OFF 后缀段头、重复段等边界说明）
 
 ## 2. 最小模块骨架
 

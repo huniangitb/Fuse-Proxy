@@ -9,6 +9,9 @@
  *   REMOVE                        按 (类型, 索引) 删除规则
  *   ENABLE / DISABLE              启用/停用规则（# 注释切换，解析器自动跳过）
  *   SET                           设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/INJECT_ENABLE）
+ *   FTP_LIST / FTP_GET              查询 ftp.conf 服务器账号（密码脱敏，只回 has_password）
+ *   FTP_ADD / FTP_SET / FTP_REMOVE  增改删 ftp.conf 服务器段（原子落盘，
+ *                                   ftp_module 经 inotify 自动热重载）
  *   RELOAD                        向 injector 发送 SIGHUP 触发配置重载
  *   STOP                          向 injector 发送 SIGTERM 停止注入服务
  *   STATUS                        系统状态概览
@@ -24,6 +27,7 @@
 
 #include "common.h"
 #include "nsp_util.h"
+#include "nsp_ini_store.h"
 #include <json-c/json.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -2132,6 +2136,363 @@ static void handle_quit(int fd, json_object *req) {
     reply_ok(fd, "QUIT", NULL);
 }
 
+/* ==================== FTP 服务器账号管理（ftp.conf） ====================
+ * 基于公共 nsp_ini_store 抽象（第三方模块可借用，见 nsp_ini_store.h）：
+ * 注释保留的行级读写 + 临时文件 rename 原子落盘；ftp_module 经 inotify
+ * 监听目录自动热重载，无需 RELOAD。
+ * 安全：password 只写不读——LIST/GET 仅回 has_password 布尔；ftp.conf
+ * 本身明文落盘（与模块解析现状一致），文档中明确提示。
+ * 段名允许中文（如 [云盘]，不用 valid_pkg），仅禁 \n\r[]（nsp_ini_valid_section）；
+ * [GLOBAL] 段非服务器（ftp_conf 跳过），控制面拒绝写入该名。
+ * 字段上限与 FtpServerCfg 对应：name≤63、host≤255、user≤63、pass≤127、
+ * remote_dir≤511；port 1~65535（缺省 21）；user 缺省 anonymous、
+ * remote_dir 缺省 /（LIST/GET 回填生效值，与模块行为一致）。 */
+
+#define FTP_NAME_MAX 63
+#define FTP_HOST_MAX 255
+#define FTP_USER_MAX 63
+#define FTP_PASS_MAX 127
+#define FTP_RDIR_MAX 511
+
+static void ftp_conf_path(char *out, size_t sz) {
+    snprintf(out, sz, "%s/ftp.conf", g_config_dir);
+}
+
+/* 去首尾空白拷入定长缓冲；超长返回 -1 */
+static int ftp_trim_copy(const char *src, char *dst, size_t sz) {
+    if (!src) { dst[0] = '\0'; return 0; }
+    while (isspace((unsigned char)*src)) src++;
+    size_t n = strlen(src);
+    while (n > 0 && isspace((unsigned char)src[n - 1])) n--;
+    if (n >= sz) return -1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    return 0;
+}
+
+static bool ftp_valid_name(const char *name) {
+    if (!nsp_ini_valid_section(name)) return false;
+    char tmp[256];
+    if (ftp_trim_copy(name, tmp, sizeof tmp) != 0) return false;
+    if (tmp[0] == '\0' || strlen(tmp) > FTP_NAME_MAX) return false;
+    if (strcmp(tmp, "GLOBAL") == 0) return false;   /* [GLOBAL] 非服务器段 */
+    return true;
+}
+
+static bool ftp_valid_field(const char *v, size_t max) {
+    if (!v) return true;   /* 缺省 = 不写该键 */
+    size_t n = strlen(v);
+    if (n > max) return false;
+    for (size_t i = 0; i < n; i++) {
+        /* `#` 禁止：store/ftp_conf 读侧以首个 `#` 为注释起点剥除，
+           放行会导致写入值被截断（如密码 "a#b" 读回成 "a"） */
+        if (v[i] == '\n' || v[i] == '\r' || v[i] == '\0' || v[i] == '#') return false;
+    }
+    return true;
+}
+
+/* 单服务器 JSON（生效值 + has_password，绝不回传密码明文） */
+static json_object *build_ftp_server_json(NspIniStore *s, const char *name) {
+    char host[FTP_HOST_MAX + 1] = {0};
+    char port_s[32] = {0};
+    char user[FTP_USER_MAX + 1] = {0};
+    char rdir[FTP_RDIR_MAX + 1] = {0};
+    nsp_ini_get(s, name, "host", host, sizeof host);
+    nsp_ini_get(s, name, "port", port_s, sizeof port_s);
+    nsp_ini_get(s, name, "user", user, sizeof user);
+    nsp_ini_get(s, name, "remote_dir", rdir, sizeof rdir);
+    bool has_pass = (nsp_ini_get(s, name, "password", NULL, 0) == 0 ||
+                     nsp_ini_get(s, name, "pass", NULL, 0) == 0);
+    int port = atoi(port_s);
+    if (port <= 0 || port > 65535) port = 21;
+    json_object *o = json_object_new_object();
+    json_object_object_add(o, "name", json_object_new_string(name));
+    json_object_object_add(o, "host", json_object_new_string(host));
+    json_object_object_add(o, "port", json_object_new_int(port));
+    json_object_object_add(o, "user", json_object_new_string(user[0] ? user : "anonymous"));
+    json_object_object_add(o, "remote_dir", json_object_new_string(rdir[0] ? rdir : "/"));
+    json_object_object_add(o, "has_password", json_object_new_boolean(has_pass));
+    return o;
+}
+
+static void handle_ftp_list(int fd, json_object *req) {
+    (void)req;
+    char path[PATH_MAX];
+    ftp_conf_path(path, sizeof(path));
+    NspIniStore *s = nsp_ini_open(path);
+    if (!s) {
+        reply_error(fd, "FTP_LIST", "内存不足");
+        return;
+    }
+    json_object *data = json_object_new_object();
+    json_object *arr = json_object_new_array();
+    int n = nsp_ini_section_count(s);
+    for (int i = 0; i < n; i++) {
+        const char *sec = nsp_ini_section_name(s, i);
+        if (!sec || strcmp(sec, "GLOBAL") == 0) continue;
+        json_object_array_add(arr, build_ftp_server_json(s, sec));
+    }
+    nsp_ini_close(s);
+    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "servers", arr);
+    reply_ok(fd, "FTP_LIST", data);
+}
+
+static void handle_ftp_get(int fd, json_object *req) {
+    const char *name = json_object_get_string(json_object_object_get(req, "name"));
+    if (!name || !ftp_valid_name(name)) {
+        reply_error(fd, "FTP_GET", "缺少或非法参数: name");
+        return;
+    }
+    char path[PATH_MAX];
+    ftp_conf_path(path, sizeof(path));
+    NspIniStore *s = nsp_ini_open(path);
+    if (!s) {
+        reply_error(fd, "FTP_GET", "内存不足");
+        return;
+    }
+    char trimmed[FTP_NAME_MAX + 1];
+    ftp_trim_copy(name, trimmed, sizeof trimmed);
+    if (nsp_ini_find_section(s, trimmed) < 0) {
+        nsp_ini_close(s);
+        reply_error(fd, "FTP_GET", "服务器不存在: %s", trimmed);
+        return;
+    }
+    json_object *data = build_ftp_server_json(s, trimmed);
+    nsp_ini_close(s);
+    json_object_object_add(data, "file", json_object_new_string(path));
+    reply_ok(fd, "FTP_GET", data);
+}
+
+/* FTP_ADD：新建或更新服务器段。section 不存在时 host 必填；
+ * 同名且所给字段与现状一致 → duplicate:true 免写；否则更新并落盘。
+ * 空字符串的可选字段（user/password/remote_dir）视为"不写该键"
+ * （走模块缺省；清空请用 FTP_SET 传空值删键）。 */
+static void handle_ftp_add(int fd, json_object *req) {
+    const char *name = json_object_get_string(json_object_object_get(req, "name"));
+    const char *host = json_object_get_string(json_object_object_get(req, "host"));
+    const char *user = json_object_get_string(json_object_object_get(req, "user"));
+    const char *password = json_object_get_string(json_object_object_get(req, "password"));
+    const char *rdir = json_object_get_string(json_object_object_get(req, "remote_dir"));
+    bool has_port = (json_object_object_get(req, "port") != NULL);
+    int port = json_object_get_int(json_object_object_get(req, "port"));
+    if (!name || !ftp_valid_name(name)) {
+        reply_error(fd, "FTP_ADD", "缺少或非法参数: name");
+        return;
+    }
+    if (has_port && (port <= 0 || port > 65535)) {
+        reply_error(fd, "FTP_ADD", "非法 port: %d（1~65535）", port);
+        return;
+    }
+    if (!ftp_valid_field(host, FTP_HOST_MAX) || !ftp_valid_field(user, FTP_USER_MAX) ||
+        !ftp_valid_field(password, FTP_PASS_MAX) || !ftp_valid_field(rdir, FTP_RDIR_MAX)) {
+        reply_error(fd, "FTP_ADD", "字段非法或超长");
+        return;
+    }
+    char path[PATH_MAX];
+    ftp_conf_path(path, sizeof(path));
+    NspIniStore *s = nsp_ini_open(path);
+    if (!s) {
+        reply_error(fd, "FTP_ADD", "内存不足");
+        return;
+    }
+    char trimmed[FTP_NAME_MAX + 1];
+    ftp_trim_copy(name, trimmed, sizeof trimmed);
+    bool exists = (nsp_ini_find_section(s, trimmed) >= 0);
+    if (!exists && (!host || !host[0])) {
+        nsp_ini_close(s);
+        reply_error(fd, "FTP_ADD", "新建服务器需提供 host");
+        return;
+    }
+    /* 幂等判定：所给字段与现状逐项一致 → duplicate */
+    char cur[FTP_RDIR_MAX + 1];
+    bool same = exists;
+    if (same && host && host[0]) {
+        same = (nsp_ini_get(s, trimmed, "host", cur, sizeof cur) == 0 && strcmp(cur, host) == 0);
+    }
+    if (same && has_port) {
+        char ps[32] = {0};
+        nsp_ini_get(s, trimmed, "port", ps, sizeof ps);
+        int cur_port = atoi(ps);
+        if (cur_port <= 0 || cur_port > 65535) cur_port = 21;
+        same = (cur_port == port);
+    }
+    if (same && user && user[0]) {
+        same = (nsp_ini_get(s, trimmed, "user", cur, sizeof cur) == 0 && strcmp(cur, user) == 0);
+    }
+    if (same && rdir && rdir[0]) {
+        same = (nsp_ini_get(s, trimmed, "remote_dir", cur, sizeof cur) == 0 && strcmp(cur, rdir) == 0);
+    }
+    if (same && password && password[0]) {
+        /* 密码可明文比对（ftp.conf 本就明文存储）：值不同即视为变更，
+           否则轮换密码会被误判 duplicate 静默吞掉 */
+        same = (nsp_ini_get(s, trimmed, "password", cur, sizeof cur) == 0 &&
+                strcmp(cur, password) == 0);
+    }
+    json_object *data = json_object_new_object();
+    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "name", json_object_new_string(trimmed));
+    if (same) {
+        nsp_ini_close(s);
+        json_object_object_add(data, "duplicate", json_object_new_boolean(true));
+        json_object_object_add(data, "changed", json_object_new_boolean(false));
+        reply_ok(fd, "FTP_ADD", data);
+        return;
+    }
+    char tbuf[FTP_RDIR_MAX + 1];
+    if (host && host[0]) {
+        ftp_trim_copy(host, tbuf, sizeof tbuf);
+        if (tbuf[0] == '\0' || nsp_ini_set(s, trimmed, "host", tbuf) != 0) goto ftp_add_fail;
+    }
+    if (has_port) {
+        snprintf(tbuf, sizeof tbuf, "%d", port);
+        if (nsp_ini_set(s, trimmed, "port", tbuf) != 0) goto ftp_add_fail;
+    }
+    if (user && user[0]) {
+        ftp_trim_copy(user, tbuf, sizeof tbuf);
+        if (nsp_ini_set(s, trimmed, "user", tbuf) != 0) goto ftp_add_fail;
+    }
+    if (password && password[0]) {
+        /* 统一写 password 键并清理旧 pass 别名，防同段双键语义歧义 */
+        nsp_ini_del_key(s, trimmed, "pass");
+        if (nsp_ini_set(s, trimmed, "password", password) != 0) goto ftp_add_fail;
+    }
+    if (rdir && rdir[0]) {
+        ftp_trim_copy(rdir, tbuf, sizeof tbuf);
+        if (nsp_ini_set(s, trimmed, "remote_dir", tbuf) != 0) goto ftp_add_fail;
+    }
+    if (nsp_ini_save(s) != 0) goto ftp_add_fail;
+    nsp_ini_close(s);
+    json_object_object_add(data, "duplicate", json_object_new_boolean(false));
+    json_object_object_add(data, "changed", json_object_new_boolean(true));
+    reply_ok(fd, "FTP_ADD", data);
+    return;
+ftp_add_fail:
+    nsp_ini_close(s);
+    reply_error(fd, "FTP_ADD", "写入 %s 失败", path);
+}
+
+/* FTP_SET：修改单个字段（key 限 host/port/user/password/remote_dir，
+ * pass 归一 password）。空值 = 删键回缺省；段不存在报错（新建请用 FTP_ADD）。 */
+static void handle_ftp_set(int fd, json_object *req) {
+    const char *name = json_object_get_string(json_object_object_get(req, "name"));
+    const char *key = json_object_get_string(json_object_object_get(req, "key"));
+    const char *value = json_object_get_string(json_object_object_get(req, "value"));
+    if (!name || !ftp_valid_name(name) || !key) {
+        reply_error(fd, "FTP_SET", "缺少或非法参数: name/key");
+        return;
+    }
+    char norm_key[16];
+    if (strcasecmp(key, "host") == 0) snprintf(norm_key, sizeof norm_key, "host");
+    else if (strcasecmp(key, "port") == 0) snprintf(norm_key, sizeof norm_key, "port");
+    else if (strcasecmp(key, "user") == 0) snprintf(norm_key, sizeof norm_key, "user");
+    else if (strcasecmp(key, "password") == 0 || strcasecmp(key, "pass") == 0)
+        snprintf(norm_key, sizeof norm_key, "password");
+    else if (strcasecmp(key, "remote_dir") == 0) snprintf(norm_key, sizeof norm_key, "remote_dir");
+    else {
+        reply_error(fd, "FTP_SET", "未知字段: %s（限 host/port/user/password/remote_dir）", key);
+        return;
+    }
+    char path[PATH_MAX];
+    ftp_conf_path(path, sizeof(path));
+    NspIniStore *s = nsp_ini_open(path);
+    if (!s) {
+        reply_error(fd, "FTP_SET", "内存不足");
+        return;
+    }
+    char trimmed[FTP_NAME_MAX + 1];
+    ftp_trim_copy(name, trimmed, sizeof trimmed);
+    if (nsp_ini_find_section(s, trimmed) < 0) {
+        nsp_ini_close(s);
+        reply_error(fd, "FTP_SET", "服务器不存在: %s（新建请用 FTP_ADD）", trimmed);
+        return;
+    }
+    bool changed = false;
+    if (!value || !value[0]) {
+        /* 空值 = 删键回缺省；password 一并清 pass 别名 */
+        if (nsp_ini_del_key(s, trimmed, norm_key) == 0) changed = true;
+        if (strcmp(norm_key, "password") == 0 && nsp_ini_del_key(s, trimmed, "pass") == 0)
+            changed = true;
+    } else if (strcmp(norm_key, "port") == 0) {
+        int port = atoi(value);
+        if (port <= 0 || port > 65535) {
+            nsp_ini_close(s);
+            reply_error(fd, "FTP_SET", "非法 port: %s（1~65535）", value);
+            return;
+        }
+        char ps[32];
+        snprintf(ps, sizeof ps, "%d", port);
+        char cur[32] = {0};
+        if (nsp_ini_get(s, trimmed, "port", cur, sizeof cur) != 0 || strcmp(cur, ps) != 0) {
+            if (nsp_ini_set(s, trimmed, "port", ps) != 0) goto ftp_set_fail;
+            changed = true;
+        }
+    } else {
+        size_t max = FTP_RDIR_MAX;
+        if (strcmp(norm_key, "host") == 0) max = FTP_HOST_MAX;
+        else if (strcmp(norm_key, "user") == 0) max = FTP_USER_MAX;
+        else if (strcmp(norm_key, "password") == 0) max = FTP_PASS_MAX;
+        if (!ftp_valid_field(value, max)) {
+            nsp_ini_close(s);
+            reply_error(fd, "FTP_SET", "字段值非法或超长");
+            return;
+        }
+        char tbuf[FTP_RDIR_MAX + 1];
+        ftp_trim_copy(value, tbuf, sizeof tbuf);
+        char cur[FTP_RDIR_MAX + 1] = {0};
+        bool cur_hit = (nsp_ini_get(s, trimmed, norm_key, cur, sizeof cur) == 0);
+        if (!cur_hit || strcmp(cur, tbuf) != 0) {
+            if (strcmp(norm_key, "password") == 0) nsp_ini_del_key(s, trimmed, "pass");
+            if (nsp_ini_set(s, trimmed, norm_key, tbuf) != 0) goto ftp_set_fail;
+            changed = true;
+        }
+    }
+    if (changed && nsp_ini_save(s) != 0) goto ftp_set_fail;
+    nsp_ini_close(s);
+    json_object *data = json_object_new_object();
+    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "name", json_object_new_string(trimmed));
+    json_object_object_add(data, "key", json_object_new_string(norm_key));
+    json_object_object_add(data, "changed", json_object_new_boolean(changed));
+    reply_ok(fd, "FTP_SET", data);
+    return;
+ftp_set_fail:
+    nsp_ini_close(s);
+    reply_error(fd, "FTP_SET", "写入 %s 失败", path);
+}
+
+static void handle_ftp_remove(int fd, json_object *req) {
+    const char *name = json_object_get_string(json_object_object_get(req, "name"));
+    if (!name || !ftp_valid_name(name)) {
+        reply_error(fd, "FTP_REMOVE", "缺少或非法参数: name");
+        return;
+    }
+    char path[PATH_MAX];
+    ftp_conf_path(path, sizeof(path));
+    NspIniStore *s = nsp_ini_open(path);
+    if (!s) {
+        reply_error(fd, "FTP_REMOVE", "内存不足");
+        return;
+    }
+    char trimmed[FTP_NAME_MAX + 1];
+    ftp_trim_copy(name, trimmed, sizeof trimmed);
+    if (nsp_ini_del_section(s, trimmed) != 0) {
+        nsp_ini_close(s);
+        reply_error(fd, "FTP_REMOVE", "服务器不存在: %s", trimmed);
+        return;
+    }
+    if (nsp_ini_save(s) != 0) {
+        nsp_ini_close(s);
+        reply_error(fd, "FTP_REMOVE", "写入 %s 失败", path);
+        return;
+    }
+    nsp_ini_close(s);
+    json_object *data = json_object_new_object();
+    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "name", json_object_new_string(trimmed));
+    reply_ok(fd, "FTP_REMOVE", data);
+}
+
 /* ==================== 命令分发 ==================== */
 static void dispatch(int fd, json_object *req) {
     const char *cmd = json_object_get_string(json_object_object_get(req, "cmd"));
@@ -2151,7 +2512,12 @@ static void dispatch(int fd, json_object *req) {
     else if (strcasecmp(cmd, "ENABLE") == 0)      handle_toggle(fd, req, true);
     else if (strcasecmp(cmd, "DISABLE") == 0)     handle_toggle(fd, req, false);
     else if (strcasecmp(cmd, "SET") == 0)         handle_set(fd, req);
-    else if (strcasecmp(cmd, "RELOAD") == 0)      handle_reload(fd, req);
+    else if (strcasecmp(cmd, "FTP_LIST") == 0)   handle_ftp_list(fd, req);
+    else if (strcasecmp(cmd, "FTP_GET") == 0)    handle_ftp_get(fd, req);
+    else if (strcasecmp(cmd, "FTP_ADD") == 0)    handle_ftp_add(fd, req);
+    else if (strcasecmp(cmd, "FTP_SET") == 0)    handle_ftp_set(fd, req);
+    else if (strcasecmp(cmd, "FTP_REMOVE") == 0) handle_ftp_remove(fd, req);
+    else if (strcasecmp(cmd, "RELOAD") == 0)     handle_reload(fd, req);
     else if (strcasecmp(cmd, "STOP") == 0)        handle_stop(fd, req);
     else if (strcasecmp(cmd, "SERVICE") == 0)     handle_service(fd, req);
     else if (strcasecmp(cmd, "STATUS") == 0)      handle_status(fd, req);
