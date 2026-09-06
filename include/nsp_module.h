@@ -282,6 +282,11 @@ void common_default_real_path(int user_id, const char* sub_path, char* out, size
 void common_storage_root(int user_id, char* out, size_t sz);
 int  common_sandbox_path(int uid, const char* pkg, char* out, size_t sz);
 
+/* 通用 INI 段式存储（nsp_ini_store.c 实现，经主程序导出表解析）：
+ * 注释保留的行级读写 + 原子落盘，适合模块自有配置文件
+ * （如类 ftp.conf 的服务器账号）；语义见 nsp_ini_store.h */
+#include "nsp_ini_store.h"
+
 #define NSP_LOG_DBG(format, ...)    log_internal(0, format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define NSP_LOG_DBG_PERF(format, ...) do { if (g_min_log_level == 0) log_internal(0, format "\n" __VA_OPT__(,) __VA_ARGS__); } while (0)
 #define NSP_LOG(format, ...)        log_internal(1, format "\n" __VA_OPT__(,) __VA_ARGS__)
