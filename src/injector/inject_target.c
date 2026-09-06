@@ -7,6 +7,7 @@
 #include "mount_manager.h"
 #include "uid_map.h"
 #include "fast_pid.h"
+#include "sys_pkg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,120 +32,21 @@ typedef struct TrackedEntry {
 static TrackedEntry *g_tracked_hash[TRACKED_HASH_SIZE];
 static pthread_mutex_t g_tracked_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* 系统应用包名缓存 */
-#define SYSTEM_PKG_HASH_SIZE 1024
-typedef struct SystemPkgEntry {
-    char pkg[128];
-    struct SystemPkgEntry *next;
-} SystemPkgEntry;
-
-static SystemPkgEntry *g_system_pkg_hash[SYSTEM_PKG_HASH_SIZE];
-static pthread_mutex_t g_system_pkg_mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool g_system_pkg_cache_loaded = false;
-
-static unsigned int hash_pkg_name(const char* pkg) {
-    unsigned int hash = 5381;
-    while (*pkg) {
-        hash = ((hash << 5) + hash) + (unsigned char)*pkg;
-        pkg++;
-    }
-    return hash % SYSTEM_PKG_HASH_SIZE;
-}
-
-static void free_system_pkg_cache(void) {
-    for (int i = 0; i < SYSTEM_PKG_HASH_SIZE; i++) {
-        SystemPkgEntry *e = g_system_pkg_hash[i];
-        while (e) {
-            SystemPkgEntry *tmp = e;
-            e = e->next;
-            free(tmp);
-        }
-        g_system_pkg_hash[i] = NULL;
-    }
-    g_system_pkg_cache_loaded = false;
-}
-
-static void add_system_pkg(const char* pkg) {
-    unsigned int h = hash_pkg_name(pkg);
-    SystemPkgEntry *e = g_system_pkg_hash[h];
-    while (e) {
-        if (strcmp(e->pkg, pkg) == 0) return;
-        e = e->next;
-    }
-    SystemPkgEntry *new_entry = malloc(sizeof(SystemPkgEntry));
-    if (new_entry) {
-        strncpy(new_entry->pkg, pkg, sizeof(new_entry->pkg) - 1);
-        new_entry->pkg[sizeof(new_entry->pkg) - 1] = '\0';
-        new_entry->next = g_system_pkg_hash[h];
-        g_system_pkg_hash[h] = new_entry;
-    }
-}
-
-static bool load_system_pkg_cache(void) {
-    if (g_system_pkg_cache_loaded) return true;
-
-    FILE* fp = popen("pm list packages -s 2>/dev/null", "r");
-    if (!fp) {
-        LOG_WRN("load_system_pkg_cache: pm list packages -s 执行失败，回退到 UID 判断");
-        g_system_pkg_cache_loaded = true;
-        return false;
-    }
-
-    char line[512];
-    int count = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "package:", 8) == 0) {
-            char* pkg = line + 8;
-            char* nl = strchr(pkg, '\n');
-            if (nl) *nl = '\0';
-            nl = strchr(pkg, '\r');
-            if (nl) *nl = '\0';
-            char* colon = strchr(pkg, ':');
-            if (colon) *colon = '\0';
-            if (pkg[0]) {
-                pthread_mutex_lock(&g_system_pkg_mutex);
-                add_system_pkg(pkg);
-                pthread_mutex_unlock(&g_system_pkg_mutex);
-                count++;
-            }
-        }
-    }
-    pclose(fp);
-
-    pthread_mutex_lock(&g_system_pkg_mutex);
-    g_system_pkg_cache_loaded = true;
-    pthread_mutex_unlock(&g_system_pkg_mutex);
-
-    LOG_DBG("load_system_pkg_cache: 加载了 %d 个系统应用包名", count);
-    return count > 0;
-}
-
+/* 系统应用包名缓存：实现已抽取至 src/core/sys_pkg.c（跨进程共享，
+ * injector pm 查询并落盘，fuse_daemon 侧只读文件）；此处仅保留同名薄封装，
+ * 调用点（init/cleanup/is_system_app_by_pkg）零改动 */
 static bool is_system_pkg_cached(const char* pkg) {
-    if (!pkg || !pkg[0]) return false;
-    load_system_pkg_cache();
-
-    pthread_mutex_lock(&g_system_pkg_mutex);
-    unsigned int h = hash_pkg_name(pkg);
-    SystemPkgEntry *e = g_system_pkg_hash[h];
-    while (e) {
-        if (strcmp(e->pkg, pkg) == 0) {
-            pthread_mutex_unlock(&g_system_pkg_mutex);
-            return true;
-        }
-        e = e->next;
-    }
-    pthread_mutex_unlock(&g_system_pkg_mutex);
-    return false;
+    return sys_pkg_is_system(pkg);
 }
 
 void cleanup_system_pkg_cache(void) {
-    pthread_mutex_lock(&g_system_pkg_mutex);
-    free_system_pkg_cache();
-    pthread_mutex_unlock(&g_system_pkg_mutex);
+    sys_pkg_cleanup();
 }
 
 void init_system_pkg_cache(void) {
-    load_system_pkg_cache();
+    /* injector 是唯一允许 pm 查询的进程：查表并落盘 sys_pkgs.cache，
+       供 fuse_daemon 侧只读消费（禁 popen，防 binder 挂起） */
+    sys_pkg_init(true);
 }
 
 static unsigned int hash_pid(int pid) {
@@ -510,6 +412,15 @@ bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_i
     int user_id = uid / 100000;
     AppConfig* cfg = find_app_cfg_locked(cmdline, user_id);
     if (cfg) return cfg->inject_enable;
+    /* 类别段点名（[USER_APPS[:uid]] / [SYSTEM_APPS]）：与应用段同优先级——
+       显式 OFF 否决注入（含通配/全局），有实质规则则直接判为目标（点名即
+       注入，跳过下方 SKIP_SYSTEM_APPS 过滤）；空类别段（只有段头）透传 */
+    bool is_sys = is_system_app_by_pkg(cmdline, uid);
+    AppConfig* cat = find_category_cfg_locked(is_sys, user_id);
+    if (cat) {
+        if (!cat->inject_enable) return false;
+        if (category_has_rules_locked(is_sys, user_id)) return true;
+    }
     if (has_wildcard_enabled_locked(user_id)) return true;
     if (g_global_cfg.global_inject && !is_isolated_uid(uid) && !strstr(cmdline, "zygote")) {
         /* 默认跳过系统应用，pm list packages -s 查询失败时回退到 uid < 10000 */
@@ -916,6 +827,18 @@ bool is_media_module_injected_target(void) {
         } else {
             // 如果该用户下没有显式规则，则看是否命中了通配符 [*] 注入
             if (has_wildcard_enabled_locked(user_id)) {
+                target = true;
+                break;
+            }
+            /* 类别段点名：media 在不同设备可归系统/用户任一类，两类有实质
+               规则（且段头启用）即视为注入目标 */
+            AppConfig* ucat = find_category_cfg_locked(false, user_id);
+            if (ucat && ucat->inject_enable && category_has_rules_locked(false, user_id)) {
+                target = true;
+                break;
+            }
+            AppConfig* scat = find_category_cfg_locked(true, user_id);
+            if (scat && scat->inject_enable && category_has_rules_locked(true, user_id)) {
                 target = true;
                 break;
             }

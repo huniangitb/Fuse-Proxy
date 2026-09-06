@@ -3,6 +3,7 @@
 #include "common.h"
 #include "nsp_util.h"
 #include "path_vars.h"
+#include "sys_pkg.h"
 #include "inject_target.h"
 #include <sys/stat.h>
 #include <sys/xattr.h>
@@ -22,6 +23,8 @@ static AppConfig g_global_cfg_stage;
 static AppConfig** g_app_cfgs_stage = nullptr;
 static int g_app_cfg_count_stage = 0;
 static int g_app_cfg_capacity_stage = 0;
+/* 是否存在类别段（config_publish 扫描 live 设置，config_has_category_rules 读） */
+static bool g_has_category_rules = false;
 int g_active_users[MAX_USERS];
 int g_active_user_count = 0;
 /* 应用规则目录创建权限：默认只读（false）——只有 injector 能创建
@@ -227,6 +230,15 @@ static void config_publish(void) {
     g_app_cfgs = g_app_cfgs_stage;
     g_app_cfg_count = g_app_cfg_count_stage;
     g_app_cfg_capacity = g_app_cfg_capacity_stage;
+    /* 类别段存在性：扫描 live（publish 后调用方持写锁，赋值原子可见性
+       由后续 config_publish_end 的 release 保证；读者经代际重试） */
+    bool has_cat = false;
+    for (int i = 0; i < g_app_cfg_count && !has_cat; i++) {
+        if (g_app_cfgs[i] && (strcmp(g_app_cfgs[i]->pkg_name, "USER_APPS") == 0 ||
+                              strcmp(g_app_cfgs[i]->pkg_name, "SYSTEM_APPS") == 0))
+            has_cat = true;
+    }
+    g_has_category_rules = has_cat;
     /* 重置暂存区（指针已移交 live，不得再触碰） */
     memset(&g_global_cfg_stage, 0, sizeof(AppConfig));
     g_app_cfgs_stage = nullptr;
@@ -347,11 +359,23 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         cur->sandbox_explicit = true;
     } else if (strcmp(tok, "GLOBAL_INJECT") == 0) {
         char* val = get_next_token(&p_ptr);
-        cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+        if (cur != &g_global_cfg_stage) {
+            LOG_WRN("GLOBAL_INJECT 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+        } else {
+            cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+        }
     } else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0) {
         char* val = get_next_token(&p_ptr);
-        cur->skip_system_apps = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+        if (cur != &g_global_cfg_stage) {
+            LOG_WRN("SKIP_SYSTEM_APPS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+        } else {
+            cur->skip_system_apps = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+        }
     } else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0) {
+        if (cur != &g_global_cfg_stage) {
+            LOG_WRN("FUSE_EXTRA_ARGS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+            return;
+        }
         /* 读取行尾剩余全部内容，不做分词（原样透传给 fuse_daemon） */
         char* p = p_ptr;
         while (p && isspace((unsigned char)*p)) p++;
@@ -578,6 +602,23 @@ bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_
     }
     return best != NULL;
 }
+/* 类别段（[USER_APPS[:uid]] / [SYSTEM_APPS]）段头归一：
+ * - USER_APPS：uid 原样（无 :uid 则 -1，跨用户 fallback）；
+ * - SYSTEM_APPS：对所有 uid 系统应用生效，user_id 恒 -1，带 :uid 归一并告警；
+ * - GLOBAL/普通包：uid 原样。返回 true = 类别段（调用方跳过普通包分支）。 */
+static bool classify_category_section(const char* pkg, int* uid_inout, const char* file, int line) {
+    if (strcmp(pkg, "USER_APPS") == 0) return true;
+    if (strcmp(pkg, "SYSTEM_APPS") == 0) {
+        if (*uid_inout != -1) {
+            LOG_WRN("[SYSTEM_APPS] 不支持按用户隔离（行 %d, 文件 %s），:uid 已忽略（对所有用户系统应用生效）",
+                    line, file);
+            *uid_inout = -1;
+        }
+        return true;
+    }
+    return false;
+}
+
 static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     /* S1：构建进暂存区（live 由 config_publish 一次性换入） */
     if (strcmp(pkg, "GLOBAL") == 0) return &g_global_cfg_stage;
@@ -774,6 +815,9 @@ void load_config_rules(const char* path) {
                     if (strcmp(pkg, "GLOBAL") == 0) {
                         cur = &g_global_cfg_stage;
                     } else {
+                        /* 类别段经归一后与普通包同走 get_or_create（特殊 pkg 名
+                           天然去重）；SYSTEM_APPS 带 :uid 在此归一为 -1 */
+                        classify_category_section(pkg, &current_user_id, path, line_num);
                         cur = get_or_create_app_cfg(pkg, current_user_id);
                         if (cur) cur->inject_enable = enabled;
                     }
@@ -835,7 +879,13 @@ void load_config_rules(const char* path) {
                                         if (colon) { *colon = '\0'; sub_uid = atoi(colon + 1); }
                                         strncpy(sub_pkg, sec, sizeof(sub_pkg)-1);
                                         if (strcmp(sub_pkg, "GLOBAL") == 0) cur = &g_global_cfg_stage;
-                                        else { cur = get_or_create_app_cfg(sub_pkg, sub_uid); if (cur) cur->inject_enable = enabled; }
+                                        else {
+                                            /* 分文件内类别段同样归一（SYSTEM_APPS :uid→-1）；
+                                               类别段一般只写主文件，此处为语义一致兜底 */
+                                            classify_category_section(sub_pkg, &sub_uid, app_conf_path, app_line_num);
+                                            cur = get_or_create_app_cfg(sub_pkg, sub_uid);
+                                            if (cur) cur->inject_enable = enabled;
+                                        }
                                     }
                                     continue;
                                 }
@@ -975,6 +1025,46 @@ AppConfig* find_app_cfg_locked(const char* pkg, int user_id) {
     }
     return NULL;
 }
+/* 类别段查找（供 br_resolve/is_target_app 三层合并）：
+ * - 系统应用 → SYSTEM_APPS（user_id 恒 -1，忽略传入 user_id）；
+ * - 用户应用 → USER_APPS[user_id] 精确，无则 USER_APPS[-1] 跨用户 fallback。
+ * 精确 strcmp（不用 fnmatch）：通配段 [*] 只作用于应用层，不混入类别层。 */
+AppConfig* find_category_cfg_locked(bool is_system_app, int user_id) {
+    if (is_system_app) {
+        for (int i = 0; i < g_app_cfg_count; i++) {
+            if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == -1 &&
+                strcmp(g_app_cfgs[i]->pkg_name, "SYSTEM_APPS") == 0)
+                return g_app_cfgs[i];
+        }
+        return NULL;
+    }
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == user_id &&
+            strcmp(g_app_cfgs[i]->pkg_name, "USER_APPS") == 0)
+            return g_app_cfgs[i];
+    }
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == -1 &&
+            strcmp(g_app_cfgs[i]->pkg_name, "USER_APPS") == 0)
+            return g_app_cfgs[i];
+    }
+    return NULL;
+}
+
+/* 是否存在类别段：IO 热路径据此决定是否走系统/用户分类（含 sys_pkg
+ * 查表），无类别段时零额外开销、行为与旧版一致 */
+bool config_has_category_rules(void) {
+    return g_has_category_rules;
+}
+
+/* 类别段是否有实质规则（注入判定用）：与 app_has_active_rules 口径一致
+ *（redir/hide/ro/sandbox；MONITOR-only 不触发注入）。调用方须持读锁 */
+bool category_has_rules_locked(bool is_system_app, int user_id) {
+    AppConfig* cat = find_category_cfg_locked(is_system_app, user_id);
+    if (!cat) return false;
+    return cat->redir_count > 0 || cat->hide_count > 0 || cat->ro_count > 0 || cat->sandbox;
+}
+
 bool has_wildcard_enabled_locked(int user_id) {
     for (int i = 0; i < g_app_cfg_count; i++) {
         if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == user_id &&
@@ -994,19 +1084,26 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     config_lock_read();
     int user_id = linux_uid / 100000;
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
+    /* 类别层归属（与 br_pick_category 同口径，sys_pkg 在各进程均可用） */
+    bool is_sys = (linux_uid < 10000) || (pkg && sys_pkg_is_system(pkg));
+    AppConfig* cat = find_category_cfg_locked(is_sys, user_id);
     bool is_wildcard = (cfg == NULL) && has_wildcard_enabled_locked(user_id);
-    int final_redir_count = (cfg ? cfg->redir_count : 0) + g_global_cfg.redir_count;
-    int final_hide_count = (cfg ? cfg->hide_count : 0) + g_global_cfg.hide_count;
-    int final_ro_count = (cfg ? cfg->ro_count : 0) + g_global_cfg.ro_count;
+    int final_redir_count = (cfg ? cfg->redir_count : 0) + (cat ? cat->redir_count : 0) + g_global_cfg.redir_count;
+    int final_hide_count = (cfg ? cfg->hide_count : 0) + (cat ? cat->hide_count : 0) + g_global_cfg.hide_count;
+    int final_ro_count = (cfg ? cfg->ro_count : 0) + (cat ? cat->ro_count : 0) + g_global_cfg.ro_count;
     bool final_sandbox;
     if (cfg && cfg->sandbox_explicit) {
         final_sandbox = cfg->sandbox;
+    } else if (cat && cat->sandbox_explicit) {
+        final_sandbox = cat->sandbox;
     } else {
         final_sandbox = g_global_cfg.sandbox && !is_media_provider(pkg);
     }
     bool final_monitor;
     if (cfg && cfg->monitor_explicit) {
         final_monitor = cfg->monitor;
+    } else if (cat && cat->monitor_explicit) {
+        final_monitor = cat->monitor;
     } else {
         final_monitor = g_global_cfg.monitor;
     }

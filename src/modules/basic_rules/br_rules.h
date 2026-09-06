@@ -18,17 +18,19 @@
    （可能含 '?' 前缀，运行时再展开）。 */
 typedef struct {
     bool valid;      /* 是否已 resolve */
-    bool hidden;     /* app_hidden || global_hidden */
-    bool ro;         /* app_ro || global_ro */
-    bool has_redir;  /* 命中 redirect（app 优先，无则 global） */
+    bool hidden;     /* app_hidden || cat_hidden || global_hidden */
+    bool ro;         /* app_ro || cat_ro || global_ro */
+    bool has_redir;  /* 命中 redirect（app > 类别 > global） */
     char redir[PATH_MAX];
-    /* FTP 最长前缀命中（trie 下降过程输出）：app 段优先，global 兜底 */
+    /* FTP 最长前缀命中（trie 下降过程输出）：app > 类别 > global */
     char ftp_app[64];     /* app trie 命中段名（可空） */
+    char ftp_cat[64];     /* 类别 trie（USER_APPS/SYSTEM_APPS）命中段名（可空） */
     char ftp_global[64];  /* global trie 命中段名（可空） */
     /* trie 完整匹配的最深节点（由 trie_lookup_full 填充，可 NULL）：
        供 br_resolve 复用一次遍历结果判定 virtual_ancestor / redirect_target，
        避免各自再全路径遍历（FUSE 热路径每操作最多省 4 次 trie 下降） */
     const TrieNode* app_node;
+    const TrieNode* cat_node;     /* 类别 trie 最深节点（可 NULL） */
     const TrieNode* global_node;
 } TrieMatch;
 

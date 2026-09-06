@@ -257,6 +257,42 @@ REDIRECT /空/ /Empty/""", [
         except Exception as e: fail("热重载",str(e))
         finally: stop(p)
 
+    # ── 类别段（测试进程 uid=1000 → system 分支：SYSTEM_APPS 生效，USER_APPS 无副作用）──
+    run("""[GLOBAL] MONITOR OFF
+[SYSTEM_APPS]
+HIDE /Download/Pics/""", [
+        ("SYS:HIDE生效","0/Download/Pics/1.jpg","NOT_EXISTS"),
+        ("SYS:其他可见","0/Download/hi.txt","hello"),
+    ],"17.SYSTEM_APPS/HIDE")
+
+    # 类别 REDIRECT 优先于 GLOBAL（应用>类别>全局的后两层）
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /类/ /Download/Music/
+[SYSTEM_APPS]
+REDIRECT /类/ /Download/Pics/""", [
+        ("SYS:类别优先全局","0/类/1.jpg","img1"),
+    ],"18.SYSTEM_APPS> GLOBAL")
+
+    # HIDE 并集：GLOBAL + 类别同时隐藏
+    run("""[GLOBAL] MONITOR OFF
+HIDE /Download/Music/
+[SYSTEM_APPS]
+HIDE /Download/Pics/""", [
+        ("并集:Music藏","0/Download/Music/song.mp3","NOT_EXISTS"),
+        ("并集:Pics藏","0/Download/Pics/1.jpg","NOT_EXISTS"),
+        ("并集:其他可见","0/Download/hi.txt","hello"),
+    ],"19.HIDE并集")
+
+    # USER_APPS 对 system 访问者无副作用（作用域隔离）
+    run("""[GLOBAL] MONITOR OFF
+[USER_APPS:0]
+HIDE /Download/Pics/
+[USER_APPS]
+HIDE /Download/Music/""", [
+        ("USR:Pics仍可见","0/Download/Pics/1.jpg","img1"),
+        ("USR:Music仍可见","0/Download/Music/song.mp3","music"),
+    ],"20.USER_APPS不污染system")
+
     # cleanup
     subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)
     subprocess.run(["fusermount3","-u",MNT],capture_output=True)

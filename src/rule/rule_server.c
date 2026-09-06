@@ -738,6 +738,43 @@ static int append_line(char ***lines, int *cap, int count, const char *text) {
     return insert_line_at(lines, cap, count, count, text);
 }
 
+/* 类别段判定：[USER_APPS[:uid]] / [SYSTEM_APPS]（rule_server 读写均走主文件）。
+ * P2：大小写敏感（strcmp），与 config_parser 及 GLOBAL 段保持一致——
+ * [user_apps:0] 会被 parser 当普通应用加载，控制面不得将其当类别写入 */
+static bool is_category_pkg(const char *pkg) {
+    return pkg && (strcmp(pkg, "USER_APPS") == 0 || strcmp(pkg, "SYSTEM_APPS") == 0);
+}
+
+/* 类别段头文本：USER_APPS 恒带显式 :uid（默认 0），SYSTEM_APPS 无参 */
+static void category_section_header(const char *pkg, int uid, char *out, size_t sz) {
+    if (strcmp(pkg, "SYSTEM_APPS") == 0)
+        snprintf(out, sz, "[SYSTEM_APPS]");
+    else
+        snprintf(out, sz, "[USER_APPS:%d]", uid < 0 ? 0 : uid);
+}
+
+/* 精确段头行匹配（含可选 ON/OFF 后缀）：整行去空白后以 hdr_text 开头、
+   余部为空或 ON/OFF——避免把 [USER_APPS] 与 [USER_APPS:0] 混淆 */
+static int find_header_line(char **lines, int count, const char *hdr_text) {
+    size_t hlen = strlen(hdr_text);
+    for (int i = 0; i < count; i++) {
+        char *p = lines[i];
+        while (isspace((unsigned char)*p)) p++;
+        if (strncmp(p, hdr_text, hlen) != 0) continue;
+        char *rest = p + hlen;
+        while (isspace((unsigned char)*rest)) rest++;
+        /* P2：ON/OFF 须有边界（空白/NUL/换行），[USER_APPS:0]OFFX 之类不算段头 */
+        if (*rest == '\0' || *rest == '\n') return i;
+        if (strncmp(rest, "ON", 2) == 0 &&
+            (rest[2] == '\0' || rest[2] == '\n' || isspace((unsigned char)rest[2])))
+            return i;
+        if (strncmp(rest, "OFF", 3) == 0 &&
+            (rest[3] == '\0' || rest[3] == '\n' || isspace((unsigned char)rest[3])))
+            return i;
+    }
+    return -1;
+}
+
 /* 查找段头 [name]（或 [name:uid]），返回行号，未找到返回 -1 */
 static int find_section_header(char **lines, int count, const char *name) {
     size_t nlen = strlen(name);
@@ -867,10 +904,8 @@ static bool valid_value(const char *v) {
 }
 
 /* ==================== 规则列表构建 ==================== */
-/* 构建单个规则文件的 rules 数组 + switches 对象 */
-static void build_file_rules(const char *path, json_object *rules, json_object *switches) {
-    int count = 0, cap = 0;
-    char **lines = read_file_lines(path, &count, &cap);
+/* 构建已读取行数组的 rules 数组 + switches 对象（索引与 REMOVE/TOGGLE 一致） */
+static void build_lines_rules(char **lines, int count, json_object *rules, json_object *switches) {
     if (!lines) return;
     int type_index[MAX_RULE_TYPES] = {0};
     char valbuf[MAX_LINE];
@@ -896,7 +931,50 @@ static void build_file_rules(const char *path, json_object *rules, json_object *
             type_index[t]++;
         }
     }
+}
+
+/* 构建单个规则文件的 rules 数组 + switches 对象 */
+static void build_file_rules(const char *path, json_object *rules, json_object *switches) {
+    int count = 0, cap = 0;
+    char **lines = read_file_lines(path, &count, &cap);
+    if (!lines) return;
+    build_lines_rules(lines, count, rules, switches);
     free_file_lines(lines, count);
+}
+
+/* 类别段 JSON：只取主文件内精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]）
+   到下一段头之间的行；段不存在返回空规则（file 照样回主文件路径） */
+static json_object *build_category_json(const char *pkg, int uid) {
+    char path[PATH_MAX];
+    char hdr[64];
+    main_conf_path(path, sizeof(path));
+    category_section_header(pkg, uid, hdr, sizeof hdr);
+    json_object *cat = json_object_new_object();
+    json_object *switches = json_object_new_object();
+    json_object *rules = json_object_new_array();
+    int count = 0, cap = 0;
+    char **lines = read_file_lines(path, &count, &cap);
+    if (lines) {
+        int hdr_idx = find_header_line(lines, count, hdr);
+        if (hdr_idx >= 0) {
+            int end = hdr_idx + 1;
+            while (end < count) {
+                char *p = lines[end];
+                while (isspace((unsigned char)*p)) p++;
+                if (*p == '[') break;
+                end++;
+            }
+            build_lines_rules(lines + hdr_idx + 1, end - hdr_idx - 1, rules, switches);
+        }
+        free_file_lines(lines, count);
+    }
+    json_object_object_add(cat, "pkg", json_object_new_string(pkg));
+    json_object_object_add(cat, "uid", json_object_new_int(uid));
+    json_object_object_add(cat, "section", json_object_new_string(hdr));
+    json_object_object_add(cat, "file", json_object_new_string(path));
+    json_object_object_add(cat, "switches", switches);
+    json_object_object_add(cat, "rules", rules);
+    return cat;
 }
 
 static json_object *build_global_json(void) {
@@ -1165,6 +1243,14 @@ static void handle_get(int fd, json_object *req) {
         reply_error(fd, "GET", "非法 uid: %d", uid);
         return;
     }
+    /* 类别段视图：主文件内精确段头切片（索引为段内局部序号，仅展示用；
+       REMOVE/TOGGLE 仍用主文件全局索引，与 pkg=GLOBAL 语义一致） */
+    if (is_category_pkg(pkg)) {
+        json_object *data = json_object_new_object();
+        json_object_object_add(data, "category", build_category_json(pkg, uid));
+        reply_ok(fd, "GET", data);
+        return;
+    }
     if (!valid_pkg(pkg)) {
         reply_error(fd, "GET", "非法包名: %s", pkg ? pkg : "(null)");
         return;
@@ -1258,14 +1344,17 @@ static void handle_add(int fd, json_object *req) {
         return;
     }
     bool is_global = (strcasecmp(pkg, "GLOBAL") == 0);
+    /* 类别段（[USER_APPS:<uid>]/[SYSTEM_APPS]）：写主文件精确段头 */
+    bool is_category = (!is_global && is_category_pkg(pkg));
 
     /* INJECT_ENABLE：应用规则启用/停用总开关。
        通过重命名 App-rules/<pkg>.conf ↔ <pkg>.conf.disabled 实现：
        OFF（停用）→ 加 .disabled 后缀，解析器跳过该文件（规则不生效）；
        ON（启用） → 去掉 .disabled 后缀，规则重新生效。
-       全程不接触 injector.conf（其 [pkg:uid] 段头仅控制注入挂载）。 */
+       全程不接触 injector.conf（其 [pkg:uid] 段头仅控制注入挂载）。
+       类别段无分文件：启停请直接编辑主文件段头 ON/OFF。 */
     if (strcasecmp(type_s, "INJECT_ENABLE") == 0) {
-        if (is_global) {
+        if (is_global || is_category) {
             reply_error(fd, "ADD", "INJECT_ENABLE 仅适用于应用作用域");
             return;
         }
@@ -1328,7 +1417,8 @@ static void handle_add(int fd, json_object *req) {
         reply_error(fd, "ADD", "未知规则类型: %s", type_s);
         return;
     }
-    /* 全局专属类型（GLOBAL_INJECT/SKIP_SYSTEM_APPS）：仅 [GLOBAL] 段可用 */
+    /* 全局专属类型（GLOBAL_INJECT/SKIP_SYSTEM_APPS）：仅 [GLOBAL] 段可用
+       （类别段同样拒绝，is_category 非全局） */
     if (!is_global && g_rule_types[t].global_only) {
         reply_error(fd, "ADD", "规则类型 %s 仅可在全局规则中使用，不能配置到应用 %s",
                     type_s, pkg);
@@ -1340,8 +1430,18 @@ static void handle_add(int fd, json_object *req) {
         return;
     }
 
-    if (is_global) {
-        /* GLOBAL：写入 injector.conf 的 [GLOBAL] 段（开关替换/规则去重插入） */
+    if (is_global || is_category) {
+        /* GLOBAL/类别段：写入 injector.conf 的对应段（开关替换/规则去重插入）。
+           类别段用精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]），避免与裸
+           [USER_APPS] 混淆；USER_APPS 按请求 uid 落段（默认 0）。 */
+        char sec_hdr[64], sec_line[MAX_LINE];
+        if (is_category) {
+            category_section_header(pkg, uid, sec_hdr, sizeof sec_hdr);
+            snprintf(sec_line, sizeof sec_line, "%s\n", sec_hdr);
+        } else {
+            snprintf(sec_hdr, sizeof sec_hdr, "[GLOBAL]");
+            snprintf(sec_line, sizeof sec_line, "[GLOBAL]\n");
+        }
         char conf[PATH_MAX];
         main_conf_path(conf, sizeof(conf));
         int count = 0, cap = 0;
@@ -1351,7 +1451,7 @@ static void handle_add(int fd, json_object *req) {
                 reply_error(fd, "ADD", "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
                 return;
             }
-            if (append_line(&lines, &cap, 0, "[GLOBAL]\n") < 0 ||
+            if (append_line(&lines, &cap, 0, sec_line) < 0 ||
                 append_line(&lines, &cap, 1, line) < 0) {
                 free_file_lines(lines, count);
                 reply_error(fd, "ADD", "内存不足");
@@ -1370,7 +1470,8 @@ static void handle_add(int fd, json_object *req) {
             reply_ok(fd, "ADD", data);
             return;
         }
-        int hdr = find_section_header(lines, count, "GLOBAL");
+        int hdr = is_global ? find_section_header(lines, count, "GLOBAL")
+                            : find_header_line(lines, count, sec_hdr);
         bool changed = false;
         if (is_switch_type(t)) {
             const char *tname = rule_type_name(t);
@@ -1398,7 +1499,7 @@ static void handle_add(int fd, json_object *req) {
                     changed = true;
                 }
             } else {
-                if (append_line(&lines, &cap, count, "[GLOBAL]\n") < 0 ||
+                if (append_line(&lines, &cap, count, sec_line) < 0 ||
                     append_line(&lines, &cap, count + 1, line) < 0) {
                     free_file_lines(lines, count);
                     reply_error(fd, "ADD", "内存不足");
@@ -1408,7 +1509,7 @@ static void handle_add(int fd, json_object *req) {
                 changed = true;
             }
         } else {
-            /* 规则行：去重后插入 [GLOBAL] 段头之后 */
+            /* 规则行：去重后插入段头之后 */
             bool dup = false;
             for (int i = 0; i < count; i++) {
                 if (strcmp(lines[i], line) == 0) { dup = true; break; }
@@ -1416,7 +1517,7 @@ static void handle_add(int fd, json_object *req) {
             if (!dup) {
                 int pos = hdr >= 0 ? hdr + 1 : count;
                 if (hdr < 0) {
-                    if (append_line(&lines, &cap, count, "[GLOBAL]\n") < 0) {
+                    if (append_line(&lines, &cap, count, sec_line) < 0) {
                         free_file_lines(lines, count);
                         reply_error(fd, "ADD", "内存不足");
                         return;
@@ -1530,10 +1631,11 @@ static void handle_add(int fd, json_object *req) {
     }
 }
 
-/* 定位规则所在文件路径；scope=GLOBAL 返回主配置文件，否则返回应用规则**当前生效**文件
-   （停用状态返回 .conf.disabled，保证后续操作写入同一文件、不丢规则） */
+/* 定位规则所在文件路径；scope=GLOBAL/类别段返回主配置文件，否则返回应用规则
+   **当前生效**文件（停用状态返回 .conf.disabled，保证后续操作写入同一文件、
+   不丢规则）。类别段 REMOVE/TOGGLE 用主文件全局索引（与 GLOBAL 一致）。 */
 static void resolve_rule_path(const char *pkg, int uid, bool *is_global, char *out, size_t sz) {
-    if (!pkg || strcasecmp(pkg, "GLOBAL") == 0) {
+    if (!pkg || strcasecmp(pkg, "GLOBAL") == 0 || is_category_pkg(pkg)) {
         *is_global = true;
         main_conf_path(out, sz);
     } else {
@@ -1566,7 +1668,7 @@ static void handle_remove(int fd, json_object *req) {
         reply_error(fd, "REMOVE", "索引必须 >= 0");
         return;
     }
-    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !valid_pkg(pkg)) {
+    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !is_category_pkg(pkg) && !valid_pkg(pkg)) {
         reply_error(fd, "REMOVE", "非法包名: %s", pkg);
         return;
     }
@@ -1629,7 +1731,7 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
         reply_error(fd, cmd, "索引必须 >= 0");
         return;
     }
-    if (strcmp(pkg, "GLOBAL") != 0 && !valid_pkg(pkg)) {
+    if (strcmp(pkg, "GLOBAL") != 0 && !is_category_pkg(pkg) && !valid_pkg(pkg)) {
         reply_error(fd, cmd, "非法包名: %s", pkg);
         return;
     }

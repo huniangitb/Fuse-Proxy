@@ -22,6 +22,20 @@
 | `[GLOBAL]` | 全局段，规则对所有应用生效 |
 | `[<pkg>]` | 应用段，如 `[com.tencent.mm]` |
 | `[<pkg>:<uid>]` | 指定多用户的应用段，如 `[com.tencent.mm:10]`、`[com.tencent.mm:999]` |
+| `[USER_APPS:<uid>]` | 类别段：该用户全部**用户应用**，如 `[USER_APPS:0]`；省略 `:uid`（裸 `[USER_APPS]`）时对所有用户生效 |
+| `[SYSTEM_APPS]` | 类别段：全部**系统应用**（忽略 uid，对所有用户系统应用生效；带 `:uid` 会被归一并告警） |
+
+- 类别判定复用 `SKIP_SYSTEM_APPS` 逻辑：`pm list packages -s` 缓存（injector 查询并落盘
+  `sys_pkgs.cache` 供 FUSE 侧只读），失败回退 `uid < 10000`；无表时等价于回退。
+- 优先级：**应用专属 > 类别 > GLOBAL**（REDIRECT/FTP 取首命中，HIDE/RO 取并集，
+  MONITOR/SANDBOX 显式覆盖按同序，ALLOW 豁免同序；应用段 `SANDBOX OFF` 显式否决类别+全局，
+  类别段 `SANDBOX OFF` 显式否决全局）。
+- 包名不可解析时（`system`/`unknown`/过短/`zygote` 等）类别段不生效，仅 GLOBAL 适用。
+- 注入判定：类别段有实质规则（REDIRECT/HIDE/RO/SANDBOX）即视为点名注入（跳过
+  `SKIP_SYSTEM_APPS` 过滤）；段头 `OFF` 则显式否决该类别注入（含通配/全局）。
+- 类别段只写主文件（`App-rules/` 分文件暂不支持，写了也会被归一读取——建议只写主文件）。
+- `GLOBAL_INJECT` / `SKIP_SYSTEM_APPS` / `FUSE_EXTRA_ARGS` 仍仅 `[GLOBAL]` 段有效，
+  写在其他段会被忽略并告警。
 
 - 段头后可加 `ON` / `OFF` 控制该段是否注入使能：
   ```
@@ -226,6 +240,14 @@ HIDE /sdcard/Tencent/MicroMsg/*/credential
 SANDBOX ON
 HIDE /sdcard/Tencent/MicroMsg/999/private
 
+[USER_APPS:0] ON
+# user 0 全部用户应用：隐藏各应用私有目录（类别变量 target 侧可用 $package）
+HIDE $DATA_BASE/private
+
+[SYSTEM_APPS] ON
+# 全部系统应用：只读保护系统字体
+RO /system/fonts
+
 [com.termux] OFF
 # 已声明关闭注入，下列规则不会生效
 ```
@@ -268,7 +290,7 @@ RO   /system/fonts
 
 写完配置后逐条核对：
 
-- [ ] 段头格式正确：`[GLOBAL]` / `[<pkg>]` / `[<pkg>:<uid>]`，段头缺省 ON/OFF 时默认 ON
+- [ ] 段头格式正确：`[GLOBAL]` / `[<pkg>]` / `[<pkg>:<uid>]` / `[USER_APPS:<uid>]` / `[SYSTEM_APPS]`，段头缺省 ON/OFF 时默认 ON
 - [ ] 开关值只用 `ON` / `1`（开）或省略/其他（关）
 - [ ] `FUSE_EXTRA_ARGS` 仅写在 `[GLOBAL]` 段
 - [ ] `HIDE` / `RO` / `ALLOW` / `REDIRECT` 关键字拼写无误

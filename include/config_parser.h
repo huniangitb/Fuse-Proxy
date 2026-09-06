@@ -109,6 +109,15 @@ void strip_trailing_slash(char* path);
 void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger_source);
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id);
 bool has_wildcard_enabled_locked(int user_id);
+/* 类别段查找：is_system_app=true → SYSTEM_APPS（忽略 user_id）；
+   false → USER_APPS[user_id]，无则 USER_APPS[-1]。调用方须持读锁/快照槽。
+   类别段名（USER_APPS/SYSTEM_APPS）：[USER_APPS[:uid]] 对用户应用生效
+   （无 :uid 则对所有用户生效）；[SYSTEM_APPS] 对所有 uid 系统应用生效 */
+AppConfig* find_category_cfg_locked(bool is_system_app, int user_id);
+/* 是否存在类别段（publish 时设置）：热路径据此跳过分类开销 */
+bool config_has_category_rules(void);
+/* 类别段是否有实质规则（注入判定用，调用方须持读锁） */
+bool category_has_rules_locked(bool is_system_app, int user_id);
 /* Trie 接口见 path_trie.h（config_parser.h 已 include） */
 
 #endif
