@@ -7,7 +7,7 @@
  * 备份仅取一个族（优先级 user > androidwritable > installer），三族共用。
  *
  * 本文件从原 ns_utils.c 拆出（可维护性重构）：mountinfo 枚举与族根工具
- * （read_mountinfo_pid/is_family_root/parse_family_root 等）供 ns_utils.c
+ * （ns_read_mountinfo_pid/ns_is_family_root/ns_parse_family_root 等）供 ns_utils.c
  * 的 combined mount Step J preserve 恢复共用，故非 static 导出。
  */
 #include "common.h"
@@ -36,7 +36,7 @@
 #endif
 
 /* 读取指定进程的 mountinfo（本函数不进入命名空间，仅解析文件） */
-int read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
+int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
     FILE* fp = fopen(path, "re");
@@ -68,10 +68,10 @@ int read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
     return count;
 }
 
-bool is_digit_char(char c) { return c >= '0' && c <= '9'; }
+bool ns_is_digit_char(char c) { return c >= '0' && c <= '9'; }
 
 /* 判断是否为 emulated 族根：/mnt/(installer|androidwritable|user)/<数字>/emulated */
-bool is_family_root(const char* mp) {
+bool ns_is_family_root(const char* mp) {
     static const char* const families[] = { "installer", "androidwritable", "user" };
     if (strncmp(mp, "/mnt/", 5) != 0) return false;
     const char* p = mp + 5;
@@ -79,8 +79,8 @@ bool is_family_root(const char* mp) {
         size_t flen = strlen(families[i]);
         if (strncmp(p, families[i], flen) == 0 && p[flen] == '/') {
             const char* q = p + flen + 1;
-            if (!is_digit_char(*q)) return false;
-            while (is_digit_char(*q)) q++;
+            if (!ns_is_digit_char(*q)) return false;
+            while (ns_is_digit_char(*q)) q++;
             return strcmp(q, "/emulated") == 0;
         }
     }
@@ -88,7 +88,7 @@ bool is_family_root(const char* mp) {
 }
 
 /* 提取族根的 family 索引（0=installer,1=androidwritable,2=user）与用户 id，失败返回 -1 */
-int parse_family_root(const char* mp, int* user_id) {
+int ns_parse_family_root(const char* mp, int* user_id) {
     static const char* const families[] = { "installer", "androidwritable", "user" };
     if (strncmp(mp, "/mnt/", 5) != 0) return -1;
     const char* p = mp + 5;
@@ -96,9 +96,9 @@ int parse_family_root(const char* mp, int* user_id) {
         size_t flen = strlen(families[i]);
         if (strncmp(p, families[i], flen) == 0 && p[flen] == '/') {
             const char* q = p + flen + 1;
-            if (!is_digit_char(*q)) return -1;
+            if (!ns_is_digit_char(*q)) return -1;
             int id = 0;
-            while (is_digit_char(*q)) { id = id * 10 + (*q - '0'); q++; }
+            while (ns_is_digit_char(*q)) { id = id * 10 + (*q - '0'); q++; }
             if (strcmp(q, "/emulated") != 0) return -1;
             if (user_id) *user_id = id;
             return i;
@@ -108,7 +108,7 @@ int parse_family_root(const char* mp, int* user_id) {
 }
 
 /* 收集 base 前缀下的挂载点（含/不含自身，含/不含 fuse 类型），不排序 */
-int collect_mounts_under(const NsMountEntry* all, int n, const char* base,
+int ns_gather_mounts_under(const NsMountEntry* all, int n, const char* base,
                                 bool include_self, bool include_fuse,
                                 NsMountEntry* out, int max) {
     size_t blen = strlen(base);
@@ -124,8 +124,8 @@ int collect_mounts_under(const NsMountEntry* all, int n, const char* base,
     return count;
 }
 
-/* 统计 base 前缀下匹配的挂载点数量（与 collect_mounts_under 同规则，仅计数） */
-int count_mounts_under(const NsMountEntry* all, int n, const char* base,
+/* 统计 base 前缀下匹配的挂载点数量（与 ns_gather_mounts_under 同规则，仅计数） */
+int ns_count_mounts_under(const NsMountEntry* all, int n, const char* base,
                               bool include_self, bool include_fuse) {
     size_t blen = strlen(base);
     int count = 0;
@@ -141,7 +141,7 @@ int count_mounts_under(const NsMountEntry* all, int n, const char* base,
 }
 
 /* 按深度降序排序（最深优先，用于卸载顺序） */
-void sort_deepest_first(NsMountEntry* arr, int n) {
+void ns_sort_deepest_first(NsMountEntry* arr, int n) {
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
             if (arr[j].depth > arr[i].depth) {
@@ -151,7 +151,7 @@ void sort_deepest_first(NsMountEntry* arr, int n) {
     }
 }
 /* 按深度升序排序（最浅优先，用于 bind 顺序：父先子后） */
-void sort_shallowest_first(NsMountEntry* arr, int n) {
+void ns_sort_shallowest_first(NsMountEntry* arr, int n) {
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
             if (arr[j].depth < arr[i].depth) {
@@ -165,10 +165,10 @@ void sort_shallowest_first(NsMountEntry* arr, int n) {
    关键：系统视图备份的 bind 视图，mountinfo source 是 fsname=/dev/fuse（fstype=fuse），
    **这是有效备份的正常特征**，绝不能判为污染；仅当 source/fstype 含 fuse_daemon
    （项目 FUSE 视图，如崩溃恢复二次替换叠上去的代理 bind）时才判为污染 */
-int backup_point_state(int pid, const char* path) {
+int ns_backup_point_state(int pid, const char* path) {
     NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     if (!all) return 0;
-    int n = read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
+    int n = ns_read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
     if (n <= 0) { free(all); return 0; }
     int st = 0;
     for (int i = 0; i < n; i++) {
@@ -208,7 +208,7 @@ static int do_global_replace(void* raw) {
         LOG_ERR("全局替换: 分配内存失败");
         return -1;
     }
-    int n = read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
+    int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
     if (n <= 0) { free(all); free(roots); free(sub); log_ns_error("[global_replace] read mountinfo failed n=%d errno=%d\n", n, errno); LOG_ERR("全局替换: 读取 mountinfo 失败"); return -1; }
     LOG_DBG("全局替换: mountinfo 共 %d 行, fuse_src=%s, backup_root=%s", n, fuse_src, backup_root);
 
@@ -228,7 +228,7 @@ static int do_global_replace(void* raw) {
     int root_count = 0;
     bool root_truncated = false;
     for (int i = 0; i < n; i++) {
-        if (is_family_root(all[i].mount_point)) {
+        if (ns_is_family_root(all[i].mount_point)) {
             if (root_count >= 128) { root_truncated = true; break; }
             roots[root_count++] = all[i];
             LOG_DBG("全局替换: 族根[%d] %s dev=%s fstype=%s", root_count - 1,
@@ -252,7 +252,7 @@ static int do_global_replace(void* raw) {
         bool exists = false;
         for (int i = 0; i < root_count; i++) {
             int uid = 0;
-            if (parse_family_root(roots[i].mount_point, &uid) == fam) { exists = true; break; }
+            if (ns_parse_family_root(roots[i].mount_point, &uid) == fam) { exists = true; break; }
         }
         if (exists) { backup_family = fam; break; }
     }
@@ -263,7 +263,7 @@ static int do_global_replace(void* raw) {
     /* 3. 备份：对备份族每个用户，逐节点 bind 到 backup_root/user_<id>/emulated */
     for (int i = 0; i < root_count; i++) {
         int uid = 0;
-        if (parse_family_root(roots[i].mount_point, &uid) != backup_family) continue;
+        if (ns_parse_family_root(roots[i].mount_point, &uid) != backup_family) continue;
         const char* root = roots[i].mount_point;
         char backup_top[PATH_MAX];
         snprintf(backup_top, sizeof(backup_top), "%s/user_%d/emulated", backup_root, uid);
@@ -277,7 +277,7 @@ static int do_global_replace(void* raw) {
             continue;
         }
         /* 污染检查：备份顶层已挂载为 fuse 则拒绝 */
-        int st = backup_point_state(getpid(), backup_top);
+        int st = ns_backup_point_state(getpid(), backup_top);
         if (st < 0) {
             LOG_ERR("全局替换: 备份点 %s 已被挂载为 fuse(污染)，拒绝替换", backup_top);
             free(all); free(roots); free(sub);
@@ -288,13 +288,13 @@ static int do_global_replace(void* raw) {
             continue;
         }
         /* 收集该族根全部挂载点（含自身与 fuse 子挂载） */
-        int sn = collect_mounts_under(all, n, root, true, true, sub, 128);
+        int sn = ns_gather_mounts_under(all, n, root, true, true, sub, 128);
         if (sn >= 128) {
             LOG_ERR("全局替换: 族根 %s 子挂载达到 128 上限，拒绝静默截断（备份将不完整）", root);
             free(all); free(roots); free(sub);
             return -1;
         }
-        sort_shallowest_first(sub, sn);   /* 父先子后 bind */
+        ns_sort_shallowest_first(sub, sn);   /* 父先子后 bind */
         for (int k = 0; k < sn; k++) {
             const char* rel = sub[k].mount_point + strlen(root);   /* "" 或 "/0/Android/data" */
             char target[PATH_MAX];
@@ -319,13 +319,13 @@ static int do_global_replace(void* raw) {
     /* 4. 替换：三族全部族根，最深优先卸载后 bind fuse_src，并置 MS_SHARED 传播 */
     for (int i = 0; i < root_count; i++) {
         const char* root = roots[i].mount_point;
-        int sn = collect_mounts_under(all, n, root, true, true, sub, 128);
+        int sn = ns_gather_mounts_under(all, n, root, true, true, sub, 128);
         if (sn >= 128) {
             LOG_ERR("全局替换: 族根 %s 子挂载达到 128 上限，拒绝静默截断（替换将不完整）", root);
             free(all); free(roots); free(sub);
             return -1;
         }
-        sort_deepest_first(sub, sn);   /* 最深优先卸载 */
+        ns_sort_deepest_first(sub, sn);   /* 最深优先卸载 */
         for (int k = 0; k < sn; k++) {
             for (int t = 0; t < 8; t++) {
                 if (umount2(sub[k].mount_point, MNT_DETACH) == 0) break;
@@ -376,7 +376,7 @@ static int do_global_restore(void* raw) {
         free(all); free(bsub); free(cur);
         return -1;
     }
-    int n = read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
+    int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
     if (n <= 0) { free(all); free(bsub); free(cur); return -1; }
     bool failed = false;   /* 任一 mkdir/mount 失败即置位：保留备份副本并返回非零，
                               调用方（崩溃恢复/关机还原）据此记录错误并重试 */
@@ -387,36 +387,36 @@ static int do_global_restore(void* raw) {
         if (strncmp(btop, backup_root, blen) != 0 || btop[blen] != '/') continue;
         if (strncmp(btop + blen + 1, "user_", 5) != 0) continue;
         const char* q = btop + blen + 1 + 5;
-        if (!is_digit_char(*q)) continue;
+        if (!ns_is_digit_char(*q)) continue;
         int uid = 0;
-        while (is_digit_char(*q)) { uid = uid * 10 + (*q - '0'); q++; }
+        while (ns_is_digit_char(*q)) { uid = uid * 10 + (*q - '0'); q++; }
         if (strcmp(q, "/emulated") != 0) continue;
         /* 校验备份点未被 fuse 污染 */
-        if (backup_point_state(getpid(), btop) != 1) {
+        if (ns_backup_point_state(getpid(), btop) != 1) {
             LOG_WRN("全局恢复: 备份点 %s 无效或已被污染，跳过用户 %d", btop, uid);
             continue;
         }
         /* 收集备份树全部挂载点（父先子后 bind 用） */
-        int bn = collect_mounts_under(all, n, btop, true, true, bsub, 128);
+        int bn = ns_gather_mounts_under(all, n, btop, true, true, bsub, 128);
         if (bn >= 128) {
             LOG_ERR("全局恢复: 备份点 %s 子挂载达到 128 上限，拒绝静默截断（恢复将不完整）", btop);
             free(all); free(bsub); free(cur);
             return -1;
         }
-        sort_shallowest_first(bsub, bn);
+        ns_sort_shallowest_first(bsub, bn);
         /* 对三族该用户的族根逐一恢复 */
         for (int fam = 0; fam < 3; fam++) {
             static const char* const fam_names[] = { "installer", "androidwritable", "user" };
             char root[PATH_MAX];
             snprintf(root, sizeof(root), "/mnt/%s/%d/emulated", fam_names[fam], uid);
             /* 卸载当前族根上的全部挂载（含 fuse_src bind 与传播子挂载） */
-            int cn = collect_mounts_under(all, n, root, true, true, cur, 128);
+            int cn = ns_gather_mounts_under(all, n, root, true, true, cur, 128);
             if (cn >= 128) {
                 LOG_ERR("全局恢复: 族根 %s 子挂载达到 128 上限，拒绝静默截断", root);
                 free(all); free(bsub); free(cur);
                 return -1;
             }
-            sort_deepest_first(cur, cn);
+            ns_sort_deepest_first(cur, cn);
             for (int k = 0; k < cn; k++) {
                 for (int t = 0; t < 8; t++) {
                     if (umount2(cur[k].mount_point, MNT_DETACH) == 0) break;
@@ -453,7 +453,7 @@ static int do_global_restore(void* raw) {
            保留备份树作为恢复副本（崩溃恢复/关机还原重试的唯一数据源），
            避免把瞬态挂载失败变成系统视图永久丢失 */
         if (!failed) {
-            sort_deepest_first(bsub, bn);
+            ns_sort_deepest_first(bsub, bn);
             for (int k = 0; k < bn; k++) {
                 for (int t = 0; t < 8; t++) {
                     if (umount2(bsub[k].mount_point, MNT_DETACH) == 0) break;
@@ -484,7 +484,7 @@ static int do_restore_app_fuse(void* raw) {
     NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     NsMountEntry* sub = NULL;   /* 动态分配：按 target/备份树下实际挂载数决定容量 */
     if (!all) { free(all); free(sub); return -1; }
-    int n = read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
+    int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
     if (n <= 0) { free(all); free(sub); return -1; }
     const char* target = "/storage/emulated";
     /* 项目 FUSE 源（fuse_src 挂载点）的 major:minor：bind 视图与源共享 superblock，
@@ -520,15 +520,15 @@ static int do_restore_app_fuse(void* raw) {
        不再是项目 FUSE 而永久跳过该应用） */
     char backup_top[PATH_MAX];
     snprintf(backup_top, sizeof(backup_top), "%s/user_%d/emulated", args->backup_root, args->user_id);
-    if (backup_point_state(getpid(), backup_top) != 1) {
+    if (ns_backup_point_state(getpid(), backup_top) != 1) {
         LOG_ERR("应用还原: 备份点 %s 无效，放弃还原", backup_top);
         free(all); free(sub);
         return -1;
     }
     /* 动态分配 sub：容量取 target 与备份树挂载数的较大值（+余量），
        彻底避免固定上限导致的堆溢出 */
-    int cap_target = count_mounts_under(all, n, target, true, true);
-    int cap_backup = count_mounts_under(all, n, backup_top, true, true);
+    int cap_target = ns_count_mounts_under(all, n, target, true, true);
+    int cap_backup = ns_count_mounts_under(all, n, backup_top, true, true);
     int sub_cap = cap_target > cap_backup ? cap_target : cap_backup;
     if (sub_cap < 16) sub_cap = 16;   /* 保底容量 */
     sub = malloc(sub_cap * sizeof(NsMountEntry));
@@ -537,8 +537,8 @@ static int do_restore_app_fuse(void* raw) {
         return -1;
     }
     /* 卸载顶层（含子挂载，最深优先） */
-    int sn = collect_mounts_under(all, n, target, true, true, sub, sub_cap);
-    sort_deepest_first(sub, sn);
+    int sn = ns_gather_mounts_under(all, n, target, true, true, sub, sub_cap);
+    ns_sort_deepest_first(sub, sn);
     for (int k = 0; k < sn; k++) {
         for (int t = 0; t < 8; t++) {
             if (umount2(sub[k].mount_point, MNT_DETACH) == 0) break;
@@ -550,8 +550,8 @@ static int do_restore_app_fuse(void* raw) {
     }
     /* 收集备份树全部挂载点（含自身与 f2fs 子挂载），父先子后逐节点 bind 回
        target：仅 bind 顶层会丢失 Android/data|obb 等 f2fs 直通子挂载 */
-    int bn = collect_mounts_under(all, n, backup_top, true, true, sub, sub_cap);
-    sort_shallowest_first(sub, bn);
+    int bn = ns_gather_mounts_under(all, n, backup_top, true, true, sub, sub_cap);
+    ns_sort_shallowest_first(sub, bn);
     if (bn == 0) {
         LOG_ERR("应用还原: 备份点 %s 下未收集到任何挂载，放弃还原", backup_top);
         free(all); free(sub);
@@ -641,7 +641,7 @@ int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_ro
 int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
     NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     if (!all) return NSP_GLOBAL_STATUS_UNKNOWN;
-    int n = read_mountinfo_pid(mnt_ns_pid, all, NS_MOUNTINFO_MAX);
+    int n = ns_read_mountinfo_pid(mnt_ns_pid, all, NS_MOUNTINFO_MAX);
     if (n <= 0) { free(all); return NSP_GLOBAL_STATUS_UNKNOWN; }
     /* 项目 FUSE 源的 major:minor：bind 视图与源共享 superblock，
        mountinfo source 字段是 devname/fsname 而非 bind 源路径，需以 dev 判定 */
@@ -654,7 +654,7 @@ int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
     }
     int total = 0, replaced = 0;
     for (int i = 0; i < n; i++) {
-        if (!is_family_root(all[i].mount_point)) continue;
+        if (!ns_is_family_root(all[i].mount_point)) continue;
         total++;
         bool is_proxy = (src_dev[0] && strcmp(all[i].dev, src_dev) == 0);
         if (!is_proxy && fast_strstr(all[i].fstype, "fuse_daemon") != nullptr)
@@ -674,10 +674,10 @@ int ns_collect_mounts_under(int pid, const char* base_path, int include_self, in
     NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     NsMountEntry* sub = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     if (!all || !sub) { free(all); free(sub); return 0; }
-    int n = read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
+    int n = ns_read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
     if (n <= 0) { free(all); free(sub); return 0; }
-    int count = collect_mounts_under(all, n, base_path, include_self != 0, include_fuse != 0, sub, 512);
-    sort_deepest_first(sub, count);
+    int count = ns_gather_mounts_under(all, n, base_path, include_self != 0, include_fuse != 0, sub, 512);
+    ns_sort_deepest_first(sub, count);
     if (count > max_count) count = max_count;
     for (int i = 0; i < count; i++) {
         strncpy(mount_points[i], sub[i].mount_point, PATH_MAX - 1);

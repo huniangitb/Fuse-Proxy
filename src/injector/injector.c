@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "injector.h"
 #include "common.h"
+#include "nsp_util.h"
 #include "config_parser.h"
 #include "ns_utils.h"
 #include "fast_pid.h"
@@ -946,27 +947,8 @@ int main(int argc, char *argv[]) {
     }
     g_global_root_fd = open("/", O_RDONLY | O_PATH | O_CLOEXEC);
     escape_cgroup();
-    pid_t pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    setsid();
-    pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    /* SIGPIPE 忽略必须在 daemonize 后设置：fork 子进程会继承信号表，
-       但第二次 fork 后的孙子进程才是实际 daemon，此时设置最稳 */
-    signal(SIGPIPE, SIG_IGN);
-    /* 钳制 close 范围上限：sysconf 在某些环境可能返回 -1 或极大值，避免异常长循环 */
-    long max_fd_l = sysconf(_SC_OPEN_MAX);
-    int max_fd = (max_fd_l <= 0 || max_fd_l > 4096) ? 4096 : (int)max_fd_l;
-    for (int x = max_fd; x >= 0; x--) {
-        if (x != g_global_root_fd) close(x);
-    }
-    int dev_null = open("/dev/null", O_RDWR | O_CLOEXEC);
-    dup2(dev_null, 0);
-    dup2(dev_null, 1);
-    dup2(dev_null, 2);
-    close(dev_null);
+    /* 后台化经 nsp_util 公共库复用（保留 g_global_root_fd，禁私刻 fork 样板） */
+    nsp_daemonize(g_global_root_fd);
     log_init("injector");
     init_system_pkg_cache();
     config_init_lock();

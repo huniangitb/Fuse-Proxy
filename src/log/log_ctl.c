@@ -16,6 +16,7 @@
 #include <time.h>
 #include <json-c/json.h>
 #include "common.h"
+#include "nsp_util.h"
 #include "config_parser.h"
 
 static volatile sig_atomic_t g_running = 1;
@@ -890,10 +891,10 @@ static int config_broadcast_connect(void) {
         perror("创建 DGRAM socket 失败");
         return -1;
     }
-    struct sockaddr_un local = { .sun_family = AF_UNIX };
-    local.sun_path[0] = '\0';
-    snprintf(local.sun_path + 1, sizeof(local.sun_path) - 2, "nsp_ctl_%d", getpid());
-    socklen_t local_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(local.sun_path + 1);
+    char local_name[64];
+    snprintf(local_name, sizeof(local_name), "nsp_ctl_%d", getpid());
+    struct sockaddr_un local;
+    socklen_t local_len = nsp_uds_abstract_addr(&local, local_name);
     if (bind(sock, (struct sockaddr *)&local, local_len) < 0) {
         perror("绑定本地 DGRAM 地址失败");
         close(sock);
@@ -903,10 +904,8 @@ static int config_broadcast_connect(void) {
 }
 
 static int config_broadcast_send_cmd(int sock, const char *cmd) {
-    struct sockaddr_un pub = { .sun_family = AF_UNIX };
-    pub.sun_path[0] = '\0';
-    strncpy(pub.sun_path + 1, CONFIG_BROADCAST_SOCKET, sizeof(pub.sun_path) - 2);
-    socklen_t pub_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(CONFIG_BROADCAST_SOCKET);
+    struct sockaddr_un pub;
+    socklen_t pub_len = nsp_uds_abstract_addr(&pub, CONFIG_BROADCAST_SOCKET);
     return sendto(sock, cmd, strlen(cmd), MSG_NOSIGNAL,
                   (struct sockaddr *)&pub, pub_len);
 }
@@ -1035,10 +1034,8 @@ void process_and_print(char* line, bool force_uid, [[maybe_unused]] bool api_mod
 
 static void handle_list_injected(bool api_mode) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, IPC_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(IPC_SOCKET_NAME);
+    struct sockaddr_un addr;
+    socklen_t addr_len = nsp_uds_abstract_addr(&addr, IPC_SOCKET_NAME);
     if (connect(sock, (struct sockaddr*)&addr, addr_len) < 0) {
         perror("连接注入器 IPC 服务失败");
         return;
@@ -1169,9 +1166,8 @@ static void handle_list_users(bool api_mode) {
 
 static void stream_logs(const char* stream_cmd) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+    struct sockaddr_un addr;
+    socklen_t len = nsp_uds_abstract_addr(&addr, LOG_SOCKET_NAME);
     if (connect(sock, (struct sockaddr*)&addr, len) < 0) {
         perror("连接日志服务失败");
         return;
@@ -1361,9 +1357,8 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(pos_args[0], "log-count") == 0) {
         int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-        struct sockaddr_un log_addr = { .sun_family = AF_UNIX };
-        strncpy(log_addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(log_addr.sun_path) - 2);
-        socklen_t log_addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+        struct sockaddr_un log_addr;
+        socklen_t log_addr_len = nsp_uds_abstract_addr(&log_addr, LOG_SOCKET_NAME);
         if (connect(sock, (struct sockaddr*)&log_addr, log_addr_len) < 0) {
             perror("连接日志服务失败");
             return 1;
@@ -1397,9 +1392,8 @@ int main(int argc, char *argv[]) {
         perror("创建 socket 失败");
         return 1;
     }
-    struct sockaddr_un log_addr = { .sun_family = AF_UNIX };
-    strncpy(log_addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(log_addr.sun_path) - 2);
-    socklen_t log_addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+    struct sockaddr_un log_addr;
+    socklen_t log_addr_len = nsp_uds_abstract_addr(&log_addr, LOG_SOCKET_NAME);
     if (connect(sock, (struct sockaddr*)&log_addr, log_addr_len) < 0) {
         perror("连接日志服务失败");
         close(sock);

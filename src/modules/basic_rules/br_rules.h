@@ -91,7 +91,4 @@ void br_reload_config(void);
 /* uid → 包名解析（框架日志用） */
 int br_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
 
-/* 管道就绪通知（供 resolve 内日志等使用，不依赖 fuse_context） */
-int br_get_effective_user_id(int path_user_id, uid_t uid);
-
 #endif /* BR_RULES_H */
