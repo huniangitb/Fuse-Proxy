@@ -71,6 +71,8 @@ rule_server -c '{"cmd":"LIST"}'
 | `REMOVE` | 按 (类型, 索引) 删除规则 |
 | `ENABLE` / `DISABLE` | 启用 / 停用规则（`#` 注释切换） |
 | `SET` | 设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/INJECT_ENABLE） |
+| `FTP_LIST` / `FTP_GET` | 查询 ftp.conf 服务器账号（密码脱敏，只回 `has_password`） |
+| `FTP_ADD` / `FTP_SET` / `FTP_REMOVE` | 增改删 ftp.conf 服务器段（原子落盘，ftp_module 经 inotify 自动热重载） |
 | `RELOAD` | 向 injector 发送 SIGHUP 触发配置重载 |
 | `STOP` | 向 injector 发送 SIGTERM 停止注入服务 |
 | `SERVICE` | 服务状态查询与启停控制（log_monitor/injector/fuse_daemon） |
@@ -322,6 +324,45 @@ rule_server 在运行时解析并体现在 `rule_types` 中，前端无需硬编
 ```
 
 复用 ADD 的写入逻辑（INJECT_ENABLE 仅应用作用域有效）。
+
+### 7.1 FTP —— 服务器账号管理（ftp.conf）
+
+基于公共 `nsp_ini_store` 抽象（`include/nsp_ini_store.h`，第三方模块可借用）：
+注释保留的行级读写 + 临时文件 rename 原子落盘；`ftp_module` 经 inotify
+监听目录自动热重载，改完即生效，无需 RELOAD。
+
+安全：`password` 只写不读——`FTP_LIST`/`FTP_GET` 绝不回传密码明文，
+仅回 `has_password` 布尔。`ftp.conf` 本身明文落盘（与模块解析现状一致，
+备份/分享配置目录时注意脱敏）。
+
+段名允许中文（如`云盘`，不用包名字符集校验），仅禁 `\n\r[]`；
+`[GLOBAL]` 非服务器段，控制面拒绝写入该名。字段上限与 `FtpServerCfg`
+对应：段名≤63、`host`≤255、`user`≤63、`password`≤127、`remote_dir`≤511；
+`port` 1~65535（缺省 21）；`user` 缺省 `anonymous`、`remote_dir` 缺省 `/`
+（LIST/GET 回填生效值，与模块行为一致）。
+字段值禁 `\n\r#`（`#` 为行内注释起点，放行会导致读回截断）；落盘文件
+权限收紧为 0600（含已存在文件的旧权限一并收紧）。
+
+```json
+{"cmd":"FTP_LIST"}
+{"cmd":"FTP_GET","name":"云盘"}
+{"cmd":"FTP_ADD","name":"云盘","host":"192.168.1.100","port":21,
+ "user":"myuser","password":"mypass","remote_dir":"/"}
+{"cmd":"FTP_SET","name":"云盘","key":"host","value":"10.0.0.1"}
+{"cmd":"FTP_REMOVE","name":"云盘"}
+```
+
+- `FTP_LIST` → `data{file, servers[]}`，每项
+  `{name,host,port,user,remote_dir,has_password}`。
+- `FTP_GET` → 同形状单对象（+ `file`）；段不存在返回 error。
+- `FTP_ADD`：段不存在时 `host` 必填；同名且所给字段与现状一致返回
+  `duplicate:true, changed:false` 免写；空字符串的可选字段视为"不写该键"
+  （走模块缺省；清空请用 `FTP_SET` 传空值删键）；`password` 统一写
+  `password` 键并清理旧 `pass` 别名。
+- `FTP_SET`：`key` 限 `host/port/user/password/remote_dir`（`pass` 归一
+  `password`）；空值 = 删键回缺省；段不存在报错（新建请用 `FTP_ADD`）；
+  同值免写（`changed:false`）。
+- `FTP_REMOVE`：整段删除；段不存在返回 error。
 
 ### 8. RELOAD / STOP
 

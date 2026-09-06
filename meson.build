@@ -110,7 +110,10 @@ common_sources = [
     'src/core/sys_pkg.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c']
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
+  # nsp_ini_store 逐源编入（非静态库）：fuse_daemon 自身不调用，但须常驻导出表
+  # 供 dlopen 的第三方模块借用——静态库无人引用会被链接器丢弃，逐源编译则常驻
+  'src/core/nsp_ini_store.c']
 injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
@@ -204,10 +207,11 @@ executable('log_ctl',
 )
 
 # rule_server：规则控制守护进程（前端经 nsp_rule_socket 抽象 UDS 以 JSON 行协议
-# 动态增删/启停规则、重载配置、停止注入）。纯文件级操作，仅依赖 json-c，
-# 不链接 libfuse3；Android/GNU 均构建（路径经 CONFIG_DIR 宏适配）。
+# 动态增删/启停规则、重载配置、停止注入，还管 ftp.conf 服务器账号）。
+# 纯文件级操作，仅依赖 json-c，不链接 libfuse3；Android/GNU 均构建
+# （路径经 CONFIG_DIR 宏适配）。nsp_ini_store 逐源编入，与 fuse_daemon 导出表同实现。
 executable('rule_server',
-  ['src/rule/rule_server.c'],
+  ['src/rule/rule_server.c', 'src/core/nsp_ini_store.c'],
   include_directories: all_inc_dirs,
   dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep],
   install: true,

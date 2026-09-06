@@ -558,6 +558,105 @@ def check(proc, sock_name, conf_dir):
     expect("压力后 HIDE 规则数 ≤ 51（去重）", hide_cnt <= 51, f"HIDE={hide_cnt}")
     expect("压力后 HIDE 文件未丢失内容", hide_cnt > 0, f"HIDE={hide_cnt}")
 
+    # ---- FTP 服务器账号管理（ftp.conf，基于公共 nsp_ini_store） ----
+    # 初始无 ftp.conf：空表
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_LIST"})
+    expect("FTP_LIST 空表", r.get("status") == "ok" and r["data"]["servers"] == []
+           and r["data"]["file"].endswith("ftp.conf"), r)
+    # 新建中文段名服务器
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "云盘", "host": "192.168.1.100",
+                                   "port": 21, "user": "myuser", "password": "mypass",
+                                   "remote_dir": "/"})
+    expect("FTP_ADD 云盘", r.get("status") == "ok" and r["data"]["changed"] is True
+           and r["data"]["duplicate"] is False, r)
+    # 幂等：同值再加 → duplicate
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "云盘", "host": "192.168.1.100",
+                                   "port": 21, "user": "myuser", "password": "mypass",
+                                   "remote_dir": "/"})
+    expect("FTP_ADD 幂等 duplicate", r.get("status") == "ok" and r["data"]["duplicate"] is True
+           and r["data"]["changed"] is False, r)
+    # GET 脱敏：无 password 键、有 has_password
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "云盘"})
+    expect("FTP_GET 脱敏", r.get("status") == "ok" and "password" not in r["data"]
+           and "pass" not in r["data"] and r["data"]["has_password"] is True
+           and r["data"]["host"] == "192.168.1.100" and r["data"]["port"] == 21
+           and r["data"]["user"] == "myuser" and r["data"]["remote_dir"] == "/", r)
+    # 缺省值回填：只给 host 的匿名服务器
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "公共盘", "host": "ftp.example.com"})
+    expect("FTP_ADD 缺省字段", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "公共盘"})
+    expect("FTP_GET 缺省回填", r.get("status") == "ok" and r["data"]["port"] == 21
+           and r["data"]["user"] == "anonymous" and r["data"]["remote_dir"] == "/"
+           and r["data"]["has_password"] is False, r)
+    # LIST 两条
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_LIST"})
+    expect("FTP_LIST 两条", r.get("status") == "ok" and len(r["data"]["servers"]) == 2, r)
+    # SET 改 host + port
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "host", "value": "10.0.0.1"})
+    expect("FTP_SET host", r.get("status") == "ok" and r["data"]["changed"] is True, r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "host", "value": "10.0.0.1"})
+    expect("FTP_SET 同值免写", r.get("status") == "ok" and r["data"]["changed"] is False, r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "port", "value": "2121"})
+    expect("FTP_SET port", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "云盘"})
+    expect("FTP_SET 生效", r["data"]["host"] == "10.0.0.1" and r["data"]["port"] == 2121, r["data"])
+    # 轮换密码：FTP_ADD 同名新密码必须落盘（非 duplicate）
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "云盘", "host": "10.0.0.1",
+                                   "port": 2121, "user": "myuser", "password": "newpass",
+                                   "remote_dir": "/"})
+    expect("FTP_ADD 换密码落盘", r.get("status") == "ok" and r["data"]["changed"] is True
+           and r["data"]["duplicate"] is False, r)
+    ftp_text = open(os.path.join(conf_dir, "ftp.conf"), encoding="utf-8").read()
+    expect("FTP_ADD 新密码已写入", "password = newpass" in ftp_text
+           and "password = mypass" not in ftp_text, ftp_text)
+    # 含 # 的值拒绝（读侧以 # 为注释起点，放行会被截断）
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "井号盘", "host": "h", "password": "a#b"})
+    expect("FTP_ADD 密码含#拒绝", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "host", "value": "h#x"})
+    expect("FTP_SET host含#拒绝", r.get("status") == "error", r)
+    # 落盘权限 0600（明文密码）
+    import stat as _stat
+    mode = _stat.S_IMODE(os.stat(os.path.join(conf_dir, "ftp.conf")).st_mode)
+    expect("ftp.conf 权限 0600", mode == 0o600, oct(mode))
+    # pass 别名归一 password
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "公共盘", "key": "pass", "value": "anonpass"})
+    expect("FTP_SET pass 别名", r.get("status") == "ok" and r["data"]["key"] == "password", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "公共盘"})
+    expect("FTP_SET pass 生效且脱敏", r["data"]["has_password"] is True
+           and "password" not in r["data"] and "pass" not in r["data"], r["data"])
+    # 空值删键回缺省
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "公共盘", "key": "password", "value": ""})
+    expect("FTP_SET 空值删键", r.get("status") == "ok" and r["data"]["changed"] is True, r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "公共盘"})
+    expect("FTP_SET 删键后无密码", r["data"]["has_password"] is False, r["data"])
+    # 非法输入拒绝
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "GLOBAL", "host": "x"})
+    expect("FTP_ADD 拒绝 GLOBAL 段名", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "坏[名", "host": "x"})
+    expect("FTP_ADD 拒绝非法段名", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "新盘"})
+    expect("FTP_ADD 新建缺 host 拒绝", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "新盘", "host": "x", "port": 99999})
+    expect("FTP_ADD 非法端口拒绝", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "bogus", "value": "x"})
+    expect("FTP_SET 未知字段拒绝", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "不存在", "key": "host", "value": "x"})
+    expect("FTP_SET 不存在拒绝", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "不存在"})
+    expect("FTP_GET 不存在拒绝", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": "不存在"})
+    expect("FTP_REMOVE 不存在拒绝", r.get("status") == "error", r)
+    # 文件级验证：注释保留、可被 ftp_conf 语义解析
+    ftp_text = open(os.path.join(conf_dir, "ftp.conf"), encoding="utf-8").read()
+    expect("ftp.conf 含两段", "[云盘]" in ftp_text and "[公共盘]" in ftp_text, ftp_text)
+    expect("ftp.conf 密码落盘（轮换后）", "password = newpass" in ftp_text, ftp_text)
+    # REMOVE
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": "公共盘"})
+    expect("FTP_REMOVE", r.get("status") == "ok" and r["data"]["name"] == "公共盘", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_LIST"})
+    expect("FTP_REMOVE 后剩一条", len(r["data"]["servers"]) == 1
+           and r["data"]["servers"][0]["name"] == "云盘", r)
+
     # ---- STATUS ----
     r = send_cmd(proc, sock_name, {"cmd": "STATUS"})
     expect("STATUS", r.get("status") == "ok" and r["data"]["config_dir"] == conf_dir, r)
