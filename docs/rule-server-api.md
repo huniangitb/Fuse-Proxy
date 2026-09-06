@@ -195,12 +195,19 @@ rule_server -c '{"cmd":"LIST"}'
 {"cmd":"GET","uid":10}
 ```
 
-- `pkg` 省略或为 `GLOBAL` 时返回全局段；否则返回该应用。
-- `uid` 默认 `0`（多用户场景指定用户，见下）。
+- `pkg` 省略或为 `GLOBAL` 时返回全局段；`pkg` 为 `USER_APPS`/`SYSTEM_APPS`
+  时返回类别段视图（`data.category`：主文件内精确段头切片，含 `section` 段头名；
+  其中 `rules[].index` 为**段内局部序号**，仅展示用）；否则返回该应用。
+- `uid` 默认 `0`（多用户场景指定用户，见下；类别段 `USER_APPS` 按 `uid` 选段）。
 - **uid 过滤**：`GET {"uid":10}` 返回全局快照 + uid 10 用户空间的全部应用；
   `GET {"pkg":"GLOBAL","uid":10}` 同理。
 
-响应 `data`：`global` 或 `app` 对象（结构与 LIST 内对应项一致）。
+响应 `data`：`global`、`app` 或 `category` 对象（`global`/`app` 结构与 LIST 内对应项一致）。
+
+```json
+{"cmd":"GET","pkg":"USER_APPS","uid":10}
+{"cmd":"GET","pkg":"SYSTEM_APPS"}
+```
 
 ### 3.1 USERS —— 多用户列表
 
@@ -274,7 +281,17 @@ rule_server 在运行时解析并体现在 `rule_types` 中，前端无需硬编
 
 - `pkg=GLOBAL` 写入 `injector.conf` 的 `[GLOBAL]` 段（开关替换、规则去重插入）。
 - `pkg=<应用>` 写入 `App-rules/<pkg>.conf`（uid>0 时 `App-rules-<uid>/`），目录不存在自动创建。
+- `pkg=USER_APPS`/`SYSTEM_APPS` 写入 `injector.conf` 的精确类别段头
+  （`[USER_APPS:<uid>]`，`uid` 默认 0；`[SYSTEM_APPS]`），开关替换、规则去重插入；
+  控制面恒写显式 `:uid`，裸 `[USER_APPS]`（跨用户 fallback）仅支持手写配置；
+  `INJECT_ENABLE` 不适用于类别段（启停请直接编辑段头 `ON`/`OFF`），
+  `GLOBAL_INJECT`/`SKIP_SYSTEM_APPS` 仍仅 `[GLOBAL]` 可用。
 - 重复规则幂等（去重，返回 `duplicate:true`）。
+
+```json
+{"cmd":"ADD","pkg":"USER_APPS","uid":10,"type":"HIDE","value":"/sdcard/secret"}
+{"cmd":"ADD","pkg":"SYSTEM_APPS","type":"REDIRECT","value":"/sdcard/a|/sdcard/b"}
+```
 
 ### 5. REMOVE —— 删除规则
 
@@ -284,6 +301,8 @@ rule_server 在运行时解析并体现在 `rule_types` 中，前端无需硬编
 ```
 
 按 `type` 内第 `index` 条（含已停用行）删除，索引与 LIST 输出一致。
+类别段（`pkg=USER_APPS`/`SYSTEM_APPS`）路由到主文件，用**主文件全局索引**
+（与 `pkg=GLOBAL` 语义一致；`GET category` 返回的是段内局部序号，仅展示用）。
 
 ### 6. ENABLE / DISABLE —— 启用 / 停用规则
 

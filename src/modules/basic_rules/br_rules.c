@@ -4,6 +4,7 @@
 #include "path_vars.h"
 #include "uid_map.h"
 #include "fast_pid.h"
+#include "sys_pkg.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,11 +39,13 @@ typedef struct {
     _Atomic uint64_t seq;        /* seqlock 序号 */
     uid_t uid;
     AppConfig* cfg;
+    AppConfig* cat;              /* 命中的类别段（USER_APPS/SYSTEM_APPS，可 NULL；
+                                     与 cfg 同代际、同样仅作废不保留） */
     uint64_t gen;                /* 填充时的配置代际（g_br_cfg_gen）：
-                                    重载后过期 → 走 pkg 复用路径（见下） */
+                                     重载后过期 → 走 pkg 复用路径（见下） */
     char pkg[128];               /* pkg 为进程事实，不随规则重载变化：
-                                    重载仅作废 cfg（置 NULL + gen=0），
-                                    保留 uid/pkg，下次命中免 /proc 重解析 */
+                                     重载仅作废 cfg（置 NULL + gen=0），
+                                     保留 uid/pkg，下次命中免 /proc 重解析 */
 } UidCacheSlot;
 static UidCacheSlot g_uid_cache[UID_CACHE_SIZE];
 static UidMapEntry *g_uid_maps = NULL;
@@ -61,9 +64,12 @@ typedef struct {
     pid_t pid;
     char dir[PATH_MAX];        /* 父目录 sub_path（"/" 或 "/a/b"） */
     AppConfig* cfg;            /* 命中的应用段（可 NULL=system） */
+    AppConfig* cat;            /* 命中的类别段（可 NULL），与 cfg 同代际 */
     char current_pkg[128];
     const TrieNode* app_dir_node;   /* app trie 父目录最深节点（可 NULL） */
     bool app_dir_hidden;            /* 根→父目录累积 hidden（app） */
+    const TrieNode* cat_dir_node;   /* 类别 trie 父目录最深节点（可 NULL） */
+    bool cat_dir_hidden;            /* 根→父目录累积 hidden（类别） */
     const TrieNode* g_dir_node;     /* global trie 父目录最深节点（可 NULL） */
     bool g_dir_hidden;              /* 根→父目录累积 hidden（global） */
 } BrProbeDirCache;
@@ -116,6 +122,7 @@ static void clear_uid_cache(void) {
            保留 uid/pkg——pkg 为进程事实不随规则重载变化，下次同 uid 命中
            可复用 pkg 免 /proc 重解析（热重载后不再全量 uid /proc 风暴） */
         s->cfg = nullptr;
+        s->cat = nullptr;   /* 类别指针同代际，同样作废（防悬垂） */
         s->gen = 0;
         atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
                               memory_order_release);
@@ -133,6 +140,7 @@ void br_reload_config(void) {
     clear_uid_cache();
     load_config_rules(g_br_rules_path);
     load_uid_map();
+    sys_pkg_refresh();   /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     config_unlock_write();
     LOG_DBG("已检测到配置变更，重新加载配置，全局监控状态: %s",
             g_global_cfg.monitor ? "开启" : "关闭");
@@ -209,6 +217,9 @@ int br_rules_init(const char* rules_path, bool disable_sandbox) {
        热重载（config_monitor_thread → br_reload_config）同理会卡死 */
     config_set_allow_app_rules_mkdir(false);
     config_set_scan_users_skip_pm(true);
+    /* 只读消费系统应用表（injector 落盘的 sys_pkgs.cache）：本进程永不
+       popen pm（binder 挂起风险），无表时回退 uid<10000 */
+    sys_pkg_init(false);
     config_init_lock();
     for (int i = 0; i < UID_CACHE_SIZE; i++) {
         pthread_mutex_init(&g_uid_cache[i].wlock, nullptr);
@@ -237,6 +248,7 @@ void br_rules_exit(void) {
     g_br_stop = true;
     pthread_join(g_br_monitor_tid, nullptr);
     config_destroy_lock();
+    sys_pkg_cleanup();
     free(g_uid_maps);
     g_uid_maps = NULL;
     g_uid_map_count = 0;
@@ -244,10 +256,30 @@ void br_rules_exit(void) {
 
 /* ============ uid → AppConfig 解析（适配 vfs_get_app_cfg） ============ */
 
-static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
+/* 类别段拾取（三层合并应用>类别>全局的中间层）：
+ * - uid<10000 / pkg=="system" → 系统 → SYSTEM_APPS（忽略 user_id，
+ *   对所有用户系统应用生效）；
+ * - 可解析包名 → pm 系统表命中（GMS 类高 uid 系统应用）归 SYSTEM_APPS，
+ *   否则 USER_APPS[user_id]，无则 USER_APPS[-1] 跨用户 fallback；
+ * - 不可解析（unknown/zygote/过短）→ NULL（仅 GLOBAL，fail-safe）。
+ * 无类别段时直接 NULL：零额外开销、行为与旧版一致 */
+static AppConfig* br_pick_category(uid_t uid, int user_id, const char* base_pkg) {
+    if (!config_has_category_rules()) return nullptr;
+    if (uid < 10000 || strcmp(base_pkg, "system") == 0)
+        return find_category_cfg_locked(true, user_id);
+    if (!pkg_resolvable(base_pkg)) return nullptr;
+    if (sys_pkg_is_system(base_pkg))
+        return find_category_cfg_locked(true, user_id);
+    return find_category_cfg_locked(false, user_id);
+}
+
+static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, AppConfig** cat_out) {
+    if (cat_out) *cat_out = nullptr;
     if (uid < 10000) {
         strncpy(current_pkg_out, "system", 127);
         current_pkg_out[127] = '\0';
+        /* 系统伪包同样参与类别层：SYSTEM_APPS 对 uid<10000 生效 */
+        if (cat_out) *cat_out = br_pick_category(uid, (int)(uid / 100000), "system");
         return nullptr;
     }
     int slot = uid % UID_CACHE_SIZE;
@@ -264,6 +296,7 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
         if (s1 & 1) continue;   /* 写者进行中：重试 */
         uid_t suid = s->uid;
         AppConfig* scfg = s->cfg;
+        AppConfig* scat = s->cat;
         uint64_t sgen = s->gen;
         memcpy(reuse_pkg, s->pkg, sizeof reuse_pkg);
         uint64_t s2 = atomic_load_explicit(&s->seq, memory_order_acquire);
@@ -272,6 +305,7 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
             if (sgen == cur_gen) {
                 strncpy(current_pkg_out, reuse_pkg, 127);
                 current_pkg_out[127] = '\0';
+                if (cat_out) *cat_out = scat;
                 return scfg;
             }
             /* 代际过期（热重载后）：pkg 为进程事实仍有效，可复用免 /proc */
@@ -322,6 +356,7 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
                               memory_order_release);
         s->uid = uid;
         s->cfg = nullptr;
+        s->cat = nullptr;   /* 不可解析包名：类别层不同时生效（仅 GLOBAL） */
         s->gen = cur_gen;
         strncpy(s->pkg, base_pkg, 127);
         s->pkg[127] = '\0';
@@ -332,11 +367,14 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out) {
     }
 
     AppConfig* matched = find_app_cfg_locked(final_pkg, user_id);
+    AppConfig* cat = br_pick_category(uid, user_id, base_pkg);
+    if (cat_out) *cat_out = cat;
     pthread_mutex_lock(&s->wlock);
     atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
                           memory_order_release);
     s->uid = uid;
     s->cfg = matched;
+    s->cat = cat;
     s->gen = cur_gen;
     strncpy(s->pkg, current_pkg_out, 127);
     s->pkg[127] = '\0';
@@ -370,7 +408,7 @@ static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg) {
     return false;
 }
 
-static void br_trie_resolve(AppConfig* cfg, const char* sub_path, TrieMatch* out) {
+static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path, TrieMatch* out) {
     if (!out) return;
     out->valid = true;
     out->hidden = false;
@@ -378,8 +416,10 @@ static void br_trie_resolve(AppConfig* cfg, const char* sub_path, TrieMatch* out
     out->has_redir = false;
     out->redir[0] = '\0';
     out->ftp_app[0] = '\0';
+    out->ftp_cat[0] = '\0';
     out->ftp_global[0] = '\0';
     out->app_node = NULL;
+    out->cat_node = NULL;
     out->global_node = NULL;
     if (cfg && cfg->trie_root) {
         bool h = false, r = false;
@@ -397,6 +437,23 @@ static void br_trie_resolve(AppConfig* cfg, const char* sub_path, TrieMatch* out
         if (redir[0] != '\0') {
             out->has_redir = true;
             strcpy(out->redir, redir);          /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
+        }
+    }
+    /* 类别层（USER_APPS/SYSTEM_APPS）：hidden/ro 取并集，redir 仅 app 未命中时补 */
+    if (cat && cat->trie_root) {
+        bool h = false, r = false;
+        char redir[PATH_MAX]; redir[0] = '\0';
+        char ftp[64]; ftp[0] = '\0';
+        out->cat_node = trie_lookup_full(cat->trie_root, sub_path, &h, &r, redir, sizeof(redir),
+                                         ftp, sizeof(ftp));
+        if (h) out->hidden = true;
+        if (r) out->ro = true;
+        if (ftp[0] != '\0') {
+            strcpy(out->ftp_cat, ftp);
+        }
+        if (!out->has_redir && redir[0] != '\0') {
+            out->has_redir = true;
+            strcpy(out->redir, redir);
         }
     }
     if (g_global_cfg.trie_root) {
@@ -439,7 +496,29 @@ static bool br_hidden_static_part(const char* sub_path, const char* current_pkg,
     return false;
 }
 
-static bool br_is_path_hidden_internal(AppConfig* cfg, const char* sub_path, const char* current_pkg, const TrieMatch* tm) {
+/* 类别 hide 线性扫描（USER_APPS/SYSTEM_APPS 动态规则）：变量展开以类别段
+   为专属作用域（覆盖全局同名），与 app/global 展开对称 */
+static bool br_cat_hide_linear(AppConfig* cat, const char* sub_path, const char* current_pkg) {
+    if (!(cat && cat->hide_rules && cat->dyn_hide)) return false;
+    for (int i = 0; i < cat->hide_count; i++) {
+        if (cat->hide_rules[i]) {
+            const char* rule = cat->hide_rules[i];
+            char expanded[PATH_MAX];
+            const char* match_str = rule;
+            if (has_path_var(rule)) {
+                if (!pkg_resolvable(current_pkg)) continue;
+                expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg, current_pkg);
+                match_str = expanded;
+            }
+            if (fnmatch(match_str, sub_path, 0) == 0) return true;
+            size_t len = strlen(match_str);
+            if (strncmp(sub_path, match_str, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) return true;
+        }
+    }
+    return false;
+}
+
+static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const char* sub_path, const char* current_pkg, const TrieMatch* tm) {
     bool is_skel = false;
     if (br_hidden_static_part(sub_path, current_pkg, tm, &is_skel)) return true;
     if (is_skel) return false;   /* 骨架目录恒不隐藏（原逻辑提前返回，不扫 hide） */
@@ -449,6 +528,12 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, const char* sub_path, con
         if (cfg && cfg->trie_root) {
             if (trie_lookup(cfg->trie_root, sub_path, &hidden, &dummy_ro, NULL, 0)) {
                 if (hidden) return true;
+            }
+        }
+        if (cat && cat->trie_root) {
+            bool cat_hidden = false;
+            if (trie_lookup(cat->trie_root, sub_path, &cat_hidden, &dummy_ro, NULL, 0)) {
+                if (cat_hidden) return true;
             }
         }
         if (g_global_cfg.trie_root) {
@@ -475,6 +560,7 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, const char* sub_path, con
             }
         }
     }
+    if (br_cat_hide_linear(cat, sub_path, current_pkg)) return true;
     if (g_global_cfg.hide_rules && g_global_cfg.dyn_hide) {
         for (int i = 0; i < g_global_cfg.hide_count; i++) {
             if (g_global_cfg.hide_rules[i]) {
@@ -528,16 +614,16 @@ static int br_strip_and_sanitize(const char* path, int* path_user_id_out,
     return 0;
 }
 
-static int br_sanitize_and_check_hidden(AppConfig* cfg, const char* path, int* path_user_id_out,
+static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const char* path, int* path_user_id_out,
                                         char* sub_path_out, size_t sub_path_size,
                                         const char* current_pkg, uid_t uid, TrieMatch* tm_out) {
     (void)uid;
     if (br_strip_and_sanitize(path, path_user_id_out, sub_path_out, sub_path_size) != 0)
         return -ENOENT;
-    if (tm_out) br_trie_resolve(cfg, sub_path_out, tm_out);
+    if (tm_out) br_trie_resolve(cfg, cat, sub_path_out, tm_out);
     /* 隐藏判定对所有访问者生效（含 root，与 vfs_readdir probe 过滤一致）：
        HIDE 规则配置后，root ls 也不应看到被隐藏条目 */
-    if (br_is_path_hidden_internal(cfg, sub_path_out, current_pkg, tm_out)) return -ENOENT;
+    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out)) return -ENOENT;
     return 0;
 }
 
@@ -648,7 +734,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
     return false;
 }
 
-static int br_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, size_t size,
+static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf, size_t size,
                            int user_id, bool* is_redir_out, const char* current_pkg,
                            const TrieMatch* tm, uid_t uid) {
     char temp[PATH_MAX] = {0};
@@ -665,6 +751,12 @@ static int br_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, 
         bool dummy_ro = false;
         if (cfg && cfg->trie_root) {
             if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
+                if (temp[0] != '\0') redir = true;
+            }
+        }
+        if (!redir && cat && cat->trie_root) {
+            temp[0] = '\0';
+            if (trie_lookup(cat->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp, sizeof(temp))) {
                 if (temp[0] != '\0') redir = true;
             }
         }
@@ -685,18 +777,27 @@ static int br_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, 
     }
 
     /* redir 线性兜底仅当存在通配/变量规则（未入 trie）时执行；
-       全静态规则已由上方 trie（tm.has_redir）覆盖，跳过 O(N) 扫描 */
+       全静态规则已由上方 trie（tm.has_redir）覆盖，跳过 O(N) 扫描。
+       顺序：应用 > 类别 > 全局（类别变量展开以类别段为专属作用域） */
     if (!redir && cfg && cfg->dyn_redir)
         redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid);
+    if (!redir && cat && cat->dyn_redir)
+        redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid);
     if (!redir && g_global_cfg.dyn_redir)
         redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid);
+    /* sandbox 三层：应用显式 OFF 否决类别+全局；类别显式 OFF 否决全局；
+       应用显式 ON（或类别显式 ON 且应用未显式）时各自 sandbox 生效 */
+    bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
+    bool cat_sandbox_off = (!app_sandbox_off && cat && cat->sandbox_explicit && !cat->sandbox);
     if (!redir && !g_br_disable_sandbox) {
-        bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
         if (!app_sandbox_off) redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp), uid);
     }
     if (!redir && !g_br_disable_sandbox) {
-        bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
-        if (!app_sandbox_off) redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp), uid);
+        if (!app_sandbox_off) redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, false, sizeof(temp), uid);
+    }
+    if (!redir && !g_br_disable_sandbox) {
+        if (!app_sandbox_off && !cat_sandbox_off)
+            redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false, sizeof(temp), uid);
     }
     if (!redir) {
         common_default_real_path(user_id, sub_path, temp, sizeof(temp));
@@ -708,7 +809,28 @@ static int br_to_real_path(AppConfig* cfg, const char* sub_path, char* out_buf, 
     return 0;
 }
 
-static bool br_is_path_ro(AppConfig* cfg, const char* sub_path, const char* current_pkg, const TrieMatch* tm) {
+/* 类别 RO 线性扫描：变量展开以类别段为专属作用域 */
+static bool br_cat_ro_linear(AppConfig* cat, const char* sub_path, const char* current_pkg) {
+    if (!(cat && cat->ro_rules && cat->dyn_ro)) return false;
+    for (int i = 0; i < cat->ro_count; i++) {
+        if (cat->ro_rules[i]) {
+            const char* rule = cat->ro_rules[i];
+            char expanded[PATH_MAX];
+            const char* match_str = rule;
+            if (has_path_var(rule)) {
+                if (!pkg_resolvable(current_pkg)) continue;
+                expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg, current_pkg);
+                match_str = expanded;
+            }
+            if (fnmatch(match_str, sub_path, 0) == 0) return true;
+            size_t len = strlen(match_str);
+            if (strncmp(sub_path, match_str, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/')) return true;
+        }
+    }
+    return false;
+}
+
+static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path, const char* current_pkg, const TrieMatch* tm) {
     if (tm && tm->valid) {
         if (tm->ro) return true;
     } else {
@@ -717,6 +839,12 @@ static bool br_is_path_ro(AppConfig* cfg, const char* sub_path, const char* curr
         if (cfg && cfg->trie_root) {
             if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &ro, NULL, 0)) {
                 if (ro) return true;
+            }
+        }
+        if (cat && cat->trie_root) {
+            bool cat_ro = false;
+            if (trie_lookup(cat->trie_root, sub_path, &dummy_hidden, &cat_ro, NULL, 0)) {
+                if (cat_ro) return true;
             }
         }
         if (g_global_cfg.trie_root) {
@@ -743,6 +871,7 @@ static bool br_is_path_ro(AppConfig* cfg, const char* sub_path, const char* curr
             }
         }
     }
+    if (br_cat_ro_linear(cat, sub_path, current_pkg)) return true;
     if (g_global_cfg.ro_rules && g_global_cfg.dyn_ro) {
         for (int i = 0; i < g_global_cfg.ro_count; i++) {
             if (g_global_cfg.ro_rules[i]) {
@@ -786,7 +915,27 @@ static bool br_get_virtual_child(const char* parent, const char* desc, char* nam
 
 /* 虚拟祖先判定的线性规则部分（redir/ftp 前缀的祖先检查，不含 trie）——
    readdir 目录级缓存命中时复用，避免每条目重复全路径 trie 遍历 */
-static bool br_virtual_ancestor_linear(AppConfig* cfg, const char* sub_path) {
+/* 类别 redir/ftp 前缀的虚拟子目录判定（br_process_cfg_dirs 的线性版对应） */
+static bool br_cat_virtual_child(AppConfig* cat, const char* sub_path) {
+    if (!cat) return false;
+    if (cat->redir_rules) {
+        for (int i = 0; i < cat->redir_count; i++) {
+            if (strlen(sub_path) < strlen(cat->redir_rules[i].virtual_prefix)) {
+                if (br_get_virtual_child(sub_path, cat->redir_rules[i].virtual_prefix, nullptr, 0)) return true;
+            }
+        }
+    }
+    if (cat->ftp_rules) {
+        for (int i = 0; i < cat->ftp_count; i++) {
+            if (strlen(sub_path) < strlen(cat->ftp_rules[i].virtual_prefix)) {
+                if (br_get_virtual_child(sub_path, cat->ftp_rules[i].virtual_prefix, nullptr, 0)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool br_virtual_ancestor_linear(AppConfig* cfg, AppConfig* cat, const char* sub_path) {
     bool res = false;
     if (cfg) {
         if (cfg->redir_rules) {
@@ -804,6 +953,7 @@ static bool br_virtual_ancestor_linear(AppConfig* cfg, const char* sub_path) {
             }
         }
     }
+    if (!res) res = br_cat_virtual_child(cat, sub_path);
     if (!res) {
         if (g_global_cfg.redir_rules) {
             for (int i = 0; i < g_global_cfg.redir_count; i++) {
@@ -835,7 +985,7 @@ static bool br_allow_rule_match(const char* prefix, const char* sub_path) {
 }
 
 /* redirect_target 判定的线性规则部分（redir 前缀精确匹配 + 根 sandbox），不含 trie */
-static bool br_redirect_target_linear(AppConfig* cfg, const char* sub_path) {
+static bool br_redirect_target_linear(AppConfig* cfg, AppConfig* cat, const char* sub_path) {
     bool res = false;
     if (cfg) {
         if (cfg->redir_rules) {
@@ -845,39 +995,58 @@ static bool br_redirect_target_linear(AppConfig* cfg, const char* sub_path) {
         }
         if (!res && cfg->sandbox && strcmp(sub_path, "/") == 0) res = true;
     }
+    if (!res && cat) {
+        if (cat->redir_rules) {
+            for (int i = 0; i < cat->redir_count; i++) {
+                if (strcmp(sub_path, cat->redir_rules[i].virtual_prefix) == 0) { res = true; break; }
+            }
+        }
+        /* 类别 sandbox 根判定：应用显式设置时以应用为准（与全局层对称） */
+        if (!res && !(cfg && cfg->sandbox_explicit) && cat->sandbox && strcmp(sub_path, "/") == 0) res = true;
+    }
     if (!res) {
         if (g_global_cfg.redir_rules) {
             for (int i = 0; i < g_global_cfg.redir_count; i++) {
                 if (strcmp(sub_path, g_global_cfg.redir_rules[i].virtual_prefix) == 0) { res = true; break; }
             }
         }
-        if (!res && !(cfg && cfg->sandbox_explicit) && g_global_cfg.sandbox && strcmp(sub_path, "/") == 0) res = true;
+        bool sandbox_veto = (cfg && cfg->sandbox_explicit) || (cat && cat->sandbox_explicit);
+        if (!res && !sandbox_veto && g_global_cfg.sandbox && strcmp(sub_path, "/") == 0) res = true;
     }
     return res;
 }
 
-static bool br_is_virtual_ancestor(AppConfig* cfg, const char* sub_path) {
+static bool br_is_virtual_ancestor(AppConfig* cfg, AppConfig* cat, const char* sub_path) {
     bool res = false;
     if (cfg && cfg->trie_root) res = trie_is_ancestor(cfg->trie_root, sub_path);
+    if (!res && cat && cat->trie_root) res = trie_is_ancestor(cat->trie_root, sub_path);
     if (!res && g_global_cfg.trie_root) res = trie_is_ancestor(g_global_cfg.trie_root, sub_path);
     /* 线性兜底仅覆盖通配/变量 redir（FTP 已入 trie 且 trie_node_has_rules
        覆盖 ftp_backend），全静态时跳过 O(N) 扫描 */
     if (!res) {
-        bool dyn_any = (cfg && cfg->dyn_redir) || g_global_cfg.dyn_redir;
-        if (dyn_any) res = br_virtual_ancestor_linear(cfg, sub_path);
+        bool dyn_any = (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
+        if (dyn_any) res = br_virtual_ancestor_linear(cfg, cat, sub_path);
     }
     return res;
 }
 
-static bool br_is_redirect_target(AppConfig* cfg, const char* sub_path) {
+static bool br_is_redirect_target(AppConfig* cfg, AppConfig* cat, const char* sub_path) {
     bool res = false;
     if (cfg && cfg->trie_root) res = trie_is_redirect_target(cfg->trie_root, sub_path);
+    if (!res && cat && cat->trie_root) res = trie_is_redirect_target(cat->trie_root, sub_path);
     if (!res && g_global_cfg.trie_root) res = trie_is_redirect_target(g_global_cfg.trie_root, sub_path);
     if (!res) {
-        bool dyn_any = (cfg && cfg->dyn_redir) || g_global_cfg.dyn_redir;
-        if (dyn_any) res = br_redirect_target_linear(cfg, sub_path);
+        bool dyn_any = (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
+        if (dyn_any) res = br_redirect_target_linear(cfg, cat, sub_path);
     }
     return res;
+}
+
+/* MONITOR 三层合并：应用显式 > 类别显式 > 全局 */
+static bool br_effective_monitor(AppConfig* cfg, AppConfig* cat) {
+    if (cfg && cfg->monitor_explicit) return cfg->monitor;
+    if (cat && cat->monitor_explicit) return cat->monitor;
+    return g_global_cfg.monitor;
 }
 
 /* ============ 核心决策入口 ============ */
@@ -916,25 +1085,26 @@ void br_resolve(const BrQuery* q, BrResult* out) {
         uint64_t cfg_gen = config_read_begin();
         br_result_init(out);
         char current_pkg[128] = "unknown";
-        AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, current_pkg);
+        AppConfig* cat = nullptr;
+        AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, current_pkg, &cat);
 
     int path_user_id = -1;
     char sub_path[PATH_MAX];
     TrieMatch tm;
-    if (br_sanitize_and_check_hidden(cfg, q->path, &path_user_id, sub_path, sizeof sub_path,
+    if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path, sizeof sub_path,
                                      current_pkg, q->uid, &tm) != 0) {
         out->valid = true;
         out->hidden = true;
         out->user_id = path_user_id;
         strcpy(out->sub_path, sub_path);   /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         strcpy(out->pkg, current_pkg);     /* 源为 128B 栈缓冲，NUL 结尾 */
-        out->monitor_on = (cfg && cfg->monitor_explicit) ? cfg->monitor : g_global_cfg.monitor;
+        out->monitor_on = br_effective_monitor(cfg, cat);
         if (config_read_end(cfg_gen)) return;
         continue;
     }
     char p[PATH_MAX];
     bool is_redir = false;
-    if (br_to_real_path(cfg, sub_path, p, sizeof p, path_user_id, &is_redir, current_pkg, &tm, q->uid) != 0) {
+    if (br_to_real_path(cfg, cat, sub_path, p, sizeof p, path_user_id, &is_redir, current_pkg, &tm, q->uid) != 0) {
         out->valid = false;
         if (config_read_end(cfg_gen)) return;
         continue;
@@ -943,7 +1113,7 @@ void br_resolve(const BrQuery* q, BrResult* out) {
     out->user_id = path_user_id;
     strcpy(out->sub_path, sub_path);   /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
     strcpy(out->pkg, current_pkg);     /* 源为 128B 栈缓冲，NUL 结尾 */
-    out->ro = br_is_path_ro(cfg, sub_path, current_pkg, &tm);
+    out->ro = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
     out->is_redir = is_redir;
     strcpy(out->real_path, p);         /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
     if (tm.has_redir) {
@@ -953,13 +1123,20 @@ void br_resolve(const BrQuery* q, BrResult* out) {
     /* ALLOW 豁免：静态 ALLOW（无通配/变量）已入 trie 并以 "?<prefix>" 自引用
        redir 形式命中（上方 tm.has_redir 已置 has_redir），此处线性扫描仅覆盖
        **动态** ALLOW（通配/路径变量，未入 trie）。通配规则 fnmatch 全路径匹配，
-       非通配保持原前缀匹配（含 / 根豁免）。app 段优先、GLOBAL 兜底（与
+       非通配保持原前缀匹配（含 / 根豁免）。应用 > 类别 > GLOBAL（与
        REDIRECT 作用域一致）；全静态配置（常见）跳过 O(N) 扫描 */
     bool allow_hit = false;
     if (cfg && cfg->redir_rules && cfg->dyn_redir) {
         for (int i = 0; i < cfg->redir_count && !allow_hit; i++) {
             if (cfg->redir_rules[i].is_allow &&
                 br_allow_rule_match(cfg->redir_rules[i].virtual_prefix, sub_path))
+                allow_hit = true;
+        }
+    }
+    if (!allow_hit && cat && cat->redir_rules && cat->dyn_redir) {
+        for (int i = 0; i < cat->redir_count && !allow_hit; i++) {
+            if (cat->redir_rules[i].is_allow &&
+                br_allow_rule_match(cat->redir_rules[i].virtual_prefix, sub_path))
                 allow_hit = true;
         }
     }
@@ -971,34 +1148,37 @@ void br_resolve(const BrQuery* q, BrResult* out) {
         }
     }
     if (allow_hit) out->has_redir = true;
-    /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/global 完整匹配节点），
+    /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/类别/global 完整匹配节点），
        直接判定 virtual_ancestor / redirect_target，避免各自再全路径遍历：
        - virtual_ancestor：最深节点下存在带规则子节点（trie_is_ancestor 语义）
        - redirect_target：最深节点本身是重定向目标（trie_is_redirect_target 语义）
        （节点为 NULL = 路径未完整命中，两语义均为 false，与 trie_* 一致）
        线性兜底仅覆盖通配/变量 redir 规则（未入 trie），全静态时跳过 */
-    bool dyn_any = (cfg && cfg->dyn_redir) || g_global_cfg.dyn_redir;
+    bool dyn_any = (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
     out->is_virtual_ancestor =
         ((tm.app_node && trie_any_child_has_rules(tm.app_node)) ||
+         (tm.cat_node && trie_any_child_has_rules(tm.cat_node)) ||
          (tm.global_node && trie_any_child_has_rules(tm.global_node))) ||
-        (dyn_any && br_virtual_ancestor_linear(cfg, sub_path));
+        (dyn_any && br_virtual_ancestor_linear(cfg, cat, sub_path));
     out->is_redirect_target =
         ((tm.app_node && tm.app_node->redir_target) ||
+         (tm.cat_node && tm.cat_node->redir_target) ||
          (tm.global_node && tm.global_node->redir_target)) ||
-        (dyn_any && br_redirect_target_linear(cfg, sub_path));
-    /* FTP 规则（`FTP <虚拟前缀> <段名>`）：应用段规则优先、GLOBAL 兜底
+        (dyn_any && br_redirect_target_linear(cfg, cat, sub_path));
+    /* FTP 规则（`FTP <虚拟前缀> <段名>`）：应用 > 类别 > GLOBAL
        （与 REDIRECT 作用域语义一致）；命中结果由 br_trie_resolve 的 trie
        下降一次取得（替代 config_ftp_match 每请求 O(N) 线性扫描）；
        命中后由框架分派给 FTP 后端模块 */
     const char* ftp_bk = NULL;
     if (tm.ftp_app[0] != '\0') ftp_bk = tm.ftp_app;
+    else if (tm.ftp_cat[0] != '\0') ftp_bk = tm.ftp_cat;
     else if (tm.ftp_global[0] != '\0') ftp_bk = tm.ftp_global;
     if (ftp_bk) {
         out->is_ftp = true;
         strcpy(out->ftp_backend, ftp_bk);   /* 源为 TrieMatch 64B 字段，NUL 结尾 */
     }
     out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
-    out->monitor_on = (cfg && cfg->monitor_explicit) ? cfg->monitor : g_global_cfg.monitor;
+    out->monitor_on = br_effective_monitor(cfg, cat);
     if (config_read_end(cfg_gen)) return;
     /* 读期间发生发布：整体重试 */
     }
@@ -1010,7 +1190,7 @@ int br_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {
     for (;;) {
         uint64_t cfg_gen = config_read_begin();
         char pkg[128];
-        br_get_app_cfg(uid, tid, pkg);
+        br_get_app_cfg(uid, tid, pkg, NULL);   /* 仅需包名，类别层不需要 */
         if (config_read_end(cfg_gen)) {
             strncpy(pkg_out, pkg, pkg_size - 1);
             pkg_out[pkg_size - 1] = '\0';
@@ -1069,6 +1249,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
     if (pc->valid && pc->gen == gen && pc->uid == q->uid && pc->pid == q->pid &&
         strcmp(pc->dir, dir) == 0) {
         cfg = pc->cfg;
+        AppConfig* cat = pc->cat;
         strncpy(current_pkg, pc->current_pkg, 127); current_pkg[127] = '\0';
         /* 无锁快速路径：全静态规则（redir/hide/ro 均无通配/变量）+ 父目录无
            规则子节点——判定只用线程私有缓存字段与纯字符串，不触碰 cfg/trie
@@ -1077,11 +1258,12 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
            acquire 读 gen 相等即自缓存填充以来无重载；缓存为线程私有无并发写。 */
         bool all_static = !g_global_cfg.dyn_redir && !g_global_cfg.dyn_hide && !g_global_cfg.dyn_ro &&
                           !(cfg && (cfg->dyn_redir || cfg->dyn_hide || cfg->dyn_ro)) &&
-                          !pc->app_dir_node && !pc->g_dir_node;
+                          !(cat && (cat->dyn_redir || cat->dyn_hide || cat->dyn_ro)) &&
+                          !pc->app_dir_node && !pc->cat_dir_node && !pc->g_dir_node;
         if (all_static) {
             TrieMatch tm;
             tm.valid = true;
-            tm.hidden = pc->app_dir_hidden || pc->g_dir_hidden;
+            tm.hidden = pc->app_dir_hidden || pc->cat_dir_hidden || pc->g_dir_hidden;
             bool is_skel = false;
             /* 跨应用隔离仅在此（probe/readdir 列举过滤）显式生效：
                resolve 不再判 hidden（见 br_hidden_static_part 注释），
@@ -1095,9 +1277,11 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
             continue;
         }
         const TrieNode* ca = trie_find_child(pc->app_dir_node, name, name_len);
+        const TrieNode* cc = trie_find_child(pc->cat_dir_node, name, name_len);
         const TrieNode* cg = trie_find_child(pc->g_dir_node, name, name_len);
-        bool trie_hidden = pc->app_dir_hidden || pc->g_dir_hidden;
+        bool trie_hidden = pc->app_dir_hidden || pc->cat_dir_hidden || pc->g_dir_hidden;
         if (ca && ca->is_hidden) trie_hidden = true;
+        if (cc && cc->is_hidden) trie_hidden = true;
         if (cg && cg->is_hidden) trie_hidden = true;
         TrieMatch tm;
         tm.valid = true;
@@ -1108,7 +1292,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
            及 vfs_readdir probe 过滤语义一致，HIDE 后 root ls 也看不见。
            跨应用隔离在此显式叠加（resolve 不再判 hidden，见
            br_hidden_static_part 注释） */
-        if (br_is_path_hidden_internal(cfg, sub_path, current_pkg, &tm) ||
+        if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, &tm) ||
             br_is_other_app_pkg(sub_path, current_pkg)) {
             out->valid = true;
             out->hidden = true;
@@ -1117,21 +1301,24 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
         }
         out->valid = true;
         out->hidden = trie_hidden || br_is_other_app_pkg(sub_path, current_pkg);
-        bool dyn_any = (cfg && cfg->dyn_redir) || g_global_cfg.dyn_redir;
-        out->is_redirect_target = ((ca && ca->redir_target) || (cg && cg->redir_target)) ||
-                                  (dyn_any && br_redirect_target_linear(cfg, sub_path));
+        bool dyn_any = (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
+        out->is_redirect_target = ((ca && ca->redir_target) || (cc && cc->redir_target) ||
+                                   (cg && cg->redir_target)) ||
+                                  (dyn_any && br_redirect_target_linear(cfg, cat, sub_path));
         out->is_virtual_ancestor = ((ca && trie_any_child_has_rules(ca)) ||
+                                    (cc && trie_any_child_has_rules(cc)) ||
                                     (cg && trie_any_child_has_rules(cg))) ||
-                                   (dyn_any && br_virtual_ancestor_linear(cfg, sub_path));
+                                   (dyn_any && br_virtual_ancestor_linear(cfg, cat, sub_path));
         out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
         if (config_read_end(cfg_gen)) return;
         continue;
     }
 
     /* 未命中：完整路径解析（原逻辑）+ 填充目录缓存 */
-    cfg = br_get_app_cfg(q->uid, q->pid, current_pkg);
+    AppConfig* cat = nullptr;
+    cfg = br_get_app_cfg(q->uid, q->pid, current_pkg, &cat);
     TrieMatch tm;
-    if (br_sanitize_and_check_hidden(cfg, q->path, &path_user_id, sub_path, sizeof sub_path,
+    if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path, sizeof sub_path,
                                      current_pkg, q->uid, &tm) != 0 ||
         br_is_other_app_pkg(sub_path, current_pkg)) {
         out->valid = true;
@@ -1141,8 +1328,8 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
     }
     out->valid = true;
     out->hidden = tm.hidden || br_is_other_app_pkg(sub_path, current_pkg);
-    out->is_redirect_target = br_is_redirect_target(cfg, sub_path);
-    out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, sub_path);
+    out->is_redirect_target = br_is_redirect_target(cfg, cat, sub_path);
+    out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, cat, sub_path);
     out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
 
     /* 填充目录缓存（trie 沿父目录一次下降，后续条目复用） */
@@ -1154,11 +1341,15 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
     strncpy(pc->dir, dir, sizeof pc->dir - 1);
     pc->dir[sizeof pc->dir - 1] = '\0';
     pc->cfg = cfg;
+    pc->cat = cat;
     strncpy(pc->current_pkg, current_pkg, sizeof pc->current_pkg - 1);
     pc->current_pkg[sizeof pc->current_pkg - 1] = '\0';
     bool h = false, r = false;
     pc->app_dir_node = (cfg && cfg->trie_root) ? trie_walk_to(cfg->trie_root, dir, &h, &r) : NULL;
     pc->app_dir_hidden = h;
+    h = false; r = false;
+    pc->cat_dir_node = (cat && cat->trie_root) ? trie_walk_to(cat->trie_root, dir, &h, &r) : NULL;
+    pc->cat_dir_hidden = h;
     h = false; r = false;
     pc->g_dir_node = g_global_cfg.trie_root ? trie_walk_to(g_global_cfg.trie_root, dir, &h, &r) : NULL;
     pc->g_dir_hidden = h;
@@ -1230,10 +1421,12 @@ int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id,
         uint64_t cfg_gen = config_read_begin();
         char pkg_buf[128];
         (void)pkg;
-        AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, pkg_buf);
+        AppConfig* cat = nullptr;
+        AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, pkg_buf, &cat);
 
         int n = 0;
         n = br_process_cfg_dirs(cfg, sub_path, user_id, pkg_buf, is_root, out, max, n);
+        n = br_process_cfg_dirs(cat, sub_path, user_id, pkg_buf, is_root, out, max, n);
         n = br_process_cfg_dirs(&g_global_cfg, sub_path, user_id, pkg_buf, is_root, out, max, n);
         if (config_read_end(cfg_gen)) return n;
         /* 读期间发生发布：重试 */

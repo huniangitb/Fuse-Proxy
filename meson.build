@@ -106,7 +106,8 @@ common_sources = [
     'src/config/config_parser.c',
     'src/config/path_vars.c',
     'src/core/fast_search.c',
-    'src/core/uid_map.c'
+    'src/core/uid_map.c',
+    'src/core/sys_pkg.c'
 ]
 
 fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c']
@@ -225,6 +226,7 @@ basic_rules_sources = [
     'src/core/path_trie.c',
     'src/core/uid_map.c',
     'src/core/fast_pid.c',
+    'src/core/sys_pkg.c',
     'src/core/sha256.c',
     'src/modules/nsp_self_hash.c',
 ]

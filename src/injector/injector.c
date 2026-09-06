@@ -9,6 +9,7 @@
 #include "mount_manager.h"
 #include "ipc_server.h"
 #include "config_publisher.h"
+#include "sys_pkg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -180,6 +181,9 @@ static void reload_injector_config() {
     config_lock_write();
     load_config_rules(INJECTOR_CONFIG_PATH);
     config_unlock_write();
+    /* 系统应用表刷新（pm→内存+落盘 sys_pkgs.cache，供 fuse_daemon 只读消费；
+       仅当类别段存在时查询，避免无谓 popen） */
+    if (config_has_category_rules()) sys_pkg_refresh();
     setup_inotify_watches();
 }
 
@@ -924,15 +928,17 @@ static void do_cleanup() {
     fast_pid_cleanup();
 }
 
-int main(int argc, char *argv[]) {
-    escape_cgroup();
-    sigset_t sig_mask;
-    sigemptyset(&sig_mask);
-    sigaddset(&sig_mask, SIGINT);
-    sigaddset(&sig_mask, SIGTERM);
-    sigaddset(&sig_mask, SIGHUP);
-    sigaddset(&sig_mask, SIGCHLD);
-    pthread_sigmask(SIG_BLOCK, &sig_mask, nullptr);
+/* ============ 主入口编排（main 只按序调用，不含具体逻辑） ============
+   下列 static 阶段/分发函数语义与原 main 内联代码逐行一致（纯搬运），
+   便于单测与阅读：parse → early_init → setup_epoll → start_fuses →
+   event_loop → shutdown。 */
+typedef struct {
+    int sig_fd;
+    int timer_fd;
+    int ipc_sock;
+} InjectorFds;
+
+static void parse_cli_args(int argc, char *argv[], bool *start_passive_out) {
     bool start_passive = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "debug") == 0) g_min_log_level = LOG_DEBUG;
@@ -945,6 +951,21 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--passive") == 0 || strcmp(argv[i], "passive") == 0) start_passive = true;
         else if (strcmp(argv[i], "--global-replace") == 0) g_global_replace_mode = true;
     }
+    *start_passive_out = start_passive;
+}
+
+/* P3：信号集唯一构造点（early_init 填充，setup_epoll 复用，禁两处手写重复） */
+static sigset_t g_injector_sig_mask;
+
+static void injector_early_init(void) {
+    /* 信号屏蔽须在 daemonize 之前（原 main 时序）：fork/setsid 期间不丢信号，
+       signalfd 创建后统一经 epoll 分发 */
+    sigemptyset(&g_injector_sig_mask);
+    sigaddset(&g_injector_sig_mask, SIGINT);
+    sigaddset(&g_injector_sig_mask, SIGTERM);
+    sigaddset(&g_injector_sig_mask, SIGHUP);
+    sigaddset(&g_injector_sig_mask, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &g_injector_sig_mask, nullptr);
     g_global_root_fd = open("/", O_RDONLY | O_PATH | O_CLOEXEC);
     escape_cgroup();
     /* 后台化经 nsp_util 公共库复用（保留 g_global_root_fd，禁私刻 fork 样板） */
@@ -954,12 +975,17 @@ int main(int argc, char *argv[]) {
     config_init_lock();
     fast_pid_init();
     init_uid_map_cache();
+}
+
+static void injector_setup_epoll(InjectorFds *fds) {
+    /* P3：复用 early_init 已构造的信号集；escape_cgroup 只保留 early_init
+       open 后的那一次（原 main 入口处多余的一次不再重复） */
     g_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (g_epoll_fd < 0) {
         PERROR("无法创建 epoll 实例");
         exit(1);
     }
-    int sig_fd = signalfd(-1, &sig_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    int sig_fd = signalfd(-1, &g_injector_sig_mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sig_fd < 0) {
         PERROR("无法创建 signalfd");
         exit(1);
@@ -985,6 +1011,12 @@ int main(int argc, char *argv[]) {
     }
     struct epoll_event ev_ipc = { .events = EPOLLIN, .data.fd = ipc_sock };
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, ipc_sock, &ev_ipc);
+    fds->sig_fd = sig_fd;
+    fds->timer_fd = timer_fd;
+    fds->ipc_sock = ipc_sock;
+}
+
+static void injector_start_fuses(bool start_passive) {
     g_config_pub_fd = config_publisher_init();
     strcpy(g_real_root, STORAGE_BASE);
     mkdir_recursive(BACKUP_DIR);
@@ -1008,13 +1040,205 @@ int main(int argc, char *argv[]) {
     } else {
         LOG_DBG("com.android.providers.media.module 未开启注入，跳过媒体 FUSE 实例的启动。");
     }
-    
+
     g_pending_first_scan = 1;
     seconds_until_next_scan = 0;
     if (start_passive) {
         g_passive_mode = 1;
         LOG("被动监听模式启动");
     }
+}
+
+static void on_signal_event(int sig_fd) {
+    struct signalfd_siginfo fdsi;
+    ssize_t s = read(sig_fd, &fdsi, sizeof(struct signalfd_siginfo));
+    if (s == sizeof(struct signalfd_siginfo)) {
+        if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
+            LOG("收到终止信号 (%d)，执行退出...", fdsi.ssi_signo);
+            g_should_exit = 1;
+        } else if (fdsi.ssi_signo == SIGHUP) {
+            LOG("收到规则重载指令 (SIGHUP)。");
+            g_reload_config = 1;
+        } else if (fdsi.ssi_signo == SIGCHLD) {
+            reap_zombies();
+        }
+    }
+}
+
+static void maybe_periodic_scan(void) {
+    if (!g_passive_mode || (g_global_replace_mode && !g_global_replace_scanned_once)) {
+        /* 被动模式下禁用周期扫描（新应用由 zygisk IPC 通知即时还原）；
+           全局替换模式仅在程序生命周期开始时执行一次兜底扫描，
+           还原存量非目标应用，之后不再反复周期检测 */
+        if (seconds_until_next_scan > 0) {
+            seconds_until_next_scan--;
+        }
+        if (seconds_until_next_scan == 0) {
+            int found_now = scan_zygote_children();
+            if (g_global_replace_mode) {
+                g_global_replace_scanned_once = true;
+            }
+            if (found_now > 0) {
+                g_last_scan_found = true;
+                g_scan_interval_seconds = 30;
+            } else {
+                if (g_last_scan_found) {
+                    g_last_scan_found = false;
+                    g_scan_interval_seconds = 60;
+                } else {
+                    if (g_scan_interval_seconds < 300) {
+                        g_scan_interval_seconds = (g_scan_interval_seconds * 3) / 2;
+                        if (g_scan_interval_seconds > 300) g_scan_interval_seconds = 300;
+                    }
+                }
+            }
+            seconds_until_next_scan = g_scan_interval_seconds;
+        }
+    }
+}
+
+static void retry_pending_mounts(void) {
+    if (g_fuse_ready && g_retry_mount_count > 0) {
+        const char *mnt_src_retry = get_active_mnt_src();
+        if (mnt_src_retry) {
+            int retry_idx = 0;
+            while (retry_idx < g_retry_mount_count) {
+                RetryMountEntry *e = &g_retry_mounts[retry_idx];
+                e->retries++;
+                if (e->retries > 5) {
+                    LOG_DBG("重试耗尽，放弃 %s(PID:%d)", e->cmdline, e->pid);
+                    e->pid = -1;
+                } else if (kill(e->pid, 0) != 0) {
+                    LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e->cmdline, e->pid);
+                    e->pid = -1;
+                } else {
+                    /* 指数退避：第 N 次重试间隔 2^(N-2) 秒 (N>=2) */
+                    if (e->retries > 1) {
+                        time_t now = time(NULL);
+                        int backoff = 1 << (e->retries - 2); /* 1, 2, 4, 8 秒 */
+                        if (now - e->last_attempt < backoff) {
+                            LOG_DBG("重试退避 %s(PID:%d), 第%d次, 已过%lds<%ds",
+                                    e->cmdline, e->pid, e->retries,
+                                    now - e->last_attempt, backoff);
+                            retry_idx++;
+                            continue;
+                        }
+                    }
+                    uid_t uid = get_app_uid(e->pid);
+                    e->last_attempt = time(NULL);
+                    LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid, e->retries);
+                    int ret = perform_app_mount(e->cmdline, e->pid, uid, nullptr, "失败重试");
+                    if (ret == 0) {
+                        LOG_DBG("重试成功/跳过, 移除 %s(PID:%d) 的重试", e->cmdline, e->pid);
+                        e->pid = -1;
+                    }
+                }
+                retry_idx++;
+            }
+            int new_count = 0;
+            for (int i = 0; i < g_retry_mount_count; i++) {
+                if (g_retry_mounts[i].pid > 0)
+                    g_retry_mounts[new_count++] = g_retry_mounts[i];
+            }
+            g_retry_mount_count = new_count;
+        }
+    }
+}
+
+static void on_timer_event(int timer_fd) {
+    uint64_t expirations;
+    if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
+        check_and_recover_fuse();
+        reap_zombies();
+        maybe_periodic_scan();
+        retry_pending_mounts();
+    }
+}
+
+static void on_inotify_event(void) {
+    char inotify_buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    ssize_t len = read(g_inotify_fd, inotify_buf, sizeof(inotify_buf));
+    if (len > 0) {
+        bool need_reload = false;
+        for (char *ptr = inotify_buf; ptr < inotify_buf + len; ) {
+            struct inotify_event *ev = (struct inotify_event *) ptr;
+            if (ev->len && (strcmp(ev->name, "injector.conf") == 0 || strstr(ev->name, ".conf"))) {
+                need_reload = true;
+            }
+            ptr += sizeof(struct inotify_event) + ev->len;
+        }
+        if (need_reload) {
+            g_reload_config = 1;  /* 直接触发，去除 cooldown race */
+        }
+    }
+}
+
+static void on_ipc_accept(int ipc_sock) {
+    int client_fd = accept(ipc_sock, nullptr, nullptr);
+    if (client_fd >= 0) {
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
+        struct epoll_event ev_client = { .events = EPOLLIN | EPOLLONESHOT, .data.fd = client_fd };
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, client_fd, &ev_client);
+    }
+}
+
+static void on_client_fd(int fd) {
+    int mount_idx = -1;
+    for (int m = 0; m < g_async_mount_count; m++) {
+        if (g_async_mount_fds[m] == fd) {
+            mount_idx = m;
+            break;
+        }
+    }
+    if (mount_idx >= 0) {
+        handle_async_mount_event(g_async_mount_ctxs[mount_idx]);
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_async_mount_fds[mount_idx], nullptr);
+        close(g_async_mount_fds[mount_idx]);
+        g_async_mount_fds[mount_idx] = g_async_mount_fds[g_async_mount_count - 1];
+        g_async_mount_ctxs[mount_idx] = g_async_mount_ctxs[g_async_mount_count - 1];
+        g_async_mount_count--;
+    } else {
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+        handle_ipc_client_readable(fd);
+    }
+}
+
+static void handle_pending_reload(void) {
+    if (g_reload_config && !g_should_exit) {
+        g_reload_config = 0;
+        fast_pid_cache_clear();
+        ChangedPkg out_changed[128];
+        config_lock_write();
+        int changed_count = reload_config_rules_diff(INJECTOR_CONFIG_PATH, out_changed, 128);
+        config_unlock_write();
+        if (config_has_category_rules()) sys_pkg_refresh();
+        setup_inotify_watches();
+        config_publisher_broadcast();
+
+        if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
+            LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
+            kill(g_media_fuse.fuse_pid, SIGTERM);
+            int status;
+            waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+            g_media_fuse.fuse_pid = 0;
+            ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
+        } else if (g_media_fuse.fuse_pid <= 0 && !g_global_replace_mode &&
+                   is_media_module_injected_target() && g_fuse_ready) {
+            LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
+            inject_media_fuse();
+        }
+
+        if (changed_count == -1) {
+            audit_tracked_apps();
+        } else if (changed_count > 0) {
+            audit_and_remount_specific_apps(out_changed, changed_count);
+        }
+    }
+}
+
+static void injector_event_loop(const InjectorFds *fds) {
     struct epoll_event events[64];
     while (!g_should_exit) {
         int nfds = epoll_wait(g_epoll_fd, events, 64, -1);
@@ -1025,125 +1249,14 @@ int main(int argc, char *argv[]) {
         }
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
-            if (fd == sig_fd) {
-                struct signalfd_siginfo fdsi;
-                ssize_t s = read(sig_fd, &fdsi, sizeof(struct signalfd_siginfo));
-                if (s == sizeof(struct signalfd_siginfo)) {
-                    if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
-                        LOG("收到终止信号 (%d)，执行退出...", fdsi.ssi_signo);
-                        g_should_exit = 1;
-                    } else if (fdsi.ssi_signo == SIGHUP) {
-                        LOG("收到规则重载指令 (SIGHUP)。");
-                        g_reload_config = 1;
-                    } else if (fdsi.ssi_signo == SIGCHLD) {
-                        reap_zombies();
-                    }
-                }
-            } else if (fd == timer_fd) {
-                uint64_t expirations;
-                if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
-                    check_and_recover_fuse();
-                    reap_zombies();
-                    if (!g_passive_mode || (g_global_replace_mode && !g_global_replace_scanned_once)) {
-                        /* 被动模式下禁用周期扫描（新应用由 zygisk IPC 通知即时还原）；
-                           全局替换模式仅在程序生命周期开始时执行一次兜底扫描，
-                           还原存量非目标应用，之后不再反复周期检测 */
-                        if (seconds_until_next_scan > 0) {
-                            seconds_until_next_scan--;
-                        }
-                        if (seconds_until_next_scan == 0) {
-                            int found_now = scan_zygote_children();
-                            if (g_global_replace_mode) {
-                                g_global_replace_scanned_once = true;
-                            }
-                            if (found_now > 0) {
-                                g_last_scan_found = true;
-                                g_scan_interval_seconds = 30;          
-                            } else {
-                                if (g_last_scan_found) {
-                                    g_last_scan_found = false;
-                                    g_scan_interval_seconds = 60;
-                                } else {
-                                    if (g_scan_interval_seconds < 300) {
-                                        g_scan_interval_seconds = (g_scan_interval_seconds * 3) / 2;
-                                        if (g_scan_interval_seconds > 300) g_scan_interval_seconds = 300;
-                                    }
-                                }
-                            }
-                            seconds_until_next_scan = g_scan_interval_seconds;
-                        }
-                    }
-                    if (g_fuse_ready && g_retry_mount_count > 0) {
-                        const char *mnt_src_retry = get_active_mnt_src();
-                        if (mnt_src_retry) {
-                            int retry_idx = 0;
-                            while (retry_idx < g_retry_mount_count) {
-                                RetryMountEntry *e = &g_retry_mounts[retry_idx];
-                                e->retries++;
-                                if (e->retries > 5) {
-                                    LOG_DBG("重试耗尽，放弃 %s(PID:%d)", e->cmdline, e->pid);
-                                    e->pid = -1; 
-                                } else if (kill(e->pid, 0) != 0) {
-                                    LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e->cmdline, e->pid);
-                                    e->pid = -1; 
-                                } else {
-                                    /* 指数退避：第 N 次重试间隔 2^(N-2) 秒 (N>=2) */
-                                    if (e->retries > 1) {
-                                        time_t now = time(NULL);
-                                        int backoff = 1 << (e->retries - 2); /* 1, 2, 4, 8 秒 */
-                                        if (now - e->last_attempt < backoff) {
-                                            LOG_DBG("重试退避 %s(PID:%d), 第%d次, 已过%lds<%ds",
-                                                    e->cmdline, e->pid, e->retries,
-                                                    now - e->last_attempt, backoff);
-                                            retry_idx++;
-                                            continue;
-                                        }
-                                    }
-                                    uid_t uid = get_app_uid(e->pid);
-                                    e->last_attempt = time(NULL);
-                                    LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid, e->retries);
-                                    int ret = perform_app_mount(e->cmdline, e->pid, uid, nullptr, "失败重试");
-                                    if (ret == 0) {
-                                        LOG_DBG("重试成功/跳过, 移除 %s(PID:%d) 的重试", e->cmdline, e->pid);
-                                        e->pid = -1;
-                                    }
-                                }
-                                retry_idx++;
-                            }
-                            int new_count = 0;
-                            for (int i = 0; i < g_retry_mount_count; i++) {
-                                if (g_retry_mounts[i].pid > 0)
-                                    g_retry_mounts[new_count++] = g_retry_mounts[i];
-                            }
-                            g_retry_mount_count = new_count;
-                        }
-                    }
-                }
+            if (fd == fds->sig_fd) {
+                on_signal_event(fds->sig_fd);
+            } else if (fd == fds->timer_fd) {
+                on_timer_event(fds->timer_fd);
             } else if (fd == g_inotify_fd) {
-                char inotify_buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
-                ssize_t len = read(g_inotify_fd, inotify_buf, sizeof(inotify_buf));
-                if (len > 0) {
-                    bool need_reload = false;
-                    for (char *ptr = inotify_buf; ptr < inotify_buf + len; ) {
-                        struct inotify_event *ev = (struct inotify_event *) ptr;
-                        if (ev->len && (strcmp(ev->name, "injector.conf") == 0 || strstr(ev->name, ".conf"))) {
-                            need_reload = true;
-                        }
-                        ptr += sizeof(struct inotify_event) + ev->len;
-                    }
-                    if (need_reload) {
-                        g_reload_config = 1;  /* 直接触发，去除 cooldown race */
-                    }
-                }
-            } else if (fd == ipc_sock) {
-                int client_fd = accept(ipc_sock, nullptr, nullptr);
-                if (client_fd >= 0) {
-                    int flags = fcntl(client_fd, F_GETFL, 0);
-                    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-                    fcntl(client_fd, F_SETFD, FD_CLOEXEC);
-                    struct epoll_event ev_client = { .events = EPOLLIN | EPOLLONESHOT, .data.fd = client_fd };
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, client_fd, &ev_client);
-                }
+                on_inotify_event();
+            } else if (fd == fds->ipc_sock) {
+                on_ipc_accept(fds->ipc_sock);
             } else if (fd == g_config_pub_fd) {
                 config_publisher_handle_readable(fd);
             } else if (fd == g_fuse_ready_pipe_fd) {
@@ -1151,60 +1264,33 @@ int main(int argc, char *argv[]) {
                 g_fuse_ready_pipe_fd = -1;
                 g_fuse_ready_ctx = nullptr;
             } else {
-                int mount_idx = -1;
-                for (int m = 0; m < g_async_mount_count; m++) {
-                    if (g_async_mount_fds[m] == fd) {
-                        mount_idx = m;
-                        break;
-                    }
-                }
-                if (mount_idx >= 0) {
-                    handle_async_mount_event(g_async_mount_ctxs[mount_idx]);
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_async_mount_fds[mount_idx], nullptr);
-                    close(g_async_mount_fds[mount_idx]);
-                    g_async_mount_fds[mount_idx] = g_async_mount_fds[g_async_mount_count - 1];
-                    g_async_mount_ctxs[mount_idx] = g_async_mount_ctxs[g_async_mount_count - 1];
-                    g_async_mount_count--;
-                } else {
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-                    handle_ipc_client_readable(fd);
-                }
+                on_client_fd(fd);
             }
         }
-        if (g_reload_config && !g_should_exit) {
-            g_reload_config = 0;
-            fast_pid_cache_clear();
-            ChangedPkg out_changed[128];
-            config_lock_write();
-            int changed_count = reload_config_rules_diff(INJECTOR_CONFIG_PATH, out_changed, 128);
-            config_unlock_write();
-            setup_inotify_watches();
-            config_publisher_broadcast();
-            
-            if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
-                LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
-                kill(g_media_fuse.fuse_pid, SIGTERM);
-                int status;
-                waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
-                g_media_fuse.fuse_pid = 0;
-                ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
-            } else if (g_media_fuse.fuse_pid <= 0 && !g_global_replace_mode &&
-                       is_media_module_injected_target() && g_fuse_ready) {
-                LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
-                inject_media_fuse();
-            }
-
-            if (changed_count == -1) {
-                audit_tracked_apps();
-            } else if (changed_count > 0) {
-                audit_and_remount_specific_apps(out_changed, changed_count);
-            }
-        }
+        handle_pending_reload();
     }
+}
+
+static void injector_shutdown(const InjectorFds *fds) {
+    int ipc_sock = fds->ipc_sock;
+    int timer_fd = fds->timer_fd;
+    int sig_fd = fds->sig_fd;
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);
     if (sig_fd >= 0) close(sig_fd);
     if (g_epoll_fd >= 0) close(g_epoll_fd);
+}
+
+/* 主入口：只负责按序调用，不含具体逻辑（见上方阶段/分发函数） */
+int main(int argc, char *argv[]) {
+    bool start_passive = false;
+    parse_cli_args(argc, argv, &start_passive);
+    injector_early_init();
+    InjectorFds fds = { .sig_fd = -1, .timer_fd = -1, .ipc_sock = -1 };
+    injector_setup_epoll(&fds);
+    injector_start_fuses(start_passive);
+    injector_event_loop(&fds);
+    injector_shutdown(&fds);
     return 0;
 }

@@ -281,6 +281,33 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "GLOBAL"})
     expect("SANDBOX ON reflected", r["data"]["global"]["switches"].get("SANDBOX") is True, r)
 
+    # ---- ADD 类别段规则（[USER_APPS:<uid>]/[SYSTEM_APPS] 写主文件精确段头）----
+    # 置于 REMOVE/TOGGLE 之后：类别规则进入主文件会影响文件全局索引断言
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "USER_APPS", "uid": 10, "type": "HIDE", "value": "/sdcard/cat_secret"})
+    expect("ADD USER_APPS HIDE", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "SYSTEM_APPS", "type": "REDIRECT", "value": "/sdcard/sys_a|/sdcard/sys_b"})
+    expect("ADD SYSTEM_APPS REDIRECT", r.get("status") == "ok", r)
+    conf_text = open(os.path.join(conf_dir, "injector.conf"), encoding="utf-8").read()
+    expect("主文件含 [USER_APPS:10] 段头", "[USER_APPS:10]" in conf_text, conf_text)
+    expect("主文件含 [SYSTEM_APPS] 段头", "[SYSTEM_APPS]" in conf_text, conf_text)
+    expect("类别规则落段", "HIDE /sdcard/cat_secret" in conf_text, conf_text)
+    # 全局专属类型拒绝写入类别段；INJECT_ENABLE 不适用于类别段
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "USER_APPS", "uid": 10, "type": "GLOBAL_INJECT", "value": "ON"})
+    expect("类别段拒绝 GLOBAL_INJECT", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "SYSTEM_APPS", "type": "INJECT_ENABLE", "value": "OFF"})
+    expect("类别段拒绝 INJECT_ENABLE", r.get("status") == "error", r)
+    # SET 开关写入类别段（开关替换路径）
+    r = send_cmd(proc, sock_name, {"cmd": "SET", "pkg": "USER_APPS", "uid": 10, "type": "MONITOR", "value": "ON"})
+    expect("SET USER_APPS MONITOR ON", r.get("status") == "ok", r)
+    # GET 类别段视图（段内切片）
+    r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "USER_APPS", "uid": 10})
+    cat = r["data"]["category"]
+    expect("GET USER_APPS section", r.get("status") == "ok" and cat["section"] == "[USER_APPS:10]", cat)
+    expect("GET USER_APPS 含 HIDE", any(x["type"] == "HIDE" and "cat_secret" in x["value"] for x in cat["rules"]), cat["rules"])
+    expect("GET USER_APPS 开关", cat["switches"].get("MONITOR") is True, cat["switches"])
+    r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "SYSTEM_APPS"})
+    expect("GET SYSTEM_APPS section", r.get("status") == "ok" and r["data"]["category"]["section"] == "[SYSTEM_APPS]", r)
+
     # ---- 动态规则类型（模块 .rules 注册）----
     # 1. PING 返回的类型表应含模块声明的 FTP（非内置、来源 ftp_module、pair 双参）
     r = send_cmd(proc, sock_name, {"cmd": "PING"})
@@ -482,7 +509,12 @@ def check(proc, sock_name, conf_dir):
         r = send_cmd(proc, sock_name, {"cmd": "SET", "pkg": "com.example.app", "type": "SANDBOX", "value": v})
     gconf_text = open(os.path.join(conf_dir, "injector.conf"), encoding="utf-8").read()
     aconf_text = open(os.path.join(conf_dir, "App-rules", "com.example.app.conf"), encoding="utf-8").read()
-    for fname, text, sw in [("injector.conf", gconf_text, ["MONITOR", "SANDBOX"]),
+    # injector.conf 含类别段（[USER_APPS:10] MONITOR）时开关天然多行：仅统计 [GLOBAL] 段内
+    glines = gconf_text.splitlines()
+    gstart = next((i for i, l in enumerate(glines) if l.strip() == "[GLOBAL]"), 0)
+    gend = next((i for i in range(gstart + 1, len(glines)) if glines[i].strip().startswith("[")), len(glines))
+    gscope = "\n".join(glines[gstart:gend])
+    for fname, text, sw in [("injector.conf[GLOBAL]", gscope, ["MONITOR", "SANDBOX"]),
                             ("App-rules/com.example.app.conf", aconf_text, ["MONITOR", "SANDBOX"])]:
         for s in sw:
             cnt = len([l for l in text.splitlines() if l.strip().startswith(s + " ")])

@@ -118,11 +118,16 @@ static void build_templates_json(json_object *root) {
     
     json_object_array_add(templates, global);
     
-    // 应用模板
+    // 应用模板（含类别段：模板名 USER_APPS/SYSTEM_APPS，scope=category 标记，
+    // 老消费端按 apply_to_app 精确匹配包名——类别名恒不等于真实包名，保持惰性）
     for (int i = 0; i < g_app_cfg_count; i++) {
         AppConfig *cfg = g_app_cfgs[i];
         json_object *app = json_object_new_object();
         json_object_object_add(app, "template_name", json_object_new_string(cfg->pkg_name));
+        if (strcmp(cfg->pkg_name, "USER_APPS") == 0 || strcmp(cfg->pkg_name, "SYSTEM_APPS") == 0) {
+            json_object_object_add(app, "scope", json_object_new_string("category"));
+            json_object_object_add(app, "user_id", json_object_new_int(cfg->user_id));
+        }
         
         json_object *hook_op = json_object_new_array();
         json_object_array_add(hook_op, json_object_new_string("query"));
