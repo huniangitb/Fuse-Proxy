@@ -1,18 +1,12 @@
 #define _GNU_SOURCE
 #include "ftp_conf.h"
+#include "nsp_util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-/* 去首尾空白 */
-static char* trim(char* s) {
-    while (*s && isspace((unsigned char)*s)) s++;
-    char* end = s + strlen(s);
-    while (end > s && isspace((unsigned char)end[-1])) end--;
-    *end = '\0';
-    return s;
-}
+/* 去首尾空白经 nsp_util 公共库复用（nsp_str_trim），禁私刻 trim 副本 */
 
 /* 去掉行内注释（'#' 前导）与尾部空白 */
 static void strip_comment(char* line) {
@@ -36,14 +30,14 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
 
     while (fgets(line, sizeof line, fp)) {
         strip_comment(line);
-        char* s = trim(line);
+        char* s = nsp_str_trim(line);
         if (!s[0]) continue;
 
         if (s[0] == '[') {
             char* close = strchr(s, ']');
             if (!close) continue;
             *close = '\0';
-            set_str(cur_section, sizeof cur_section, trim(s + 1));
+            set_str(cur_section, sizeof cur_section, nsp_str_trim(s + 1));
             if (strcmp(cur_section, "GLOBAL") == 0) {
                 cur = NULL;
                 continue;
@@ -65,8 +59,8 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
         char* eq = strchr(s, '=');
         if (!eq) continue;
         *eq = '\0';
-        char* key = trim(s);
-        char* val = trim(eq + 1);
+        char* key = nsp_str_trim(s);
+        char* val = nsp_str_trim(eq + 1);
         if (!key[0]) continue;
 
         if (!cur) {

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "ipc_server.h"
 #include "common.h"
+#include "nsp_util.h"
 #include "injector.h"
 #include "inject_target.h"
 #include "mount_manager.h"
@@ -203,10 +204,8 @@ int ipc_server_init() {
 
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0); 
     if (sock < 0) return -1;
-    struct sockaddr_un addr = { .sun_family = AF_UNIX }; 
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, IPC_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(IPC_SOCKET_NAME);
+    struct sockaddr_un addr;
+    socklen_t addr_len = nsp_uds_abstract_addr(&addr, IPC_SOCKET_NAME);
     if (bind(sock, (struct sockaddr*)&addr, addr_len) < 0) { 
         close(sock); 
         return -1; 

@@ -299,10 +299,13 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
        剩余为空（如 ?/、挂载点本身、仅 /storage/emulated/0/ 用户层）：
        指向 FUSE 根目录，不允许任何规则插入，仅 <uid>/ 之后允许 */
     if (!rest || rest[0] == '\0') return false;
-    /* ===== 目录合成：<uid>/ 之后的路径 ===== */
-    if (g_real_root[0])
-        snprintf(real_base, sz, "%s/%d/%s", g_real_root, user_id, rest);
-    else
-        snprintf(real_base, sz, STORAGE_BASE "/%d/%s", user_id, rest);
+    /* ===== 目录合成：<uid>/ 之后的路径 =====
+       经 common_default_real_path 统一合成（禁裸拼 STORAGE_BASE）：
+       rest 无前导 '/'，补 '/' 后语义与原 "%s/%d/%s" 分支逐字节一致 */
+    char with_slash[PATH_MAX];
+    with_slash[0] = '/';
+    strncpy(with_slash + 1, rest, sizeof(with_slash) - 2);
+    with_slash[sizeof(with_slash) - 1] = '\0';
+    common_default_real_path(user_id, with_slash, real_base, sz);
     return true;
 }

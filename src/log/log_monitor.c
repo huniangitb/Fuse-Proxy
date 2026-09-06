@@ -23,8 +23,9 @@
 #include <sys/uio.h>
 #include <pthread.h>
 #include <sys/eventfd.h>
-#include <dirent.h>
 #include "common.h"
+#include "nsp_comm.h"
+#include "nsp_util.h"
 #define MAX_MSG_LEN 4096
 /* 滑动日志缓冲：按字节上限控制（超出丢弃最旧日志）。
    IO 日志最大 128MB，普通日志（sys/logcat）各 16MB。
@@ -39,7 +40,6 @@
 #define DEFAULT_LIMIT 500
 #define MAX_EVENTS 256
 #define RING_CAP 16384
-#define OVERFLOW_DIR CONFIG_DIR "/log/overflow"
 typedef struct AsyncCtx {
     int fd;
     int type;               /* 0=undef, 1=IO, 2=SYS, 3=LOGCAT */
@@ -95,6 +95,7 @@ typedef struct ClientCtx {
     size_t pos;
     struct timespec start_time;
     bool is_streaming;
+    bool stream_del_posted;   /* STOP 路径已投递 DEL，外层关闭路径不再重复投递 */
     struct ClientCtx *next;
     struct ClientCtx *prev;
 } ClientCtx;
@@ -141,17 +142,16 @@ static void init_buf(LogBuffer* buf, int max) {
 static void destroy_buf(LogBuffer* buf) {
     if (buf->data) { free(buf->data); buf->data = nullptr; }
 }
-static void add_stream_client(int fd, int type, int min_level, bool level_tag, bool with_ts) {
-    StreamClient *c = malloc(sizeof(StreamClient));
-    c->fd = fd; c->type = type; c->min_level = min_level; c->level_tag = level_tag;
-    c->with_ts = with_ts;
-    c->next = g_stream_clients; g_stream_clients = c;
-}
+/* 订阅集合仅 comm 线程触碰（主线程一律 post 'A'/'D'）：'D' 在此同步 close，
+   主线程只 shutdown，不断号故无 fd 复用竞态 */
 static void remove_stream_client(int fd) {
     StreamClient **pp = &g_stream_clients;
     while (*pp) {
         if ((*pp)->fd == fd) {
-            StreamClient *tmp = *pp; *pp = (*pp)->next; free(tmp); break;
+            StreamClient *tmp = *pp; *pp = (*pp)->next;
+            close(tmp->fd);
+            free(tmp);
+            break;
         }
         pp = &(*pp)->next;
     }
@@ -165,8 +165,84 @@ static int parse_stream_args(const char *p, bool *with_ts) {
     return level;
 }
 
+/* BCAST 通道载荷（客户端集合归 comm 线程所有，主线程只 post）：
+   'L' + type:1 + level:4 + t:8 + 行字节 —— 实时推送（过滤/组帧在 comm 侧）
+   'A' + type:1 + min_level:4 + level_tag:1 + with_ts:1 + fd:4 —— 订阅加入
+   'D' + fd:4 —— 订阅移除并由 comm 线程 close（主线程仅 shutdown，不断号防复用） */
+static void stream_post_add(int fd, int type, int min_level, bool level_tag, bool with_ts) {
+    uint8_t buf[1 + 1 + 4 + 1 + 1 + 4];
+    buf[0] = 'A';
+    buf[1] = (uint8_t)type;
+    memcpy(buf + 2, &min_level, 4);
+    buf[6] = level_tag ? 1 : 0;
+    buf[7] = with_ts ? 1 : 0;
+    memcpy(buf + 8, &fd, 4);
+    nsp_comm_post(NSP_CH_BCAST, buf, sizeof(buf));
+}
+
+static void stream_post_del(int fd) {
+    uint8_t buf[1 + 4];
+    buf[0] = 'D';
+    memcpy(buf + 1, &fd, 4);
+    nsp_comm_post(NSP_CH_BCAST, buf, sizeof(buf));
+}
+
 static void broadcast_log(int type, const char *line, int level, time_t t) {
     size_t len = strlen(line);
+    size_t total = 1 + 1 + 4 + 8 + len + 1;
+    uint8_t *buf = malloc(total);
+    if (!buf) return;
+    buf[0] = 'L';
+    buf[1] = (uint8_t)type;
+    memcpy(buf + 2, &level, 4);
+    memcpy(buf + 6, &t, 8);
+    memcpy(buf + 14, line, len + 1);
+    nsp_comm_post(NSP_CH_BCAST, buf, total);
+    free(buf);
+}
+
+/* 后端（comm 线程）：STREAM 客户端集合的唯一读写者 */
+static int stream_emit(void *ctx, const void *data, size_t len) {
+    (void)ctx;
+    if (len < 1) return 0;
+    const uint8_t *p = data;
+    if (p[0] == 'A') {
+        if (len < 12) return 0;
+        int fd;
+        int min_level;
+        memcpy(&min_level, p + 2, 4);
+        memcpy(&fd, p + 8, 4);
+        for (StreamClient *e = g_stream_clients; e; e = e->next) {
+            if (e->fd == fd) { /* 重复加入：更新属性（幂等） */
+                e->type = p[1]; e->min_level = min_level;
+                e->level_tag = p[6] ? true : false;
+                e->with_ts = p[7] ? true : false;
+                return 0;
+            }
+        }
+        StreamClient *c = malloc(sizeof(StreamClient));
+        if (!c) return 0;
+        c->fd = fd; c->type = p[1]; c->min_level = min_level;
+        c->level_tag = p[6] ? true : false;
+        c->with_ts = p[7] ? true : false;
+        c->next = g_stream_clients; g_stream_clients = c;
+        return 0;
+    }
+    if (p[0] == 'D') {
+        if (len < 5) return 0;
+        int fd;
+        memcpy(&fd, p + 1, 4);
+        remove_stream_client(fd);   /* comm 线程内同步 close（不断号，无复用竞态） */
+        return 0;
+    }
+    if (p[0] != 'L' || len < 15) return 0;
+    int type = p[1];
+    int level;
+    time_t t;
+    memcpy(&level, p + 2, 4);
+    memcpy(&t, p + 6, 8);
+    const char *line = (const char *)(p + 14);
+    size_t llen = len - 15;
     char nl = '\n';
     char level_pref[4]; /* "0|", "1|", "2|", "3|" */
     char ts_buf[32] = {0};
@@ -197,7 +273,7 @@ static void broadcast_log(int type, const char *line, int level, time_t t) {
                     iovlen++;
                 }
                 iov[iovlen].iov_base = (void *)line;
-                iov[iovlen].iov_len = len;
+                iov[iovlen].iov_len = llen;
                 iovlen++;
                 iov[iovlen].iov_base = &nl;
                 iov[iovlen].iov_len = 1;
@@ -214,33 +290,178 @@ static void broadcast_log(int type, const char *line, int level, time_t t) {
         if ((*pp)->fd == -1) { StreamClient *tmp = *pp; *pp = (*pp)->next; free(tmp); }
         else { pp = &(*pp)->next; }
     }
+    return 0;
 }
-static void overflow_write(const char *log_type, const char *msg, int level, time_t t) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s.overflow", OVERFLOW_DIR, log_type);
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (fd < 0) return;
+/* overflow 应急落盘机制已移除：producer 环满时直接丢弃（见 async 线程注释）；
+   持久化统一走 io/sys 自动落盘（persist_*，单文件 2MB 轮转） */
+/* ===== io/sys 自动落盘（懒写入 + 单文件 2MB 轮转） =====
+   写入路径：push_log（主线程单漏斗）→ 行暂存 64KB stage → 刷盘时机：
+   stage 满 / 500ms tick（脏超 1s） / 进程退出。刷盘 open-fstat-rotate-
+   write-close 一次批量写完，杜绝逐条 open/write/close。轮转：cur+本批超
+   2MB → cur 改名 .1（删旧 .1），每类最多保留 cur + .1（≤4MB），单文件
+   严格 ≤2MB。logcat 不落盘。 */
+#define PERSIST_FILE_MAX (2u * 1024u * 1024u)
+#define PERSIST_STAGE_CAP (64u * 1024u)
+#define PERSIST_LAZY_MS 1000
+#define PERSIST_FAIL_BACKOFF_MS 5000
+typedef struct {
+    char path[PATH_MAX];    /* LOG_DIR/io.log */
+    char rot[PATH_MAX];     /* LOG_DIR/io.log.1（单备份轮转） */
+    char *stage;
+    size_t staged;
+    uint64_t last_flush_ms;
+    uint64_t fail_until_ms; /* 磁盘失败退避：到期前跳过 open 尝试 */
+    uint64_t dropped;       /* 磁盘不可写时丢弃批次数 */
+} PersistWriter;
+static PersistWriter g_persist_io;
+static PersistWriter g_persist_sys;
+
+static uint64_t persist_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void persist_init_writer(PersistWriter *w, const char *name) {
+    snprintf(w->path, sizeof(w->path), "%s/%s.log", LOG_DIR, name);
+    snprintf(w->rot, sizeof(w->rot), "%s/%s.log.1", LOG_DIR, name);
+    w->stage = malloc(PERSIST_STAGE_CAP);
+    w->staged = 0;
+    w->last_flush_ms = persist_now_ms();
+    w->fail_until_ms = 0;
+    w->dropped = 0;
+}
+
+/* 刷盘：open → fstat 校准 → 超限轮转 → 全量写出 → close。失败退避，下轮
+   重试；磁盘不可写时丢弃本批（内存链路不受影响，dropped 计数）。 */
+static void persist_flush(PersistWriter *w) {
+    if (!w->stage || w->staged == 0) return;
+    uint64_t now = persist_now_ms();
+    if (now < w->fail_until_ms) { w->staged = 0; w->dropped++; return; }
+    int fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) { w->fail_until_ms = now + PERSIST_FAIL_BACKOFF_MS; w->staged = 0; w->dropped++; return; }
+    struct stat st;
+    uint64_t cur = (fstat(fd, &st) == 0 && st.st_size > 0) ? (uint64_t)st.st_size : 0;
+    if (cur + w->staged > PERSIST_FILE_MAX) {
+        close(fd);
+        unlink(w->rot);
+        rename(w->path, w->rot);
+        fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd < 0) { w->fail_until_ms = now + PERSIST_FAIL_BACKOFF_MS; w->staged = 0; w->dropped++; return; }
+    }
+    size_t off = 0;
+    while (off < w->staged) {
+        ssize_t n = write(fd, w->stage + off, w->staged - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        off += (size_t)n;
+    }
+    close(fd);
+    if (off < w->staged) { w->fail_until_ms = now + PERSIST_FAIL_BACKOFF_MS; w->dropped++; }
+    w->staged = 0;
+    w->last_flush_ms = now;
+}
+
+static void persist_stage(PersistWriter *w, const char *msg, int level, time_t t) {
+    if (!w->stage) return;
     struct tm tm_buf;
     localtime_r(&t, &tm_buf);
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
     char line[MAX_MSG_LEN + 128];
-    int len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf, level, msg);
-    write(fd, line, len);
-
-    /* 日志轮转：超过 1MB 时自动切割 */
-    struct stat st;
-    if (fstat(fd, &st) == 0 && st.st_size > 1024 * 1024) {
-        close(fd);
-        char rotated[PATH_MAX];
-        char ts[20];
-        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_buf);
-        snprintf(rotated, sizeof(rotated), "%s/%s.overflow.%s", OVERFLOW_DIR, log_type, ts);
-        rename(path, rotated);
-    } else {
-        close(fd);
+    int len = snprintf(line, sizeof(line), "%s|%d|%s\n", ts, level, msg);
+    if (len <= 0) return;
+    /* 截断时强制尾部换行，避免与下一行拼接成无换行超长行 */
+    if ((size_t)len >= sizeof(line)) {
+        len = sizeof(line) - 1;
+        line[len - 1] = '\n';
     }
+    if (w->staged + (size_t)len > PERSIST_STAGE_CAP) persist_flush(w);
+    if (w->staged + (size_t)len > PERSIST_STAGE_CAP) { w->dropped++; return; }
+    memcpy(w->stage + w->staged, line, (size_t)len);
+    w->staged += (size_t)len;
 }
+
+/* 懒刷盘：500ms tick 调用，脏数据超 1s 未刷则写出（低频场景最多延迟 1s+） */
+static void persist_lazy_tick(void) {
+    uint64_t now = persist_now_ms();
+    if (g_persist_io.staged > 0 && now - g_persist_io.last_flush_ms >= PERSIST_LAZY_MS)
+        persist_flush(&g_persist_io);
+    if (g_persist_sys.staged > 0 && now - g_persist_sys.last_flush_ms >= PERSIST_LAZY_MS)
+        persist_flush(&g_persist_sys);
+}
+
+/* ===== 启动时加载落盘快照（只读独立缓冲） =====
+   io.log.1 → io.log（先旧后新）解析为线性数组（oldest→newest），上限
+   DISK_LOAD_MAX 条/类（滑动保留最新，超限丢弃最旧）。与内存环无重叠
+   （内存启动时为空），客户端获取时拼接：磁盘在前、内存在后。
+   行格式 ts|level|msg（与落盘格式一致），解析失败跳过。 */
+#define DISK_LOAD_MAX 2048
+typedef struct {
+    LogEntry *data;   /* oldest→newest 线性数组，启动后只读 */
+    int count;
+} DiskLogBuf;
+static DiskLogBuf g_io_disk = {0};
+static DiskLogBuf g_sys_disk = {0};
+
+static time_t parse_log_ts(const char *ts) {
+    int Y, M, D, h, m, s;
+    if (sscanf(ts, "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6) return (time_t)0;
+    if (Y < 1970 || M < 1 || M > 12 || D < 1 || D > 31 || h > 23 || m > 59 || s > 61)
+        return (time_t)0;
+    struct tm tm = {0};
+    tm.tm_year = Y - 1900; tm.tm_mon = M - 1; tm.tm_mday = D;
+    tm.tm_hour = h; tm.tm_min = m; tm.tm_sec = s;
+    tm.tm_isdst = -1;
+    time_t t = mktime(&tm);
+    return t < 0 ? (time_t)0 : t;
+}
+
+static void disk_load_file(LogEntry *ring, int *total, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[MAX_MSG_LEN + 128];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        char *p1 = strchr(line, '|');
+        if (!p1) continue;
+        char *p2 = strchr(p1 + 1, '|');
+        if (!p2) continue;
+        *p1 = '\0';                                   /* ts 段 */
+        int level = atoi(p1 + 1);
+        const char *msg = p2 + 1;
+        time_t t = parse_log_ts(line);
+        if (t == 0 || !msg[0]) continue;
+        LogEntry *e = &ring[(*total) % DISK_LOAD_MAX];
+        e->t = t;
+        e->level = level;
+        strncpy(e->msg, msg, MAX_MSG_LEN - 1);
+        e->msg[MAX_MSG_LEN - 1] = '\0';
+        (*total)++;
+    }
+    fclose(fp);
+}
+
+static void disk_load(DiskLogBuf *d, const char *rot_path, const char *cur_path) {
+    LogEntry *ring = calloc(DISK_LOAD_MAX, sizeof(LogEntry));
+    if (!ring) return;
+    int total = 0;
+    disk_load_file(ring, &total, rot_path);   /* 先旧（.1） */
+    disk_load_file(ring, &total, cur_path);   /* 后新 */
+    int n = total < DISK_LOAD_MAX ? total : DISK_LOAD_MAX;
+    d->data = malloc((size_t)n * sizeof(LogEntry));
+    if (!d->data) { free(ring); d->count = 0; return; }
+    int start = total < DISK_LOAD_MAX ? 0 : total % DISK_LOAD_MAX;
+    for (int i = 0; i < n; i++)
+        d->data[i] = ring[(start + i) % DISK_LOAD_MAX];
+    d->count = n;
+    free(ring);
+}
+
 static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     time_t now = time(nullptr);
     broadcast_log(type, msg, level, now);
@@ -255,6 +476,9 @@ static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     buf->data[buf->head].msg[MAX_MSG_LEN - 1] = '\0';
     buf->head = (buf->head + 1) % buf->max;
     if (buf->head == buf->tail) buf->full = true;
+    /* io/sys 自动落盘（logcat 除外）：只暂存，刷盘时机见 persist_lazy_tick */
+    if (type == 1) persist_stage(&g_persist_io, msg, level, now);
+    else if (type == 2) persist_stage(&g_persist_sys, msg, level, now);
 }
 static void drain_async(AsyncCtx *ctx) {
     /* 合并日志多槽队列：逐槽 push 入 g_sys_buf（整块可超过 entries.msg
@@ -325,9 +549,8 @@ static void *async_log_thread(void *arg) {
                             ctx->batch_q_head++;
                             uint64_t val = 1;
                             write(ctx->notify_fd, &val, sizeof(val));
-                        } else {
-                            overflow_write("sys", batch_msg, LOG_DEBUG, time(nullptr));
                         }
+                        /* batch_q 满：丢弃本合并包（overflow 机制已移除） */
                     }
                     pos = 0;
                     continue;
@@ -373,10 +596,8 @@ static void *async_log_thread(void *arg) {
                     ctx->head = next;
                     uint64_t val = 1;
                     write(ctx->notify_fd, &val, sizeof(val));
-                } else {
-                    const char *type_str = (ctx->type == 1) ? "io" : (ctx->type == 3) ? "logcat" : "sys";
-                    overflow_write(type_str, msg, level, time(nullptr));
                 }
+                /* entries 环满：丢弃本条（overflow 机制已移除） */
             }
             pos = 0;
         } else if (pos < (int)sizeof(line) - 1) {
@@ -409,9 +630,8 @@ static void *async_log_thread(void *arg) {
                                 ctx->batch_q_head++;
                                 uint64_t val = 1;
                                 write(ctx->notify_fd, &val, sizeof(val));
-                            } else {
-                                overflow_write("sys", batch_msg, LOG_DEBUG, time(nullptr));
                             }
+                            /* batch_q 满：丢弃本合并包（overflow 机制已移除） */
                         }
                         pos = 0;
                         continue;
@@ -460,10 +680,8 @@ static void *async_log_thread(void *arg) {
                         ctx->head = next;
                         uint64_t val = 1;
                         write(ctx->notify_fd, &val, sizeof(val));
-                    } else {
-                        const char *type_str = (ctx->type == 1) ? "io" : (ctx->type == 3) ? "logcat" : "sys";
-                        overflow_write(type_str, msg, level, time(nullptr));
                     }
+                    /* entries 环满：丢弃本条（overflow 机制已移除） */
                 }
                 pos = 0;
             } else if (pos < (int)sizeof(line) - 1) {
@@ -580,73 +798,61 @@ static bool should_ignore_io(const char *line) {
     }
     return ignore;
 }
-static void search_overflow_file(int fd, const char *log_type, const char *key,
-                                  int limit, int offset, int level_filter, int *sent_count, int *total_matched) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s.overflow", OVERFLOW_DIR, log_type);
-    FILE *fp = fopen(path, "r");
-    if (!fp) return;
-    char fline[MAX_MSG_LEN + 128];
-    int skip_count = 0;
-    while (fgets(fline, sizeof(fline), fp)) {
-        size_t flen = strlen(fline);
-        while (flen > 0 && (fline[flen-1] == '\n' || fline[flen-1] == '\r')) fline[--flen] = '\0';
-        char *pipe1 = strchr(fline, '|');
-        if (!pipe1) continue;
-        char *pipe2 = strchr(pipe1 + 1, '|');
-        if (!pipe2) continue;
-        int msg_level = atoi(pipe1 + 1);
-        char *msg = pipe2 + 1;
-        bool level_match = (level_filter < 0 || msg_level >= level_filter);
-        bool key_match = (!key || key[0] == '\0' || strstr(msg, key));
-        if (level_match && key_match) {
-            (*total_matched)++;   /* 仅统计匹配 level/key 的行，与 search_log_paged 的 buffer 计数一致 */
-            if (skip_count < offset) skip_count++;
-            else if (*sent_count < limit) {
-                char outline[MAX_MSG_LEN + 128];
-                int len = snprintf(outline, sizeof(outline), "%s\n", fline);
-                write(fd, outline, len);
-                (*sent_count)++;
-            }
-        }
-    }
-    fclose(fp);
+static bool search_hit(int level, const char *msg, const char *key, int level_filter) {
+    return (level_filter < 0 || level >= level_filter) &&
+           (!key || key[0] == '\0' || strstr(msg, key));
 }
-static void search_log_paged(int fd, LogBuffer* buf, const char* key, int limit, int offset, int level_filter, const char *log_type) {
+
+static void search_emit_line(int fd, time_t t, int level, const char *msg, const char *log_type) {
+    char line[MAX_MSG_LEN + 128];
+    struct tm tm_info; localtime_r(&t, &tm_info);
+    char time_buf[32]; strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+    int len;
+    if (log_type && strcmp(log_type, "sys") == 0) {
+        /* SYS 查询行附带等级（与落盘行/STREAM_SYS_API 格式一致）：
+           客户端据此执行等级阈值过滤 */
+        len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf, level % 10, msg);
+    } else {
+        len = snprintf(line, sizeof(line), "%s|%s\n", time_buf, msg);
+    }
+    write(fd, line, len);
+}
+
+/* 分页查询：内存环（newest→oldest）在前、落盘快照（newest→oldest）在后，
+   offset/limit 跨段共享计数 */
+static void search_log_paged(int fd, LogBuffer* buf, const DiskLogBuf *disk,
+                             const char* key, int limit, int offset, int level_filter,
+                             const char *log_type) {
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
     int total_matched = 0; int idx = buf->tail;
     for (int i = 0; i < total_in_buf; i++) {
-        bool level_match = (level_filter < 0 || buf->data[idx].level >= level_filter);
-        if (level_match && (!key || key[0] == '\0' || strstr(buf->data[idx].msg, key))) total_matched++;
+        if (search_hit(buf->data[idx].level, buf->data[idx].msg, key, level_filter)) total_matched++;
         idx = (idx + 1) % buf->max;
     }
+    if (disk) {
+        for (int i = 0; i < disk->count; i++) {
+            if (search_hit(disk->data[i].level, disk->data[i].msg, key, level_filter)) total_matched++;
+        }
+    }
     int sent_count = 0; int skip_count = 0;
-    idx = (buf->head - 1 + buf->max) % buf->max;
     char line[MAX_MSG_LEN + 128];
+    idx = (buf->head - 1 + buf->max) % buf->max;
     for (int i = 0; i < total_in_buf && sent_count < limit; i++) {
-        bool level_match = (level_filter < 0 || buf->data[idx].level >= level_filter);
-        if (level_match && (!key || key[0] == '\0' || strstr(buf->data[idx].msg, key))) {
+        if (search_hit(buf->data[idx].level, buf->data[idx].msg, key, level_filter)) {
             if (skip_count < offset) skip_count++;
-            else {
-                struct tm tm_info; localtime_r(&buf->data[idx].t, &tm_info);
-                char time_buf[32]; strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
-                int len;
-                if (log_type && strcmp(log_type, "sys") == 0) {
-                    /* SYS 查询行附带等级（与 overflow 行/STREAM_SYS_API 格式一致）：
-                       客户端据此执行等级阈值过滤 */
-                    len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf,
-                                   buf->data[idx].level % 10, buf->data[idx].msg);
-                } else {
-                    len = snprintf(line, sizeof(line), "%s|%s\n", time_buf, buf->data[idx].msg);
-                }
-                write(fd, line, len); sent_count++;
-            }
+            else { search_emit_line(fd, buf->data[idx].t, buf->data[idx].level, buf->data[idx].msg, log_type); sent_count++; }
         }
         idx = (idx - 1 + buf->max) % buf->max;
     }
-    if (log_type) {
-        search_overflow_file(fd, log_type, key, limit, offset, level_filter, &sent_count, &total_matched);
+    if (disk) {
+        for (int i = disk->count - 1; i >= 0 && sent_count < limit; i--) {
+            if (search_hit(disk->data[i].level, disk->data[i].msg, key, level_filter)) {
+                if (skip_count < offset) skip_count++;
+                else { search_emit_line(fd, disk->data[i].t, disk->data[i].level, disk->data[i].msg, log_type); sent_count++; }
+            }
+        }
     }
+    (void)log_type; /* 保留参数供行格式分支使用；overflow 查询已移除 */
     int remaining = total_matched - (offset + sent_count);
     if (remaining < 0) remaining = 0;
     snprintf(line, sizeof(line), "DONE|%d|%d\n", total_matched, remaining);
@@ -670,36 +876,50 @@ static void remove_active_client(ClientCtx *ctx) {
         ctx->next->prev = ctx->prev;
     }
 }
-/* 历史转储：逐条输出缓冲内容。with_level 时为 SYS 条目附加 "<level>|" 等级前缀
- * （与 STREAM_SYS_API 实时推送 broadcast_log 的行格式一致：ts|<lvl>|msg），
- * 使客户端能对历史数据执行等级阈值过滤 */
-static void dump_buf_to_client(int fd, LogBuffer* buf, int type, int min_level, bool with_ts, bool with_level) {
+/* 单条历史输出（dump/search 共用格式）：false=对端硬错，调用方停止 */
+static bool dump_one_entry(int fd, time_t t, int level, const char *msg,
+                           int type, int min_level, bool with_ts, bool with_level) {
+    if (level < min_level) return true;
     char line_buf[MAX_MSG_LEN + 64]; /* ts(20) + msg + \n */
+    size_t msg_len = strnlen(msg, MAX_MSG_LEN);
+    if (msg_len > MAX_MSG_LEN - 1) msg_len = MAX_MSG_LEN - 1;
+    int off = 0;
+    if (with_ts && t > 0) {
+        struct tm tm_info;
+        localtime_r(&t, &tm_info);
+        char time_buf[32];
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+        off = snprintf(line_buf, sizeof(line_buf), "%s|", time_buf);
+    }
+    if (with_level && type == 2) {
+        line_buf[off++] = (char)('0' + (level % 10));
+        line_buf[off++] = '|';
+    }
+    memcpy(line_buf + off, msg, msg_len);
+    line_buf[off + msg_len] = '\n';
+    line_buf[off + msg_len + 1] = '\0';
+    ssize_t ret = send(fd, line_buf, off + msg_len + 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+    return !(ret <= 0 && (errno != EAGAIN && errno != EWOULDBLOCK));
+}
+
+/* 历史转储：落盘快照（oldest→newest）在前、内存环在后拼接。
+ * with_level 时为 SYS 条目附加 "<level>|" 等级前缀（与 STREAM_SYS_API
+ * 实时推送行格式一致：ts|<lvl>|msg），客户端据此做等级阈值过滤 */
+static void dump_buf_to_client(int fd, LogBuffer* buf, const DiskLogBuf *disk,
+                               int type, int min_level, bool with_ts, bool with_level) {
+    if (disk) {
+        for (int i = 0; i < disk->count; i++) {
+            if (!dump_one_entry(fd, disk->data[i].t, disk->data[i].level, disk->data[i].msg,
+                                type, min_level, with_ts, with_level))
+                return;
+        }
+    }
     int total_in_buf = buf->full ? buf->max : (buf->head - buf->tail + buf->max) % buf->max;
     int idx = buf->tail;
     for (int i = 0; i < total_in_buf; i++) {
-        if (buf->data[idx].level >= min_level) {
-            size_t msg_len = strnlen(buf->data[idx].msg, MAX_MSG_LEN);
-            if (msg_len > MAX_MSG_LEN - 1) msg_len = MAX_MSG_LEN - 1;
-            int off = 0;
-            if (with_ts && buf->data[idx].t > 0) {
-                struct tm tm_info;
-                localtime_r(&buf->data[idx].t, &tm_info);
-                char time_buf[32];
-                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
-                int tl = snprintf(line_buf, sizeof(line_buf), "%s|", time_buf);
-                off = tl;
-            }
-            if (with_level && type == 2) {
-                line_buf[off++] = (char)('0' + (buf->data[idx].level % 10));
-                line_buf[off++] = '|';
-            }
-            memcpy(line_buf + off, buf->data[idx].msg, msg_len);
-            line_buf[off + msg_len] = '\n';
-            line_buf[off + msg_len + 1] = '\0';
-            ssize_t ret = send(fd, line_buf, off + msg_len + 1, MSG_NOSIGNAL | MSG_DONTWAIT);
-            if (ret <= 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) break;
-        }
+        if (!dump_one_entry(fd, buf->data[idx].t, buf->data[idx].level, buf->data[idx].msg,
+                            type, min_level, with_ts, with_level))
+            break;
         idx = (idx + 1) % buf->max;
     }
 }
@@ -834,30 +1054,36 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
                 limit = atoi(limit_s);
             }
         }
-        search_log_paged(fd, is_io ? &g_io_buf : (is_logcat ? &g_logcat_buf : &g_sys_buf), key, limit, offset, level_filter, is_io ? "io" : (is_logcat ? "logcat" : "sys"));
+        search_log_paged(fd, is_io ? &g_io_buf : (is_logcat ? &g_logcat_buf : &g_sys_buf),
+                         is_io ? &g_io_disk : (is_logcat ? nullptr : &g_sys_disk),
+                         key, limit, offset, level_filter, is_io ? "io" : (is_logcat ? "logcat" : "sys"));
         return 1; 
     } else if (strcmp(line, "CLEAR_IO") == 0) {
         g_io_buf.head = g_io_buf.tail = 0; g_io_buf.full = false;
-        unlink(OVERFLOW_DIR "/io.overflow");
+        /* 同步清启动快照、暂存与落盘文件（暂存不清会与 tick 刷盘竞态复活文件） */
+        free(g_io_disk.data); g_io_disk.data = nullptr; g_io_disk.count = 0;
+        g_persist_io.staged = 0;
+        unlink(g_persist_io.path); unlink(g_persist_io.rot);
         write(fd, "OK\n", 3);
         return 1;
     } else if (strcmp(line, "CLEAR_SYS") == 0) {
         g_sys_buf.head = g_sys_buf.tail = 0; g_sys_buf.full = false;
-        unlink(OVERFLOW_DIR "/sys.overflow");
+        free(g_sys_disk.data); g_sys_disk.data = nullptr; g_sys_disk.count = 0;
+        g_persist_sys.staged = 0;
+        unlink(g_persist_sys.path); unlink(g_persist_sys.rot);
         write(fd, "OK\n", 3);
         return 1;
     } else if (strcmp(line, "CLEAR_LOGCAT") == 0) {
         g_logcat_buf.head = g_logcat_buf.tail = 0; g_logcat_buf.full = false;
-        unlink(OVERFLOW_DIR "/logcat.overflow");
         write(fd, "OK\n", 3);
-        return 1; 
+        return 1;
     } else if (strncmp(line, "STREAM_IO", 9) == 0) {
         bool with_ts = false;
         int min_level = 0;
         if (line[9] == ':') min_level = parse_stream_args(line + 10, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts, false);
-        add_stream_client(fd, 1, min_level, false, with_ts);
+        dump_buf_to_client(fd, &g_io_buf, &g_io_disk, 1, min_level, with_ts, false);
+        stream_post_add(fd, 1, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_SYS_API", 14) == 0) {
@@ -866,8 +1092,8 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         if (line[14] == ':') min_level = parse_stream_args(line + 15, &with_ts);
         write(fd, "OK\n", 3);
         /* API 模式：历史转储附带等级前缀，与其自身实时推送行格式一致 */
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts, true);
-        add_stream_client(fd, 2, min_level, true, with_ts);
+        dump_buf_to_client(fd, &g_sys_buf, &g_sys_disk, 2, min_level, with_ts, true);
+        stream_post_add(fd, 2, min_level, true, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_SYS", 10) == 0) {
@@ -875,8 +1101,8 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[10] == ':') min_level = parse_stream_args(line + 11, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts, false);
-        add_stream_client(fd, 2, min_level, false, with_ts);
+        dump_buf_to_client(fd, &g_sys_buf, &g_sys_disk, 2, min_level, with_ts, false);
+        stream_post_add(fd, 2, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_LOGCAT", 13) == 0) {
@@ -884,8 +1110,8 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[13] == ':') min_level = parse_stream_args(line + 14, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts, false);
-        add_stream_client(fd, 3, min_level, false, with_ts);
+        dump_buf_to_client(fd, &g_logcat_buf, nullptr, 3, min_level, with_ts, false);
+        stream_post_add(fd, 3, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STREAM_ALL", 10) == 0) {
@@ -893,20 +1119,26 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         int min_level = 0;
         if (line[10] == ':') min_level = parse_stream_args(line + 11, &with_ts);
         write(fd, "OK\n", 3);
-        dump_buf_to_client(fd, &g_io_buf, 1, min_level, with_ts, false);
-        dump_buf_to_client(fd, &g_sys_buf, 2, min_level, with_ts, false);
-        dump_buf_to_client(fd, &g_logcat_buf, 3, min_level, with_ts, false);
-        add_stream_client(fd, 0, min_level, false, with_ts);
+        dump_buf_to_client(fd, &g_io_buf, &g_io_disk, 1, min_level, with_ts, false);
+        dump_buf_to_client(fd, &g_sys_buf, &g_sys_disk, 2, min_level, with_ts, false);
+        dump_buf_to_client(fd, &g_logcat_buf, nullptr, 3, min_level, with_ts, false);
+        stream_post_add(fd, 0, min_level, false, with_ts);
         ctx->is_streaming = true;
         return 0;
     } else if (strncmp(line, "STOP_STREAM", 11) == 0) {
-        remove_stream_client(fd); 
-        ctx->is_streaming = false;
-        write(fd, "OK\n", 3); 
-        return 1; 
+        /* 订阅集合归 comm 线程：先同步回 OK（shutdown 后不可再写），再 shutdown
+           并投递 DEL（comm 侧 close）；is_streaming 保持 true，使公共关闭路径
+           走 shutdown+DEL 而非直接 close */
+        write(fd, "OK\n", 3);
+        shutdown(fd, SHUT_RDWR);
+        stream_post_del(fd);
+        ctx->stream_del_posted = true;
+        return 1;
     } else if (strcmp(line, "COUNT") == 0) {
-        int io_total = g_io_buf.full ? g_io_buf.max : (g_io_buf.head - g_io_buf.tail + g_io_buf.max) % g_io_buf.max;
-        int sys_total = g_sys_buf.full ? g_sys_buf.max : (g_sys_buf.head - g_sys_buf.tail + g_sys_buf.max) % g_sys_buf.max;
+        int io_total = g_io_disk.count +
+            (g_io_buf.full ? g_io_buf.max : (g_io_buf.head - g_io_buf.tail + g_io_buf.max) % g_io_buf.max);
+        int sys_total = g_sys_disk.count +
+            (g_sys_buf.full ? g_sys_buf.max : (g_sys_buf.head - g_sys_buf.tail + g_sys_buf.max) % g_sys_buf.max);
         int logcat_total = g_logcat_buf.full ? g_logcat_buf.max : (g_logcat_buf.head - g_logcat_buf.tail + g_logcat_buf.max) % g_logcat_buf.max;
         char resp[128];
         int len = snprintf(resp, sizeof(resp), "COUNT|%d|%d|%d\n", io_total, sys_total, logcat_total);
@@ -942,6 +1174,7 @@ static void handle_client_timeout_tick(int timer_fd) {
     uint64_t expirations;
     ssize_t r = read(timer_fd, &expirations, sizeof(expirations));
     (void)r;
+    persist_lazy_tick();   /* 落盘懒刷盘（500ms tick 驱动） */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     ClientCtx *curr_chk = g_active_clients;
@@ -950,13 +1183,14 @@ static void handle_client_timeout_tick(int timer_fd) {
         if (!curr_chk->is_streaming) {
             long elapsed_ms = (now.tv_sec - curr_chk->start_time.tv_sec) * 1000 +
                               (now.tv_nsec - curr_chk->start_time.tv_nsec) / 1000000;
-            if (elapsed_ms >= 500) {
-                epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, curr_chk->fd, nullptr);
-                close(curr_chk->fd);
-                remove_stream_client(curr_chk->fd);
-                remove_active_client(curr_chk);
-                free(curr_chk);
-            }
+                if (elapsed_ms >= 500) {
+                    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, curr_chk->fd, nullptr);
+                    close(curr_chk->fd);
+                    /* 超时清理仅针对非订阅连接（订阅连接 is_streaming=true，不会走到这里），
+                       故不在订阅集合中，无需投递 DEL */
+                    remove_active_client(curr_chk);
+                    free(curr_chk);
+                }
         }
         curr_chk = next_chk;
     }
@@ -976,7 +1210,6 @@ static void handle_client_timeout_tick(int timer_fd) {
 }
 int main(int argc, char *argv[]) {
     escape_cgroup();
-    extern void init_timezone();
     init_timezone();
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_signal);
@@ -998,66 +1231,17 @@ int main(int argc, char *argv[]) {
     }
     (void)verbose;
     init_buf(&g_io_buf, MAX_IO_LOGS); init_buf(&g_sys_buf, MAX_SYS_LOGS); init_buf(&g_logcat_buf, MAX_LOGCAT_LOGS);
-    mkdir(OVERFLOW_DIR, 0755);
-    {
-        DIR *od = opendir(OVERFLOW_DIR);
-        if (od) {
-            time_t cutoff = time(NULL) - 86400;
-            struct dirent *de;
-            while ((de = readdir(od)) != nullptr) {
-                if (de->d_type != DT_REG) continue;
-                char fpath[PATH_MAX];
-                snprintf(fpath, sizeof(fpath), "%s/%s", OVERFLOW_DIR, de->d_name);
-                struct stat st;
-                if (stat(fpath, &st) == 0 && st.st_mtime < cutoff) unlink(fpath);
-            }
-            closedir(od);
-        }
-        /* 清理轮转文件：每种类型最多保留 5 个 */
-        const char *types[] = {"io", "sys", "logcat"};
-        for (int t = 0; t < 3; t++) {
-            char pattern[64];
-            snprintf(pattern, sizeof(pattern), "%s.overflow.*", types[t]);
-            od = opendir(OVERFLOW_DIR);
-            if (!od) continue;
-            /* 收集匹配的轮转文件 */
-            char files[32][PATH_MAX];
-            time_t mtimes[32];
-            int count = 0;
-            struct dirent *de2;
-            while ((de2 = readdir(od)) != nullptr && count < 32) {
-                if (de2->d_type != DT_REG) continue;
-                if (fnmatch(pattern, de2->d_name, 0) != 0) continue;
-                snprintf(files[count], PATH_MAX, "%s/%s", OVERFLOW_DIR, de2->d_name);
-                struct stat st;
-                if (stat(files[count], &st) == 0) {
-                    mtimes[count] = st.st_mtime;
-                    count++;
-                }
-            }
-            closedir(od);
-            /* 按修改时间降序排序，删除第 6 个及之后的 */
-            for (int i = 0; i < count - 1; i++) {
-                for (int j = i + 1; j < count; j++) {
-                    if (mtimes[j] > mtimes[i]) {
-                        char tmp_path[PATH_MAX]; strncpy(tmp_path, files[i], PATH_MAX);
-                        strncpy(files[i], files[j], PATH_MAX);
-                        strncpy(files[j], tmp_path, PATH_MAX);
-                        time_t tmp_t = mtimes[i]; mtimes[i] = mtimes[j]; mtimes[j] = tmp_t;
-                    }
-                }
-            }
-            for (int i = 5; i < count; i++) unlink(files[i]);
-        }
-    }
-    if (g_persist_all_logs) mkdir(LOG_DIR, 0755);
+    /* io/sys 自动落盘常开：建目录 + 初始化暂存器（先于首条 push_log） */
+    mkdir(LOG_DIR, 0755);
+    persist_init_writer(&g_persist_io, "io");
+    persist_init_writer(&g_persist_sys, "sys");
+    /* 启动加载落盘快照到只读独立缓冲（与内存拼接，客户端获取时合并） */
+    disk_load(&g_io_disk, g_persist_io.rot, g_persist_io.path);
+    disk_load(&g_sys_disk, g_persist_sys.rot, g_persist_sys.path);
     load_ignore_rules();
     g_server_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path + 1, LOG_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(LOG_SOCKET_NAME);
+    socklen_t addr_len = nsp_uds_abstract_addr(&addr, LOG_SOCKET_NAME);
     unlink(LOG_SOCKET_NAME);
     bind(g_server_sock, (struct sockaddr*)&addr, addr_len);
     listen(g_server_sock, 128);
@@ -1071,6 +1255,13 @@ int main(int argc, char *argv[]) {
     }
     /* 启动 client 超时异步定时器并注册至 epoll */
     int timer_fd = setup_client_timeout_timer(g_epoll_fd);
+    /* 统一通讯线程：STREAM 实时推送扇出改由 comm 线程驱动，主线程只 post */
+    nsp_comm_init();
+    nsp_comm_backend_t stream_be = {
+        .ctx = NULL, .ensure_link = NULL, .emit = stream_emit,
+        .fini = NULL, .report = nsp_log_report,
+    };
+    nsp_comm_register(NSP_CH_BCAST, &stream_be);
     while (!g_should_exit) {
         int nfds = epoll_wait(g_epoll_fd, events, MAX_EVENTS, -1); /* 取消同步 100ms 超时，转为无限等待 */
         for (int i = 0; i < nfds; i++) {
@@ -1138,8 +1329,14 @@ int main(int argc, char *argv[]) {
                 }
                 if (consumed) {
                     epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->fd, nullptr);
-                    close(ctx->fd);
-                    remove_stream_client(ctx->fd);
+                    if (ctx->is_streaming && !ctx->stream_del_posted) {
+                        /* 订阅连接：shutdown + 投递 DEL，close 由 comm 线程执行
+                           （不断号，无 fd 复用竞态；STOP 路径已投递则跳过） */
+                        shutdown(ctx->fd, SHUT_RDWR);
+                        stream_post_del(ctx->fd);
+                    } else if (!ctx->is_streaming) {
+                        close(ctx->fd);
+                    }
                     remove_active_client(ctx);
                     free(ctx);
                 }
@@ -1147,8 +1344,18 @@ int main(int argc, char *argv[]) {
             }
         }
     }
-    close(g_server_sock); 
-    if (inotify_fd >= 0) close(inotify_fd); 
+    /* 先 join comm 线程（含订阅集合收尾），再直接关闭全部 fd（无竞态） */
+    nsp_comm_fini();
+    /* P3：fini 后投递的 DEL 只计 dropped（comm 已 join 无人 close），订阅 fd
+       仅 shutdown 未 close——退出前统一关闭（comm 线程已结束，无竞态） */
+    while (g_stream_clients) {
+        StreamClient *tmp = g_stream_clients;
+        g_stream_clients = tmp->next;
+        close(tmp->fd);
+        free(tmp);
+    }
+    close(g_server_sock);
+    if (inotify_fd >= 0) close(inotify_fd);
     if (timer_fd >= 0) close(timer_fd);
     close(g_epoll_fd);
     ClientCtx* curr_free = g_active_clients;
@@ -1169,6 +1376,13 @@ int main(int argc, char *argv[]) {
         a_curr = a_next;
     }
     g_async_clients = nullptr;
+    /* 退出前刷盘残余暂存并释放 */
+    persist_flush(&g_persist_io);
+    persist_flush(&g_persist_sys);
+    free(g_persist_io.stage); g_persist_io.stage = nullptr;
+    free(g_persist_sys.stage); g_persist_sys.stage = nullptr;
+    free(g_io_disk.data); g_io_disk.data = nullptr; g_io_disk.count = 0;
+    free(g_sys_disk.data); g_sys_disk.data = nullptr; g_sys_disk.count = 0;
     destroy_buf(&g_io_buf); destroy_buf(&g_sys_buf); destroy_buf(&g_logcat_buf);
     return 0;
 }

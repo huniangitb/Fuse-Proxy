@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include "config_publisher.h"
 #include "common.h"
+#include "nsp_comm.h"
+#include "nsp_util.h"
+#include <stdatomic.h>
 #include "injector.h"
 #include "config_parser.h"
 #include "inject_target.h"
@@ -193,20 +196,94 @@ static char *build_config_json_payload(int *out_len) {
     *out_len = len;
     return result;
 }
-static void broadcast_json(int sock_fd);
-static int g_pub_fd = -1;
-void config_publisher_broadcast(void) {
-    if (g_pub_fd >= 0)
-        broadcast_json(g_pub_fd);
+/* BCAST 通道载荷（仅 comm 线程解释，订阅者集合归 comm 线程所有，
+   主线程只 post，禁直接触碰 g_subscribers）：
+   'J' + json 字节                    —— 扇出广播
+   'A' + addrlen:1 + sockaddr 字节    —— 订阅注册（含去重 + 即时快照仍由主线程同步回复）
+   'D' + addrlen:1 + sockaddr 字节    —— 取消订阅 */
+/* 主线程写（init/cleanup）+ comm 线程读（ensure/emit），原子化防数据竞争；
+   cleanup 只 shutdown 不断号 close，残余 sendto 至多 EBADF，不会误发复用 fd */
+static _Atomic int g_pub_fd = -1;
+static _Atomic bool g_pub_active = false;
+
+static int sub_recount(void) {
+    int alive = 0;
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+        if (g_subscribers[i].active) alive++;
+    }
+    g_subscriber_count = alive;
+    return alive;
 }
-static void broadcast_json(int sock_fd) {
-    int len;
-    char *json = build_config_json_payload(&len);
-    if (!json) return;
-    LOG_DBG("配置广播: %d 订阅者, JSON 大小 %d 字节", g_subscriber_count, len);
+
+static void sub_add(const struct sockaddr_un *addr, socklen_t addr_len) {
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+        if (g_subscribers[i].active && g_subscribers[i].addr_len == addr_len &&
+            memcmp(&g_subscribers[i].addr, addr, addr_len) == 0) {
+            return; /* 重复订阅：幂等，主线程已同步回复快照 */
+        }
+    }
+    int idx = -1;
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+        if (!g_subscribers[i].active) { idx = i; break; }
+    }
+    if (idx < 0) {
+        /* 所有 slot 都被占用，强制移除第一个旧订阅者腾出空间 */
+        for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+            if (g_subscribers[i].active) {
+                LOG("配置广播: 强制移除旧订阅者 #%d", i);
+                g_subscribers[i].active = false;
+                idx = i;
+                break;
+            }
+        }
+    }
+    if (idx < 0) return;  /* 不应走到这里，但保留防御 */
+    memcpy(&g_subscribers[idx].addr, addr, addr_len);
+    g_subscribers[idx].addr_len = addr_len;
+    g_subscribers[idx].active = true;
+    LOG("配置广播: 新订阅者 #%d 已注册, 当前 %d 个订阅者", idx, sub_recount());
+}
+
+static void sub_del(const struct sockaddr_un *addr, socklen_t addr_len) {
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
+        if (g_subscribers[i].active && g_subscribers[i].addr_len == addr_len &&
+            memcmp(&g_subscribers[i].addr, addr, addr_len) == 0) {
+            g_subscribers[i].active = false;
+            LOG("配置广播: 订阅者 #%d 已取消订阅", i);
+            sub_recount();
+            return;
+        }
+    }
+}
+
+/* 后端（comm 线程）：DGRAM 无连接，ensure 以 active 标记为准 */
+static bool cfgpub_ensure_link(void *ctx) {
+    (void)ctx;
+    return atomic_load(&g_pub_active) && atomic_load(&g_pub_fd) >= 0;
+}
+
+static int cfgpub_emit(void *ctx, const void *data, size_t len) {
+    (void)ctx;
+    int sock_fd = atomic_load(&g_pub_fd);
+    if (len < 1 || sock_fd < 0) return -1;
+    const uint8_t *p = data;
+    if (p[0] == 'A' || p[0] == 'D') {
+        if (len < 2) return 0;
+        uint8_t alen = p[1];
+        if (alen == 0 || alen > sizeof(struct sockaddr_un) || len < (size_t)2 + alen) return 0;
+        struct sockaddr_un addr;
+        memcpy(&addr, p + 2, alen);
+        if (p[0] == 'A') sub_add(&addr, alen);
+        else sub_del(&addr, alen);
+        return 0;
+    }
+    if (p[0] != 'J') return 0;
+    const char *json = (const char *)(p + 1);
+    size_t jlen = len - 1;
+    LOG_DBG("配置广播: %d 订阅者, JSON 大小 %zu 字节", g_subscriber_count, jlen);
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (!g_subscribers[i].active) continue;
-        ssize_t ret = sendto(sock_fd, json, len, MSG_NOSIGNAL | MSG_DONTWAIT,
+        ssize_t ret = sendto(sock_fd, json, jlen, MSG_NOSIGNAL | MSG_DONTWAIT,
                              (struct sockaddr *)&g_subscribers[i].addr,
                              g_subscribers[i].addr_len);
         if (ret < 0) {
@@ -218,12 +295,24 @@ static void broadcast_json(int sock_fd) {
             }
         }
     }
-    /* 清理后重算真实活跃订阅数 */
-    int alive = 0;
-    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-        if (g_subscribers[i].active) alive++;
+    sub_recount();
+    return 0;
+}
+
+void config_publisher_broadcast(void) {
+    if (atomic_load(&g_pub_fd) < 0) return;
+    int len;
+    char *json = build_config_json_payload(&len);
+    if (!json) return;
+    /* JSON 拼装仍在调用方（沿用配置读锁上下文），扇出投递给 comm 线程 */
+    size_t total = (size_t)len + 1;
+    uint8_t *buf = malloc(total);
+    if (buf) {
+        buf[0] = 'J';
+        memcpy(buf + 1, json, (size_t)len);
+        nsp_comm_post(NSP_CH_BCAST, buf, total);
+        free(buf);
     }
-    g_subscriber_count = alive;
     free(json);
 }
 #define MAX_FILE_SIZE (256 * 1024)  
@@ -416,58 +505,24 @@ static void handle_get_request(int sock_fd, struct sockaddr_un *cli_addr,
            (struct sockaddr *)cli_addr, cli_len);
     free(json);
 }
+/* 订阅注册经 comm 线程（集合归 comm 所有，去重在 sub_add 内幂等）；
+   快照回复仍由主线程同步发送（请求应答语义不变） */
+static void post_sub_ctrl(char op, const struct sockaddr_un *cli_addr, socklen_t cli_len) {
+    if (cli_len == 0 || cli_len > sizeof(struct sockaddr_un)) return;
+    uint8_t buf[2 + sizeof(struct sockaddr_un)];
+    buf[0] = (uint8_t)op;
+    buf[1] = (uint8_t)cli_len;
+    memcpy(buf + 2, cli_addr, cli_len);
+    nsp_comm_post(NSP_CH_BCAST, buf, (size_t)2 + cli_len);
+}
+
 static void handle_subscribe(int sock_fd, struct sockaddr_un *cli_addr,
-                              socklen_t cli_len) {
-    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-        if (g_subscribers[i].active && g_subscribers[i].addr_len == cli_len &&
-            memcmp(&g_subscribers[i].addr, cli_addr, cli_len) == 0) {
-            handle_get_request(sock_fd, cli_addr, cli_len);
-            return;
-        }
-    }
-    int idx = -1;
-    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-        if (!g_subscribers[i].active) { idx = i; break; }
-    }
-    if (idx < 0) {
-        /* 所有 slot 都被占用，强制移除第一个旧订阅者腾出空间 */
-        for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-            if (g_subscribers[i].active) {
-                LOG("配置广播: 强制移除旧订阅者 #%d", i);
-                g_subscribers[i].active = false;
-                idx = i;
-                break;
-            }
-        }
-    }
-    if (idx < 0) return;  /* 不应走到这里，但保留防御 */
-    memcpy(&g_subscribers[idx].addr, cli_addr, cli_len);
-    g_subscribers[idx].addr_len = cli_len;
-    g_subscribers[idx].active = true;
-    /* 重算真实活跃订阅数 */
-    int alive = 0;
-    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-        if (g_subscribers[i].active) alive++;
-    }
-    g_subscriber_count = alive;
-    LOG("配置广播: 新订阅者 #%d 已注册, 当前 %d 个订阅者", idx, g_subscriber_count);
+                               socklen_t cli_len) {
+    post_sub_ctrl('A', cli_addr, cli_len);
     handle_get_request(sock_fd, cli_addr, cli_len);
 }
 static void handle_unsubscribe(struct sockaddr_un *cli_addr, socklen_t cli_len) {
-    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
-        if (g_subscribers[i].active && g_subscribers[i].addr_len == cli_len &&
-            memcmp(&g_subscribers[i].addr, cli_addr, cli_len) == 0) {
-            g_subscribers[i].active = false;
-            /* 重算真实活跃订阅数 */
-            int alive = 0;
-            for (int j = 0; j < MAX_SUBSCRIBERS; j++) {
-                if (g_subscribers[j].active) alive++;
-            }
-            g_subscriber_count = alive;
-            LOG("配置广播: 订阅者 #%d 已取消订阅", i);
-            return;
-        }
-    }
+    post_sub_ctrl('D', cli_addr, cli_len);
 }
 void config_publisher_handle_readable(int fd) {
     union {
@@ -507,10 +562,8 @@ int config_publisher_init(void) {
     int bufsize = 256 * 1024;  
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, PUBSUB_SOCKET_NAME, sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(PUBSUB_SOCKET_NAME);
+    struct sockaddr_un addr;
+    socklen_t addr_len = nsp_uds_abstract_addr(&addr, PUBSUB_SOCKET_NAME);
     if (bind(sock, (struct sockaddr *)&addr, addr_len) < 0) {
         LOG_ERR("配置广播: bind 失败: %s", strerror(errno));
         close(sock);
@@ -522,7 +575,14 @@ int config_publisher_init(void) {
         close(sock);
         return -1;
     }
-    g_pub_fd = sock;
+    atomic_store(&g_pub_fd, sock);
+    atomic_store(&g_pub_active, true);
+    /* BCAST 后端注册到统一 comm 线程：扇出 + 订阅集合改由 comm 线程驱动 */
+    nsp_comm_backend_t be = {
+        .ctx = NULL, .ensure_link = cfgpub_ensure_link, .emit = cfgpub_emit,
+        .fini = NULL, .report = nsp_log_report,
+    };
+    nsp_comm_register(NSP_CH_BCAST, &be);
     LOG("配置广播服务已启动 (DGRAM: %s)", PUBSUB_SOCKET_NAME);
     return sock;
 }
@@ -530,11 +590,11 @@ void config_publisher_cleanup(int fd) {
     if (fd < 0) return;
     if (g_epoll_fd >= 0)
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-    close(fd);
-    if (g_pub_fd == fd)
-        g_pub_fd = -1;
-    for (int i = 0; i < MAX_SUBSCRIBERS; i++)
-        g_subscribers[i].active = false;
-    g_subscriber_count = 0;
+    /* 关闭期：先停扇出（comm 线程随后 join），fd 以 shutdown 失效不断号——
+       comm 侧残余 sendto 至多 EBADF，不会因号段复用误发；集合内存随进程退出回收 */
+    atomic_store(&g_pub_active, false);
+    shutdown(fd, SHUT_RDWR);
+    if (atomic_load(&g_pub_fd) == fd)
+        atomic_store(&g_pub_fd, -1);
     LOG("配置广播服务已关闭");
 }

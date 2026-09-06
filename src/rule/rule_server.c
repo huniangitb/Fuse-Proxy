@@ -23,6 +23,7 @@
  */
 
 #include "common.h"
+#include "nsp_util.h"
 #include <json-c/json.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -815,34 +816,9 @@ static void injector_pid_path(char *out, size_t sz) {
     snprintf(out, sz, "%s/injector.pid", g_config_dir);
 }
 
-/* 递归建目录（最小实现，避免依赖 common.c） */
-static int mkdir_p(const char *path) {
-    if (!path || !*path) return -1;
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    size_t len = strlen(tmp);
-    if (len > 0 && tmp[len - 1] == '/') tmp[len - 1] = '\0';
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) { *p = '/'; return -1; }
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
-    return 0;
-}
-
-/* ==================== JSON 应答 ==================== */
-static void send_all(int fd, const char *buf, size_t len) {
-    while (len > 0) {
-        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
-        if (n <= 0) return;
-        buf += n;
-        len -= (size_t)n;
-    }
-}
-
+/* ==================== JSON 应答 ====================
+   mkdir/send 全量发送经 nsp_util 公共库复用（nsp_mkdir_p / nsp_send_all，
+   见 nsp_util.h），禁私刻副本（旧 mkdir_p/send_all 已删除） */
 static void reply_json(int fd, const char *status, const char *cmd, json_object *data, const char *err) {
     json_object *root = json_object_new_object();
     json_object_object_add(root, "status", json_object_new_string(status));
@@ -851,8 +827,8 @@ static void reply_json(int fd, const char *status, const char *cmd, json_object 
     if (err) json_object_object_add(root, "error", json_object_new_string(err));
     json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
     const char *s = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
-    send_all(fd, s, strlen(s));
-    send_all(fd, "\n", 1);
+    nsp_send_all(fd, s, strlen(s));
+    nsp_send_all(fd, "\n", 1);
     json_object_put(root);
 }
 
@@ -1312,7 +1288,7 @@ static void handle_add(int fd, json_object *req) {
                 }
             } else if (!active_exists) {
                 /* 无任何规则文件：创建空配置文件（应用已配置但无规则） */
-                if (mkdir_p(dir) != 0) {
+                if (nsp_mkdir_p(dir, 0755) != 0) {
                     reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
                     return;
                 }
@@ -1325,7 +1301,7 @@ static void handle_add(int fd, json_object *req) {
             }
         } else {
             if (active_exists) {
-                if (mkdir_p(dir) != 0) {
+                if (nsp_mkdir_p(dir, 0755) != 0) {
                     reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
                     return;
                 }
@@ -1371,7 +1347,7 @@ static void handle_add(int fd, json_object *req) {
         int count = 0, cap = 0;
         char **lines = read_file_lines(conf, &count, &cap);
         if (!lines) {
-            if (mkdir_p(g_config_dir) != 0) {
+            if (nsp_mkdir_p(g_config_dir, 0755) != 0) {
                 reply_error(fd, "ADD", "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
                 return;
             }
@@ -1483,7 +1459,7 @@ static void handle_add(int fd, json_object *req) {
     char dir[PATH_MAX], path[PATH_MAX];
     app_rule_dir(dir, sizeof(dir), uid);
     resolve_app_rule_active_path(pkg, uid, path, sizeof(path));
-    if (mkdir_p(dir) != 0) {
+    if (nsp_mkdir_p(dir, 0755) != 0) {
         reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
         return;
     }
@@ -2151,10 +2127,8 @@ static int run_server(void) {
         fprintf(stderr, "[rule_server] 创建 socket 失败: %s\n", strerror(errno));
         return 1;
     }
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, g_socket_name, sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(g_socket_name);
+    struct sockaddr_un addr;
+    socklen_t addr_len = nsp_uds_abstract_addr(&addr, g_socket_name);
     if (bind(sock, (struct sockaddr *)&addr, addr_len) < 0) {
         fprintf(stderr, "[rule_server] 绑定 %s 失败: %s\n", g_socket_name, strerror(errno));
         close(sock);
@@ -2205,10 +2179,8 @@ static int run_client(const char *cmd_json) {
         fprintf(stderr, "创建 socket 失败: %s\n", strerror(errno));
         return 1;
     }
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, g_socket_name, sizeof(addr.sun_path) - 2);
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(g_socket_name);
+    struct sockaddr_un addr;
+    socklen_t addr_len = nsp_uds_abstract_addr(&addr, g_socket_name);
     if (connect(sock, (struct sockaddr *)&addr, addr_len) < 0) {
         fprintf(stderr, "连接 %s 失败: %s（服务未启动？）\n", g_socket_name, strerror(errno));
         close(sock);
@@ -2216,7 +2188,7 @@ static int run_client(const char *cmd_json) {
     }
     char req[MAX_REQ_LEN];
     snprintf(req, sizeof(req), "%s\n", cmd_json);
-    send_all(sock, req, strlen(req));
+    nsp_send_all(sock, req, strlen(req));
     shutdown(sock, SHUT_WR);
 
     /* 响应动态扩容读取（LIST/GET 全量规则可能远超 8KB），杜绝静默截断 */
@@ -2252,51 +2224,15 @@ static int run_client(const char *cmd_json) {
 
 /* ==================== 后台化（daemonize + cgroup 逃脱） ====================
    与 injector 同策略：默认自动退入后台（service.sh 无需 &），双重 fork + setsid
-   脱离会话与控制终端；并将进程写入 cgroup 根（v2 cgroup.procs / v1 tasks），
-   逃出 Android 应用冻结/内存清理 cgroup，避免后台被系统误杀。
-   --foreground 保留前台模式（测试/调试）。
-   命名加 rs_ 前缀：common.h 已声明公共 escape_cgroup（injector 用），
-   本文件独立实现避免符号冲突。 */
-
+   脱离会话与控制终端；并将进程写入 cgroup 根，逃出 Android 应用冻结/内存清理
+   cgroup，避免后台被系统误杀。--foreground 保留前台模式（测试/调试）。
+   实现经 nsp_util 公共库复用（nsp_daemonize / nsp_escape_cgroup），禁私刻副本。 */
 static void rs_escape_cgroup(void) {
-    char pid_s[32];
-    snprintf(pid_s, sizeof(pid_s), "%d", (int)getpid());
-    const char *targets[] = {
-        "/sys/fs/cgroup/cgroup.procs", /* v2 根 cgroup */
-        "/dev/cpuctl/tasks",           /* v1 cpu */
-        "/dev/cpuset/tasks",           /* v1 cpuset */
-        "/dev/stune/tasks"             /* v1 stune */
-    };
-    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
-        int fd = open(targets[i], O_WRONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            /* 静默吞掉写入失败：cgroup 路径在不同 Android 版本与配置下可能不存在或无写权限 */
-            if (write(fd, pid_s, strlen(pid_s)) < 0)
-                RLOG("rs_escape_cgroup: 写入 %s 失败: %s\n", targets[i], strerror(errno));
-            close(fd);
-        }
-    }
+    nsp_escape_cgroup();
 }
 
 static void rs_daemonize(void) {
-    pid_t pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);   /* 父进程退出，service.sh 无需 & 即返回 */
-    setsid();
-    pid = fork();           /* 二次 fork 确保不重新获得控制终端 */
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    /* 关闭全部 fd 并重定向标准流到 /dev/null */
-    long max_fd_l = sysconf(_SC_OPEN_MAX);
-    int max_fd = (max_fd_l <= 0 || max_fd_l > 4096) ? 4096 : (int)max_fd_l;
-    for (int x = max_fd; x >= 0; x--) close(x);
-    int dev_null = open("/dev/null", O_RDWR | O_CLOEXEC);
-    if (dev_null >= 0) {
-        dup2(dev_null, 0);
-        dup2(dev_null, 1);
-        dup2(dev_null, 2);
-        close(dev_null);
-    }
+    nsp_daemonize(-1);
 }
 
 static void usage(const char *prog) {

@@ -96,6 +96,10 @@ else
 endif
 
 # ================= 源码集合 =================
+# 契约：common_sources 被多个二进制逐源重编译（Meson 正常行为，非错误）；
+# basic_rules.so 故意独立重编 config_parser/path_vars/trie（模块须 dlopen
+# 自包含，不依赖主程序符号除导出表外）——规则语义双活，修改 trie/变量静态性
+# 时须同步验证 tests/test_rules.py 与 tests/test_path_vars.py，防行为分叉。
 common_sources = [
     'src/core/common.c',
     'src/core/path_trie.c',
@@ -131,10 +135,29 @@ sha256_hw_lib = static_library('sha256_hw',
 sha256_hw_dep = declare_dependency(link_with: sha256_hw_lib,
                                    include_directories: all_inc_dirs)
 
+# nsp_util 轻量公共库（纯 libc，无项目全局依赖）：收敛 UDS 抽象地址填充、send_all
+# 全量发送、str_trim、mkdir_p、daemonize、cgroup 逃逸，供各二进制与热插拔模块
+# 复用（rule_server 等未链接 common.c 的目标亦可直接用，避免私刻副本漂移）
+nsp_util_lib = static_library('nsp_util',
+  'src/core/nsp_util.c',
+  include_directories: all_inc_dirs,
+)
+nsp_util_dep = declare_dependency(link_with: nsp_util_lib,
+                                  include_directories: all_inc_dirs)
+
+# nsp_comm 统一通讯线程（epoll: eventfd+timerfd）：无锁/短临界区 outbox +
+# 后端 emit 表。调用线程只 nsp_comm_post，永不阻塞；各二进制按需 register。
+nsp_comm_lib = static_library('nsp_comm',
+  'src/core/nsp_comm.c',
+  include_directories: all_inc_dirs,
+)
+nsp_comm_dep = declare_dependency(link_with: nsp_comm_lib,
+                                  include_directories: all_inc_dirs)
+
 executable('fuse_daemon',
   fuse_daemon_sources + ['src/core/common.c'],
   include_directories: all_inc_dirs,
-  dependencies: project_deps + [sha256_hw_dep],
+  dependencies: project_deps + [sha256_hw_dep, nsp_util_dep, nsp_comm_dep],
   c_args: ['-DFUSE_USE_VERSION=317'],
   link_args: ['-Wl,--export-dynamic'],  # 导出公共符号，供 dlopen 的热插拔模块解析
   install: true,
@@ -145,7 +168,7 @@ if target_os == 'android'
   executable('injector',
     injector_sources + common_sources,
     include_directories: all_inc_dirs,
-    dependencies: project_deps,
+    dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
     install: true,
     install_dir: install_bin_dir
   )
@@ -156,9 +179,9 @@ else
   executable('global_replace_ctl',
     ['src/injector/global_replace_ctl.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c',
      'src/injector/inject_target.c', 'src/injector/mount_manager.c',
-     'src/core/fast_pid.c'] + common_sources,
+      'src/core/fast_pid.c'] + common_sources,
     include_directories: all_inc_dirs,
-    dependencies: project_deps,
+    dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
     install: false
   )
 endif
@@ -166,7 +189,7 @@ endif
 executable('log_monitor',
   ['src/log/log_monitor.c'] + common_sources,
   include_directories: all_inc_dirs,
-  dependencies: project_deps,
+  dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
   install: true,
   install_dir: install_bin_dir
 )
@@ -174,7 +197,7 @@ executable('log_monitor',
 executable('log_ctl',
   ['src/log/log_ctl.c'] + common_sources,
   include_directories: all_inc_dirs,
-  dependencies: project_deps,
+  dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
   install: true,
   install_dir: install_bin_dir
 )
@@ -185,7 +208,7 @@ executable('log_ctl',
 executable('rule_server',
   ['src/rule/rule_server.c'],
   include_directories: all_inc_dirs,
-  dependencies: json_c,
+  dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep],
   install: true,
   install_dir: install_bin_dir
 )
@@ -209,7 +232,7 @@ basic_rules_sources = [
 shared_library('basic_rules',
   basic_rules_sources,
   include_directories: all_inc_dirs,
-  dependencies: [dependency('threads'), cc.find_library('dl', required: false), sha256_hw_dep],
+  dependencies: [dependency('threads'), cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep, nsp_comm_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
   install: true,
@@ -276,7 +299,7 @@ endif
 shared_library('ftp_module',
   ftp_module_sources,
   include_directories: [all_inc_dirs, ftp_curl_inc],
-  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), sha256_hw_dep],
+  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep, nsp_comm_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,

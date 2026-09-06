@@ -33,6 +33,7 @@
 #include <sys/syscall.h>
 #include <ctype.h>
 #include "common.h"
+#include "nsp_comm.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
 #include "module_guard.h"
@@ -177,19 +178,10 @@ static int fw_parse_path(const char* path, int* user_id_out, char* sub_path_out,
     return 0;
 }
 
-/* 框架默认存储路径（无规则模块 / 模块未命中时的直通回退） */
+/* 框架默认存储路径（无规则模块 / 模块未命中时的直通回退）：
+   经 common_default_real_path 统一合成（见 common.h），禁裸拼 STORAGE_BASE */
 static void fw_default_real_path(int user_id, const char* sub_path, char* out, size_t sz) {
-    if (user_id >= 0) {
-        if (g_real_root[0])
-            snprintf(out, sz, "%s/%d%s", g_real_root, user_id, sub_path);
-        else
-            snprintf(out, sz, STORAGE_BASE "/%d%s", user_id, sub_path);
-    } else {
-        if (g_real_root[0])
-            snprintf(out, sz, "%s%s", g_real_root, sub_path);
-        else
-            snprintf(out, sz, STORAGE_BASE "%s", sub_path);
-    }
+    common_default_real_path(user_id, sub_path, out, sz);
 }
 
 /* 虚拟目录判空（原 vfs_is_virtual_dir_empty 的分派器版）：
@@ -458,10 +450,7 @@ static int vfs_getattr(const char *path, struct stat *st, struct fuse_file_info 
                lstat 必失败，故取用户存储根的真实属主，而非固定 root） */
             int root_uid = (path_user_id >= 0) ? path_user_id : 0;
             char root_path[PATH_MAX];
-            if (g_real_root[0])
-                snprintf(root_path, sizeof(root_path), "%s/%d", g_real_root, root_uid);
-            else
-                snprintf(root_path, sizeof(root_path), STORAGE_BASE "/%d", root_uid);
+            common_storage_root(root_uid, root_path, sizeof(root_path));
             struct stat pst;
             if (lstat(root_path, &pst) == 0) {
                 st->st_uid = pst.st_uid;
@@ -746,10 +735,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
         {
             int root_uid = (path_user_id >= 0) ? path_user_id : 0;
             char root_path[PATH_MAX];
-            if (g_real_root[0])
-                snprintf(root_path, sizeof(root_path), "%s/%d", g_real_root, root_uid);
-            else
-                snprintf(root_path, sizeof(root_path), STORAGE_BASE "/%d", root_uid);
+            common_storage_root(root_uid, root_path, sizeof(root_path));
             have_parent = (lstat(root_path, &parent_st) == 0);
         }
         int vn = module_dispatch_readdir(&vq, sub_path, path_user_id, current_pkg, is_root, virt, MAX_MODULES * 8);
@@ -1652,12 +1638,13 @@ static int vfs_removexattr(const char *path, const char *name) {
 
 static void vfs_destroy(void *private_data) {
     (void)private_data; LOG_DBG("FUSE 守护进程正在退出，清理资源...");
-    log_close();
+    /* 先投递 EXIT（comm 线程仍存活），再 log_close 做最尽力 drain + join */
+    char msg[256]; snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid()); nsp_comm_post(NSP_CH_IPC, msg, strlen(msg) + 1);
     if (g_global_root_fd >= 0) close(g_global_root_fd);
 #ifdef TARGET_ANDROID
     if (g_bpf_fd >= 0) close(g_bpf_fd);
 #endif
-    char msg[256]; snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid()); send_ipc_message(msg);
+    log_close();
 }
 
 /* 透传会话 fd：经 fuse_get_context()->fuse → fuse_get_session → fuse_session_fd 解析
@@ -1862,7 +1849,8 @@ skip_passthrough:
     } else {
         LOG_WRN("FUSE Passthrough: 所有文件I/O将走标准FUSE用户态路径 (性能较低)");
     }
-    char msg[512]; snprintf(msg, 511, "FUSE_ALIVE Global %d", getpid()); send_ipc_message(msg);
+    /* 生命线投递经 comm 线程（init 路径不再被 connect 卡 500ms） */
+    char msg[512]; snprintf(msg, 511, "FUSE_ALIVE Global %d", getpid()); nsp_comm_post(NSP_CH_IPC, msg, strlen(msg) + 1);
     /* 协商详情：内核上报能力与本端请求位——若后续就绪验证失败(内核 conn_error)，
        据此可定位是哪个请求位被内核拒绝（如 DAX 设备把回包 legacy bit31 误读为
        FUSE_MAP_ALIGNMENT 而拒绝回包） */
