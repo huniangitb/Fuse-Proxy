@@ -623,6 +623,40 @@ static int find_section_header(char **lines, int count, const char *name) {
     return -1;
 }
 
+/* 类别段（[USER_APPS[:uid]]/[SYSTEM_APPS]）：set-rule/remove-rule 均路由到
+   主文件精确段头（USER_APPS 恒带显式 :uid，默认 0） */
+static bool is_category_pkg(const char *pkg) {
+    /* P2：大小写敏感，与 config_parser 及 GLOBAL 一致 */
+    return pkg && (strcmp(pkg, "USER_APPS") == 0 || strcmp(pkg, "SYSTEM_APPS") == 0);
+}
+
+static void category_section_header(const char *pkg, int user_id, char *out, size_t sz) {
+    if (strcmp(pkg, "SYSTEM_APPS") == 0)
+        snprintf(out, sz, "[SYSTEM_APPS]");
+    else
+        snprintf(out, sz, "[USER_APPS:%d]", user_id < 0 ? 0 : user_id);
+}
+
+static int find_header_line(char **lines, int count, const char *hdr_text) {
+    size_t hlen = strlen(hdr_text);
+    for (int i = 0; i < count; i++) {
+        char *p = lines[i];
+        while (isspace((unsigned char)*p)) p++;
+        if (strncmp(p, hdr_text, hlen) != 0) continue;
+        char *rest = p + hlen;
+        while (isspace((unsigned char)*rest)) rest++;
+        /* P2：ON/OFF 须有边界（空白/NUL/换行），[USER_APPS:0]OFFX 之类不算段头 */
+        if (*rest == '\0' || *rest == '\n') return i;
+        if (strncmp(rest, "ON", 2) == 0 &&
+            (rest[2] == '\0' || rest[2] == '\n' || isspace((unsigned char)rest[2])))
+            return i;
+        if (strncmp(rest, "OFF", 3) == 0 &&
+            (rest[3] == '\0' || rest[3] == '\n' || isspace((unsigned char)rest[3])))
+            return i;
+    }
+    return -1;
+}
+
 static int find_switch_in_section(char **lines, int count, int header_idx, const char *type) {
     size_t tlen = strlen(type);
     for (int i = header_idx + 1; i < count; i++) {
@@ -643,8 +677,10 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
         json_api_error(api_mode, "\"set-rule\"", "缺少必要参数: pkg type value");
         return;
     }
+    bool is_global = (strcmp(pkg, "GLOBAL") == 0);
+    bool is_cat = (!is_global && is_category_pkg(pkg));
     char rule_path[PATH_MAX];
-    if (strcmp(pkg, "GLOBAL") == 0) {
+    if (is_global || is_cat) {
         snprintf(rule_path, sizeof(rule_path), "%s", INJECTOR_CONFIG_PATH);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
@@ -687,7 +723,15 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
     bool is_global_switch = (strcmp(type, "MONITOR") == 0 ||
                              strcmp(type, "SANDBOX") == 0 ||
                              strcmp(type, "GLOBAL_INJECT") == 0);
-    if (strcmp(pkg, "GLOBAL") == 0) {
+    if (is_global || is_cat) {
+        char sec_hdr[64], sec_line[72];
+        if (is_cat) {
+            category_section_header(pkg, user_id, sec_hdr, sizeof sec_hdr);
+            snprintf(sec_line, sizeof sec_line, "%s\n", sec_hdr);
+        } else {
+            snprintf(sec_hdr, sizeof sec_hdr, "[GLOBAL]");
+            snprintf(sec_line, sizeof sec_line, "[GLOBAL]\n");
+        }
         int line_count = 0, line_cap = 0;
         char **lines = read_file_lines(rule_path, &line_count, &line_cap);
         if (!lines) {
@@ -698,12 +742,13 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                 json_api_error(api_mode, "\"set-rule\"", err_buf);
                 return;
             }
-            fprintf(fp, "[GLOBAL]\n");
+            fputs(sec_line, fp);
             fputs(line, fp);
             fclose(fp);
             goto report_success;
         }
-        int hdr = find_section_header(lines, line_count, "GLOBAL");
+        int hdr = is_global ? find_section_header(lines, line_count, "GLOBAL")
+                            : find_header_line(lines, line_count, sec_hdr);
         bool changed = false;
         if (is_global_switch && hdr >= 0) {
             int old = find_switch_in_section(lines, line_count, hdr, type);
@@ -747,7 +792,7 @@ static void handle_set_rule(bool api_mode, const char *pkg, const char *type,
                 changed = true;
             }
         } else {
-            int new_count = append_line(&lines, &line_cap, line_count, "[GLOBAL]\n");
+            int new_count = append_line(&lines, &line_cap, line_count, sec_line);
             if (new_count < 0) {
                 free_file_lines(lines, line_count);
                 json_api_error(api_mode, "\"set-rule\"", "内存不足");
@@ -823,7 +868,7 @@ static void handle_remove_rule(bool api_mode, const char *pkg, const char *type,
         return;
     }
     char rule_path[PATH_MAX];
-    if (strcmp(pkg, "GLOBAL") == 0) {
+    if (strcmp(pkg, "GLOBAL") == 0 || is_category_pkg(pkg)) {
         snprintf(rule_path, sizeof(rule_path), "%s", INJECTOR_CONFIG_PATH);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);

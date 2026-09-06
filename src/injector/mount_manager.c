@@ -5,6 +5,7 @@
 #include "inject_target.h"
 #include "injector.h"
 #include "common.h"
+#include "sys_pkg.h"
 #include "fast_search.h"
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +27,11 @@ bool app_has_active_rules(const char* pkg, uid_t uid) {
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     bool has_rules = false;
     if (cfg) has_rules = (cfg->redir_count > 0 || cfg->hide_count > 0 || cfg->ro_count > 0 || cfg->sandbox);
+    /* 类别层（与 br_pick_category 同口径）：应用段无规则时看类别段 */
+    if (!has_rules) {
+        bool is_sys = (uid < 10000) || (pkg && sys_pkg_is_system(pkg));
+        has_rules = category_has_rules_locked(is_sys, user_id);
+    }
     if (!has_rules) {
         bool use_global_sandbox = !is_media_provider(pkg);
         has_rules = (g_global_cfg.global_inject ||
