@@ -518,6 +518,7 @@ static void cleanup_async(AsyncCtx *ctx) {
 }
 static void *async_log_thread(void *arg) {
     AsyncCtx *ctx = arg;
+    nsp_set_thread_name("nsp_logasy");
     char buf[4096];
     char line[MAX_MSG_LEN + 128];   /* 行缓冲须容纳完整合并日志（单行制表符），
                                        否则 511 截断会切坏 UTF-8 中文产生乱码 */
@@ -1239,6 +1240,7 @@ int main(int argc, char *argv[]) {
     disk_load(&g_io_disk, g_persist_io.rot, g_persist_io.path);
     disk_load(&g_sys_disk, g_persist_sys.rot, g_persist_sys.path);
     load_ignore_rules();
+    /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
     g_server_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un addr;
     socklen_t addr_len = nsp_uds_abstract_addr(&addr, LOG_SOCKET_NAME);
