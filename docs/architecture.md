@@ -104,6 +104,9 @@ src/
 ├── injector/             # 注入器（injector/inject_target/mount_manager/
 │   │                     #   ns_utils/ns_global_replace/ipc_server/config_publisher）
 │   └── global_replace_ctl.c  # 全局替换挂载测试驱动（仅 GNU）
+├── zygisk/               # Zygisk 应用创建通知模块（仅 Android，双 ABI）
+│   ├── zygisk.hpp        # Zygisk ABI 头（ISC，取自 Magisk，原样收录）
+│   └── zygisk_module.cpp # preAppSpecialize 上报 → companion → injector
 ├── rule/rule_server.c    # 规则控制服务（JSON 行协议）
 └── log/                  # log_monitor、log_ctl
 ```
@@ -158,6 +161,21 @@ FUSE 回调（如 getattr）
 3. `inject_target` 判定是否为目标（含 `SKIP_SYSTEM_APPS` 过滤、隔离进程过滤）。
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
 5. 此后该应用对 `/sdcard` 的访问经 FUSE → basic_rules 匹配。
+
+#### 主动扫描与被动通知
+
+第 2 步有两条并存的途径。除周期扫描外，Zygisk 模块（`src/zygisk/`）在应用创建时即时上报：
+
+```
+app 进程  preAppSpecialize ──→ connectCompanion ──→ "REQ <pkg> <pid> <uid>"
+companion（root）           ──→ nsp_ipc_socket   ──→ "REPORT <pkg> <pid> <uid>"
+injector  ipc_server.c 解析 ──→ 置 g_passive_mode，转入被动模式
+```
+
+injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫描（`maybe_periodic_scan`），此后新应用的发现完全依赖该模块——通知比轮询及时，也免去了持续扫描 `/proc` 的开销。
+
+因此 Zygisk 模块**必须 64/32 位双 ABI 部署**：只装 64 位时，任一 64 位应用触发被动模式后，跑在 32 位 zygote 上的应用既收不到通知、也等不到扫描，将彻底漏注入。打包脚本对两个 ABI 都有存在性断言。
+
 
 ### 5.2 配置热重载
 
