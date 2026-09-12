@@ -1,3 +1,13 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later WITH Fuse-Proxy-module-exception */
+/*
+ * 版权所有 (C) 2026 huniangitb <3361107168@qq.com>
+ *
+ * 本文件是 Fuse-Proxy 的一部分，以 GPL-3.0-or-later 发布（见 LICENSE）。
+ *
+ * 模块 ABI 链接例外：仅通过本头文件声明的公开 ABI 与 Fuse-Proxy 结合的
+ * 独立模块（运行时 dlopen 加载的 .so），可按任意条款发布，不因此受 GPL
+ * 约束。完整条款见 LICENSE.module-exception。
+ */
 #ifndef NSP_MODULE_H
 #define NSP_MODULE_H
 /*
