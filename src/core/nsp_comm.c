@@ -1,4 +1,5 @@
 #include "nsp_comm.h"
+#include "nsp_util.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -293,6 +294,7 @@ static void drain_once(bool for_shutdown) {
 
 static void *nsp_comm_thread(void *arg) {
     (void)arg;
+    nsp_set_thread_name("nsp_comm");
     struct epoll_event evs[4];
     drain_once(false); /* 启动即排空 init 前堆积（未 init 的 post 已计 dropped，不会堆积） */
     while (!g_shutdown) {

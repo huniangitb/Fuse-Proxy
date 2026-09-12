@@ -37,4 +37,9 @@ void nsp_escape_cgroup(void);
  * 传入 -1 则关闭全部。父进程直接 exit(0)，永不返回非零（失败 exit(1)）。 */
 void nsp_daemonize(int preserve_fd);
 
+/* 运行时线程语义化命名（/proc/<pid>/task/<tid>/comm）：各线程入口首行调用，
+ * 替代默认继承的二进制程序名，便于崩溃日志 TID 归因与 top -H 排查。
+ * 超 15 字节截断（TASK_COMM_LEN 上限），NULL/空串直接返回。 */
+void nsp_set_thread_name(const char *name);
+
 #endif
