@@ -3,6 +3,7 @@
 #include "ftp_backend.h"
 #include "nsp_module.h"
 #include "nsp_module.h"
+#include "nsp_util.h"   /* nsp_set_thread_name（线程语义化命名） */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,7 @@ static void reload_ftp_conf(void) {
 /* ftp.conf 热加载监控线程：inotify 监听目录，变更后重建后端前缀表 */
 static void* ftp_conf_watch_thread(void* arg) {
     (void)arg;
+    nsp_set_thread_name("nsp_ftpcfg");
     int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (fd < 0) {
         LOG_WRN("ftp_module: inotify_init1 失败 (%s)", strerror(errno));

@@ -1,8 +1,12 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* pthread_setname_np 声明所需（模块侧无 -D_GNU_SOURCE 时） */
+#endif
 #include "nsp_util.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,4 +111,16 @@ void nsp_daemonize(int preserve_fd) {
         dup2(dev_null, 2);
         if (dev_null > 2) close(dev_null);
     }
+}
+
+void nsp_set_thread_name(const char *name) {
+    if (!name || !name[0]) return;
+#ifdef __linux__
+    /* TASK_COMM_LEN=16（含 NUL）：超长截断，调用方无需预处理 */
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.15s", name);
+    pthread_setname_np(pthread_self(), buf);
+#else
+    (void)name;
+#endif
 }

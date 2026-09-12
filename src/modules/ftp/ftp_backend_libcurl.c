@@ -10,6 +10,7 @@
 
 #include "nsp_module.h"
 #include "nsp_module.h"
+#include "nsp_util.h"   /* nsp_set_thread_name（线程语义化命名） */
 #include "ftp_backend.h"
 #include <curl/curl.h>
 #include <pthread.h>
@@ -1209,6 +1210,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
    调用方须确保 read_curl 有效（错误时线程内销毁，read 层重建）。 */
 static void* ftp_dl_thread(void* arg) {
     FtpBackendFile* f = arg;
+    nsp_set_thread_name("nsp_ftpdl");
     int dl_backoff_ms = 500;   /* 弱网适配：错误退避指数增长（500ms→8s 封顶） */
     while (!f->dl_stop) {
         pthread_mutex_lock(&f->f_lock);
@@ -1476,6 +1478,7 @@ static int ftp_stream_chunk(FtpBackendFile* f, const char* data, size_t len, boo
    retransmit/up_error 时立即退出（flush 转全量重传兜底）。 */
 static void* ftp_up_thread(void* arg) {
     FtpBackendFile* f = arg;
+    nsp_set_thread_name("nsp_ftpup");
     char* buf = malloc(FTP_UP_CHUNK);
     if (!buf) {
         pthread_mutex_lock(&f->f_lock);
