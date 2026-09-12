@@ -138,7 +138,23 @@ for f in injector.conf ftp.conf monitor_ignore.conf; do
     fi
 done
 
-# ===================== 2.5 同步许可证（分发二进制的法定义务） =====================
+# ===================== 2.2 同步 Zygisk 模块（双 ABI，必须齐全） =====================
+# injector 收到首次 IPC 通知即转被动模式停止周期扫描，缺 32 位会让跑在
+# 32 位 zygote 上的应用既无通知也无扫描，静默漏注入——故两个 ABI 缺一不可。
+echo "== 同步 Zygisk 模块 ..."
+mkdir -p "$MODULE_DIR/zygisk"
+for abi in arm64-v8a armeabi-v7a; do
+    src="$BUILD_DIR/src/zygisk/$abi.so"
+    if [[ -f "$src" ]]; then
+        cp -f "$src" "$MODULE_DIR/zygisk/$abi.so"
+        echo "   - $abi.so"
+    else
+        echo "错误: 缺少 Zygisk 模块 $src（应用创建通知将失效）" >&2
+        exit 1
+    fi
+done
+
+# ============================ 2.5 同步许可证（分发二进制的法定义务） =====================
 # GPL-3.0 要求随二进制附许可证；libfuse 为静态链接的 LGPL-2.1 组件，
 # 其告知义务同样在分发时履行（见 THIRD-PARTY-NOTICES.md）。
 echo "== 同步许可证文件 ..."
@@ -270,6 +286,8 @@ check("fuse_daemon 存在", any("bin/fuse_daemon" in n for n in names))
 check("basic_rules.rules 存在", any(n.endswith("basic_rules/basic_rules.rules") for n in names))
 check("ftp_module.rules 存在", any(n.endswith("ftp_module/ftp_module.rules") for n in names))
 check("zygisk 存在", any(n.startswith("zygisk/") and n.endswith(".so") for n in names))
+check("zygisk arm64-v8a 存在", "zygisk/arm64-v8a.so" in names)
+check("zygisk armeabi-v7a 存在", "zygisk/armeabi-v7a.so" in names)
 check("webroot 存在", any(n.startswith("webroot/") for n in names))
 check("reload_rules 无残留", not any("reload_rules" in n for n in names))
 check("LICENSE 存在", "LICENSE" in names)

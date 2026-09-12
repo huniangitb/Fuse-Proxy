@@ -45,6 +45,7 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 | `rule_server` | 规则控制服务（JSON 行协议动态改规则） |
 | `log_monitor` / `log_ctl` | 日志收集服务 / 查询流式输出 CLI |
 | `basic_rules.so` / `ftp_module.so` | 热插拔模块（规则引擎 / FTP 存储后端） |
+| `src/zygisk/{arm64-v8a,armeabi-v7a}.so` | Zygisk 应用创建通知模块（仅 Android，双 ABI） |
 
 ## 测试
 
@@ -64,6 +65,7 @@ src/
   injector/   # injector（主控：挂载/命名空间/IPC/配置广播）
   module/     # 模块框架（加载器 + 故障围栏 + 熔断）
   modules/    # basic_rules（规则引擎）、ftp（FTP 后端）
+  zygisk/     # Zygisk 应用创建通知模块（仅 Android，双 ABI）
   rule/       # rule_server
   config/     # 规则解析 + 路径变量
   core/       # 公共工具（日志/通讯线程/trie/uid 映射/crash）
