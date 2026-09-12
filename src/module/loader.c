@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "module_loader.h"
 #include "common.h"
+#include "nsp_util.h"
 #include "fault_fence.h"
 #include "module_guard.h"
 #include "../core/sha256.h"
@@ -8,6 +9,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <sys/inotify.h>
+#include <sys/file.h>
 #include <poll.h>
 #include <pthread.h>
 #include <errno.h>
@@ -273,14 +275,36 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info,
     char so_path[PATH_MAX];
     snprintf(so_path, sizeof so_path, "%s/%s/%s.so", g_modules_dir, name, name);
     pthread_rwlock_wrlock(&g_module_lock);
-    if (g_module_count >= MAX_MODULES) {
-        pthread_rwlock_unlock(&g_module_lock);
-        LOG_ERR("模块注册表已满，拒绝 %s", name);
-        if (info->exit) info->exit();
-        dlclose(h);
-        return -6;
+    /* 槽位复用：毒化/卸载后的非活跃槽位可复用，否则反复 ban→更新→新槽
+       16 次后注册表满拒绝一切新模块（DoS 上限）。优先复用同名非活跃槽。
+       置毒超时（在途引用未归零、跳过 dlclose）槽位不可复用：.so 仍映射且
+       有在途调用，复用会混淆引用计数与快照。 */
+    int slot = -1;
+    for (int i = 0; i < g_module_count; i++) {
+        if (!g_modules[i].active && strcmp(g_modules[i].name, name) == 0 &&
+            atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0 &&
+            atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) { slot = i; break; }
     }
-    int slot = g_module_count++;
+    if (slot < 0) {
+        for (int i = 0; i < g_module_count; i++) {
+            if (!g_modules[i].active &&
+                atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0 &&
+                atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) { slot = i; break; }
+        }
+    }
+    if (slot < 0) {
+        if (g_module_count >= MAX_MODULES) {
+            pthread_rwlock_unlock(&g_module_lock);
+            LOG_ERR("模块注册表已满，拒绝 %s", name);
+            if (info->exit) info->exit();
+            dlclose(h);
+            return -6;
+        }
+        slot = g_module_count++;
+    } else {
+        /* 复用槽位：清零残留 guard/ban 状态（旧错误不跨加载周期继承） */
+        module_guard_reset(slot);
+    }
     ModuleEntry* m = &g_modules[slot];
     memset(m, 0, sizeof *m);
     strncpy(m->name, name, sizeof m->name - 1);
@@ -434,14 +458,26 @@ static void banned_path_init(void) {
 
 static bool module_ban_lookup(const char* name, const char* hash, char reason_out[96]) {
     banned_path_init();
+    if (!name || !name[0]) return false;
     FILE* fp = fopen(g_banned_path, "r");
     if (!fp) return false;   /* 无 ban 记录 */
+    /* 共享锁：防与置毒线程追加/重写并发读到半行 */
+    flock(fileno(fp), LOCK_SH);
     char line[512];
-    char rewrite[4096] = {0};
+    /* rewrite 缓冲放大到 64KB：ban 多时不静默丢行；仍溢出则放弃重写保旧文件 */
+    static char rewrite[65536];
+    rewrite[0] = '\0';
     size_t rl = 0;
-    bool found = false, stale = false;
+    bool found = false, stale = false, overflow = false, has_name = false;
+    bool hash_empty = (!hash || !hash[0]);
     while (fgets(line, sizeof line, fp)) {
         size_t len = strlen(line);
+        /* fgets 截断（行超 511 且无换行）：残片当新行会误判，整行丢弃 */
+        if (len == sizeof line - 1 && line[len - 1] != '\n') {
+            int c;
+            do { c = fgetc(fp); } while (c != '\n' && c != EOF);
+            continue;
+        }
         if (len && line[len - 1] == '\n') line[--len] = '\0';
         /* 保存原始完整行（含 hash|reason|timestamp），防止截断后丢失 */
         char original[512];
@@ -455,8 +491,10 @@ static bool module_ban_lookup(const char* name, const char* hash, char reason_ou
             /* 用原始完整行写入 rewrite（非截断后的仅模块名） */
             size_t olen = strlen(original);
             if (rl + olen + 2 < sizeof rewrite) { strcat(rewrite, original); strcat(rewrite, "\n"); rl = strlen(rewrite); }
+            else overflow = true;
             continue;
         }
+        has_name = true;
         /* 同名：比对哈希 */
         char* l2 = strchr(l1 + 1, '|');
         char lhash[65] = {0};
@@ -475,25 +513,58 @@ static bool module_ban_lookup(const char* name, const char* hash, char reason_ou
                 memcpy(reason_out, l2 + 1, rl2);
                 reason_out[rl2] = '\0';
             }
+            /* 命中行同样保留进 rewrite（ban 未解除，不删除） */
+            size_t olen = strlen(original);
+            if (rl + olen + 2 < sizeof rewrite) { strcat(rewrite, original); strcat(rewrite, "\n"); rl = strlen(rewrite); }
+            else overflow = true;
         } else {
-            stale = true;   /* 哈希变化：记录失效，重写时丢弃该行 */
+            /* 哈希为空（sha 失败）时不判 stale：保守命中防坏模块无限重载 */
+            if (hash_empty) {
+                found = true;
+                if (reason_out) snprintf(reason_out, 96, "hash-unavailable 保守命中");
+                size_t olen = strlen(original);
+                if (rl + olen + 2 < sizeof rewrite) { strcat(rewrite, original); strcat(rewrite, "\n"); rl = strlen(rewrite); }
+                else overflow = true;
+            } else {
+                stale = true;   /* 哈希变化：记录失效，重写时丢弃该行 */
+            }
         }
     }
+    flock(fileno(fp), LOCK_UN);
     fclose(fp);
-    if (stale) {
-        FILE* w = fopen(g_banned_path, "w");
-        if (w) { fputs(rewrite, w); fclose(w); }
+    if (stale && !found && !overflow) {
+        /* 原子重写：tmp+rename，崩溃掉电不丢全部 ban */
+        char tmp[PATH_MAX + 8];
+        snprintf(tmp, sizeof tmp, "%s.tmp", g_banned_path);
+        FILE* w = fopen(tmp, "w");
+        if (w) {
+            flock(fileno(w), LOCK_EX);
+            fputs(rewrite, w);
+            fflush(w);
+            int fd = fileno(w);
+            fsync(fd);
+            flock(fileno(w), LOCK_UN);
+            fclose(w);
+            rename(tmp, g_banned_path);
+        }
     }
+    (void)has_name;
     return found;
 }
 
 static void module_ban_record(const char* name, const char* hash, const char* reason) {
     banned_path_init();
+    if (!name || !name[0]) return;
     FILE* fp = fopen(g_banned_path, "a");
     if (!fp) return;
+    flock(fileno(fp), LOCK_EX);
     time_t now = time(NULL);
+    /* reason 为固定串（不含 '|'），name 受 is_valid_module_name 约束，防格式破坏 */
     fprintf(fp, "%s|%s|%s|%ld\n", name, hash ? hash : "", reason ? reason : "unknown",
             (long)now);
+    fflush(fp);
+    fsync(fileno(fp));
+    flock(fileno(fp), LOCK_UN);
     fclose(fp);
 }
 
@@ -610,8 +681,11 @@ static void module_scan_diff(void) {
         if (!is_valid_module_name(de->d_name)) continue;
         char so[PATH_MAX];
         snprintf(so, sizeof so, "%s/%s/%s.so", g_modules_dir, de->d_name, de->d_name);
-        if (access(so, F_OK) == 0)
-            strncpy(present[pcount++], de->d_name, 63);
+        if (access(so, F_OK) == 0) {
+            strncpy(present[pcount], de->d_name, sizeof present[pcount] - 1);
+            present[pcount][sizeof present[pcount] - 1] = '\0';
+            pcount++;
+        }
     }
     closedir(d);
 
@@ -644,7 +718,12 @@ static void module_scan_diff(void) {
             char so[PATH_MAX];
             snprintf(so, sizeof so, "%s/%s/%s.so", g_modules_dir, present[p], present[p]);
             char dhash[65] = {0};
-            if (sha256_file_hex(so, dhash) == 0) {
+            if (sha256_file_hex(so, dhash) != 0) {
+                /* 哈希失败（I/O 错误/文件正写入）：延迟到下次扫描，不绕过 ban 直接加载 */
+                LOG_WRN("模块 %s 哈希计算失败，延迟加载（等下次扫描）", present[p]);
+                continue;
+            }
+            {
                 char br[96] = {0};
                 if (module_ban_lookup(present[p], dhash, br)) {
                     LOG_WRN("[MOD_ERR] module=%s op=scan reason=%s detail=ban 名单命中(哈希一致),跳过加载",
@@ -702,6 +781,7 @@ static void module_scan_diff(void) {
 
 static void* module_monitor_thread(void* arg) {
     (void)arg;
+    nsp_set_thread_name("nsp_modmon");
     int inotify_fd = -1;
     int wd = -1;
     while (!g_log_shutdown) {
@@ -988,7 +1068,18 @@ static int backend_scan_match(const char* path, int* slot_out, const NspModuleOp
             atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
-        if (ops->backend_match(path) == 1) {
+        /* 围栏包裹：裸调用悬垂 ops 即野指针跳转（PC=fault_addr），必须经 fence */
+        int mrc = nsp_fence_backend_match(i, "backend_match", ops->backend_match, path);
+        if (mrc == NSP_FENCE_FAULT) {
+            atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
+            module_guard_fault(i, "backend_match", path);
+            continue;
+        }
+        if (mrc == NSP_FENCE_BADFN) {
+            atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
+            continue;
+        }
+        if (mrc == 1) {
             if (slot_out) *slot_out = i;
             *ops_out = ops;
             return 0;   /* 引用已持（g_backend_slot_refs[i]），调用方须 put */
@@ -1110,6 +1201,12 @@ int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user
             continue;
         }
         if (got > 0) {
+            /* 越界钳制：模块超额返回时已越界写 out+n，必须丢弃整批并熔断，
+               否则上层栈数组 vn 累加超 max 导致栈越界读+filler 垃圾 */
+            if (got > max - n) {
+                module_guard_error(i, "readdir_extra", 0, sub_path, "返回条目数超限(越界写)");
+                continue;
+            }
             /* 条目校验：坏条目名（未终止）丢弃该批次（计入熔断） */
             bool entries_ok = true;
             for (int k = 0; k < got; k++)

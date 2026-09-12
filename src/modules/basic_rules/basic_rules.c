@@ -54,15 +54,20 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     out->valid = true;
     out->user_id = r.user_id;
     strncpy(out->sub_path, r.sub_path, sizeof out->sub_path - 1);
+    out->sub_path[sizeof out->sub_path - 1] = '\0';
     strncpy(out->pkg, r.pkg, sizeof out->pkg - 1);
+    out->pkg[sizeof out->pkg - 1] = '\0';
     out->monitor_on = r.monitor_on;   /* 修复：漏拷贝导致全局 MONITOR ON 时 IO 监控失效 */
     out->hidden = r.hidden;
     out->ro = r.ro;
     out->has_redir = r.has_redir;
     strncpy(out->redir_target, r.redir_target, sizeof out->redir_target - 1);
+    out->redir_target[sizeof out->redir_target - 1] = '\0';
     out->has_sandbox = r.has_sandbox;
     strncpy(out->sandbox_target, r.sandbox_target, sizeof out->sandbox_target - 1);
+    out->sandbox_target[sizeof out->sandbox_target - 1] = '\0';
     strncpy(out->real_path, r.real_path, sizeof out->real_path - 1);
+    out->real_path[sizeof out->real_path - 1] = '\0';
     out->is_redir = r.is_redir;
     out->is_virtual_ancestor = r.is_virtual_ancestor;
     out->is_redirect_target = r.is_redirect_target;
@@ -97,7 +102,7 @@ static int br_module_probe(const NspQueryCtx* q, NspProbeResult* out) {
 
 static int br_module_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_id,
                                    const char* pkg, bool is_root, NspDirEntry* out, int max) {
-    if (!q || !out || max <= 0) return 0;
+    if (!q || !out || max <= 0 || !sub_path) return 0;
     BrQuery bq = {
         .path = sub_path,
         .uid = q->uid,
