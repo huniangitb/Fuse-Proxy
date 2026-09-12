@@ -31,6 +31,32 @@ endif
 
 is_clang = cc.get_id() == 'clang'
 
+# ================= 构建版本水印（sys.log 头 + crash 日志归因） =================
+# 每个二进制编译进 NSP_GIT_HASH / NSP_BUILD_MODE / NSP_PROJECT_VERSION，
+# 启动时经 nsp_log_build_info() 打进 sys.log，崩溃时 crash_handler 同样打印，
+# 使线下 addr2line 可精确对应到提交。无 git 环境回退 unknown（可用
+# -Dgit_hash_override=<sha> 手动指定，如 tarball 构建）。
+_git_override = get_option('git_hash_override')
+_git_prog = find_program('git', required: false)
+_git_hash = _git_override
+if _git_hash == '' and _git_prog.found()
+  _git_hash = run_command(_git_prog, 'rev-parse', '--short', 'HEAD',
+                          check: false).stdout().strip()
+endif
+if _git_hash == ''
+  _git_hash = 'unknown'
+elif _git_override == '' and _git_prog.found()
+  _dirty = run_command(_git_prog, 'diff', '--quiet', check: false)
+  if _dirty.returncode() != 0
+    _git_hash = _git_hash + '-dirty'
+  endif
+endif
+add_project_arguments('-DNSP_GIT_HASH="' + _git_hash + '"', language: 'c')
+add_project_arguments('-DNSP_BUILD_MODE="' + (enable_debug ? 'debug' : 'release') + '"',
+                      language: 'c')
+add_project_arguments('-DNSP_PROJECT_VERSION="' + meson.project_version() + '"',
+                      language: 'c')
+
 # ================= 依赖查找 =================
 if target_os == 'android'
   fuse3_root = get_option('fuse3_root')
@@ -80,7 +106,8 @@ else
     if is_clang
         opt_flags += ['-mllvm', '-unroll-threshold=128']
     endif
-    link_flags = ['-Wl,-s', '-Wl,--gc-sections']
+    # -Dstrip=false（如符号包 build_android_sym）时不剥离，保留 addr2line 可用符号
+    link_flags = (get_option('strip') ? ['-Wl,-s'] : []) + ['-Wl,--gc-sections']
 endif
 
 # 将所有 flags 应用到项目
@@ -102,6 +129,7 @@ endif
 # 时须同步验证 tests/test_rules.py 与 tests/test_path_vars.py，防行为分叉。
 common_sources = [
     'src/core/common.c',
+    'src/core/build_info.c',
     'src/core/path_trie.c',
     'src/config/config_parser.c',
     'src/config/path_vars.c',
@@ -110,10 +138,13 @@ common_sources = [
     'src/core/sys_pkg.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
   # nsp_ini_store 逐源编入（非静态库）：fuse_daemon 自身不调用，但须常驻导出表
   # 供 dlopen 的第三方模块借用——静态库无人引用会被链接器丢弃，逐源编译则常驻
-  'src/core/nsp_ini_store.c']
+  'src/core/nsp_ini_store.c',
+  # pthread_create 截持：libfuse worker 默认命名 fuse_worker（见文件头），
+  # 仅 fuse_daemon 编入（injector/log_monitor 自有线程均已自命名，无需截持）
+  'src/daemon/fuse_thread_naming.c']
 injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
@@ -161,7 +192,10 @@ nsp_comm_dep = declare_dependency(link_with: nsp_comm_lib,
 executable('fuse_daemon',
   fuse_daemon_sources + ['src/core/common.c'],
   include_directories: all_inc_dirs,
-  dependencies: project_deps + [sha256_hw_dep, nsp_util_dep, nsp_comm_dep],
+  # libdl：fuse_thread_naming 经 dlsym(RTLD_NEXT) 取真实 pthread_create
+  #（bionic 自带，GNU 经此显式链接；required=false 兼容无独立 libdl 的工具链）
+  dependencies: project_deps + [sha256_hw_dep, nsp_util_dep, nsp_comm_dep,
+                                cc.find_library('dl', required: false)],
   c_args: ['-DFUSE_USE_VERSION=317'],
   link_args: ['-Wl,--export-dynamic'],  # 导出公共符号，供 dlopen 的热插拔模块解析
   install: true,
@@ -210,8 +244,11 @@ executable('log_ctl',
 # 动态增删/启停规则、重载配置、停止注入，还管 ftp.conf 服务器账号）。
 # 纯文件级操作，仅依赖 json-c，不链接 libfuse3；Android/GNU 均构建
 # （路径经 CONFIG_DIR 宏适配）。nsp_ini_store 逐源编入，与 fuse_daemon 导出表同实现。
+# 日志统一走 comm 线程（common.c 的 log_init/log_internal，sys.log 显 [rule_server]），
+# 与 injector/fuse_daemon 同通道，不再各写 stderr。
 executable('rule_server',
-  ['src/rule/rule_server.c', 'src/core/nsp_ini_store.c'],
+  ['src/rule/rule_server.c', 'src/core/nsp_ini_store.c', 'src/core/common.c',
+   'src/core/build_info.c'],
   include_directories: all_inc_dirs,
   dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep],
   install: true,

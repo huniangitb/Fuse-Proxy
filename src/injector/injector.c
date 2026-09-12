@@ -10,6 +10,7 @@
 #include "ipc_server.h"
 #include "config_publisher.h"
 #include "sys_pkg.h"
+#include "build_info.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -971,6 +972,8 @@ static void injector_early_init(void) {
     /* 后台化经 nsp_util 公共库复用（保留 g_global_root_fd，禁私刻 fork 样板） */
     nsp_daemonize(g_global_root_fd);
     log_init("injector");
+    /* 构建水印 + 设备环境进 sys.log（崩溃包归因用，失败不阻断启动） */
+    nsp_log_build_info("injector");
     init_system_pkg_cache();
     config_init_lock();
     fast_pid_init();

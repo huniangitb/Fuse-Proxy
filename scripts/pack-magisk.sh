@@ -21,8 +21,18 @@
 #   -c, --conf-dir <dir>     conf 配置源目录（默认 $REPO/conf）
 #   -o, --out <file>         输出 zip 路径（默认 /home/bdy/ftp/upload/Namespace-Proxy-<git校验码>.zip）
 #   -v, --version <str>      版本号（默认 2.0；打包时自动写入 module.prop）
+#   -s, --symbols-dir <dir>  unstripped 符号构建目录（默认 $REPO/build_android_sym；
+#                            存在则额外产出 <输出名>-symbols.zip，供崩溃 addr2line 归因）
+#   --skip-symbols           跳过符号包（即使符号目录存在也不打包）
 #   --release                发布模式：输出名用版本号（默认非发布用 git 提交校验码）
 #   -h, --help               显示本帮助
+#
+# 符号构建目录制备（与主构建同 cross-file、同源码，仅保留符号）：
+#   meson setup build_android_sym --cross-file android-aarch64.ini \
+#     -Dfuse3_root=<静态库根> -Dcurl_dir=<预构建 libcurl 根> -Dbuildtype=release \
+#     -Db_lto=false -Dstrip=false -Dc_args='-g' -Dc_link_args=''
+#   ninja -C build_android_sym
+# 注意：主构建默认 -Wl,-s 会剥离符号，strip 后无法恢复，故符号包必须来自独立构建目录。
 # =============================================================================
 set -euo pipefail
 
@@ -37,9 +47,11 @@ CONF_DIR_SRC="${CONF_DIR_SRC:-$REPO_DIR/conf}"
 OUT_ZIP="${OUT_ZIP:-}"               # 输出 zip 路径（未指定时自动生成）
 MODULE_VERSION="${MODULE_VERSION:-2.0}"  # 模块版本号：自动写入 module.prop
 RELEASE_MODE="${RELEASE_MODE:-0}"    # 发布模式（--release）：输出名用版本号；默认用 git 提交校验码
+SYMBOLS_DIR="${SYMBOLS_DIR:-$REPO_DIR/build_android_sym}"  # unstripped 符号构建目录
+SKIP_SYMBOLS="${SKIP_SYMBOLS:-0}"    # --skip-symbols 置 1 跳过符号包
 
 usage() {
-    sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^[^#]/p' "${BASH_SOURCE[0]}" | head -n -1 | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -51,6 +63,8 @@ while [[ $# -gt 0 ]]; do
         -c|--conf-dir)   CONF_DIR_SRC="$2"; shift 2 ;;
         -o|--out)        OUT_ZIP="$2";    shift 2 ;;
         -v|--version)    MODULE_VERSION="$2"; shift 2 ;;
+        -s|--symbols-dir) SYMBOLS_DIR="$2";   shift 2 ;;
+        --skip-symbols)  SKIP_SYMBOLS=1;      shift ;;
         --release)       RELEASE_MODE=1; shift ;;
         -h|--help)       usage ;;
         *) echo "未知参数: $1" >&2; usage ;;
@@ -158,6 +172,36 @@ else
     fi
 fi
 
+# ============================ 3.6 构建水印文件 ============================
+# bin/build-info.txt 随模块上机：用户执行 `cat` 即可上报版本，
+# 与 sys.log 首批 [*/build] 行、crash 日志 Build: 行三方互证。
+echo "== 生成 bin/build-info.txt ..."
+GIT_FULL="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+GIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if git -C "$REPO_DIR" diff --quiet 2>/dev/null; then GIT_DIRTY="clean"; else GIT_DIRTY="dirty"; fi
+{
+    echo "version=$MODULE_VERSION"
+    echo "versionCode=$VERCODE"
+    echo "git=$GIT_FULL"
+    echo "git_short=$GIT_SHORT"
+    echo "git_status=$GIT_DIRTY"
+    echo "target=android-aarch64"
+    echo "built=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "files:"
+    for bin in rule_server injector fuse_daemon log_monitor log_ctl; do
+        if [[ -f "$BUILD_DIR/$bin" ]]; then
+            echo "  $bin sha256=$(sha256sum "$BUILD_DIR/$bin" | cut -d' ' -f1) size=$(stat -c%s "$BUILD_DIR/$bin")"
+        fi
+    done
+    for mod in basic_rules/basic_rules.so ftp_module/ftp_module.so; do
+        name="${mod%%/*}"; so="${mod##*/}"
+        if [[ -f "$BUILD_DIR/$so" ]]; then
+            echo "  modules/$mod sha256=$(sha256sum "$BUILD_DIR/$so" | cut -d' ' -f1) size=$(stat -c%s "$BUILD_DIR/$so")"
+        fi
+    done
+} > "$MODULE_DIR/bin/build-info.txt"
+echo "   - bin/build-info.txt (git=$GIT_SHORT $GIT_DIRTY)"
+
 # ============================ 4. 打包 ============================
 echo "== 打包 zip ..."
 mkdir -p "$(dirname "$OUT_ZIP")"
@@ -235,3 +279,63 @@ PYEOF
 
 echo
 echo "完成: $OUT_ZIP"
+
+# ============================ 6. unstripped 符号包 ============================
+# 崩溃 backtrace 是 ASLR 绝对地址，需同提交 unstripped ELF 做
+# `llvm-addr2line -e symbols/fuse_daemon -f -C <offset>`（offset 取
+# fuse_crash.log 中 "-> offset +0x..."）。主构建 -Wl,-s 已剥离符号，
+# strip 后不可恢复，故符号包必须来自独立符号构建目录。
+if [[ "$SKIP_SYMBOLS" == "1" ]]; then
+    echo "== 符号包：已按 --skip-symbols 跳过"
+else
+    SYM_ZIP="${OUT_ZIP%.zip}-symbols.zip"
+    [[ "$SYM_ZIP" == "$OUT_ZIP" ]] && SYM_ZIP="$OUT_ZIP-symbols.zip"
+    SYM_FILES=()
+    for bin in rule_server injector fuse_daemon log_monitor log_ctl basic_rules.so ftp_module.so; do
+        [[ -f "$SYMBOLS_DIR/$bin" ]] && SYM_FILES+=("$bin")
+    done
+    if [[ ${#SYM_FILES[@]} -eq 0 ]]; then
+        echo "== 符号包：跳过（符号目录无产物: $SYMBOLS_DIR）"
+        echo "   制备命令（与主构建同 cross-file/依赖，仅保留符号）："
+        echo "   meson setup $SYMBOLS_DIR --cross-file android-aarch64.ini \\"
+        echo "     -Dfuse3_root=<静态库根> -Dcurl_dir=<预构建 libcurl 根> \\"
+        echo "     -Dbuildtype=release -Db_lto=false -Dstrip=false \\"
+        echo "     -Dc_args='-g' -Dc_link_args='' && ninja -C $SYMBOLS_DIR"
+    else
+        echo "== 打包符号包: $SYM_ZIP"
+        if command -v file >/dev/null 2>&1; then
+            for bin in "${SYM_FILES[@]}"; do
+                if file "$SYMBOLS_DIR/$bin" | grep -q "not stripped"; then
+                    echo "   ✅ $bin (not stripped)"
+                else
+                    echo "   ⚠ $bin (疑似已剥离：$(file -b "$SYMBOLS_DIR/$bin" | cut -c1-60))"
+                fi
+            done
+        fi
+        cp -f "$MODULE_DIR/bin/build-info.txt" "$SYMBOLS_DIR/build-info.txt"
+        python3 - "$SYMBOLS_DIR" "$SYM_ZIP" "${SYM_FILES[*]}" <<'PYEOF'
+import os, sys, zipfile
+sym_dir, out_zip, files = sys.argv[1], sys.argv[2], sys.argv[3].split()
+with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+    for name in files:
+        src = os.path.join(sym_dir, os.path.basename(name))
+        zi = zipfile.ZipInfo("symbols/" + os.path.basename(name), (1980, 1, 1, 0, 0, 0))
+        zi.external_attr = (0o644 & 0xFFFF) << 16
+        with open(src, "rb") as f:
+            z.writestr(zi, f.read())
+    hint = ("addr2line 用法（NDK llvm-addr2line）：\n"
+            "  llvm-addr2line -e symbols/fuse_daemon -f -C <offset>\n"
+            "offset 取 fuse_crash.log 中 '-> offset +0x...'（如 +0x30c1c）。\n"
+            "归因前先核对本包 build-info.txt 的 git 与崩溃日志 Build: 行一致。\n")
+    zi = zipfile.ZipInfo("symbols/README", (1980, 1, 1, 0, 0, 0))
+    zi.external_attr = (0o644 & 0xFFFF) << 16
+    z.writestr(zi, hint)
+    zi = zipfile.ZipInfo("symbols/build-info.txt", (1980, 1, 1, 0, 0, 0))
+    zi.external_attr = (0o644 & 0xFFFF) << 16
+    with open(os.path.join(sym_dir, "build-info.txt"), "rb") as f:
+        z.writestr(zi, f.read())
+print(f"符号包完成: {out_zip} ({os.path.getsize(out_zip)} bytes)")
+PYEOF
+        echo "   sha256: $(sha256sum "$SYM_ZIP" | cut -d' ' -f1)"
+    fi
+fi

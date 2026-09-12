@@ -51,12 +51,9 @@ static bool g_foreground = false;   /* --foreground：前台运行（测试/调�
 static struct timespec g_start_mono;  /* 启动时刻（CLOCK_MONOTONIC，运行时长基准） */
 static time_t g_start_wall = 0;       /* 启动时刻（墙钟，started_at 展示） */
 
-/* 日志开关：DEBUG 构建输出到 stderr（Android 由 logcat 捕获） */
-#ifdef DEBUG
-#define RLOG(...) fprintf(stderr, "[rule_server] " __VA_ARGS__)
-#else
-#define RLOG(...) do { } while (0)
-#endif
+/* 统一日志：经 comm 线程进 sys.log（[rule_server] 前缀由 log_frame_packet
+ * 按 g_proc_name 自动添加，调用方不再手写）。保持 RLOG 调用名，存量调用点零改动。 */
+#define RLOG(...) log_internal(LOG_INFO, __VA_ARGS__)
 
 /* ==================== 规则类型（动态注册表） ====================
    类型来源两类：
@@ -2585,6 +2582,11 @@ static int run_server(void) {
     clock_gettime(CLOCK_MONOTONIC, &g_start_mono);
     g_start_wall = time(NULL);
 
+    /* 统一日志：daemonize 之后建链（comm 线程不跨 fork），此后 RLOG/LOG_*
+     * 经 comm 线程进 sys.log；启动失败同时保留 stderr，service.sh 仍可见 */
+    log_init("rule_server");
+    /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
+
     struct sigaction sa = { .sa_handler = sig_handler };
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
@@ -2592,26 +2594,34 @@ static int run_server(void) {
 
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock < 0) {
+        LOG_ERR("创建 socket 失败: %s", strerror(errno));
         fprintf(stderr, "[rule_server] 创建 socket 失败: %s\n", strerror(errno));
+        log_close();
         return 1;
     }
     struct sockaddr_un addr;
     socklen_t addr_len = nsp_uds_abstract_addr(&addr, g_socket_name);
     if (bind(sock, (struct sockaddr *)&addr, addr_len) < 0) {
+        LOG_ERR("绑定 %s 失败: %s", g_socket_name, strerror(errno));
         fprintf(stderr, "[rule_server] 绑定 %s 失败: %s\n", g_socket_name, strerror(errno));
         close(sock);
+        log_close();
         return 1;
     }
     if (listen(sock, 16) < 0) {
+        LOG_ERR("listen 失败: %s", strerror(errno));
         fprintf(stderr, "[rule_server] listen 失败: %s\n", strerror(errno));
         close(sock);
+        log_close();
         return 1;
     }
     RLOG("服务已启动 socket=%s config_dir=%s\n", g_socket_name, g_config_dir);
 
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) {
+        LOG_ERR("创建 epoll 失败: %s", strerror(errno));
         close(sock);
+        log_close();
         return 1;
     }
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = sock };
@@ -2637,6 +2647,7 @@ static int run_server(void) {
     close(ep);
     close(sock);
     RLOG("服务退出\n");
+    log_close();
     return 0;
 }
 
