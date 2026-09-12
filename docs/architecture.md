@@ -15,34 +15,46 @@ Fuse-Proxy 运行在 **Android 13+（API 33~35）**，作为 root 模块的二�
 
 6 个可执行文件各自为独立进程，经 Unix Domain Socket 协作：
 
+```mermaid
+flowchart TB
+    zy["zygisk 模块<br/>preAppSpecialize（应用进程）"]
+    conf[("injector.conf<br/>App-rules/")]
+    rs["rule_server<br/>JSON 行协议"]
+    mgr["管理器 App / log_ctl"]
+    lm["log_monitor<br/>日志收集服务"]
+
+    subgraph inj["injector — 主控进程"]
+        core["主循环<br/>epoll + inotify"]
+        ipc["ipc_server<br/>IPC 服务"]
+        it["inject_target<br/>目标判定"]
+        mm["mount_manager<br/>挂载 / 命名空间注入"]
+        cp["config_publisher<br/>配置广播"]
+    end
+
+    subgraph fd["fuse_daemon — FUSE 框架"]
+        vfs["vfs 回调 + 模块调度<br/>约 27 个 FUSE 回调"]
+        br["basic_rules.so<br/>规则决策（dlopen）"]
+        ftp["ftp_module.so<br/>FTP 后端（dlopen）"]
+    end
+
+    zy -->|"REPORT pkg/pid/uid"| ipc
+    core --> ipc
+    core --> cp
+    ipc --> it --> mm
+    core -->|"fork（--root / --rules）"| vfs
+    vfs -->|"resolve"| br
+    vfs -->|"backend_*"| ftp
+    rs -->|"原子写"| conf
+    rs -->|"SIGHUP"| core
+    conf -.->|"inotify"| core
+    conf -.->|"inotify"| br
+    cp -->|"UDS 广播配置"| mgr
+    core -.->|"log_internal"| lm
+    vfs -.->|"log_internal"| lm
+    lm -->|"查询 / 流式输出"| mgr
 ```
-                         ┌─────────────────────────────────────────┐
-                         │            injector (主控进程)            │
-                         │  epoll 事件循环 + inotify 配置监听        │
-                         │  ┌─────────────┬──────────────────────┐  │
-       zygote fork 检测 ────▶│  │ inject_target│ mount_manager        │  │
-                         │  │ (目标判定)   │ (挂载/命名空间注入)  │  │
-                         │  ├─────────────┼──────────────────────┤  │
-                         │  │ ipc_server  │ config_publisher     │  │
-                         │  │ (IPC 服务)  │ (配置广播 UDS)       │  │
-                         │  └─────────────┴──────────────────────┘  │
-                         └───────┬───────────────────────┬─────────┘
-                                 │ 启动 / 信号             │ UDS 广播
-                                 ▼                         ▼
-                    ┌────────────────────┐      ┌────────────────────┐
-                    │  fuse_daemon        │      │  管理器 App /       │
-                    │  FUSE 回调骨架       │      │  log_ctl (CLI)     │
-                    │  ┌───────────────┐  │      └────────────────────┘
-                    │  │ basic_rules.so│  │
-                    │  │ (dlopen 决策)  │  │      ┌────────────────────┐
-                    │  └───────────────┘  │      │  log_monitor        │
-                    └────────────────────┘      │  日志收集服务        │
-                                                 └─────────▲──────────┘
-                    ┌────────────────────┐                 │ UDS
-                    │  rule_server        │      各进程 log_internal
-                    │  JSON 行协议改规则   │
-                    └────────────────────┘
-```
+
+> 除 zygisk 通知外，injector 也可经周期扫描 `/proc` 主动发现应用；两条途径的关系见 §5.1。
 
 > injector 同时维护**两棵** FUSE 树——全局 FUSE（`inject_global_fuse`，挂载于 `/mnt/nsp_global`）与媒体模块专属 FUSE（`inject_media_fuse`，惰性）。二者共用同一 `fuse_daemon` 二进制与 `--rules` 配置，挂载点不同。
 
