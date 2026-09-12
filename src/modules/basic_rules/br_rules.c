@@ -5,6 +5,7 @@
 #include "uid_map.h"
 #include "fast_pid.h"
 #include "sys_pkg.h"
+#include "nsp_util.h"   /* nsp_set_thread_name（线程语义化命名） */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,6 +150,7 @@ void br_reload_config(void) {
 /* inotify 监听规则目录，热重载（沿用 vfs_core 的 watch 重建/归并模式） */
 static void* config_monitor_thread(void* arg) {
     (void)arg;
+    nsp_set_thread_name("nsp_cfgmon");
     int inotify_fd = -1;
     int wd = -1;
     while (!g_log_shutdown && !g_br_stop) {
@@ -895,8 +897,12 @@ static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path, 
 /* ============ 虚拟目录合成 ============ */
 
 static bool br_get_virtual_child(const char* parent, const char* desc, char* name, size_t max_len) {
+    if (!parent || !desc) return false;
     size_t plen = strlen(parent);
     if (strcmp(parent, "/") == 0) plen = 0;
+    /* 防越界读：desc 短于 plen 时 strncmp 会读过 '\0'，先判长度 */
+    size_t dlen = strlen(desc);
+    if (dlen < plen) return false;
     if (strncmp(parent, desc, plen) != 0) return false;
     if (plen > 0 && desc[plen] != '/' && desc[plen] != '\0') return false;
     const char* p = desc + plen;
@@ -917,7 +923,7 @@ static bool br_get_virtual_child(const char* parent, const char* desc, char* nam
    readdir 目录级缓存命中时复用，避免每条目重复全路径 trie 遍历 */
 /* 类别 redir/ftp 前缀的虚拟子目录判定（br_process_cfg_dirs 的线性版对应） */
 static bool br_cat_virtual_child(AppConfig* cat, const char* sub_path) {
-    if (!cat) return false;
+    if (!cat || !sub_path) return false;
     if (cat->redir_rules) {
         for (int i = 0; i < cat->redir_count; i++) {
             if (strlen(sub_path) < strlen(cat->redir_rules[i].virtual_prefix)) {
@@ -937,6 +943,7 @@ static bool br_cat_virtual_child(AppConfig* cat, const char* sub_path) {
 
 static bool br_virtual_ancestor_linear(AppConfig* cfg, AppConfig* cat, const char* sub_path) {
     bool res = false;
+    if (!sub_path) return false;
     if (cfg) {
         if (cfg->redir_rules) {
             for (int i = 0; i < cfg->redir_count; i++) {
@@ -1364,7 +1371,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
    函数化替代宏：避免对 &g_global_cfg 这类常量地址判空触发 -Waddress */
 static int br_process_cfg_dirs(AppConfig* c, const char* sub_path, int user_id,
                                const char* pkg, bool is_root, NspDirEntry* out, int max, int n) {
-    if (!c || n >= max) return n;
+    if (!c || !sub_path || !out || n >= max) return n;
     /* REDIRECT 虚拟目录合成 */
     if (c->redir_rules) {
         for (int i = 0; i < c->redir_count && n < max; i++) {
@@ -1415,7 +1422,7 @@ static int br_process_cfg_dirs(AppConfig* c, const char* sub_path, int user_id,
 
 int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id,
                      const char* pkg, bool is_root, NspDirEntry* out, int max) {
-    if (!q || !out || max <= 0) return 0;
+    if (!q || !out || max <= 0 || !sub_path) return 0;
     /* S1 无锁快照读：替代 rwlock 读锁（与 br_resolve 一致，发布发生则重试） */
     for (;;) {
         uint64_t cfg_gen = config_read_begin();
