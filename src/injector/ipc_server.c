@@ -66,6 +66,7 @@ typedef struct {
    整个还原周期（派发→重试→完成）合并为单条汇总日志，方便调试、减少占用 */
 static void* ipc_restore_thread(void* raw) {
     IpcMountArg* arg = (IpcMountArg*)raw;
+    nsp_set_thread_name("nsp_restore");
     int ret = -1;
     int attempts = 0;
     /* IPC 通知时间非常早（应用 fork 后视图尚未就绪）：跳过(ret=1)表示
@@ -117,6 +118,7 @@ static void* ipc_restore_thread(void* raw) {
 
 static void* ipc_mount_thread(void* raw) {
     IpcMountArg* arg = (IpcMountArg*)raw;
+    nsp_set_thread_name("nsp_mount");
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
