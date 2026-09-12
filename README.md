@@ -83,3 +83,11 @@ docs/         # 设计文档
 | `docs/modules.md` | 模块架构、ABI 契约、第三方模块开发 |
 | `docs/config.md` | 配置语法、路径变量、禁忌清单 |
 | `AGENTS.md` | 构建陷阱、开发红线、测试映射表 |
+
+## 许可证
+
+本项目以 **GPL-3.0-or-later** 发布，见 `LICENSE`。
+
+**模块 ABI 链接例外**：仅通过 `include/nsp_module.h` 的公开 ABI 与本项目结合的独立模块（运行时 dlopen 加载的 `.so`），可按任意条款发布，不因此受 GPL 约束——框架保持 copyleft，模块生态保持自由。完整条款见 `LICENSE.module-exception`。
+
+构建产物静态链接了 libfuse（LGPL-2.1）、json-c（MIT）、libcurl（curl 许可证）。各组件许可证与 LGPL 重新链接权利的说明见 `THIRD-PARTY-NOTICES.md`。

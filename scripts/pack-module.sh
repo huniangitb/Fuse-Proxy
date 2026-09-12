@@ -138,6 +138,19 @@ for f in injector.conf ftp.conf monitor_ignore.conf; do
     fi
 done
 
+# ===================== 2.5 同步许可证（分发二进制的法定义务） =====================
+# GPL-3.0 要求随二进制附许可证；libfuse 为静态链接的 LGPL-2.1 组件，
+# 其告知义务同样在分发时履行（见 THIRD-PARTY-NOTICES.md）。
+echo "== 同步许可证文件 ..."
+for f in LICENSE LICENSE.module-exception THIRD-PARTY-NOTICES.md; do
+    if [[ -f "$REPO_DIR/$f" ]]; then
+        cp -f "$REPO_DIR/$f" "$MODULE_DIR/$f"
+        echo "   - $f"
+    else
+        echo "   - $f (缺失，跳过)" >&2
+    fi
+done
+
 # ============================ 3. 权限 ============================
 echo "== 设置可执行权限 (0755) ..."
 chmod 755 "$MODULE_DIR"/bin/* 2>/dev/null || true
@@ -259,6 +272,9 @@ check("ftp_module.rules 存在", any(n.endswith("ftp_module/ftp_module.rules") f
 check("zygisk 存在", any(n.startswith("zygisk/") and n.endswith(".so") for n in names))
 check("webroot 存在", any(n.startswith("webroot/") for n in names))
 check("reload_rules 无残留", not any("reload_rules" in n for n in names))
+check("LICENSE 存在", "LICENSE" in names)
+check("模块 ABI 例外条款存在", "LICENSE.module-exception" in names)
+check("第三方组件声明存在", "THIRD-PARTY-NOTICES.md" in names)
 check("可执行文件权限 0755",
       all((z.getinfo(n).external_attr >> 16 & 0o777) == 0o755
           for n in names if n.endswith((".so", ".sh")) or "bin/rule_server" in n))

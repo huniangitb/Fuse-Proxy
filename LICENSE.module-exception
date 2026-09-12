@@ -1,0 +1,45 @@
+# Fuse-Proxy 模块 ABI 链接例外
+
+版权所有 (C) 2026 huniangitb <3361107168@qq.com>
+
+Fuse-Proxy 以 GNU 通用公共许可证第 3 版或（依你选择）任何更新版本发布，
+完整条款见同目录 `LICENSE` 文件。作为对该许可证的**附加许可**（GPLv3
+第 7 节意义上的 additional permission），特此授予以下例外。
+
+## 例外条款
+
+将 Fuse-Proxy 的目标代码与「独立模块」结合、链接或组合而产生的作品，
+你可以按你自选的条款发布该独立模块，而无需使其适用 GNU 通用公共许可证。
+你也无需因此对该独立模块承担 GPLv3 的源码提供义务。
+
+本例外仅及于该独立模块自身。Fuse-Proxy 本体及其任何修改版本，仍完全受
+GNU 通用公共许可证第 3 版或更新版本约束。
+
+## 「独立模块」的定义
+
+同时满足以下全部条件的作品，为本例外所称的独立模块：
+
+1. 它是一个在运行时由 Fuse-Proxy 经 `dlopen` 加载的共享对象（`.so`）；
+2. 它与 Fuse-Proxy 之间的全部接口，均限于 `include/nsp_module.h` 所声明
+   的公开 ABI——即 `NspModuleInfo`、`NspModuleOps`、`NspFrameworkApi`、
+   `NspQueryCtx`、`NspResolveResult`、`NspProbeResult`、`NspDirEntry`
+   等结构体，`NSP_CAP_*` 能力位，以及该头文件声明的框架导出符号；
+3. 它不包含取自 Fuse-Proxy 其他源码的代码，亦非 Fuse-Proxy 其他部分的
+   派生作品。
+
+若某模块以上述公开 ABI 之外的方式与 Fuse-Proxy 结合——例如编入了框架
+源码、依赖了 `include/nsp_module.h` 以外的内部头文件，或直接引用了未经
+该头文件声明的内部符号——则本例外不适用于它。
+
+## 说明
+
+本例外的意图是：**框架本身保持 copyleft，模块生态保持自由。** 对 Fuse-Proxy
+框架的改进应当回馈社区，而第三方开发者可以按自己的意愿授权其模块，无论
+开源与否。
+
+此做法沿用 GCC Runtime Library Exception 与 OpenJDK Classpath Exception
+的既有惯例。
+
+若你不希望你的模块受本例外约束，可以直接删除本文件对你那份 Fuse-Proxy
+副本的适用声明，从而使该副本仅受 GNU 通用公共许可证约束（GPLv3 第 7 节
+允许移除附加许可）。
