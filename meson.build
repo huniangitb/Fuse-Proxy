@@ -80,15 +80,21 @@ if target_os == 'android'
   fuse3_root = get_option('fuse3_root')
   android_fuse_sp = get_option('android_libfuse') != 'prebuilt'
   android_json_sp = get_option('android_json_c') != 'prebuilt'
-  # NDK 根：从交叉编译器路径反推（<NDK>/toolchains/llvm/prebuilt/<host>/
-  # bin/<triple>-clang），供 cmake 子项目（json-c/curl）的 Android 平台检测，
-  # 不硬编码、与 cross 文件单源一致。
-  fs_mod = import('fs')
-  _ndk_bin = fs_mod.parent(cc.cmd_array()[0])
-  _ndk_root = _ndk_bin
-  foreach i : range(5)
-    _ndk_root = fs_mod.parent(_ndk_root)
-  endforeach
+  # NDK 根：优先用 -Dandroid_ndk_root 显式传入（scripts/android-build.sh
+  # 自动探测后传入）；留空时从交叉编译器路径反推（要求 ini 内为绝对路径，
+  # 裸工具名经 PATH 解析时此处只能拿到相对路径，反推失效）。
+  # 供 cmake 子项目（json-c/curl）的 Android 平台检测，不硬编码。
+  _ndk_opt = get_option('android_ndk_root')
+  if _ndk_opt != ''
+    _ndk_root = _ndk_opt
+  else
+    fs_mod = import('fs')
+    _ndk_bin = fs_mod.parent(cc.cmd_array()[0])
+    _ndk_root = _ndk_bin
+    foreach i : range(5)
+      _ndk_root = fs_mod.parent(_ndk_root)
+    endforeach
+  endif
   if android_json_sp
     # Android + json-c 子模块：经 cmake 随主项目交叉编译（静态库、无 apps/
     # tests、-Werror 关闭防 NDK 新警告炸构建；PUBLIC 头文件路径自动透传，
