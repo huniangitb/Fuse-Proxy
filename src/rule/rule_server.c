@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* 版权所有 (C) 2026 huniangitb <3361107168@qq.com> */
 /*
  * rule_server —— 规则控制守护进程
  *

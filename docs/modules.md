@@ -149,6 +149,7 @@ int (*get_vars)(const char*** names, const char*** values, int* count);
 ### 6.1 依赖与前置
 
 - **唯一接口头**：`include/nsp_module.h`，源码只依赖本头 + 标准库。
+- **许可证**：框架以 GPL-3.0-or-later 发布，但**对模块 ABI 授予链接例外**——仅通过本头文件公开 ABI 结合的独立模块，可按任意条款发布（含闭源），不因此受 GPL 约束。前提是不编入框架源码、不依赖本头以外的内部头、不引用未声明的内部符号。完整条款见 `LICENSE.module-exception`。
 - **编译宏**：必须定义 `-DNSP_MODULE_BUILD`，激活头内「模块公共运行时 ABI」段（日志宏 `LOG/LOG_WRN/LOG_ERR/LOG_DBG`、`CONFIG_DIR`/`STORAGE_BASE`、框架导出符号声明）。
 - **运行时符号**：日志/路径等框架符号经 fuse_daemon 的 `-Wl,--export-dynamic` 导出表在 dlopen 时解析，模块无需链接框架，**不得把 `src/core/common.c` 等框架源编入自身**。
 - **可借用的公共抽象**：通用 INI 段式存储（`nsp_ini_open/close/get/set/del_key/del_section/save`，经 `nsp_module.h` 代含 `nsp_ini_store.h`）——模块自有配置文件（如 `ftp.conf`）可直接调用，注释保留 + 原子落盘，语义见该头注释。
