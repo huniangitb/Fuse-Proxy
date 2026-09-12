@@ -1,29 +1,19 @@
-# Fuse-Proxy 总体设计文档
+# 总体设计
 
-> 面向维护者的架构说明。目标读者：需要理解模块边界、进程协作与数据流，以便安全地修改和扩展本项目的开发者。
+面向维护者的架构说明：模块边界、进程协作与数据流。
 
 ## 1. 项目定位
 
-Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代理，作为 KernelSU / Magisk 模块的二进制核心组件运行。它通过两项内核机制实现**应用粒度**的存储访问控制：
+Fuse-Proxy 运行在 **Android 13+（API 33~35）**，作为 root 模块的二进制核心组件，通过两项内核机制实现**应用粒度**的存储访问控制：
 
-- **FUSE 用户态文件系统**：拦截应用对外部存储（`/sdcard`、`/storage/emulated/N`）的文件操作，按规则透明改写。底层真实物理存储固定为 `/data/media/<user_id>`（`STORAGE_BASE` 常量），所有重定向最终都归一到此。
-- **Linux 挂载命名空间（mount namespace）隔离**：通过检测 zygote 子进程，将定制的 FUSE 挂载注入到目标应用的 mount namespace，使规则只对目标应用生效，不影响系统其余部分。
+- **FUSE 用户态文件系统**：拦截应用对外部存储（`/sdcard`、`/storage/emulated/N`）的文件操作，按规则透明改写。底层真实物理存储固定为 `/data/media/<user_id>`（`STORAGE_BASE`），所有重定向最终归一到此。
+- **挂载命名空间隔离**：检测 zygote 子进程，将定制的 FUSE 挂载注入目标应用的 mount namespace，规则只对目标应用生效。
 
-### 核心能力
-
-| 能力 | 说明 |
-|------|------|
-| 存储重定向（REDIRECT / ALLOW） | 将虚拟路径的文件操作透明重定向到指定真实目录；`ALLOW` 等价于"重定向回自身真实存储"（parse 阶段生成 `?` 前缀内部标记） |
-| 路径隐藏（HIDE） | 对特定应用隐藏文件/目录（返回 ENOENT）；含跨应用隔离——应用访问 `/Android/data/<其他包名>/` 自动隐藏 |
-| 只读保护（RO） | 指定路径对应用只读（写操作返回 EROFS） |
-| 沙箱隔离（SANDBOX） | 为应用创建独立存储沙箱（`/Android/data/<pkg>/sandbox`），隔离 `/Android/data`、`/Android/obb` |
-| 命名空间注入 | 检测 zygote fork，自动为目标应用注入 FUSE 挂载 |
-| 专属媒体 FUSE | 为 `com.android.providers.media.module` 单独起一个 FUSE 实例（惰性启动/退出） |
-| 配置广播 | 通过 UDS 实时对外发布当前配置（供管理器 App 消费） |
+核心能力：存储重定向（REDIRECT/ALLOW）、路径隐藏（HIDE，含跨应用隔离）、只读保护（RO）、沙箱隔离（SANDBOX）、命名空间注入、专属媒体 FUSE（为 `com.android.providers.media.module` 单独起实例，惰性启停）、配置广播（UDS 实时发布配置供管理器 App 消费）。规则语法见 `config.md`。
 
 ## 2. 进程架构
 
-项目编译产出 6 个独立可执行文件，各自是一个进程，通过 Unix Domain Socket 协作（rule_server 为规则控制守护进程，见 `rule-server-api.md`；global_replace_ctl 仅 GNU 构建、供测试驱动全局替换挂载原语）：
+6 个可执行文件各自为独立进程，经 Unix Domain Socket 协作：
 
 ```
                          ┌─────────────────────────────────────────┐
@@ -41,254 +31,174 @@ Fuse-Proxy 是运行在 **Android 13+（API 33~35）** 上的用户态存储代�
                                  ▼                         ▼
                     ┌────────────────────┐      ┌────────────────────┐
                     │  fuse_daemon        │      │  管理器 App /       │
-                    │  FUSE 操作回调       │      │  log_ctl (CLI)     │
+                    │  FUSE 回调骨架       │      │  log_ctl (CLI)     │
                     │  ┌───────────────┐  │      └────────────────────┘
-                    │  │ 规则模块       │  │
-                    │  │ basic_rules   │  │
-                    │  │ (dlopen 决策)  │  │
-                    │  └───────┬───────┘  │
-                    └──────────┼──────────┘
-                               │ 读 config_parser 解析的规则
-                               ▼
-                    ┌────────────────────┐
-                    │  config_parser      │
-                    │  规则解析 + Trie    │
+                    │  │ basic_rules.so│  │
+                    │  │ (dlopen 决策)  │  │      ┌────────────────────┐
+                    │  └───────────────┘  │      │  log_monitor        │
+                    └────────────────────┘      │  日志收集服务        │
+                                                 └─────────▲──────────┘
+                    ┌────────────────────┐                 │ UDS
+                    │  rule_server        │      各进程 log_internal
+                    │  JSON 行协议改规则   │
                     └────────────────────┘
-
-                    ┌────────────────────┐      ┌────────────────────┐
-                    │  log_monitor        │◀─────│  各进程 log_internal │
-                    │  日志收集服务        │ UDS  │  (common.c)         │
-                    └────────────────────┘      └────────────────────┘
 ```
 
-> 注：injector 实际同时维护**两棵** FUSE 树——全局 FUSE（`inject_global_fuse`）和媒体模块专属 FUSE（`inject_media_fuse`，仅当 `com.android.providers.media.module` 在注入目标时起）。二者共用同一 `fuse_daemon` 二进制、同一 `--rules` 配置，但挂载点不同。
+> injector 同时维护**两棵** FUSE 树——全局 FUSE（`inject_global_fuse`，挂载于 `/mnt/nsp_global`）与媒体模块专属 FUSE（`inject_media_fuse`，惰性）。二者共用同一 `fuse_daemon` 二进制与 `--rules` 配置，挂载点不同。
 
-### 2.1 injector — 主控进程
+### 2.1 injector — 主控
 
-职责：系统级守护，负责发现目标应用并为其注入 FUSE 挂载。
+系统级守护，发现目标应用并为其注入 FUSE 挂载。
 
-- **事件循环**：`epoll` 统一管理 inotify（配置文件变更）、IPC socket、异步挂载完成管道、FUSE ready 管道、定时器（周期扫描）。
-- **目标判定**（`inject_target.c`）：判断一个进程是否为注入目标——依据包名匹配配置、系统应用过滤、隔离进程过滤等。
-- **挂载注入**（`mount_manager.c` + `ns_utils.c`）：进入目标进程的 mount namespace，挂载 FUSE 并做 bind mount 恢复。
-- **IPC 服务**（`ipc_server.c`）：接收外部（如管理器 App）的查询/控制命令。
-- **配置广播**（`config_publisher.c`）：以 JSON 通过 UDS 实时发布配置，支持 GET / STATIC / SUBSCRIBE。详见 `config-broadcast.md`。
+- **事件循环**：`epoll` 统一管理 inotify（配置变更）、IPC socket、异步挂载完成管道、FUSE ready 管道、定时器（周期扫描）。
+- **目标判定**（`inject_target.c`）：包名匹配配置、系统应用过滤、隔离进程过滤。
+- **挂载注入**（`mount_manager.c` + `ns_utils.c`）：进入目标进程 mount namespace，挂载 FUSE 并做 bind mount 恢复。
+- **IPC / 广播**（`ipc_server.c` / `config_publisher.c`）：接收查询控制命令；以 JSON 经 UDS 发布配置（GET / STATIC / SUBSCRIBE）。
 
-### 2.2 fuse_daemon — FUSE 文件系统守护
+### 2.2 fuse_daemon — FUSE 守护
 
-职责：实现 FUSE 操作回调，对被注入应用的每次文件操作应用规则。
+由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动，实现约 27 个 `fuse_operations` 回调。框架**零规则功能**：
 
-- **FUSE 回调层**（`fuse_daemon.c`）：实现约 27 个 `fuse_operations` 回调（getattr/readdir/open/read/write/rename/xattr…）。由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动。框架**零规则功能**：规则决策经模块分派（`module_dispatch_resolve`）交给 dlopen 的规则模块（basic_rules.so）完成；无规则模块时直通回退。
-- **后端分派**（`NSP_CAP_BACKEND_IO`）：FUSE 回调解析出 sub_path 后，若规则模块 resolve 命中 FTP 规则（`rr.is_ftp`，`FTP <虚拟前缀> <段名>`，作用域按规则所在段：GLOBAL=全局、应用段=仅该应用），则经 `module_backend_lookup` 定位后端模块（如 ftp_module.so）并改调其 `backend_*` 方法完成文件操作——**模块不实现 FUSE，只提供目标功能的方法，最终执行仍由框架回调驱动**；无后端模块或未命中 FTP 规则时本地文件系统直通（`module_backend_active()` 快速路径零开销）。
-- **规则匹配引擎**：已整体迁移为热插拔规则模块 `basic_rules.so`（`src/modules/basic_rules/`，dlopen 进 fuse_daemon 进程，函数指针调用），模块化后框架不含任何规则语义。
-- **uid→包名解析**（规则模块内 `br_get_pkg`）：uid<10000 直接判为 `system`；否则先查 `uid.map`、再读 `/proc/<tid>/status` 的 `Tgid`+`cmdline`；解析出 `<pre-`/`zygote`/长度<3 的进程视为不可解析，缓存为 nullptr。
-- **每个 metadata 操作的热路径**：`br_get_app_cfg`（uid→配置，2048 槽 seqlock 无锁读缓存，命中 O(1)；写者 wlock+seq 翻转，读者零原子写）→ `br_sanitize_and_check_hidden`（路径消毒 + 隐藏判定）→ `br_to_real_path`（重定向/沙箱解析）——以上均由 basic_rules 模块内实现，框架经一次 `module_dispatch_resolve` 调用取回全部决策（含最终真实路径），保住"一次查询多路复用"的性能语义。
+- **规则决策**经 `module_dispatch_resolve` 分派给 dlopen 的 `basic_rules.so`，无规则模块时直通回退。
+- **后端分派**（`NSP_CAP_BACKEND_IO`）：resolve 命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。
+- **uid→包名解析**（模块内 `br_get_pkg`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`。解析出 `<pre-`/`zygote`/长度<3 的视为不可解析，缓存为 nullptr。
 
-### 2.3 log_monitor / log_ctl — 日志子系统
+模块架构详见 `modules.md`。
 
-- **log_monitor**：常驻日志收集服务，通过 AF_UNIX 流式 socket（抽象地址 `nsp_log_socket`，`SOCK_STREAM`）接收各进程 `log_internal` 发来的日志，落盘/转发；同时提供 `search`/`stream`/`clear`/`count` 等查询服务。io/sys 自动落盘 `LOG_DIR/io.log`、`sys.log`（`push_log` 单漏斗暂存 64KB，stage 满 / 500ms tick 脏超 1s / 退出时刷盘；单文件超 2MB 轮转为 `.1` 单备份，logcat 不落盘）。启动时把落盘文件加载进只读独立缓冲（`.1`→cur，每类上限 2048 条，解析失败跳过），`search`/`STREAM` 历史/`COUNT` 按"磁盘在前、内存在后"拼接（内存启动时为空故无重叠）。
-- **log_ctl**：CLI 客户端，用于查询日志、流式输出、规则编辑（`set-rule`/`remove-rule`/`validate-rules`）、以及拉取配置广播（`get-config` / `stream-config`）。详见 `log_ctl-api.md`。
+### 2.3 日志子系统
 
-#### 挂载周期日志合并（LOG_BATCH 协议）
+- **log_monitor**：常驻收集服务，经 AF_UNIX `SOCK_STREAM`（抽象地址 `nsp_log_socket`）接收各进程 `log_internal`，并提供 `search`/`stream`/`clear`/`count` 查询。io/sys 自动落盘 `LOG_DIR/io.log`、`sys.log`（`push_log` 单漏斗暂存 64KB，stage 满 / 500ms tick 脏超 1s / 退出时刷盘；单文件超 2MB 轮转 `.1` 单备份，logcat 不落盘）。启动时把落盘文件载入只读独立缓冲（每类上限 2048 条），查询按"磁盘在前、内存在后"拼接。
+- **log_ctl**：CLI 客户端——查询日志、流式输出、规则编辑（`set-rule`/`remove-rule`/`validate-rules`）、拉取配置广播（`get-config`/`stream-config`）。
+- **LOG_BATCH 协议**：应用还原等"一条日志对应整个挂载周期"的场景，周期内中间日志由 `log_batch_begin/end` 在 `log_internal` 层累积，`log_batch_end` 合并为**单条**（`LOG_KIND_MERGED`）发送。合并日志为单行 `[injector] <条目1>\t<条目2>...`（制表符连接，避免前端按行拆分导致 UTF-8 截断），级别固定 `LOG_DEBUG`。
 
-应用还原等"一条日志对应整个挂载周期"的场景，周期内中间日志（bind/f2fs
-等）由 `log_batch_begin/end` 在 `log_internal` 层累积，`log_batch_end`
-合并为**单条**经 comm 线程发送（`LOG_KIND_MERGED` 载荷）：
-
-- comm 线程的 LOG 后端按 `LOG_BATCH\n<内容>\nLOG_BATCH_END`
-  分帧发送；普通日志（LOG_IO/LOGCAT/SYS）逐条逻辑不变
-- log_monitor 的 `async_log_thread` 收集 LOG_BATCH 帧，`LOG_BATCH_END`
-  整块合并为**一条**入库（前端最终只显示一条，多个发送请求并入一个日志）
-- 合并日志为**单行输出**：`[injector] <条目1>\t<条目2>...`，条目间以
-  制表符连接（不用换行，避免前端按行拆分导致 UTF-8 截断乱码）
-- 合并日志级别固定为 `LOG_DEBUG`（`--level >=1` 查询时不显示）
-- 粘包/竞态处理：主循环首行 LOG_SYS 转 async 前把剩余字节移交
-  `AsyncCtx.pending`（在 `pthread_create` 之前填充）；背靠背 LOG_BATCH
-  帧写入多槽队列 `batch_q`（BATCH_Q_CAP=4），由 `drain_async` 逐槽
-  push 入 g_sys_buf，互不覆盖
-
-## 3. 模块与源码布局
+## 3. 源码布局
 
 ```
-Fuse-Proxy/
-├── include/                # 公共头文件（对外接口声明）
-├── src/
-│   ├── core/               # 跨进程共享的基础设施
-│   │   ├── common.c        # 日志、路径消毒、IPC 收发、时区、cgroup 逃逸、STORAGE_BASE 常量
-│   │   ├── crash_dump.c    # 崩溃转储
-│   │   ├── fast_pid.c      # PID/进程信息快速读取
-│   │   ├── fast_search.c   # NEON 优化的子串检索（mountinfo 匹配）
-│   │   ├── path_trie.c     # 路径 Trie（零业务依赖，可独立单元测试）
-│   │   └── uid_map.c       # uid→包名 映射表（磁盘持久化 + 内存缓存）
-│   ├── config/             # 规则配置
-│   │   ├── config_parser.c # 规则文件解析、AppConfig 管理、Trie 构建、变量静态性分析
-│   │   └── path_vars.c     # 路径变量（$package 等）展开、真实目标分类
-│   ├── daemon/             # FUSE 守护进程
-│   │   └── fuse_daemon.c   # FUSE 操作回调 + main（框架零规则功能，含后端分派）
-│   ├── module/             # 热插拔模块加载器
-│   │   └── loader.c        # dlopen 加载/卸载、能力登记、resolve/probe/后端分派、inotify 热插拔监控
-│   ├── modules/            # 热插拔模块（.so，dlopen 进 fuse_daemon）
-│   │   ├── basic_rules/    # 基础规则引擎（原 vfs_core 迁移）：REDIRECT/SANDBOX/HIDE/ALLOW/RO
-│   │   └── ftp/            # FTP 存储后端（纯方法模块，无 FUSE 实现）：ftp_backend/ftp_client/ftp_conf/ftp_module
-│   ├── injector/           # 注入器
-│   │   ├── injector.c      # main + epoll 事件循环（含 inject_global_fuse/inject_media_fuse）
-│   │   ├── inject_target.c # 注入目标判定 + uid 映射维护
-│   │   ├── mount_manager.c # FUSE 挂载管理
-│   │   ├── ns_utils.c      # mount namespace 操作（含 do_force_umount_stale 预清理）
-│   │   ├── ipc_server.c    # IPC 服务端
-│   │   └── config_publisher.c # 配置广播 UDS 服务
-│   └── log/                # 日志子系统
-│       ├── log_monitor.c   # 日志收集服务（AF_UNIX SOCK_STREAM，抽象地址 nsp_log_socket）
-│       └── log_ctl.c       # 日志/配置查询 + 规则编辑 CLI
-└── meson.build             # Meson 构建配置
+src/
+├── core/                 # 跨进程共享基础设施
+│   ├── common.c          # 日志、路径消毒、IPC 收发、时区、cgroup 逃逸、存储路径合成
+│   ├── nsp_util.c        # 纯 libc 公共库（UDS 地址、send_all、trim、mkdir_p、daemonize）
+│   ├── nsp_comm.c        # 统一通讯线程（全进程唯一发后即忘出口）
+│   ├── nsp_ini_store.c   # 通用 INI 段式存储（模块配置可借用）
+│   ├── path_trie.c       # 路径 Trie（零业务依赖，可独立单测）
+│   ├── uid_map.c         # uid→包名映射（磁盘持久化 + 内存缓存）
+│   ├── sys_pkg.c         # 系统应用包名缓存（pm list packages -s）
+│   ├── fast_pid.c        # PID/进程信息快速读取
+│   ├── fast_search.c     # NEON 优化子串检索（mountinfo 匹配）
+│   ├── sha256*.c         # 模块 ban 记录哈希（含硬件加速）
+│   ├── crash_dump.c      # 崩溃转储
+│   └── build_info.c      # 编译期版本/git 哈希
+├── config/
+│   ├── config_parser.c   # 规则解析、AppConfig 管理、Trie 构建、变量静态性分析
+│   └── path_vars.c       # 路径变量展开、真实目标分类
+├── daemon/
+│   ├── fuse_daemon.c     # FUSE 回调 + main（框架，含后端分派）
+│   └── fuse_thread_naming.c  # 线程语义命名（pthread_create 截持）
+├── module/               # 模块框架
+│   ├── loader.c          # dlopen 加载/卸载、能力登记、分派、inotify 热插拔
+│   ├── fault_fence.c     # 调用围栏（sigsetjmp 崩溃恢复）
+│   └── module_guard.c    # 输出校验 + 熔断器
+├── modules/              # 热插拔模块（.so）
+│   ├── basic_rules/      # 规则引擎：REDIRECT/SANDBOX/HIDE/ALLOW/RO
+│   └── ftp/              # FTP 存储后端（纯方法模块，无 FUSE 实现）
+├── injector/             # 注入器（injector/inject_target/mount_manager/
+│   │                     #   ns_utils/ns_global_replace/ipc_server/config_publisher）
+│   └── global_replace_ctl.c  # 全局替换挂载测试驱动（仅 GNU）
+├── rule/rule_server.c    # 规则控制服务（JSON 行协议）
+└── log/                  # log_monitor、log_ctl
 ```
 
-## 4. 构建产物与源文件映射
+外部依赖：`libfuse3`（**仅 fuse_daemon 直接用**，规则/后端模块均不链接）、`json-c`（配置广播/日志 JSON）、`libcurl`（仅 ftp_module，≥8.21.0）、`iconv`、`pthread`。C23 标准，`warning_level=3`，Release `-O3 -flto`。产物与源文件映射见 `meson.build`。
 
-由 `meson.build` 定义。四个可执行文件共享一组 `common_sources`：
+## 4. 规则系统
 
-```
-common_sources = core/common.c, config/config_parser.c, config/path_vars.c,
-                 core/fast_search.c, core/uid_map.c
-```
+由 `config_parser.c`（解析与存储，编译进各进程）+ `basic_rules.so`（匹配与应用，dlopen 进 fuse_daemon）组成。规则语法与作用域见 `config.md`。
 
-| 可执行文件 | 专属源文件 | 说明 |
-|-----------|-----------|------|
-| `fuse_daemon` | daemon/fuse_daemon.c, module/loader.c, core/crash_dump.c, core/fast_pid.c | FUSE 守护（框架，零规则功能） |
-| `injector` | injector/*.c（injector, inject_target, mount_manager, ipc_server, config_publisher, ns_utils）, core/fast_pid.c | 注入器 |
-| `rule_server` | rule/rule_server.c | 规则控制守护进程（Android/GNU 均构建），详见 `rule-server-api.md` |
-| `global_replace_ctl` | injector/global_replace_ctl.c, injector/ns_utils.c | 全局替换式挂载测试驱动（仅 GNU 构建，供 tests/test_global_replace.py 使用） |
-| `log_monitor` | log/log_monitor.c | 日志收集 |
-| `log_ctl` | log/log_ctl.c | 日志/配置 CLI |
+### 4.1 双通道存储：Trie + 线性数组
 
-| 共享库（模块，dlopen） | 源文件 | 说明 |
-|-----------------------|--------|------|
-| `basic_rules.so` | modules/basic_rules/*.c | 规则模块（原 vfs_core 迁移），安装到 `bin/modules/basic_rules/` |
-| `ftp_module.so` | modules/ftp/*.c, core/common.c | FTP 存储后端（纯方法模块，**不依赖 libfuse3**），安装到 `bin/modules/ftp_module/` |
+按是否含通配符/变量分两条通道，是性能与灵活性的权衡：
 
-外部依赖：`libfuse3`（仅 fuse_daemon 直接用；规则/后端模块均不链接）、`json-c`（配置广播/日志 JSON 序列化）、`iconv`（字符编码）、`pthread`。
+- **纯静态规则**（无 `*?[]`、无 `$`）→ **Trie**（多叉前缀树，按 `/` 分段）。单次查询 O(路径段数)，且一次 `trie_lookup_full` 同时返回 hidden/ro/redirect/ftp 四类命中。绝大多数规则走此快路径。
+- **含通配/变量的规则** → 线性数组（`hide_rules[]`/`ro_rules[]`/`redir_rules[]`），逐条 `fnmatch` + 前缀匹配。数量通常很少。
 
-编译：交叉编译到 `aarch64-linux-android35`，C23 标准，`warning_level=3`。Release 用 `-O3 -flto`。
-
-## 5. 规则系统设计（核心）
-
-规则系统由 `config_parser.c`（解析与存储，共享库编译进各进程）+ 规则模块 `basic_rules.so`（匹配与应用，dlopen 进 fuse_daemon）组成；框架 fuse_daemon 不含任何规则语义。
-
-### 5.1 规则类型
-
-| 规则 | 语法 | 语义 |
-|------|------|------|
-| ALLOW | `ALLOW <虚拟路径>` | 放行：虚拟路径映射到当前用户真实存储（`?` 前缀内部标记） |
-| REDIRECT | `REDIRECT <虚拟路径> <真实目标>` | 将虚拟路径重定向到指定真实目标 |
-| HIDE | `HIDE <路径>` | 对应用隐藏该路径（返回 ENOENT） |
-| RO | `RO <路径>` | 该路径对应用只读（写返回 EROFS） |
-| SANDBOX | `SANDBOX ON/OFF` | 沙箱开关（隔离 /Android/data、/Android/obb 到独立目录） |
-
-作用域：`[GLOBAL]` 段为全局规则（所有应用共享）；`[包名:用户ID]` 段为应用专属。应用规则也可放在 `App-rules/包名.conf` 独立文件。多用户场景使用 `App-rules-<uid>/<包名>.conf`。
-
-> 注：`SANDBOX` / `MONITOR` 等开关既可写在 `[GLOBAL]` 段作全局默认，也可写在应用段覆盖全局；应用段显式写一次即标记 `*_explicit`，此后以应用段值为准——不存在"继承全局后再覆盖"的中间态。
-
-### 5.2 双通道存储：Trie + 线性数组
-
-规则按是否含**通配符/变量**分两条通道存储，这是性能与灵活性的权衡：
-
-- **纯静态规则**（无 `*?[]` 通配、无 `$` 变量）→ 写入 **Trie（前缀树）**。按路径 `/` 分段逐层匹配，单次查询 O(路径段数)，且一次 `trie_lookup` 同时返回 hidden/ro/redirect 三类命中。这是绝大多数规则的快路径。
-- **含通配/变量的规则** → 存入线性数组（`hide_rules[]` / `ro_rules[]` / `redir_rules[]`），逐条 `fnmatch` + 前缀匹配。数量通常很少。
-
-> 注：Trie 是一棵**多叉前缀树**（每个节点按路径段分支），不是二叉树。它是内聚、零配置依赖的数据结构，独立于 AppConfig。
-
-### 5.3 路径变量
-
-`REDIRECT` / `HIDE` / `RO` / `ALLOW` 的路径支持变量（`path_vars.c`）：
-
-- `$package`：当前命中应用的包名（运行时按 uid 解析）。
-- 自定义变量：`NAME=VALUE` 定义，可相互引用（带循环检测）。
-- **静态/动态优化**：加载时分析每个变量——不含 `$package` 的静态变量预计算并缓存展开值；含动态因素的每次请求展开。详见 `path-variables.md`。
-
-### 5.4 单次操作的匹配流程（fuse_daemon 热路径）
+### 4.2 单次操作的热路径
 
 ```
 FUSE 回调（如 getattr）
   └─ VFS_SETUP_CORE 宏：经 module_dispatch_resolve 一次调用取回全部决策
-       ① br_get_app_cfg(uid) ──────────── uid→AppConfig（2048 槽 seqlock 无锁读缓存，命中 O(1)）
+       ① br_get_app_cfg(uid) ──────────── uid→AppConfig（2048 槽 seqlock 无锁读缓存，O(1)）
        ② br_sanitize_and_check_hidden ─── 路径消毒 + Trie 一次性解析（填 TrieMatch）+ 隐藏判定
        ③ br_to_real_path ──────────────── 复用 TrieMatch 的 redirect 结果 → 真实路径
   └─ 写操作额外：br_is_path_ro ────────── 复用 TrieMatch 的 ro 结果
 ```
 
-`TrieMatch` 缓存使单次操作对两棵 Trie（app + global）的遍历从 6 次降到 2 次（`trie_lookup_full` 一次下降同时取 hidden/ro/redir/ftp 命中）。
+`TrieMatch` 缓存使单次操作对两棵 Trie（app + global）的遍历从 6 次降到 2 次。
 
-### 5.5 真实目标分类与 sandbox
+### 4.3 真实路径解析优先级
 
-`br_to_real_path` 解析真实路径时按以下优先级：
+`br_to_real_path` 按序解析：
 
-1. **Trie 静态 redirect 命中**（复用 `TrieMatch`）：若目标以 `?` 开头，转换为 `STORAGE_BASE/<user_id><后缀>`。
-2. **线性 redir_rules**：app 优先、global 兜底；目标经 `build_real_base_from_target` 分类——`?` 前缀或相对路径→当前用户存储；`/storage/emulated/X/...`→归一为当前用户存储；`/data`、`/mnt`、`/storage`→绝对路径原样；其他以 `/` 开头→当前用户存储。
-3. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data/<pkg>`、`/Android/obb/<pkg>` 外的 `/Android/data`、`/Android/obb` 访问重定向到 `/Android/data/<pkg>/sandbox`。应用段显式 `SANDBOX OFF` 可覆盖全局 `ON`（靠 `sandbox_explicit` 标记）。
-4. **fallback**：无任何命中则默认 `STORAGE_BASE/<user_id><sub_path>`。
+1. **Trie 静态 redirect 命中**（复用 `TrieMatch`）：目标以 `?` 开头则转 `STORAGE_BASE/<user_id><后缀>`。
+2. **线性 redir_rules**：app 优先、global 兜底；目标经 `build_real_base_from_target` 分类（分类表见 `config.md` §4）。
+3. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `/Android/data/<pkg>/sandbox`。
+4. **fallback**：`STORAGE_BASE/<user_id><sub_path>`。
 
-> `?` 前缀是项目内部标记，由 parse 阶段对 ALLOW 和相对路径 REDIRECT 自动生成，表示"相对当前用户存储"，运行时由 `br_to_real_path`/`build_real_base_from_target` 还原为 `STORAGE_BASE/<user_id>`。配置文件中一般无需手写。
+> `?` 前缀是内部标记，由 parse 阶段对 ALLOW 和相对路径 REDIRECT 自动生成，表示"相对当前用户存储"。
 
-### 5.6 跨应用隔离
+### 4.4 跨应用隔离
 
-- `br_is_other_app_pkg`：应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用。隔离只作用于**列举**——readdir 条目级 probe 过滤（`br_probe` 返回 hidden，列表不显示其他应用目录内容）；resolve（getattr/open）**不再**判隐藏，已知路径的文件可正常打开/stat（修复 MT 管理器跨应用列表可见但打开 ENOENT 的问题）。
-- `CONFIG_DIR`（`/data/Namespace-Proxy`）路径下的所有访问无条件隐藏，防止应用窥探配置本身。
+`br_is_other_app_pkg` 判定应用访问 `/Android/data|obb/<其他包>/`。隔离**只作用于列举**——readdir 条目级 probe 过滤；resolve（getattr/open）**不判隐藏**，已知路径的文件可正常打开（修复 MT 管理器跨应用列表可见但打开 ENOENT）。`CONFIG_DIR` 下所有访问无条件隐藏。
 
-## 6. 进程间协作与数据流
+## 5. 进程协作
 
-### 6.1 注入流程
+### 5.1 注入流程
 
-1. injector 启动时先 `inject_global_fuse`：在 `/mnt/nsp_global` 挂载全局 FUSE 实例（fuse_daemon 以 `--root=/data/media --rules=<injector.conf>` 启动）。若 `com.android.providers.media.module` 在注入目标之列，再惰性 `inject_media_fuse` 起一个专用 FUSE 实例。
-2. injector 通过检测 zygote 子进程（`fast_pid` + `/proc` 扫描，周期由 timerfd 驱动）发现新启动的应用。
-3. `inject_target` 判定该进程是否为配置的目标应用（含 `SKIP_SYSTEM_APPS` 默认过滤 uid<10000、隔离进程过滤）。
-4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace，挂载 fuse_daemon 提供的 FUSE 文件系统。
-5. 此后该应用对 `/sdcard` 等的访问经 FUSE → 规则模块（basic_rules）匹配。
+1. injector 启动先 `inject_global_fuse` 挂载全局 FUSE；若 `com.android.providers.media.module` 在目标之列，惰性起媒体专属实例。
+2. 经 zygote 子进程检测（`fast_pid` + `/proc` 扫描，timerfd 驱动）发现新启动应用。
+3. `inject_target` 判定是否为目标（含 `SKIP_SYSTEM_APPS` 过滤、隔离进程过滤）。
+4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
+5. 此后该应用对 `/sdcard` 的访问经 FUSE → basic_rules 匹配。
 
-### 6.2 配置热重载
+### 5.2 配置热重载
 
-- injector 用 inotify 监听 `injector.conf` 与 `App-rules/*.conf` 变更。
-- fuse_daemon 内的规则模块（basic_rules）独立用 inotify 监听规则目录（`config_monitor_thread`，br_rules.c），变更后 `reload_config` 重建 AppConfig 与 Trie、清空 uid 缓存、重读 `uid.map`。
-- 变更后 injector 通过 `config_publisher` 向订阅者广播新配置；若 `global_inject` 切换则广播"全量变更"（`changed_count=-1`）触发全应用重挂载，否则仅通知受影响包。
+- injector 用 inotify 监听 `injector.conf` 与 `App-rules*/*.conf`。
+- fuse_daemon 内的 basic_rules 独立用 inotify 监听规则目录（`config_monitor_thread`），变更后 `reload_config` 重建 AppConfig 与 Trie、清空 uid 缓存、重读 `uid.map`。
+- injector 经 `config_publisher` 向订阅者广播；`global_inject` 切换则广播全量变更（`changed_count=-1`）触发全应用重挂，否则仅通知受影响包。
 
-### 6.3 IPC 与广播（UDS）
+### 5.3 UDS 一览
 
 | Socket | 类型 | 用途 |
 |--------|------|------|
-| `nsp_ipc_socket` | IPC 命令（抽象） | injector 控制/查询（如 `list-injected`） |
-| `nsp_config_broadcast` | DGRAM 抽象 | 配置广播（GET/STATIC/SUBSCRIBE），详见 config-broadcast.md |
-| `nsp_log_socket` | AF_UNIX SOCK_STREAM 抽象 | 各进程 `log_internal` → log_monitor；log_ctl 也经此 `search`/`stream`/`clear`/`count` |
+| `nsp_ipc_socket` | 抽象 | injector 控制/查询（如 `list-injected`、`MODULE_CHANGED`） |
+| `nsp_config_broadcast` | DGRAM 抽象 | 配置广播（GET/STATIC/SUBSCRIBE） |
+| `nsp_log_socket` | SOCK_STREAM 抽象 | 各进程 `log_internal` → log_monitor；log_ctl 查询同走此路 |
 
-## 7. 关键全局状态与并发
+## 6. 全局状态与并发
 
-| 全局 | 归属 | 保护 | 说明 |
-|------|------|------|------|
-| `g_global_cfg` / `g_app_cfgs` | config_parser | `g_rules_lock`（rwlock） | 规则配置，读多写少，reload 时持写锁 |
-| `g_uid_maps` / `g_uid_map_count` | basic_rules | 同上 rwlock | uid→包名 映射（`uid.map` 加载，二分查询） |
-| `g_uid_cache[2048]` | basic_rules | seqlock（写者 wlock+seq 翻转，读者无锁） | uid→AppConfig 缓存，slot = `uid % 2048`，带配置代际校验（重载仅作废 cfg、保留 pkg） |
-| `g_global_fuse` / `g_media_fuse` | injector | 各自字段 | 全局/媒体 FUSE 实例状态（pid/mnt_path/disabled/crash_count） |
+| 全局 | 归属 | 保护 |
+|------|------|------|
+| `g_global_cfg` / `g_app_cfgs` | config_parser | `g_rules_lock`（rwlock），读多写少 |
+| `g_uid_maps` / `g_uid_map_count` | basic_rules | 同上 rwlock（二分查询） |
+| `g_uid_cache[2048]` | basic_rules | seqlock（写者 wlock+seq 翻转，读者无锁），slot = `uid % 2048`，带配置代际校验 |
+| `g_global_fuse` / `g_media_fuse` | injector | 各自字段（pid/mnt_path/disabled/crash_count） |
 
-并发要点：FUSE 回调多线程并发执行，读规则前必须 `config_lock_read()`，且**所有返回路径必须解锁**（`VFS_RETURN` 宏统一处理，切勿裸 `return`）。uid 缓存槽用 `uid % UID_CACHE_SIZE` 取模，未命中时回退到 `/proc/<tid>/status`+`cmdline` 解析；seqlock 读侧零原子写，多线程并发读不产生缓存行颠簸。
+FUSE 回调多线程并发执行，读规则前必须 `config_lock_read()`，且**所有返回路径必须解锁**（`VFS_RETURN` 宏统一处理，切勿裸 `return`）。seqlock 读侧零原子写，并发读不产生缓存行颠簸。
 
-## 8. 维护规范
+## 7. 维护规范
 
-- **公共工具归属**：跨进程复用的工具有两层——①纯 libc、无全局依赖的放 `src/core/nsp_util.c`（声明在 `nsp_util.h`）：UDS 抽象地址填充（`nsp_uds_abstract_addr`）、全量发送（`nsp_send_all`）、去空白（`nsp_str_trim`）、`nsp_mkdir_p`、后台化（`nsp_daemonize`）、cgroup 逃逸（`nsp_escape_cgroup`），各二进制与 dlopen 模块均可链接，**禁止私刻副本**（`rule_server` 的 `mkdir_p`/`send_all`、`ftp_conf` 的 `trim`、`injector`/`rule_server` 的 fork 样板已删除）；②依赖项目全局（`g_real_root`、日志、SELinux）的放 `src/core/common.c`（声明在 `common.h`，模块侧经 `nsp_module.h` 导出表解析）。路径/字符串处理、mkdir 等应集中一处，避免各文件各写一份。
-- **存储路径合成唯一出口**：禁止裸拼 `STORAGE_BASE "/%d…"` `snprintf`——默认真实路径走 `common_default_real_path()`、用户存储根走 `common_storage_root()`、沙盒目标走 `common_sandbox_path()`（`MAX_PATH_LEN` 放不下时返回 -1，调用方放弃重定向而非截断）。三函数在 `common.c` 实现、`nsp_module.h` 向模块导出。
-- **函数命名前缀**：`br_*`（基础规则）、`config_*`（配置锁/发布）、`module_*/nsp_guard_*/nsp_fence_*`（模块框架）、`ftp_*`（FTP 后端）、`trie_*`、`sha256_*/uid_map_*/fast_pid_*`、`vfs_*/fw_*`（FUSE 回调/框架）、`ns_*`（mount namespace 操作，含 `ns_global_replace.c/h` 跨文件 helper）、`nsp_*`（`nsp_util` 轻量公共库）、`common_*`（存储路径合成等）。新增跨文件函数必须带域前缀；`inject_target.c` 的 `is_*/add_*/all_apps_*` 裸名是已知历史包袱（改动面大，后续单独治理）。
-- **头文件职责**：`mkdir_recursive_p` 权威声明只在 `common.h`（`config_parser.h` 不得重复声明）；`_locked` 后缀函数（须持有读写锁）不得进公共头；`is_media_provider` 权威声明在 `common.h`。`crash_dump.c` 的 `backtrace/backtrace_symbols*` 是**故意**的静态实现（满足 `libfuse3.a` 对 `execinfo.h` 符号的链接依赖），不得改名。
-- **初始化契约**：`log_init` 内部调用 `init_timezone`；`log_monitor` 因不走 `log_init`（自身即日志服务端）才直接调 `init_timezone`，其余进程不得手动补调。
-- **统一通讯线程**：所有发后即忘 socket 发送经 `nsp_comm_post(ch, data, len)`（`nsp_comm.h`，全进程唯一入口），调用线程永不阻塞、永不碰 socket。`LOG`/`IPC` 后端常驻于 `log_init`（common.c）；`BCAST` 后端由 `injector`（订阅集合归 comm 线程，`SUB/UNSUB` 经控制消息）、`log_monitor`（STREAM 客户端集合归 comm 线程，`ADD/DEL` 经控制消息，主线程只 `shutdown` 不断号 `close`）各自注册。同步 query 类（`LIST/COUNT/QUERY/rule -c`）与 `log_ctl` 短命 CLI 保持阻塞原样，不进 comm 模型。
-- **背压与顺序**：满环覆盖最旧 + `dropped` 计数（drain 轮结束经 report 钩子发一行 SYS 可查，计数以 `nsp_comm_dropped()` 为准）；单生产者保序、多生产者允许乱序。drain 优先级 `IPC > LOG > BCAST`，生命线信号优先。
-- **fd 归属铁律**：谁拥有集合，谁 `close`。comm 线程拥有的客户端 fd，主线程只允许 `shutdown` + 投递控制消息，禁止直接 `close`（不断号，杜绝复用竞态）；进程退出时先 `nsp_comm_fini()` 再集中关闭。
-- **数据结构独立**：内聚、零业务依赖的数据结构（如 Trie）应自成模块（`.c`+`.h`），可独立单元测试。`path_trie.c` 不引用 AppConfig 或任何配置全局。
-- **规则匹配语义等价**：修改 Trie 或线性通道时，务必保持二者对同一规则的优先级一致——app trie 优先于 global trie；redirect 取 app 命中优先、global 仅兜底；hidden/ro 取 app+global **并集**（任一命中即生效）。
-- **Trie matched 语义**：`trie_lookup` 的返回值表示"命中至少一条真实规则（hidden/ro/redirect，含祖先继承）"，而非"路径途经了无规则的中间节点"——否则 `/Android/data/<未配置包>` 会误判。修改时务必保留此语义。
-- **sandbox 路径长度校验**：`current_pkg` 来自 uid 缓存可极长，sandbox target 拼接后可能超过 `MAX_PATH_LEN`，命中时**放弃沙盒重定向**（不截断后 mkdir 错误位置）。修改 sandbox 路径生成时勿破坏该校验。
-- **YAGNI**：不保留无调用者的"预留"实现。新增能力以实际需求驱动。
-- **单元测试**：`tests/` 下有 `test_trie` / `test_path_vars` / `test_path_sanitize`。修改对应模块须同步更新测试，`ninja -C build test` 全绿方可提交。
+- **公共工具归属**：①纯 libc、无全局依赖 → `src/core/nsp_util.c`（UDS 地址填充、`nsp_send_all`、`nsp_str_trim`、`nsp_mkdir_p`、`nsp_daemonize`、`nsp_escape_cgroup`），各二进制与 dlopen 模块均可链接，**禁止私刻副本**；②依赖项目全局（`g_real_root`、日志、SELinux）→ `src/core/common.c`（模块侧经 `nsp_module.h` 导出表解析）。
+- **存储路径合成唯一出口**：禁止裸拼 `STORAGE_BASE "/%d…"`——默认真实路径走 `common_default_real_path()`、用户存储根走 `common_storage_root()`、沙盒目标走 `common_sandbox_path()`。`MAX_PATH_LEN` 放不下时返回 -1，调用方**放弃重定向而非截断**（sandbox 尤其注意：`current_pkg` 可能极长）。
+- **函数命名前缀**：`br_*`（基础规则）、`config_*`、`module_*`/`nsp_guard_*`/`nsp_fence_*`（模块框架）、`ftp_*`、`trie_*`、`sha256_*`/`uid_map_*`/`fast_pid_*`、`vfs_*`/`fw_*`（FUSE 回调）、`ns_*`（mount namespace）、`nsp_*`（轻量公共库）、`common_*`（路径合成）。新增跨文件函数必须带域前缀；`inject_target.c` 的 `is_*/add_*` 裸名是已知历史包袱。
+- **头文件职责**：`mkdir_recursive_p`、`is_media_provider` 的权威声明只在 `common.h`（`config_parser.h` 不得重复）；`_locked` 后缀函数不得进公共头。`crash_dump.c` 的 `backtrace/backtrace_symbols*` 是**故意**的静态实现（满足 `libfuse3.a` 对 `execinfo.h` 的链接依赖），不得改名。
+- **初始化契约**：`log_init` 内部调用 `init_timezone`；仅 `log_monitor`（自身即日志服务端，不走 `log_init`）直接调，其余进程不得手动补调。
+- **统一通讯线程**：所有发后即忘 socket 发送经 `nsp_comm_post(ch, data, len)`（`nsp_comm.h`，全进程唯一入口），调用线程永不阻塞、永不碰 socket。`LOG`/`IPC` 后端常驻 `log_init`；`BCAST` 由 injector、log_monitor 各自注册。同步 query 类（`LIST/COUNT/QUERY`）与 `log_ctl` 短命 CLI 保持阻塞原样。背压：满环覆盖最旧 + `dropped` 计数；drain 优先级 `IPC > LOG > BCAST`。
+- **fd 归属铁律**：谁拥有集合，谁 `close`。comm 线程拥有的客户端 fd，主线程只允许 `shutdown` + 投递控制消息，**禁止直接 `close`**（不断号，杜绝复用竞态）；退出时先 `nsp_comm_fini()` 再集中关闭。
+- **规则匹配语义等价**：修改 Trie 或线性通道时保持二者优先级一致——app trie 优先于 global trie；redirect 取 app 优先、global 兜底；hidden/ro 取 app+global **并集**。
+- **Trie matched 语义**：`trie_lookup` 返回值表示"命中至少一条真实规则（含祖先继承）"，而非"途经了无规则的中间节点"——否则 `/Android/data/<未配置包>` 会误判。
+- **数据结构独立**：内聚、零业务依赖的数据结构（如 Trie）自成模块，可独立单测。`path_trie.c` 不引用 AppConfig 或任何配置全局。
+- **YAGNI**：不保留无调用者的"预留"实现。
 
-## 9. 相关文档
+## 8. 相关文档
 
-- `docs/ai-config-guide.md` — 配置规范（段头、开关、规则、变量、禁忌）
-- `docs/path-variables.md` — 路径变量语法与真实目标分类
-- `docs/config-broadcast.md` — 配置广播服务的 Android 接入
-- `docs/log_ctl-api.md` — 日志/配置/规则编辑 CLI API
-
+- `README.md` — 构建与产物　|　`AGENTS.md` — 构建陷阱、红线、测试映射
+- `modules.md` — 模块架构与第三方开发　|　`config.md` — 配置语法与路径变量

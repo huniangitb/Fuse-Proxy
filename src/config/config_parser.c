@@ -264,7 +264,7 @@ char* clean_path_string(char* str) {
     return s;
 }
 void strip_trailing_slash(char* path) {
-    /* 剥尾随 '/'，但保留 "?/"——'?' 后必跟 '/' 是内部前缀语义（见 docs/path-variables.md），
+    /* 剥尾随 '/'，但保留 "?/"——'?' 后必跟 '/' 是内部前缀语义（见 docs/config.md），
        剥成裸 '?' 会使 Trie 命中根 redirect 时拼出 ?Android 而非 ?/Android，
        导致 vfs_to_real_path 还原成 /data/media/0Android（缺分隔符） */
     size_t len = strlen(path);
@@ -848,9 +848,9 @@ void load_config_rules(const char* path) {
                         strncpy(pkg, de->d_name, len);
                         pkg[len] = '\0';
                         AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
-                        /* 存在 <pkg>.conf（未被重命名 .disabled）即启用该应用注入：
-                           与 rule-server-api 文档语义一致，不依赖段头 ON。
-                           文件内若含 [pkg] OFF 段头会在下方解析时覆盖为 false */
+                        /* 存在 <pkg>.conf（未被重命名 .disabled）即启用该应用注入，
+                           不依赖段头 ON。文件内若含 [pkg] OFF 段头会在下方
+                           解析时覆盖为 false */
                         file_cur->inject_enable = true;
                         AppConfig* cur = file_cur; 
                         char app_conf_path[PATH_MAX];

@@ -9,7 +9,7 @@
      daemon 存活，单次即置毒，/0/virt/ 规则同样自动失效
   4. ban 持久化：重启 daemon 后同哈希 .so 不重载（防崩溃-重载震荡）
 
-测试模块（gcc 现场编译，第三方视角仅依赖 nsp_module.h，见 docs/module-dev.md）：
+测试模块（gcc 现场编译，第三方视角仅依赖 nsp_module.h，见 docs/modules.md）：
   bad_rules.so    — /0/virt/→重定向；/0/errtest/→resolve 返回 -EIO
   crash_rules.so  — /0/virt/→重定向；/0/crashtest/→resolve 触发 SIGSEGV
 

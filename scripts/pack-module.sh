@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# pack-magisk.sh —— Fuse-Proxy Magisk 模块一键打包脚本
+# pack-module.sh —— Fuse-Proxy 模块一键打包脚本
 #
 # 功能：
 #   1. 从 Android 交叉构建目录同步最新二进制到模块骨架目录
 #   2. 同步模块 .rules 规则类型注册文件与 conf 配置
 #   3. 设置可执行权限（0755）
 #   4. 自动写入版本号到 module.prop（默认 2.0，-v 可覆盖）
-#   5. 打包为 Magisk 模块 zip（保留可执行权限位，无系统 zip 依赖）
+#   5. 打包为模块 zip（保留可执行权限位，无系统 zip 依赖）
 #   6. 打包后自动验证（文件数/关键文件/权限位）
 #
 # 用法：
-#   scripts/pack-magisk.sh                        # 使用默认路径（版本自动为 2.0）
-#   scripts/pack-magisk.sh -m <模块目录> -b <构建目录> -o <输出zip>
+#   scripts/pack-module.sh                        # 使用默认路径（版本自动为 2.0）
+#   scripts/pack-module.sh -m <模块目录> -b <构建目录> -o <输出zip>
 #
 # 选项：
 #   -m, --module-dir <dir>   模块骨架目录（含 bin/ conf/ zygisk/ 等，默认 /home/bdy/nsp_module）
