@@ -5,7 +5,7 @@
  *   - 其余路径        → valid=false（框架直通）
  *
  * 编译：gcc -shared -fPIC -O1 -DNSP_MODULE_BUILD -Iinclude bad_rules.c -o bad_rules.so
- * 第三方模块视角：仅依赖 nsp_module.h（docs/module-dev.md 契约）。
+ * 第三方模块视角：仅依赖 nsp_module.h（docs/modules.md 契约）。
  */
 #define _GNU_SOURCE
 #include "nsp_module.h"
