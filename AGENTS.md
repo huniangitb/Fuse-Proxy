@@ -1,31 +1,52 @@
 # AGENTS.md
 
-Android 13+ 用户态 FUSE 存储代理（KernelSU/Magisk 模块二进制核心），C23 编写，Meson + Ninja 构建。仓库文档与提交信息均使用中文（提交为 fix:/feat:/docs:/refactor:/perf: 等 Conventional Commits 前缀）。
+Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 编写，Meson + Ninja 构建。
 
 ## 构建
 
-- 本机 GNU 构建（主线 libfuse3，pkg-config 查找）：`meson setup build_gnu -Dtarget_os=gnu && ninja -C build_gnu`。GNU 构建还需系统 **libcurl >= 8.21.0**（ftp_module 依赖；meson 会编译期校验版本，过旧直接报错）。
-- 陷阱：`meson_options.txt` 中 `target_os` **默认是 `android`**。不带 `-Dtarget_os=gnu` 配置会走 Android 分支（依赖 NDK clang 与 `fuse3_root` 静态库），在普通 Linux 上必然失败。
-- Android 交叉构建：`meson setup build --cross-file android-aarch64.ini -Dfuse3_root=<静态库根> -Dcurl_dir=<预构建 libcurl 根>`——缺 `-Dcurl_dir` 直接 error（ftp_module 静态链接 libcurl）。
-- 产物：`fuse_daemon`、`log_monitor`、`log_ctl`、`rule_server`、`basic_rules.so`、`ftp_module.so`（全部平台）；`injector` 仅 Android；`global_replace_ctl` 仅 GNU（测试驱动，不 install）。仅 `fuse_daemon` 带 `-DFUSE_USE_VERSION=317` 且 `-Wl,--export-dynamic` 导出公共符号供 dlopen 模块解析；模块与 `rule_server` 均不链接 libfuse3。
-- 调试：`-Denable_debug=true`（可叠加 `-Dwith_asan=true` / `-Dwith_ubsan=true`，sanitizer 仅在 debug 下生效）；默认 `-O3 -flto -Wl,-s`。
+- **陷阱**：`target_os` **默认是 `android`**。不带 `-Dtarget_os=gnu` 在普通 Linux 上必然失败（依赖 NDK clang）。
+- GNU 本机：`scripts/build.sh`（默认 `build_gnu/`）。第三方依赖系统库优先、缺失回退子模块，clone 后一键成功。
+- Android 交叉：`scripts/android-build.sh`，或 `meson setup build --cross-file android-aarch64.ini && ninja -C build`。cross 文件须含 `cmake = 'cmake'`（cmake 子项目交叉必需）与 `host_machine.system = 'android'`（libfuse 的 librt 豁免开关）。`-Dandroid_{libfuse,json_c,curl}=prebuilt` 可切回预构建（需 `-Dfuse3_root=` / `-Dcurl_dir=`）。
+- 产物：`fuse_daemon`、`log_monitor`、`log_ctl`、`rule_server`、`basic_rules.so`、`ftp_module.so`（全平台）；`injector` 仅 Android；`global_replace_ctl` 仅 GNU（测试驱动，不 install）。仅 `fuse_daemon` 带 `-DFUSE_USE_VERSION=317` 与 `-Wl,--export-dynamic` 导出公共符号供模块解析；模块与 `rule_server` 均不链接 libfuse3。
+- 调试：`-Denable_debug=true`（可叠加 `-Dwith_asan=true` / `-Dwith_ubsan=true`，sanitizer 仅 debug 下生效）；默认 `-O3 -flto -Wl,-s`。
+- 打包：`scripts/pack-module.sh`（同步 `build_android/` 产物到模块骨架，产出 zip 与符号包）。
 
-## 测试（纯 Python，无 C 测试目标）
+## 开发流程
 
-- 核心套件：`python3 tests/test_functional.py`（基础 IO/SQLite/并发）、`tests/test_rules.py`（ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀优先/沙盒/热重载）、`tests/test_modules.py`（热插拔）、`tests/test_rule_server.py`（内置+模块动态规则热更新、多语言 desc/argc 约束）、`tests/test_path_vars.py`（路径合成）、`tests/test_crash_log.py`（崩溃链路，不挂载 FUSE）。有失败时退出码为 1（注意勿用管道吞掉退出码）。
-- 特殊前置：`tests/test_ftp.py` 需本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写）；`tests/test_global_replace.py` 需 root（私有 mount namespace 内跑，无权限自动跳过）。压力类：`stress_fuse.py`、`test_ftp_stress.py`。
-- 前置：GNU 构建产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。产物路径可用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`BASIC_RULES_SO`、`GLOBAL_REPLACE_CTL`（默认均在 `build_gnu/`）。
-- 测试挂载 `/tmp/fuse_proxy_test/mnt` 与 `/tmp/fuse_rules_test/mnt`，规则写入 `/tmp/Namespace-Proxy/injector.conf`；失败残留的挂载点需 `fusermount3 -u` 清理后才能重跑。
+1. 先读对应文档：架构 `docs/architecture.md`、模块 `docs/modules.md`、配置语法 `docs/config.md`。
+2. 按归属写代码：纯 libc 无全局依赖的公共工具进 `src/core/nsp_util.c`（禁止各文件私刻副本）；依赖项目全局（`g_real_root`、日志）的进 `src/core/common.c`；新跨文件函数必须带域前缀（见 `docs/architecture.md` §7）。
+3. 同步测试：改了行为就地补用例，跑下方映射表全绿。
+4. 提交：仓库文档与提交信息均中文，Conventional Commits 前缀（`fix:`/`feat:`/`docs:`/`refactor:`/`perf:`）。
 
-## 架构与约定
+### 红线（破坏即回滚）
 
-- 多进程经 Unix Domain Socket 协作：`injector`（主控：epoll + inotify + zygote fork 检测）启动 `fuse_daemon`（`--mode=redirect --root=... --rules=<conf>`，约 27 个 FUSE 回调 + 模块调度）；`rule_server` 以 JSON 行协议动态增删/启停规则；`log_monitor` 收集日志、`log_ctl` 查询。injector 维护全局 + 媒体模块两棵 FUSE 树，共用同一二进制与配置。
-- **模块化**：fuse_daemon 是零规则功能的框架——规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）由 dlopen 的 `basic_rules.so` 提供（原 `vfs_core.c` 迁移）；存储后端（如 FTP）由 `ftp_module.so` 提供：模块**不实现 FUSE**，只提供 `backend_*` 操作方法；FTP 映射由 injector.conf 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`，写在 `[GLOBAL]`=全局生效、`[应用包名]`=仅该应用生效，与 REDIRECT 作用域一致），框架 vfs 回调经规则模块 resolve 命中 FTP 规则（`rr.is_ftp`）后调用模块方法完成读写。模块目录 `<CONFIG_DIR>/modules/<名>/<名>.so`，inotify 热插拔。详见 `docs/modules.md`。
-- 模块 ABI 契约：第三方模块源码**只依赖 `include/nsp_module.h`**，编译须带 `-DNSP_MODULE_BUILD`；日志等公共符号经 fuse_daemon 导出表解析（`b_lundef=false` + `--export-dynamic`）——修改公共符号签名会破坏已编译模块。详见 `docs/module-dev.md`。
-- 规则为 INI 格式：`[GLOBAL]` 段含 `MONITOR ON/OFF`（inotify 热重载开关）、`SANDBOX ON/OFF`；规则关键字 `REDIRECT <虚拟> <真实>`、`ALLOW`、`HIDE`、`RO`；应用段用 `[包名]` 或 `[包名:userid]`。`CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/common.h`），但测试显式传 `--rules=/tmp/Namespace-Proxy/injector.conf`。
-- 关键陷阱：配置中 REDIRECT 的虚拟前缀**不含 user_id**（如 `/云盘/`），测试经 `/0/云盘/...` 访问——FUSE 层剥离 `/0/` 后再匹配规则。修改路径匹配语义时勿破坏该约定。
-- 改动后必跑：`basic_rules` / `fuse_daemon.c` / `config_parser.c` → `tests/test_rules.py`；`src/modules/ftp/` 或框架后端分派 → `tests/test_ftp.py`；`src/config/path_vars.c` 路径合成逻辑 → `tests/test_path_vars.py`。
+- 不改 fuse_daemon 导出表公共符号签名——已编译模块靠 `b_lundef=false` + `--export-dynamic` 解析它们。
+- 不破坏"REDIRECT 虚拟前缀不含 user_id，FUSE 层剥离 `/0/` 后再匹配"约定。
+- 路径合成走 `common_*` 唯一出口（禁止裸拼，`MAX_PATH_LEN` 放不下返回 -1 而非截断）。
+- YAGNI——不留无调用者的预留实现。
 
-## 文档索引
+## 测试流程（纯 Python，无 C 测试目标）
 
-- 设计总览：`docs/architecture.md`；模块架构/开发：`docs/modules.md`、`docs/module-dev.md`；配置规范（含 App-rules 分文件）：`docs/ai-config-guide.md`；配置广播：`docs/config-broadcast.md`；路径变量：`docs/path-variables.md`；规则控制服务：`docs/rule-server-api.md`；log_ctl JSON API：`docs/log_ctl-api.md`；测试说明：`tests/README.md`。
+前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`BASIC_RULES_SO`、`GLOBAL_REPLACE_CTL`。
+
+按改动跑映射（全绿方可提交）：
+
+| 改动 | 测试 |
+|---|---|
+| `basic_rules` / `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀/沙盒/热重载） |
+| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（13，需 vsftpd） |
+| `src/config/path_vars.c` | `test_path_vars.py` |
+| `src/module/`（加载器/围栏/熔断） | `test_modules.py`（10，热插拔）、`test_module_circuit.py`（故障隔离） |
+| 通用回归 | `test_functional.py`（34，IO/SQLite/并发）、`test_rule_server.py`、`test_crash_log.py` |
+| 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
+
+特殊前置：`test_ftp.py` 需本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写）；`test_global_replace.py` 需 root（无权限自动跳过）。
+
+失败处理：退出码 1 为失败（勿用管道吞退出码）；残留挂载点（`/tmp/fuse_proxy_test/mnt`、`/tmp/fuse_rules_test/mnt`）用 `fusermount3 -u` 清理后重跑；测试规则文件在 `/tmp/Namespace-Proxy/injector.conf`。
+
+## 架构要点
+
+- **多进程 + UDS**：`injector`（主控：epoll + inotify + zygote fork 检测）启动 `fuse_daemon`（约 27 个 FUSE 回调 + 模块调度）；`rule_server` 以 JSON 行协议动态改规则；`log_monitor` 收日志、`log_ctl` 查询。injector 维护全局 + 媒体模块两棵 FUSE 树，共用同一二进制与配置。
+- **模块化**：fuse_daemon 是零规则功能的框架——规则能力由 dlopen 的 `basic_rules.so` 提供，存储后端（FTP）由 `ftp_module.so` 提供。模块**不实现 FUSE**，只提供 `backend_*` 方法；FTP 映射由 `FTP <虚拟前缀> <段名>` 规则决定，作用域随所在段（`[GLOBAL]` 全局 / `[包名]` 仅该应用）。模块目录 `<CONFIG_DIR>/modules/<名>/<名>.so`，inotify 热插拔。
+- **模块 ABI**：第三方模块只依赖 `include/nsp_module.h`，编译须带 `-DNSP_MODULE_BUILD`；日志等公共符号经导出表解析——改签名会破坏已编译模块。
+- **规则**：INI 格式，`[GLOBAL]` / `[包名]` / `[包名:userid]` / `[USER_APPS:uid]` / `[SYSTEM_APPS]` 段；关键字 `REDIRECT`/`ALLOW`/`HIDE`/`RO`/`SANDBOX`/`MONITOR`。`CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/common.h`）。
