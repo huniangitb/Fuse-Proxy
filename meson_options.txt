@@ -2,9 +2,19 @@
 option('enable_debug', type: 'boolean', value: false, description: 'Enable debug build')
 option('with_asan', type: 'boolean', value: false, description: 'Enable AddressSanitizer')
 option('with_ubsan', type: 'boolean', value: false, description: 'Enable UndefinedBehaviorSanitizer')
-option('fuse3_root', type: 'string', value: '/data/user/0/com.termux/files/home/build-install', description: 'Path to fuse3 static lib + headers root (android only)')
-option('curl_dir', type: 'string', value: '/home/bdy/curl-8.21.0', description: 'Path to prebuilt libcurl root (android only, 含 lib/.libs/libcurl.a 与 include/)')
+option('fuse3_root', type: 'string', value: '/data/user/0/com.termux/files/home/build-install', description: '预构建根（android only）：仅各 android_*=prebuilt 回退时使用（libfuse3.a/libjson-c.a 取自此处）；默认全子模块时用不到')
+option('android_libfuse', type: 'combo', choices: ['subproject', 'prebuilt'], value: 'subproject',
+       description: 'Android 下 libfuse 来源：subproject=项目内子模块随主项目交叉编译（默认）；prebuilt=经 fuse3_root 传入预构建静态库')
+option('android_json_c', type: 'combo', choices: ['subproject', 'prebuilt'], value: 'subproject',
+       description: 'Android 下 json-c 来源：subproject=项目内子模块经 cmake 随主项目交叉编译（默认）；prebuilt=经 fuse3_root 传入预构建静态库')
+option('curl_dir', type: 'string', value: '/home/bdy/curl-8.21.0', description: '预构建 libcurl 根（仅 android_curl=prebuilt 有效，含 lib/.libs/libcurl.a 与 include/）')
+option('android_curl', type: 'combo', choices: ['subproject', 'prebuilt'], value: 'subproject',
+       description: 'Android 下 libcurl 来源：subproject=项目内子模块经 cmake 随主项目交叉编译（默认）；prebuilt=经 curl_dir 传入预构建静态库')
 option('target_os', type: 'combo', choices: ['android', 'gnu'], value: 'android',
        description: 'Target OS: android=Android NDK with passthrough, gnu=GNU/Linux with mainline libfuse3')
+option('libfuse_source', type: 'combo', choices: ['auto', 'system', 'custom', 'subproject'], value: 'auto',
+       description: 'GNU 下 libfuse 来源：auto=系统库优先、缺失回退子模块；system=系统 pkg-config 主线库；custom=定制预构建（经 custom_libfuse_root 传入）；subproject=项目内子模块 subprojects/libfuse')
+option('custom_libfuse_root', type: 'string', value: '',
+       description: '定制 libfuse 预构建根（含 include/ 与 lib/，如 ~/libfuse-install），仅 GNU + libfuse_source=custom 有效')
 option('git_hash_override', type: 'string', value: '',
        description: '覆盖编译进二进制的 git 提交哈希（默认自动 git rev-parse，无 git 环境填 unknown；tarball 构建时可手动指定）')

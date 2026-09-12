@@ -58,21 +58,141 @@ add_project_arguments('-DNSP_PROJECT_VERSION="' + meson.project_version() + '"',
                       language: 'c')
 
 # ================= 依赖查找 =================
+# libfuse / json-c 按平台隔离，子模块随主项目一起编译（clone 后一键成功）：
+#   - android(subproject，默认)：子模块 subprojects/libfuse（master-Android，
+#     与 ~/libfuse 同源）NDK 交叉编译 + 子模块 subprojects/json-c（上游 0.19）
+#     经 cmake 交叉编译；compat/ 转接头将 <fuse3/...>/<json-c/...> 引用映射
+#     到各自平铺头文件布局；
+#   - android(prebuilt)：-Dandroid_libfuse=prebuilt / -Dandroid_json_c=prebuilt
+#     可分别切回 fuse3_root 预构建静态库；
+#   - gnu(system)：系统主线 libfuse3（pkg-config，如本机 3.18.3）；
+#   - gnu(custom)：~/libfuse 的 GNU 预构建（~/libfuse-install，3.19.0-rc0，
+#     与主线双位兼容：legacy bit31 + 上游 bit37，主线内核下可正常协商），
+#     由 -Dlibfuse_source=custom -Dcustom_libfuse_root=<根> 传入，静态链接；
+#   - gnu(subproject)：libfuse 用项目内子模块（同 android 子模块路径）；
+#   - gnu(auto，默认)：libfuse 系统库优先、缺失回退子模块；
+#   - gnu json-c：系统 pkg-config 优先、缺失回退 cmake 子模块（上游即标准，
+#     无 ABI 分叉，可直接回退）。
+# libcurl（ftp_module，8.21.0+）同样自动处理：gnu 系统优先缺失回退子模块；
+# android 默认 cmake 子模块（-Dandroid_curl=prebuilt 切回 -Dcurl_dir 预构建）。
+gnu_extra_deps = []
 if target_os == 'android'
   fuse3_root = get_option('fuse3_root')
-  fuse_inc = include_directories(fuse3_root + '/include')
-  fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
-
-  # json-c 静态库
-  json_c = cc.find_library('json-c', dirs: [fuse3_root + '/lib'], static: true, required: true)
+  android_fuse_sp = get_option('android_libfuse') != 'prebuilt'
+  android_json_sp = get_option('android_json_c') != 'prebuilt'
+  # NDK 根：从交叉编译器路径反推（<NDK>/toolchains/llvm/prebuilt/<host>/
+  # bin/<triple>-clang），供 cmake 子项目（json-c/curl）的 Android 平台检测，
+  # 不硬编码、与 cross 文件单源一致。
+  fs_mod = import('fs')
+  _ndk_bin = fs_mod.parent(cc.cmd_array()[0])
+  _ndk_root = _ndk_bin
+  foreach i : range(5)
+    _ndk_root = fs_mod.parent(_ndk_root)
+  endforeach
+  if android_json_sp
+    # Android + json-c 子模块：经 cmake 随主项目交叉编译（静态库、无 apps/
+    # tests、-Werror 关闭防 NDK 新警告炸构建；PUBLIC 头文件路径自动透传，
+    # <json-c/json.h> 经 compat/json-c 转接头解析）。
+    message('json-c: 使用项目内子模块 subprojects/json-c（cmake 交叉编译）')
+    json_cmake = import('cmake')
+    jsonc_sp = json_cmake.subproject('json-c',
+      cmake_options: ['-DBUILD_SHARED_LIBS=OFF', '-DBUILD_STATIC_LIBS=ON',
+                      '-DBUILD_APPS=OFF', '-DBUILD_TESTING=OFF',
+                      '-DDISABLE_WERROR=ON',
+                      '-DANDROID_NDK=' + _ndk_root],
+      required: true)
+    json_c = jsonc_sp.dependency('json-c')
+    json_c_inc = []
+  else
+    # json-c 静态库+头文件取自 fuse3_root 预构建
+    json_c = cc.find_library('json-c', dirs: [fuse3_root + '/lib'], static: true, required: true)
+    json_c_inc = include_directories(fuse3_root + '/include')
+    message('json-c: 使用预构建静态库 ' + fuse3_root)
+  endif
+  if not android_fuse_sp
+    fuse_inc = include_directories(fuse3_root + '/include')
+    fuse_lib = cc.find_library('fuse3', dirs: [fuse3_root + '/lib'], static: true, required: true)
+    compat_inc = []
+    message('libfuse3: 使用预构建静态库 ' + fuse3_root)
+  else
+    # Android + 子模块：随主项目一起 NDK 交叉编译（选项与
+    # ~/libfuse/build_android.sh 对齐：静态库、无 utils/examples/tests、
+    # 无 usdt/io-uring、无 mtab）。注意 both_libraries 无视 default_library，
+    # 其 libfuse_dep 默认链 shared——Android 设备无 libfuse3.so，必须显式取
+    # 静态库并重组依赖（用法需求经 declare_dependency 透传，与预构建一致）。
+    message('libfuse3: 使用项目内子模块 subprojects/libfuse（NDK 交叉编译）')
+    fuse3_sp = subproject('libfuse', required: true,
+      default_options: ['default_library=static', 'disable-mtab=true',
+        'utils=false', 'examples=false', 'tests=false', 'useroot=false',
+        'enable-usdt=false', 'enable-io-uring=false'])
+    fuse_lib = declare_dependency(
+      link_with: fuse3_sp.get_variable('libfuse').get_static_lib(),
+      include_directories: fuse3_sp.get_variable('include_dirs'),
+      dependencies: [dependency('threads'),
+                     cc.find_library('dl', required: false)])
+    fuse_inc = []
+    compat_inc = include_directories('compat')
+  endif
 else
-  # 主线 libfuse3: 使用 pkg-config 或系统库
-  fuse3_dep = dependency('fuse3', version: '>=3.6', required: true)
-  fuse_inc = []
-  fuse_lib = fuse3_dep
+  libfuse_source = get_option('libfuse_source')
+  if libfuse_source == 'custom'
+    # GNU + 定制库：头文件与静态库均取自预构建根（如 ~/libfuse-install）；
+    # 定制库启用 io-uring，静态链接需补 liburing（见其 fuse3.pc Requires.private）
+    custom_libfuse_root = get_option('custom_libfuse_root')
+    if custom_libfuse_root == ''
+      error('GNU + libfuse_source=custom 需要 -Dcustom_libfuse_root=<根>（如 ~/libfuse-install，含 include/ 与 lib/）')
+    endif
+    fuse_inc = include_directories(custom_libfuse_root + '/include')
+    fuse_lib = cc.find_library('fuse3', dirs: [custom_libfuse_root + '/lib'],
+                               static: true, required: true)
+    gnu_extra_deps = [dependency('liburing', required: true)]
+    compat_inc = []
+    message('libfuse3: 使用定制预构建 ' + custom_libfuse_root)
+  else
+    if libfuse_source == 'system'
+      fuse3_sys_dep = dependency('fuse3', version: '>=3.6', required: true)
+    else
+      # auto：系统库优先、缺失回退子模块；subproject：强制子模块（仍探测
+      # 系统库版本号用于日志，但不用它）
+      fuse3_sys_dep = dependency('fuse3', version: '>=3.6', required: false)
+    endif
+    if libfuse_source != 'subproject' and fuse3_sys_dep.found()
+      # GNU + 系统库：系统 pkg-config 主线 libfuse3
+      message('libfuse3: 使用系统 pkg-config')
+      fuse_inc = []
+      fuse_lib = fuse3_sys_dep
+      compat_inc = []
+    else
+      if libfuse_source == 'system'
+        error('未找到系统 libfuse3（pkg-config），请安装 libfuse3-dev，或改用 -Dlibfuse_source=auto/subproject/custom')
+      endif
+      # GNU + 子模块：随主项目一起编译（libfuse 自带的 utils/examples/tests
+      # 与主项目无关，一键构建时关闭，只取 libfuse_dep）
+      message('libfuse3: 使用项目内子模块 subprojects/libfuse')
+      fuse3_sp = subproject('libfuse', required: true,
+        default_options: ['utils=false', 'examples=false', 'tests=false'])
+      fuse_lib = fuse3_sp.get_variable('libfuse_dep')
+      fuse_inc = []
+      compat_inc = include_directories('compat')
+    endif
+  endif
 
-  # 系统 json-c
-  json_c = dependency('json-c', required: true)
+  # 系统 json-c 优先，缺失回退 cmake 子模块
+  json_c_sys = dependency('json-c', required: false)
+  if json_c_sys.found()
+    message('json-c: 使用系统 pkg-config')
+    json_c = json_c_sys
+  else
+    message('json-c: 使用项目内子模块 subprojects/json-c（cmake 编译）')
+    json_cmake = import('cmake')
+    jsonc_sp = json_cmake.subproject('json-c',
+      cmake_options: ['-DBUILD_SHARED_LIBS=OFF', '-DBUILD_STATIC_LIBS=ON',
+                      '-DBUILD_APPS=OFF', '-DBUILD_TESTING=OFF',
+                      '-DDISABLE_WERROR=ON'],
+      required: true)
+    json_c = jsonc_sp.dependency('json-c')
+    compat_inc = include_directories('compat')
+  endif
 endif
 
 # 自动探测 libiconv
@@ -84,7 +204,7 @@ project_deps = [
   fuse_lib,
   libiconv,
   json_c
-]
+] + gnu_extra_deps
 
 # ================= 编译标志 =================
 opt_flags = []
@@ -117,9 +237,24 @@ add_project_link_arguments(link_flags, language: 'c')
 # ================= 项目头文件路径 =================
 inc_dir = include_directories('include')
 if target_os == 'android'
-  all_inc_dirs = [fuse_inc, inc_dir]
+  if get_option('android_libfuse') == 'prebuilt'
+    all_inc_dirs = [fuse_inc, inc_dir]
+    if get_option('android_json_c') != 'prebuilt'
+      # libfuse 预构建 + json-c 子模块：compat/ 只为 <json-c/json.h> 转接头
+      all_inc_dirs += include_directories('compat')
+    endif
+  else
+    # Android + 子模块：预构建根（若启用）只提供 json-c 头文件，compat/
+    # 转接头将 <fuse3/...>/<json-c/...> 映射到子模块平铺头文件
+    all_inc_dirs = [json_c_inc, inc_dir, compat_inc]
+  endif
+elif get_option('libfuse_source') == 'custom'
+  # GNU + 定制库：定制头文件优先，保证 <fuse3/...> 解析到预构建根；
+  # json-c 回退子模块时追加 compat/ 转接头
+  all_inc_dirs = [fuse_inc, inc_dir, compat_inc]
 else
-  all_inc_dirs = inc_dir
+  # GNU + 系统库/子模块：子模块构建时追加 compat/ 转接头
+  all_inc_dirs = [inc_dir, compat_inc]
 endif
 
 # ================= 源码集合 =================
@@ -297,45 +432,74 @@ ftp_module_sources = [
     'src/modules/nsp_self_hash.c',
 ]
 
+# ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库，无 FUSE 实现）。
+# libcurl（8.21.0+）默认经子模块自动构建，无需手动指定：
+#   - gnu：系统 pkg-config（版本门槛 >=8.21.0）优先，缺失回退 cmake 子模块
+#    （pin curl-8_22_0，门槛天然满足）；
+#   - android(subproject，默认)：cmake 子模块随主项目交叉编译（静态库，
+#     仅 FTP+HTTP、无 SSL 及可选外部依赖，CURL::libcurl 别名透传头文件）；
+#   - android(prebuilt)：-Dandroid_curl=prebuilt 切回 -Dcurl_dir 预构建。
+# 最小构建集与 ftp 代码用法对齐（只用明文 FTP，CURLOPT_USE_SSL=CURLUSESSL_NONE；
+# 认证/代理/MIME/NETRC 保持默认，禁掉的均为未引用协议与特性——误禁会在
+# 编译期以 CURLE_NOT_BUILT_IN 相关符号缺失暴露，而非静默降级）。
+curl_cmake_opts = ['-DBUILD_SHARED_LIBS=OFF', '-DBUILD_STATIC_LIBS=ON',
+  '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
+  '-DBUILD_CURL_EXE=OFF', '-DBUILD_TESTING=OFF',
+  '-DCURL_DISABLE_INSTALL=ON',
+  '-DCURL_ENABLE_SSL=OFF',
+  '-DCURL_ZLIB=OFF', '-DCURL_BROTLI=OFF', '-DCURL_ZSTD=OFF',
+  '-DUSE_NGHTTP2=OFF', '-DUSE_LIBIDN2=OFF',
+  '-DCURL_USE_LIBPSL=OFF', '-DCURL_USE_LIBSSH2=OFF',
+  '-DCURL_DISABLE_DICT=ON', '-DCURL_DISABLE_FILE=ON',
+  '-DCURL_DISABLE_GOPHER=ON', '-DCURL_DISABLE_IMAP=ON',
+  '-DCURL_DISABLE_LDAP=ON', '-DCURL_DISABLE_MQTT=ON',
+  '-DCURL_DISABLE_POP3=ON', '-DCURL_DISABLE_RTSP=ON',
+  '-DCURL_DISABLE_SMTP=ON', '-DCURL_DISABLE_TELNET=ON',
+  '-DCURL_DISABLE_TFTP=ON', '-DCURL_DISABLE_WEBSOCKETS=ON',
+  '-DCURL_DISABLE_IPFS=ON', '-DCURL_DISABLE_DOH=ON',
+  '-DCURL_DISABLE_ALTSVC=ON', '-DCURL_DISABLE_HEADERS_API=ON',
+  '-DCURL_DISABLE_HSTS=ON']
+
 if target_os == 'gnu'
   ftp_curl_dep = dependency('libcurl', version: '>=8.21.0', required: false)
-  if not ftp_curl_dep.found()
-    cc = meson.get_compiler('c')
-    ftp_curl_dep = cc.find_library('curl', required: true)
-    # find_library 不校验版本：运行时检查 curl_version_info >= 8.21.0，
-    # 防止系统旧 curl 绕过主查找的版本门槛（编译失败或行为不符）
-    curl_ver_check = cc.run('''
-      #include <curl/curl.h>
-      #include <stdio.h>
-      int main(void) {
-        curl_version_info_data *v = curl_version_info(CURLVERSION_NOW);
-        int maj = 0, min = 0, pat = 0;
-        if (sscanf(v->version, "%d.%d.%d", &maj, &min, &pat) != 3) return 1;
-        if (maj > 8 || (maj == 8 && (min > 21 || (min == 21 && pat >= 0)))) return 0;
-        fprintf(stderr, "libcurl %s 过旧，需要 >= 8.21.0\\n", v->version);
-        return 1;
-      }
-    ''', dependencies: ftp_curl_dep)
-    if not curl_ver_check.compiled() or curl_ver_check.returncode() != 0
-      error('系统 libcurl 版本过旧，需要 >= 8.21.0（fallback find_library 未通过版本校验）')
-    endif
+  if ftp_curl_dep.found()
+    message('libcurl: 使用系统 pkg-config')
+  else
+    # GNU + curl 子模块：经 cmake 随主项目编译（静态库，见上；取实 target
+    # libcurl_static——cmake ALIAS 不在 meson target 列表，见构建验证）
+    message('libcurl: 使用项目内子模块 subprojects/curl（cmake 编译）')
+    curl_cmake = import('cmake')
+    curl_sp = curl_cmake.subproject('curl',
+      cmake_options: curl_cmake_opts, required: true)
+    ftp_curl_dep = curl_sp.dependency('libcurl_static')
   endif
   ftp_curl_inc = []
 else
-  curl_root = get_option('curl_dir')
-  if curl_root == ''
-    error('Android 构建需要预构建 libcurl，请用 -Dcurl_dir=<根目录> 指定（含 lib/.libs/libcurl.a 与 include/）')
-  endif
-  curl_a_dir = curl_root + '/lib/.libs'
-  curl_inc_dir = curl_root + '/include'
-  ftp_curl_dep = meson.get_compiler('c').find_library('curl',
-    dirs: [curl_a_dir], required: true, static: true)
-  ftp_curl_inc = include_directories(curl_inc_dir)
-  # 编译期校验：确认预构建 libcurl 头文件含代码使用的新 API
-  # （CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，curl >= 7.55.0），防止误用旧库
-  if not meson.get_compiler('c').has_header_symbol('curl/curl.h',
-      'CURLINFO_CONTENT_LENGTH_DOWNLOAD_T', include_directories: ftp_curl_inc)
-    error('预构建 libcurl（' + curl_root + '）头文件缺少 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，请确认使用 curl >= 8.21.0')
+  if get_option('android_curl') == 'prebuilt'
+    curl_root = get_option('curl_dir')
+    if curl_root == ''
+      error('android_curl=prebuilt 需要 -Dcurl_dir=<根目录>（含 lib/.libs/libcurl.a 与 include/，如 ~/curl-8.21.0）')
+    endif
+    curl_a_dir = curl_root + '/lib/.libs'
+    curl_inc_dir = curl_root + '/include'
+    ftp_curl_dep = meson.get_compiler('c').find_library('curl',
+      dirs: [curl_a_dir], required: true, static: true)
+    ftp_curl_inc = include_directories(curl_inc_dir)
+    # 编译期校验：确认预构建 libcurl 头文件含代码使用的新 API
+    # （CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，curl >= 7.55.0），防止误用旧库
+    if not meson.get_compiler('c').has_header_symbol('curl/curl.h',
+        'CURLINFO_CONTENT_LENGTH_DOWNLOAD_T', include_directories: ftp_curl_inc)
+      error('预构建 libcurl（' + curl_root + '）头文件缺少 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，请确认使用 curl >= 8.21.0')
+    endif
+    message('libcurl: 使用预构建静态库 ' + curl_root)
+  else
+    message('libcurl: 使用项目内子模块 subprojects/curl（cmake 交叉编译）')
+    curl_cmake = import('cmake')
+    curl_sp = curl_cmake.subproject('curl',
+      cmake_options: curl_cmake_opts + ['-DANDROID_NDK=' + _ndk_root],
+      required: true)
+    ftp_curl_dep = curl_sp.dependency('libcurl_static')
+    ftp_curl_inc = []
   endif
 endif
 
@@ -355,7 +519,7 @@ install_data('src/modules/ftp/ftp_module.rules',
 )
 
 # ================= 测试 =================
-# 测试流程由 Python 脚本完成（tests/ 目录），详见 tests/README.md
+# 测试流程由 Python 脚本完成（tests/ 目录），详见 AGENTS.md“测试流程”
 message('========================================')
 message('构建配置信息:')
 message('  目标平台: ' + target_os)
