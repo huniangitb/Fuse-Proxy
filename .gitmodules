@@ -1,0 +1,12 @@
+[submodule "subprojects/libfuse"]
+	path = subprojects/libfuse
+	url = https://github.com/huniangitb/libfuse
+	branch = master-Android
+[submodule "json-c"]
+	path = subprojects/json-c
+	url = https://github.com/json-c/json-c.git
+	branch = master
+[submodule "curl"]
+	path = subprojects/curl
+	url = https://github.com/curl/curl.git
+	branch = master
