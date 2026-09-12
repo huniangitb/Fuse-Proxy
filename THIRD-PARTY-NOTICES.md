@@ -33,6 +33,15 @@ Fuse-Proxy 本体以 GPL-3.0-or-later 发布（见 `LICENSE`），并对模块 A
 - 许可证：**curl 许可证**（MIT/X 衍生）
 - 完整文本：`subprojects/curl/COPYING`
 
+## zygisk.hpp
+
+- 用途：Zygisk 模块 ABI 头，`src/zygisk/zygisk_module.cpp` 编译所需
+- 来源：`src/zygisk/zygisk.hpp`，取自 Magisk（https://github.com/topjohnwu/Magisk）
+- 版权：Copyright 2022-2023 John "topjohnwu" Wu
+- 许可证：**ISC**（许可证全文见该文件头部注释）
+- 说明：原样收录、未作任何修改——该头文件是与 Zygisk 框架的 ABI 契约
+  （`ZYGISK_API_VERSION 4`），其自身注释亦明确要求不得修改
+
 ## 获取源码
 
 完整源码（含上述子模块的引用版本）：

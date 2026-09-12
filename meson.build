@@ -524,6 +524,13 @@ install_data('src/modules/ftp/ftp_module.rules',
   install_dir: install_bin_dir + '/modules/ftp_module'
 )
 
+# ================= Zygisk 应用创建通知模块（仅 Android，双 ABI） =================
+# 新应用经 preAppSpecialize → companion → nsp_ipc_socket 通知 injector，
+# injector 收到后转入被动模式停止周期扫描（src/injector/ipc_server.c）。
+if target_os == 'android'
+  subdir('src/zygisk')
+endif
+
 # ================= 测试 =================
 # 测试流程由 Python 脚本完成（tests/ 目录），详见 AGENTS.md“测试流程”
 message('========================================')
