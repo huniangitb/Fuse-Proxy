@@ -6,3 +6,5 @@ option('fuse3_root', type: 'string', value: '/data/user/0/com.termux/files/home/
 option('curl_dir', type: 'string', value: '/home/bdy/curl-8.21.0', description: 'Path to prebuilt libcurl root (android only, 含 lib/.libs/libcurl.a 与 include/)')
 option('target_os', type: 'combo', choices: ['android', 'gnu'], value: 'android',
        description: 'Target OS: android=Android NDK with passthrough, gnu=GNU/Linux with mainline libfuse3')
+option('git_hash_override', type: 'string', value: '',
+       description: '覆盖编译进二进制的 git 提交哈希（默认自动 git rev-parse，无 git 环境填 unknown；tarball 构建时可手动指定）')

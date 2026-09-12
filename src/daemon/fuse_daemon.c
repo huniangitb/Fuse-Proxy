@@ -34,7 +34,6 @@
 #include <ctype.h>
 #include "common.h"
 #include "nsp_comm.h"
-#include "build_info.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
 #include "module_guard.h"
@@ -2048,8 +2047,7 @@ int main(int argc, char *argv[]) {
     fuse_argv[fuse_argc] = nullptr; 
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
-    /* 构建水印 + 设备环境进 sys.log（崩溃包归因用，失败不阻断启动） */
-    nsp_log_build_info("fuse_daemon");
+    /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
     /* 崩溃处理器安装顺序（关键）：先装 crash_handler（内层/dump+re-raise），
        再装 fault_fence 处理器（外层/活动处理器）——后安装者生效。fence 在
        模块调用窗口内崩溃时 siglongjmp 恢复（daemon 存活，模块置毒卸载）；

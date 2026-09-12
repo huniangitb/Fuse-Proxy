@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "crash_dump.h"
+#include "build_info.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,6 +156,10 @@ void crash_handler(int sig, siginfo_t *info, void *ctx) {
     int err_fd = open(ERROR_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
     if (err_fd >= 0) {
         safe_printf(err_fd, "FUSE Daemon Crashed - Signal: %d - %s\n", sig, sig_name);
+        /* 构建水印进 error.log：线下包直接对应提交，无需翻 sys.log */
+        safe_printf(err_fd, "Build: git=%s version=%s mode=%s built=%s %s\n",
+                    NSP_GIT_HASH, NSP_PROJECT_VERSION, NSP_BUILD_MODE,
+                    __DATE__, __TIME__);
         close(err_fd);
     }
     int out_fd = STDERR_FILENO;
@@ -166,6 +171,10 @@ void crash_handler(int sig, siginfo_t *info, void *ctx) {
     safe_printf(out_fd, "FUSE DAEMON CRASH - PID: %d\n", getpid());
 #endif
     safe_printf(out_fd, "Signal: %d - %s\n", sig, sig_name);
+    /* 构建水印进 fuse_crash.log：addr2line 必须对应同提交 unstripped 符号包 */
+    safe_printf(out_fd, "Build: git=%s version=%s mode=%s built=%s %s\n",
+                NSP_GIT_HASH, NSP_PROJECT_VERSION, NSP_BUILD_MODE,
+                __DATE__, __TIME__);
     if (sig == SIGSEGV || sig == SIGBUS) {
         safe_printf(out_fd, "Fault address: %p\n", info->si_addr);
         if (sig == SIGSEGV) {
