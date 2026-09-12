@@ -34,6 +34,7 @@
 #include <ctype.h>
 #include "common.h"
 #include "nsp_comm.h"
+#include "build_info.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
 #include "module_guard.h"
@@ -76,7 +77,8 @@ static bool g_pt_probe_pending = false;  /* GNU：init 无会话 fd，探测推�
 static int passthrough_enable_fixed_method(int fd);  /* 实现见文件后部 */
 static bool g_is_media_fuse = false; /* --media-fuse: 媒体模块专属 FUSE */
 static char g_modules_dir_arg[PATH_MAX] = {0}; /* --modules-dir: 热插拔模块目录覆盖 */
-static int g_fuse_threads = -1;                 /* --fuse-threads: FUSE worker 线程数（-1=libfuse 默认 10） */
+static int g_fuse_threads = 2;                  /* --fuse-threads: FUSE worker 线程数上限
+                                                   （默认 2=双线程；0/-s=单线程；-1=libfuse 默认 10） */
 
 #define MAX_PENDING_CLOSE 64
 #define PENDING_CLOSE_MASK (MAX_PENDING_CLOSE - 1)
@@ -584,6 +586,11 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             free(entries);
             VFS_RETURN(n);
         }
+        if (n > 512) {
+            module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
+            free(entries);
+            VFS_RETURN(-EIO);
+        }
         /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致） */
         struct stat dirst; memset(&dirst, 0, sizeof dirst);
         dirst.st_mode = S_IFDIR | 0755;
@@ -739,6 +746,9 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_
             have_parent = (lstat(root_path, &parent_st) == 0);
         }
         int vn = module_dispatch_readdir(&vq, sub_path, path_user_id, current_pkg, is_root, virt, MAX_MODULES * 8);
+        /* 纵深防御：dispatch 已钳制，但仍钳制 vn 防栈越界读 */
+        if (vn < 0) vn = 0;
+        if (vn > MAX_MODULES * 8) vn = MAX_MODULES * 8;
         for (int vi = 0; vi < vn; vi++) {
             if (virt[vi].name[0] == '\0') continue;
             if (vfs_hash_insert(&ht, virt[vi].name)) {
@@ -1210,6 +1220,7 @@ static int vfs_opendir(const char *path, struct fuse_file_info *fi) {
        本地 real_path 不存在，不可 opendir） */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
+        module_backend_put(bops);
         fi->fh = 0;
         VFS_RETURN(0);
     }
@@ -1440,10 +1451,22 @@ static int vfs_rename(const char *from, const char *to, unsigned int flags) {
     bool bt_hit = (ok2 && r2.is_ftp && module_backend_lookup(sub_to, &bt_ops) == 0);
     if (bf_hit || bt_hit) {
         if (bf_hit && bt_hit && bf_ops == bt_ops && bf_ops->backend_rename) {
-            int brc = bf_ops->backend_rename(sub_from, sub_to);
+            int bslot = module_ops_slot(bf_ops);
+            int brc = nsp_fence_backend_rename(bslot, "backend_rename",
+                                              bf_ops->backend_rename, sub_from, sub_to);
             module_backend_put(bf_ops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_rename", sub_from);
+                return -EIO;
+            }
+            if (brc == NSP_FENCE_BADFN) return -EXDEV;
+            if (brc < 0) {
+                module_guard_error(bslot, "backend_rename", brc, sub_from, "rename 返回异常");
+            }
             return brc < 0 ? brc : 0;
         }
+        if (bf_hit) module_backend_put(bf_ops);
+        if (bt_hit && bt_ops != bf_ops) module_backend_put(bt_ops);
         return -EXDEV;   /* 跨后端/后端↔本地重命名不支持 */
     }
 #ifdef SYS_renameat2
@@ -2004,9 +2027,10 @@ int main(int argc, char *argv[]) {
             /* 解析并应用禁用沙盒指令 */
             g_disable_sandbox = true;
         } else if (strncmp(argv[i], "--fuse-threads=", 15) == 0) {
-            /* FUSE 多线程 worker 数（libfuse fuse_session_loop_mt）。
-               默认 -1 = libfuse 默认（10）；显式 0/负值 = 单线程（-s 语义，
-               fuse_new 内 clamp）。注入器按宿主 CPU 核数下发调优。 */
+            /* FUSE 多线程 worker 数上限（libfuse fuse_session_loop_mt）。
+               缺省 2=双线程；显式 0（或 -s）= 单线程 fuse_loop；
+               -1=libfuse 默认（10，兼容旧语义）；小于 -1 钳制为 -1。
+               注入器可按宿主 CPU 核数经 fuse_extra_args 下发调优。 */
             g_fuse_threads = atoi(argv[i] + 15);
             if (g_fuse_threads < -1) g_fuse_threads = -1;
         } else if (strcmp(argv[i], "debug") == 0 || strcmp(argv[i], "--debug") == 0) { 
@@ -2024,6 +2048,8 @@ int main(int argc, char *argv[]) {
     fuse_argv[fuse_argc] = nullptr; 
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
+    /* 构建水印 + 设备环境进 sys.log（崩溃包归因用，失败不阻断启动） */
+    nsp_log_build_info("fuse_daemon");
     /* 崩溃处理器安装顺序（关键）：先装 crash_handler（内层/dump+re-raise），
        再装 fault_fence 处理器（外层/活动处理器）——后安装者生效。fence 在
        模块调用窗口内崩溃时 siglongjmp 恢复（daemon 存活，模块置毒卸载）；
@@ -2080,7 +2106,7 @@ int main(int argc, char *argv[]) {
 #endif
     /* Phase 3：显式 FUSE 会话，复刻 libfuse fuse_main_real_versioned
        （3.18）的完整 7 步序列，仅将最后一步的 worker 线程数变为可控
-       （--fuse-threads=N；-1 = libfuse 默认 10；0/负值 = 单线程 -s 语义）。
+       （--fuse-threads=N；缺省 2=双线程；0/-s = 单线程；-1 = libfuse 默认 10）。
        注意 fuse_new 本身**不做** cmdline 解析/挂载/信号注册——这些是
        fuse_main 的独立步骤，缺了 fuse_session_new 会把 -f/挂载点当
        unknown option 拒绝。
@@ -2117,10 +2143,18 @@ int main(int argc, char *argv[]) {
                longjmp 恢复链路失效。SIGINT/SIGTERM 仍归 libfuse。 */
             fault_fence_rearm();
             LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint,
-                (fopts.singlethread || g_fuse_threads <= 0) ? "单线程" :
-                (g_fuse_threads == -1 ? "libfuse 默认(10)" : "自定义"));
-            if (fopts.singlethread || g_fuse_threads <= 0) {
-                fmain_rc = fuse_loop(f);   /* 单线程（-s / --fuse-threads=0） */
+                (fopts.singlethread || g_fuse_threads == 0) ? "单线程" :
+                (g_fuse_threads == -1 ? "libfuse 默认(10)" :
+                 g_fuse_threads == 2 ? "双线程(2)" : "自定义"));
+            if (fopts.singlethread || g_fuse_threads == 0) {
+                /* 单线程（-s / --fuse-threads=0）：刻意沿用旧 fuse_loop 语义
+                   （调用线程服务请求）。libfuse 3.19 起将其标记 deprecated
+                   并改变语义（worker 代服），但升 FUSE_USE_VERSION 到 319
+                   会断 GNU 系统库（3.18.3）兼容，故此处压警告保留旧行为。 */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                fmain_rc = fuse_loop(f);
+#pragma GCC diagnostic pop
             } else {
                 lcfg = fuse_loop_cfg_create();   /* 默认: max_threads=10, idle=无上限 */
                 if (!lcfg) {

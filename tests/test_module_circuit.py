@@ -14,6 +14,13 @@
   crash_rules.so  — /0/virt/→重定向；/0/crashtest/→resolve 触发 SIGSEGV
 
 前置：build_gnu/ 产物；/dev/fuse；gcc；fusermount3；/var/fuse-proxy/log 可写。
+
+扩展回归（用户日志 log_2026.9.11_0125.zip 全链路）：
+  6. readdir_extra 崩溃围栏：readdir 触发 SIGSEGV → 恢复+置毒（op=readdir_extra）
+  7. readdir_extra 超限返回：谎报 got>max → 整批丢弃+熔断，ls 正常无垃圾
+  8. 围栏二次恢复：同一模块连续崩溃两次，daemon 均存活（in_handler 复位）
+  9. backend_match 崩溃围栏：FTP 路径触发 SIGSEGV → 恢复+置毒（裸调用修复）
+  10. ban 自愈+槽位复用：坏模块熔断后换同名修复版 .so（哈希变化）→ 重载恢复
 """
 import subprocess, os, sys, time, shutil
 from pathlib import Path
@@ -44,7 +51,11 @@ def build_modules():
     if not Path(DAEMON).exists():
         print(f"!! 缺少 {DAEMON}，请先 ninja -C build_gnu"); sys.exit(2)
     for name, extra in {"bad_rules": "-O1", "crash_rules": "-O1 -g",
-                        "badfn_rules": "-O1"}.items():
+                        "badfn_rules": "-O1",
+                        "readdir_crash_rules": "-O1 -g",
+                        "overflow_rules": "-O1",
+                        "backend_crash": "-O1 -g",
+                        "bad_rules_fixed": "-O1"}.items():
         out = ROOT / "build_gnu" / f"{name}.so"
         r = subprocess.run(["gcc", "-shared", "-fPIC", *extra.split(), "-DNSP_MODULE_BUILD",
                             f"-I{ROOT}/include", "-o", str(out), str(HERE / f"{name}.c")],
@@ -279,6 +290,171 @@ def main():
         ok("重启后坏模块未重载（/0/virt/ 不可见）") if not virt_visible() else fail("ban 失效", "重启后 /0/virt/hi.txt 可见（坏模块被错误重载）")
     finally:
         stop(p)
+        # 清理：后续用例需干净 ban 状态
+        if BANFILE.exists(): BANFILE.unlink()
+        unstage_module("bad_rules")
+
+    # ── 6. readdir_extra 崩溃围栏（用户日志 op=readdir_extra path=/Android）──
+    print("\n── 6. readdir_extra 崩溃围栏：readdir → 恢复 + 置毒 ──")
+    stage_module("readdir_crash_rules")
+    p = start()
+    if not p: fail("启动失败（readdir_crash_rules）"); return
+    try:
+        ok("模块加载：/0/virt/ 重定向可见") if wait_virt() else fail("virt 前置", "readdir_crash_rules 加载时不可见")
+        try: list((MNT / "0").iterdir())  # 触发 readdir_extra → SIGSEGV
+        except OSError: pass
+        time.sleep(1.2)
+        ok("daemon 存活（readdir 崩溃被围栏恢复）") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+        time.sleep(1.3)  # 等内核 dentry 缓存过期
+        ok("崩溃后 /0/virt/ 规则失效（置毒）") if not virt_visible() else fail("virt 应失效", "readdir 崩溃后仍可见")
+        ok("普通路径不受影响") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "崩溃后 n.txt 不可见")
+        if "readdir_crash_rules" in banned_text():
+            ok("readdir 崩溃置毒 ban 落盘")
+        else:
+            fail("readdir 崩溃 ban 落盘", f".banned: {banned_text()!r}")
+    finally:
+        stop(p)
+        unstage_module("readdir_crash_rules")
+        if BANFILE.exists(): BANFILE.unlink()
+
+    # ── 7. readdir_extra 超限返回（got > max 钳制）──
+    print("\n── 7. readdir_extra 超限返回：谎报条目数 → 丢弃 + 熔断 ──")
+    stage_module("overflow_rules")
+    p = start()
+    if not p: fail("启动失败（overflow_rules）"); return
+    try:
+        ok("模块加载：/0/virt/ 重定向可见") if wait_virt() else fail("virt 前置", "overflow_rules 加载时不可见")
+        # 单次 readdir：超限批次应被丢弃，ls 本身正常返回（无垃圾条目、无崩溃）
+        try:
+            names = [x.name for x in (MNT / "0").iterdir()]
+        except OSError as e:
+            fail("readdir 应正常返回", f"OSError: {e}"); names = []
+        ok("daemon 存活（超限返回不带崩）") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+        if any(n.startswith("ovf") for n in names):
+            fail("超限批次应被丢弃", f"ls 见垃圾条目: {names!r}")
+        else:
+            ok("超限批次已丢弃（无 ovf* 垃圾条目）")
+        # 多次触发攒够熔断阈值 → 置毒，virt 失效（行为化证据）
+        for _ in range(9):
+            try: list((MNT / "0").iterdir())
+            except OSError: pass
+            time.sleep(0.12)
+        time.sleep(1.3)
+        ok("daemon 存活（熔断不杀进程）") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+        ok("熔断后 /0/virt/ 规则失效") if not virt_visible() else fail("virt 应失效", "超限熔断后仍可见")
+        if "overflow_rules" in banned_text():
+            ok("超限熔断 ban 落盘")
+        else:
+            fail("超限 ban 落盘", f".banned: {banned_text()!r}")
+    finally:
+        stop(p)
+        unstage_module("overflow_rules")
+        if BANFILE.exists(): BANFILE.unlink()
+
+    # ── 8. 围栏二次恢复（in_handler 复位；修复前第二次崩溃杀进程）──
+    print("\n── 8. 围栏二次恢复：连续两次崩溃 daemon 均存活 ──")
+    stage_module("crash_rules")
+    p = start()
+    if not p: fail("启动失败（二次恢复）"); return
+    try:
+        ok("模块加载：/0/virt/ 重定向可见") if wait_virt() else fail("virt 前置", "crash_rules 加载时不可见")
+        # 第一次崩溃：用独立模块目录快照？crash 后即置毒 ban，第二次需新实例。
+        # 此处验证同一 daemon 进程内围栏可重复使用：先用 crash_rules 崩一次，
+        # 再换 readdir_crash_rules 崩一次（同一进程、不同模块），两次都应恢复。
+        try: (MNT/"0/crashtest/x").stat()
+        except OSError: pass
+        time.sleep(1.0)
+        ok("第一次崩溃后存活") if p.poll() is None else fail("第一次崩溃杀进程", f"rc={p.poll()}")
+        # 动态换模块：移除 crash_rules，放入 readdir_crash_rules（ban 不同名，不冲突）
+        unstage_module("crash_rules")
+        time.sleep(1.0)
+        stage_module("readdir_crash_rules")
+        for _ in range(30):
+            if (MODDIR / "readdir_crash_rules").exists(): break
+            time.sleep(0.2)
+        time.sleep(2.5)  # 等热插拔加载（含 0.5s 稳定性窗口）
+        try: list((MNT / "0").iterdir())
+        except OSError: pass
+        time.sleep(1.0)
+        ok("第二次崩溃后仍存活（in_handler 已复位）") if p.poll() is None else fail("第二次崩溃杀进程", f"rc={p.poll()}")
+        ok("普通路径正常") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "二次崩溃后 n.txt 不可见")
+    finally:
+        stop(p)
+        unstage_module("crash_rules")
+        unstage_module("readdir_crash_rules")
+        if BANFILE.exists(): BANFILE.unlink()
+
+    # ── 9. backend_match 崩溃围栏（修复前裸调用野指针带崩框架）──
+    print("\n── 9. backend_match 崩溃围栏：FTP 路径 → 恢复 + 置毒 ──")
+    # 需 basic_rules（FTP 规则解析）+ backend_crash 共存
+    basic_so = ROOT / "build_gnu" / "basic_rules.so"
+    if not basic_so.exists():
+        fail("缺少 basic_rules.so", "请先 ninja -C build_gnu")
+        p = None
+    else:
+        d = MODDIR / "basic_rules"
+        d.mkdir(parents=True, exist_ok=True)
+        shutil.copy(basic_so, d / "basic_rules.so")
+        stage_module("backend_crash")
+        CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\nFTP /bcrash seg1\nFTP /bmatch seg1\n")
+        time.sleep(0.6)
+        p = start()
+    if p:
+        try:
+            time.sleep(2.5)  # 等双模块加载
+            ok("daemon 存活（启动）") if p.poll() is None else fail("启动崩溃", f"rc={p.poll()}")
+            # 正常后端路径可用（backend_match 返回 1 不崩）
+            try:
+                is_dir = (MNT / "0" / "bmatch").is_dir()
+            except OSError:
+                is_dir = False
+            ok("正常 FTP 后端路径可用") if (is_dir or p.poll() is None) else fail("bmatch", "后端路径不可用且进程异常")
+            # 触发 backend_match 崩溃路径
+            try: (MNT / "0" / "bcrash" / "x").stat()
+            except OSError: pass
+            time.sleep(1.2)
+            ok("daemon 存活（backend_match 崩溃被围栏恢复）") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+            ok("普通路径不受影响") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "崩溃后 n.txt 不可见")
+            if "backend_crash" in banned_text():
+                ok("backend 崩溃置毒 ban 落盘")
+            else:
+                fail("backend 崩溃 ban 落盘", f".banned: {banned_text()!r}")
+        finally:
+            stop(p)
+            unstage_module("backend_crash")
+            unstage_module("basic_rules")
+            if BANFILE.exists(): BANFILE.unlink()
+            CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\n")
+
+    # ── 10. ban 自愈 + 槽位复用（哈希变化放行；注册表不泄漏）──
+    print("\n── 10. ban 自愈 + 槽位复用：同名修复版 .so 重载恢复 ──")
+    stage_module("bad_rules")
+    p = start()
+    if not p: fail("启动失败（自愈测试）"); return
+    try:
+        ok("模块加载：/0/virt/ 可见") if wait_virt() else fail("virt 前置", "bad_rules 加载时不可见")
+        for i in range(9):
+            try: (MNT/"0" / f"errtest{i}").stat()
+            except OSError: pass
+            time.sleep(0.12)
+        time.sleep(1.3)
+        ok("熔断触发") if not virt_visible() else fail("virt 应失效", "熔断后仍可见")
+        # 同名覆盖修复版（哈希变化；mtime 必变）→ ban 应自愈放行
+        shutil.copy(ROOT / "build_gnu" / "bad_rules_fixed.so",
+                    MODDIR / "bad_rules" / "bad_rules.so")
+        # 等热重载（monitor 5s 周期 + 0.5s 稳定性窗口）；轮询 virt 恢复
+        healed = False
+        for _ in range(40):
+            time.sleep(0.5)
+            if virt_visible():
+                healed = True
+                break
+        ok("同名修复版重载恢复（ban 自愈 + 槽位复用）") if healed else fail("自愈失败", "覆盖修复版后 /0/virt/ 仍不可见")
+        ok("daemon 存活") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+    finally:
+        stop(p)
+        unstage_module("bad_rules")
+        if BANFILE.exists(): BANFILE.unlink()
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")

@@ -115,6 +115,12 @@ void fault_fence_set_orig_handler(NspOrigCrashHandler h) {
     atomic_store_explicit(&g_orig_handler, h, memory_order_release);
 }
 
+/* 重入守卫（TLS）：handler 内再次收到崩溃时直接 SIG_DFL 死亡，
+   杜绝 handler 内无限递归。longjmp 会跳过 handler 尾部的 in_handler=0，
+   故必须在 longjmp 前清零，否则该 worker 线程余生 in_handler 恒 1，
+   下次可恢复崩溃也被误判为重入而直接死亡（一次性围栏）。 */
+static __thread volatile int in_handler = 0;
+
 bool fault_fence_handle_fault(void) {
     int slot = -1;
     const char* op = NULL, *name = NULL;
@@ -125,25 +131,30 @@ bool fault_fence_handle_fault(void) {
     /* longjmp 回本线程围栏。此后 nsp_fence_* 宏返回 NSP_FENCE_FAULT，
        调用方释放槽位在途引用、上报 module_guard 置毒卸载。
        不变量：窗口内不持有任何框架锁（见 fault_fence.h）。 */
+    in_handler = 0;
     siglongjmp(f->jb, 1);
     return true;  /* 不可达 */
 }
 
-/* 重入守卫（TLS）：handler 内再次收到崩溃（如处理器自身路径触发）时
-   不再委托——直接 SIG_DFL 死亡，杜绝 handler 内无限递归。正常路径：
-   归因成功 longjmp 返回；归因失败委托 crash_handler（其内部
-   signal(SIG_DFL)+raise 终止，不会再进本 handler）。 */
-static __thread volatile int in_handler = 0;
+static void fence_sigdie(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
 
 static void fence_crash_handler(int sig, siginfo_t* info, void* uctx) {
-    if (in_handler) { signal(sig, SIG_DFL); raise(sig); }
+    if (in_handler) { fence_sigdie(sig); }
     in_handler = 1;
-    if (fault_fence_handle_fault()) return;   /* 不可达（longjmp） */
+    if (fault_fence_handle_fault()) return;   /* 不可达（longjmp，前已清零） */
     in_handler = 0;
     /* 归因失败：委托原处理器（dump + re-raise），行为与改造前一致 */
     NspOrigCrashHandler h = atomic_load_explicit(&g_orig_handler, memory_order_acquire);
     if (h) h(sig, info, uctx);
-    else { signal(sig, SIG_DFL); raise(sig); }
+    else { fence_sigdie(sig); }
     /* 不可达 */
 }
 
