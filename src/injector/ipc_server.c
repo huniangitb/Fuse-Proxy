@@ -38,7 +38,8 @@ static void handle_list_modules(int client_fd) {
                    （snprintf 返回应写长度，255 字符模块名单行最长 263 字节） */
                 int n = snprintf(nullptr, 0, "MODULE|%s\n", de->d_name);
                 if (n <= 0 || n >= (int)sizeof(reply) - offset) break;
-                int w = snprintf(reply + offset, (size_t)((int)sizeof(reply) - offset), "MODULE|%s\n", de->d_name);
+                int w = snprintf(reply + offset, (size_t)((int)sizeof(reply) - offset),
+                                 "MODULE|%s\n", de->d_name);
                 if (w > 0) offset += w;
             }
         }
@@ -48,7 +49,7 @@ static void handle_list_modules(int client_fd) {
         int n = snprintf(reply + offset, sizeof(reply) - (size_t)offset, "END\n");
         if (n > 0) offset += n;
     } else {
-        offset = (int)sizeof(reply) - 1;   /* 钳制，杜绝 size 回绕越界写 */
+        offset = (int)sizeof(reply) - 1; /* 钳制，杜绝 size 回绕越界写 */
         reply[offset] = '\0';
     }
     send(client_fd, reply, offset, MSG_NOSIGNAL);
@@ -85,12 +86,11 @@ static void* ipc_restore_thread(void* raw) {
         }
         attempts++;
         ret = perform_app_restore(arg->pkg, arg->pid, arg->uid);
-        if (ret != 1) break;   /* 0=成功 或 -1=失败：结束重试 */
+        if (ret != 1) break; /* 0=成功 或 -1=失败：结束重试 */
         clock_gettime(CLOCK_MONOTONIC, &tn);
-        long elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000 +
-                          (tn.tv_nsec - t0.tv_nsec) / 1000000;
-        if (elapsed_ms >= 300) break;   /* 总预算 300ms 耗尽 */
-        usleep(10000);   /* 10ms 间隔，配合 300ms 总预算 */
+        long elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000 + (tn.tv_nsec - t0.tv_nsec) / 1000000;
+        if (elapsed_ms >= 300) break; /* 总预算 300ms 耗尽 */
+        usleep(10000);                /* 10ms 间隔，配合 300ms 总预算 */
     }
     log_batch_end();
     /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用；
@@ -101,16 +101,15 @@ static void* ipc_restore_thread(void* raw) {
     }
     /* 单条汇总日志：一次还原周期仅输出一条（派发→重试→完成合并） */
     clock_gettime(CLOCK_MONOTONIC, &tn);
-    long total_ms = (tn.tv_sec - t0.tv_sec) * 1000 +
-                    (tn.tv_nsec - t0.tv_nsec) / 1000000;
+    long total_ms = (tn.tv_sec - t0.tv_sec) * 1000 + (tn.tv_nsec - t0.tv_nsec) / 1000000;
     if (ret == 0) {
         LOG("IPC还原: %s(PID:%d) 成功 (尝试%d次, %ldms)", arg->pkg, arg->pid, attempts, total_ms);
     } else if (ret == 1) {
-        LOG_WRN("IPC还原异常: %s(PID:%d) %ldms内仍非项目 FUSE 视图 (尝试%d次)",
-                arg->pkg, arg->pid, total_ms, attempts);
+        LOG_WRN("IPC还原异常: %s(PID:%d) %ldms内仍非项目 FUSE 视图 (尝试%d次)", arg->pkg, arg->pid,
+                total_ms, attempts);
     } else {
-        LOG_ERR("IPC还原失败: %s(PID:%d) ret=%d (尝试%d次, %ldms)",
-                arg->pkg, arg->pid, ret, attempts, total_ms);
+        LOG_ERR("IPC还原失败: %s(PID:%d) ret=%d (尝试%d次, %ldms)", arg->pkg, arg->pid, ret,
+                attempts, total_ms);
     }
     free(arg);
     return NULL;
@@ -177,12 +176,11 @@ static void* ipc_mount_thread(void* raw) {
     ret = perform_app_mount(arg->pkg, arg->pid, arg->uid, NULL, "IPC通知");
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    long elapsed_us = (ts_end.tv_sec - ts_start.tv_sec) * 1000000L +
-                      (ts_end.tv_nsec - ts_start.tv_nsec) / 1000L;
+    long elapsed_us =
+        (ts_end.tv_sec - ts_start.tv_sec) * 1000000L + (ts_end.tv_nsec - ts_start.tv_nsec) / 1000L;
 
     if (ret == 0) {
-        LOG("IPC挂载完成: %s(PID:%d)%s 耗时: %ldus",
-            arg->pkg, arg->pid, "", elapsed_us);
+        LOG("IPC挂载完成: %s(PID:%d)%s 耗时: %ldus", arg->pkg, arg->pid, "", elapsed_us);
     } else {
         LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
         remove_tracked(arg->pid);
@@ -204,13 +202,13 @@ int ipc_server_init() {
         LOG("IPC: 进程已绑定到 CPU 4-7");
     }
 
-    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0); 
+    int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock < 0) return -1;
     struct sockaddr_un addr;
     socklen_t addr_len = nsp_uds_abstract_addr(&addr, IPC_SOCKET_NAME);
-    if (bind(sock, (struct sockaddr*)&addr, addr_len) < 0) { 
-        close(sock); 
-        return -1; 
+    if (bind(sock, (struct sockaddr*)&addr, addr_len) < 0) {
+        close(sock);
+        return -1;
     }
     if (listen(sock, 20) < 0) {
         close(sock);
@@ -232,18 +230,19 @@ void handle_ipc_client_readable(int client_fd) {
         fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
     }
     // 设置严格的 500ms 读写超时，防止异常客户端引发挂起
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    char buf[512] = {0}; 
+    char buf[512] = {0};
     ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-    if (n <= 0) { 
-        close(client_fd); 
-        return; 
+    if (n <= 0) {
+        close(client_fd);
+        return;
     }
     char pkg[256];
     int pid = 0, uid = 0;
-    if (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3 || sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3) {
+    if (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3 ||
+        sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3) {
         /* 输入校验：拒绝越界 pid/uid，避免后续 /proc/<pid> 路径被构造用于越权访问 */
         if (pid <= 0 || pid >= 1048576 /* PID_BITMAP_MAX, Android PID 上限 */) {
             LOG_WRN("IPC: 拒绝非法 pid=%d", pid);
@@ -313,7 +312,8 @@ void handle_ipc_client_readable(int client_fd) {
                mountinfo 全量读取等 20ms+ 耗时）；非目标应用还原走上方分支 */
             mark_injected(pid);
             print_active_rules(clean_pkg, pid, uid, "IPC通知");
-            LOG_DBG("全局替换模式: 目标应用 %s(PID:%d) 无需挂载，已由全局 FUSE 提供代理视图", clean_pkg, pid);
+            LOG_DBG("全局替换模式: 目标应用 %s(PID:%d) 无需挂载，已由全局 FUSE 提供代理视图",
+                    clean_pkg, pid);
             return;
         }
 
@@ -346,9 +346,9 @@ void handle_ipc_client_readable(int client_fd) {
         close(client_fd);
         return;
     }
-    if (strncmp(buf, "FUSE_ALIVE", 10) == 0 || strncmp(buf, "FUSE_EXIT", 9) == 0) { 
-        close(client_fd); 
-        return; 
+    if (strncmp(buf, "FUSE_ALIVE", 10) == 0 || strncmp(buf, "FUSE_EXIT", 9) == 0) {
+        close(client_fd);
+        return;
     }
     close(client_fd);
 }

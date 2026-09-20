@@ -23,7 +23,7 @@ bool g_strip_o_direct = false;
 /* 日志合并周期：batch 期间 log_internal 将日志累积到批量缓冲（不逐条写
    环形缓冲），log_batch_end 时把整个周期合并为单条日志写入，前端最终只
    显示一条（多个发送请求并入一个日志）。原子嵌套计数 + 互斥锁保护缓冲 */
-static volatile sig_atomic_t g_log_batch_depth = 0;   /* >0 = 合并周期中 */
+static volatile sig_atomic_t g_log_batch_depth = 0; /* >0 = 合并周期中 */
 static pthread_mutex_t g_log_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_log_batch_buf[65536];
 static size_t g_log_batch_len = 0;
@@ -33,7 +33,7 @@ static char g_proc_name[64] = "unknown";
 static bool g_log_inited = false;
 static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define LOG_MSG_MAX_LEN  4096
+#define LOG_MSG_MAX_LEN 4096
 
 /* LOG 通道载荷组帧（与 log_monitor 行协议对齐，旧 log_entry_packet 语义）：
    kind=0 普通：level==LOG_IO → "LOG_IO:%s\n"；LOG_LOGCAT → "LOG_LOGCAT:%s\n"；
@@ -41,16 +41,11 @@ static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
    kind=1 合并： "LOG_BATCH\n<content>\nLOG_BATCH_END\n"（level 字节忽略） */
 #define LOG_KIND_NORMAL 0
 #define LOG_KIND_MERGED 1
-static int log_frame_packet(uint8_t kind, uint8_t level, const char *msg,
-                            char *packet, size_t sz) {
-    if (kind == LOG_KIND_MERGED)
-        return snprintf(packet, sz, "LOG_BATCH\n%s\nLOG_BATCH_END\n", msg);
-    if (level == LOG_IO)
-        return snprintf(packet, sz, "LOG_IO:%s\n", msg);
-    if (level == LOG_LOGCAT)
-        return snprintf(packet, sz, "LOG_LOGCAT:%s\n", msg);
-    return snprintf(packet, sz, "LOG_SYS:%d:[%s] %s\n",
-                    level, g_proc_name, msg);
+static int log_frame_packet(uint8_t kind, uint8_t level, const char* msg, char* packet, size_t sz) {
+    if (kind == LOG_KIND_MERGED) return snprintf(packet, sz, "LOG_BATCH\n%s\nLOG_BATCH_END\n", msg);
+    if (level == LOG_IO) return snprintf(packet, sz, "LOG_IO:%s\n", msg);
+    if (level == LOG_LOGCAT) return snprintf(packet, sz, "LOG_LOGCAT:%s\n", msg);
+    return snprintf(packet, sz, "LOG_SYS:%d:[%s] %s\n", level, g_proc_name, msg);
 }
 
 /* 日志合并周期控制：原子嵌套计数（>0 = 周期中），支持并发/嵌套 begin/end，
@@ -81,7 +76,7 @@ void log_batch_end(void) {
     snprintf(line, sizeof(line), "[%s] %s", g_proc_name, merged);
     uint8_t buf[2 + LOG_MSG_MAX_LEN];
     buf[0] = LOG_KIND_MERGED;
-    buf[1] = (uint8_t)LOG_DEBUG;   /* 合并日志归为 debug 级别，--level>=1 不显示 */
+    buf[1] = (uint8_t)LOG_DEBUG; /* 合并日志归为 debug 级别，--level>=1 不显示 */
     size_t llen = strlen(line);
     memcpy(buf + 2, line, llen + 1);
     nsp_comm_post(NSP_CH_LOG, buf, llen + 3);
@@ -91,7 +86,7 @@ void log_batch_end(void) {
 int g_log_forward_fd = -1;
 _Atomic(bool) g_log_shutdown = false;
 void init_timezone() {
-    const char *tz = getenv("TZ");
+    const char* tz = getenv("TZ");
     if (tz && tz[0] != '\0') {
         tzset();
         return;
@@ -104,14 +99,15 @@ void init_timezone() {
         tzset();
         return;
     }
-    FILE *fp = fopen("/data/property/persist.sys.timezone", "re");
+    FILE* fp = fopen("/data/property/persist.sys.timezone", "re");
 #else
-    FILE *fp = fopen("/etc/timezone", "re");
+    FILE* fp = fopen("/etc/timezone", "re");
 #endif
     if (fp) {
         if (fgets(prop_buf, sizeof(prop_buf), fp)) {
             size_t plen = strlen(prop_buf);
-            while (plen > 0 && (prop_buf[plen-1] == '\n' || prop_buf[plen-1] == '\r')) prop_buf[--plen] = '\0';
+            while (plen > 0 && (prop_buf[plen - 1] == '\n' || prop_buf[plen - 1] == '\r'))
+                prop_buf[--plen] = '\0';
             if (plen > 0) {
                 setenv("TZ", prop_buf, 1);
                 tzset();
@@ -162,7 +158,9 @@ void persist_io_log(const char* message) {
     pthread_mutex_unlock(&g_persist_mutex);
 }
 void escape_cgroup() {
-    int pid = getpid(); char pid_s[32]; snprintf(pid_s, sizeof(pid_s), "%d", pid);
+    int pid = getpid();
+    char pid_s[32];
+    snprintf(pid_s, sizeof(pid_s), "%d", pid);
     const char* targets[] = {
         "/sys/fs/cgroup/cgroup.procs", // v2
         "/dev/cpuctl/tasks",           // v1 cpu
@@ -185,24 +183,25 @@ void escape_cgroup() {
 static int connect_ipc(void) {
     int sock_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock_fd < 0) return -1;
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     struct sockaddr_un server_addr;
     socklen_t len = nsp_uds_abstract_addr(&server_addr, IPC_SOCKET_NAME);
     if (connect(sock_fd, (struct sockaddr*)&server_addr, len) < 0) {
-        close(sock_fd); return -1;
+        close(sock_fd);
+        return -1;
     }
     return sock_fd;
 }
 
 /* IPC 后端（comm 线程）：每条消息独立短连接（与 injector ipc_server 短连接
    语义一致：send 后即关，不读回包） */
-static int nsp_ipc_emit(void *ctx, const void *data, size_t len) {
+static int nsp_ipc_emit(void* ctx, const void* data, size_t len) {
     (void)ctx;
     int fd = connect_ipc();
     if (fd < 0) return -1;
-    const char *p = data;
+    const char* p = data;
     while (len > 0) {
         ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n <= 0) {
@@ -216,15 +215,22 @@ static int nsp_ipc_emit(void *ctx, const void *data, size_t len) {
     close(fd);
     return 0;
 }
-void set_self_dir(const char* path) { if (path && *path) strncpy(g_self_dir, path, sizeof(g_self_dir) - 1); }
+void set_self_dir(const char* path) {
+    if (path && *path) strncpy(g_self_dir, path, sizeof(g_self_dir) - 1);
+}
 char* get_self_dir() {
     if (g_self_dir[0] != 0) return g_self_dir;
-    char buf[PATH_MAX]; ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    char buf[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (len != -1) {
-        buf[len] = '\0'; char* last_slash = strrchr(buf, '/');
+        buf[len] = '\0';
+        char* last_slash = strrchr(buf, '/');
         if (last_slash) *last_slash = '\0';
         strncpy(g_self_dir, buf, sizeof(g_self_dir) - 1);
-    } else { strncpy(g_self_dir, "/data/local/tmp", sizeof(g_self_dir) - 1); g_self_dir[sizeof(g_self_dir) - 1] = '\0'; }
+    } else {
+        strncpy(g_self_dir, "/data/local/tmp", sizeof(g_self_dir) - 1);
+        g_self_dir[sizeof(g_self_dir) - 1] = '\0';
+    }
     return g_self_dir;
 }
 /* 读取整个文件到堆内存（动态扩容，尾随 NUL）：injector 的 mount_manager
@@ -266,12 +272,14 @@ char* read_file_dynamic(const char* path, size_t* out_size) {
     return buf;
 }
 
-int mkdir_recursive(const char *dir) {
+int mkdir_recursive(const char* dir) {
     if (!dir) return -1;
     size_t in_len = strlen(dir);
-    if (in_len == 0 || in_len >= 256) return -1;   /* 拒绝空与超长输入，杜绝 snprintf 静默截断 */
-    char tmp[256], *p = nullptr; snprintf(tmp, sizeof(tmp), "%s", dir);
-    size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
+    if (in_len == 0 || in_len >= 256) return -1; /* 拒绝空与超长输入，杜绝 snprintf 静默截断 */
+    char tmp[256], *p = nullptr;
+    snprintf(tmp, sizeof(tmp), "%s", dir);
+    size_t len = strlen(tmp);
+    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
     for (p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
@@ -290,7 +298,8 @@ int mkdir_recursive(const char *dir) {
 static void sync_attributes(const char* source_parent, const char* target_path) {
     struct stat st;
     if (lstat(source_parent, &st) != 0) return;
-    if (lchown(target_path, st.st_uid, st.st_gid) != 0) {}
+    if (lchown(target_path, st.st_uid, st.st_gid) != 0) {
+    }
     chmod(target_path, st.st_mode & 07777);
 #ifdef TARGET_ANDROID
     char context[256];
@@ -305,32 +314,41 @@ static void sync_attributes(const char* source_parent, const char* target_path) 
 }
 
 static void inherit_from_parent(const char* real_path) {
-    char parent[PATH_MAX]; strncpy(parent, real_path, PATH_MAX - 1);
+    char parent[PATH_MAX];
+    strncpy(parent, real_path, PATH_MAX - 1);
     char* last = strrchr(parent, '/');
     if (last) {
-        if (last == parent) strcpy(parent, "/");
-        else *last = '\0';
+        if (last == parent)
+            strcpy(parent, "/");
+        else
+            *last = '\0';
         sync_attributes(parent, real_path);
     }
 }
 
-int mkdir_recursive_p(const char *path, mode_t mode) {
+int mkdir_recursive_p(const char* path, mode_t mode) {
     if (!path || !path[0]) return -1;
-    char tmp[PATH_MAX]; snprintf(tmp, sizeof(tmp), "%s", path);
-    size_t len = strlen(tmp); if (tmp[len - 1] == '/') tmp[len - 1] = 0;
-    for (char *p = tmp + 1; *p; p++) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
+    for (char* p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
             if (access(tmp, F_OK) != 0) {
-                if (mkdir(tmp, mode) == 0) inherit_from_parent(tmp);
-                else if (errno != EEXIST) return -1;
+                if (mkdir(tmp, mode) == 0)
+                    inherit_from_parent(tmp);
+                else if (errno != EEXIST)
+                    return -1;
             }
             *p = '/';
         }
     }
     if (access(tmp, F_OK) != 0) {
-        if (mkdir(tmp, mode) == 0) inherit_from_parent(tmp);
-        else if (errno != EEXIST) return -1;
+        if (mkdir(tmp, mode) == 0)
+            inherit_from_parent(tmp);
+        else if (errno != EEXIST)
+            return -1;
     }
     return 0;
 }
@@ -373,7 +391,10 @@ bool path_contains_invalid_chars(const char* path) {
 }
 void path_sanitize(char* out, size_t size, const char* path) {
     if (!out || size == 0) return;
-    if (!path) { out[0] = '\0'; return; }
+    if (!path) {
+        out[0] = '\0';
+        return;
+    }
     const unsigned char* p = (const unsigned char*)path;
     size_t o = 0;
     size_t max = size - 1;
@@ -390,16 +411,16 @@ void path_sanitize(char* out, size_t size, const char* path) {
 }
 /* LOG 通道载荷：[kind:1][level:1][msg...]（调用线程组帧头，发送组包） */
 typedef struct {
-    int sock;   /* -1=未建链（仅 comm 线程触碰） */
+    int sock; /* -1=未建链（仅 comm 线程触碰） */
 } log_be_ctx_t;
-static log_be_ctx_t g_log_be = { .sock = -1 };
+static log_be_ctx_t g_log_be = {.sock = -1};
 
-static bool nsp_log_ensure_link(void *ctx) {
-    log_be_ctx_t *c = ctx;
+static bool nsp_log_ensure_link(void* ctx) {
+    log_be_ctx_t* c = ctx;
     if (c->sock >= 0) return true;
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return false;
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     struct sockaddr_un addr;
     socklen_t len = nsp_uds_abstract_addr(&addr, LOG_SOCKET_NAME);
@@ -411,10 +432,10 @@ static bool nsp_log_ensure_link(void *ctx) {
     return true;
 }
 
-static int nsp_log_emit(void *ctx, const void *data, size_t len) {
-    log_be_ctx_t *c = ctx;
+static int nsp_log_emit(void* ctx, const void* data, size_t len) {
+    log_be_ctx_t* c = ctx;
     if (len < 2 || c->sock < 0) return -1;
-    const uint8_t *p = data;
+    const uint8_t* p = data;
     char packet[LOG_MSG_MAX_LEN * 2 + 128];
     /* msg 段以 NUL 截断防越界（post 载荷恒以 NUL 结尾，见 log_internal） */
     size_t mlen = len - 2;
@@ -424,7 +445,7 @@ static int nsp_log_emit(void *ctx, const void *data, size_t len) {
     msg[mlen] = '\0';
     int plen = log_frame_packet(p[0], p[1], msg, packet, sizeof(packet));
     if (plen <= 0) return 0;
-    const char *q = packet;
+    const char* q = packet;
     size_t left = (size_t)plen;
     while (left > 0) {
         ssize_t n = send(c->sock, q, left, MSG_NOSIGNAL);
@@ -440,15 +461,18 @@ static int nsp_log_emit(void *ctx, const void *data, size_t len) {
     return 0;
 }
 
-static void nsp_log_fini(void *ctx) {
-    log_be_ctx_t *c = ctx;
-    if (c->sock >= 0) { close(c->sock); c->sock = -1; }
+static void nsp_log_fini(void* ctx) {
+    log_be_ctx_t* c = ctx;
+    if (c->sock >= 0) {
+        close(c->sock);
+        c->sock = -1;
+    }
 }
 
 /* 拥塞上报：本 drain 轮有覆盖丢弃时经 LOG 通道发一行 SYS 可查
    （post 永不阻塞；LOG 自身拥塞时该行亦可能被覆盖，计数以 API 为准。
    若本进程未注册 LOG 后端（如 log_monitor），该行计 dropped，无限循环） */
-void nsp_log_report(nsp_ch_t ch, uint64_t n, void *ctx) {
+void nsp_log_report(nsp_ch_t ch, uint64_t n, void* ctx) {
     (void)ctx;
     /* 限频 5s：LOG 自身拥塞时报告回注会加剧拥塞、下轮再报，限频后每轮
        最多一条；精确计数以 nsp_comm_dropped() 为准 */
@@ -458,10 +482,10 @@ void nsp_log_report(nsp_ch_t ch, uint64_t n, void *ctx) {
     uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
     if (now - last_ms < 5000) return;
     last_ms = now;
-    static const char *names[NSP_CH__N] = { "LOG", "IPC", "BCAST" };
+    static const char* names[NSP_CH__N] = {"LOG", "IPC", "BCAST"};
     char msg[128];
-    int mlen = snprintf(msg, sizeof(msg), "comm: %s 通道拥塞，覆盖旧数据 %llu 条",
-                        names[ch], (unsigned long long)n);
+    int mlen = snprintf(msg, sizeof(msg), "comm: %s 通道拥塞，覆盖旧数据 %llu 条", names[ch],
+                        (unsigned long long)n);
     if (mlen <= 0) return;
     uint8_t buf[2 + 128];
     buf[0] = LOG_KIND_NORMAL;
@@ -481,13 +505,19 @@ void log_init(const char* process_name) {
         return;
     }
     nsp_comm_backend_t log_be = {
-        .ctx = &g_log_be, .ensure_link = nsp_log_ensure_link,
-        .emit = nsp_log_emit, .fini = nsp_log_fini, .report = nsp_log_report,
+        .ctx = &g_log_be,
+        .ensure_link = nsp_log_ensure_link,
+        .emit = nsp_log_emit,
+        .fini = nsp_log_fini,
+        .report = nsp_log_report,
     };
     nsp_comm_register(NSP_CH_LOG, &log_be);
     nsp_comm_backend_t ipc_be = {
-        .ctx = NULL, .ensure_link = NULL, .emit = nsp_ipc_emit,
-        .fini = NULL, .report = nsp_log_report,
+        .ctx = NULL,
+        .ensure_link = NULL,
+        .emit = nsp_ipc_emit,
+        .fini = NULL,
+        .report = nsp_log_report,
     };
     nsp_comm_register(NSP_CH_IPC, &ipc_be);
     g_log_inited = true;
@@ -495,7 +525,7 @@ void log_init(const char* process_name) {
 
 void log_close(void) {
     if (!g_log_inited) return;
-    nsp_comm_fini();   /* 最尽力 drain + join */
+    nsp_comm_fini(); /* 最尽力 drain + join */
     g_log_inited = false;
 }
 
@@ -529,8 +559,10 @@ void log_internal(LogLevel level, const char* format, ...) {
         persist_io_log(msg_buf);
 #endif
     } else if (g_persist_all_logs) {
-        if (level == LOG_LOGCAT) persist_log_to_disk("logcat", msg_buf, true);
-        else persist_log_to_disk("sys", msg_buf, true);
+        if (level == LOG_LOGCAT)
+            persist_log_to_disk("logcat", msg_buf, true);
+        else
+            persist_log_to_disk("sys", msg_buf, true);
     }
     if (!g_log_inited) return;
     /* 合并周期内：累积到批量缓冲（不逐条写环形缓冲），由 log_batch_end
@@ -543,8 +575,7 @@ void log_internal(LogLevel level, const char* format, ...) {
     if (__sync_fetch_and_add(&g_log_batch_depth, 0) > 0) {
         pthread_mutex_lock(&g_log_batch_mutex);
         int w = snprintf(g_log_batch_buf + g_log_batch_len,
-                         sizeof(g_log_batch_buf) - g_log_batch_len,
-                         "%s\t", msg_buf);
+                         sizeof(g_log_batch_buf) - g_log_batch_len, "%s\t", msg_buf);
         if (w > 0 && g_log_batch_len + (size_t)w < sizeof(g_log_batch_buf))
             g_log_batch_len += (size_t)w;
         pthread_mutex_unlock(&g_log_batch_mutex);
@@ -569,18 +600,19 @@ bool is_media_provider(const char* pkg) {
  * 截断可观测：保持 void 签名（不断模块 ABI）。P3：每展开点独立计数、前 3 次
  * 带调用点告警（不同场景不再被一次性标志屏蔽），之后每 1024 次补一行抑制计数。
  * 输入恒受 MAX_PATH_LEN/PATH_MAX 约束，实际不可达；一旦出现即排查。 */
-#define PATH_SNPRINTF(out, sz, ...) do { \
-    int _pn = snprintf(out, sz, __VA_ARGS__); \
-    if (_pn < 0 || (size_t)_pn >= (sz)) { \
-        static _Atomic unsigned _pwarn_n = 0; \
-        unsigned _n0 = atomic_fetch_add(&_pwarn_n, 1); \
-        if (_n0 < 3) \
-            LOG_WRN("路径合成截断[%s:%d]（需 %d/限 %zu），请排查超长输入", \
-                    __func__, __LINE__, _pn, (size_t)(sz)); \
-        else if (_n0 % 1024 == 0) \
-            LOG_WRN("路径合成截断[%s:%d]已累计 %u 次（抑制中）", __func__, __LINE__, _n0); \
-    } \
-} while (0)
+#define PATH_SNPRINTF(out, sz, ...)                                                                \
+    do {                                                                                           \
+        int _pn = snprintf(out, sz, __VA_ARGS__);                                                  \
+        if (_pn < 0 || (size_t)_pn >= (sz)) {                                                      \
+            static _Atomic unsigned _pwarn_n = 0;                                                  \
+            unsigned _n0 = atomic_fetch_add(&_pwarn_n, 1);                                         \
+            if (_n0 < 3)                                                                           \
+                LOG_WRN("路径合成截断[%s:%d]（需 %d/限 %zu），请排查超长输入", __func__, __LINE__, \
+                        _pn, (size_t)(sz));                                                        \
+            else if (_n0 % 1024 == 0)                                                              \
+                LOG_WRN("路径合成截断[%s:%d]已累计 %u 次（抑制中）", __func__, __LINE__, _n0);     \
+        }                                                                                          \
+    } while (0)
 
 void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz) {
     if (!out || sz == 0) return;

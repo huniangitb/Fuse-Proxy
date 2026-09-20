@@ -26,7 +26,9 @@ bool app_has_active_rules(const char* pkg, uid_t uid) {
     config_lock_read();
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     bool has_rules = false;
-    if (cfg) has_rules = (cfg->redir_count > 0 || cfg->hide_count > 0 || cfg->ro_count > 0 || cfg->sandbox);
+    if (cfg)
+        has_rules =
+            (cfg->redir_count > 0 || cfg->hide_count > 0 || cfg->ro_count > 0 || cfg->sandbox);
     /* 类别层（与 br_pick_category 同口径）：应用段无规则时看类别段 */
     if (!has_rules) {
         bool is_sys = (uid < 10000) || (pkg && sys_pkg_is_system(pkg));
@@ -34,8 +36,8 @@ bool app_has_active_rules(const char* pkg, uid_t uid) {
     }
     if (!has_rules) {
         bool use_global_sandbox = !is_media_provider(pkg);
-        has_rules = (g_global_cfg.global_inject ||
-                     g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0 ||
+        has_rules = (g_global_cfg.global_inject || g_global_cfg.redir_count > 0 ||
+                     g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0 ||
                      (g_global_cfg.sandbox && use_global_sandbox));
     }
     config_unlock_read();
@@ -72,7 +74,7 @@ static bool lookup_mount_cache(int pid, MountState* st) {
     pthread_mutex_lock(&g_mount_cache_mutex);
     for (int i = 0; i < g_mount_cache_count; i++) {
         if (g_mount_cache[i].pid == pid) {
-            *st = g_mount_cache[i].st;   /* 值拷贝：调用方拿到快照，不持有数组指针 */
+            *st = g_mount_cache[i].st; /* 值拷贝：调用方拿到快照，不持有数组指针 */
             found = true;
             break;
         }
@@ -214,7 +216,8 @@ static bool path_prefix_overlap(const char* a, const char* b) {
     return (a[minlen] == '/' || a[minlen] == '\0') && (b[minlen] == '/' || b[minlen] == '\0');
 }
 
-static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path, const char* pkg) {
+static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path,
+                                                 const char* pkg) {
     bool conflicts = false;
     bool is_media = is_media_provider(pkg);
     bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
@@ -237,7 +240,8 @@ static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const cha
     }
     if (!conflicts) {
         for (int i = 0; i < g_global_cfg.redir_count && !conflicts; i++) {
-            if (path_prefix_overlap(g_global_cfg.redir_rules[i].virtual_prefix, rel_path)) conflicts = true;
+            if (path_prefix_overlap(g_global_cfg.redir_rules[i].virtual_prefix, rel_path))
+                conflicts = true;
         }
         for (int i = 0; i < g_global_cfg.hide_count && !conflicts; i++) {
             if (path_prefix_overlap(g_global_cfg.hide_rules[i], rel_path)) conflicts = true;
@@ -277,10 +281,11 @@ static inline bool is_bpf_fuse_running(void) {
 #ifdef TARGET_ANDROID
     if (g_bpf_fuse_running < 0) {
         char prop[PROP_VALUE_MAX];
-        g_bpf_fuse_running = (__system_property_get("ro.fuse.bpf.is_running", prop) > 0
-                              && strcmp(prop, "true") == 0) ? 1 : 0;
-        if (g_bpf_fuse_running)
-            LOG_DBG("(ro.fuse.bpf.is_running=true)，跳过子挂载扫描");
+        g_bpf_fuse_running =
+            (__system_property_get("ro.fuse.bpf.is_running", prop) > 0 && strcmp(prop, "true") == 0)
+                ? 1
+                : 0;
+        if (g_bpf_fuse_running) LOG_DBG("(ro.fuse.bpf.is_running=true)，跳过子挂载扫描");
     }
     return g_bpf_fuse_running == 1;
 #else
@@ -288,7 +293,8 @@ static inline bool is_bpf_fuse_running(void) {
 #endif
 }
 
-int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, const char* trigger) {
+int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
+                      const char* trigger) {
     if (kill(pid, 0) != 0) {
         LOG_DBG("目标进程已退出，跳过挂载: %s(PID:%d)", pkg, pid);
         invalidate_mount_cache(pid);
@@ -304,7 +310,8 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         if (media_src) {
             mnt_src = media_src;
         } else {
-            LOG_ERR("专用媒体 FUSE 实例未就绪/未启用，拒绝为媒体模块 %s(PID:%d) 执行挂载", pkg, pid);
+            LOG_ERR("专用媒体 FUSE 实例未就绪/未启用，拒绝为媒体模块 %s(PID:%d) 执行挂载", pkg,
+                    pid);
             return -1;
         }
     } else {
@@ -317,8 +324,10 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         }
     }
 
-    char target_path[128]; get_target_storage_path(uid, target_path, sizeof(target_path));
-    char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+    char target_path[128];
+    get_target_storage_path(uid, target_path, sizeof(target_path));
+    char backup_path[PATH_MAX];
+    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
 
     MountState mnt;
     if (!lookup_mount_cache(pid, &mnt)) {
@@ -353,7 +362,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
     }
-    
+
     /* preserve 目标收集：combined 挂载保留 target 下原生子视图（如
        Android/data）时使用。备份复制已弃用（不再 mount target→backup），
        恢复源改为直接 bind /mnt/ 下系统视图（多用户族根）——收集的仍是
@@ -378,7 +387,8 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
             config_unlock_read();
         }
     }
-    if (ns_combined_mount_async(pid, pkg, mnt_src, target_path, backup_path, preserve_paths, preserve_count) == 0) {
+    if (ns_combined_mount_async(pid, pkg, mnt_src, target_path, backup_path, preserve_paths,
+                                preserve_count) == 0) {
         if (uid >= 10000) update_uid_map(uid, pkg);
         mark_injected(pid);
         invalidate_mount_cache(pid);
@@ -419,8 +429,10 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         }
     }
 
-    char target_path[128]; get_target_storage_path(uid, target_path, sizeof(target_path));
-    char backup_path[PATH_MAX]; snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+    char target_path[128];
+    get_target_storage_path(uid, target_path, sizeof(target_path));
+    char backup_path[PATH_MAX];
+    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
 
     MountState mnt;
     if (!lookup_mount_cache(pid, &mnt)) {
@@ -471,7 +483,8 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         }
     }
     /* 同步合并挂载 */
-    if (ns_combined_mount(pid, pkg, mnt_src, target_path, backup_path, preserve_paths, preserve_count) == 0) {
+    if (ns_combined_mount(pid, pkg, mnt_src, target_path, backup_path, preserve_paths,
+                          preserve_count) == 0) {
         invalidate_mount_cache(pid);
         return 0;
     } else {
@@ -500,7 +513,7 @@ int perform_app_restore(const char* pkg, int pid, uid_t uid) {
     if (ret == 0) {
         LOG_DBG("非目标应用已还原系统视图: %s(PID:%d, user=%d)", pkg, pid, user_id);
         invalidate_mount_cache(pid);
-        unmark_injected(pid);   /* 还原即解除注入状态（显式标志清除） */
+        unmark_injected(pid); /* 还原即解除注入状态（显式标志清除） */
     } else if (ret == 1) {
         LOG_DBG("非目标应用还原跳过: %s(PID:%d, user=%d) 顶层非项目 FUSE", pkg, pid, user_id);
         /* 还原跳过（顶层非项目 FUSE）：缓存可能残留旧的 target_has_fuse=true，

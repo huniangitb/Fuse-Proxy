@@ -16,7 +16,7 @@ typedef struct NsMountEntry {
     char mount_point[PATH_MAX];
     char source[PATH_MAX];
     char fstype[64];
-    char dev[64];      /* major:minor，bind 与源共享 superblock，用于替换状态判断 */
+    char dev[64]; /* major:minor，bind 与源共享 superblock，用于替换状态判断 */
     int depth;
 } NsMountEntry;
 
@@ -31,7 +31,8 @@ void log_ns_error(const char* format, ...);
 
 /* 命名空间执行原语：定义于 ns_utils.c（fork + setns + 状态管道同步），
    全局替换方案在目标命名空间内执行 replace/restore 时共用 */
-int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* child_err, int timeout_ms);
+int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* child_err,
+                          int timeout_ms);
 
 /* ---- mountinfo 枚举与族根工具（原 ns_utils.c static，拆分后跨文件共享） ----
    命名统一 ns_ 前缀（mount namespace 操作域），禁裸通用名污染全局命名空间 */
@@ -39,11 +40,10 @@ int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max);
 bool ns_is_digit_char(char c);
 bool ns_is_family_root(const char* mp);
 int ns_parse_family_root(const char* mp, int* user_id);
-int ns_gather_mounts_under(const NsMountEntry* all, int n, const char* base,
-                           bool include_self, bool include_fuse,
-                           NsMountEntry* out, int max);
-int ns_count_mounts_under(const NsMountEntry* all, int n, const char* base,
-                          bool include_self, bool include_fuse);
+int ns_gather_mounts_under(const NsMountEntry* all, int n, const char* base, bool include_self,
+                           bool include_fuse, NsMountEntry* out, int max);
+int ns_count_mounts_under(const NsMountEntry* all, int n, const char* base, bool include_self,
+                          bool include_fuse);
 void ns_sort_deepest_first(NsMountEntry* arr, int n);
 void ns_sort_shallowest_first(NsMountEntry* arr, int n);
 int ns_backup_point_state(int pid, const char* path);

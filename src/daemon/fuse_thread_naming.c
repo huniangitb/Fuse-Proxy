@@ -27,8 +27,8 @@
 
 /* 真实 pthread_create：首次调用时经 RTLD_NEXT 解析（dlsym 本身不建线程，
  * 懒初始化安全；解析失败直接返回 EAGAIN，调用方按建线程失败处理） */
-static int (*s_real_pthread_create)(pthread_t*, const pthread_attr_t*,
-                                    void* (*)(void*), void*) = NULL;
+static int (*s_real_pthread_create)(pthread_t*, const pthread_attr_t*, void* (*)(void*),
+                                    void*) = NULL;
 
 typedef struct {
     void* (*start)(void*);
@@ -45,16 +45,16 @@ static void* fuse_thread_entry(void* raw) {
     return start(arg);
 }
 
-int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
-                   void* (*start_routine)(void*), void* arg) {
+int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start_routine)(void*),
+                   void* arg) {
     if (!s_real_pthread_create) {
         void* sym = dlsym(RTLD_NEXT, "pthread_create");
-        if (!sym) return 11;   /* EAGAIN：调用方走建线程失败分支 */
+        if (!sym) return 11; /* EAGAIN：调用方走建线程失败分支 */
         s_real_pthread_create = sym;
     }
-    if (!start_routine) return 22;   /* EINVAL：与 glibc 语义对齐 */
+    if (!start_routine) return 22; /* EINVAL：与 glibc 语义对齐 */
     FuseThreadTrampoline* t = malloc(sizeof *t);
-    if (!t) return 11;   /* EAGAIN */
+    if (!t) return 11; /* EAGAIN */
     t->start = start_routine;
     t->arg = arg;
     int rc = s_real_pthread_create(thread, attr, fuse_thread_entry, t);

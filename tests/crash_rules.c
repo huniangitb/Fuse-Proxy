@@ -24,13 +24,12 @@ static int crash_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     /* FUSE 按组件逐级 lookup：stat(/0/crashtest/x) 先查 /0/crashtest（无尾斜杠） */
     if (strncmp(vp, "crashtest", 9) == 0 && (vp[9] == '/' || vp[9] == '\0')) {
         volatile int* p = (int*)0;
-        *p = 1;                    /* SIGSEGV → 围栏恢复（longjmp 回框架） */
+        *p = 1; /* SIGSEGV → 围栏恢复（longjmp 回框架） */
     }
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
-        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s",
-                 test_storage(), rest);
+        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
         snprintf(out->redir_target, sizeof out->redir_target, "/virt");
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
@@ -51,19 +50,19 @@ static int crash_probe(const NspQueryCtx* q, NspProbeResult* out) {
 
 static const NspModuleOps crash_ops = {
     .resolve = crash_resolve,
-    .probe   = crash_probe,
+    .probe = crash_probe,
 };
 
 /* 模块导出的是**数据符号**（全局 NspModuleInfo 结构体），loader 经 dlsym
    后直接强转 NspModuleInfo* 读取——不是函数。name 必须与目录名一致。 */
 const NspModuleInfo nsp_module_info = {
-    .magic       = NSP_MODULE_MAGIC,
+    .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type        = NSP_MODULE_TYPE_RULES,
-    .caps        = NSP_CAP_REDIRECT,
-    .name        = "crash_rules",
-    .version     = "1.0",
-    .init        = NULL,
-    .exit        = NULL,
-    .ops         = &crash_ops,
+    .type = NSP_MODULE_TYPE_RULES,
+    .caps = NSP_CAP_REDIRECT,
+    .name = "crash_rules",
+    .version = "1.0",
+    .init = NULL,
+    .exit = NULL,
+    .ops = &crash_ops,
 };

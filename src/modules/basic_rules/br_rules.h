@@ -8,7 +8,7 @@
  * 不再依赖 fuse_get_context，uid 由 resolve 上下文传入。
  */
 #include "config_parser.h"
-#include "nsp_module.h"   /* NspDirEntry（readdir 补充接口） */
+#include "nsp_module.h" /* NspDirEntry（readdir 补充接口） */
 #include <sys/types.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -17,20 +17,20 @@
    单次操作内对同一 sub_path 的 Trie 查询结果缓存，redir 存已拼接的完整目标串
    （可能含 '?' 前缀，运行时再展开）。 */
 typedef struct {
-    bool valid;      /* 是否已 resolve */
-    bool hidden;     /* app_hidden || cat_hidden || global_hidden */
-    bool ro;         /* app_ro || cat_ro || global_ro */
-    bool has_redir;  /* 命中 redirect（app > 类别 > global） */
+    bool valid;     /* 是否已 resolve */
+    bool hidden;    /* app_hidden || cat_hidden || global_hidden */
+    bool ro;        /* app_ro || cat_ro || global_ro */
+    bool has_redir; /* 命中 redirect（app > 类别 > global） */
     char redir[PATH_MAX];
     /* FTP 最长前缀命中（trie 下降过程输出）：app > 类别 > global */
-    char ftp_app[64];     /* app trie 命中段名（可空） */
-    char ftp_cat[64];     /* 类别 trie（USER_APPS/SYSTEM_APPS）命中段名（可空） */
-    char ftp_global[64];  /* global trie 命中段名（可空） */
+    char ftp_app[64];    /* app trie 命中段名（可空） */
+    char ftp_cat[64];    /* 类别 trie（USER_APPS/SYSTEM_APPS）命中段名（可空） */
+    char ftp_global[64]; /* global trie 命中段名（可空） */
     /* trie 完整匹配的最深节点（由 trie_lookup_full 填充，可 NULL）：
        供 br_resolve 复用一次遍历结果判定 virtual_ancestor / redirect_target，
        避免各自再全路径遍历（FUSE 热路径每操作最多省 4 次 trie 下降） */
     const TrieNode* app_node;
-    const TrieNode* cat_node;     /* 类别 trie 最深节点（可 NULL） */
+    const TrieNode* cat_node; /* 类别 trie 最深节点（可 NULL） */
     const TrieNode* global_node;
 } TrieMatch;
 
@@ -40,7 +40,7 @@ void br_rules_exit(void);
 
 /* 核心决策：替代 vfs_core 的三连调用（sanitize + hidden + to_real_path + ro） */
 typedef struct {
-    const char* path;       /* 原始路径 */
+    const char* path; /* 原始路径 */
     uid_t uid;
     pid_t pid;
     gid_t gid;
@@ -48,7 +48,7 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    int  user_id;
+    int user_id;
     char sub_path[PATH_MAX];
     char pkg[128];
     bool hidden;
@@ -62,8 +62,8 @@ typedef struct {
     bool is_virtual_ancestor;
     bool is_redirect_target;
     bool is_other_app_pkg;
-    bool is_ftp;              /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定） */
-    char ftp_backend[64];     /* FTP 段名（ftp.conf [段名]） */
+    bool is_ftp;          /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定） */
+    char ftp_backend[64]; /* FTP 段名（ftp.conf [段名]） */
     bool monitor_on;
 } BrResult;
 
@@ -84,8 +84,8 @@ void br_probe(const BrQuery* q, BrProbeResult* out);
 /* readdir 虚拟目录补充：返回属于 sub_path 的 REDIRECT 前缀合成子目录条目
    （框架负责 ht 去重 + filler；sandbox/Android 骨架由框架基于 path_user_id/
     g_disable_sandbox/current_pkg 自行合成，模块无需提供） */
-int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id,
-                     const char* pkg, bool is_root, NspDirEntry* out, int max);
+int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id, const char* pkg,
+                     bool is_root, NspDirEntry* out, int max);
 
 /* 配置热重载 */
 void br_reload_config(void);

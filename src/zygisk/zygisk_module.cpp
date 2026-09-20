@@ -34,9 +34,9 @@
 
 #include "zygisk.hpp"
 
-#define LOG_TAG "Zygisk_NSProxy"
+#define LOG_TAG   "Zygisk_NSProxy"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 /* 必须与 include/common.h 的 IPC_SOCKET_NAME 同值（抽象命名空间地址）。
    本模块不可 include common.h——它代含 nsp_comm.h 等十余个头，会把项目
@@ -47,14 +47,13 @@
    （src/core/nsp_util.c），含同一处修正：地址长度按**截断后**实际写入的
    内容计算，而非 strlen(name)——名称超长时后者会让长度越过 sun_path 的
    真实内容，造成内核侧越界读。 */
-static socklen_t uds_abstract_addr(struct sockaddr_un *addr, const char *name) {
+static socklen_t uds_abstract_addr(struct sockaddr_un* addr, const char* name) {
     memset(addr, 0, sizeof(*addr));
     addr->sun_family = AF_UNIX;
     addr->sun_path[0] = '\0';
     strncpy(addr->sun_path + 1, name, sizeof(addr->sun_path) - 2);
     addr->sun_path[sizeof(addr->sun_path) - 1] = '\0';
-    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 +
-                       strlen(addr->sun_path + 1));
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(addr->sun_path + 1));
 }
 
 /* 普通用户应用判定。上界 90000 与 injector 的 is_isolated_uid()
@@ -91,14 +90,14 @@ static void companion_handler(int client_fd) {
         struct sockaddr_un addr;
         socklen_t addr_len = uds_abstract_addr(&addr, IPC_SOCKET_NAME);
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 };
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 500000};
         setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-        if (connect(inj_fd, (struct sockaddr *)&addr, addr_len) == 0) {
+        if (connect(inj_fd, (struct sockaddr*)&addr, addr_len) == 0) {
             char report_msg[512];
-            int msg_len = snprintf(report_msg, sizeof(report_msg),
-                                   "REPORT %s %d %d", pkg_name, pid, uid);
+            int msg_len =
+                snprintf(report_msg, sizeof(report_msg), "REPORT %s %d %d", pkg_name, pid, uid);
             if (write(inj_fd, report_msg, msg_len) > 0) {
                 /* 等 injector 的 ACK：确保其已受理再放行应用继续 specialize，
                    否则应用可能先于挂载完成访问存储。读失败不改变结果（上报
@@ -122,32 +121,32 @@ static void companion_handler(int client_fd) {
 /* ============================ Zygisk 模块（应用进程） ============================ */
 
 class AppReporterModule : public zygisk::ModuleBase {
-public:
-    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+  public:
+    void onLoad(zygisk::Api* api, JNIEnv* env) override {
         this->api = api;
         this->env = env;
     }
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         if (!is_user_app(args->uid)) {
             return;
         }
 
-        const char *nice_name = nullptr;
+        const char* nice_name = nullptr;
         if (args->nice_name != nullptr) {
             nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
         }
-        const char *final_name = nice_name ? nice_name : "unknown";
+        const char* final_name = nice_name ? nice_name : "unknown";
 
         int fd = api->connectCompanion();
         if (fd >= 0) {
             char req_buf[512];
-            int req_len = snprintf(req_buf, sizeof(req_buf),
-                                   "REQ %s %d %d", final_name, getpid(), args->uid);
+            int req_len =
+                snprintf(req_buf, sizeof(req_buf), "REQ %s %d %d", final_name, getpid(), args->uid);
             if (write(fd, req_buf, req_len) > 0) {
                 /* 等 companion 完成中转（上限 1s）：specialize 阶段阻塞会拖慢
                    应用冷启动，故设上限而非无限等待。 */
-                struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+                struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
                 poll(&pfd, 1, 1000);
                 LOGI("App [%s] (UID:%u) 已上报", final_name, args->uid);
             }
@@ -159,14 +158,14 @@ public:
         }
     }
 
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
+    void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
         /* 上报已完成，卸载自身以保持应用进程纯净 */
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
-private:
-    zygisk::Api *api = nullptr;
-    JNIEnv *env = nullptr;
+  private:
+    zygisk::Api* api = nullptr;
+    JNIEnv* env = nullptr;
 };
 
 REGISTER_ZYGISK_MODULE(AppReporterModule)

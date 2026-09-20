@@ -26,11 +26,13 @@
 /* ---- 链接 stub：满足 ns_utils.o / inject_target.o 的符号引用 ---- */
 int g_epoll_fd = -1;
 bool register_async_mount_pipe(int fd, void* ctx) {
-    (void)fd; (void)ctx;
+    (void)fd;
+    (void)ctx;
     return true;
 }
 void schedule_retry_mount(const char* pkg, int pid) {
-    (void)pkg; (void)pid;
+    (void)pkg;
+    (void)pid;
 }
 /* get_active_mnt_src 由测试通过 audit-ctl 前置参数注入（fuse_src），
    模拟 injector.c 中的实现语义：返回当前项目 FUSE 源挂载点 */
@@ -38,7 +40,9 @@ static const char* g_ctl_mnt_src = nullptr;
 const char* get_active_mnt_src(void) {
     return g_ctl_mnt_src;
 }
-void set_ctl_mnt_src(const char* src) { g_ctl_mnt_src = src; }
+void set_ctl_mnt_src(const char* src) {
+    g_ctl_mnt_src = src;
+}
 
 /* 全局替换模式开关（injector.c 定义，本驱动自行提供便于测试控制） */
 bool g_global_replace_mode = false;
@@ -50,15 +54,16 @@ const char* get_media_mnt_src(void) {
 
 static const char* status_name(int st) {
     switch (st) {
-        case NSP_GLOBAL_STATUS_NORMAL:   return "normal";
+        case NSP_GLOBAL_STATUS_NORMAL: return "normal";
         case NSP_GLOBAL_STATUS_REPLACED: return "replaced";
-        case NSP_GLOBAL_STATUS_MIXED:    return "mixed";
-        default:                         return "unknown";
+        case NSP_GLOBAL_STATUS_MIXED: return "mixed";
+        default: return "unknown";
     }
 }
 
 static void usage(const char* prog) {
-    fprintf(stderr,
+    fprintf(
+        stderr,
         "用法: %s <cmd> [args]\n"
         "  replace <ns_pid> <fuse_src> <backup_root>  全局替换（备份一个族 + 三族替换）\n"
         "  restore <ns_pid> <backup_root>             从备份恢复三族视图\n"
@@ -74,7 +79,10 @@ static void usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     log_init("global_replace_ctl");
-    if (argc < 2) { usage(argv[0]); return 2; }
+    if (argc < 2) {
+        usage(argv[0]);
+        return 2;
+    }
     const char* cmd = argv[1];
 
     if (strcmp(cmd, "set-src") == 0 && argc >= 3) {
@@ -96,7 +104,7 @@ int main(int argc, char* argv[]) {
     }
     if (strcmp(cmd, "audit-specific") == 0 && argc >= 4) {
         g_global_replace_mode = (strcmp(argv[2], "on") == 0);
-        ChangedPkg c = { .user_id = -1 };
+        ChangedPkg c = {.user_id = -1};
         strncpy(c.pkg_name, argv[3], sizeof(c.pkg_name) - 1);
         c.pkg_name[sizeof(c.pkg_name) - 1] = '\0';
         audit_and_remount_specific_apps(&c, 1);
@@ -122,16 +130,18 @@ int main(int argc, char* argv[]) {
         int audit_mounted = (ns_is_mounted(pid, "/storage/emulated", nullptr) > 0);
         force_recover_tracked_mounts();
         int force_mounted = (ns_is_mounted(pid, "/storage/emulated", nullptr) > 0);
-        printf("audit_mounted=%d force_mounted=%d (global_replace=%d)\n",
-               audit_mounted, force_mounted, (int)g_global_replace_mode);
+        printf("audit_mounted=%d force_mounted=%d (global_replace=%d)\n", audit_mounted,
+               force_mounted, (int)g_global_replace_mode);
         return 0;
     }
     if (strcmp(cmd, "batch-test") == 0) {
         /* 本地验证 log_batch 合并链路：begin → 多条日志（含 bind/f2fs 样式）
            → end 合并为单条；随后输出环形缓冲条目供比对 */
         log_batch_begin();
-        LOG_DBG("应用还原: bind /data/Namespace-Proxy/nsp_backup/global_emulated/user_0/emulated -> /storage/emulated");
-        LOG_DBG("应用还原: f2fs 补充 bind /data/media/0/Android/data -> /storage/emulated/0/Android/data");
+        LOG_DBG(
+            "应用还原: bind /data/Namespace-Proxy/nsp_backup/global_emulated/user_0/emulated -> /storage/emulated");
+        LOG_DBG(
+            "应用还原: f2fs 补充 bind /data/media/0/Android/data -> /storage/emulated/0/Android/data");
         LOG_DBG("ns操作 pid=12345 耗时: 35ms, 结果: 跳过");
         LOG("IPC还原: com.example.app(PID:12345) 成功 (尝试1次, 10ms)");
         log_batch_end();

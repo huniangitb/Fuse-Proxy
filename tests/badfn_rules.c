@@ -23,8 +23,7 @@ static int badfn_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
-        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s",
-                 test_storage(), rest);
+        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
         snprintf(out->redir_target, sizeof out->redir_target, "/virt");
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
@@ -47,18 +46,18 @@ static int badfn_probe(const NspQueryCtx* q, NspProbeResult* out) {
    → nsp_fence_readdir_extra / nsp_fence_get_pkg 返回 NSP_FENCE_BADFN */
 static const NspModuleOps badfn_ops = {
     .resolve = badfn_resolve,
-    .probe   = badfn_probe,
+    .probe = badfn_probe,
     /* readdir_extra = NULL, get_pkg = NULL */
 };
 
 const NspModuleInfo nsp_module_info = {
-    .magic       = NSP_MODULE_MAGIC,
+    .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type        = NSP_MODULE_TYPE_RULES,
-    .caps        = NSP_CAP_REDIRECT,
-    .name        = "badfn_rules",
-    .version     = "1.0",
-    .init        = NULL,
-    .exit        = NULL,
-    .ops         = &badfn_ops,
+    .type = NSP_MODULE_TYPE_RULES,
+    .caps = NSP_CAP_REDIRECT,
+    .name = "badfn_rules",
+    .version = "1.0",
+    .init = NULL,
+    .exit = NULL,
+    .ops = &badfn_ops,
 };

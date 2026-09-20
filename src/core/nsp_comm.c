@@ -14,49 +14,50 @@
 #include <unistd.h>
 
 /* 通道容量（槽数）与单条上限：LOG 沿用旧 ring 2048 条；BCAST JSON 可达数百 KB */
-static const uint64_t kCap[NSP_CH__N] = { 2048, 64, 32 };
-static const size_t kMaxPayload[NSP_CH__N] = { 16 * 1024, 1024, 1024 * 1024 };
+static const uint64_t kCap[NSP_CH__N] = {2048, 64, 32};
+static const size_t kMaxPayload[NSP_CH__N] = {16 * 1024, 1024, 1024 * 1024};
 /* drain 优先级：生命线 IPC > 日志 LOG > 广播 BCAST */
-static const nsp_ch_t kPrio[NSP_CH__N] = { NSP_CH_IPC, NSP_CH_LOG, NSP_CH_BCAST };
-#define DRAIN_BATCH 64          /* 单轮单通道最多取走条数（有界临界区外发送） */
-#define BACKOFF_MIN_MS 100      /* 重连退避起点（与旧 sender 100ms 一致） */
+static const nsp_ch_t kPrio[NSP_CH__N] = {NSP_CH_IPC, NSP_CH_LOG, NSP_CH_BCAST};
+#define DRAIN_BATCH    64  /* 单轮单通道最多取走条数（有界临界区外发送） */
+#define BACKOFF_MIN_MS 100 /* 重连退避起点（与旧 sender 100ms 一致） */
 #define BACKOFF_MAX_MS 1000
 
 typedef struct {
-    void *data;
+    void* data;
     size_t len;
 } slot_t;
 
 typedef struct {
-    pthread_mutex_t lock;       /* 仅保护 head/tail/slots，临界区内无 IO、无大拷贝 */
-    slot_t *slots;
-    uint64_t cap;               /* 2 的幂 */
+    pthread_mutex_t lock; /* 仅保护 head/tail/slots，临界区内无 IO、无大拷贝 */
+    slot_t* slots;
+    uint64_t cap; /* 2 的幂 */
     uint64_t mask;
-    uint64_t head;              /* 下一写入位 */
-    uint64_t tail;              /* 下一读出位 */
+    uint64_t head; /* 下一写入位 */
+    uint64_t tail; /* 下一读出位 */
     size_t max_payload;
-    _Atomic uint64_t dropped;   /* 累计覆盖/丢弃（含未 init、超长、满环、链路断时批丢） */
+    _Atomic uint64_t dropped;        /* 累计覆盖/丢弃（含未 init、超长、满环、链路断时批丢） */
     _Atomic uint64_t pending_report; /* 待上报丢弃数：post 侧 fetch_add，drain 侧 exchange 取走 */
     nsp_comm_backend_t be;
     _Atomic bool has_be;
     /* 链路状态（仅 comm 线程触碰） */
     bool link_up;
     uint64_t backoff_ms;
-    uint64_t retry_at_ms;       /* monotonic ms，0=无需定时 */
+    uint64_t retry_at_ms; /* monotonic ms，0=无需定时 */
 } channel_t;
 
 static channel_t g_ch[NSP_CH__N];
 static bool g_ch_init = false; /* 仅 g_init_lock 内读写 */
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool g_inited = false;  /* 仅 g_init_lock 内读写 */
+static bool g_inited = false; /* 仅 g_init_lock 内读写 */
 static _Atomic bool g_shutdown = false;
-static _Atomic bool g_accepting = false; /* fini 置 false 后 post 只计数不写 fd（断 fini/close 竞态） */
+static _Atomic bool g_accepting =
+    false; /* fini 置 false 后 post 只计数不写 fd（断 fini/close 竞态） */
 static pthread_t g_tid;
 static int g_epfd = -1;
 static int g_evfd = -1;
 static int g_timerfd = -1;
 
-static void *nsp_comm_thread(void *arg);
+static void* nsp_comm_thread(void* arg);
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -67,7 +68,7 @@ static uint64_t now_ms(void) {
 static void ch_setup(void) {
     if (g_ch_init) return;
     for (int c = 0; c < NSP_CH__N; c++) {
-        channel_t *ch = &g_ch[c];
+        channel_t* ch = &g_ch[c];
         pthread_mutex_init(&ch->lock, NULL);
         ch->cap = kCap[c];
         ch->mask = ch->cap - 1;
@@ -84,7 +85,10 @@ static void ch_setup(void) {
 int nsp_comm_init(void) {
     pthread_mutex_lock(&g_init_lock);
     ch_setup();
-    if (g_inited) { pthread_mutex_unlock(&g_init_lock); return 0; }
+    if (g_inited) {
+        pthread_mutex_unlock(&g_init_lock);
+        return 0;
+    }
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
     g_evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     g_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -96,7 +100,7 @@ int nsp_comm_init(void) {
         pthread_mutex_unlock(&g_init_lock);
         return -1;
     }
-    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = 0 };
+    struct epoll_event ev = {.events = EPOLLIN, .data.u32 = 0};
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_evfd, &ev);
     ev.data.u32 = 1;
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_timerfd, &ev);
@@ -104,7 +108,9 @@ int nsp_comm_init(void) {
     atomic_store(&g_accepting, true);
     if (pthread_create(&g_tid, NULL, nsp_comm_thread, NULL) != 0) {
         atomic_store(&g_accepting, false);
-        close(g_epfd); close(g_evfd); close(g_timerfd);
+        close(g_epfd);
+        close(g_evfd);
+        close(g_timerfd);
         g_epfd = g_evfd = g_timerfd = -1;
         pthread_mutex_unlock(&g_init_lock);
         return -1;
@@ -114,11 +120,11 @@ int nsp_comm_init(void) {
     return 0;
 }
 
-int nsp_comm_register(nsp_ch_t ch, const nsp_comm_backend_t *be) {
+int nsp_comm_register(nsp_ch_t ch, const nsp_comm_backend_t* be) {
     if ((int)ch < 0 || ch >= NSP_CH__N || !be || !be->emit) return -1;
     pthread_mutex_lock(&g_init_lock);
     ch_setup();
-    channel_t *c = &g_ch[ch];
+    channel_t* c = &g_ch[ch];
     pthread_mutex_lock(&c->lock);
     c->be = *be;
     pthread_mutex_unlock(&c->lock);
@@ -128,9 +134,9 @@ int nsp_comm_register(nsp_ch_t ch, const nsp_comm_backend_t *be) {
 }
 
 /* 空转非空才写一次 eventfd（批量唤醒，稳态高吞吐下单次 write 覆盖一批 post） */
-void nsp_comm_post(nsp_ch_t ch, const void *data, size_t len) {
+void nsp_comm_post(nsp_ch_t ch, const void* data, size_t len) {
     if ((int)ch < 0 || ch >= NSP_CH__N || !data || len == 0) return;
-    channel_t *c = &g_ch[ch];
+    channel_t* c = &g_ch[ch];
     /* 未注册/已 fini → 只计数不触碰环与 fd（fini 后 post 安全） */
     if (!atomic_load(&g_accepting) || !atomic_load(&c->has_be)) {
         atomic_fetch_add(&c->dropped, 1);
@@ -141,7 +147,7 @@ void nsp_comm_post(nsp_ch_t ch, const void *data, size_t len) {
         atomic_fetch_add(&c->pending_report, 1);
         return;
     }
-    void *copy = malloc(len);
+    void* copy = malloc(len);
     if (!copy) {
         atomic_fetch_add(&c->dropped, 1);
         return;
@@ -160,7 +166,7 @@ void nsp_comm_post(nsp_ch_t ch, const void *data, size_t len) {
     }
     if (c->head - c->tail >= c->cap) {
         /* 满环覆盖最旧（与旧 sender 语义一致）+ 计数 */
-        slot_t *old = &c->slots[c->tail & c->mask];
+        slot_t* old = &c->slots[c->tail & c->mask];
         free(old->data);
         c->tail++;
         atomic_fetch_add(&c->dropped, 1);
@@ -168,7 +174,7 @@ void nsp_comm_post(nsp_ch_t ch, const void *data, size_t len) {
     } else if (c->head == c->tail) {
         wake = true;
     }
-    slot_t *s = &c->slots[c->head & c->mask];
+    slot_t* s = &c->slots[c->head & c->mask];
     s->data = copy;
     s->len = len;
     c->head++;
@@ -207,11 +213,11 @@ static void arm_timer(uint64_t at_ms) {
 }
 
 /* 取一批（调用方持有返回数组；失败只发生在链路断时由调用方计 dropped） */
-static int ch_take(channel_t *c, void **out_data, size_t *out_len, int max) {
+static int ch_take(channel_t* c, void** out_data, size_t* out_len, int max) {
     int n = 0;
     pthread_mutex_lock(&c->lock);
     while (n < max && c->tail != c->head) {
-        slot_t *s = &c->slots[c->tail & c->mask];
+        slot_t* s = &c->slots[c->tail & c->mask];
         out_data[n] = s->data;
         out_len[n] = s->len;
         s->data = NULL;
@@ -225,8 +231,8 @@ static int ch_take(channel_t *c, void **out_data, size_t *out_len, int max) {
 
 /* 单通道排空至空（循环取批发送）：修复旧版单轮 64 条上限 + 空转非空才唤醒
    组合导致的永久堆积。链路断/退避未到期则跳出等下轮。 */
-static void drain_channel(nsp_ch_t ch_id, bool for_shutdown, uint64_t *earliest) {
-    channel_t *c = &g_ch[ch_id];
+static void drain_channel(nsp_ch_t ch_id, bool for_shutdown, uint64_t* earliest) {
+    channel_t* c = &g_ch[ch_id];
     if (!atomic_load(&c->has_be)) return;
     for (;;) {
         uint64_t now = now_ms();
@@ -253,7 +259,7 @@ static void drain_channel(nsp_ch_t ch_id, bool for_shutdown, uint64_t *earliest)
             c->backoff_ms = BACKOFF_MIN_MS;
             c->retry_at_ms = 0;
         }
-        void *bufs[DRAIN_BATCH];
+        void* bufs[DRAIN_BATCH];
         size_t lens[DRAIN_BATCH];
         int n = ch_take(c, bufs, lens, DRAIN_BATCH);
         if (n == 0) break;
@@ -276,7 +282,7 @@ static void drain_channel(nsp_ch_t ch_id, bool for_shutdown, uint64_t *earliest)
                 break;
             }
         }
-        if (!c->link_up) break;   /* 刚断链：等退避，不再空转 */
+        if (!c->link_up) break; /* 刚断链：等退避，不再空转 */
     }
     /* 本轮上报覆盖丢弃（exchange 取走一次，避免风暴） */
     if (c->be.report) {
@@ -287,12 +293,11 @@ static void drain_channel(nsp_ch_t ch_id, bool for_shutdown, uint64_t *earliest)
 
 static void drain_once(bool for_shutdown) {
     uint64_t earliest = 0;
-    for (int p = 0; p < NSP_CH__N; p++)
-        drain_channel(kPrio[p], for_shutdown, &earliest);
+    for (int p = 0; p < NSP_CH__N; p++) drain_channel(kPrio[p], for_shutdown, &earliest);
     if (!for_shutdown) arm_timer(earliest);
 }
 
-static void *nsp_comm_thread(void *arg) {
+static void* nsp_comm_thread(void* arg) {
     (void)arg;
     nsp_set_thread_name("nsp_comm");
     struct epoll_event evs[4];
@@ -306,10 +311,12 @@ static void *nsp_comm_thread(void *arg) {
         for (int i = 0; i < n; i++) {
             if (evs[i].data.u32 == 0) {
                 uint64_t v;
-                while (read(g_evfd, &v, sizeof(v)) > 0) { } /* 读空防忙转 */
+                while (read(g_evfd, &v, sizeof(v)) > 0) {
+                } /* 读空防忙转 */
             } else {
                 uint64_t v;
-                while (read(g_timerfd, &v, sizeof(v)) > 0) { }
+                while (read(g_timerfd, &v, sizeof(v)) > 0) {
+                }
             }
         }
         drain_once(false);
@@ -320,7 +327,10 @@ static void *nsp_comm_thread(void *arg) {
 
 void nsp_comm_fini(void) {
     pthread_mutex_lock(&g_init_lock);
-    if (!g_inited) { pthread_mutex_unlock(&g_init_lock); return; }
+    if (!g_inited) {
+        pthread_mutex_unlock(&g_init_lock);
+        return;
+    }
     g_inited = false;
     /* 先停接收：此后 post 只计数不写 fd，join 前无任何线程能触碰待关闭 fd */
     atomic_store(&g_accepting, false);
@@ -330,7 +340,7 @@ void nsp_comm_fini(void) {
     pthread_mutex_unlock(&g_init_lock);
     pthread_join(g_tid, NULL);
     for (int c = 0; c < NSP_CH__N; c++) {
-        channel_t *ch = &g_ch[c];
+        channel_t* ch = &g_ch[c];
         if (atomic_load(&ch->has_be) && ch->be.fini) ch->be.fini(ch->be.ctx);
         pthread_mutex_lock(&ch->lock);
         while (ch->tail != ch->head) {
@@ -344,7 +354,9 @@ void nsp_comm_fini(void) {
     }
     /* P1：关 fd 持 g_init_lock，与 post 侧唤醒写同锁，互斥 close/write */
     pthread_mutex_lock(&g_init_lock);
-    close(g_epfd); close(g_evfd); close(g_timerfd);
+    close(g_epfd);
+    close(g_evfd);
+    close(g_timerfd);
     g_epfd = g_evfd = g_timerfd = -1;
     pthread_mutex_unlock(&g_init_lock);
 }

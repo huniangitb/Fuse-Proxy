@@ -46,20 +46,18 @@ static __thread FenceTls* tls_fence = NULL;
 static FenceTls* ensure_fence(void) {
     if (!tls_fence) {
         FenceTls* f = calloc(1, sizeof(FenceTls));
-        if (f) { f->slot = -1; tls_fence = f; }   /* 必须回写 TLS 指针：
+        if (f) {
+            f->slot = -1;
+            tls_fence = f;
+        } /* 必须回写 TLS 指针：
             信号处理器经 tls_fence 定位窗口，漏写则归因恒 NULL，围栏失效 */
 
         /* P1 修复：sigaltstack 是 per-thread 的（非全局），FUSE worker
            线程不继承主线程的 altstack。此处为每个首次调用围栏的线程
            设置独立 altstack（TLS 静态缓冲），确保模块踩坏线程栈后
            崩溃处理器仍可运行于独立栈上。 */
-        static __thread char tls_altstack[FENCE_ALTSTACK_SIZE]
-            __attribute__((aligned(16)));
-        stack_t ss = {
-            .ss_sp = tls_altstack,
-            .ss_size = sizeof(tls_altstack),
-            .ss_flags = 0
-        };
+        static __thread char tls_altstack[FENCE_ALTSTACK_SIZE] __attribute__((aligned(16)));
+        stack_t ss = {.ss_sp = tls_altstack, .ss_size = sizeof(tls_altstack), .ss_flags = 0};
         sigaltstack(&ss, NULL);
 
         return f;
@@ -69,7 +67,7 @@ static FenceTls* ensure_fence(void) {
 
 /* ================= 静态槽位注册表（信号安全） ================= */
 
-#define FENCE_MAX_SLOTS 16  /* 与 MAX_MODULES 一致（module_loader.h） */
+#define FENCE_MAX_SLOTS 16 /* 与 MAX_MODULES 一致（module_loader.h） */
 
 typedef struct {
     char name[64];
@@ -90,8 +88,7 @@ void fault_fence_unregister_slot(int slot) {
     g_slots[slot].name[0] = '\0';
 }
 
-void fault_fence_attribution(int* slot_out, const char** op_out,
-                             const char** name_out) {
+void fault_fence_attribution(int* slot_out, const char** op_out, const char** name_out) {
     FenceTls* f = tls_fence;
     if (!f || !f->in_window) {
         if (slot_out) *slot_out = -1;
@@ -102,8 +99,10 @@ void fault_fence_attribution(int* slot_out, const char** op_out,
     int slot = f->slot;
     if (slot_out) *slot_out = slot;
     if (op_out) *op_out = f->op;
-    if (name_out) *name_out = (slot >= 0 && slot < FENCE_MAX_SLOTS &&
-                               g_slots[slot].name[0]) ? g_slots[slot].name : "(unknown)";
+    if (name_out)
+        *name_out = (slot >= 0 && slot < FENCE_MAX_SLOTS && g_slots[slot].name[0])
+                        ? g_slots[slot].name
+                        : "(unknown)";
 }
 
 /* ================= 崩溃处理器（外层包壳） ================= */
@@ -123,7 +122,7 @@ static __thread volatile int in_handler = 0;
 
 bool fault_fence_handle_fault(void) {
     int slot = -1;
-    const char* op = NULL, *name = NULL;
+    const char *op = NULL, *name = NULL;
     fault_fence_attribution(&slot, &op, &name);
     if (slot < 0 || slot >= FENCE_MAX_SLOTS) return false;
     FenceTls* f = tls_fence;
@@ -133,7 +132,7 @@ bool fault_fence_handle_fault(void) {
        不变量：窗口内不持有任何框架锁（见 fault_fence.h）。 */
     in_handler = 0;
     siglongjmp(f->jb, 1);
-    return true;  /* 不可达 */
+    return true; /* 不可达 */
 }
 
 static void fence_sigdie(int sig) {
@@ -147,14 +146,19 @@ static void fence_sigdie(int sig) {
 }
 
 static void fence_crash_handler(int sig, siginfo_t* info, void* uctx) {
-    if (in_handler) { fence_sigdie(sig); }
+    if (in_handler) {
+        fence_sigdie(sig);
+    }
     in_handler = 1;
-    if (fault_fence_handle_fault()) return;   /* 不可达（longjmp，前已清零） */
+    if (fault_fence_handle_fault()) return; /* 不可达（longjmp，前已清零） */
     in_handler = 0;
     /* 归因失败：委托原处理器（dump + re-raise），行为与改造前一致 */
     NspOrigCrashHandler h = atomic_load_explicit(&g_orig_handler, memory_order_acquire);
-    if (h) h(sig, info, uctx);
-    else { fence_sigdie(sig); }
+    if (h)
+        h(sig, info, uctx);
+    else {
+        fence_sigdie(sig);
+    }
     /* 不可达 */
 }
 
@@ -170,9 +174,9 @@ void fault_fence_rearm(void) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
-    sigaction(SIGFPE,  &sa, NULL);
-    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
 }
 
@@ -197,72 +201,69 @@ void fault_fence_init(void) {
  * 返回 NSP_FENCE_FAULT（崩溃时模块返回码无意义，不透传）。
  * 正常路径透传模块返回码（0/负值）。
  */
-#define NSP_FENCE_WRAP(slot, op_name, fn_call_expr) \
-    do { \
-        FenceTls* __f = ensure_fence(); \
-        if (!__f) return NSP_FENCE_BADFN;   /* calloc 失败（OOM）：防御性失败 */ \
-        __f->slot = (slot); \
-        __f->op = (op_name); \
-        __f->in_window = 1; \
-        if (sigsetjmp(__f->jb, 1) != 0) { \
-            __f->in_window = 0; \
-            __f->slot = -1; \
-            __f->op = NULL; \
-            return NSP_FENCE_FAULT; \
-        } \
-        int __rc = (fn_call_expr); \
-        __f->in_window = 0; \
-        __f->slot = -1; \
-        __f->op = NULL; \
-        return (int)(__rc); \
+#define NSP_FENCE_WRAP(slot, op_name, fn_call_expr)                            \
+    do {                                                                       \
+        FenceTls* __f = ensure_fence();                                        \
+        if (!__f) return NSP_FENCE_BADFN; /* calloc 失败（OOM）：防御性失败 */ \
+        __f->slot = (slot);                                                    \
+        __f->op = (op_name);                                                   \
+        __f->in_window = 1;                                                    \
+        if (sigsetjmp(__f->jb, 1) != 0) {                                      \
+            __f->in_window = 0;                                                \
+            __f->slot = -1;                                                    \
+            __f->op = NULL;                                                    \
+            return NSP_FENCE_FAULT;                                            \
+        }                                                                      \
+        int __rc = (fn_call_expr);                                             \
+        __f->in_window = 0;                                                    \
+        __f->slot = -1;                                                        \
+        __f->op = NULL;                                                        \
+        return (int)(__rc);                                                    \
     } while (0)
 
 /* void 返回型模板：正常返回 0 */
 #define NSP_FENCE_WRAP_VOID(slot, op_name, fn_call_expr) \
-    do { \
-        FenceTls* __f = ensure_fence(); \
-        if (!__f) return NSP_FENCE_BADFN; \
-        __f->slot = (slot); \
-        __f->op = (op_name); \
-        __f->in_window = 1; \
-        if (sigsetjmp(__f->jb, 1) != 0) { \
-            __f->in_window = 0; \
-            __f->slot = -1; \
-            __f->op = NULL; \
-            return NSP_FENCE_FAULT; \
-        } \
-        (fn_call_expr); \
-        __f->in_window = 0; \
-        __f->slot = -1; \
-        __f->op = NULL; \
-        return 0; \
+    do {                                                 \
+        FenceTls* __f = ensure_fence();                  \
+        if (!__f) return NSP_FENCE_BADFN;                \
+        __f->slot = (slot);                              \
+        __f->op = (op_name);                             \
+        __f->in_window = 1;                              \
+        if (sigsetjmp(__f->jb, 1) != 0) {                \
+            __f->in_window = 0;                          \
+            __f->slot = -1;                              \
+            __f->op = NULL;                              \
+            return NSP_FENCE_FAULT;                      \
+        }                                                \
+        (fn_call_expr);                                  \
+        __f->in_window = 0;                              \
+        __f->slot = -1;                                  \
+        __f->op = NULL;                                  \
+        return 0;                                        \
     } while (0)
 
 /* ================= 规则能力 ================= */
 
 int nsp_fence_resolve(int slot, const char* op_name,
-                      int (*fn)(const NspQueryCtx*, NspResolveResult*),
-                      const NspQueryCtx* q, NspResolveResult* out) {
+                      int (*fn)(const NspQueryCtx*, NspResolveResult*), const NspQueryCtx* q,
+                      NspResolveResult* out) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(q, out));
 }
-int nsp_fence_probe(int slot, const char* op_name,
-                    int (*fn)(const NspQueryCtx*, NspProbeResult*),
+int nsp_fence_probe(int slot, const char* op_name, int (*fn)(const NspQueryCtx*, NspProbeResult*),
                     const NspQueryCtx* q, NspProbeResult* out) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(q, out));
 }
 int nsp_fence_readdir_extra(int slot, const char* op_name,
-                            int (*fn)(const NspQueryCtx*, const char*, int,
-                                      const char*, bool, NspDirEntry*, int),
-                            const NspQueryCtx* q, const char* sub_path,
-                            int user_id, const char* pkg, bool is_root,
-                            NspDirEntry* out, int max) {
+                            int (*fn)(const NspQueryCtx*, const char*, int, const char*, bool,
+                                      NspDirEntry*, int),
+                            const NspQueryCtx* q, const char* sub_path, int user_id,
+                            const char* pkg, bool is_root, NspDirEntry* out, int max) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(q, sub_path, user_id, pkg, is_root, out, max));
 }
-int nsp_fence_get_pkg(int slot, const char* op_name,
-                      int (*fn)(uid_t, pid_t, char*, size_t),
+int nsp_fence_get_pkg(int slot, const char* op_name, int (*fn)(uid_t, pid_t, char*, size_t),
                       uid_t uid, pid_t tid, char* out, size_t sz) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(uid, tid, out, sz));
@@ -270,78 +271,69 @@ int nsp_fence_get_pkg(int slot, const char* op_name,
 
 /* ================= 后端能力 ================= */
 
-int nsp_fence_backend_match(int slot, const char* op_name,
-                            int (*fn)(const char*), const char* path) {
+int nsp_fence_backend_match(int slot, const char* op_name, int (*fn)(const char*),
+                            const char* path) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path));
 }
-int nsp_fence_backend_getattr(int slot, const char* op_name,
-                              int (*fn)(const char*, struct stat*),
+int nsp_fence_backend_getattr(int slot, const char* op_name, int (*fn)(const char*, struct stat*),
                               const char* path, struct stat* st) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path, st));
 }
 int nsp_fence_backend_readdir(int slot, const char* op_name,
-                              int (*fn)(const char*, NspDirEntry*, int),
-                              const char* path, NspDirEntry* entries, int max) {
+                              int (*fn)(const char*, NspDirEntry*, int), const char* path,
+                              NspDirEntry* entries, int max) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path, entries, max));
 }
-int nsp_fence_backend_open(int slot, const char* op_name,
-                           int (*fn)(const char*, int, uint64_t*),
+int nsp_fence_backend_open(int slot, const char* op_name, int (*fn)(const char*, int, uint64_t*),
                            const char* path, int flags, uint64_t* h) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path, flags, h));
 }
 int nsp_fence_backend_read(int slot, const char* op_name,
-                           int (*fn)(uint64_t, char*, size_t, off_t, size_t*),
-                           uint64_t h, char* buf, size_t size, off_t off,
-                           size_t* got) {
+                           int (*fn)(uint64_t, char*, size_t, off_t, size_t*), uint64_t h,
+                           char* buf, size_t size, off_t off, size_t* got) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(h, buf, size, off, got));
 }
 int nsp_fence_backend_write(int slot, const char* op_name,
-                            int (*fn)(uint64_t, const char*, size_t, off_t, size_t*),
-                            uint64_t h, const char* buf, size_t size, off_t off,
-                            size_t* wrote) {
+                            int (*fn)(uint64_t, const char*, size_t, off_t, size_t*), uint64_t h,
+                            const char* buf, size_t size, off_t off, size_t* wrote) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(h, buf, size, off, wrote));
 }
-int nsp_fence_backend_flush(int slot, const char* op_name,
-                            int (*fn)(uint64_t), uint64_t h) {
+int nsp_fence_backend_flush(int slot, const char* op_name, int (*fn)(uint64_t), uint64_t h) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(h));
 }
-int nsp_fence_backend_release(int slot, const char* op_name,
-                              int (*fn)(uint64_t), uint64_t h) {
+int nsp_fence_backend_release(int slot, const char* op_name, int (*fn)(uint64_t), uint64_t h) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(h));
 }
 int nsp_fence_backend_create(int slot, const char* op_name,
-                             int (*fn)(const char*, mode_t, uint64_t*),
-                             const char* path, mode_t mode, uint64_t* h) {
+                             int (*fn)(const char*, mode_t, uint64_t*), const char* path,
+                             mode_t mode, uint64_t* h) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path, mode, h));
 }
-int nsp_fence_backend_simple(int slot, const char* op_name,
-                             int (*fn)(const char*), const char* path) {
+int nsp_fence_backend_simple(int slot, const char* op_name, int (*fn)(const char*),
+                             const char* path) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path));
 }
-int nsp_fence_backend_mkdir(int slot, const char* op_name,
-                            int (*fn)(const char*, mode_t),
+int nsp_fence_backend_mkdir(int slot, const char* op_name, int (*fn)(const char*, mode_t),
                             const char* path, mode_t mode) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path, mode));
 }
-int nsp_fence_backend_rename(int slot, const char* op_name,
-                             int (*fn)(const char*, const char*),
+int nsp_fence_backend_rename(int slot, const char* op_name, int (*fn)(const char*, const char*),
                              const char* from, const char* to) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(from, to));
 }
-int nsp_fence_backend_truncate(int slot, const char* op_name,
-                               int (*fn)(const char*, off_t),
+int nsp_fence_backend_truncate(int slot, const char* op_name, int (*fn)(const char*, off_t),
                                const char* path, off_t size) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(path, size));
@@ -349,8 +341,8 @@ int nsp_fence_backend_truncate(int slot, const char* op_name,
 
 /* ================= 生命周期 ================= */
 
-int nsp_fence_init_call(int slot, const char* op_name,
-                        int (*fn)(const NspFrameworkApi*), const NspFrameworkApi* api) {
+int nsp_fence_init_call(int slot, const char* op_name, int (*fn)(const NspFrameworkApi*),
+                        const NspFrameworkApi* api) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(api));
 }

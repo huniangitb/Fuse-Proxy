@@ -34,19 +34,19 @@ static bool path_has_uid_layer(const char* path) {
 
 typedef struct {
     char name[64];
-    void* handle;              /* dlopen 句柄 */
-    NspModuleInfo info;        /* 静态信息拷贝 */
-    time_t mtime;              /* .so 文件 mtime，热重载检测 */
+    void* handle;       /* dlopen 句柄 */
+    NspModuleInfo info; /* 静态信息拷贝 */
+    time_t mtime;       /* .so 文件 mtime，热重载检测 */
     bool active;
-    _Atomic int backend_refs;  /* 后端 ops 在途引用计数（防热卸载 dlclose 悬垂） */
-    int (*active_handles_fn)(void);  /* 可选：活跃句柄查询（模块导出 nsp_module_active_handles），
+    _Atomic int backend_refs; /* 后端 ops 在途引用计数（防热卸载 dlclose 悬垂） */
+    int (*active_handles_fn)(void); /* 可选：活跃句柄查询（模块导出 nsp_module_active_handles），
                                         热重载 quiescence 门控——有应用 open 时延迟卸载/重载 */
-    char hash[65];                   /* 已加载 .so 文件的 SHA-256（框架计算，加载时存入）：
+    char hash[65]; /* 已加载 .so 文件的 SHA-256（框架计算，加载时存入）：
                                         热重载时与磁盘哈希比对——一致则内容未变化，跳过热加载 */
     /* ---- 熔断/ban（Phase 1a/1b）：module_guard 维护 ---- */
     _Atomic unsigned err_count;      /* 滑动窗口内错误计数（1b 熔断器） */
-    _Atomic time_t  err_window_start;/* 窗口起点（首次错误时刻） */
-    _Atomic bool    banned;          /* 已 ban：崩溃恢复/熔断触发后置位，
+    _Atomic time_t err_window_start; /* 窗口起点（首次错误时刻） */
+    _Atomic bool banned;             /* 已 ban：崩溃恢复/熔断触发后置位，
                                         扫描线程见 .so 哈希与 ban 记录一致则不重载 */
     char ban_reason[96];             /* ban 原因（日志/健康快照展示） */
 } ModuleEntry;
@@ -82,7 +82,7 @@ static _Atomic(int) g_backend_active_count = 0;
    无锁读取，免 rwlock + 线性扫描 + backend_match 前缀比较。
    槽位号由 open 时编码进 fh 高位（见 fuse_daemon.c NSP_FH_BACKEND_SLOT_*）。 */
 static _Atomic(const NspModuleOps*) g_backend_slot_ops[MAX_MODULES];
-static _Atomic(int) g_backend_slot_refs[MAX_MODULES];  /* 槽位在途引用（acquire 配对 release） */
+static _Atomic(int) g_backend_slot_refs[MAX_MODULES]; /* 槽位在途引用（acquire 配对 release） */
 /* 规则模块槽位原子快照：与后端槽位同模式，供 resolve 分派无锁读取——
    消除每请求 g_module_lock rwlock 往返（S2 热路径优化）。
    load 写锁内置 ops；unload 先置 NULL 再等 g_rule_slot_refs 归零后 dlclose。
@@ -109,7 +109,9 @@ static void api_log(int level, const char* fmt, ...) {
     log_internal((LogLevel)level, "%s", buf);
 }
 
-static const char* api_get_real_root(void) { return g_real_root; }
+static const char* api_get_real_root(void) {
+    return g_real_root;
+}
 
 /* 框架参数（module_system_init 传入） */
 static char g_fw_rules_path[PATH_MAX] = {0};
@@ -117,8 +119,12 @@ static uint32_t g_fw_flags = 0;
 /* 模块目录（默认 MODULES_DIR 宏，可经 --modules-dir 覆盖） */
 static char g_modules_dir[PATH_MAX] = MODULES_DIR;
 
-static const char* api_get_rules_path(void) { return g_fw_rules_path[0] ? g_fw_rules_path : NULL; }
-static uint32_t api_get_flags(void) { return g_fw_flags; }
+static const char* api_get_rules_path(void) {
+    return g_fw_rules_path[0] ? g_fw_rules_path : NULL;
+}
+static uint32_t api_get_flags(void) {
+    return g_fw_flags;
+}
 
 static const NspFrameworkApi g_api = {
     .api_version = NSP_FRAMEWORK_API_VERSION,
@@ -133,15 +139,13 @@ static const NspFrameworkApi g_api = {
 static bool is_valid_module_name(const char* n) {
     if (!n || !n[0] || strlen(n) >= 64) return false;
     for (const char* p = n; *p; p++) {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
-              *p == '_' || *p == '-'))
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
             return false;
     }
     return true;
 }
 
-#define RULE_CAPS (NSP_CAP_REDIRECT | NSP_CAP_SANDBOX | NSP_CAP_HIDE | \
-                   NSP_CAP_ALLOW | NSP_CAP_RO)
+#define RULE_CAPS (NSP_CAP_REDIRECT | NSP_CAP_SANDBOX | NSP_CAP_HIDE | NSP_CAP_ALLOW | NSP_CAP_RO)
 
 static int find_slot(const char* name) {
     for (int i = 0; i < g_module_count; i++)
@@ -216,8 +220,8 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         return -2;
     }
     if (info->magic != NSP_MODULE_MAGIC || info->abi_version != NSP_MODULE_ABI_VERSION) {
-        LOG_ERR("模块 %s ABI 不匹配 (magic=0x%x abi=%u，期望 0x%x/%u)",
-                name, info->magic, info->abi_version, NSP_MODULE_MAGIC, NSP_MODULE_ABI_VERSION);
+        LOG_ERR("模块 %s ABI 不匹配 (magic=0x%x abi=%u，期望 0x%x/%u)", name, info->magic,
+                info->abi_version, NSP_MODULE_MAGIC, NSP_MODULE_ABI_VERSION);
         dlclose(h);
         return -3;
     }
@@ -234,8 +238,7 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         if (self_hash) {
             const char* mh = self_hash();
             if (!mh || strcmp(mh, hash_out) != 0) {
-                LOG_ERR("模块 %s 自哈希与文件哈希不一致（文件被修改/替换？），拒绝加载",
-                        name);
+                LOG_ERR("模块 %s 自哈希与文件哈希不一致（文件被修改/替换？），拒绝加载", name);
                 dlclose(h);
                 return -7;
             }
@@ -250,7 +253,9 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         fault_fence_register_slot(tent_slot, name, h);
         int irc = nsp_fence_init_call(tent_slot, "init", info->init, &g_api);
         if (irc == NSP_FENCE_FAULT) {
-            LOG_ERR("[MOD_ERR] module=%s op=init reason=init 崩溃被围栏恢复 detail=拒绝加载并落盘 ban", name);
+            LOG_ERR(
+                "[MOD_ERR] module=%s op=init reason=init 崩溃被围栏恢复 detail=拒绝加载并落盘 ban",
+                name);
             module_ban_record(name, hash_out, "init crash");
             fault_fence_unregister_slot(tent_slot);
             dlclose(h);
@@ -262,7 +267,7 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
             dlclose(h);
             return -5;
         }
-        fault_fence_unregister_slot(tent_slot);  /* commit 时按正式槽位再注册 */
+        fault_fence_unregister_slot(tent_slot); /* commit 时按正式槽位再注册 */
     }
     *h_out = h;
     *info_out = *info;
@@ -270,8 +275,7 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
 }
 
 /* 登记已校验模块到槽位（写锁内发布原子快照/链），并存入文件哈希 */
-static int module_commit(const char* name, void* h, const NspModuleInfo* info,
-                         const char* hash) {
+static int module_commit(const char* name, void* h, const NspModuleInfo* info, const char* hash) {
     char so_path[PATH_MAX];
     snprintf(so_path, sizeof so_path, "%s/%s/%s.so", g_modules_dir, name, name);
     pthread_rwlock_wrlock(&g_module_lock);
@@ -283,13 +287,19 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info,
     for (int i = 0; i < g_module_count; i++) {
         if (!g_modules[i].active && strcmp(g_modules[i].name, name) == 0 &&
             atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0 &&
-            atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) { slot = i; break; }
+            atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) {
+            slot = i;
+            break;
+        }
     }
     if (slot < 0) {
         for (int i = 0; i < g_module_count; i++) {
             if (!g_modules[i].active &&
                 atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0 &&
-                atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) { slot = i; break; }
+                atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) {
+                slot = i;
+                break;
+            }
         }
     }
     if (slot < 0) {
@@ -309,7 +319,7 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info,
     memset(m, 0, sizeof *m);
     strncpy(m->name, name, sizeof m->name - 1);
     m->handle = h;
-    m->info = *info;          /* 浅拷贝：info->ops 指针有效 */
+    m->info = *info; /* 浅拷贝：info->ops 指针有效 */
     /* 可选活跃句柄查询（热重载 quiescence 门控）：模块导出则使用，缺省视为 0 */
     m->active_handles_fn = (int (*)(void))dlsym(h, "nsp_module_active_handles");
     if (hash && hash[0]) strncpy(m->hash, hash, sizeof m->hash - 1);
@@ -330,8 +340,8 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info,
     }
     pthread_rwlock_unlock(&g_module_lock);
 
-    LOG("模块已加载: %s v%s (类型=%u caps=0x%x)", name,
-        info->version ? info->version : "?", info->type, info->caps);
+    LOG("模块已加载: %s v%s (类型=%u caps=0x%x)", name, info->version ? info->version : "?",
+        info->type, info->caps);
     return 0;
 }
 
@@ -358,8 +368,7 @@ static int module_load_one(const char* name) {
     void* h = NULL;
     NspModuleInfo info;
     char hash[65] = {0};
-    if (module_prepare(name, &h, &info, hash) != 0)
-        return -1;
+    if (module_prepare(name, &h, &info, hash) != 0) return -1;
     return module_commit(name, h, &info, hash);
 }
 
@@ -432,7 +441,9 @@ static int module_unload_one(const char* name) {
     if (info.exit) {
         int erc = nsp_fence_exit_call(slot, "exit", info.exit);
         if (erc == NSP_FENCE_FAULT)
-            LOG_WRN("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 detail=跳过 exit 直接 dlclose", name);
+            LOG_WRN(
+                "[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 detail=跳过 exit 直接 dlclose",
+                name);
     }
     dlclose(h);
     fault_fence_unregister_slot(slot);
@@ -460,7 +471,7 @@ static bool module_ban_lookup(const char* name, const char* hash, char reason_ou
     banned_path_init();
     if (!name || !name[0]) return false;
     FILE* fp = fopen(g_banned_path, "r");
-    if (!fp) return false;   /* 无 ban 记录 */
+    if (!fp) return false; /* 无 ban 记录 */
     /* 共享锁：防与置毒线程追加/重写并发读到半行 */
     flock(fileno(fp), LOCK_SH);
     char line[512];
@@ -475,7 +486,9 @@ static bool module_ban_lookup(const char* name, const char* hash, char reason_ou
         /* fgets 截断（行超 511 且无换行）：残片当新行会误判，整行丢弃 */
         if (len == sizeof line - 1 && line[len - 1] != '\n') {
             int c;
-            do { c = fgetc(fp); } while (c != '\n' && c != EOF);
+            do {
+                c = fgetc(fp);
+            } while (c != '\n' && c != EOF);
             continue;
         }
         if (len && line[len - 1] == '\n') line[--len] = '\0';
@@ -490,8 +503,12 @@ static bool module_ban_lookup(const char* name, const char* hash, char reason_ou
         if (strcmp(lname, name) != 0) {
             /* 用原始完整行写入 rewrite（非截断后的仅模块名） */
             size_t olen = strlen(original);
-            if (rl + olen + 2 < sizeof rewrite) { strcat(rewrite, original); strcat(rewrite, "\n"); rl = strlen(rewrite); }
-            else overflow = true;
+            if (rl + olen + 2 < sizeof rewrite) {
+                strcat(rewrite, original);
+                strcat(rewrite, "\n");
+                rl = strlen(rewrite);
+            } else
+                overflow = true;
             continue;
         }
         has_name = true;
@@ -515,18 +532,26 @@ static bool module_ban_lookup(const char* name, const char* hash, char reason_ou
             }
             /* 命中行同样保留进 rewrite（ban 未解除，不删除） */
             size_t olen = strlen(original);
-            if (rl + olen + 2 < sizeof rewrite) { strcat(rewrite, original); strcat(rewrite, "\n"); rl = strlen(rewrite); }
-            else overflow = true;
+            if (rl + olen + 2 < sizeof rewrite) {
+                strcat(rewrite, original);
+                strcat(rewrite, "\n");
+                rl = strlen(rewrite);
+            } else
+                overflow = true;
         } else {
             /* 哈希为空（sha 失败）时不判 stale：保守命中防坏模块无限重载 */
             if (hash_empty) {
                 found = true;
                 if (reason_out) snprintf(reason_out, 96, "hash-unavailable 保守命中");
                 size_t olen = strlen(original);
-                if (rl + olen + 2 < sizeof rewrite) { strcat(rewrite, original); strcat(rewrite, "\n"); rl = strlen(rewrite); }
-                else overflow = true;
+                if (rl + olen + 2 < sizeof rewrite) {
+                    strcat(rewrite, original);
+                    strcat(rewrite, "\n");
+                    rl = strlen(rewrite);
+                } else
+                    overflow = true;
             } else {
-                stale = true;   /* 哈希变化：记录失效，重写时丢弃该行 */
+                stale = true; /* 哈希变化：记录失效，重写时丢弃该行 */
             }
         }
     }
@@ -560,8 +585,7 @@ static void module_ban_record(const char* name, const char* hash, const char* re
     flock(fileno(fp), LOCK_EX);
     time_t now = time(NULL);
     /* reason 为固定串（不含 '|'），name 受 is_valid_module_name 约束，防格式破坏 */
-    fprintf(fp, "%s|%s|%s|%ld\n", name, hash ? hash : "", reason ? reason : "unknown",
-            (long)now);
+    fprintf(fp, "%s|%s|%s|%ld\n", name, hash ? hash : "", reason ? reason : "unknown", (long)now);
     fflush(fp);
     fsync(fileno(fp));
     flock(fileno(fp), LOCK_UN);
@@ -582,11 +606,14 @@ static void module_ban_record(const char* name, const char* hash, const char* re
 int module_fault_poison(int slot, const char* reason) {
     if (slot < 0 || slot >= MAX_MODULES) return -1;
     pthread_rwlock_rdlock(&g_module_lock);
-    if (slot >= g_module_count) { pthread_rwlock_unlock(&g_module_lock); return -1; }
+    if (slot >= g_module_count) {
+        pthread_rwlock_unlock(&g_module_lock);
+        return -1;
+    }
     ModuleEntry* m = &g_modules[slot];
     if (atomic_load_explicit(&m->banned, memory_order_acquire)) {
         pthread_rwlock_unlock(&g_module_lock);
-        return 0;   /* 已置毒，幂等 */
+        return 0; /* 已置毒，幂等 */
     }
     /* 拷贝卸载所需信息（锁外等待） */
     char name[64] = {0}, hash[65] = {0};
@@ -607,13 +634,16 @@ int module_fault_poison(int slot, const char* reason) {
        早期 IN_CREATE 触发的扫描此刻槽位仍 active → 走"热重载"分支 →
        mtime 未变 → 跳过，安全。 */
     atomic_store_explicit(&m->banned, true, memory_order_release);
-    if (reason) { strncpy(m->ban_reason, reason, sizeof m->ban_reason - 1); m->ban_reason[sizeof m->ban_reason - 1] = '\0'; }
+    if (reason) {
+        strncpy(m->ban_reason, reason, sizeof m->ban_reason - 1);
+        m->ban_reason[sizeof m->ban_reason - 1] = '\0';
+    }
     module_ban_record(name, hash, reason);
 
     if (!was_active || !h) {
         /* 槽位本就不活跃（加载失败路径）：ban 已落盘，无需进一步处理 */
-        LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=槽位非活跃,ban 已落盘",
-                name, reason ? reason : "(null)");
+        LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=槽位非活跃,ban 已落盘", name,
+                reason ? reason : "(null)");
         return 0;
     }
 
@@ -649,7 +679,7 @@ int module_fault_poison(int slot, const char* reason) {
     if (!drained) {
         LOG_WRN("模块 %s 置毒后在途引用未归零，跳过 dlclose（.so 保持映射,规则持续失效）", name);
         fault_fence_unregister_slot(slot);
-        return 0;   /* ban 已在槽位置空前落盘 */
+        return 0; /* ban 已在槽位置空前落盘 */
     }
 
     /* exit 必须调（经围栏）才能 dlclose：模块可能持有**仍在运行的 pthread**
@@ -669,7 +699,8 @@ int module_fault_poison(int slot, const char* reason) {
         if (erc == NSP_FENCE_FAULT) {
             can_unload = false;
             LOG_WRN("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
-                    "detail=无法确认模块线程已停,保持 .so 映射不 dlclose", name);
+                    "detail=无法确认模块线程已停,保持 .so 映射不 dlclose",
+                    name);
         }
     }
     if (!can_unload) {
@@ -722,15 +753,16 @@ static void module_scan_diff(void) {
         if (!g_modules[i].active) continue;
         bool found = false;
         for (int p = 0; p < pcount; p++) {
-            if (strcmp(present[p], g_modules[i].name) == 0) { found = true; break; }
+            if (strcmp(present[p], g_modules[i].name) == 0) {
+                found = true;
+                break;
+            }
         }
         if (!found) {
             /* quiescence 门控：模块仍有活跃句柄（应用 open 中）则延迟卸载，
                等下次扫描（无应用持有）再执行——避免热重载竞态崩溃 */
-            if (g_modules[i].active_handles_fn &&
-                g_modules[i].active_handles_fn() > 0) {
-                LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟卸载",
-                        g_modules[i].name);
+            if (g_modules[i].active_handles_fn && g_modules[i].active_handles_fn() > 0) {
+                LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟卸载", g_modules[i].name);
                 continue;
             }
             LOG("检测到模块目录移除: %s", g_modules[i].name);
@@ -754,8 +786,9 @@ static void module_scan_diff(void) {
             {
                 char br[96] = {0};
                 if (module_ban_lookup(present[p], dhash, br)) {
-                    LOG_WRN("[MOD_ERR] module=%s op=scan reason=%s detail=ban 名单命中(哈希一致),跳过加载",
-                            present[p], br[0] ? br : "unknown");
+                    LOG_WRN(
+                        "[MOD_ERR] module=%s op=scan reason=%s detail=ban 名单命中(哈希一致),跳过加载",
+                        present[p], br[0] ? br : "unknown");
                     continue;
                 }
             }
@@ -768,10 +801,8 @@ static void module_scan_diff(void) {
             if (stat(so, &st) == 0 && st.st_mtime != g_modules[slot].mtime) {
                 /* quiescence 门控：模块仍有活跃句柄（应用 open 中）则延迟
                    热重载，等下次扫描再执行——"无应用 open、写入完成后才热加载" */
-                if (g_modules[slot].active_handles_fn &&
-                    g_modules[slot].active_handles_fn() > 0) {
-                    LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟热重载",
-                            present[p]);
+                if (g_modules[slot].active_handles_fn && g_modules[slot].active_handles_fn() > 0) {
+                    LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟热重载", present[p]);
                     continue;
                 }
                 /* 哈希判定：磁盘内容与已加载模块哈希一致（mtime 变化但内容
@@ -794,9 +825,8 @@ static void module_scan_diff(void) {
                     continue;
                 }
                 if (module_unload_one(present[p]) != 0) {
-                    dlclose(nh);   /* 旧模块在途引用未归零（回滚保留旧）→ 放弃新模块 */
-                    LOG_WRN("模块 %s 旧实例仍有在途调用，热重载放弃（保留旧模块）",
-                            present[p]);
+                    dlclose(nh); /* 旧模块在途引用未归零（回滚保留旧）→ 放弃新模块 */
+                    LOG_WRN("模块 %s 旧实例仍有在途调用，热重载放弃（保留旧模块）", present[p]);
                     continue;
                 }
                 module_commit(present[p], nh, &ninfo, nhash);
@@ -815,12 +845,15 @@ static void* module_monitor_thread(void* arg) {
     while (!g_log_shutdown) {
         if (inotify_fd < 0) {
             inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-            if (inotify_fd < 0) { sleep(2); continue; }
+            if (inotify_fd < 0) {
+                sleep(2);
+                continue;
+            }
         }
         if (wd < 0) {
             wd = inotify_add_watch(inotify_fd, g_modules_dir,
-                IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM |
-                IN_CLOSE_WRITE | IN_DELETE_SELF);
+                                   IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM |
+                                       IN_CLOSE_WRITE | IN_DELETE_SELF);
             if (wd < 0) {
                 close(inotify_fd);
                 inotify_fd = -1;
@@ -828,7 +861,7 @@ static void* module_monitor_thread(void* arg) {
                 continue;
             }
         }
-        struct pollfd pfd = { .fd = inotify_fd, .events = POLLIN };
+        struct pollfd pfd = {.fd = inotify_fd, .events = POLLIN};
         int pr = poll(&pfd, 1, 5000);
         if (pr < 0) {
             if (errno == EINTR) continue;
@@ -856,12 +889,12 @@ static void* module_monitor_thread(void* arg) {
         }
         if (len == 0) continue;
         bool watch_invalidated = false;
-        for (char* p = buf; p < buf + len; ) {
+        for (char* p = buf; p < buf + len;) {
             struct inotify_event* ev = (struct inotify_event*)p;
             if (ev->mask & IN_IGNORED) watch_invalidated = true;
             p += sizeof(struct inotify_event) + ev->len;
         }
-        sleep(1);   /* 归并窗口：多个叠加事件只重扫一次 */
+        sleep(1); /* 归并窗口：多个叠加事件只重扫一次 */
         module_scan_diff();
         if (watch_invalidated) wd = -1;
     }
@@ -875,16 +908,14 @@ static void* module_monitor_thread(void* arg) {
 /* ================= 对外接口 ================= */
 
 int module_system_init(const char* rules_path, const char* modules_dir, uint32_t flags) {
-    if (rules_path)
-        strncpy(g_fw_rules_path, rules_path, sizeof g_fw_rules_path - 1);
+    if (rules_path) strncpy(g_fw_rules_path, rules_path, sizeof g_fw_rules_path - 1);
     if (modules_dir && modules_dir[0])
         strncpy(g_modules_dir, modules_dir, sizeof g_modules_dir - 1);
     g_fw_flags = flags;
     mkdir_recursive(g_modules_dir);
     module_scan_diff();
     pthread_t tid;
-    if (pthread_create(&tid, NULL, module_monitor_thread, NULL) == 0)
-        pthread_detach(tid);
+    if (pthread_create(&tid, NULL, module_monitor_thread, NULL) == 0) pthread_detach(tid);
     /* 初始扫描完成后标记，后续热插拔变更才通知 injector */
     g_boot_scan_done = 1;
     int active = 0;
@@ -963,7 +994,7 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         int rc = nsp_fence_resolve(i, "resolve", ops->resolve, q, &gd.r);
         atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         if (rc == NSP_FENCE_FAULT) {
-            module_guard_fault(i, "resolve", q->path);   /* 崩溃：单次即置毒 */
+            module_guard_fault(i, "resolve", q->path); /* 崩溃：单次即置毒 */
             continue;
         }
         if (rc != 0) {
@@ -996,7 +1027,7 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         out->allow = out->allow || r->allow;
         if (!out->has_redir && r->has_redir) {
             out->has_redir = true;
-            strcpy(out->redir_target, r->redir_target);   /* 模块 out 字段，NUL 结尾（已校验） */
+            strcpy(out->redir_target, r->redir_target); /* 模块 out 字段，NUL 结尾（已校验） */
         }
         if (!out->has_sandbox && r->has_sandbox) {
             out->has_sandbox = true;
@@ -1088,7 +1119,8 @@ int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out) {
 static int backend_scan_match(const char* path, int* slot_out, const NspModuleOps** ops_out) {
     if (!path || !ops_out) return -1;
     for (int i = 0; i < MAX_MODULES; i++) {
-        const NspModuleOps* ops = atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire);
+        const NspModuleOps* ops =
+            atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire);
         if (!ops || !ops->backend_match) continue;
         atomic_fetch_add_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
         if (atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire) != ops) {
@@ -1110,7 +1142,7 @@ static int backend_scan_match(const char* path, int* slot_out, const NspModuleOp
         if (mrc == 1) {
             if (slot_out) *slot_out = i;
             *ops_out = ops;
-            return 0;   /* 引用已持（g_backend_slot_refs[i]），调用方须 put */
+            return 0; /* 引用已持（g_backend_slot_refs[i]），调用方须 put */
         }
         atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
     }
@@ -1208,22 +1240,20 @@ int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user
         int i = active_slots[s];
         const NspModuleOps* ops = active_ops[s];
         /* 槽位快照二次确认（unload 置空则跳过，与 S2 分派一致） */
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops)
-            continue;
+        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) continue;
         atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
-        int got = nsp_fence_readdir_extra(i, "readdir_extra", ops->readdir_extra,
-                                          q, sub_path, user_id, pkg, is_root,
-                                          out + n, max - n);
+        int got = nsp_fence_readdir_extra(i, "readdir_extra", ops->readdir_extra, q, sub_path,
+                                          user_id, pkg, is_root, out + n, max - n);
         atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         if (got == NSP_FENCE_FAULT) {
             module_guard_fault(i, "readdir_extra", sub_path);
             continue;
         }
-        if (got == NSP_FENCE_BADFN) continue;  /* 函数指针 NULL：未实现，静默跳过 */
+        if (got == NSP_FENCE_BADFN) continue; /* 函数指针 NULL：未实现，静默跳过 */
         if (got < 0) {
             module_guard_error(i, "readdir_extra", got, sub_path, "模块返回异常");
             continue;
@@ -1238,7 +1268,10 @@ int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user
             /* 条目校验：坏条目名（未终止）丢弃该批次（计入熔断） */
             bool entries_ok = true;
             for (int k = 0; k < got; k++)
-                if (!nsp_guard_dir_entry_ok(out + n + k)) { entries_ok = false; break; }
+                if (!nsp_guard_dir_entry_ok(out + n + k)) {
+                    entries_ok = false;
+                    break;
+                }
             if (!entries_ok) {
                 module_guard_error(i, "readdir_extra", 0, sub_path, "条目名未终止(越界写)");
                 continue;
@@ -1269,22 +1302,20 @@ int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size
     for (int s = 0; s < scount && rc != 0; s++) {
         int i = active_slots[s];
         const NspModuleOps* ops = active_ops[s];
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops)
-            continue;
+        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) continue;
         atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
         pkg_out[0] = '\0';
-        int crc = nsp_fence_get_pkg(i, "get_pkg", ops->get_pkg, uid, tid,
-                                    pkg_out, pkg_size);
+        int crc = nsp_fence_get_pkg(i, "get_pkg", ops->get_pkg, uid, tid, pkg_out, pkg_size);
         atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         if (crc == NSP_FENCE_FAULT) {
             module_guard_fault(i, "get_pkg", NULL);
             continue;
         }
-        if (crc == NSP_FENCE_BADFN) continue;  /* 函数指针 NULL：未实现，静默跳过 */
+        if (crc == NSP_FENCE_BADFN) continue; /* 函数指针 NULL：未实现，静默跳过 */
         if (crc != 0) {
             module_guard_error(i, "get_pkg", crc, NULL, "模块返回异常");
             continue;
@@ -1307,14 +1338,20 @@ int module_health_snapshot(NspModuleHealth** info_out) {
     if (!info_out) return -1;
     *info_out = NULL;
     pthread_rwlock_rdlock(&g_module_lock);
-    if (g_module_count == 0) { pthread_rwlock_unlock(&g_module_lock); return 0; }
+    if (g_module_count == 0) {
+        pthread_rwlock_unlock(&g_module_lock);
+        return 0;
+    }
     NspModuleHealth* arr = calloc(g_module_count, sizeof(NspModuleHealth));
-    if (!arr) { pthread_rwlock_unlock(&g_module_lock); return -1; }
+    if (!arr) {
+        pthread_rwlock_unlock(&g_module_lock);
+        return -1;
+    }
     int n = 0;
     for (int i = 0; i < g_module_count; i++) {
         ModuleEntry* m = &g_modules[i];
         if (!m->active && !atomic_load_explicit(&m->banned, memory_order_acquire))
-            continue;   /* 从未加载/正常卸载且无 ban 的槽位不展示 */
+            continue; /* 从未加载/正常卸载且无 ban 的槽位不展示 */
         NspModuleHealth* h = &arr[n];
         memset(h, 0, sizeof *h);
         strncpy(h->name, m->name, sizeof h->name - 1);
@@ -1336,8 +1373,7 @@ int module_snapshot(char names[][64], int max) {
     int n = 0;
     pthread_rwlock_rdlock(&g_module_lock);
     for (int i = 0; i < g_module_count && n < max; i++) {
-        if (g_modules[i].active)
-            strncpy(names[n++], g_modules[i].name, 63);
+        if (g_modules[i].active) strncpy(names[n++], g_modules[i].name, 63);
     }
     pthread_rwlock_unlock(&g_module_lock);
     return n;
@@ -1347,7 +1383,10 @@ bool module_any_loaded(void) {
     bool any = false;
     pthread_rwlock_rdlock(&g_module_lock);
     for (int i = 0; i < g_module_count; i++)
-        if (g_modules[i].active) { any = true; break; }
+        if (g_modules[i].active) {
+            any = true;
+            break;
+        }
     pthread_rwlock_unlock(&g_module_lock);
     return any;
 }
@@ -1363,7 +1402,7 @@ int module_ops_slot(const NspModuleOps* ops) {
 }
 
 const char* module_slot_name(int slot) {
-    static char slot_names[MAX_MODULES][16];   /* "slotN" 占位（无锁安全） */
+    static char slot_names[MAX_MODULES][16]; /* "slotN" 占位（无锁安全） */
     if (slot < 0 || slot >= MAX_MODULES) return "unknown";
     static _Atomic(bool) names_ready = false;
     if (!atomic_load_explicit(&names_ready, memory_order_relaxed)) {

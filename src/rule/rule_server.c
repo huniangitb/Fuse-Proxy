@@ -42,16 +42,16 @@
 #include <poll.h>
 
 #define RULE_VERSION "1.0.0"
-#define MAX_REQ_LEN 8192
-#define MAX_LINE 2048
+#define MAX_REQ_LEN  8192
+#define MAX_LINE     2048
 
 /* 可被命令行覆盖的运行参数（--config-dir / --socket） */
 static char g_config_dir[PATH_MAX] = CONFIG_DIR;
 static char g_socket_name[64] = RULE_SOCKET_NAME;
 static volatile sig_atomic_t g_should_exit = 0;
-static bool g_foreground = false;   /* --foreground：前台运行（测试/调试用） */
-static struct timespec g_start_mono;  /* 启动时刻（CLOCK_MONOTONIC，运行时长基准） */
-static time_t g_start_wall = 0;       /* 启动时刻（墙钟，started_at 展示） */
+static bool g_foreground = false;    /* --foreground：前台运行（测试/调试用） */
+static struct timespec g_start_mono; /* 启动时刻（CLOCK_MONOTONIC，运行时长基准） */
+static time_t g_start_wall = 0;      /* 启动时刻（墙钟，started_at 展示） */
 
 /* 统一日志：经 comm 线程进 sys.log（[rule_server] 前缀由 log_frame_packet
  * 按 g_proc_name 自动添加，调用方不再手写）。保持 RLOG 调用名，存量调用点零改动。 */
@@ -69,10 +69,10 @@ static time_t g_start_wall = 0;       /* 启动时刻（墙钟，started_at 展�
      switch — ON/OFF 开关（MONITOR ON）
      tokens — 空格分隔多 token（ADD 时 value 用 | 分隔） */
 typedef enum {
-    RFT_PATH = 0,   /* 单值路径 */
-    RFT_PAIR,       /* src|dst */
-    RFT_SWITCH,     /* ON/OFF */
-    RFT_TOKENS      /* 多 token（| 分隔） */
+    RFT_PATH = 0, /* 单值路径 */
+    RFT_PAIR,     /* src|dst */
+    RFT_SWITCH,   /* ON/OFF */
+    RFT_TOKENS    /* 多 token（| 分隔） */
 } RuleFmt;
 
 #define MAX_RULE_TYPES 64
@@ -83,43 +83,58 @@ typedef struct {
     char text[160];
 } DescEntry;
 typedef struct {
-    char name[64];        /* 类型名（大写，如 HIDE / FTP） */
-    RuleFmt fmt;          /* 值格式 */
-    bool builtin;         /* 内置类型（不可随模块卸载移除） */
-    bool global_only;     /* 仅全局作用域可用（如 GLOBAL_INJECT/SKIP_SYSTEM_APPS） */
-    char module[64];      /* 来源模块名（内置为 "builtin"） */
+    char name[64];    /* 类型名（大写，如 HIDE / FTP） */
+    RuleFmt fmt;      /* 值格式 */
+    bool builtin;     /* 内置类型（不可随模块卸载移除） */
+    bool global_only; /* 仅全局作用域可用（如 GLOBAL_INJECT/SKIP_SYSTEM_APPS） */
+    char module[64];  /* 来源模块名（内置为 "builtin"） */
     /* 动态适配扩展：.rules 可选属性（argc=N / argc=N:M / global-only / desc[.lang]="..."）
        argc_min/argc_max：pair/tokens 的参数数量约束（-1=不限制，默认：
        pair=2:2、path=1:1、tokens=2:-1、switch=1:1），ADD 时按此校验 */
     int argc_min;
     int argc_max;
-    DescEntry descs[MAX_DESC_LANGS];  /* 多语言描述（desc=→zh，desc.en=→en，...） */
+    DescEntry descs[MAX_DESC_LANGS]; /* 多语言描述（desc=→zh，desc.en=→en，...） */
     int desc_count;
 } RuleTypeDef;
 
-typedef int RuleType;     /* 动态表索引；RT_UNKNOWN 表示未知 */
+typedef int RuleType; /* 动态表索引；RT_UNKNOWN 表示未知 */
 #define RT_UNKNOWN (-1)
 
 static RuleTypeDef g_rule_types[MAX_RULE_TYPES];
 static int g_rule_type_count = 0;
 
 /* 按格式取默认参数数量约束：path=1、pair=2、tokens=2+（上限不限）、switch=1 */
-static void rule_fmt_default_argc(RuleFmt fmt, int *minp, int *maxp) {
+static void rule_fmt_default_argc(RuleFmt fmt, int* minp, int* maxp) {
     switch (fmt) {
-        case RFT_PATH:   *minp = 1; *maxp = 1; break;
-        case RFT_PAIR:   *minp = 2; *maxp = 2; break;
-        case RFT_SWITCH: *minp = 1; *maxp = 1; break;
-        case RFT_TOKENS: *minp = 2; *maxp = -1; break;
-        default:         *minp = 1; *maxp = -1; break;
+        case RFT_PATH:
+            *minp = 1;
+            *maxp = 1;
+            break;
+        case RFT_PAIR:
+            *minp = 2;
+            *maxp = 2;
+            break;
+        case RFT_SWITCH:
+            *minp = 1;
+            *maxp = 1;
+            break;
+        case RFT_TOKENS:
+            *minp = 2;
+            *maxp = -1;
+            break;
+        default:
+            *minp = 1;
+            *maxp = -1;
+            break;
     }
 }
 
 /* 内置类型初始化（与 basic_rules 能力一一对应） */
-static void rule_types_add_ex(const char *name, RuleFmt fmt, bool builtin, bool global_only,
-                              const char *module, int argc_min, int argc_max,
-                              const DescEntry *descs, int desc_count) {
+static void rule_types_add_ex(const char* name, RuleFmt fmt, bool builtin, bool global_only,
+                              const char* module, int argc_min, int argc_max,
+                              const DescEntry* descs, int desc_count) {
     if (g_rule_type_count >= MAX_RULE_TYPES) return;
-    RuleTypeDef *t = &g_rule_types[g_rule_type_count];
+    RuleTypeDef* t = &g_rule_types[g_rule_type_count];
     strncpy(t->name, name, sizeof(t->name) - 1);
     t->fmt = fmt;
     t->builtin = builtin;
@@ -132,15 +147,18 @@ static void rule_types_add_ex(const char *name, RuleFmt fmt, bool builtin, bool 
     t->desc_count = 0;
     for (int i = 0; i < desc_count && t->desc_count < MAX_DESC_LANGS; i++) {
         if (!descs[i].text[0]) continue;
-        strncpy(t->descs[t->desc_count].lang, descs[i].lang, sizeof(t->descs[t->desc_count].lang) - 1);
-        strncpy(t->descs[t->desc_count].text, descs[i].text, sizeof(t->descs[t->desc_count].text) - 1);
+        strncpy(t->descs[t->desc_count].lang, descs[i].lang,
+                sizeof(t->descs[t->desc_count].lang) - 1);
+        strncpy(t->descs[t->desc_count].text, descs[i].text,
+                sizeof(t->descs[t->desc_count].text) - 1);
         t->desc_count++;
     }
     g_rule_type_count++;
 }
 
 /* 兼容旧签名：argc/desc 取默认 */
-static void rule_types_add(const char *name, RuleFmt fmt, bool builtin, bool global_only, const char *module) {
+static void rule_types_add(const char* name, RuleFmt fmt, bool builtin, bool global_only,
+                           const char* module) {
     rule_types_add_ex(name, fmt, builtin, global_only, module, -1, -1, nullptr, 0);
 }
 
@@ -158,16 +176,15 @@ static void rule_types_init(void) {
 }
 
 /* 按名查找类型（大小写不敏感），返回索引；未找到返回 RT_UNKNOWN */
-static RuleType rule_type_of(const char *name);
+static RuleType rule_type_of(const char* name);
 
 /* 合并属性到已存在的类型（定义见 conf 解析段）：前向声明供旧行格式
    rule_types_parse_line 使用（两种格式共用同一合并语义） */
-static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set,
-                             int argc_min, int argc_max, bool argc_set,
-                             bool global_only, bool global_only_set,
-                             const DescEntry *descs, int desc_count);
+static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set, int argc_min, int argc_max,
+                             bool argc_set, bool global_only, bool global_only_set,
+                             const DescEntry* descs, int desc_count);
 
-static RuleType rule_type_of(const char *name) {
+static RuleType rule_type_of(const char* name) {
     if (!name) return RT_UNKNOWN;
     for (int i = 0; i < g_rule_type_count; i++) {
         if (strcasecmp(name, g_rule_types[i].name) == 0) return i;
@@ -175,7 +192,7 @@ static RuleType rule_type_of(const char *name) {
     return RT_UNKNOWN;
 }
 
-static const char *rule_type_name(RuleType t) {
+static const char* rule_type_name(RuleType t) {
     if (t < 0 || t >= g_rule_type_count) return NULL;
     return g_rule_types[t].name;
 }
@@ -187,8 +204,8 @@ static bool is_switch_type(RuleType t) {
 
 /* 识别一行是否为规则/开关行（忽略行首空白与可选的 # 注释前缀）；
    返回类型索引；非规则行（空行/段头/未知关键字）返回 RT_UNKNOWN */
-static RuleType classify_line(const char *line) {
-    const char *p = line;
+static RuleType classify_line(const char* line) {
+    const char* p = line;
     while (*p == ' ' || *p == '\t') p++;
     if (*p == '#') {
         p++;
@@ -196,7 +213,7 @@ static RuleType classify_line(const char *line) {
     }
     if (*p == '[' || *p == '\0' || *p == '\n') return RT_UNKNOWN;
     for (int i = 0; i < g_rule_type_count; i++) {
-        const char *name = g_rule_types[i].name;
+        const char* name = g_rule_types[i].name;
         size_t nlen = strlen(name);
         if (strncasecmp(p, name, nlen) == 0 &&
             (p[nlen] == ' ' || p[nlen] == '\t' || p[nlen] == '\n' || p[nlen] == '\0'))
@@ -207,23 +224,31 @@ static RuleType classify_line(const char *line) {
 
 /* 解析一行 .rules 声明："<TYPE> <FORMAT>"，追加进类型表（去重）。
    FORMAT: path|pair|switch|tokens，缺省为 path */
-static void rule_types_parse_line(char *line, const char *module) {
-    char *p = line;
+static void rule_types_parse_line(char* line, const char* module) {
+    char* p = line;
     while (isspace((unsigned char)*p)) p++;
     if (!*p || *p == '#') return;
     char type[64];
     int i = 0;
-    while (*p && !isspace((unsigned char)*p) && i < (int)sizeof(type) - 1)
-        type[i++] = *p++;
+    while (*p && !isspace((unsigned char)*p) && i < (int)sizeof(type) - 1) type[i++] = *p++;
     type[i] = '\0';
     if (!type[0]) return;
     while (isspace((unsigned char)*p)) p++;
     RuleFmt fmt = RFT_PATH;
-    if (strncasecmp(p, "pair", 4) == 0)      { fmt = RFT_PAIR;   p += 4; }
-    else if (strncasecmp(p, "switch", 6) == 0) { fmt = RFT_SWITCH; p += 6; }
-    else if (strncasecmp(p, "tokens", 6) == 0) { fmt = RFT_TOKENS; p += 6; }
-    else if (strncasecmp(p, "path", 4) == 0)  { fmt = RFT_PATH;   p += 4; }
-    else return;                              /* 未知 FORMAT：跳过 */
+    if (strncasecmp(p, "pair", 4) == 0) {
+        fmt = RFT_PAIR;
+        p += 4;
+    } else if (strncasecmp(p, "switch", 6) == 0) {
+        fmt = RFT_SWITCH;
+        p += 6;
+    } else if (strncasecmp(p, "tokens", 6) == 0) {
+        fmt = RFT_TOKENS;
+        p += 6;
+    } else if (strncasecmp(p, "path", 4) == 0) {
+        fmt = RFT_PATH;
+        p += 4;
+    } else
+        return; /* 未知 FORMAT：跳过 */
     /* 可选属性列（以空格分隔，顺序任意）：
          argc=N          — 恰好 N 个参数
          argc=N:M        — N~M 个参数（M 省略或 * 表示不限上界）
@@ -246,10 +271,10 @@ static void rule_types_parse_line(char *line, const char *module) {
                使该类型所有 ADD 被拒且错误信息误导调用方。
                畸形时跳过该属性（保持向前兼容），不注册错误约束 */
             p += 5;
-            char *end = nullptr;
+            char* end = nullptr;
             errno = 0;
             long v1 = strtol(p, &end, 10);
-            if (end == p || errno == ERANGE) {   /* 非数字：跳过属性 */
+            if (end == p || errno == ERANGE) { /* 非数字：跳过属性 */
                 while (*p && !isspace((unsigned char)*p)) p++;
                 continue;
             }
@@ -261,13 +286,13 @@ static void rule_types_parse_line(char *line, const char *module) {
             if (*p == ':') {
                 p++;
                 if (*p == '*' || *p == '\0' || isspace((unsigned char)*p)) {
-                    new_max = -1;   /* 不限上界 */
+                    new_max = -1; /* 不限上界 */
                     if (*p == '*') p++;
                 } else {
-                    char *end2 = nullptr;
+                    char* end2 = nullptr;
                     errno = 0;
                     long v2 = strtol(p, &end2, 10);
-                    if (end2 == p || errno == ERANGE) {   /* 畸形上界：整体跳过属性 */
+                    if (end2 == p || errno == ERANGE) { /* 畸形上界：整体跳过属性 */
                         while (*p && !isspace((unsigned char)*p)) p++;
                         continue;
                     }
@@ -289,9 +314,9 @@ static void rule_types_parse_line(char *line, const char *module) {
                "顺序任意"）——desc.en= 出现在 desc= 之前时，默认描述
                不会被错误标记为上一变体的语言 */
             strncpy(langbuf, "zh", sizeof(langbuf) - 1);
-            const char *lang = langbuf;   /* 默认中文 */
+            const char* lang = langbuf; /* 默认中文 */
             p += 4;
-            if (*p == '.') {           /* desc.xx= 语言变体 */
+            if (*p == '.') { /* desc.xx= 语言变体 */
                 p++;
                 size_t li = 0;
                 while (*p && *p != '=' && li < sizeof(langbuf) - 1) langbuf[li++] = *p++;
@@ -326,13 +351,11 @@ static void rule_types_parse_line(char *line, const char *module) {
        不覆盖类型名与 module 来源；否则作为新模块类型注册 */
     RuleType existing = rule_type_of(type);
     if (existing != RT_UNKNOWN) {
-        rule_types_merge(existing, fmt, true,
-                         argc_min, argc_max, (argc_min >= 0),
-                         global_only, global_only,
-                         descs, desc_count);
+        rule_types_merge(existing, fmt, true, argc_min, argc_max, (argc_min >= 0), global_only,
+                         global_only, descs, desc_count);
     } else {
-        rule_types_add_ex(type, fmt, false, global_only, module,
-                          argc_min, argc_max, descs, desc_count);
+        rule_types_add_ex(type, fmt, false, global_only, module, argc_min, argc_max, descs,
+                          desc_count);
     }
 }
 
@@ -351,19 +374,19 @@ static void rule_types_parse_line(char *line, const char *module) {
 /* conf 段属性收集状态 */
 typedef struct {
     char type[64];
-    bool active;          /* 是否处于 [TYPE] 段内 */
+    bool active; /* 是否处于 [TYPE] 段内 */
     RuleFmt fmt;
-    bool fmt_set;         /* format 键是否显式声明（未声明不覆盖已有类型） */
+    bool fmt_set; /* format 键是否显式声明（未声明不覆盖已有类型） */
     int argc_min, argc_max;
-    bool argc_set;        /* argc 键是否显式声明 */
+    bool argc_set; /* argc 键是否显式声明 */
     bool global_only;
     bool global_only_set; /* global-only 键是否显式声明 */
     DescEntry descs[MAX_DESC_LANGS];
     int desc_count;
-    char langbuf[8];      /* desc 语言缓冲（函数级作用域防悬垂） */
+    char langbuf[8]; /* desc 语言缓冲（函数级作用域防悬垂） */
 } ConfSection;
 
-static void conf_section_reset(ConfSection *cs) {
+static void conf_section_reset(ConfSection* cs) {
     cs->active = false;
     cs->type[0] = '\0';
     cs->fmt = RFT_PATH;
@@ -379,12 +402,11 @@ static void conf_section_reset(ConfSection *cs) {
 /* 合并属性到已存在的类型（内置或他模块注册的同名类型）：
    .rules 中的补充声明（desc 多语言/argc/global-only 等）生效，
    不覆盖内置类型名与 module 来源；显式声明的字段（*_set）才覆盖。 */
-static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set,
-                             int argc_min, int argc_max, bool argc_set,
-                             bool global_only, bool global_only_set,
-                             const DescEntry *descs, int desc_count) {
+static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set, int argc_min, int argc_max,
+                             bool argc_set, bool global_only, bool global_only_set,
+                             const DescEntry* descs, int desc_count) {
     if (idx < 0 || idx >= g_rule_type_count) return;
-    RuleTypeDef *t = &g_rule_types[idx];
+    RuleTypeDef* t = &g_rule_types[idx];
     if (fmt_set) t->fmt = fmt;
     if (argc_set) {
         t->argc_min = argc_min;
@@ -412,29 +434,32 @@ static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set,
 }
 
 /* 段结束时把收集的属性注册进类型表（同名内置类型改为合并补充） */
-static void conf_section_flush(ConfSection *cs, const char *module) {
+static void conf_section_flush(ConfSection* cs, const char* module) {
     if (cs->active && cs->type[0]) {
         RuleType existing = rule_type_of(cs->type);
         if (existing == RT_UNKNOWN) {
-            rule_types_add_ex(cs->type, cs->fmt, false, cs->global_only, module,
-                              cs->argc_min, cs->argc_max, cs->descs, cs->desc_count);
+            rule_types_add_ex(cs->type, cs->fmt, false, cs->global_only, module, cs->argc_min,
+                              cs->argc_max, cs->descs, cs->desc_count);
         } else {
-            rule_types_merge(existing, cs->fmt, cs->fmt_set,
-                             cs->argc_min, cs->argc_max, cs->argc_set,
-                             cs->global_only, cs->global_only_set,
-                             cs->descs, cs->desc_count);
+            rule_types_merge(existing, cs->fmt, cs->fmt_set, cs->argc_min, cs->argc_max,
+                             cs->argc_set, cs->global_only, cs->global_only_set, cs->descs,
+                             cs->desc_count);
         }
     }
     conf_section_reset(cs);
 }
 
 /* 解析 conf 键值属性（format/argc/global-only/desc[.lang]），写入段状态 */
-static void conf_section_apply_key(ConfSection *cs, const char *key, const char *val) {
+static void conf_section_apply_key(ConfSection* cs, const char* key, const char* val) {
     if (strcasecmp(key, "format") == 0) {
-        if (strcasecmp(val, "pair") == 0) cs->fmt = RFT_PAIR;
-        else if (strcasecmp(val, "switch") == 0) cs->fmt = RFT_SWITCH;
-        else if (strcasecmp(val, "tokens") == 0) cs->fmt = RFT_TOKENS;
-        else cs->fmt = RFT_PATH;
+        if (strcasecmp(val, "pair") == 0)
+            cs->fmt = RFT_PAIR;
+        else if (strcasecmp(val, "switch") == 0)
+            cs->fmt = RFT_SWITCH;
+        else if (strcasecmp(val, "tokens") == 0)
+            cs->fmt = RFT_TOKENS;
+        else
+            cs->fmt = RFT_PATH;
         cs->fmt_set = true;
         return;
     }
@@ -442,21 +467,21 @@ static void conf_section_apply_key(ConfSection *cs, const char *key, const char 
         /* 先完整解析 N 或 N:M（含畸形上界），全部成功后才提交到段状态：
            argc=2:abc 的畸形上界会使整个属性被跳过，而不是注册 2:∞
            错误约束（与文档"畸形声明被跳过"语义一致） */
-        char *end = nullptr;
+        char* end = nullptr;
         errno = 0;
         long v1 = strtol(val, &end, 10);
-        if (end == val || errno == ERANGE) return;   /* 畸形：跳过 */
+        if (end == val || errno == ERANGE) return; /* 畸形：跳过 */
         int new_min = (int)v1;
         int new_max = new_min;
         if (*end == ':') {
-            const char *up = end + 1;
+            const char* up = end + 1;
             if (*up == '*' || *up == '\0' || isspace((unsigned char)*up)) {
-                new_max = -1;                        /* 不限上界 */
+                new_max = -1; /* 不限上界 */
             } else {
-                char *end2 = nullptr;
+                char* end2 = nullptr;
                 errno = 0;
                 long v2 = strtol(up, &end2, 10);
-                if (end2 == up || errno == ERANGE) return;   /* 畸形上界：整体跳过 */
+                if (end2 == up || errno == ERANGE) return; /* 畸形上界：整体跳过 */
                 new_max = (int)v2;
             }
         }
@@ -474,18 +499,18 @@ static void conf_section_apply_key(ConfSection *cs, const char *key, const char 
     if (strncasecmp(key, "desc", 4) == 0) {
         /* 每个 desc= 前重置默认中文（属性顺序任意） */
         strncpy(cs->langbuf, "zh", sizeof(cs->langbuf) - 1);
-        const char *lang = cs->langbuf;
-        const char *dot = key + 4;
-        if (*dot == '.') {                           /* desc.xx= 语言变体 */
+        const char* lang = cs->langbuf;
+        const char* dot = key + 4;
+        if (*dot == '.') { /* desc.xx= 语言变体 */
             dot++;
             size_t li = 0;
             while (*dot && li < sizeof(cs->langbuf) - 1) cs->langbuf[li++] = *dot++;
             cs->langbuf[li] = '\0';
             if (li > 0) lang = cs->langbuf;
         }
-        const char *v = val;
+        const char* v = val;
         char dtext[160] = {0};
-        if (*v == '"') {                             /* 引号包裹（可含空格） */
+        if (*v == '"') { /* 引号包裹（可含空格） */
             v++;
             size_t di = 0;
             while (*v && *v != '"' && di < sizeof(dtext) - 1) dtext[di++] = *v++;
@@ -494,8 +519,10 @@ static void conf_section_apply_key(ConfSection *cs, const char *key, const char 
             while (*v && di < sizeof(dtext) - 1) dtext[di++] = *v++;
         }
         if (dtext[0] && cs->desc_count < MAX_DESC_LANGS) {
-            strncpy(cs->descs[cs->desc_count].lang, lang, sizeof(cs->descs[cs->desc_count].lang) - 1);
-            strncpy(cs->descs[cs->desc_count].text, dtext, sizeof(cs->descs[cs->desc_count].text) - 1);
+            strncpy(cs->descs[cs->desc_count].lang, lang,
+                    sizeof(cs->descs[cs->desc_count].lang) - 1);
+            strncpy(cs->descs[cs->desc_count].text, dtext,
+                    sizeof(cs->descs[cs->desc_count].text) - 1);
             cs->desc_count++;
         }
         return;
@@ -504,17 +531,17 @@ static void conf_section_apply_key(ConfSection *cs, const char *key, const char 
 }
 
 /* 解析整个 .rules 文件（conf 段 + 旧行格式混合） */
-static void rule_types_parse_conf(FILE *fp, const char *module) {
+static void rule_types_parse_conf(FILE* fp, const char* module) {
     char line[256];
     ConfSection cs;
     conf_section_reset(&cs);
     while (fgets(line, sizeof(line), fp)) {
-        char *nl = strchr(line, '\n');
+        char* nl = strchr(line, '\n');
         if (nl) *nl = '\0';
-        char *p = line;
+        char* p = line;
         while (isspace((unsigned char)*p)) p++;
-        if (!*p || *p == '#') continue;              /* 空行/注释 */
-        if (*p == '[') {                             /* 段头：[TYPE] */
+        if (!*p || *p == '#') continue; /* 空行/注释 */
+        if (*p == '[') {                /* 段头：[TYPE] */
             conf_section_flush(&cs, module);
             p++;
             size_t ti = 0;
@@ -523,14 +550,17 @@ static void rule_types_parse_conf(FILE *fp, const char *module) {
             cs.active = (ti > 0);
             continue;
         }
-        char *eq = strchr(p, '=');
-        if (cs.active && eq) {                       /* 段内 key=value */
+        char* eq = strchr(p, '=');
+        if (cs.active && eq) { /* 段内 key=value */
             *eq = '\0';
-            char *key = p;
+            char* key = p;
             while (key < eq && isspace((unsigned char)key[0])) key++;
-            char *kend = eq - 1;
-            while (kend >= key && isspace((unsigned char)*kend)) { *kend = '\0'; kend--; }
-            char *val = eq + 1;
+            char* kend = eq - 1;
+            while (kend >= key && isspace((unsigned char)*kend)) {
+                *kend = '\0';
+                kend--;
+            }
+            char* val = eq + 1;
             while (isspace((unsigned char)*val)) val++;
             conf_section_apply_key(&cs, key, val);
             continue;
@@ -538,7 +568,7 @@ static void rule_types_parse_conf(FILE *fp, const char *module) {
         /* 旧行格式（兼容）：FTP pair argc=2 ... */
         rule_types_parse_line(line, module);
     }
-    conf_section_flush(&cs, module);                 /* 文件尾刷新未结束段 */
+    conf_section_flush(&cs, module); /* 文件尾刷新未结束段 */
 }
 
 /* ==================== 模块规则类型缓存（避免每次命令全量扫描） ====================
@@ -548,10 +578,10 @@ static void rule_types_parse_conf(FILE *fp, const char *module) {
 
 #define MAX_CACHED_MODULES 32
 typedef struct {
-    char name[64];        /* 模块名（目录名 = <name>.rules 前缀） */
-    long long mtime_ns;   /* 上次扫描时 <name>.rules 的 mtime（纳秒精度，
+    char name[64];      /* 模块名（目录名 = <name>.rules 前缀） */
+    long long mtime_ns; /* 上次扫描时 <name>.rules 的 mtime（纳秒精度，
                              避免同秒内写入被快速路径误判为未变化） */
-    bool present;         /* 上次扫描时 .rules 是否存在 */
+    bool present;       /* 上次扫描时 .rules 是否存在 */
 } ModuleTypeCache;
 
 static ModuleTypeCache g_module_cache[MAX_CACHED_MODULES];
@@ -560,7 +590,7 @@ static long long g_modules_dir_mtime_ns = 0;
 static bool g_module_cache_valid = false;
 
 /* 取文件/目录 mtime（纳秒）：不存在返回 0 */
-static long long file_mtime_ns(const char *path) {
+static long long file_mtime_ns(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
@@ -579,8 +609,8 @@ static void rule_types_refresh(void) {
         bool unchanged = true;
         for (int i = 0; i < g_module_cache_count; i++) {
             char rules_path[PATH_MAX];
-            snprintf(rules_path, sizeof(rules_path), "%s/%s/%s.rules",
-                     modules_dir, g_module_cache[i].name, g_module_cache[i].name);
+            snprintf(rules_path, sizeof(rules_path), "%s/%s/%s.rules", modules_dir,
+                     g_module_cache[i].name, g_module_cache[i].name);
             long long cur = file_mtime_ns(rules_path);
             bool present = (cur != 0);
             if (present != g_module_cache[i].present ||
@@ -589,7 +619,7 @@ static void rule_types_refresh(void) {
                 break;
             }
         }
-        if (unchanged) return;   /* 全部未变：跳过全量扫描 */
+        if (unchanged) return; /* 全部未变：跳过全量扫描 */
     }
 
     /* 慢路径：全量重建类型表与缓存 */
@@ -599,12 +629,12 @@ static void rule_types_refresh(void) {
     g_modules_dir_mtime_ns = cur_dir_mtime;
     g_module_cache_valid = true;
 
-    if (cur_dir_mtime == 0) return;   /* 模块目录不存在 */
-    DIR *d = opendir(modules_dir);
+    if (cur_dir_mtime == 0) return; /* 模块目录不存在 */
+    DIR* d = opendir(modules_dir);
     if (!d) return;
-    struct dirent *de;
+    struct dirent* de;
     while ((de = readdir(d)) != NULL) {
-        const char *mname = de->d_name;
+        const char* mname = de->d_name;
         if (mname[0] == '.') continue;
         if (strchr(mname, '/')) continue;
         char rules_path[PATH_MAX];
@@ -612,34 +642,34 @@ static void rule_types_refresh(void) {
         long long r_mtime = file_mtime_ns(rules_path);
         bool present = (r_mtime != 0);
         if (g_module_cache_count < MAX_CACHED_MODULES) {
-            ModuleTypeCache *c = &g_module_cache[g_module_cache_count];
+            ModuleTypeCache* c = &g_module_cache[g_module_cache_count];
             strncpy(c->name, mname, sizeof(c->name) - 1);
             c->present = present;
             c->mtime_ns = r_mtime;
             g_module_cache_count++;
         }
         if (!present) continue;
-        FILE *fp = fopen(rules_path, "r");
+        FILE* fp = fopen(rules_path, "r");
         if (!fp) continue;
         /* 支持 conf 段格式（[TYPE] + key=value）与旧行格式（TYPE FORMAT ...）混合 */
         rule_types_parse_conf(fp, mname);
         fclose(fp);
     }
     closedir(d);
-    RLOG("规则类型表: %d 项（含模块动态类型，缓存 %d 个模块）\n",
-         g_rule_type_count, g_module_cache_count);
+    RLOG("规则类型表: %d 项（含模块动态类型，缓存 %d 个模块）\n", g_rule_type_count,
+         g_module_cache_count);
 }
 
 /* 该行是否为已注释（停用）状态 */
-static bool line_is_disabled(const char *line) {
-    const char *p = line;
+static bool line_is_disabled(const char* line) {
+    const char* p = line;
     while (*p == ' ' || *p == '\t') p++;
     return *p == '#';
 }
 
 /* 提取规则行的"值"部分：关键字后的原始内容（REDIRECT 为 "src dst"） */
-static const char *rule_line_value(const char *line, char *out, size_t sz) {
-    const char *p = line;
+static const char* rule_line_value(const char* line, char* out, size_t sz) {
+    const char* p = line;
     while (*p == ' ' || *p == '\t') p++;
     if (*p == '#') {
         p++;
@@ -662,21 +692,26 @@ static const char *rule_line_value(const char *line, char *out, size_t sz) {
 }
 
 /* ==================== 文件行级工具 ==================== */
-static char **read_file_lines(const char *path, int *out_count, int *out_cap) {
-    FILE *fp = fopen(path, "r");
-    if (!fp) { *out_count = 0; *out_cap = 0; return NULL; }
-    char **lines = NULL;
+static char** read_file_lines(const char* path, int* out_count, int* out_cap) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        *out_count = 0;
+        *out_cap = 0;
+        return NULL;
+    }
+    char** lines = NULL;
     int count = 0, cap = 0;
     char buf[MAX_LINE];
     while (fgets(buf, sizeof(buf), fp)) {
         if (count >= cap) {
             cap = cap == 0 ? 64 : cap * 2;
-            char **new_lines = realloc(lines, cap * sizeof(char *));
+            char** new_lines = realloc(lines, cap * sizeof(char*));
             if (!new_lines) {
                 for (int j = 0; j < count; j++) free(lines[j]);
                 free(lines);
                 fclose(fp);
-                *out_count = 0; *out_cap = 0;
+                *out_count = 0;
+                *out_cap = 0;
                 return NULL;
             }
             lines = new_lines;
@@ -686,70 +721,82 @@ static char **read_file_lines(const char *path, int *out_count, int *out_cap) {
             for (int j = 0; j < count; j++) free(lines[j]);
             free(lines);
             fclose(fp);
-            *out_count = 0; *out_cap = 0;
+            *out_count = 0;
+            *out_cap = 0;
             return NULL;
         }
         count++;
     }
     fclose(fp);
-    *out_count = count; *out_cap = cap;
+    *out_count = count;
+    *out_cap = cap;
     return lines;
 }
 
 /* 原子写入：先写临时文件再 rename，避免 inotify 读到半截配置 */
-static bool write_file_lines_atomic(const char *path, char **lines, int count) {
+static bool write_file_lines_atomic(const char* path, char** lines, int count) {
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *fp = fopen(tmp, "w");
+    FILE* fp = fopen(tmp, "w");
     if (!fp) return false;
     for (int i = 0; i < count; i++) {
-        if (fputs(lines[i], fp) < 0) { fclose(fp); unlink(tmp); return false; }
+        if (fputs(lines[i], fp) < 0) {
+            fclose(fp);
+            unlink(tmp);
+            return false;
+        }
     }
-    if (fclose(fp) != 0) { unlink(tmp); return false; }
-    if (rename(tmp, path) != 0) { unlink(tmp); return false; }
+    if (fclose(fp) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
     return true;
 }
 
-static void free_file_lines(char **lines, int count) {
+static void free_file_lines(char** lines, int count) {
     for (int i = 0; i < count; i++) free(lines[i]);
     free(lines);
 }
 
-static int insert_line_at(char ***lines, int *cap, int count, int pos, const char *text) {
+static int insert_line_at(char*** lines, int* cap, int count, int pos, const char* text) {
     if (pos < 0 || pos > count) return -1;
     if (count >= *cap) {
         int new_cap = *cap == 0 ? 64 : *cap * 2;
-        if (new_cap > 65536) return -1;   /* 防止无界 realloc */
-        char **new_lines = realloc(*lines, (size_t)new_cap * sizeof(char *));
+        if (new_cap > 65536) return -1; /* 防止无界 realloc */
+        char** new_lines = realloc(*lines, (size_t)new_cap * sizeof(char*));
         if (!new_lines) return -1;
         *lines = new_lines;
         *cap = new_cap;
     }
-    memmove(&(*lines)[pos + 1], &(*lines)[pos], (count - pos) * sizeof(char *));
+    memmove(&(*lines)[pos + 1], &(*lines)[pos], (count - pos) * sizeof(char*));
     (*lines)[pos] = strdup(text);
     return (*lines)[pos] ? count + 1 : -1;
 }
 
-static void remove_line_at(char **lines, int *count, int pos) {
+static void remove_line_at(char** lines, int* count, int pos) {
     if (pos < 0 || pos >= *count) return;
     free(lines[pos]);
-    memmove(&lines[pos], &lines[pos + 1], (*count - pos - 1) * sizeof(char *));
+    memmove(&lines[pos], &lines[pos + 1], (*count - pos - 1) * sizeof(char*));
     (*count)--;
 }
 
-static int append_line(char ***lines, int *cap, int count, const char *text) {
+static int append_line(char*** lines, int* cap, int count, const char* text) {
     return insert_line_at(lines, cap, count, count, text);
 }
 
 /* 类别段判定：[USER_APPS[:uid]] / [SYSTEM_APPS]（rule_server 读写均走主文件）。
  * P2：大小写敏感（strcmp），与 config_parser 及 GLOBAL 段保持一致——
  * [user_apps:0] 会被 parser 当普通应用加载，控制面不得将其当类别写入 */
-static bool is_category_pkg(const char *pkg) {
+static bool is_category_pkg(const char* pkg) {
     return pkg && (strcmp(pkg, "USER_APPS") == 0 || strcmp(pkg, "SYSTEM_APPS") == 0);
 }
 
 /* 类别段头文本：USER_APPS 恒带显式 :uid（默认 0），SYSTEM_APPS 无参 */
-static void category_section_header(const char *pkg, int uid, char *out, size_t sz) {
+static void category_section_header(const char* pkg, int uid, char* out, size_t sz) {
     if (strcmp(pkg, "SYSTEM_APPS") == 0)
         snprintf(out, sz, "[SYSTEM_APPS]");
     else
@@ -758,13 +805,13 @@ static void category_section_header(const char *pkg, int uid, char *out, size_t 
 
 /* 精确段头行匹配（含可选 ON/OFF 后缀）：整行去空白后以 hdr_text 开头、
    余部为空或 ON/OFF——避免把 [USER_APPS] 与 [USER_APPS:0] 混淆 */
-static int find_header_line(char **lines, int count, const char *hdr_text) {
+static int find_header_line(char** lines, int count, const char* hdr_text) {
     size_t hlen = strlen(hdr_text);
     for (int i = 0; i < count; i++) {
-        char *p = lines[i];
+        char* p = lines[i];
         while (isspace((unsigned char)*p)) p++;
         if (strncmp(p, hdr_text, hlen) != 0) continue;
-        char *rest = p + hlen;
+        char* rest = p + hlen;
         while (isspace((unsigned char)*rest)) rest++;
         /* P2：ON/OFF 须有边界（空白/NUL/换行），[USER_APPS:0]OFFX 之类不算段头 */
         if (*rest == '\0' || *rest == '\n') return i;
@@ -779,10 +826,10 @@ static int find_header_line(char **lines, int count, const char *hdr_text) {
 }
 
 /* 查找段头 [name]（或 [name:uid]），返回行号，未找到返回 -1 */
-static int find_section_header(char **lines, int count, const char *name) {
+static int find_section_header(char** lines, int count, const char* name) {
     size_t nlen = strlen(name);
     for (int i = 0; i < count; i++) {
-        char *p = lines[i];
+        char* p = lines[i];
         while (isspace((unsigned char)*p)) p++;
         if (p[0] == '[' && strncmp(p + 1, name, nlen) == 0) {
             char after = p[1 + nlen];
@@ -793,10 +840,10 @@ static int find_section_header(char **lines, int count, const char *name) {
 }
 
 /* 在段头之后查找指定开关行（MONITOR 等），返回行号，未找到返回 -1 */
-static int find_switch_in_section(char **lines, int count, int header_idx, const char *type) {
+static int find_switch_in_section(char** lines, int count, int header_idx, const char* type) {
     size_t tlen = strlen(type);
     for (int i = header_idx + 1; i < count; i++) {
-        char *p = lines[i];
+        char* p = lines[i];
         while (isspace((unsigned char)*p)) p++;
         if (p[0] == '[') break;
         if (strncasecmp(p, type, tlen) == 0 &&
@@ -808,18 +855,18 @@ static int find_switch_in_section(char **lines, int count, int header_idx, const
 }
 
 /* ==================== 路径工具 ==================== */
-static void main_conf_path(char *out, size_t sz) {
+static void main_conf_path(char* out, size_t sz) {
     snprintf(out, sz, "%s/injector.conf", g_config_dir);
 }
 
-static void app_rule_path(char *out, size_t sz, const char *pkg, int uid) {
+static void app_rule_path(char* out, size_t sz, const char* pkg, int uid) {
     if (uid == 0)
         snprintf(out, sz, "%s/App-rules/%s.conf", g_config_dir, pkg);
     else
         snprintf(out, sz, "%s/App-rules-%d/%s.conf", g_config_dir, uid, pkg);
 }
 
-static void app_rule_dir(char *out, size_t sz, int uid) {
+static void app_rule_dir(char* out, size_t sz, int uid) {
     if (uid == 0)
         snprintf(out, sz, "%s/App-rules", g_config_dir);
     else
@@ -830,7 +877,7 @@ static void app_rule_dir(char *out, size_t sz, int uid) {
    （停用）→ .disabled；两者皆无 → .conf（新建时使用）。
    保证停用状态下 ADD/SET/REMOVE/TOGGLE 继续操作 .disabled 文件，
    不会新建残缺 .conf 导致规则丢失或注入状态异常开启。 */
-static void resolve_app_rule_active_path(const char *pkg, int uid, char *out, size_t sz) {
+static void resolve_app_rule_active_path(const char* pkg, int uid, char* out, size_t sz) {
     char path[PATH_MAX];
     app_rule_path(path, sizeof(path), pkg, uid);
     if (access(path, F_OK) == 0) {
@@ -846,37 +893,38 @@ static void resolve_app_rule_active_path(const char *pkg, int uid, char *out, si
 }
 
 /* 应用规则状态：true=启用（.conf 存在），false=停用（仅 .conf.disabled） */
-static bool app_rule_is_enabled(const char *pkg, int uid) {
+static bool app_rule_is_enabled(const char* pkg, int uid) {
     char path[PATH_MAX];
     app_rule_path(path, sizeof(path), pkg, uid);
     return (access(path, F_OK) == 0);
 }
 
-static void injector_pid_path(char *out, size_t sz) {
+static void injector_pid_path(char* out, size_t sz) {
     snprintf(out, sz, "%s/injector.pid", g_config_dir);
 }
 
 /* ==================== JSON 应答 ====================
    mkdir/send 全量发送经 nsp_util 公共库复用（nsp_mkdir_p / nsp_send_all，
    见 nsp_util.h），禁私刻副本（旧 mkdir_p/send_all 已删除） */
-static void reply_json(int fd, const char *status, const char *cmd, json_object *data, const char *err) {
-    json_object *root = json_object_new_object();
+static void reply_json(int fd, const char* status, const char* cmd, json_object* data,
+                       const char* err) {
+    json_object* root = json_object_new_object();
     json_object_object_add(root, "status", json_object_new_string(status));
     json_object_object_add(root, "command", json_object_new_string(cmd));
     if (data) json_object_object_add(root, "data", data);
     if (err) json_object_object_add(root, "error", json_object_new_string(err));
     json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
-    const char *s = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    const char* s = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
     nsp_send_all(fd, s, strlen(s));
     nsp_send_all(fd, "\n", 1);
     json_object_put(root);
 }
 
-static void reply_ok(int fd, const char *cmd, json_object *data) {
+static void reply_ok(int fd, const char* cmd, json_object* data) {
     reply_json(fd, "ok", cmd, data, NULL);
 }
 
-static void reply_error(int fd, const char *cmd, const char *fmt, ...) {
+static void reply_error(int fd, const char* cmd, const char* fmt, ...) {
     char msg[512];
     va_list ap;
     va_start(ap, fmt);
@@ -887,20 +935,19 @@ static void reply_error(int fd, const char *cmd, const char *fmt, ...) {
 
 /* ==================== 输入校验 ==================== */
 /* 包名只能含 [A-Za-z0-9._-]，禁止 / 与 ..，防路径穿越 */
-static bool valid_pkg(const char *pkg) {
+static bool valid_pkg(const char* pkg) {
     if (!pkg || !*pkg || strlen(pkg) > 127) return false;
     if (strchr(pkg, '/') || strstr(pkg, "..")) return false;
-    for (const char *p = pkg; *p; p++) {
-        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-'))
-            return false;
+    for (const char* p = pkg; *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '-')) return false;
     }
     return true;
 }
 
-static bool valid_value(const char *v) {
+static bool valid_value(const char* v) {
     if (!v || !*v || strchr(v, '\n')) return false;
     if (strlen(v) >= MAX_LINE - 64) return false;
-    for (const char *p = v; *p; p++) {
+    for (const char* p = v; *p; p++) {
         if (*p == '\r' || *p == '\0') return false;
     }
     return true;
@@ -908,14 +955,14 @@ static bool valid_value(const char *v) {
 
 /* ==================== 规则列表构建 ==================== */
 /* 构建已读取行数组的 rules 数组 + switches 对象（索引与 REMOVE/TOGGLE 一致） */
-static void build_lines_rules(char **lines, int count, json_object *rules, json_object *switches) {
+static void build_lines_rules(char** lines, int count, json_object* rules, json_object* switches) {
     if (!lines) return;
     int type_index[MAX_RULE_TYPES] = {0};
     char valbuf[MAX_LINE];
     for (int i = 0; i < count; i++) {
         RuleType t = classify_line(lines[i]);
         if (t == RT_UNKNOWN) continue;
-        const char *name = rule_type_name(t);
+        const char* name = rule_type_name(t);
         bool disabled = line_is_disabled(lines[i]);
         if (is_switch_type(t)) {
             /* 开关：switches.{name} = "ON"/"OFF"（以值行为准，默认 OFF） */
@@ -923,7 +970,7 @@ static void build_lines_rules(char **lines, int count, json_object *rules, json_
             bool on = (strcasecmp(valbuf, "ON") == 0) || (strcasecmp(valbuf, "1") == 0);
             json_object_object_add(switches, name, json_object_new_boolean(on));
         } else {
-            json_object *r = json_object_new_object();
+            json_object* r = json_object_new_object();
             json_object_object_add(r, "index", json_object_new_int(type_index[t]));
             json_object_object_add(r, "type", json_object_new_string(name));
             rule_line_value(lines[i], valbuf, sizeof(valbuf));
@@ -937,9 +984,9 @@ static void build_lines_rules(char **lines, int count, json_object *rules, json_
 }
 
 /* 构建单个规则文件的 rules 数组 + switches 对象 */
-static void build_file_rules(const char *path, json_object *rules, json_object *switches) {
+static void build_file_rules(const char* path, json_object* rules, json_object* switches) {
     int count = 0, cap = 0;
-    char **lines = read_file_lines(path, &count, &cap);
+    char** lines = read_file_lines(path, &count, &cap);
     if (!lines) return;
     build_lines_rules(lines, count, rules, switches);
     free_file_lines(lines, count);
@@ -947,22 +994,22 @@ static void build_file_rules(const char *path, json_object *rules, json_object *
 
 /* 类别段 JSON：只取主文件内精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]）
    到下一段头之间的行；段不存在返回空规则（file 照样回主文件路径） */
-static json_object *build_category_json(const char *pkg, int uid) {
+static json_object* build_category_json(const char* pkg, int uid) {
     char path[PATH_MAX];
     char hdr[64];
     main_conf_path(path, sizeof(path));
     category_section_header(pkg, uid, hdr, sizeof hdr);
-    json_object *cat = json_object_new_object();
-    json_object *switches = json_object_new_object();
-    json_object *rules = json_object_new_array();
+    json_object* cat = json_object_new_object();
+    json_object* switches = json_object_new_object();
+    json_object* rules = json_object_new_array();
     int count = 0, cap = 0;
-    char **lines = read_file_lines(path, &count, &cap);
+    char** lines = read_file_lines(path, &count, &cap);
     if (lines) {
         int hdr_idx = find_header_line(lines, count, hdr);
         if (hdr_idx >= 0) {
             int end = hdr_idx + 1;
             while (end < count) {
-                char *p = lines[end];
+                char* p = lines[end];
                 while (isspace((unsigned char)*p)) p++;
                 if (*p == '[') break;
                 end++;
@@ -980,12 +1027,12 @@ static json_object *build_category_json(const char *pkg, int uid) {
     return cat;
 }
 
-static json_object *build_global_json(void) {
+static json_object* build_global_json(void) {
     char path[PATH_MAX];
     main_conf_path(path, sizeof(path));
-    json_object *global = json_object_new_object();
-    json_object *switches = json_object_new_object();
-    json_object *rules = json_object_new_array();
+    json_object* global = json_object_new_object();
+    json_object* switches = json_object_new_object();
+    json_object* rules = json_object_new_array();
     build_file_rules(path, rules, switches);
     json_object_object_add(global, "file", json_object_new_string(path));
     json_object_object_add(global, "switches", switches);
@@ -993,13 +1040,13 @@ static json_object *build_global_json(void) {
     return global;
 }
 
-static json_object *build_app_json(const char *pkg, int uid) {
+static json_object* build_app_json(const char* pkg, int uid) {
     char read_path[PATH_MAX];
     resolve_app_rule_active_path(pkg, uid, read_path, sizeof(read_path));
     bool disabled = !app_rule_is_enabled(pkg, uid);
-    json_object *app = json_object_new_object();
-    json_object *switches = json_object_new_object();
-    json_object *rules = json_object_new_array();
+    json_object* app = json_object_new_object();
+    json_object* switches = json_object_new_object();
+    json_object* rules = json_object_new_array();
     build_file_rules(read_path, rules, switches);
     json_object_object_add(app, "pkg", json_object_new_string(pkg));
     json_object_object_add(app, "uid", json_object_new_int(uid));
@@ -1014,13 +1061,13 @@ static json_object *build_app_json(const char *pkg, int uid) {
 /* 扫描 App-rules 与 App-rules-<uid> 目录，列出全部应用规则
    （含已停用 <pkg>.conf.disabled 文件——前端需可见以便重新启用）
    uid_filter >= 0 时仅返回该用户的应用（GET ?uid= 场景） */
-static json_object *build_apps_json_filtered(int uid_filter) {
-    json_object *apps = json_object_new_array();
-    DIR *d = opendir(g_config_dir);
+static json_object* build_apps_json_filtered(int uid_filter) {
+    json_object* apps = json_object_new_array();
+    DIR* d = opendir(g_config_dir);
     if (!d) return apps;
-    struct dirent *de;
+    struct dirent* de;
     while ((de = readdir(d)) != NULL) {
-        const char *name = de->d_name;
+        const char* name = de->d_name;
         int uid = 0;
         if (strcmp(name, "App-rules") == 0) {
             uid = 0;
@@ -1032,18 +1079,18 @@ static json_object *build_apps_json_filtered(int uid_filter) {
         if (uid_filter >= 0 && uid != uid_filter) continue;
         char dir[PATH_MAX];
         app_rule_dir(dir, sizeof(dir), uid);
-        DIR *ad = opendir(dir);
+        DIR* ad = opendir(dir);
         if (!ad) continue;
-        struct dirent *ae;
+        struct dirent* ae;
         while ((ae = readdir(ad)) != NULL) {
-            const char *fn = ae->d_name;
+            const char* fn = ae->d_name;
             size_t flen = strlen(fn);
             /* 匹配 <pkg>.conf 与 <pkg>.conf.disabled 两种形态 */
             bool disabled = false;
-            size_t suffix = 5;   /* ".conf" */
+            size_t suffix = 5; /* ".conf" */
             if (flen > 14 && strcmp(fn + flen - 14, ".conf.disabled") == 0) {
                 disabled = true;
-                suffix = 14;     /* ".conf.disabled" */
+                suffix = 14; /* ".conf.disabled" */
             } else if (flen <= 5 || strcmp(fn + flen - 5, ".conf") != 0) {
                 continue;
             }
@@ -1064,37 +1111,36 @@ static json_object *build_apps_json_filtered(int uid_filter) {
     return apps;
 }
 
-static json_object *build_apps_json(void) {
+static json_object* build_apps_json(void) {
     return build_apps_json_filtered(-1);
 }
 
 /* 扫描 config_dir 下全部用户目录（App-rules=uid 0、App-rules-<uid>=uid>0），
    返回用户列表 [{uid, dir, app_count}] */
-static json_object *build_users_json(void) {
-    json_object *users = json_object_new_array();
-    DIR *d = opendir(g_config_dir);
+static json_object* build_users_json(void) {
+    json_object* users = json_object_new_array();
+    DIR* d = opendir(g_config_dir);
     if (!d) return users;
-    struct dirent *de;
+    struct dirent* de;
     while ((de = readdir(d)) != NULL) {
-        const char *name = de->d_name;
+        const char* name = de->d_name;
         int uid = -1;
         if (strcmp(name, "App-rules") == 0) {
             uid = 0;
         } else if (strncmp(name, "App-rules-", 10) == 0) {
-            char *end = NULL;
+            char* end = NULL;
             long v = strtol(name + 10, &end, 10);
-            if (end && *end == '\0' && v >= 0 && v <= 100000)
-                uid = (int)v;
+            if (end && *end == '\0' && v >= 0 && v <= 100000) uid = (int)v;
         }
         if (uid < 0) continue;
         char dir[PATH_MAX];
         app_rule_dir(dir, sizeof(dir), uid);
         int app_cnt = 0;
-        DIR *ad = opendir(dir);
+        DIR* ad = opendir(dir);
         if (ad) {
-            struct dirent *ae;
+            struct dirent* ae;
             while ((ae = readdir(ad)) != NULL) {
-                const char *fn = ae->d_name;
+                const char* fn = ae->d_name;
                 size_t flen = strlen(fn);
                 if ((flen > 5 && strcmp(fn + flen - 5, ".conf") == 0) ||
                     (flen > 14 && strcmp(fn + flen - 14, ".conf.disabled") == 0))
@@ -1102,7 +1148,7 @@ static json_object *build_users_json(void) {
             }
             closedir(ad);
         }
-        json_object *u = json_object_new_object();
+        json_object* u = json_object_new_object();
         json_object_object_add(u, "uid", json_object_new_int(uid));
         json_object_object_add(u, "dir", json_object_new_string(dir));
         json_object_object_add(u, "app_count", json_object_new_int(app_cnt));
@@ -1120,7 +1166,7 @@ static bool valid_uid(int uid) {
 /* ==================== 规则定位（按类型+索引） ==================== */
 /* 在**已读取**的 lines 中定位第 index 条 type 规则（含已停用行，与 LIST 索引一致），
    返回行号；未找到返回 -1。调用方已持有 lines（避免重复读文件）。 */
-static int find_rule_line(char **lines, int count, RuleType type, int index) {
+static int find_rule_line(char** lines, int count, RuleType type, int index) {
     if (!lines) return -1;
     int seen = 0;
     for (int i = 0; i < count; i++) {
@@ -1137,24 +1183,28 @@ static int find_rule_line(char **lines, int count, RuleType type, int index) {
    lang：前端请求的语言（如 "en"），为空默认 "zh"；
    每个类型回传匹配语言的 desc（找不到回退 zh），并附 desc_map 全语言映射
    与 argc_min/argc_max 参数约束，供前端动态渲染任意模块的规则输入框 */
-static json_object *build_rule_types_json(const char *lang) {
+static json_object* build_rule_types_json(const char* lang) {
     if (!lang || !*lang) lang = "zh";
-    json_object *arr = json_object_new_array();
+    json_object* arr = json_object_new_array();
     for (int i = 0; i < g_rule_type_count; i++) {
-        json_object *t = json_object_new_object();
+        json_object* t = json_object_new_object();
         json_object_object_add(t, "type", json_object_new_string(g_rule_types[i].name));
-        const char *fmt_s = "path";
-        if (g_rule_types[i].fmt == RFT_PAIR) fmt_s = "pair";
-        else if (g_rule_types[i].fmt == RFT_SWITCH) fmt_s = "switch";
-        else if (g_rule_types[i].fmt == RFT_TOKENS) fmt_s = "tokens";
+        const char* fmt_s = "path";
+        if (g_rule_types[i].fmt == RFT_PAIR)
+            fmt_s = "pair";
+        else if (g_rule_types[i].fmt == RFT_SWITCH)
+            fmt_s = "switch";
+        else if (g_rule_types[i].fmt == RFT_TOKENS)
+            fmt_s = "tokens";
         json_object_object_add(t, "format", json_object_new_string(fmt_s));
         json_object_object_add(t, "builtin", json_object_new_boolean(g_rule_types[i].builtin));
         json_object_object_add(t, "module", json_object_new_string(g_rule_types[i].module));
-        json_object_object_add(t, "global_only", json_object_new_boolean(g_rule_types[i].global_only));
+        json_object_object_add(t, "global_only",
+                               json_object_new_boolean(g_rule_types[i].global_only));
         json_object_object_add(t, "argc_min", json_object_new_int(g_rule_types[i].argc_min));
         json_object_object_add(t, "argc_max", json_object_new_int(g_rule_types[i].argc_max));
         /* 多语言描述：按请求语言选取（回退 zh），并附全语言 desc_map */
-        const char *match = nullptr;
+        const char* match = nullptr;
         for (int d = 0; d < g_rule_types[i].desc_count; d++) {
             if (strcasecmp(g_rule_types[i].descs[d].lang, lang) == 0)
                 match = g_rule_types[i].descs[d].text;
@@ -1168,7 +1218,7 @@ static json_object *build_rule_types_json(const char *lang) {
         if (!match && g_rule_types[i].desc_count > 0) match = g_rule_types[i].descs[0].text;
         json_object_object_add(t, "desc", json_object_new_string(match ? match : ""));
         if (g_rule_types[i].desc_count > 0) {
-            json_object *dmap = json_object_new_object();
+            json_object* dmap = json_object_new_object();
             for (int d = 0; d < g_rule_types[i].desc_count; d++)
                 json_object_object_add(dmap, g_rule_types[i].descs[d].lang,
                                        json_object_new_string(g_rule_types[i].descs[d].text));
@@ -1179,14 +1229,14 @@ static json_object *build_rule_types_json(const char *lang) {
     return arr;
 }
 
-static void handle_ping(int fd, json_object *req) {
+static void handle_ping(int fd, json_object* req) {
     (void)req;
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "pong", json_object_new_boolean(true));
     json_object_object_add(data, "version", json_object_new_string(RULE_VERSION));
     json_object_object_add(data, "config_dir", json_object_new_string(g_config_dir));
     json_object_object_add(data, "socket", json_object_new_string(g_socket_name));
-    const char *lang = json_object_get_string(json_object_object_get(req, "lang"));
+    const char* lang = json_object_get_string(json_object_object_get(req, "lang"));
     json_object_object_add(data, "rule_types", build_rule_types_json(lang));
     reply_ok(fd, "PING", data);
 }
@@ -1194,43 +1244,45 @@ static void handle_ping(int fd, json_object *req) {
 /* UPTIME：查询本守护进程运行时长（CLOCK_MONOTONIC 单调时钟，不受系统
    改时间影响）。data：uptime_seconds（整数秒）、uptime（人类可读时长）、
    started_at（启动墙钟时间戳，epoch 秒） */
-static void handle_uptime(int fd, json_object *req) {
+static void handle_uptime(int fd, json_object* req) {
     (void)req;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     long long secs = (long long)(now.tv_sec - g_start_mono.tv_sec);
-    if (secs < 0) secs = 0;   /* 时钟异常兜底 */
-    json_object *data = json_object_new_object();
+    if (secs < 0) secs = 0; /* 时钟异常兜底 */
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "uptime_seconds", json_object_new_int64(secs));
     char human[64];
-    long long d = secs / 86400, h = (secs % 86400) / 3600,
-              m = (secs % 3600) / 60, s = secs % 60;
-    if (d > 0)      snprintf(human, sizeof human, "%lld天%lld小时%lld分%lld秒", d, h, m, s);
-    else if (h > 0) snprintf(human, sizeof human, "%lld小时%lld分%lld秒", h, m, s);
-    else            snprintf(human, sizeof human, "%lld分%lld秒", m, s);
+    long long d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60, s = secs % 60;
+    if (d > 0)
+        snprintf(human, sizeof human, "%lld天%lld小时%lld分%lld秒", d, h, m, s);
+    else if (h > 0)
+        snprintf(human, sizeof human, "%lld小时%lld分%lld秒", h, m, s);
+    else
+        snprintf(human, sizeof human, "%lld分%lld秒", m, s);
     json_object_object_add(data, "uptime", json_object_new_string(human));
     json_object_object_add(data, "started_at", json_object_new_int64((int64_t)g_start_wall));
     reply_ok(fd, "UPTIME", data);
 }
 
-static void handle_list(int fd, json_object *req) {
+static void handle_list(int fd, json_object* req) {
     (void)req;
-    json_object *data = json_object_new_object();
-    const char *lang = json_object_get_string(json_object_object_get(req, "lang"));
+    json_object* data = json_object_new_object();
+    const char* lang = json_object_get_string(json_object_object_get(req, "lang"));
     json_object_object_add(data, "rule_types", build_rule_types_json(lang));
     json_object_object_add(data, "global", build_global_json());
     json_object_object_add(data, "apps", build_apps_json());
     reply_ok(fd, "LIST", data);
 }
 
-static void handle_get(int fd, json_object *req) {
-    const char *pkg = json_object_get_string(json_object_object_get(req, "pkg"));
+static void handle_get(int fd, json_object* req) {
+    const char* pkg = json_object_get_string(json_object_object_get(req, "pkg"));
     int uid = json_object_get_int(json_object_object_get(req, "uid"));
     if (uid < 0) uid = 0;
     /* GET 不带 pkg 时：返回全局 + 指定用户（uid 参数）的全部应用；
        前端可用 GET {"uid":10} 只取某个用户空间的配置 */
     if (!pkg || strcasecmp(pkg, "GLOBAL") == 0) {
-        json_object *data = json_object_new_object();
+        json_object* data = json_object_new_object();
         json_object_object_add(data, "global", build_global_json());
         if (pkg && strcasecmp(pkg, "GLOBAL") != 0) {
             /* 形如 GET {"pkg":"GLOBAL","uid":10}：全局 + 该用户应用 */
@@ -1249,7 +1301,7 @@ static void handle_get(int fd, json_object *req) {
     /* 类别段视图：主文件内精确段头切片（索引为段内局部序号，仅展示用；
        REMOVE/TOGGLE 仍用主文件全局索引，与 pkg=GLOBAL 语义一致） */
     if (is_category_pkg(pkg)) {
-        json_object *data = json_object_new_object();
+        json_object* data = json_object_new_object();
         json_object_object_add(data, "category", build_category_json(pkg, uid));
         reply_ok(fd, "GET", data);
         return;
@@ -1258,28 +1310,27 @@ static void handle_get(int fd, json_object *req) {
         reply_error(fd, "GET", "非法包名: %s", pkg ? pkg : "(null)");
         return;
     }
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "app", build_app_json(pkg, uid));
     reply_ok(fd, "GET", data);
 }
 
 /* USERS：列出全部已配置用户（App-rules 与 App-rules-<uid> 目录），
    前端可据此遍历多用户空间 */
-static void handle_users(int fd, json_object *req) {
+static void handle_users(int fd, json_object* req) {
     (void)req;
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "users", build_users_json());
     reply_ok(fd, "USERS", data);
 }
 
 /* 依据类型构建规则行文本；返回 0 成功，-1 参数错误 */
-static int build_rule_line(RuleType t, const char *value, char *line, size_t sz) {
+static int build_rule_line(RuleType t, const char* value, char* line, size_t sz) {
     if (t < 0 || t >= g_rule_type_count) return -1;
-    const char *name = rule_type_name(t);
+    const char* name = rule_type_name(t);
     RuleFmt fmt = g_rule_types[t].fmt;
     if (fmt == RFT_SWITCH) {
-        if (!value || (strcasecmp(value, "ON") != 0 && strcasecmp(value, "OFF") != 0))
-            return -1;
+        if (!value || (strcasecmp(value, "ON") != 0 && strcasecmp(value, "OFF") != 0)) return -1;
         snprintf(line, sz, "%s %s\n", name, value);
         return 0;
     }
@@ -1292,16 +1343,15 @@ static int build_rule_line(RuleType t, const char *value, char *line, size_t sz)
         if (!value || !*value) return -1;
         char out[MAX_LINE];
         size_t olen = 0;
-        const char *p = value;
+        const char* p = value;
         bool first = true;
         int tok_count = 0;
         while (*p) {
             char tok[MAX_LINE];
             size_t tlen = 0;
-            while (*p && *p != '|' && tlen < sizeof(tok) - 1)
-                tok[tlen++] = *p++;
+            while (*p && *p != '|' && tlen < sizeof(tok) - 1) tok[tlen++] = *p++;
             tok[tlen] = '\0';
-            if (tlen == 0) return -1;   /* 空 token（如 /a||/b）非法 */
+            if (tlen == 0) return -1; /* 空 token（如 /a||/b）非法 */
             tok_count++;
             /* 单次 snprintf 写入并检测溢出（返回应写入长度，>= 剩余空间即截断） */
             int w = snprintf(out + olen, sizeof(out) - olen, "%s%s", first ? "" : " ", tok);
@@ -1327,10 +1377,10 @@ static int build_rule_line(RuleType t, const char *value, char *line, size_t sz)
    scope=GLOBAL 时写入 injector.conf 的 [GLOBAL] 段；
    scope=APP 时写入 App-rules/<pkg>.conf（uid>0 时 App-rules-<uid>/）。
    type=INJECT_ENABLE 仅 APP 有效，改写 injector.conf 的 [pkg:uid] ON/OFF 头。 */
-static void handle_add(int fd, json_object *req) {
-    const char *pkg = json_object_get_string(json_object_object_get(req, "pkg"));
-    const char *type_s = json_object_get_string(json_object_object_get(req, "type"));
-    const char *value = json_object_get_string(json_object_object_get(req, "value"));
+static void handle_add(int fd, json_object* req) {
+    const char* pkg = json_object_get_string(json_object_object_get(req, "pkg"));
+    const char* type_s = json_object_get_string(json_object_object_get(req, "type"));
+    const char* value = json_object_get_string(json_object_object_get(req, "value"));
     int uid = json_object_get_int(json_object_object_get(req, "uid"));
     if (uid < 0) uid = 0;
 
@@ -1384,7 +1434,7 @@ static void handle_add(int fd, json_object *req) {
                     reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
                     return;
                 }
-                FILE *fp = fopen(path, "w");
+                FILE* fp = fopen(path, "w");
                 if (!fp) {
                     reply_error(fd, "ADD", "创建 %s 失败: %s", path, strerror(errno));
                     return;
@@ -1406,7 +1456,7 @@ static void handle_add(int fd, json_object *req) {
                 return;
             }
         }
-        json_object *data = json_object_new_object();
+        json_object* data = json_object_new_object();
         json_object_object_add(data, "dir", json_object_new_string(dir));
         json_object_object_add(data, "file", json_object_new_string(on ? path : dis_path));
         json_object_object_add(data, "enabled", json_object_new_boolean(on));
@@ -1423,8 +1473,7 @@ static void handle_add(int fd, json_object *req) {
     /* 全局专属类型（GLOBAL_INJECT/SKIP_SYSTEM_APPS）：仅 [GLOBAL] 段可用
        （类别段同样拒绝，is_category 非全局） */
     if (!is_global && g_rule_types[t].global_only) {
-        reply_error(fd, "ADD", "规则类型 %s 仅可在全局规则中使用，不能配置到应用 %s",
-                    type_s, pkg);
+        reply_error(fd, "ADD", "规则类型 %s 仅可在全局规则中使用，不能配置到应用 %s", type_s, pkg);
         return;
     }
     char line[MAX_LINE];
@@ -1448,7 +1497,7 @@ static void handle_add(int fd, json_object *req) {
         char conf[PATH_MAX];
         main_conf_path(conf, sizeof(conf));
         int count = 0, cap = 0;
-        char **lines = read_file_lines(conf, &count, &cap);
+        char** lines = read_file_lines(conf, &count, &cap);
         if (!lines) {
             if (nsp_mkdir_p(g_config_dir, 0755) != 0) {
                 reply_error(fd, "ADD", "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
@@ -1467,7 +1516,7 @@ static void handle_add(int fd, json_object *req) {
                 return;
             }
             free_file_lines(lines, count);
-            json_object *data = json_object_new_object();
+            json_object* data = json_object_new_object();
             json_object_object_add(data, "file", json_object_new_string(conf));
             json_object_object_add(data, "line", json_object_new_string(line));
             reply_ok(fd, "ADD", data);
@@ -1477,7 +1526,7 @@ static void handle_add(int fd, json_object *req) {
                             : find_header_line(lines, count, sec_hdr);
         bool changed = false;
         if (is_switch_type(t)) {
-            const char *tname = rule_type_name(t);
+            const char* tname = rule_type_name(t);
             if (hdr >= 0) {
                 int old = find_switch_in_section(lines, count, hdr, tname);
                 if (old >= 0) {
@@ -1515,7 +1564,10 @@ static void handle_add(int fd, json_object *req) {
             /* 规则行：去重后插入段头之后 */
             bool dup = false;
             for (int i = 0; i < count; i++) {
-                if (strcmp(lines[i], line) == 0) { dup = true; break; }
+                if (strcmp(lines[i], line) == 0) {
+                    dup = true;
+                    break;
+                }
             }
             if (!dup) {
                 int pos = hdr >= 0 ? hdr + 1 : count;
@@ -1546,7 +1598,7 @@ static void handle_add(int fd, json_object *req) {
             }
         }
         free_file_lines(lines, count);
-        json_object *data = json_object_new_object();
+        json_object* data = json_object_new_object();
         json_object_object_add(data, "file", json_object_new_string(conf));
         json_object_object_add(data, "line", json_object_new_string(line));
         json_object_object_add(data, "changed", json_object_new_boolean(changed));
@@ -1569,14 +1621,17 @@ static void handle_add(int fd, json_object *req) {
     }
     {
         int count = 0, cap = 0;
-        char **lines = read_file_lines(path, &count, &cap);
+        char** lines = read_file_lines(path, &count, &cap);
         bool changed = false;
         if (is_switch_type(t)) {
             /* 开关类型：替换文件中已存在的同类型开关行（保持唯一，后写覆盖），
                无则追加——与 GLOBAL 段语义一致，避免 MONITOR ON/OFF 并存 */
             int old = -1;
             for (int i = 0; i < count; i++) {
-                if (classify_line(lines[i]) == t) { old = i; break; }
+                if (classify_line(lines[i]) == t) {
+                    old = i;
+                    break;
+                }
             }
             if (old >= 0) {
                 if (strcmp(lines[old], line) != 0) {
@@ -1604,7 +1659,10 @@ static void handle_add(int fd, json_object *req) {
             bool dup = false;
             if (lines) {
                 for (int i = 0; i < count; i++) {
-                    if (strcmp(lines[i], line) == 0) { dup = true; break; }
+                    if (strcmp(lines[i], line) == 0) {
+                        dup = true;
+                        break;
+                    }
                 }
             }
             if (!dup) {
@@ -1626,7 +1684,7 @@ static void handle_add(int fd, json_object *req) {
             }
         }
         free_file_lines(lines, count);
-        json_object *data = json_object_new_object();
+        json_object* data = json_object_new_object();
         json_object_object_add(data, "file", json_object_new_string(path));
         json_object_object_add(data, "line", json_object_new_string(line));
         json_object_object_add(data, "changed", json_object_new_boolean(changed));
@@ -1637,7 +1695,7 @@ static void handle_add(int fd, json_object *req) {
 /* 定位规则所在文件路径；scope=GLOBAL/类别段返回主配置文件，否则返回应用规则
    **当前生效**文件（停用状态返回 .conf.disabled，保证后续操作写入同一文件、
    不丢规则）。类别段 REMOVE/TOGGLE 用主文件全局索引（与 GLOBAL 一致）。 */
-static void resolve_rule_path(const char *pkg, int uid, bool *is_global, char *out, size_t sz) {
+static void resolve_rule_path(const char* pkg, int uid, bool* is_global, char* out, size_t sz) {
     if (!pkg || strcasecmp(pkg, "GLOBAL") == 0 || is_category_pkg(pkg)) {
         *is_global = true;
         main_conf_path(out, sz);
@@ -1648,9 +1706,9 @@ static void resolve_rule_path(const char *pkg, int uid, bool *is_global, char *o
 }
 
 /* REMOVE：按 (类型, 索引) 删除规则行（索引与 LIST 输出一致，含已停用行） */
-static void handle_remove(int fd, json_object *req) {
-    const char *pkg = json_object_get_string(json_object_object_get(req, "pkg"));
-    const char *type_s = json_object_get_string(json_object_object_get(req, "type"));
+static void handle_remove(int fd, json_object* req) {
+    const char* pkg = json_object_get_string(json_object_object_get(req, "pkg"));
+    const char* type_s = json_object_get_string(json_object_object_get(req, "type"));
     int index = json_object_get_int(json_object_object_get(req, "index"));
     int uid = json_object_get_int(json_object_object_get(req, "uid"));
     if (uid < 0) uid = 0;
@@ -1671,7 +1729,8 @@ static void handle_remove(int fd, json_object *req) {
         reply_error(fd, "REMOVE", "索引必须 >= 0");
         return;
     }
-    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !is_category_pkg(pkg) && !valid_pkg(pkg)) {
+    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !is_category_pkg(pkg) &&
+        !valid_pkg(pkg)) {
         reply_error(fd, "REMOVE", "非法包名: %s", pkg);
         return;
     }
@@ -1679,7 +1738,7 @@ static void handle_remove(int fd, json_object *req) {
     char path[PATH_MAX];
     resolve_rule_path(pkg, uid, &is_global, path, sizeof(path));
     int count = 0, cap = 0;
-    char **lines = read_file_lines(path, &count, &cap);
+    char** lines = read_file_lines(path, &count, &cap);
     if (!lines) {
         reply_error(fd, "REMOVE", "无法打开规则文件 %s", path);
         return;
@@ -1699,17 +1758,17 @@ static void handle_remove(int fd, json_object *req) {
         return;
     }
     free_file_lines(lines, count);
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "removed", json_object_new_string(removed));
     reply_ok(fd, "REMOVE", data);
 }
 
 /* ENABLE / DISABLE：切换规则行的 # 注释状态（停用行被解析器跳过） */
-static void handle_toggle(int fd, json_object *req, bool enable) {
-    const char *cmd = enable ? "ENABLE" : "DISABLE";
-    const char *pkg = json_object_get_string(json_object_object_get(req, "pkg"));
-    const char *type_s = json_object_get_string(json_object_object_get(req, "type"));
+static void handle_toggle(int fd, json_object* req, bool enable) {
+    const char* cmd = enable ? "ENABLE" : "DISABLE";
+    const char* pkg = json_object_get_string(json_object_object_get(req, "pkg"));
+    const char* type_s = json_object_get_string(json_object_object_get(req, "type"));
     int index = json_object_get_int(json_object_object_get(req, "index"));
     int uid = json_object_get_int(json_object_object_get(req, "uid"));
     if (uid < 0) uid = 0;
@@ -1742,7 +1801,7 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
     char path[PATH_MAX];
     resolve_rule_path(pkg, uid, &is_global, path, sizeof(path));
     int count = 0, cap = 0;
-    char **lines = read_file_lines(path, &count, &cap);
+    char** lines = read_file_lines(path, &count, &cap);
     if (!lines) {
         reply_error(fd, cmd, "无法打开规则文件 %s", path);
         return;
@@ -1753,14 +1812,14 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
         reply_error(fd, cmd, "未找到 %s 类型的第 %d 条规则", type_s, index);
         return;
     }
-    char *p = lines[found];
+    char* p = lines[found];
     while (*p == ' ' || *p == '\t') p++;
     bool already = (enable ? !line_is_disabled(lines[found]) : line_is_disabled(lines[found]));
     if (!already) {
         if (enable) {
             /* 去掉行首 #（及紧随其后的空白）——向前移动，长度缩小，安全 */
             if (*p == '#') {
-                char *q = p + 1;
+                char* q = p + 1;
                 while (*q == ' ' || *q == '\t') q++;
                 memmove(p, q, strlen(q) + 1);
             }
@@ -1774,7 +1833,7 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
                 reply_error(fd, cmd, "规则行过长，无法停用");
                 return;
             }
-            char *nl = malloc(len + 2);
+            char* nl = malloc(len + 2);
             if (!nl) {
                 free_file_lines(lines, count);
                 reply_error(fd, cmd, "内存不足");
@@ -1795,7 +1854,7 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
     char updated[MAX_LINE];
     snprintf(updated, sizeof(updated), "%s", lines[found]);
     free_file_lines(lines, count);
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "line", json_object_new_string(updated));
     json_object_object_add(data, "enabled", json_object_new_boolean(enable));
@@ -1805,15 +1864,15 @@ static void handle_toggle(int fd, json_object *req, bool enable) {
 
 /* SET：设置开关（MONITOR/SANDBOX/GLOBAL_INJECT）或应用注入开关，
    复用 ADD 的写入逻辑 */
-static void handle_set(int fd, json_object *req) {
+static void handle_set(int fd, json_object* req) {
     handle_add(fd, req);
 }
 
 /* 向 injector 发送信号（SIGHUP 重载 / SIGTERM 停止） */
-static void signal_injector(int fd, const char *cmd, int sig) {
+static void signal_injector(int fd, const char* cmd, int sig) {
     char path[PATH_MAX];
     injector_pid_path(path, sizeof(path));
-    FILE *fp = fopen(path, "r");
+    FILE* fp = fopen(path, "r");
     if (!fp) {
         reply_error(fd, cmd, "无法读取注入器 PID 文件 %s: %s", path, strerror(errno));
         return;
@@ -1829,10 +1888,11 @@ static void signal_injector(int fd, const char *cmd, int sig) {
         reply_error(fd, cmd, "向 PID %d 发送信号 %d 失败: %s", pid, sig, strerror(errno));
         return;
     }
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "pid", json_object_new_int(pid));
     json_object_object_add(data, "signal", json_object_new_int(sig));
-    json_object_object_add(data, "action", json_object_new_string(sig == SIGHUP ? "reload" : "stop"));
+    json_object_object_add(data, "action",
+                           json_object_new_string(sig == SIGHUP ? "reload" : "stop"));
     reply_ok(fd, cmd, data);
 }
 
@@ -1844,14 +1904,14 @@ static bool proc_alive(int pid) {
        字段（pid (comm) state ...，state 在最后一个 ')' 之后）判别 */
     char stat_path[64];
     snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
-    FILE *fp = fopen(stat_path, "r");
+    FILE* fp = fopen(stat_path, "r");
     if (fp) {
         char buf[256] = {0};
         if (fgets(buf, sizeof(buf), fp)) {
-            char *rp = strrchr(buf, ')');
+            char* rp = strrchr(buf, ')');
             if (rp && rp[1] == ' ' && (rp[2] == 'Z' || rp[2] == 'z')) {
                 fclose(fp);
-                return false;   /* 僵尸视为已退出 */
+                return false; /* 僵尸视为已退出 */
             }
         }
         fclose(fp);
@@ -1861,25 +1921,28 @@ static bool proc_alive(int pid) {
 
 /* 扫描 /proc/<pid>/comm 匹配进程名，返回第一个**存活**匹配 pid（跳过僵尸）；
    未找到返回 0 */
-static int find_proc_pid(const char *name) {
-    DIR *d = opendir("/proc");
+static int find_proc_pid(const char* name) {
+    DIR* d = opendir("/proc");
     if (!d) return 0;
-    struct dirent *de;
+    struct dirent* de;
     int found = 0;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         int pid = atoi(de->d_name);
-        if (pid <= 0 || pid == (int)getpid()) continue;   /* 排除自身 */
+        if (pid <= 0 || pid == (int)getpid()) continue; /* 排除自身 */
         char comm_path[64];
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
-        FILE *fp = fopen(comm_path, "r");
+        FILE* fp = fopen(comm_path, "r");
         if (!fp) continue;
         char buf[64] = {0};
         if (fgets(buf, sizeof(buf), fp)) {
             buf[strcspn(buf, "\n")] = '\0';
             if (strcmp(buf, name) == 0) {
                 fclose(fp);
-                if (proc_alive(pid)) { found = pid; break; }   /* 跳过僵尸，取存活实例 */
+                if (proc_alive(pid)) {
+                    found = pid;
+                    break;
+                } /* 跳过僵尸，取存活实例 */
                 continue;
             }
         }
@@ -1893,7 +1956,7 @@ static int find_proc_pid(const char *name) {
 static int read_injector_pid(void) {
     char path[PATH_MAX];
     injector_pid_path(path, sizeof(path));
-    FILE *fp = fopen(path, "r");
+    FILE* fp = fopen(path, "r");
     if (fp) {
         int pid = -1;
         if (fscanf(fp, "%d", &pid) == 1 && pid > 0 && proc_alive(pid)) {
@@ -1906,20 +1969,20 @@ static int read_injector_pid(void) {
 }
 
 /* 构建单个进程状态对象 {pid, alive} */
-static json_object *build_proc_json(int pid) {
-    json_object *o = json_object_new_object();
+static json_object* build_proc_json(int pid) {
+    json_object* o = json_object_new_object();
     json_object_object_add(o, "pid", json_object_new_int(pid));
     json_object_object_add(o, "alive", json_object_new_boolean(proc_alive(pid)));
     return o;
 }
 
 /* SERVICE status：查询 log_monitor / injector / fuse_daemon / rule_server 状态 */
-static void handle_service_status(int fd, json_object *req) {
+static void handle_service_status(int fd, json_object* req) {
     (void)req;
     int injector_pid = read_injector_pid();
     int fuse_pid = find_proc_pid("fuse_daemon");
     int log_pid = find_proc_pid("log_monitor");
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "rule_server", build_proc_json((int)getpid()));
     json_object_object_add(data, "injector", build_proc_json(injector_pid));
     json_object_object_add(data, "fuse_daemon", build_proc_json(fuse_pid));
@@ -1933,12 +1996,15 @@ static void handle_service_status(int fd, json_object *req) {
 /* ==================== SERVICE 启停控制（等价 service.sh） ==================== */
 
 /* 本进程所在目录（/proc/self/exe 解析），用于定位同目录的 injector/log_monitor/fuse_daemon */
-static void self_bin_dir(char *out, size_t sz) {
+static void self_bin_dir(char* out, size_t sz) {
     char exe[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n <= 0) { snprintf(out, sz, "."); return; }
+    if (n <= 0) {
+        snprintf(out, sz, ".");
+        return;
+    }
     exe[n] = '\0';
-    char *slash = strrchr(exe, '/');
+    char* slash = strrchr(exe, '/');
     if (slash) *slash = '\0';
     snprintf(out, sz, "%s", exe[0] ? exe : ".");
 }
@@ -1950,19 +2016,17 @@ static int stop_proc(int pid, int sig) {
     if (pid <= 0) return 0;
     if (!proc_alive(pid)) return 0;
     kill(pid, sig);
-    for (int i = 0; i < 50 && proc_alive(pid); i++)
-        usleep(10000);   /* 宽限 500ms */
+    for (int i = 0; i < 50 && proc_alive(pid); i++) usleep(10000); /* 宽限 500ms */
     if (proc_alive(pid)) {
-        kill(pid, SIGKILL);   /* 兜底强杀 */
-        for (int i = 0; i < 50 && proc_alive(pid); i++)
-            usleep(10000);
+        kill(pid, SIGKILL); /* 兜底强杀 */
+        for (int i = 0; i < 50 && proc_alive(pid); i++) usleep(10000);
     }
     return proc_alive(pid) ? -1 : 0;
 }
 
 /* 启动一个守护进程：fork+exec（setsid 脱离会话，防 shell 退出连带 kill）。
    argv 以 NULL 结尾；返回子进程 pid，失败返回 -1 */
-static int spawn_daemon(const char *path, char *const argv[]) {
+static int spawn_daemon(const char* path, char* const argv[]) {
     if (!path || access(path, X_OK) != 0) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -1983,31 +2047,37 @@ static int spawn_daemon(const char *path, char *const argv[]) {
 
 /* 停止全部服务：injector（SIGTERM，其自行清理 fuse_daemon）、log_monitor、fuse_daemon。
    执行层：不发送响应，统计结果写入 out_stopped / out_failed */
-static void service_stop_all_exec(int *out_stopped, int *out_failed) {
+static void service_stop_all_exec(int* out_stopped, int* out_failed) {
     int injector_pid = read_injector_pid();
     int log_pid = find_proc_pid("log_monitor");
     int fuse_pid = find_proc_pid("fuse_daemon");
     int stopped = 0, failed = 0;
     if (injector_pid > 0 && proc_alive(injector_pid)) {
-        if (stop_proc(injector_pid, SIGTERM) == 0) stopped++;
-        else failed++;
+        if (stop_proc(injector_pid, SIGTERM) == 0)
+            stopped++;
+        else
+            failed++;
     }
     if (fuse_pid > 0 && proc_alive(fuse_pid)) {
-        if (stop_proc(fuse_pid, SIGTERM) == 0) stopped++;
-        else failed++;
+        if (stop_proc(fuse_pid, SIGTERM) == 0)
+            stopped++;
+        else
+            failed++;
     }
     if (log_pid > 0 && proc_alive(log_pid)) {
-        if (stop_proc(log_pid, SIGTERM) == 0) stopped++;
-        else failed++;
+        if (stop_proc(log_pid, SIGTERM) == 0)
+            stopped++;
+        else
+            failed++;
     }
     if (out_stopped) *out_stopped = stopped;
     if (out_failed) *out_failed = failed;
 }
 
-static void service_stop_all(int fd, const char *cmd) {
+static void service_stop_all(int fd, const char* cmd) {
     int stopped = 0, failed = 0;
     service_stop_all_exec(&stopped, &failed);
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "action", json_object_new_string("stop"));
     json_object_object_add(data, "stopped", json_object_new_int(stopped));
     json_object_object_add(data, "failed", json_object_new_int(failed));
@@ -2017,7 +2087,7 @@ static void service_stop_all(int fd, const char *cmd) {
 /* 启动全部服务（等价 service.sh 的拉起逻辑）：
    先清理残留进程，再按 log_monitor → injector 顺序启动（fuse_daemon 由 injector 拉取）。
    执行层：不发送响应，统计结果写入 out_started / out_failed */
-static void service_start_all_exec(int *out_started, int *out_failed) {
+static void service_start_all_exec(int* out_started, int* out_failed) {
     char bin_dir[PATH_MAX];
     self_bin_dir(bin_dir, sizeof(bin_dir));
     char log_path[PATH_MAX], inj_path[PATH_MAX];
@@ -2036,26 +2106,30 @@ static void service_start_all_exec(int *out_started, int *out_failed) {
     int started = 0, failed = 0;
     /* log_monitor：先起（日志服务） */
     if (access(log_path, X_OK) == 0) {
-        char *argv_log[] = { "log_monitor", NULL };
-        if (spawn_daemon(log_path, argv_log) > 0) started++;
-        else failed++;
+        char* argv_log[] = {"log_monitor", NULL};
+        if (spawn_daemon(log_path, argv_log) > 0)
+            started++;
+        else
+            failed++;
     }
     /* injector：主控（--passive 与 service.sh 一致），其内部拉起 fuse_daemon */
     if (access(inj_path, X_OK) == 0) {
-        char *argv_inj[] = { "injector", "--passive", NULL };
-        if (spawn_daemon(inj_path, argv_inj) > 0) started++;
-        else failed++;
+        char* argv_inj[] = {"injector", "--passive", NULL};
+        if (spawn_daemon(inj_path, argv_inj) > 0)
+            started++;
+        else
+            failed++;
     }
     if (out_started) *out_started = started;
     if (out_failed) *out_failed = failed;
 }
 
-static void service_start_all(int fd, const char *cmd) {
+static void service_start_all(int fd, const char* cmd) {
     int started = 0, failed = 0;
     service_start_all_exec(&started, &failed);
     char bin_dir[PATH_MAX];
     self_bin_dir(bin_dir, sizeof(bin_dir));
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "action", json_object_new_string("start"));
     json_object_object_add(data, "started", json_object_new_int(started));
     json_object_object_add(data, "failed", json_object_new_int(failed));
@@ -2064,8 +2138,8 @@ static void service_start_all(int fd, const char *cmd) {
 }
 
 /* SERVICE 命令分发：status / start / stop / restart */
-static void handle_service(int fd, json_object *req) {
-    const char *action = json_object_get_string(json_object_object_get(req, "action"));
+static void handle_service(int fd, json_object* req) {
+    const char* action = json_object_get_string(json_object_object_get(req, "action"));
     if (!action || strcasecmp(action, "status") == 0) {
         handle_service_status(fd, req);
         return;
@@ -2083,7 +2157,7 @@ static void handle_service(int fd, json_object *req) {
         int stopped = 0, failed_stop = 0, started = 0, failed_start = 0;
         service_stop_all_exec(&stopped, &failed_stop);
         service_start_all_exec(&started, &failed_start);
-        json_object *data = json_object_new_object();
+        json_object* data = json_object_new_object();
         json_object_object_add(data, "action", json_object_new_string("restart"));
         json_object_object_add(data, "stopped", json_object_new_int(stopped));
         json_object_object_add(data, "started", json_object_new_int(started));
@@ -2094,34 +2168,34 @@ static void handle_service(int fd, json_object *req) {
     reply_error(fd, "SERVICE", "未知 action: %s（支持 status/start/stop/restart）", action);
 }
 
-static void handle_reload(int fd, json_object *req) {
+static void handle_reload(int fd, json_object* req) {
     (void)req;
     signal_injector(fd, "RELOAD", SIGHUP);
 }
 
-static void handle_stop(int fd, json_object *req) {
+static void handle_stop(int fd, json_object* req) {
     (void)req;
     signal_injector(fd, "STOP", SIGTERM);
 }
 
-static void handle_status(int fd, json_object *req) {
+static void handle_status(int fd, json_object* req) {
     (void)req;
     int injector_pid = -1;
     bool injector_alive = false;
     char path[PATH_MAX];
     injector_pid_path(path, sizeof(path));
-    FILE *fp = fopen(path, "r");
+    FILE* fp = fopen(path, "r");
     if (fp) {
         if (fscanf(fp, "%d", &injector_pid) == 1 && injector_pid > 0) {
             injector_alive = (kill(injector_pid, 0) == 0 || errno == EPERM);
         }
         fclose(fp);
     }
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "version", json_object_new_string(RULE_VERSION));
     json_object_object_add(data, "config_dir", json_object_new_string(g_config_dir));
     json_object_object_add(data, "socket", json_object_new_string(g_socket_name));
-    json_object *inj = json_object_new_object();
+    json_object* inj = json_object_new_object();
     json_object_object_add(inj, "pid", json_object_new_int(injector_pid));
     json_object_object_add(inj, "alive", json_object_new_boolean(injector_alive));
     json_object_object_add(data, "injector", inj);
@@ -2129,7 +2203,7 @@ static void handle_status(int fd, json_object *req) {
     reply_ok(fd, "STATUS", data);
 }
 
-static void handle_quit(int fd, json_object *req) {
+static void handle_quit(int fd, json_object* req) {
     (void)req;
     g_should_exit = 1;
     reply_ok(fd, "QUIT", NULL);
@@ -2153,13 +2227,16 @@ static void handle_quit(int fd, json_object *req) {
 #define FTP_PASS_MAX 127
 #define FTP_RDIR_MAX 511
 
-static void ftp_conf_path(char *out, size_t sz) {
+static void ftp_conf_path(char* out, size_t sz) {
     snprintf(out, sz, "%s/ftp.conf", g_config_dir);
 }
 
 /* 去首尾空白拷入定长缓冲；超长返回 -1 */
-static int ftp_trim_copy(const char *src, char *dst, size_t sz) {
-    if (!src) { dst[0] = '\0'; return 0; }
+static int ftp_trim_copy(const char* src, char* dst, size_t sz) {
+    if (!src) {
+        dst[0] = '\0';
+        return 0;
+    }
     while (isspace((unsigned char)*src)) src++;
     size_t n = strlen(src);
     while (n > 0 && isspace((unsigned char)src[n - 1])) n--;
@@ -2169,17 +2246,17 @@ static int ftp_trim_copy(const char *src, char *dst, size_t sz) {
     return 0;
 }
 
-static bool ftp_valid_name(const char *name) {
+static bool ftp_valid_name(const char* name) {
     if (!nsp_ini_valid_section(name)) return false;
     char tmp[256];
     if (ftp_trim_copy(name, tmp, sizeof tmp) != 0) return false;
     if (tmp[0] == '\0' || strlen(tmp) > FTP_NAME_MAX) return false;
-    if (strcmp(tmp, "GLOBAL") == 0) return false;   /* [GLOBAL] 非服务器段 */
+    if (strcmp(tmp, "GLOBAL") == 0) return false; /* [GLOBAL] 非服务器段 */
     return true;
 }
 
-static bool ftp_valid_field(const char *v, size_t max) {
-    if (!v) return true;   /* 缺省 = 不写该键 */
+static bool ftp_valid_field(const char* v, size_t max) {
+    if (!v) return true; /* 缺省 = 不写该键 */
     size_t n = strlen(v);
     if (n > max) return false;
     for (size_t i = 0; i < n; i++) {
@@ -2191,7 +2268,7 @@ static bool ftp_valid_field(const char *v, size_t max) {
 }
 
 /* 单服务器 JSON（生效值 + has_password，绝不回传密码明文） */
-static json_object *build_ftp_server_json(NspIniStore *s, const char *name) {
+static json_object* build_ftp_server_json(NspIniStore* s, const char* name) {
     char host[FTP_HOST_MAX + 1] = {0};
     char port_s[32] = {0};
     char user[FTP_USER_MAX + 1] = {0};
@@ -2204,7 +2281,7 @@ static json_object *build_ftp_server_json(NspIniStore *s, const char *name) {
                      nsp_ini_get(s, name, "pass", NULL, 0) == 0);
     int port = atoi(port_s);
     if (port <= 0 || port > 65535) port = 21;
-    json_object *o = json_object_new_object();
+    json_object* o = json_object_new_object();
     json_object_object_add(o, "name", json_object_new_string(name));
     json_object_object_add(o, "host", json_object_new_string(host));
     json_object_object_add(o, "port", json_object_new_int(port));
@@ -2214,20 +2291,20 @@ static json_object *build_ftp_server_json(NspIniStore *s, const char *name) {
     return o;
 }
 
-static void handle_ftp_list(int fd, json_object *req) {
+static void handle_ftp_list(int fd, json_object* req) {
     (void)req;
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
-    NspIniStore *s = nsp_ini_open(path);
+    NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_LIST", "内存不足");
         return;
     }
-    json_object *data = json_object_new_object();
-    json_object *arr = json_object_new_array();
+    json_object* data = json_object_new_object();
+    json_object* arr = json_object_new_array();
     int n = nsp_ini_section_count(s);
     for (int i = 0; i < n; i++) {
-        const char *sec = nsp_ini_section_name(s, i);
+        const char* sec = nsp_ini_section_name(s, i);
         if (!sec || strcmp(sec, "GLOBAL") == 0) continue;
         json_object_array_add(arr, build_ftp_server_json(s, sec));
     }
@@ -2237,15 +2314,15 @@ static void handle_ftp_list(int fd, json_object *req) {
     reply_ok(fd, "FTP_LIST", data);
 }
 
-static void handle_ftp_get(int fd, json_object *req) {
-    const char *name = json_object_get_string(json_object_object_get(req, "name"));
+static void handle_ftp_get(int fd, json_object* req) {
+    const char* name = json_object_get_string(json_object_object_get(req, "name"));
     if (!name || !ftp_valid_name(name)) {
         reply_error(fd, "FTP_GET", "缺少或非法参数: name");
         return;
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
-    NspIniStore *s = nsp_ini_open(path);
+    NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_GET", "内存不足");
         return;
@@ -2257,7 +2334,7 @@ static void handle_ftp_get(int fd, json_object *req) {
         reply_error(fd, "FTP_GET", "服务器不存在: %s", trimmed);
         return;
     }
-    json_object *data = build_ftp_server_json(s, trimmed);
+    json_object* data = build_ftp_server_json(s, trimmed);
     nsp_ini_close(s);
     json_object_object_add(data, "file", json_object_new_string(path));
     reply_ok(fd, "FTP_GET", data);
@@ -2267,12 +2344,12 @@ static void handle_ftp_get(int fd, json_object *req) {
  * 同名且所给字段与现状一致 → duplicate:true 免写；否则更新并落盘。
  * 空字符串的可选字段（user/password/remote_dir）视为"不写该键"
  * （走模块缺省；清空请用 FTP_SET 传空值删键）。 */
-static void handle_ftp_add(int fd, json_object *req) {
-    const char *name = json_object_get_string(json_object_object_get(req, "name"));
-    const char *host = json_object_get_string(json_object_object_get(req, "host"));
-    const char *user = json_object_get_string(json_object_object_get(req, "user"));
-    const char *password = json_object_get_string(json_object_object_get(req, "password"));
-    const char *rdir = json_object_get_string(json_object_object_get(req, "remote_dir"));
+static void handle_ftp_add(int fd, json_object* req) {
+    const char* name = json_object_get_string(json_object_object_get(req, "name"));
+    const char* host = json_object_get_string(json_object_object_get(req, "host"));
+    const char* user = json_object_get_string(json_object_object_get(req, "user"));
+    const char* password = json_object_get_string(json_object_object_get(req, "password"));
+    const char* rdir = json_object_get_string(json_object_object_get(req, "remote_dir"));
     bool has_port = (json_object_object_get(req, "port") != NULL);
     int port = json_object_get_int(json_object_object_get(req, "port"));
     if (!name || !ftp_valid_name(name)) {
@@ -2290,7 +2367,7 @@ static void handle_ftp_add(int fd, json_object *req) {
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
-    NspIniStore *s = nsp_ini_open(path);
+    NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_ADD", "内存不足");
         return;
@@ -2320,7 +2397,8 @@ static void handle_ftp_add(int fd, json_object *req) {
         same = (nsp_ini_get(s, trimmed, "user", cur, sizeof cur) == 0 && strcmp(cur, user) == 0);
     }
     if (same && rdir && rdir[0]) {
-        same = (nsp_ini_get(s, trimmed, "remote_dir", cur, sizeof cur) == 0 && strcmp(cur, rdir) == 0);
+        same =
+            (nsp_ini_get(s, trimmed, "remote_dir", cur, sizeof cur) == 0 && strcmp(cur, rdir) == 0);
     }
     if (same && password && password[0]) {
         /* 密码可明文比对（ftp.conf 本就明文存储）：值不同即视为变更，
@@ -2328,7 +2406,7 @@ static void handle_ftp_add(int fd, json_object *req) {
         same = (nsp_ini_get(s, trimmed, "password", cur, sizeof cur) == 0 &&
                 strcmp(cur, password) == 0);
     }
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "name", json_object_new_string(trimmed));
     if (same) {
@@ -2373,28 +2451,32 @@ ftp_add_fail:
 
 /* FTP_SET：修改单个字段（key 限 host/port/user/password/remote_dir，
  * pass 归一 password）。空值 = 删键回缺省；段不存在报错（新建请用 FTP_ADD）。 */
-static void handle_ftp_set(int fd, json_object *req) {
-    const char *name = json_object_get_string(json_object_object_get(req, "name"));
-    const char *key = json_object_get_string(json_object_object_get(req, "key"));
-    const char *value = json_object_get_string(json_object_object_get(req, "value"));
+static void handle_ftp_set(int fd, json_object* req) {
+    const char* name = json_object_get_string(json_object_object_get(req, "name"));
+    const char* key = json_object_get_string(json_object_object_get(req, "key"));
+    const char* value = json_object_get_string(json_object_object_get(req, "value"));
     if (!name || !ftp_valid_name(name) || !key) {
         reply_error(fd, "FTP_SET", "缺少或非法参数: name/key");
         return;
     }
     char norm_key[16];
-    if (strcasecmp(key, "host") == 0) snprintf(norm_key, sizeof norm_key, "host");
-    else if (strcasecmp(key, "port") == 0) snprintf(norm_key, sizeof norm_key, "port");
-    else if (strcasecmp(key, "user") == 0) snprintf(norm_key, sizeof norm_key, "user");
+    if (strcasecmp(key, "host") == 0)
+        snprintf(norm_key, sizeof norm_key, "host");
+    else if (strcasecmp(key, "port") == 0)
+        snprintf(norm_key, sizeof norm_key, "port");
+    else if (strcasecmp(key, "user") == 0)
+        snprintf(norm_key, sizeof norm_key, "user");
     else if (strcasecmp(key, "password") == 0 || strcasecmp(key, "pass") == 0)
         snprintf(norm_key, sizeof norm_key, "password");
-    else if (strcasecmp(key, "remote_dir") == 0) snprintf(norm_key, sizeof norm_key, "remote_dir");
+    else if (strcasecmp(key, "remote_dir") == 0)
+        snprintf(norm_key, sizeof norm_key, "remote_dir");
     else {
         reply_error(fd, "FTP_SET", "未知字段: %s（限 host/port/user/password/remote_dir）", key);
         return;
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
-    NspIniStore *s = nsp_ini_open(path);
+    NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_SET", "内存不足");
         return;
@@ -2428,9 +2510,12 @@ static void handle_ftp_set(int fd, json_object *req) {
         }
     } else {
         size_t max = FTP_RDIR_MAX;
-        if (strcmp(norm_key, "host") == 0) max = FTP_HOST_MAX;
-        else if (strcmp(norm_key, "user") == 0) max = FTP_USER_MAX;
-        else if (strcmp(norm_key, "password") == 0) max = FTP_PASS_MAX;
+        if (strcmp(norm_key, "host") == 0)
+            max = FTP_HOST_MAX;
+        else if (strcmp(norm_key, "user") == 0)
+            max = FTP_USER_MAX;
+        else if (strcmp(norm_key, "password") == 0)
+            max = FTP_PASS_MAX;
         if (!ftp_valid_field(value, max)) {
             nsp_ini_close(s);
             reply_error(fd, "FTP_SET", "字段值非法或超长");
@@ -2448,7 +2533,7 @@ static void handle_ftp_set(int fd, json_object *req) {
     }
     if (changed && nsp_ini_save(s) != 0) goto ftp_set_fail;
     nsp_ini_close(s);
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "name", json_object_new_string(trimmed));
     json_object_object_add(data, "key", json_object_new_string(norm_key));
@@ -2460,15 +2545,15 @@ ftp_set_fail:
     reply_error(fd, "FTP_SET", "写入 %s 失败", path);
 }
 
-static void handle_ftp_remove(int fd, json_object *req) {
-    const char *name = json_object_get_string(json_object_object_get(req, "name"));
+static void handle_ftp_remove(int fd, json_object* req) {
+    const char* name = json_object_get_string(json_object_object_get(req, "name"));
     if (!name || !ftp_valid_name(name)) {
         reply_error(fd, "FTP_REMOVE", "缺少或非法参数: name");
         return;
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
-    NspIniStore *s = nsp_ini_open(path);
+    NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_REMOVE", "内存不足");
         return;
@@ -2486,48 +2571,69 @@ static void handle_ftp_remove(int fd, json_object *req) {
         return;
     }
     nsp_ini_close(s);
-    json_object *data = json_object_new_object();
+    json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "name", json_object_new_string(trimmed));
     reply_ok(fd, "FTP_REMOVE", data);
 }
 
 /* ==================== 命令分发 ==================== */
-static void dispatch(int fd, json_object *req) {
-    const char *cmd = json_object_get_string(json_object_object_get(req, "cmd"));
+static void dispatch(int fd, json_object* req) {
+    const char* cmd = json_object_get_string(json_object_object_get(req, "cmd"));
     if (!cmd) {
         reply_error(fd, "?", "缺少 cmd 字段");
         return;
     }
     /* 每次命令前刷新规则类型表：模块 .rules 增删即动态追加/回收类型（热更新） */
     rule_types_refresh();
-    if (strcasecmp(cmd, "PING") == 0)             handle_ping(fd, req);
-    else if (strcasecmp(cmd, "UPTIME") == 0)      handle_uptime(fd, req);
-    else if (strcasecmp(cmd, "LIST") == 0)        handle_list(fd, req);
-    else if (strcasecmp(cmd, "USERS") == 0)       handle_users(fd, req);
-    else if (strcasecmp(cmd, "GET") == 0)         handle_get(fd, req);
-    else if (strcasecmp(cmd, "ADD") == 0)         handle_add(fd, req);
-    else if (strcasecmp(cmd, "REMOVE") == 0)      handle_remove(fd, req);
-    else if (strcasecmp(cmd, "ENABLE") == 0)      handle_toggle(fd, req, true);
-    else if (strcasecmp(cmd, "DISABLE") == 0)     handle_toggle(fd, req, false);
-    else if (strcasecmp(cmd, "SET") == 0)         handle_set(fd, req);
-    else if (strcasecmp(cmd, "FTP_LIST") == 0)   handle_ftp_list(fd, req);
-    else if (strcasecmp(cmd, "FTP_GET") == 0)    handle_ftp_get(fd, req);
-    else if (strcasecmp(cmd, "FTP_ADD") == 0)    handle_ftp_add(fd, req);
-    else if (strcasecmp(cmd, "FTP_SET") == 0)    handle_ftp_set(fd, req);
-    else if (strcasecmp(cmd, "FTP_REMOVE") == 0) handle_ftp_remove(fd, req);
-    else if (strcasecmp(cmd, "RELOAD") == 0)     handle_reload(fd, req);
-    else if (strcasecmp(cmd, "STOP") == 0)        handle_stop(fd, req);
-    else if (strcasecmp(cmd, "SERVICE") == 0)     handle_service(fd, req);
-    else if (strcasecmp(cmd, "STATUS") == 0)      handle_status(fd, req);
-    else if (strcasecmp(cmd, "QUIT") == 0)        handle_quit(fd, req);
-    else reply_error(fd, cmd, "未知命令: %s", cmd);
+    if (strcasecmp(cmd, "PING") == 0)
+        handle_ping(fd, req);
+    else if (strcasecmp(cmd, "UPTIME") == 0)
+        handle_uptime(fd, req);
+    else if (strcasecmp(cmd, "LIST") == 0)
+        handle_list(fd, req);
+    else if (strcasecmp(cmd, "USERS") == 0)
+        handle_users(fd, req);
+    else if (strcasecmp(cmd, "GET") == 0)
+        handle_get(fd, req);
+    else if (strcasecmp(cmd, "ADD") == 0)
+        handle_add(fd, req);
+    else if (strcasecmp(cmd, "REMOVE") == 0)
+        handle_remove(fd, req);
+    else if (strcasecmp(cmd, "ENABLE") == 0)
+        handle_toggle(fd, req, true);
+    else if (strcasecmp(cmd, "DISABLE") == 0)
+        handle_toggle(fd, req, false);
+    else if (strcasecmp(cmd, "SET") == 0)
+        handle_set(fd, req);
+    else if (strcasecmp(cmd, "FTP_LIST") == 0)
+        handle_ftp_list(fd, req);
+    else if (strcasecmp(cmd, "FTP_GET") == 0)
+        handle_ftp_get(fd, req);
+    else if (strcasecmp(cmd, "FTP_ADD") == 0)
+        handle_ftp_add(fd, req);
+    else if (strcasecmp(cmd, "FTP_SET") == 0)
+        handle_ftp_set(fd, req);
+    else if (strcasecmp(cmd, "FTP_REMOVE") == 0)
+        handle_ftp_remove(fd, req);
+    else if (strcasecmp(cmd, "RELOAD") == 0)
+        handle_reload(fd, req);
+    else if (strcasecmp(cmd, "STOP") == 0)
+        handle_stop(fd, req);
+    else if (strcasecmp(cmd, "SERVICE") == 0)
+        handle_service(fd, req);
+    else if (strcasecmp(cmd, "STATUS") == 0)
+        handle_status(fd, req);
+    else if (strcasecmp(cmd, "QUIT") == 0)
+        handle_quit(fd, req);
+    else
+        reply_error(fd, cmd, "未知命令: %s", cmd);
 }
 
 /* ==================== 服务端 ==================== */
 static void handle_client(int client_fd) {
     /* 500ms 读写超时，防止异常客户端挂起 */
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -2540,12 +2646,11 @@ static void handle_client(int client_fd) {
         ssize_t n = read(client_fd, buf + total, MAX_REQ_LEN - total);
         if (n < 0) {
             if (errno == EINTR) continue;
-            break;   /* 超时 / 错误 */
+            break; /* 超时 / 错误 */
         }
-        if (n == 0) break;   /* EOF（客户端 shutdown 写端） */
+        if (n == 0) break; /* EOF（客户端 shutdown 写端） */
         total += (size_t)n;
-        if (memchr(buf + total - (size_t)n, '\n', (size_t)n) != NULL)
-            break;   /* 已含行尾 */
+        if (memchr(buf + total - (size_t)n, '\n', (size_t)n) != NULL) break; /* 已含行尾 */
     }
     if (total == 0) {
         close(client_fd);
@@ -2562,7 +2667,7 @@ static void handle_client(int client_fd) {
         close(client_fd);
         return;
     }
-    json_object *req = json_tokener_parse(buf);
+    json_object* req = json_tokener_parse(buf);
     if (!req || !json_object_is_type(req, json_type_object)) {
         if (req) json_object_put(req);
         reply_error(client_fd, "?", "请求必须是 JSON 对象: %.80s", buf);
@@ -2589,7 +2694,7 @@ static int run_server(void) {
     log_init("rule_server");
     /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
 
-    struct sigaction sa = { .sa_handler = sig_handler };
+    struct sigaction sa = {.sa_handler = sig_handler};
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
@@ -2603,7 +2708,7 @@ static int run_server(void) {
     }
     struct sockaddr_un addr;
     socklen_t addr_len = nsp_uds_abstract_addr(&addr, g_socket_name);
-    if (bind(sock, (struct sockaddr *)&addr, addr_len) < 0) {
+    if (bind(sock, (struct sockaddr*)&addr, addr_len) < 0) {
         LOG_ERR("绑定 %s 失败: %s", g_socket_name, strerror(errno));
         fprintf(stderr, "[rule_server] 绑定 %s 失败: %s\n", g_socket_name, strerror(errno));
         close(sock);
@@ -2626,7 +2731,7 @@ static int run_server(void) {
         log_close();
         return 1;
     }
-    struct epoll_event ev = { .events = EPOLLIN, .data.fd = sock };
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = sock};
     epoll_ctl(ep, EPOLL_CTL_ADD, sock, &ev);
 
     while (!g_should_exit) {
@@ -2654,7 +2759,7 @@ static int run_server(void) {
 }
 
 /* ==================== 客户端模式 ==================== */
-static int run_client(const char *cmd_json) {
+static int run_client(const char* cmd_json) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
         fprintf(stderr, "创建 socket 失败: %s\n", strerror(errno));
@@ -2662,7 +2767,7 @@ static int run_client(const char *cmd_json) {
     }
     struct sockaddr_un addr;
     socklen_t addr_len = nsp_uds_abstract_addr(&addr, g_socket_name);
-    if (connect(sock, (struct sockaddr *)&addr, addr_len) < 0) {
+    if (connect(sock, (struct sockaddr*)&addr, addr_len) < 0) {
         fprintf(stderr, "连接 %s 失败: %s（服务未启动？）\n", g_socket_name, strerror(errno));
         close(sock);
         return 1;
@@ -2674,17 +2779,17 @@ static int run_client(const char *cmd_json) {
 
     /* 响应动态扩容读取（LIST/GET 全量规则可能远超 8KB），杜绝静默截断 */
     size_t cap = MAX_REQ_LEN;
-    char *resp = malloc(cap);
+    char* resp = malloc(cap);
     if (!resp) {
         close(sock);
         return 1;
     }
     size_t total = 0;
-    struct pollfd pfd = { .fd = sock, .events = POLLIN };
+    struct pollfd pfd = {.fd = sock, .events = POLLIN};
     while (poll(&pfd, 1, 3000) > 0) {
         if (total >= cap - 1) {
             size_t new_cap = cap * 2;
-            char *tmp = realloc(resp, new_cap);
+            char* tmp = realloc(resp, new_cap);
             if (!tmp) break;
             resp = tmp;
             cap = new_cap;
@@ -2716,8 +2821,9 @@ static void rs_daemonize(void) {
     nsp_daemonize(-1);
 }
 
-static void usage(const char *prog) {
-    fprintf(stderr,
+static void usage(const char* prog) {
+    fprintf(
+        stderr,
         "用法: %s [选项]\n"
         "  （无参数）          守护进程模式：自动退入后台，监听抽象套接字 %s，提供规则控制 JSON API\n"
         "  -c, --cmd <JSON>    客户端模式：发送单条 JSON 命令并打印响应\n"
@@ -2728,17 +2834,26 @@ static void usage(const char *prog) {
         prog, RULE_SOCKET_NAME, CONFIG_DIR, RULE_SOCKET_NAME);
 }
 
-int main(int argc, char *argv[]) {
-    const char *client_cmd = NULL;
+int main(int argc, char* argv[]) {
+    const char* client_cmd = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cmd") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return 2; }
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
             client_cmd = argv[++i];
         } else if (strcmp(argv[i], "--config-dir") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return 2; }
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
             strncpy(g_config_dir, argv[++i], sizeof(g_config_dir) - 1);
         } else if (strcmp(argv[i], "--socket") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return 2; }
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
             strncpy(g_socket_name, argv[++i], sizeof(g_socket_name) - 1);
         } else if (strcmp(argv[i], "--foreground") == 0) {
             g_foreground = true;

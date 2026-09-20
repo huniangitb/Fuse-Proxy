@@ -16,9 +16,7 @@
 const char* nsp_module_self_hash(void) {
     Dl_info info;
     static char hex[65];
-    if (dladdr((void*)&nsp_module_self_hash, &info) == 0 || !info.dli_fname)
-        return NULL;
-    if (sha256_file_hex(info.dli_fname, hex) != 0)
-        return NULL;
+    if (dladdr((void*)&nsp_module_self_hash, &info) == 0 || !info.dli_fname) return NULL;
+    if (sha256_file_hex(info.dli_fname, hex) != 0) return NULL;
     return hex;
 }

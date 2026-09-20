@@ -19,26 +19,26 @@
 /* 注册/清理后端（ftp_module.c 解析 ftp.conf 后调用）。
    虚拟前缀 = "/" + cfg->name（如 /云盘）：FUSE 剥离 /0/ 后的原始路径
    （/云盘/xxx）直接命中，无需 REDIRECT 规则或变量。 */
-int  ftp_backend_add(const FtpServerCfg* cfg);
+int ftp_backend_add(const FtpServerCfg* cfg);
 void ftp_backend_clear(void);
-int  ftp_backend_count(void);
+int ftp_backend_count(void);
 /* 每分钟重连探活：对每个后端尝试 FTP 连接（服务器恢复后无需重启模块） */
 void ftp_backend_retry_all(void);
 
 /* ---- NspModuleOps.backend_* 实现（由框架调用） ---- */
-int  ftp_backend_match(const char* path);
-int  ftp_backend_getattr(const char* path, struct stat* st);
-int  ftp_backend_readdir(const char* path, NspDirEntry* entries, int max);
-int  ftp_backend_open(const char* path, int flags, uint64_t* h);
-int  ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
-int  ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);
-int  ftp_backend_flush(uint64_t h);
-int  ftp_backend_release(uint64_t h);
-int  ftp_backend_create(const char* path, mode_t mode, uint64_t* h);
-int  ftp_backend_unlink(const char* path);
-int  ftp_backend_mkdir(const char* path, mode_t mode);
-int  ftp_backend_rmdir(const char* path);
-int  ftp_backend_rename(const char* from, const char* to);
-int  ftp_backend_truncate(const char* path, off_t size);
+int ftp_backend_match(const char* path);
+int ftp_backend_getattr(const char* path, struct stat* st);
+int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max);
+int ftp_backend_open(const char* path, int flags, uint64_t* h);
+int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
+int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);
+int ftp_backend_flush(uint64_t h);
+int ftp_backend_release(uint64_t h);
+int ftp_backend_create(const char* path, mode_t mode, uint64_t* h);
+int ftp_backend_unlink(const char* path);
+int ftp_backend_mkdir(const char* path, mode_t mode);
+int ftp_backend_rmdir(const char* path);
+int ftp_backend_rename(const char* from, const char* to);
+int ftp_backend_truncate(const char* path, off_t size);
 
 #endif /* FTP_BACKEND_H */

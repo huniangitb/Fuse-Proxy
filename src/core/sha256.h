@@ -11,9 +11,9 @@ extern "C" {
 /* 极简 SHA-256（FIPS 180-4），供模块加载哈希校验使用 */
 typedef struct {
     uint32_t state[8];
-    uint64_t len;        /* 已处理字节数 */
-    uint8_t  buf[64];
-    size_t   buflen;
+    uint64_t len; /* 已处理字节数 */
+    uint8_t buf[64];
+    size_t buflen;
 } Sha256Ctx;
 
 void sha256_init(Sha256Ctx* c);

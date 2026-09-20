@@ -48,7 +48,7 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
                 cur->port = 21;
                 set_str(cur->remote_dir, sizeof cur->remote_dir, "/");
                 set_str(cur->user, sizeof cur->user, "anonymous");
-                set_str(cur->name, sizeof cur->name, cur_section);   /* 段名 = 服务器名 */
+                set_str(cur->name, sizeof cur->name, cur_section); /* 段名 = 服务器名 */
                 out->count++;
             } else {
                 cur = NULL;
@@ -98,8 +98,7 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
 FtpServerCfg* ftp_conf_find(FtpServerList* list, const char* name) {
     if (!list || !name) return NULL;
     for (int i = 0; i < list->count; i++) {
-        if (strcmp(list->servers[i].name, name) == 0)
-            return &list->servers[i];
+        if (strcmp(list->servers[i].name, name) == 0) return &list->servers[i];
     }
     return NULL;
 }

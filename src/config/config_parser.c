@@ -63,12 +63,12 @@ static pthread_rwlock_t g_rules_lock;
    写者仍持 rwlock 写锁（互斥 + 冷读者保护），无锁协议只叠加于热路径。 */
 #define CFG_READER_MAX 64
 typedef struct {
-    _Atomic int cnt[2];      /* 按代际奇偶分槽 */
-    char _pad[56];           /* 补齐到 64B，每行独占缓存行（免假共享） */
+    _Atomic int cnt[2]; /* 按代际奇偶分槽 */
+    char _pad[56];      /* 补齐到 64B，每行独占缓存行（免假共享） */
 } CfgReaderCell;
 static _Alignas(64) CfgReaderCell g_cfg_readers[CFG_READER_MAX];
-static _Atomic(int) g_cfg_reader_next = 0;   /* 下一个可分配读者槽位 */
-static _Thread_local int g_cfg_reader_slot = -1;  /* 本线程读者槽（首次调用分配） */
+static _Atomic(int) g_cfg_reader_next = 0;       /* 下一个可分配读者槽位 */
+static _Thread_local int g_cfg_reader_slot = -1; /* 本线程读者槽（首次调用分配） */
 static _Atomic(uint64_t) g_cfg_gen = 0;
 
 /* 获取本线程读者槽：首次调用经 fetch_add 分配（热路径此后只读 TLS）。
@@ -88,11 +88,14 @@ uint64_t config_read_begin(void) {
     int s = cfg_reader_slot();
     for (;;) {
         uint64_t g1 = atomic_load_explicit(&g_cfg_gen, memory_order_acquire);
-        if (g1 & 1) { sched_yield(); continue; }   /* 写者进行中 */
+        if (g1 & 1) {
+            sched_yield();
+            continue;
+        } /* 写者进行中 */
         int slot = (int)((g1 >> 1) & 1);
         atomic_fetch_add_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_acq_rel);
         if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1)
-            return g1;                             /* 稳定快照，持槽 */
+            return g1; /* 稳定快照，持槽 */
         atomic_fetch_sub_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_release);
     }
 }
@@ -145,19 +148,31 @@ void config_publish_end(uint64_t old_gen) {
         sched_yield();
     }
 }
-static bool is_wildcard_string(const char *str) {
+static bool is_wildcard_string(const char* str) {
     /* `?` 作为首字符是项目自定义的"相对当前 user 存储"前缀，非 fnmatch 通配；
        仅从第二字符起检测真正的通配符 * ? [ ]，避免 ALLOW/REDIRECT 的 ? 前缀路径被误判跳过 trie */
     if (!str || !str[0]) return false;
-    const char *p = (str[0] == '?') ? str + 1 : str;
+    const char* p = (str[0] == '?') ? str + 1 : str;
     return strpbrk(p, "*?[]") != NULL;
 }
-void config_init_lock() { pthread_rwlock_init(&g_rules_lock, nullptr); }
-void config_destroy_lock() { pthread_rwlock_destroy(&g_rules_lock); }
-void config_lock_read() { pthread_rwlock_rdlock(&g_rules_lock); }
-void config_unlock_read() { pthread_rwlock_unlock(&g_rules_lock); }
-void config_lock_write() { pthread_rwlock_wrlock(&g_rules_lock); }
-void config_unlock_write() { pthread_rwlock_unlock(&g_rules_lock); }
+void config_init_lock() {
+    pthread_rwlock_init(&g_rules_lock, nullptr);
+}
+void config_destroy_lock() {
+    pthread_rwlock_destroy(&g_rules_lock);
+}
+void config_lock_read() {
+    pthread_rwlock_rdlock(&g_rules_lock);
+}
+void config_unlock_read() {
+    pthread_rwlock_unlock(&g_rules_lock);
+}
+void config_lock_write() {
+    pthread_rwlock_wrlock(&g_rules_lock);
+}
+void config_unlock_write() {
+    pthread_rwlock_unlock(&g_rules_lock);
+}
 static void free_app_config_rules(AppConfig* cfg) {
     if (!cfg) return;
     if (cfg->trie_root) {
@@ -260,7 +275,12 @@ char* clean_path_string(char* str) {
        \r\n 行尾截断为本函数特有语义（配置文件行处理） */
     if (!str) return nullptr;
     char* s = nsp_str_trim(str);
-    for (int i = 0; s[i]; i++) { if (s[i] == '\r' || s[i] == '\n') { s[i] = '\0'; break; } }
+    for (int i = 0; s[i]; i++) {
+        if (s[i] == '\r' || s[i] == '\n') {
+            s[i] = '\0';
+            break;
+        }
+    }
     return s;
 }
 void strip_trailing_slash(char* path) {
@@ -275,18 +295,27 @@ static char* get_next_token(char** ptr) {
     char* p = *ptr;
     if (!p) return nullptr;
     while (isspace((unsigned char)*p)) p++;
-    if (*p == '\0') { *ptr = nullptr; return nullptr; }
+    if (*p == '\0') {
+        *ptr = nullptr;
+        return nullptr;
+    }
     char* start;
     if (*p == '"') {
         start = ++p;
         while (*p && *p != '"') p++;
-        if (*p == '"') { *p = '\0'; *ptr = p + 1; } 
-        else *ptr = p;
+        if (*p == '"') {
+            *p = '\0';
+            *ptr = p + 1;
+        } else
+            *ptr = p;
     } else {
         start = p;
         while (*p && !isspace((unsigned char)*p)) p++;
-        if (*p != '\0') { *p = '\0'; *ptr = p + 1; } 
-        else *ptr = p;
+        if (*p != '\0') {
+            *p = '\0';
+            *ptr = p + 1;
+        } else
+            *ptr = p;
     }
     return start;
 }
@@ -294,8 +323,8 @@ static char* strip_storage_prefix(char* path) {
     if (strncmp(path, "/storage/emulated/", 18) == 0) {
         char* p = path + 18;
         while (*p && isdigit((unsigned char)*p)) p++;
-        if (*p == '/') return p;       /* /storage/emulated/0/Download -> /Download */
-        if (*p == '\0') return "/";    /* /storage/emulated/0 -> / */
+        if (*p == '/') return p;    /* /storage/emulated/0/Download -> /Download */
+        if (*p == '\0') return "/"; /* /storage/emulated/0 -> / */
         /* 异常形态:缺数字 user_id 或后跟非数字(如 /storage/emulated/Download)。
            把 p 退回非数字起始位置,前面补 '/',让残留当子路径(与正常 emulated 剥离一致)。 */
         return p - 1;
@@ -303,14 +332,16 @@ static char* strip_storage_prefix(char* path) {
     return path;
 }
 static int cmp_redir(const void* a, const void* b) {
-    return (int)strlen(((const RedirectRule*)b)->virtual_prefix) - (int)strlen(((const RedirectRule*)a)->virtual_prefix);
+    return (int)strlen(((const RedirectRule*)b)->virtual_prefix) -
+           (int)strlen(((const RedirectRule*)a)->virtual_prefix);
 }
 static int cmp_hide(const void* a, const void* b) {
     const char* str_a = *(const char**)a;
     const char* str_b = *(const char**)b;
     return (int)strlen(str_b) - (int)strlen(str_a);
 }
-static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_num, const char* file_path) {
+static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_num,
+                              const char* file_path) {
     (void)user_id;
     char* p_ptr = line;
     /* 先尝试 NAME=VALUE 赋值（紧凑形式，无空格围绕 =） */
@@ -322,19 +353,21 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             } else {
                 if (cur->var_count >= cur->var_capacity) {
                     int newcap = cur->var_capacity == 0 ? 8 : cur->var_capacity * 2;
-                    char **new_names = realloc(cur->var_names, newcap * sizeof(char*));
-                    char **new_values = realloc(cur->var_values, newcap * sizeof(char*));
-                    char **new_resolved = realloc(cur->var_resolved, newcap * sizeof(char*));
-                    bool *new_is_static = realloc(cur->var_is_static, newcap * sizeof(bool));
+                    char** new_names = realloc(cur->var_names, newcap * sizeof(char*));
+                    char** new_values = realloc(cur->var_values, newcap * sizeof(char*));
+                    char** new_resolved = realloc(cur->var_resolved, newcap * sizeof(char*));
+                    bool* new_is_static = realloc(cur->var_is_static, newcap * sizeof(bool));
                     if (!new_names || !new_values || !new_resolved || !new_is_static) {
                         LOG_ERR("realloc 变量数组失败 (行 %d)", line_num);
-                        free(new_names); free(new_values);
-                        free(new_resolved); free(new_is_static);
+                        free(new_names);
+                        free(new_values);
+                        free(new_resolved);
+                        free(new_is_static);
                         return;
                     }
-                    cur->var_names   = new_names;
-                    cur->var_values  = new_values;
-                    cur->var_resolved= new_resolved;
+                    cur->var_names = new_names;
+                    cur->var_values = new_values;
+                    cur->var_resolved = new_resolved;
                     cur->var_is_static = new_is_static;
                     cur->var_capacity = newcap;
                 }
@@ -360,20 +393,23 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
     } else if (strcmp(tok, "GLOBAL_INJECT") == 0) {
         char* val = get_next_token(&p_ptr);
         if (cur != &g_global_cfg_stage) {
-            LOG_WRN("GLOBAL_INJECT 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+            LOG_WRN("GLOBAL_INJECT 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                    file_path);
         } else {
             cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
         }
     } else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0) {
         char* val = get_next_token(&p_ptr);
         if (cur != &g_global_cfg_stage) {
-            LOG_WRN("SKIP_SYSTEM_APPS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+            LOG_WRN("SKIP_SYSTEM_APPS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                    file_path);
         } else {
             cur->skip_system_apps = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
         }
     } else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0) {
         if (cur != &g_global_cfg_stage) {
-            LOG_WRN("FUSE_EXTRA_ARGS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+            LOG_WRN("FUSE_EXTRA_ARGS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                    file_path);
             return;
         }
         /* 读取行尾剩余全部内容，不做分词（原样透传给 fuse_daemon） */
@@ -383,7 +419,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             size_t len = strlen(p);
             while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
             if (len > 0) {
-                size_t copy_len = len < sizeof(cur->fuse_extra_args) - 1 ? len : sizeof(cur->fuse_extra_args) - 1;
+                size_t copy_len =
+                    len < sizeof(cur->fuse_extra_args) - 1 ? len : sizeof(cur->fuse_extra_args) - 1;
                 memcpy(cur->fuse_extra_args, p, copy_len);
                 cur->fuse_extra_args[copy_len] = '\0';
             }
@@ -391,9 +428,10 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
     } else if (strcmp(tok, "HIDE") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
-            char *v_ptr = strip_storage_prefix(val);
+            char* v_ptr = strip_storage_prefix(val);
             char clean_rule[MAX_PATH_LEN];
-            if (v_ptr[0] != '/' && v_ptr[0] != '*') snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
+            if (v_ptr[0] != '/' && v_ptr[0] != '*')
+                snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
             else {
                 strncpy(clean_rule, v_ptr, MAX_PATH_LEN - 1);
                 clean_rule[MAX_PATH_LEN - 1] = '\0';
@@ -401,7 +439,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
             if (cur->hide_count >= cur->hide_capacity) {
                 int new_cap = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
-                char **new_hide = realloc(cur->hide_rules, new_cap * sizeof(char*));
+                char** new_hide = realloc(cur->hide_rules, new_cap * sizeof(char*));
                 if (!new_hide) {
                     LOG_ERR("realloc hide_rules 失败");
                     return;
@@ -414,15 +452,16 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, true, false);
             } else {
-                cur->dyn_hide = true;   /* 通配/变量规则未入 trie，须线性兜底 */
+                cur->dyn_hide = true; /* 通配/变量规则未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "RO") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
-            char *v_ptr = strip_storage_prefix(val);
+            char* v_ptr = strip_storage_prefix(val);
             char clean_rule[MAX_PATH_LEN];
-            if (v_ptr[0] != '/' && v_ptr[0] != '*') snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
+            if (v_ptr[0] != '/' && v_ptr[0] != '*')
+                snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
             else {
                 strncpy(clean_rule, v_ptr, MAX_PATH_LEN - 1);
                 clean_rule[MAX_PATH_LEN - 1] = '\0';
@@ -430,7 +469,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
             if (cur->ro_count >= cur->ro_capacity) {
                 int new_cap = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
-                char **new_ro = realloc(cur->ro_rules, new_cap * sizeof(char*));
+                char** new_ro = realloc(cur->ro_rules, new_cap * sizeof(char*));
                 if (!new_ro) {
                     LOG_ERR("realloc ro_rules 失败");
                     return;
@@ -443,17 +482,19 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
                 trie_insert(cur->trie_root, clean_rule, NULL, false, true);
             } else {
-                cur->dyn_ro = true;     /* 通配/变量规则未入 trie，须线性兜底 */
+                cur->dyn_ro = true; /* 通配/变量规则未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "ALLOW") == 0) {
         char* val = get_next_token(&p_ptr);
         if (val) {
-            char *v_ptr = strip_storage_prefix(val);
+            char* v_ptr = strip_storage_prefix(val);
             char virtual_prefix[MAX_PATH_LEN];
-            if (v_ptr[0] == '\0') strcpy(virtual_prefix, "/"); 
+            if (v_ptr[0] == '\0')
+                strcpy(virtual_prefix, "/");
             else {
-                if (v_ptr[0] != '/') snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
+                if (v_ptr[0] != '/')
+                    snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
                 else {
                     strncpy(virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
                     virtual_prefix[MAX_PATH_LEN - 1] = '\0';
@@ -467,7 +508,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
             if (cur->redir_count >= cur->redir_capacity) {
                 int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                RedirectRule *new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
+                RedirectRule* new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
                 if (!new_redir) {
                     LOG_ERR("realloc redir_rules 失败 (ALLOW)");
                     return;
@@ -484,18 +525,20 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             if (!is_wildcard_string(virtual_prefix) && !has_path_var(virtual_prefix)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             } else {
-                cur->dyn_redir = true;  /* 通配/变量 redir 未入 trie，须线性兜底 */
+                cur->dyn_redir = true; /* 通配/变量 redir 未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "REDIRECT") == 0) {
         char* v1 = get_next_token(&p_ptr);
         char* v2 = get_next_token(&p_ptr);
         if (v1 && v2) {
-            char *v_ptr = strip_storage_prefix(v1);
+            char* v_ptr = strip_storage_prefix(v1);
             char virtual_prefix[MAX_PATH_LEN];
-            if (v_ptr[0] == '\0') strcpy(virtual_prefix, "/"); 
+            if (v_ptr[0] == '\0')
+                strcpy(virtual_prefix, "/");
             else {
-                if (v_ptr[0] != '/') snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
+                if (v_ptr[0] != '/')
+                    snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
                 else {
                     strncpy(virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
                     virtual_prefix[MAX_PATH_LEN - 1] = '\0';
@@ -508,24 +551,21 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
                 /* 含变量：原样存入，路径分类延迟到运行时 build_real_base_from_target */
                 strncpy(real_target, v2, MAX_PATH_LEN - 1);
                 real_target[MAX_PATH_LEN - 1] = '\0';
-            }
-            else if (strncmp(v2, "/storage/emulated/", 18) == 0) {
+            } else if (strncmp(v2, "/storage/emulated/", 18) == 0) {
                 char* p = v2 + 18;
                 while (*p && isdigit((unsigned char)*p)) p++;
                 if (*p == '/') p++;
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
-            }
-            else if (is_system_abs_path(v2)) {
+            } else if (is_system_abs_path(v2)) {
                 strncpy(real_target, v2, MAX_PATH_LEN - 1);
                 real_target[MAX_PATH_LEN - 1] = '\0';
-            }
-            else {
+            } else {
                 snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
             }
             if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
             if (cur->redir_count >= cur->redir_capacity) {
                 int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                RedirectRule *new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
+                RedirectRule* new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
                 if (!new_redir) {
                     LOG_ERR("realloc redir_rules 失败 (ALLOW)");
                     return;
@@ -539,10 +579,11 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             strncpy(r->real_target, real_target, sizeof(r->real_target) - 1);
             r->real_target[sizeof(r->real_target) - 1] = '\0';
             r->is_allow = false;
-            if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) && !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
+            if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) &&
+                !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
                 trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
             } else {
-                cur->dyn_redir = true;  /* 通配/变量 redir 未入 trie，须线性兜底 */
+                cur->dyn_redir = true; /* 通配/变量 redir 未入 trie，须线性兜底 */
             }
         }
     } else if (strcmp(tok, "FTP") == 0) {
@@ -555,14 +596,21 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
             return;
         }
         char virtual_prefix[MAX_PATH_LEN];
-        if (v1[0] != '/') snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v1);
-        else { strncpy(virtual_prefix, v1, MAX_PATH_LEN - 1); virtual_prefix[MAX_PATH_LEN - 1] = '\0'; }
+        if (v1[0] != '/')
+            snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v1);
+        else {
+            strncpy(virtual_prefix, v1, MAX_PATH_LEN - 1);
+            virtual_prefix[MAX_PATH_LEN - 1] = '\0';
+        }
         strip_trailing_slash(virtual_prefix);
         if (virtual_prefix[0] == '\0') strcpy(virtual_prefix, "/");
         if (cur->ftp_count >= cur->ftp_capacity) {
             int newcap = cur->ftp_capacity == 0 ? 8 : cur->ftp_capacity * 2;
             FtpRule* new_rules = realloc(cur->ftp_rules, newcap * sizeof(FtpRule));
-            if (!new_rules) { LOG_ERR("realloc ftp_rules 失败 (行 %d)", line_num); return; }
+            if (!new_rules) {
+                LOG_ERR("realloc ftp_rules 失败 (行 %d)", line_num);
+                return;
+            }
             cur->ftp_rules = new_rules;
             cur->ftp_capacity = newcap;
         }
@@ -575,8 +623,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         /* 同时入 trie：resolve 热路径经 trie 下降一次取得 FTP 命中
            （替代 config_ftp_match 每请求 O(N) 线性扫描）；
            FTP 前缀为静态字面段（无通配/变量），与线性匹配语义一致 */
-        if (cur->trie_root)
-            trie_insert_ftp(cur->trie_root, virtual_prefix, v2);
+        if (cur->trie_root) trie_insert_ftp(cur->trie_root, virtual_prefix, v2);
     } else {
         LOG_WRN("不支持的规则 \"%s\" (行 %d, 文件 %s)", tok, line_num, file_path);
     }
@@ -610,8 +657,9 @@ static bool classify_category_section(const char* pkg, int* uid_inout, const cha
     if (strcmp(pkg, "USER_APPS") == 0) return true;
     if (strcmp(pkg, "SYSTEM_APPS") == 0) {
         if (*uid_inout != -1) {
-            LOG_WRN("[SYSTEM_APPS] 不支持按用户隔离（行 %d, 文件 %s），:uid 已忽略（对所有用户系统应用生效）",
-                    line, file);
+            LOG_WRN(
+                "[SYSTEM_APPS] 不支持按用户隔离（行 %d, 文件 %s），:uid 已忽略（对所有用户系统应用生效）",
+                line, file);
             *uid_inout = -1;
         }
         return true;
@@ -623,12 +671,13 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     /* S1：构建进暂存区（live 由 config_publish 一次性换入） */
     if (strcmp(pkg, "GLOBAL") == 0) return &g_global_cfg_stage;
     for (int i = 0; i < g_app_cfg_count_stage; i++) {
-        if (g_app_cfgs_stage[i]->user_id == user_id && strcmp(g_app_cfgs_stage[i]->pkg_name, pkg) == 0) 
+        if (g_app_cfgs_stage[i]->user_id == user_id &&
+            strcmp(g_app_cfgs_stage[i]->pkg_name, pkg) == 0)
             return g_app_cfgs_stage[i];
     }
     if (g_app_cfg_count_stage >= g_app_cfg_capacity_stage) {
         int new_cap = g_app_cfg_capacity_stage == 0 ? 8 : g_app_cfg_capacity_stage * 2;
-        AppConfig **new_cfgs = realloc(g_app_cfgs_stage, new_cap * sizeof(AppConfig*));
+        AppConfig** new_cfgs = realloc(g_app_cfgs_stage, new_cap * sizeof(AppConfig*));
         if (!new_cfgs) {
             LOG_ERR("realloc g_app_cfgs 失败，跳过应用 %s", pkg);
             return nullptr;
@@ -639,8 +688,8 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
     g_app_cfgs_stage[g_app_cfg_count_stage] = calloc(1, sizeof(AppConfig));
     strncpy(g_app_cfgs_stage[g_app_cfg_count_stage]->pkg_name, pkg, 127);
     g_app_cfgs_stage[g_app_cfg_count_stage]->user_id = user_id;
-    g_app_cfgs_stage[g_app_cfg_count_stage]->inject_enable = false; 
-    g_app_cfgs_stage[g_app_cfg_count_stage]->trie_root = trie_create_node(NULL); 
+    g_app_cfgs_stage[g_app_cfg_count_stage]->inject_enable = false;
+    g_app_cfgs_stage[g_app_cfg_count_stage]->trie_root = trie_create_node(NULL);
     return g_app_cfgs_stage[g_app_cfg_count_stage++];
 }
 /* 由磁盘上已存在的 App-rules-<uid> 目录补齐活跃用户列表。
@@ -663,14 +712,20 @@ static void merge_users_from_app_rules_dirs(void) {
         if (!*s) continue;
         bool is_num = true;
         for (int i = 0; s[i]; i++) {
-            if (!isdigit((unsigned char)s[i])) { is_num = false; break; }
+            if (!isdigit((unsigned char)s[i])) {
+                is_num = false;
+                break;
+            }
         }
         if (!is_num) continue;
         int uid = atoi(s);
         if (uid < 0 || uid >= MAX_REASONABLE_UID) continue;
         bool seen = false;
         for (int i = 0; i < g_active_user_count; i++) {
-            if (g_active_users[i] == uid) { seen = true; break; }
+            if (g_active_users[i] == uid) {
+                seen = true;
+                break;
+            }
         }
         if (seen) continue;
         if (g_active_user_count >= MAX_USERS) break;
@@ -711,7 +766,10 @@ void scan_active_users() {
                 if (de->d_type == DT_DIR || de->d_type == DT_LNK) {
                     bool is_num = true;
                     for (int i = 0; de->d_name[i]; i++) {
-                        if (!isdigit(de->d_name[i])) { is_num = false; break; }
+                        if (!isdigit(de->d_name[i])) {
+                            is_num = false;
+                            break;
+                        }
                     }
                     if (is_num && g_active_user_count < MAX_USERS) {
                         int uid = atoi(de->d_name);
@@ -763,7 +821,7 @@ void config_set_scan_users_skip_pm(bool skip) {
 
 void load_config_rules(const char* path) {
     /* S1 COW：构建进暂存区，末尾 config_publish 整体换入 live 并延迟释放旧配置 */
-    memset(&g_global_cfg_stage, 0, sizeof(AppConfig)); 
+    memset(&g_global_cfg_stage, 0, sizeof(AppConfig));
     g_global_cfg_stage.trie_root = trie_create_node(NULL);
     g_global_cfg_stage.skip_system_apps = true; /* 默认跳过系统应用 */
     g_app_cfgs_stage = nullptr;
@@ -773,8 +831,10 @@ void load_config_rules(const char* path) {
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
         char app_rules_dir[PATH_MAX];
-        if (uid == 0) snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
-        else snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
+        if (uid == 0)
+            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
+        else
+            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
         if (access(app_rules_dir, F_OK) != 0) {
             if (!g_allow_app_rules_mkdir) {
                 /* 只读加固：本进程（如 fuse_daemon/log_ctl）无权创建应用规则目录，
@@ -788,12 +848,14 @@ void load_config_rules(const char* path) {
     }
     FILE* fp = fopen(path, "r");
     if (fp) {
-        AppConfig* cur = &g_global_cfg_stage; char line[2048];
+        AppConfig* cur = &g_global_cfg_stage;
+        char line[2048];
         int current_user_id = -1;
         int line_num = 0;
         while (fgets(line, sizeof(line), fp)) {
             line_num++;
-            char* p = clean_path_string(line); if (!p || p[0] == '#' || p[0] == 0) continue;
+            char* p = clean_path_string(line);
+            if (!p || p[0] == '#' || p[0] == 0) continue;
             if (p[0] == '[') {
                 char* end = strchr(p, ']');
                 if (end) {
@@ -802,16 +864,18 @@ void load_config_rules(const char* path) {
                     char* after = end + 1;
                     bool enabled = true;
                     while (isspace(*after)) after++;
-                    if (strncmp(after, "OFF", 3) == 0) enabled = false;
-                    else if (strncmp(after, "ON", 2) == 0) enabled = true;
+                    if (strncmp(after, "OFF", 3) == 0)
+                        enabled = false;
+                    else if (strncmp(after, "ON", 2) == 0)
+                        enabled = true;
                     char pkg[128];
-                    current_user_id = -1; 
+                    current_user_id = -1;
                     char* colon = strchr(sec, ':');
                     if (colon) {
                         *colon = '\0';
                         current_user_id = atoi(colon + 1);
                     }
-                    strncpy(pkg, sec, sizeof(pkg)-1);
+                    strncpy(pkg, sec, sizeof(pkg) - 1);
                     if (strcmp(pkg, "GLOBAL") == 0) {
                         cur = &g_global_cfg_stage;
                     } else {
@@ -833,8 +897,10 @@ void load_config_rules(const char* path) {
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
         char app_rules_dir[PATH_MAX];
-        if (uid == 0) snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
-        else snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
+        if (uid == 0)
+            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
+        else
+            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
         DIR* dir = opendir(app_rules_dir);
         if (dir) {
             struct dirent* de;
@@ -852,9 +918,10 @@ void load_config_rules(const char* path) {
                            不依赖段头 ON。文件内若含 [pkg] OFF 段头会在下方
                            解析时覆盖为 false */
                         file_cur->inject_enable = true;
-                        AppConfig* cur = file_cur; 
+                        AppConfig* cur = file_cur;
                         char app_conf_path[PATH_MAX];
-                        snprintf(app_conf_path, sizeof(app_conf_path), "%s/%s", app_rules_dir, de->d_name);
+                        snprintf(app_conf_path, sizeof(app_conf_path), "%s/%s", app_rules_dir,
+                                 de->d_name);
                         FILE* afp = fopen(app_conf_path, "r");
                         if (afp) {
                             char line[2048];
@@ -871,25 +938,33 @@ void load_config_rules(const char* path) {
                                         char* after = end + 1;
                                         bool enabled = true;
                                         while (isspace(*after)) after++;
-                                        if (strncmp(after, "OFF", 3) == 0) enabled = false;
-                                        else if (strncmp(after, "ON", 2) == 0) enabled = true;
+                                        if (strncmp(after, "OFF", 3) == 0)
+                                            enabled = false;
+                                        else if (strncmp(after, "ON", 2) == 0)
+                                            enabled = true;
                                         char sub_pkg[128];
-                                        int sub_uid = uid; 
+                                        int sub_uid = uid;
                                         char* colon = strchr(sec, ':');
-                                        if (colon) { *colon = '\0'; sub_uid = atoi(colon + 1); }
-                                        strncpy(sub_pkg, sec, sizeof(sub_pkg)-1);
-                                        if (strcmp(sub_pkg, "GLOBAL") == 0) cur = &g_global_cfg_stage;
+                                        if (colon) {
+                                            *colon = '\0';
+                                            sub_uid = atoi(colon + 1);
+                                        }
+                                        strncpy(sub_pkg, sec, sizeof(sub_pkg) - 1);
+                                        if (strcmp(sub_pkg, "GLOBAL") == 0)
+                                            cur = &g_global_cfg_stage;
                                         else {
                                             /* 分文件内类别段同样归一（SYSTEM_APPS :uid→-1）；
                                                类别段一般只写主文件，此处为语义一致兜底 */
-                                            classify_category_section(sub_pkg, &sub_uid, app_conf_path, app_line_num);
+                                            classify_category_section(sub_pkg, &sub_uid,
+                                                                      app_conf_path, app_line_num);
                                             cur = get_or_create_app_cfg(sub_pkg, sub_uid);
                                             if (cur) cur->inject_enable = enabled;
                                         }
                                     }
                                     continue;
                                 }
-                                if (cur) parse_config_line(cur, p, uid, app_line_num, app_conf_path);
+                                if (cur)
+                                    parse_config_line(cur, p, uid, app_line_num, app_conf_path);
                             }
                             fclose(afp);
                         }
@@ -910,10 +985,11 @@ void load_config_rules(const char* path) {
                             strncpy(pkg, de->d_name, len);
                             pkg[len] = '\0';
                             char conf_path[PATH_MAX];
-                            snprintf(conf_path, sizeof(conf_path), "%s/%s.conf", app_rules_dir, pkg);
+                            snprintf(conf_path, sizeof(conf_path), "%s/%s.conf", app_rules_dir,
+                                     pkg);
                             if (access(conf_path, F_OK) != 0) {
                                 AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
-                                file_cur->inject_enable = false;   /* 明确停用 */
+                                file_cur->inject_enable = false; /* 明确停用 */
                             }
                         }
                     }
@@ -922,13 +998,17 @@ void load_config_rules(const char* path) {
             closedir(dir);
         }
     }
-    qsort(g_global_cfg_stage.redir_rules, g_global_cfg_stage.redir_count, sizeof(RedirectRule), cmp_redir);
+    qsort(g_global_cfg_stage.redir_rules, g_global_cfg_stage.redir_count, sizeof(RedirectRule),
+          cmp_redir);
     qsort(g_global_cfg_stage.hide_rules, g_global_cfg_stage.hide_count, sizeof(char*), cmp_hide);
     qsort(g_global_cfg_stage.ro_rules, g_global_cfg_stage.ro_count, sizeof(char*), cmp_hide);
-    for(int i = 0; i < g_app_cfg_count_stage; i++) {
-        qsort(g_app_cfgs_stage[i]->redir_rules, g_app_cfgs_stage[i]->redir_count, sizeof(RedirectRule), cmp_redir);
-        qsort(g_app_cfgs_stage[i]->hide_rules, g_app_cfgs_stage[i]->hide_count, sizeof(char*), cmp_hide);
-        qsort(g_app_cfgs_stage[i]->ro_rules, g_app_cfgs_stage[i]->ro_count, sizeof(char*), cmp_hide);
+    for (int i = 0; i < g_app_cfg_count_stage; i++) {
+        qsort(g_app_cfgs_stage[i]->redir_rules, g_app_cfgs_stage[i]->redir_count,
+              sizeof(RedirectRule), cmp_redir);
+        qsort(g_app_cfgs_stage[i]->hide_rules, g_app_cfgs_stage[i]->hide_count, sizeof(char*),
+              cmp_hide);
+        qsort(g_app_cfgs_stage[i]->ro_rules, g_app_cfgs_stage[i]->ro_count, sizeof(char*),
+              cmp_hide);
     }
     analyze_var_staticness(&g_global_cfg_stage, NULL);
     for (int i = 0; i < g_app_cfg_count_stage; i++) {
@@ -941,7 +1021,11 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
     /* S1：load_config_rules 内部完成 COW 发布（旧配置在发布后即被释放），
        diff 所需旧字段须在加载前快照（旧 AppConfig 指针发布后悬垂） */
     bool old_global_inject = g_global_cfg.global_inject;
-    typedef struct { char pkg[128]; int user_id; bool inject_enable; } OldAppSnap;
+    typedef struct {
+        char pkg[128];
+        int user_id;
+        bool inject_enable;
+    } OldAppSnap;
     int old_count = g_app_cfg_count;
     OldAppSnap* old_snap = old_count > 0 ? calloc((size_t)old_count, sizeof(OldAppSnap)) : NULL;
     if (old_snap) {
@@ -1068,14 +1152,12 @@ bool category_has_rules_locked(bool is_system_app, int user_id) {
 bool has_wildcard_enabled_locked(int user_id) {
     for (int i = 0; i < g_app_cfg_count; i++) {
         if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == user_id &&
-            strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 &&
-            g_app_cfgs[i]->inject_enable)
+            strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 && g_app_cfgs[i]->inject_enable)
             return true;
     }
     for (int i = 0; i < g_app_cfg_count; i++) {
         if (g_app_cfgs[i] && g_app_cfgs[i]->user_id == -1 &&
-            strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 &&
-            g_app_cfgs[i]->inject_enable)
+            strcmp(g_app_cfgs[i]->pkg_name, "*") == 0 && g_app_cfgs[i]->inject_enable)
             return true;
     }
     return false;
@@ -1088,9 +1170,12 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     bool is_sys = (linux_uid < 10000) || (pkg && sys_pkg_is_system(pkg));
     AppConfig* cat = find_category_cfg_locked(is_sys, user_id);
     bool is_wildcard = (cfg == NULL) && has_wildcard_enabled_locked(user_id);
-    int final_redir_count = (cfg ? cfg->redir_count : 0) + (cat ? cat->redir_count : 0) + g_global_cfg.redir_count;
-    int final_hide_count = (cfg ? cfg->hide_count : 0) + (cat ? cat->hide_count : 0) + g_global_cfg.hide_count;
-    int final_ro_count = (cfg ? cfg->ro_count : 0) + (cat ? cat->ro_count : 0) + g_global_cfg.ro_count;
+    int final_redir_count =
+        (cfg ? cfg->redir_count : 0) + (cat ? cat->redir_count : 0) + g_global_cfg.redir_count;
+    int final_hide_count =
+        (cfg ? cfg->hide_count : 0) + (cat ? cat->hide_count : 0) + g_global_cfg.hide_count;
+    int final_ro_count =
+        (cfg ? cfg->ro_count : 0) + (cat ? cat->ro_count : 0) + g_global_cfg.ro_count;
     bool final_sandbox;
     if (cfg && cfg->sandbox_explicit) {
         final_sandbox = cfg->sandbox;
@@ -1109,10 +1194,8 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     }
     if (cfg) {
         LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向(通配):%d条 隐藏(通配):%d条 只读(通配):%d条",
-            pkg, pid, user_id, trigger_source,
-            final_monitor ? "ON" : "OFF",
-            final_sandbox ? "ON" : "OFF",
-            final_redir_count, final_hide_count, final_ro_count);
+            pkg, pid, user_id, trigger_source, final_monitor ? "ON" : "OFF",
+            final_sandbox ? "ON" : "OFF", final_redir_count, final_hide_count, final_ro_count);
         for (int i = 0; i < cfg->redir_count; i++) {
             //LOG_DBG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
         }
@@ -1123,19 +1206,17 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             //LOG_DBG("  [只读通配]   %s", cfg->ro_rules[i]);
         }
     } else {
-        const char* match_desc = 
-            is_wildcard ? "命中通配符 [*]" :
-            (g_global_cfg.global_inject ? "命中 GLOBAL_INJECT" : "无匹配规则");
-        LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | %s (全局 MONITOR:%s SANDBOX:%s)",
-            pkg, pid, user_id, trigger_source, match_desc,
-            final_monitor ? "ON" : "OFF",
+        const char* match_desc =
+            is_wildcard ? "命中通配符 [*]"
+                        : (g_global_cfg.global_inject ? "命中 GLOBAL_INJECT" : "无匹配规则");
+        LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | %s (全局 MONITOR:%s SANDBOX:%s)", pkg, pid,
+            user_id, trigger_source, match_desc, final_monitor ? "ON" : "OFF",
             final_sandbox ? "ON" : "OFF");
     }
     if (g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0) {
         LOG_DBG("  [全局规则通配] MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
-            g_global_cfg.monitor ? "ON" : "OFF",
-            g_global_cfg.sandbox ? "ON" : "OFF",
-            g_global_cfg.redir_count, g_global_cfg.hide_count, g_global_cfg.ro_count);
+                g_global_cfg.monitor ? "ON" : "OFF", g_global_cfg.sandbox ? "ON" : "OFF",
+                g_global_cfg.redir_count, g_global_cfg.hide_count, g_global_cfg.ro_count);
     }
     config_unlock_read();
 }

@@ -23,13 +23,13 @@
 #define TRACKED_HASH_SIZE 2048
 typedef struct TrackedEntry {
     int pid;
-    bool injected;              /* 注入状态显式标志：注入成功路径置位，
+    bool injected; /* 注入状态显式标志：注入成功路径置位，
                                    restore/卸载路径清除（稳定公共函数维护，
                                    列表不再依赖挂载状态探测） */
-    struct TrackedEntry *next;
+    struct TrackedEntry* next;
 } TrackedEntry;
 
-static TrackedEntry *g_tracked_hash[TRACKED_HASH_SIZE];
+static TrackedEntry* g_tracked_hash[TRACKED_HASH_SIZE];
 static pthread_mutex_t g_tracked_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* 系统应用包名缓存：实现已抽取至 src/core/sys_pkg.c（跨进程共享，
@@ -56,7 +56,7 @@ static unsigned int hash_pid(int pid) {
 void add_tracked(int pid) {
     pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
-    TrackedEntry *e = g_tracked_hash[h];
+    TrackedEntry* e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
             pthread_mutex_unlock(&g_tracked_mutex);
@@ -99,10 +99,10 @@ void add_tracked(int pid) {
 
 /* 标记 pid 为已注入（注入成功路径调用，幂等） */
 void mark_injected(int pid) {
-    add_tracked(pid);   /* 确保条目存在（幂等） */
+    add_tracked(pid); /* 确保条目存在（幂等） */
     pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
-    TrackedEntry *e = g_tracked_hash[h];
+    TrackedEntry* e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
             e->injected = true;
@@ -117,7 +117,7 @@ void mark_injected(int pid) {
 void unmark_injected(int pid) {
     pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
-    TrackedEntry *e = g_tracked_hash[h];
+    TrackedEntry* e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
             e->injected = false;
@@ -133,7 +133,7 @@ bool is_injected(int pid) {
     bool injected = false;
     pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
-    TrackedEntry *e = g_tracked_hash[h];
+    TrackedEntry* e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
             injected = e->injected;
@@ -148,7 +148,7 @@ bool is_injected(int pid) {
 bool is_tracked(int pid) {
     pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
-    TrackedEntry *e = g_tracked_hash[h];
+    TrackedEntry* e = g_tracked_hash[h];
     while (e) {
         if (e->pid == pid) {
             pthread_mutex_unlock(&g_tracked_mutex);
@@ -163,10 +163,10 @@ bool is_tracked(int pid) {
 void remove_tracked(int pid) {
     pthread_mutex_lock(&g_tracked_mutex);
     unsigned int h = hash_pid(pid);
-    TrackedEntry **pp = &g_tracked_hash[h];
+    TrackedEntry** pp = &g_tracked_hash[h];
     while (*pp) {
         if ((*pp)->pid == pid) {
-            TrackedEntry *tmp = *pp;
+            TrackedEntry* tmp = *pp;
             *pp = (*pp)->next;
             free(tmp);
             break;
@@ -179,10 +179,10 @@ void remove_tracked(int pid) {
 static void prune_stale_tracked() {
     pthread_mutex_lock(&g_tracked_mutex);
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry **pp = &g_tracked_hash[i];
+        TrackedEntry** pp = &g_tracked_hash[i];
         while (*pp) {
             if (kill((*pp)->pid, 0) != 0) {
-                TrackedEntry *tmp = *pp;
+                TrackedEntry* tmp = *pp;
                 *pp = (*pp)->next;
                 free(tmp);
             } else {
@@ -209,10 +209,10 @@ typedef struct AllAppEntry {
     int pid;
     uid_t uid;
     char cmdline[256];
-    struct AllAppEntry *next;
+    struct AllAppEntry* next;
 } AllAppEntry;
 
-static AllAppEntry *g_all_apps_hash[ALL_APPS_HASH_SIZE];
+static AllAppEntry* g_all_apps_hash[ALL_APPS_HASH_SIZE];
 static pthread_mutex_t g_all_apps_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static unsigned int hash_app_pid(int pid) {
@@ -223,7 +223,7 @@ void all_apps_upsert(int pid, uid_t uid, const char* cmdline) {
     if (pid <= 0 || !cmdline) return;
     pthread_mutex_lock(&g_all_apps_mutex);
     unsigned int h = hash_app_pid(pid);
-    AllAppEntry *e = g_all_apps_hash[h];
+    AllAppEntry* e = g_all_apps_hash[h];
     while (e) {
         if (e->pid == pid) {
             e->uid = uid;
@@ -253,7 +253,7 @@ bool all_apps_find_by_cmdline(const char* pkg, int* pid_out, uid_t* uid_out) {
     bool found = false;
     pthread_mutex_lock(&g_all_apps_mutex);
     for (int i = 0; i < ALL_APPS_HASH_SIZE && !found; i++) {
-        AllAppEntry *e = g_all_apps_hash[i];
+        AllAppEntry* e = g_all_apps_hash[i];
         while (e) {
             if (kill(e->pid, 0) == 0 && fnmatch(pkg, e->cmdline, 0) == 0) {
                 if (pid_out) *pid_out = e->pid;
@@ -272,10 +272,10 @@ bool all_apps_find_by_cmdline(const char* pkg, int* pid_out, uid_t* uid_out) {
 void all_apps_prune(void) {
     pthread_mutex_lock(&g_all_apps_mutex);
     for (int i = 0; i < ALL_APPS_HASH_SIZE; i++) {
-        AllAppEntry **pp = &g_all_apps_hash[i];
+        AllAppEntry** pp = &g_all_apps_hash[i];
         while (*pp) {
             if (kill((*pp)->pid, 0) != 0) {
-                AllAppEntry *tmp = *pp;
+                AllAppEntry* tmp = *pp;
                 *pp = (*pp)->next;
                 free(tmp);
             } else {
@@ -290,9 +290,9 @@ void all_apps_prune(void) {
 void all_apps_cleanup(void) {
     pthread_mutex_lock(&g_all_apps_mutex);
     for (int i = 0; i < ALL_APPS_HASH_SIZE; i++) {
-        AllAppEntry *e = g_all_apps_hash[i];
+        AllAppEntry* e = g_all_apps_hash[i];
         while (e) {
-            AllAppEntry *tmp = e;
+            AllAppEntry* tmp = e;
             e = e->next;
             free(tmp);
         }
@@ -301,7 +301,7 @@ void all_apps_cleanup(void) {
     pthread_mutex_unlock(&g_all_apps_mutex);
 }
 
-static UidMapEntry *g_uid_map = NULL;
+static UidMapEntry* g_uid_map = NULL;
 static int g_uid_map_count = 0;
 static int g_uid_map_cap = 0;
 
@@ -319,8 +319,7 @@ static bool uid_has_failed(uid_t uid) {
 
 static void uid_mark_failed(uid_t uid) {
     if (uid_has_failed(uid)) return;
-    if (g_failed_uid_count < MAX_FAILED_UIDS)
-        g_failed_uids[g_failed_uid_count++] = uid;
+    if (g_failed_uid_count < MAX_FAILED_UIDS) g_failed_uids[g_failed_uid_count++] = uid;
 }
 
 void init_uid_map_cache(void) {
@@ -336,7 +335,7 @@ void init_uid_map_cache(void) {
     g_uid_map_count = uid_map_load(g_uid_map, cap);
     while (g_uid_map_count > 0 && g_uid_map_count == cap) {
         cap *= 2;
-        UidMapEntry *new_map = realloc(g_uid_map, (size_t)cap * sizeof(UidMapEntry));
+        UidMapEntry* new_map = realloc(g_uid_map, (size_t)cap * sizeof(UidMapEntry));
         if (!new_map) {
             LOG_ERR("uid_map_cache: realloc(%d) 失败", cap);
             free(g_uid_map);
@@ -349,7 +348,8 @@ void init_uid_map_cache(void) {
         g_uid_map_count = uid_map_load(g_uid_map, cap);
     }
     g_uid_map_cap = cap;
-    LOG_DBG("UID映射内存缓存已初始化: 从文件载入 %d 条映射记录 (容量 %d)", g_uid_map_count, g_uid_map_cap);
+    LOG_DBG("UID映射内存缓存已初始化: 从文件载入 %d 条映射记录 (容量 %d)", g_uid_map_count,
+            g_uid_map_cap);
 }
 
 bool is_isolated_uid(uid_t uid) {
@@ -384,7 +384,6 @@ bool is_process_safe_to_inject(const char* cmdline) {
     return true;
 }
 
-
 bool is_zygote_child(pid_t pid) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
@@ -403,7 +402,8 @@ bool is_zygote_child(pid_t pid) {
     if (ppid <= 1) return false;
     char pcmd[64] = {0};
     if (!proc_get_cmdline(ppid, pcmd, sizeof(pcmd))) return false;
-    if (strcmp(pcmd, "zygote") == 0 || strcmp(pcmd, "zygote64") == 0 || strstr(pcmd, "zygote") != nullptr || strstr(pcmd, "usap") != nullptr)
+    if (strcmp(pcmd, "zygote") == 0 || strcmp(pcmd, "zygote64") == 0 ||
+        strstr(pcmd, "zygote") != nullptr || strstr(pcmd, "usap") != nullptr)
         return true;
     return false;
 }
@@ -469,10 +469,13 @@ void update_uid_map(uid_t uid, const char* pkg) {
     /* 2. 只有在数据发生变更或属于全新映射时，才穿透执行物理磁盘落盘 */
     int ret = uid_map_upsert(uid, clean_pkg);
     if (ret != 0) {
-        const char *reason = "未知错误";
-        if (ret == UID_MAP_ERR_FULL) reason = "条目已满(>1024)";
-        else if (ret == UID_MAP_ERR_IO) reason = "文件写入失败";
-        else if (ret == UID_MAP_ERR_RENAME) reason = "原子重命名失败";
+        const char* reason = "未知错误";
+        if (ret == UID_MAP_ERR_FULL)
+            reason = "条目已满(>1024)";
+        else if (ret == UID_MAP_ERR_IO)
+            reason = "文件写入失败";
+        else if (ret == UID_MAP_ERR_RENAME)
+            reason = "原子重命名失败";
         LOG_ERR("uid_map_upsert 失败: %u -> %s (%s)", uid, clean_pkg, reason);
         uid_mark_failed(uid);
         return;
@@ -491,7 +494,7 @@ void update_uid_map(uid_t uid, const char* pkg) {
         if (g_uid_map_count >= g_uid_map_cap) {
             /* 缓存容量不够，动态扩容 */
             int new_cap = g_uid_map_cap ? g_uid_map_cap * 2 : UID_MAP_INIT_CAPACITY;
-            UidMapEntry *new_map = realloc(g_uid_map, (size_t)new_cap * sizeof(UidMapEntry));
+            UidMapEntry* new_map = realloc(g_uid_map, (size_t)new_cap * sizeof(UidMapEntry));
             if (!new_map) {
                 LOG_ERR("update_uid_map: realloc(%d) 失败，无法缓存 %s", new_cap, clean_pkg);
                 return;
@@ -509,10 +512,14 @@ void update_uid_map(uid_t uid, const char* pkg) {
 
 void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid) {
     /* 卸载 FUSE 挂载 */
-    for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, target_path, "fuse_daemon") > 0); t++) {
+    for (int t = 0; t < 3 && (ns_is_mounted(pid, target_path, "fuse.fuse_daemon") > 0 ||
+                              ns_is_mounted(pid, target_path, "fuse_daemon") > 0);
+         t++) {
         ns_umount_recursive(pid, target_path);
     }
-    for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 || ns_is_mounted(pid, backup_path, "fuse_daemon") > 0); t++) {
+    for (int t = 0; t < 3 && (ns_is_mounted(pid, backup_path, "fuse.fuse_daemon") > 0 ||
+                              ns_is_mounted(pid, backup_path, "fuse_daemon") > 0);
+         t++) {
         ns_umount_recursive(pid, backup_path);
     }
     /* 原始注入方案：从备份恢复或从 init 命名空间重建 */
@@ -536,7 +543,7 @@ void force_recover_tracked_mounts() {
         LOG_DBG("全局替换模式: force_recover 跳过逐应用卸载，由全局恢复统一处理");
     } else {
         for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-            TrackedEntry *e = g_tracked_hash[i];
+            TrackedEntry* e = g_tracked_hash[i];
             while (e) {
                 int pid = e->pid;
                 if (kill(pid, 0) == 0) {
@@ -552,9 +559,9 @@ void force_recover_tracked_mounts() {
         }
     }
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry *e = g_tracked_hash[i];
+        TrackedEntry* e = g_tracked_hash[i];
         while (e) {
-            TrackedEntry *tmp = e;
+            TrackedEntry* tmp = e;
             e = e->next;
             free(tmp);
         }
@@ -566,12 +573,12 @@ void force_recover_tracked_mounts() {
 void audit_tracked_apps() {
     prune_stale_tracked();
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry **pp = &g_tracked_hash[i];
+        TrackedEntry** pp = &g_tracked_hash[i];
         while (*pp) {
             int pid = (*pp)->pid;
             char cmd[256] = {0};
             if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) {
-                TrackedEntry *tmp = *pp;
+                TrackedEntry* tmp = *pp;
                 *pp = (*pp)->next;
                 free(tmp);
                 continue;
@@ -600,11 +607,13 @@ void audit_tracked_apps() {
                     snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
                     cleanup_app_mounts(pid, target_path, backup_path, uid);
                 }
-                LOG_DBG("配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。", cmd, pid);
+                LOG_DBG("配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。",
+                        cmd, pid);
             } else if (is_target && !has_fuse) {
                 if (g_global_replace_mode) {
                     /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载 */
-                    LOG_DBG("配置审查: %s (PID: %d) 全局替换模式，目标应用无需逐应用挂载。", cmd, pid);
+                    LOG_DBG("配置审查: %s (PID: %d) 全局替换模式，目标应用无需逐应用挂载。", cmd,
+                            pid);
                 } else {
                     const char* mnt_src = get_active_mnt_src();
                     if (mnt_src) {
@@ -623,12 +632,12 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
     prune_stale_tracked();
     const char* mnt_src = get_active_mnt_src();
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry **pp = &g_tracked_hash[i];
+        TrackedEntry** pp = &g_tracked_hash[i];
         while (*pp) {
             int pid = (*pp)->pid;
             char cmd[256] = {0};
             if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) {
-                TrackedEntry *tmp = *pp;
+                TrackedEntry* tmp = *pp;
                 *pp = (*pp)->next;
                 free(tmp);
                 continue;
@@ -649,10 +658,14 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                     /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
                        非目标应用需主动卸载项目 FUSE 并还原系统视图备份 */
                     if (is_target) {
-                        LOG_DBG("局部规则审查: 全局替换模式，目标应用 %s (PID: %d) 无需逐应用挂载。", cmd, pid);
+                        LOG_DBG(
+                            "局部规则审查: 全局替换模式，目标应用 %s (PID: %d) 无需逐应用挂载。",
+                            cmd, pid);
                     } else {
                         perform_app_restore(cmd, pid, uid);
-                        LOG_DBG("局部规则审查: 全局替换模式，非目标应用 %s (PID: %d) 已还原系统视图。", cmd, pid);
+                        LOG_DBG(
+                            "局部规则审查: 全局替换模式，非目标应用 %s (PID: %d) 已还原系统视图。",
+                            cmd, pid);
                     }
                 } else {
                     char target_path[128];
@@ -661,10 +674,13 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                     snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
                     cleanup_app_mounts(pid, target_path, backup_path, uid);
                     if (is_target && mnt_src) {
-                        LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 进行重新挂载。", cmd, pid);
+                        LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 进行重新挂载。", cmd,
+                                pid);
                         perform_app_mount(cmd, pid, uid, mnt_src, "局部规则变动重新挂载");
                     } else {
-                        LOG_DBG("局部规则审查: 受到变动影响的应用 %s (PID: %d) 已清空还原物理挂载，保持物理追踪监听。", cmd, pid);
+                        LOG_DBG(
+                            "局部规则审查: 受到变动影响的应用 %s (PID: %d) 已清空还原物理挂载，保持物理追踪监听。",
+                            cmd, pid);
                     }
                 }
             }
@@ -679,7 +695,7 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
         int pid = 0;
         uid_t uid = 0;
         if (!all_apps_find_by_cmdline(changed[c].pkg_name, &pid, &uid)) continue;
-        if (is_tracked(pid)) continue;   /* 追踪列表已处理 */
+        if (is_tracked(pid)) continue; /* 追踪列表已处理 */
         char cmd[256] = {0};
         if (!proc_get_cmdline(pid, cmd, sizeof cmd)) continue;
         int user_id = uid / 100000;
@@ -702,16 +718,25 @@ void handle_list_injected(int client_fd) {
        导致 log_ctl 端"共计 0 个"误报（DONE 解析失败） */
     size_t cap = 4096;
     char* reply = malloc(cap);
-    if (!reply) { send(client_fd, "DONE|0\n", 7, MSG_NOSIGNAL); return; }
+    if (!reply) {
+        send(client_fd, "DONE|0\n", 7, MSG_NOSIGNAL);
+        return;
+    }
     int offset = 0;
     int total = 0;
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry *e = g_tracked_hash[i];
+        TrackedEntry* e = g_tracked_hash[i];
         while (e) {
             int pid = e->pid;
-            if (kill(pid, 0) != 0) { e = e->next; continue; }
+            if (kill(pid, 0) != 0) {
+                e = e->next;
+                continue;
+            }
             char cmdline[256] = {0};
-            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) { e = e->next; continue; }
+            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) {
+                e = e->next;
+                continue;
+            }
             uid_t uid = get_app_uid(pid);
             /* 注入状态以显式标志为权威：不再探测 mountinfo（GLOBAL_INJECT
                下全局替换无逐应用挂载/异步挂载时序会导致 is_project_fuse_cached
@@ -737,8 +762,8 @@ void handle_list_injected(int client_fd) {
             int total_hide = app_hide + g_global_cfg.hide_count;
             int total_ro = app_ro + g_global_cfg.ro_count;
             config_unlock_read();
-            int n = snprintf(nullptr, 0, "APP|%s|%d|%u|%d|%d|%d\n",
-                             base_pkg, pid, uid, total_redir, total_hide, total_ro);
+            int n = snprintf(nullptr, 0, "APP|%s|%d|%u|%d|%d|%d\n", base_pkg, pid, uid, total_redir,
+                             total_hide, total_ro);
             if (n > 0) {
                 if ((size_t)offset + n + 1 > cap) {
                     cap = ((size_t)offset + n + 1) * 2;
@@ -764,15 +789,21 @@ void handle_list_injected(int client_fd) {
     free(reply);
 }
 
-int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids, int max_count) {
+int get_injected_snapshot(int* out_pids, char (*out_pkgs)[256], uid_t* out_uids, int max_count) {
     int count = 0;
     for (int i = 0; i < TRACKED_HASH_SIZE && count < max_count; i++) {
-        TrackedEntry *e = g_tracked_hash[i];
+        TrackedEntry* e = g_tracked_hash[i];
         while (e && count < max_count) {
             int pid = e->pid;
-            if (kill(pid, 0) != 0) { e = e->next; continue; }
+            if (kill(pid, 0) != 0) {
+                e = e->next;
+                continue;
+            }
             char cmdline[256] = {0};
-            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) { e = e->next; continue; }
+            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) {
+                e = e->next;
+                continue;
+            }
             uid_t uid = get_app_uid(pid);
             /* 与 handle_list_injected 一致：以显式注入标志为权威，
                不再探测 mountinfo（GLOBAL_INJECT 下挂载状态不可靠） */
@@ -783,7 +814,7 @@ int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids,
             char base_pkg[256];
             strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
             base_pkg[sizeof(base_pkg) - 1] = '\0';
-            char *colon = strchr(base_pkg, ':');
+            char* colon = strchr(base_pkg, ':');
             if (colon) *colon = '\0';
             out_pids[count] = pid;
             strncpy(out_pkgs[count], base_pkg, 255);
@@ -796,7 +827,7 @@ int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids,
     return count;
 }
 
-int get_uid_map_snapshot(UidMapEntry *out, int max_count) {
+int get_uid_map_snapshot(UidMapEntry* out, int max_count) {
     int count = g_uid_map_count;
     if (count > max_count) count = max_count;
     for (int i = 0; i < count; i++) {
@@ -814,7 +845,7 @@ int get_uid_map_snapshot(UidMapEntry *out, int max_count) {
 bool is_media_module_injected_target(void) {
     bool target = false;
     config_lock_read();
-    
+
     // 1. 优先扫描活跃用户的专属规则
     for (int i = 0; i < g_active_user_count; i++) {
         int user_id = g_active_users[i];

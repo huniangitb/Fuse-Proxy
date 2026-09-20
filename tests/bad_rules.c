@@ -30,13 +30,11 @@ static int bad_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     /* 错误路径：计一次熔断错误。注意——内核对失败 lookup 缓存负向 dentry，
        同名路径只触达模块一次；测试用 errtest0..N 不同组件名模拟真实
        错误风暴（每个新组件名都会重新进入 resolve），故按前缀匹配。 */
-    if (strncmp(vp, "errtest", 7) == 0)
-        return -EIO;
+    if (strncmp(vp, "errtest", 7) == 0) return -EIO;
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
-        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s",
-                 test_storage(), rest);
+        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
         snprintf(out->redir_target, sizeof out->redir_target, "/virt");
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
@@ -45,31 +43,31 @@ static int bad_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         out->is_redir = true;
         return 0;
     }
-    return 0;                      /* 其余路径：合法"无命中"（框架直通） */
+    return 0; /* 其余路径：合法"无命中"（框架直通） */
 }
 
 static int bad_probe(const NspQueryCtx* q, NspProbeResult* out) {
     if (!q || !out) return -EINVAL;
     memset(out, 0, sizeof *out);
-    out->valid = false;            /* 不逐条目过滤 */
+    out->valid = false; /* 不逐条目过滤 */
     return 0;
 }
 
 static const NspModuleOps bad_ops = {
     .resolve = bad_resolve,
-    .probe   = bad_probe,
+    .probe = bad_probe,
 };
 
 /* 模块导出的是**数据符号**（全局 NspModuleInfo 结构体），loader 经 dlsym
    后直接强转 NspModuleInfo* 读取——不是函数。name 必须与目录名一致。 */
 const NspModuleInfo nsp_module_info = {
-    .magic       = NSP_MODULE_MAGIC,
+    .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type        = NSP_MODULE_TYPE_RULES,
-    .caps        = NSP_CAP_REDIRECT,
-    .name        = "bad_rules",
-    .version     = "1.0",
-    .init        = NULL,
-    .exit        = NULL,
-    .ops         = &bad_ops,
+    .type = NSP_MODULE_TYPE_RULES,
+    .caps = NSP_CAP_REDIRECT,
+    .name = "bad_rules",
+    .version = "1.0",
+    .init = NULL,
+    .exit = NULL,
+    .ops = &bad_ops,
 };

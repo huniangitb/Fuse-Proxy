@@ -25,8 +25,7 @@ static int ov_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
-        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s",
-                 test_storage(), rest);
+        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
         snprintf(out->redir_target, sizeof out->redir_target, "/virt");
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
@@ -47,7 +46,11 @@ static int ov_probe(const NspQueryCtx* q, NspProbeResult* out) {
 
 static int ov_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max) {
-    (void)q; (void)sub_path; (void)user_id; (void)pkg; (void)is_root;
+    (void)q;
+    (void)sub_path;
+    (void)user_id;
+    (void)pkg;
+    (void)is_root;
     if (!out || max <= 0) return 0;
     /* 只在边界内写 2 个合法条目，但谎报超大计数（不真越界写，避免测试本身踩内存） */
     int fill = max >= 2 ? 2 : max;
@@ -60,18 +63,18 @@ static int ov_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user
 
 static const NspModuleOps ov_ops = {
     .resolve = ov_resolve,
-    .probe   = ov_probe,
+    .probe = ov_probe,
     .readdir_extra = ov_readdir_extra,
 };
 
 const NspModuleInfo nsp_module_info = {
-    .magic       = NSP_MODULE_MAGIC,
+    .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type        = NSP_MODULE_TYPE_RULES,
-    .caps        = NSP_CAP_REDIRECT | NSP_CAP_READDIR_EXTRA,
-    .name        = "overflow_rules",
-    .version     = "1.0",
-    .init        = NULL,
-    .exit        = NULL,
-    .ops         = &ov_ops,
+    .type = NSP_MODULE_TYPE_RULES,
+    .caps = NSP_CAP_REDIRECT | NSP_CAP_READDIR_EXTRA,
+    .name = "overflow_rules",
+    .version = "1.0",
+    .init = NULL,
+    .exit = NULL,
+    .ops = &ov_ops,
 };

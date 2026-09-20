@@ -15,10 +15,10 @@
 #define SYS_PKG_MAX_LINES 8192
 typedef struct SysPkgEntry {
     char pkg[128];
-    struct SysPkgEntry *next;
+    struct SysPkgEntry* next;
 } SysPkgEntry;
 
-static SysPkgEntry *g_sys_pkg_hash[SYS_PKG_HASH_SIZE];
+static SysPkgEntry* g_sys_pkg_hash[SYS_PKG_HASH_SIZE];
 static pthread_mutex_t g_sys_pkg_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_sys_pkg_loaded = false;
 static bool g_sys_pkg_allow_pm = false;
@@ -31,9 +31,9 @@ static unsigned int sys_pkg_hash(const char* pkg) {
 
 static void sys_pkg_clear_locked(void) {
     for (int i = 0; i < SYS_PKG_HASH_SIZE; i++) {
-        SysPkgEntry *e = g_sys_pkg_hash[i];
+        SysPkgEntry* e = g_sys_pkg_hash[i];
         while (e) {
-            SysPkgEntry *n = e->next;
+            SysPkgEntry* n = e->next;
             free(e);
             e = n;
         }
@@ -44,10 +44,10 @@ static void sys_pkg_clear_locked(void) {
 static void sys_pkg_add_locked(const char* pkg) {
     if (!pkg || !pkg[0]) return;
     unsigned int h = sys_pkg_hash(pkg);
-    for (SysPkgEntry *e = g_sys_pkg_hash[h]; e; e = e->next) {
+    for (SysPkgEntry* e = g_sys_pkg_hash[h]; e; e = e->next) {
         if (strcmp(e->pkg, pkg) == 0) return;
     }
-    SysPkgEntry *n = malloc(sizeof(SysPkgEntry));
+    SysPkgEntry* n = malloc(sizeof(SysPkgEntry));
     if (!n) return;
     strncpy(n->pkg, pkg, sizeof(n->pkg) - 1);
     n->pkg[sizeof(n->pkg) - 1] = '\0';
@@ -70,8 +70,7 @@ static void sys_pkg_save_locked(void) {
         return;
     }
     for (int i = 0; i < SYS_PKG_HASH_SIZE; i++) {
-        for (SysPkgEntry *e = g_sys_pkg_hash[i]; e; e = e->next)
-            fprintf(fp, "%s\n", e->pkg);
+        for (SysPkgEntry* e = g_sys_pkg_hash[i]; e; e = e->next) fprintf(fp, "%s\n", e->pkg);
     }
     fclose(fp);
     if (rename(tmp, path) != 0) {
@@ -84,13 +83,16 @@ static void sys_pkg_load_file_locked(void) {
     char path[PATH_MAX];
     sys_pkg_cache_path(path, sizeof path);
     FILE* fp = fopen(path, "r");
-    if (!fp) return;   /* 无表 = pm 查询失败语义，调用方回退 uid<10000 */
+    if (!fp) return; /* 无表 = pm 查询失败语义，调用方回退 uid<10000 */
     char line[160];
     int n = 0;
     while (n < SYS_PKG_MAX_LINES && fgets(line, sizeof line, fp)) {
         size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
-        if (line[0]) { sys_pkg_add_locked(line); n++; }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (line[0]) {
+            sys_pkg_add_locked(line);
+            n++;
+        }
     }
     fclose(fp);
 }
@@ -100,27 +102,28 @@ static void sys_pkg_load_file_locked(void) {
  * pm 会卡住 injector 事件循环线程的全部 sys_pkg_is_system 读者 */
 typedef struct SysPkgTmp {
     char pkg[128];
-    struct SysPkgTmp *next;
+    struct SysPkgTmp* next;
 } SysPkgTmp;
 
-static SysPkgTmp *sys_pkg_collect_pm(void) {
+static SysPkgTmp* sys_pkg_collect_pm(void) {
     FILE* fp = popen("pm list packages -s 2>/dev/null", "r");
     if (!fp) {
         LOG_WRN("sys_pkg: pm list packages -s 执行失败，回退到 UID 判断");
         return NULL;
     }
-    SysPkgTmp *head = NULL;
+    SysPkgTmp* head = NULL;
     char line[512];
     int count = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "package:", 8) == 0) {
             char* pkg = line + 8;
             size_t len = strlen(pkg);
-            while (len > 0 && (pkg[len-1] == '\n' || pkg[len-1] == '\r' || pkg[len-1] == ' ')) pkg[--len] = '\0';
-            char* colon = strchr(pkg, ':');   /* P2：与旧版一致截断冒号后缀 */
+            while (len > 0 && (pkg[len - 1] == '\n' || pkg[len - 1] == '\r' || pkg[len - 1] == ' '))
+                pkg[--len] = '\0';
+            char* colon = strchr(pkg, ':'); /* P2：与旧版一致截断冒号后缀 */
             if (colon) *colon = '\0';
             if (pkg[0]) {
-                SysPkgTmp *n = malloc(sizeof(SysPkgTmp));
+                SysPkgTmp* n = malloc(sizeof(SysPkgTmp));
                 if (!n) break;
                 strncpy(n->pkg, pkg, sizeof(n->pkg) - 1);
                 n->pkg[sizeof(n->pkg) - 1] = '\0';
@@ -135,18 +138,17 @@ static SysPkgTmp *sys_pkg_collect_pm(void) {
     return head;
 }
 
-static void sys_pkg_free_tmp(SysPkgTmp *head) {
+static void sys_pkg_free_tmp(SysPkgTmp* head) {
     while (head) {
-        SysPkgTmp *n = head->next;
+        SysPkgTmp* n = head->next;
         free(head);
         head = n;
     }
 }
 
 /* 调用方须持锁：临时链表合并入哈希（拷贝字符串，tmp 由收集方释放） */
-static void sys_pkg_merge_tmp_locked(SysPkgTmp *head) {
-    for (SysPkgTmp *t = head; t; t = t->next)
-        sys_pkg_add_locked(t->pkg);
+static void sys_pkg_merge_tmp_locked(SysPkgTmp* head) {
+    for (SysPkgTmp* t = head; t; t = t->next) sys_pkg_add_locked(t->pkg);
 }
 
 void sys_pkg_init(bool allow_pm) {
@@ -155,7 +157,7 @@ void sys_pkg_init(bool allow_pm) {
     bool need = !g_sys_pkg_loaded;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
     if (!need) return;
-    SysPkgTmp *tmp = allow_pm ? sys_pkg_collect_pm() : NULL;
+    SysPkgTmp* tmp = allow_pm ? sys_pkg_collect_pm() : NULL;
     pthread_mutex_lock(&g_sys_pkg_mutex);
     if (!g_sys_pkg_loaded) {
         if (allow_pm) {
@@ -182,7 +184,7 @@ void sys_pkg_refresh(void) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
     bool allow = g_sys_pkg_allow_pm;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
-    SysPkgTmp *tmp = allow ? sys_pkg_collect_pm() : NULL;
+    SysPkgTmp* tmp = allow ? sys_pkg_collect_pm() : NULL;
     pthread_mutex_lock(&g_sys_pkg_mutex);
     sys_pkg_clear_locked();
     if (allow) {
@@ -217,8 +219,11 @@ bool sys_pkg_is_system(const char* pkg) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
     unsigned int h = sys_pkg_hash(q);
     bool hit = false;
-    for (SysPkgEntry *e = g_sys_pkg_hash[h]; e; e = e->next) {
-        if (strcmp(e->pkg, q) == 0) { hit = true; break; }
+    for (SysPkgEntry* e = g_sys_pkg_hash[h]; e; e = e->next) {
+        if (strcmp(e->pkg, q) == 0) {
+            hit = true;
+            break;
+        }
     }
     pthread_mutex_unlock(&g_sys_pkg_mutex);
     return hit;

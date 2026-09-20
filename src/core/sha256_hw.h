@@ -14,7 +14,7 @@ extern "C" {
    标准摘要不一致时返回 0（永久回退纯软件实现，杜绝硬件 bug 造成错误哈希）。
    sha256_hw_blocks()：处理 nblocks 个 64 字节块，就地更新 8×32 位状态
    （与纯软件 Sha256Ctx.state 布局一致）。 */
-int  sha256_hw_available(void);
+int sha256_hw_available(void);
 void sha256_hw_blocks(uint32_t state[8], const uint8_t* blocks, size_t nblocks);
 
 #ifdef __cplusplus
