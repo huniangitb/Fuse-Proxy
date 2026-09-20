@@ -32,7 +32,7 @@
  *
  * 返回值约定：nsp_fence_* 正常时**透传模块返回码**（0 成功/负值错误，
  * 与 NspModuleOps 回调约定一致）；围栏自身异常返回 NSP_FENCE_FAULT /
- * NSP_FENCE_BADFN（正数 1/2，模块约定不会返回）。调用方判定：
+ * NSP_FENCE_BADFN（取值见下方定义，远离模块合法返回值域）。调用方判定：
  *   rc == NSP_FENCE_FAULT → 崩溃恢复，上报 nsp_module_fault_report；
  *   rc == NSP_FENCE_BADFN → 函数指针缺失（防御，按未实现处理）；
  *   其余 → 按模块返回码语义处理。
@@ -44,10 +44,17 @@
 #include <signal.h>
 #include "nsp_module.h"
 
-/* 围栏调用返回值（仅围栏自身产生，与模块返回码空间区分） */
-#define NSP_FENCE_OK      0   /* = 模块返回码 0（成功）；透传 */
-#define NSP_FENCE_FAULT   1   /* 模块崩溃被围栏恢复：out 参数视为已破坏 */
-#define NSP_FENCE_BADFN   2   /* 函数指针为 NULL（防御）：未调用 */
+/* 围栏调用返回值（仅围栏自身产生，与模块返回码空间严格区分）。
+   ⚠ 哨兵值必须远离模块的合法返回值域：backend_match 成功返回 1，
+   readdir_extra / backend_readdir 成功返回**条目数**（≥1，上界为调用方
+   传入的 max，数千量级）。历史上哨兵取小正数 1/2，与这两类成功返回
+   碰撞——每次 FTP 路径命中都被误判为"崩溃被围栏恢复"，既错误累积熔断
+   计数（终致置毒 ban + 卸载模块），又使 `rc == 1` 的命中分支永不可达
+   （后端形同未注册）。故取远高于任何计数/标志上界的正值，同时保持
+   "正数族"以维持既有 `rc < 0 ? rc : -EIO` 泄漏路径的降级行为。 */
+#define NSP_FENCE_OK      0                    /* = 模块返回码 0（成功）；透传 */
+#define NSP_FENCE_FAULT   (1 << 24)            /* 模块崩溃被围栏恢复：out 参数视为已破坏 */
+#define NSP_FENCE_BADFN   ((1 << 24) + 1)      /* 函数指针为 NULL（防御）：未调用 */
 
 /* 初始化：设置全局 sigaltstack，安装归因处理器（包在 install_crash_handlers
    原处理器外层）。须在 install_crash_handlers() 之前调用——原处理器

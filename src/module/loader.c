@@ -571,10 +571,11 @@ static void module_ban_record(const char* name, const char* hash, const char* re
 /* ================= 模块置毒（崩溃恢复/熔断触发的强制卸载） ================= */
 /*
  * 与 module_unload_one 的语义差异（崩溃不可回滚）：
- *   - 不回调 info->exit()：模块内存状态未知（已崩溃），再调其代码可能二次
- *     崩溃；资源由进程退出/OS 回收兜底
  *   - 在途引用等待超时不恢复模块：槽位快照保持置空（规则持续失效），
  *     跳过 dlclose（.so 保持映射，待引用自然归零后无人使用）
+ *   - exit 仍须经围栏调用（模块自有线程只能由 exit 停掉，否则 dlclose 后
+ *     残留线程踩空即带崩 daemon）；仅当 exit 自身崩溃（无法确认线程已停）
+ *     才保持 .so 映射不 dlclose
  *   - 落盘 ban 记录：同哈希 .so 在本 daemon 生命周期内不再加载
  * 幂等：banned/active 标志去重，重复上报直接返回 0。
  */
@@ -650,10 +651,37 @@ int module_fault_poison(int slot, const char* reason) {
         fault_fence_unregister_slot(slot);
         return 0;   /* ban 已在槽位置空前落盘 */
     }
-    /* 不调 info->exit()（崩溃模块代码不可信）；直接卸载镜像 */
+
+    /* exit 必须调（经围栏）才能 dlclose：模块可能持有**仍在运行的 pthread**
+       （如 ftp_module 的 ftp.conf 监视线程），而 exit 是模块停掉它们的唯一
+       途径（约定由模块在 exit 内 join）。dlclose 解除镜像映射后，残留线程
+       继续执行失效代码即 SIGSEGV——且该线程不在任何围栏窗口内（非框架发起
+       的调用），归因失败 → 走原崩溃处理器 dump + re-raise → 整个 daemon
+       死亡（历史现象：置毒后 daemon 必崩，崩溃线程名恒为模块自有线程）。
+       "崩溃模块代码不可信"不构成跳过 exit 的理由：nsp_fence_exit_call 正是
+       为安全调用不可信模块代码而设，exit 内二次崩溃被 longjmp 收敛。
+       唯一不能 dlclose 的情形是 exit 自身崩溃——那说明无法确认线程已停，
+       此时保持 .so 映射（同 !drained 分支的"绝不 dlclose 存活模块"）。
+       exit 缺失视为模块声明无清理需求，与优雅卸载路径同样直接 dlclose。 */
+    bool can_unload = true;
+    if (info.exit) {
+        int erc = nsp_fence_exit_call(slot, "exit", info.exit);
+        if (erc == NSP_FENCE_FAULT) {
+            can_unload = false;
+            LOG_WRN("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
+                    "detail=无法确认模块线程已停,保持 .so 映射不 dlclose", name);
+        }
+    }
+    if (!can_unload) {
+        fault_fence_unregister_slot(slot);
+        LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=槽位已置空,规则立即失效,"
+                ".so 保持映射（exit 崩溃故不 dlclose）",
+                name, reason ? reason : "(null)");
+        return 0;
+    }
     dlclose(h);
     fault_fence_unregister_slot(slot);
-    LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=dlclose 完成,ban 已落盘",
+    LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=exit 完成,dlclose 完成,ban 已落盘",
             name, reason ? reason : "(null)");
     return 0;
 }
