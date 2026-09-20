@@ -8,7 +8,7 @@
 据此在临时目录中驱动。
 
 本测试锁定的是**行为契约**，用于保护后续重构（把 log_ctl 与 rule_server 重复
-的行级文件工具收敛为共享实现）：
+的行级文件工具收敛为共享实现 nsp_rule_file）：
 
   稳定契约（重构不得改变）
     - GLOBAL 开关（MONITOR/SANDBOX/GLOBAL_INJECT）就地替换，不新增行
@@ -18,10 +18,10 @@
     - USER_APPS 落主文件 [USER_APPS:<uid>]；SYSTEM_APPS 落 [SYSTEM_APPS]
     - 未知类型报错且不改动文件
 
-  已知分叉（后续统一为 rule_server 语义：计入已停用行，与 LIST 索引一致）
-    - remove-rule 的 index 当前**跳过**以 # 停用的行；rule_server 的
-      find_rule_line/classify_line 则计入停用行。同一命令在两个二进制下
-      索引结果不同，本测试显式记录该差异。
+  已统一的分叉（log_ctl 现与 rule_server 同语义）
+    - remove-rule 的 index **计入**以 # 停用的行，与 rule_server 的
+      find_rule_line/classify_line 及 LIST 输出一致。此前 log_ctl 跳过
+      停用行，同一命令在两个二进制下索引结果不同——已随共享实现统一。
 
 前置：GNU 构建产物 build_gnu/log_ctl（可用 LOG_CTL 环境变量覆盖）。
 失败时退出码为 1（勿用管道吞掉退出码）。
@@ -176,14 +176,14 @@ def test_unknown_type():
 
 
 def test_remove_index_semantics():
-    print("── remove-rule 索引语义（记录当前分叉） ──")
-    # 当前 log_ctl：跳过以 # 停用的行
+    print("── remove-rule 索引语义（计入停用行，与 LIST 一致） ──")
+    # 索引计入以 # 停用的行
     c = Cfg("[GLOBAL]\nHIDE /a\n# HIDE /b\nHIDE /c\nRO /r\n")
     c.run("remove-rule", "GLOBAL", "HIDE", "1")
     ls = lines_of(c.main_text())
-    check("[当前语义] index 跳过停用行 → 删除 HIDE /c", "HIDE /c" in ls, False)
-    check("[当前语义] 停用行 # HIDE /b 保留", "# HIDE /b" in ls, True)
-    check("[当前语义] HIDE /a 保留", "HIDE /a" in ls, True)
+    check("index 1 命中停用行 # HIDE /b（计入停用行）", "# HIDE /b" in ls, False)
+    check("HIDE /c 保留", "HIDE /c" in ls, True)
+    check("HIDE /a 保留", "HIDE /a" in ls, True)
     c.close()
     # 索引从 0 开始，且按类型筛选
     c = Cfg("[GLOBAL]\nHIDE /a\nRO /r0\nHIDE /c\n")
