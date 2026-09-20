@@ -23,6 +23,16 @@
 
 static volatile sig_atomic_t g_running = 1;
 
+/* 配置根目录与主配置路径：默认编译期 CONFIG_DIR，可经 --config-dir 覆盖
+   （与 rule_server 同名选项一致，测试可指向临时目录，无需写 /var/fuse-proxy）。
+   g_main_conf 由 config_paths_init 在参数解析后填充。 */
+static char g_config_dir[PATH_MAX] = CONFIG_DIR;
+static char g_main_conf[PATH_MAX];
+
+static void config_paths_init(void) {
+    snprintf(g_main_conf, sizeof(g_main_conf), "%s/injector.conf", g_config_dir);
+}
+
 void sigint_handler(int sig) {
     (void)sig;
     g_running = 0;
@@ -66,6 +76,7 @@ void usage(const char* prog) {
     printf("  -u               始终显示 UID\n");
     printf("  api              以 API 格式输出（供程序调用，结构化 JSON）\n");
     printf("  --uid <uid>      指定用户 ID（默认 0）\n");
+    printf("  --config-dir <dir>  覆盖配置根目录（默认 %s）\n", CONFIG_DIR);
     exit(1);
 }
 
@@ -113,16 +124,16 @@ static const char* send_reload_signal(void) {
 
 static void get_app_rule_path(char* buf, size_t size, const char* pkg, int user_id) {
     if (user_id == 0)
-        snprintf(buf, size, "%s/App-rules/%s.conf", CONFIG_DIR, pkg);
+        snprintf(buf, size, "%s/App-rules/%s.conf", g_config_dir, pkg);
     else
-        snprintf(buf, size, "%s/App-rules-%d/%s.conf", CONFIG_DIR, user_id, pkg);
+        snprintf(buf, size, "%s/App-rules-%d/%s.conf", g_config_dir, user_id, pkg);
 }
 
 static void get_app_rule_dir(char* buf, size_t size, int user_id) {
     if (user_id == 0)
-        snprintf(buf, size, "%s/App-rules", CONFIG_DIR);
+        snprintf(buf, size, "%s/App-rules", g_config_dir);
     else
-        snprintf(buf, size, "%s/App-rules-%d", CONFIG_DIR, user_id);
+        snprintf(buf, size, "%s/App-rules-%d", g_config_dir, user_id);
 }
 
 /* ========== 解析本地规则 ========== */
@@ -163,7 +174,7 @@ static json_object* build_parsed_rules_json(void) {
 
 static void handle_parse_rules(bool api_mode) {
     config_lock_write();
-    load_config_rules(INJECTOR_CONFIG_PATH);
+    load_config_rules(g_main_conf);
     config_unlock_write();
     json_object* json = build_parsed_rules_json();
     if (api_mode) {
@@ -178,7 +189,7 @@ static void handle_parse_rules(bool api_mode) {
 
 static void handle_validate_rules(bool api_mode) {
     config_lock_write();
-    load_config_rules(INJECTOR_CONFIG_PATH);
+    load_config_rules(g_main_conf);
     int app_count = g_app_cfg_count;
     config_unlock_write();
     if (api_mode) {
@@ -203,7 +214,7 @@ static void handle_validate_rules(bool api_mode) {
 /* 核心修复：分离 ALLOW 规则和 REDIRECT 规则并输出 */
 static void handle_get_global_rules(bool api_mode) {
     config_lock_write();
-    load_config_rules(INJECTOR_CONFIG_PATH);
+    load_config_rules(g_main_conf);
     config_unlock_write();
     config_lock_read();
     if (api_mode) {
@@ -325,7 +336,7 @@ static void handle_get_global_rules(bool api_mode) {
 /* 核心修复：应用配置查询逻辑同步分离 ALLOW */
 static void handle_get_app_rules(bool api_mode, const char* pkg, int user_id) {
     config_lock_write();
-    load_config_rules(INJECTOR_CONFIG_PATH);
+    load_config_rules(g_main_conf);
     config_unlock_write();
     config_lock_read();
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
@@ -485,10 +496,10 @@ static void handle_status(bool api_mode) {
     bool fuse_alive = (fuse_pid > 0 && kill(fuse_pid, 0) == 0);
     int main_conf_size = 0;
     struct stat st;
-    if (stat(INJECTOR_CONFIG_PATH, &st) == 0) main_conf_size = (int)st.st_size;
+    if (stat(g_main_conf, &st) == 0) main_conf_size = (int)st.st_size;
 
     int app_rule_files = 0;
-    DIR* dir = opendir(CONFIG_DIR);
+    DIR* dir = opendir(g_config_dir);
     if (dir) {
         struct dirent* de;
         while ((de = readdir(dir)) != nullptr) {
@@ -496,7 +507,7 @@ static void handle_status(bool api_mode) {
             if (strcmp(de->d_name, "App-rules") != 0 && strncmp(de->d_name, "App-rules-", 10) != 0)
                 continue;
             char rules_dir[PATH_MAX];
-            snprintf(rules_dir, sizeof(rules_dir), "%s/%s", CONFIG_DIR, de->d_name);
+            snprintf(rules_dir, sizeof(rules_dir), "%s/%s", g_config_dir, de->d_name);
             DIR* rdir = opendir(rules_dir);
             if (rdir) {
                 struct dirent* rde;
@@ -539,14 +550,14 @@ static void handle_status(bool api_mode) {
 
         json_object* config = json_object_new_object();
         json_object_object_add(config, "main_conf_path",
-                               json_object_new_string(INJECTOR_CONFIG_PATH));
+                               json_object_new_string(g_main_conf));
         json_object_object_add(config, "main_conf_size", json_object_new_int(main_conf_size));
         json_object_object_add(config, "app_rule_files", json_object_new_int(app_rule_files));
         json_object_object_add(config, "parsed_apps_in_memory", json_object_new_int(mem_app_count));
         json_object_object_add(root, "config", config);
 
         json_object* system = json_object_new_object();
-        json_object_object_add(system, "config_dir", json_object_new_string(CONFIG_DIR));
+        json_object_object_add(system, "config_dir", json_object_new_string(g_config_dir));
         json_object_object_add(system, "pid_file", json_object_new_string(INJECTOR_PID_PATH));
         json_object_object_add(root, "system", system);
 
@@ -558,7 +569,7 @@ static void handle_status(bool api_mode) {
         printf("时间: %lld\n", (long long)time(NULL));
         printf("注入器: PID %d [%s]\n", injector_pid, injector_alive ? "运行中" : "未运行");
         printf("FUSE 守护进程: PID %d [%s]\n", fuse_pid, fuse_alive ? "运行中" : "未运行");
-        printf("主配置文件: %s (%d 字节)\n", INJECTOR_CONFIG_PATH, main_conf_size);
+        printf("主配置文件: %s (%d 字节)\n", g_main_conf, main_conf_size);
         printf("应用规则文件数: %d\n", app_rule_files);
         printf("内存中已解析应用: %d\n", mem_app_count);
     }
@@ -719,7 +730,7 @@ static void handle_set_rule(bool api_mode, const char* pkg, const char* type, co
     bool is_cat = (!is_global && is_category_pkg(pkg));
     char rule_path[PATH_MAX];
     if (is_global || is_cat) {
-        snprintf(rule_path, sizeof(rule_path), "%s", INJECTOR_CONFIG_PATH);
+        snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
         char rule_dir[PATH_MAX];
@@ -912,7 +923,7 @@ static void handle_remove_rule(bool api_mode, const char* pkg, const char* type,
     }
     char rule_path[PATH_MAX];
     if (strcmp(pkg, "GLOBAL") == 0 || is_category_pkg(pkg)) {
-        snprintf(rule_path, sizeof(rule_path), "%s", INJECTOR_CONFIG_PATH);
+        snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
     }
@@ -1230,7 +1241,7 @@ static void handle_list_users(bool api_mode) {
     /* 与其它 handler 一致：先加载配置——load_config_rules 内部调用
        scan_active_users 填充 g_active_users，否则本进程内恒为 0 */
     config_lock_write();
-    load_config_rules(INJECTOR_CONFIG_PATH);
+    load_config_rules(g_main_conf);
     config_unlock_write();
     config_lock_read();
     int count = g_active_user_count;
@@ -1371,6 +1382,13 @@ int main(int argc, char* argv[]) {
                 usage(argv[0]);
             }
             user_id = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--config-dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "错误: --config-dir 需要指定目录\n");
+                usage(argv[0]);
+            }
+            strncpy(g_config_dir, argv[++i], sizeof(g_config_dir) - 1);
+            g_config_dir[sizeof(g_config_dir) - 1] = '\0';
         } else {
             if (pos_idx < 10) {
                 pos_args[pos_idx++] = argv[i];
@@ -1381,6 +1399,7 @@ int main(int argc, char* argv[]) {
         }
     }
     if (pos_idx < 1) usage(argv[0]);
+    config_paths_init(); /* --config-dir 覆盖后重算主配置路径 */
 
     /* 只读加载方：跳过 scan_active_users 的 popen("pm list users")——log_ctl
        是短命 CLI，parse-rules/validate-rules/get-global-rules/get-app-rules
