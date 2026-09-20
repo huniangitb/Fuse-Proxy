@@ -831,10 +831,7 @@ void load_config_rules(const char* path) {
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
         char app_rules_dir[PATH_MAX];
-        if (uid == 0)
-            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
-        else
-            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
+        nsp_app_rule_dir(CONFIG_DIR, uid, app_rules_dir, sizeof(app_rules_dir));
         if (access(app_rules_dir, F_OK) != 0) {
             if (!g_allow_app_rules_mkdir) {
                 /* 只读加固：本进程（如 fuse_daemon/log_ctl）无权创建应用规则目录，
@@ -897,10 +894,7 @@ void load_config_rules(const char* path) {
     for (int i = 0; i < g_active_user_count; i++) {
         int uid = g_active_users[i];
         char app_rules_dir[PATH_MAX];
-        if (uid == 0)
-            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules", CONFIG_DIR);
-        else
-            snprintf(app_rules_dir, sizeof(app_rules_dir), "%s/App-rules-%d", CONFIG_DIR, uid);
+        nsp_app_rule_dir(CONFIG_DIR, uid, app_rules_dir, sizeof(app_rules_dir));
         DIR* dir = opendir(app_rules_dir);
         if (dir) {
             struct dirent* de;

@@ -174,10 +174,7 @@ static void setup_inotify_watches() {
     config_lock_read();
     for (int i = 0; i < g_active_user_count; i++) {
         char dir_path[128];
-        if (g_active_users[i] == 0)
-            snprintf(dir_path, sizeof(dir_path), "%s/App-rules", CONFIG_DIR);
-        else
-            snprintf(dir_path, sizeof(dir_path), "%s/App-rules-%d", CONFIG_DIR, g_active_users[i]);
+        nsp_app_rule_dir(CONFIG_DIR, g_active_users[i], dir_path, sizeof(dir_path));
         mkdir(dir_path, 0755);
         inotify_add_watch(g_inotify_fd, dir_path,
                           IN_MODIFY | IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO | IN_DELETE);

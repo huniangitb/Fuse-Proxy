@@ -794,11 +794,8 @@ static void load_ignore_rules() {
         while (fgets(line, sizeof(line), fp)) {
             char* p = line;
             if (strncmp(p, "\xEF\xBB\xBF", 3) == 0) p += 3;
-            while (isspace((unsigned char)*p)) p++;
+            p = nsp_str_trim(p);
             if (*p == '#' || *p == '\0') continue;
-            char* end = p + strlen(p) - 1;
-            while (end > p && isspace((unsigned char)*end)) end--;
-            *(end + 1) = '\0';
             int op_mask = 0;
             char* path = p;
             if (*p == '[') {

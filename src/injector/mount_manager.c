@@ -132,7 +132,7 @@ static bool read_mount_state(int pid, const char* target, const char* backup, Mo
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
     size_t nread = 0;
-    char* buf = read_file_dynamic(path, &nread);
+    char* buf = read_file_dynamic(path, &nread, 0);
     if (!buf) return false;
     size_t tlen = strlen(target);
     size_t blen = strlen(backup);

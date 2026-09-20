@@ -26,17 +26,18 @@ char* nsp_str_trim(char* s) {
     return s;
 }
 
-void nsp_send_all(int fd, const char* buf, size_t len) {
+bool nsp_send_all(int fd, const char* buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue; /* 信号中断继续，防止大 JSON 应答截断 */
-            return;
+            return false;
         }
-        if (n == 0) return;
+        if (n == 0) return false; /* 对端已关闭 */
         buf += n;
         len -= (size_t)n;
     }
+    return true;
 }
 
 socklen_t nsp_uds_abstract_addr(struct sockaddr_un* addr, const char* name) {
@@ -126,4 +127,27 @@ void nsp_set_thread_name(const char* name) {
 #else
     (void)name;
 #endif
+}
+
+/* ==================== App-rules 路径合成 ==================== */
+/* 语义见 nsp_util.h：config_dir 由调用方传入（模块侧不链接 common.c）。 */
+
+void nsp_app_rule_dir(const char* config_dir, int uid, char* out, size_t sz) {
+    if (!out || sz == 0) return;
+    if (uid == 0)
+        snprintf(out, sz, "%s/App-rules", config_dir);
+    else
+        snprintf(out, sz, "%s/App-rules-%d", config_dir, uid);
+}
+
+void nsp_app_rule_path(const char* config_dir, int uid, const char* pkg, char* out, size_t sz) {
+    if (!out || sz == 0) return;
+    if (uid == 0)
+        snprintf(out, sz, "%s/App-rules/%s.conf", config_dir, pkg);
+    else
+        snprintf(out, sz, "%s/App-rules-%d/%s.conf", config_dir, uid, pkg);
+}
+
+bool nsp_is_app_rules_dirname(const char* name) {
+    return name && (strcmp(name, "App-rules") == 0 || strncmp(name, "App-rules-", 10) == 0);
 }

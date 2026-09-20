@@ -1,5 +1,6 @@
 /* nsp_ini_store.c — 通用 INI 段式配置文件行级存储实现（纯 libc） */
 #include "nsp_ini_store.h"
+#include "nsp_util.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -15,15 +16,10 @@ struct NspIniStore {
     size_t cap;
 };
 
-/* ---- 行内工具（本文件自包含，不依赖 nsp_util：模块经导出表解析时
- * 仅需本 TU 符号，避免跨公共库的隐式依赖） ---- */
-static char* ini_trim(char* s) {
-    while (isspace((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
-    return s;
-}
-
+/* ---- 行内工具 ---- */
+/* 去空白统一走 nsp_util 的 nsp_str_trim（同一约束的公共设施）。所有编译
+ * 本 TU 的目标（rule_server / fuse_daemon）与借用本实现的模块都已链接
+ * nsp_util，故不构成新的链接依赖。 */
 /* 段头解析：去空白后形如 [name]（name 去空白，非空）则返回 true 并填 name */
 static bool parse_header(const char* line, char* name_out, size_t name_sz) {
     if (!line || line[0] != '[') return false;
@@ -33,7 +29,7 @@ static bool parse_header(const char* line, char* name_out, size_t name_sz) {
     if (n == 0 || n >= name_sz) return false;
     memcpy(name_out, line + 1, n);
     name_out[n] = '\0';
-    char* t = ini_trim(name_out);
+    char* t = nsp_str_trim(name_out);
     if (t != name_out) memmove(name_out, t, strlen(t) + 1);
     return name_out[0] != '\0';
 }
@@ -43,12 +39,12 @@ static bool parse_kv(char* line, char** key_out, char** val_out) {
     char* eq = strchr(line, '=');
     if (!eq) return false;
     *eq = '\0';
-    char* k = ini_trim(line);
+    char* k = nsp_str_trim(line);
     if (!k[0]) return false;
     char* v = eq + 1;
     char* hash = strchr(v, '#'); /* 与 ftp_conf 一致：首个 `#` 起皆为注释 */
     if (hash) *hash = '\0';
-    v = ini_trim(v);
+    v = nsp_str_trim(v);
     *key_out = k;
     *val_out = v;
     return true;

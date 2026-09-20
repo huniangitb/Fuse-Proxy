@@ -158,25 +158,11 @@ void persist_io_log(const char* message) {
     pthread_mutex_unlock(&g_persist_mutex);
 }
 void escape_cgroup() {
-    int pid = getpid();
-    char pid_s[32];
-    snprintf(pid_s, sizeof(pid_s), "%d", pid);
-    const char* targets[] = {
-        "/sys/fs/cgroup/cgroup.procs", // v2
-        "/dev/cpuctl/tasks",           // v1 cpu
-        "/dev/cpuset/tasks",           // v1 cpuset
-        "/dev/stune/tasks"             // v1 stune
-    };
-    for (int i = 0; i < 4; i++) {
-        int fd = open(targets[i], O_WRONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            /* 静默吞掉写入失败：cgroup 路径在不同 Android 版本与配置下可能不存在或无写权限 */
-            if (write(fd, pid_s, strlen(pid_s)) < 0) {
-                LOG_DBG("escape_cgroup: 写入 %s 失败: %s", targets[i], strerror(errno));
-            }
-            close(fd);
-        }
-    }
+    /* 实现与 cgroup 路径表统一在 nsp_util（唯一出口，避免两份路径表漂移）。
+       行为差异：原先此处对写入失败打 LOG_DBG 明细，现与 nsp_util 版一致静默
+       ——cgroup 路径在不同 Android 版本/配置下本就可能不存在或无写权限，
+       属预期内失败；需要明细时可在 nsp_escape_cgroup 内单独加。 */
+    nsp_escape_cgroup();
 }
 /* IPC 短连接 helper（500ms 收发超时 + abstract namespace）：
    仅 comm 线程的 IPC 后端使用，调用线程一律 nsp_comm_post(NSP_CH_IPC) */
@@ -201,16 +187,9 @@ static int nsp_ipc_emit(void* ctx, const void* data, size_t len) {
     (void)ctx;
     int fd = connect_ipc();
     if (fd < 0) return -1;
-    const char* p = data;
-    while (len > 0) {
-        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR)) continue;
-            close(fd);
-            return -1;
-        }
-        p += n;
-        len -= (size_t)n;
+    if (!nsp_send_all(fd, data, len)) {
+        close(fd);
+        return -1;
     }
     close(fd);
     return 0;
@@ -235,7 +214,7 @@ char* get_self_dir() {
 }
 /* 读取整个文件到堆内存（动态扩容，尾随 NUL）：injector 的 mount_manager
    与 ns_utils 原各自实现一份，现统一为公共工具（见 common.h 声明） */
-char* read_file_dynamic(const char* path, size_t* out_size) {
+char* read_file_dynamic(const char* path, size_t* out_size, size_t max_size) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return NULL;
     size_t capacity = 65536;
@@ -255,6 +234,12 @@ char* read_file_dynamic(const char* path, size_t* out_size) {
         }
         if (r == 0) break;
         size += r;
+        if (max_size > 0 && size > max_size) { /* 超上限：拒绝，防超大文件撑爆内存 */
+            free(buf);
+            close(fd);
+            errno = EFBIG;
+            return NULL;
+        }
         if (size >= capacity - 1) {
             capacity *= 2;
             char* nb = realloc(buf, capacity);
@@ -270,28 +255,6 @@ char* read_file_dynamic(const char* path, size_t* out_size) {
     buf[size] = '\0';
     if (out_size) *out_size = size;
     return buf;
-}
-
-int mkdir_recursive(const char* dir) {
-    if (!dir) return -1;
-    size_t in_len = strlen(dir);
-    if (in_len == 0 || in_len >= 256) return -1; /* 拒绝空与超长输入，杜绝 snprintf 静默截断 */
-    char tmp[256], *p = nullptr;
-    snprintf(tmp, sizeof(tmp), "%s", dir);
-    size_t len = strlen(tmp);
-    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = 0;
-            if (access(tmp, F_OK) != 0 && mkdir(tmp, 0755) != 0) {
-                *p = '/';
-                return -1;
-            }
-            *p = '/';
-        }
-    }
-    if (access(tmp, F_OK) != 0 && mkdir(tmp, 0755) != 0) return -1;
-    return 0;
 }
 
 /* 递归创建目录（带父目录属性继承，原 config_parser.c 提供，迁至公共工具） */
@@ -326,31 +289,47 @@ static void inherit_from_parent(const char* real_path) {
     }
 }
 
-int mkdir_recursive_p(const char* path, mode_t mode) {
+/* 递归建目录的唯一实现。inherit=true 时对新目录套用父目录的属主/模式
+   （Android 另含 SELinux 上下文），供 mkdir_recursive_p；
+   mkdir_recursive 保持历史语义（不继承属性、固定 0755）。
+   两者语义确有差异故保留两个入口，但共用本实现——此前各写一份循环，
+   且 mkdir_recursive 用 256 字节栈缓冲，超长路径会被静默拒绝。 */
+static int mkdir_p_impl(const char* path, mode_t mode, bool inherit) {
     if (!path || !path[0]) return -1;
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", path);
     size_t len = strlen(tmp);
-    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
+    if (len == 0) return -1;
+    if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
     for (char* p = tmp + 1; *p; p++) {
         if (*p == '/') {
-            *p = 0;
+            *p = '\0';
             if (access(tmp, F_OK) != 0) {
-                if (mkdir(tmp, mode) == 0)
-                    inherit_from_parent(tmp);
-                else if (errno != EEXIST)
+                if (mkdir(tmp, mode) == 0) {
+                    if (inherit) inherit_from_parent(tmp);
+                } else if (errno != EEXIST) {
                     return -1;
+                }
             }
             *p = '/';
         }
     }
     if (access(tmp, F_OK) != 0) {
-        if (mkdir(tmp, mode) == 0)
-            inherit_from_parent(tmp);
-        else if (errno != EEXIST)
+        if (mkdir(tmp, mode) == 0) {
+            if (inherit) inherit_from_parent(tmp);
+        } else if (errno != EEXIST) {
             return -1;
+        }
     }
     return 0;
+}
+
+int mkdir_recursive(const char* dir) {
+    return mkdir_p_impl(dir, 0755, false);
+}
+
+int mkdir_recursive_p(const char* path, mode_t mode) {
+    return mkdir_p_impl(path, mode, true);
 }
 /* 核心修复：共享的无效 Unicode/控制字符检测逻辑。
    增加全面的 Null 终止探测防御，绝不发生指针越过结束符 '\0' 的情况，阻断任何越界或野指针异常 */
@@ -445,18 +424,10 @@ static int nsp_log_emit(void* ctx, const void* data, size_t len) {
     msg[mlen] = '\0';
     int plen = log_frame_packet(p[0], p[1], msg, packet, sizeof(packet));
     if (plen <= 0) return 0;
-    const char* q = packet;
-    size_t left = (size_t)plen;
-    while (left > 0) {
-        ssize_t n = send(c->sock, q, left, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            close(c->sock);
-            c->sock = -1;
-            return -1;
-        }
-        q += n;
-        left -= (size_t)n;
+    if (!nsp_send_all(c->sock, packet, (size_t)plen)) {
+        close(c->sock);
+        c->sock = -1;
+        return -1;
     }
     return 0;
 }

@@ -123,20 +123,6 @@ static const char* send_reload_signal(void) {
     return NULL;
 }
 
-static void get_app_rule_path(char* buf, size_t size, const char* pkg, int user_id) {
-    if (user_id == 0)
-        snprintf(buf, size, "%s/App-rules/%s.conf", g_config_dir, pkg);
-    else
-        snprintf(buf, size, "%s/App-rules-%d/%s.conf", g_config_dir, user_id, pkg);
-}
-
-static void get_app_rule_dir(char* buf, size_t size, int user_id) {
-    if (user_id == 0)
-        snprintf(buf, size, "%s/App-rules", g_config_dir);
-    else
-        snprintf(buf, size, "%s/App-rules-%d", g_config_dir, user_id);
-}
-
 /* ========== 解析本地规则 ========== */
 static json_object* build_parsed_rules_json(void) {
     json_object* root = json_object_new_object();
@@ -505,8 +491,7 @@ static void handle_status(bool api_mode) {
         struct dirent* de;
         while ((de = readdir(dir)) != nullptr) {
             if (de->d_type != DT_DIR) continue;
-            if (strcmp(de->d_name, "App-rules") != 0 && strncmp(de->d_name, "App-rules-", 10) != 0)
-                continue;
+            if (!nsp_is_app_rules_dirname(de->d_name)) continue;
             char rules_dir[PATH_MAX];
             snprintf(rules_dir, sizeof(rules_dir), "%s/%s", g_config_dir, de->d_name);
             DIR* rdir = opendir(rules_dir);
@@ -591,7 +576,7 @@ static void handle_set_rule(bool api_mode, const char* pkg, const char* type, co
     if (is_global || is_cat) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
-        get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
+        nsp_app_rule_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
     }
 
     char line[1024];
@@ -646,7 +631,7 @@ static void handle_set_rule(bool api_mode, const char* pkg, const char* type, co
     } else {
         /* 应用段：无段结构文件（规则行去重追加、开关就地替换） */
         char rule_dir[PATH_MAX];
-        get_app_rule_dir(rule_dir, sizeof(rule_dir), user_id);
+        nsp_app_rule_dir(g_config_dir, user_id, rule_dir, sizeof(rule_dir));
         if (nsp_mkdir_p(rule_dir, 0755) != 0) {
             char err_buf[256];
             snprintf(err_buf, sizeof(err_buf), "无法创建目录 %s: %s", rule_dir, strerror(errno));
@@ -698,7 +683,7 @@ static void handle_remove_rule(bool api_mode, const char* pkg, const char* type,
     if (strcmp(pkg, "GLOBAL") == 0 || nsp_rule_file_is_category_pkg(pkg)) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
-        get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
+        nsp_app_rule_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
     }
     /* 索引计入已停用行（与 rule_server / LIST 输出一致） */
     int rc = nsp_rule_file_remove_nth(rule_path, type, index, NULL, 0);
