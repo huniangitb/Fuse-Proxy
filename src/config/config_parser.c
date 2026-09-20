@@ -1197,13 +1197,10 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
             pkg, pid, user_id, trigger_source, final_monitor ? "ON" : "OFF",
             final_sandbox ? "ON" : "OFF", final_redir_count, final_hide_count, final_ro_count);
         for (int i = 0; i < cfg->redir_count; i++) {
-            //LOG_DBG("  [重定向通配] %s -> %s", cfg->redir_rules[i].virtual_prefix, cfg->redir_rules[i].real_target);
         }
         for (int i = 0; i < cfg->hide_count; i++) {
-            //LOG_DBG("  [隐藏通配]   %s", cfg->hide_rules[i]);
         }
         for (int i = 0; i < cfg->ro_count; i++) {
-            //LOG_DBG("  [只读通配]   %s", cfg->ro_rules[i]);
         }
     } else {
         const char* match_desc =

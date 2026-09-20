@@ -54,8 +54,7 @@ static struct timespec g_start_mono; /* 启动时刻（CLOCK_MONOTONIC，运行�
 static time_t g_start_wall = 0;      /* 启动时刻（墙钟，started_at 展示） */
 
 /* 统一日志：经 comm 线程进 sys.log（[rule_server] 前缀由 log_frame_packet
- * 按 g_proc_name 自动添加，调用方不再手写）。保持 RLOG 调用名，存量调用点零改动。 */
-#define RLOG(...) log_internal(LOG_INFO, __VA_ARGS__)
+ * 按 g_proc_name 自动添加，调用方不再手写）。日志走 common.h 的 LOG 宏。 */
 
 /* ==================== 规则类型（动态注册表） ====================
    类型来源两类：
@@ -656,8 +655,8 @@ static void rule_types_refresh(void) {
         fclose(fp);
     }
     closedir(d);
-    RLOG("规则类型表: %d 项（含模块动态类型，缓存 %d 个模块）\n", g_rule_type_count,
-         g_module_cache_count);
+    LOG("规则类型表: %d 项（含模块动态类型，缓存 %d 个模块）", g_rule_type_count,
+        g_module_cache_count);
 }
 
 /* 该行是否为已注释（停用）状态 */
@@ -2689,7 +2688,7 @@ static int run_server(void) {
     clock_gettime(CLOCK_MONOTONIC, &g_start_mono);
     g_start_wall = time(NULL);
 
-    /* 统一日志：daemonize 之后建链（comm 线程不跨 fork），此后 RLOG/LOG_*
+    /* 统一日志：daemonize 之后建链（comm 线程不跨 fork），此后 LOG_*
      * 经 comm 线程进 sys.log；启动失败同时保留 stderr，service.sh 仍可见 */
     log_init("rule_server");
     /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
@@ -2722,7 +2721,7 @@ static int run_server(void) {
         log_close();
         return 1;
     }
-    RLOG("服务已启动 socket=%s config_dir=%s\n", g_socket_name, g_config_dir);
+    LOG("服务已启动 socket=%s config_dir=%s", g_socket_name, g_config_dir);
 
     int ep = epoll_create1(EPOLL_CLOEXEC);
     if (ep < 0) {
@@ -2753,7 +2752,7 @@ static int run_server(void) {
     }
     close(ep);
     close(sock);
-    RLOG("服务退出\n");
+    LOG("服务退出");
     log_close();
     return 0;
 }

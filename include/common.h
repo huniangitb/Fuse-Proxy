@@ -94,7 +94,6 @@ extern int g_log_forward_fd;
 void log_init(const char* process_name);
 void log_close();
 void log_internal(LogLevel level, const char* format, ...);
-void log_internal_ext(LogLevel level, const char* proc_name_override, const char* format, ...);
 char* get_self_dir();
 void set_self_dir(const char* path);
 int mkdir_recursive(const char *dir);
@@ -106,8 +105,6 @@ char* read_file_dynamic(const char* path, size_t* out_size);
    旧 send_ipc_message 同步直发已删除；query_ipc_message 零调用已删除 */
 void escape_cgroup();
 void persist_log_to_disk(const char* log_type, const char* message, bool append_timestamp);
-void start_logcat_capture();
-void stop_logcat_capture();
 
 #define LOG_DBG(format, ...) log_internal(LOG_DEBUG, format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define LOG_DBG_PERF(format, ...) do { if (g_min_log_level == LOG_DEBUG) log_internal(LOG_DEBUG, format "\n" __VA_OPT__(,) __VA_ARGS__); } while (0)
@@ -128,7 +125,6 @@ int common_sandbox_path(int uid, const char *pkg, char *out, size_t sz);
 bool is_media_provider(const char *pkg);
 /* comm 拥塞上报（common.c 实现）：供各进程 BCAST 等后端复用为 report 钩子 */
 void nsp_log_report(nsp_ch_t ch, uint64_t n, void *ctx);
-void common_cleanup();
 void init_timezone();
 bool path_contains_invalid_chars(const char* path);
 void path_sanitize(char* out, size_t size, const char* path);

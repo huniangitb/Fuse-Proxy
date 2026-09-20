@@ -702,7 +702,6 @@ static int do_combined_mount(void* raw_args) {
     }
     size_t tlen = strlen(target);
     size_t blen = strlen(backup);
-    //log_ns_error("[combined] Step A: read mountinfo for pkg=%s\n", pkg);
     size_t nread = 0;
     char* buf = read_file_dynamic("/proc/self/mountinfo", &nread);
     if (!buf) {
@@ -757,13 +756,11 @@ static int do_combined_mount(void* raw_args) {
         line = next_line + 1;
     }
     free(buf);
-    //log_ns_error("[combined] Step B: umount2 sub-backup mounts, count=%d\n", backup_count);
     for (int i = backup_count - 1; i >= 0; i--) {
         for (int t = 0; t < 8; t++) {
             if (umount2(backup_mounts[i], MNT_DETACH) == 0) break;
         }
     }
-    // log_ns_error("[combined] Step C: umount2 backup=%s\n", backup);
     for (int t = 0; t < 8; t++) {
         if (umount2(backup, MNT_DETACH) == 0) break;
     }
@@ -772,13 +769,11 @@ static int do_combined_mount(void* raw_args) {
        Step J）。收益：免一次 bind 复制 + 免备份管理，缩短挂载周期延迟；
        且规避部分设备/ROM 应用命名空间内源路径不可见（ENOENT/EROFS）误报。
        backup 目录仍由父进程 ns_combined_mount 预先 mkdir（保留挂载点占位）。 */
-    //  log_ns_error("[combined] Step F: umount2 sub-target mounts, count=%d\n", target_count);
     for (int i = target_count - 1; i >= 0; i--) {
         for (int t = 0; t < 8; t++) {
             if (umount2(target_mounts[i], MNT_DETACH) == 0) break;
         }
     }
-    //   log_ns_error("[combined] Step G: umount2 target=%s\n", target);
     for (int t = 0; t < 8; t++) {
         if (umount2(target, MNT_DETACH) == 0) break;
     }
@@ -786,7 +781,6 @@ static int do_combined_mount(void* raw_args) {
        就绪性由函数头部门控保证——首次注入在卸载前等待条目出现；重试注入
        时目录通常已存在（裸挂载点可直接 bind）。此处若仍缺失，Step I 的
        mount 以 ENOENT 真实裁决 */
-    //  log_ns_error("[combined] Step I: mount(source->target) source=%s target=%s\n", source, target);
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
         log_ns_error(
@@ -798,7 +792,6 @@ static int do_combined_mount(void* raw_args) {
             pkg, source, target, err, strerror(err));
         return err;
     }
-    //  log_ns_error("[combined] Step J: preserve sub-mounts, count=%d\n", preserve_count);
     if (preserve_count > 0) {
         /* 备份机制已移除（不再 mount target→backup 复制原生视图）：preserve
            恢复直接 bind /mnt/ 下系统 fuse 挂载视图（Android 多用户族根
@@ -864,7 +857,6 @@ static int do_combined_mount(void* raw_args) {
             free(roots);
         }
     }
-    //  log_ns_error("[combined] Step Z: done\n");
     return 0;
 }
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target,

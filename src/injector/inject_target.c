@@ -827,17 +827,6 @@ int get_injected_snapshot(int* out_pids, char (*out_pkgs)[256], uid_t* out_uids,
     return count;
 }
 
-int get_uid_map_snapshot(UidMapEntry* out, int max_count) {
-    int count = g_uid_map_count;
-    if (count > max_count) count = max_count;
-    for (int i = 0; i < count; i++) {
-        out[i].uid = g_uid_map[i].uid;
-        strncpy(out[i].pkg, g_uid_map[i].pkg, 127);
-        out[i].pkg[127] = '\0';
-    }
-    return count;
-}
-
 /*
  * 精确分析当前规则中 com.android.providers.media.module 是否真正属于注入目标。
  * 支持多用户 UID 解析。

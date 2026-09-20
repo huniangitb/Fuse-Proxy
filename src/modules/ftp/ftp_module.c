@@ -2,7 +2,6 @@
 #include "ftp_conf.h"
 #include "ftp_backend.h"
 #include "nsp_module.h"
-#include "nsp_module.h"
 #include "nsp_util.h" /* nsp_set_thread_name（线程语义化命名） */
 #include <stdio.h>
 #include <stdlib.h>
