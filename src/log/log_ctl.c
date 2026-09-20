@@ -19,6 +19,7 @@
 #include <json-c/json.h>
 #include "common.h"
 #include "nsp_util.h"
+#include "nsp_rule_file.h"
 #include "config_parser.h"
 
 static volatile sig_atomic_t g_running = 1;
@@ -549,8 +550,7 @@ static void handle_status(bool api_mode) {
         json_object_object_add(root, "fuse", fuse);
 
         json_object* config = json_object_new_object();
-        json_object_object_add(config, "main_conf_path",
-                               json_object_new_string(g_main_conf));
+        json_object_object_add(config, "main_conf_path", json_object_new_string(g_main_conf));
         json_object_object_add(config, "main_conf_size", json_object_new_int(main_conf_size));
         json_object_object_add(config, "app_rule_files", json_object_new_int(app_rule_files));
         json_object_object_add(config, "parsed_apps_in_memory", json_object_new_int(mem_app_count));
@@ -576,149 +576,8 @@ static void handle_status(bool api_mode) {
 }
 
 /* ========== set-rule / remove-rule 处理 ========== */
-static char** read_file_lines(const char* path, int* out_count, int* out_cap) {
-    FILE* fp = fopen(path, "r");
-    if (!fp) {
-        *out_count = 0;
-        *out_cap = 0;
-        return NULL;
-    }
-    char** lines = NULL;
-    int count = 0, cap = 0;
-    char buf[2048];
-    while (fgets(buf, sizeof(buf), fp)) {
-        if (count >= cap) {
-            cap = cap == 0 ? 64 : cap * 2;
-            char** new_lines = realloc(lines, cap * sizeof(char*));
-            if (!new_lines) {
-                for (int j = 0; j < count; j++) free(lines[j]);
-                free(lines);
-                fclose(fp);
-                *out_count = 0;
-                *out_cap = 0;
-                return NULL;
-            }
-            lines = new_lines;
-        }
-        lines[count] = strdup(buf);
-        if (!lines[count]) {
-            for (int j = 0; j < count; j++) free(lines[j]);
-            free(lines);
-            fclose(fp);
-            *out_count = 0;
-            *out_cap = 0;
-            return NULL;
-        }
-        count++;
-    }
-    fclose(fp);
-    *out_count = count;
-    *out_cap = cap;
-    return lines;
-}
-
-static bool write_file_lines(const char* path, char** lines, int count) {
-    FILE* fp = fopen(path, "w");
-    if (!fp) return false;
-    for (int i = 0; i < count; i++) {
-        if (fputs(lines[i], fp) < 0) {
-            fclose(fp);
-            return false;
-        }
-    }
-    fclose(fp);
-    return true;
-}
-
-static void free_file_lines(char** lines, int count) {
-    for (int i = 0; i < count; i++) free(lines[i]);
-    free(lines);
-}
-
-static int insert_line_at(char*** lines, int* cap, int count, int pos, const char* text) {
-    if (pos < 0 || pos > count) return -1;
-    if (count >= *cap) {
-        *cap = *cap == 0 ? 64 : *cap * 2;
-        char** new_lines = realloc(*lines, *cap * sizeof(char*));
-        if (!new_lines) return -1;
-        *lines = new_lines;
-    }
-    memmove(&(*lines)[pos + 1], &(*lines)[pos], (count - pos) * sizeof(char*));
-    (*lines)[pos] = strdup(text);
-    return (*lines)[pos] ? count + 1 : -1;
-}
-
-static void remove_line_at(char** lines, int* count, int pos) {
-    if (pos < 0 || pos >= *count) return;
-    free(lines[pos]);
-    memmove(&lines[pos], &lines[pos + 1], (*count - pos - 1) * sizeof(char*));
-    (*count)--;
-}
-
-static int append_line(char*** lines, int* cap, int count, const char* text) {
-    return insert_line_at(lines, cap, count, count, text);
-}
-
-static int find_section_header(char** lines, int count, const char* name) {
-    size_t nlen = strlen(name);
-    for (int i = 0; i < count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (p[0] == '[' && strncmp(p + 1, name, nlen) == 0) {
-            char after = p[1 + nlen];
-            if (after == ']' || after == ':') return i;
-        }
-    }
-    return -1;
-}
-
-/* 类别段（[USER_APPS[:uid]]/[SYSTEM_APPS]）：set-rule/remove-rule 均路由到
-   主文件精确段头（USER_APPS 恒带显式 :uid，默认 0） */
-static bool is_category_pkg(const char* pkg) {
-    /* P2：大小写敏感，与 config_parser 及 GLOBAL 一致 */
-    return pkg && (strcmp(pkg, "USER_APPS") == 0 || strcmp(pkg, "SYSTEM_APPS") == 0);
-}
-
-static void category_section_header(const char* pkg, int user_id, char* out, size_t sz) {
-    if (strcmp(pkg, "SYSTEM_APPS") == 0)
-        snprintf(out, sz, "[SYSTEM_APPS]");
-    else
-        snprintf(out, sz, "[USER_APPS:%d]", user_id < 0 ? 0 : user_id);
-}
-
-static int find_header_line(char** lines, int count, const char* hdr_text) {
-    size_t hlen = strlen(hdr_text);
-    for (int i = 0; i < count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (strncmp(p, hdr_text, hlen) != 0) continue;
-        char* rest = p + hlen;
-        while (isspace((unsigned char)*rest)) rest++;
-        /* P2：ON/OFF 须有边界（空白/NUL/换行），[USER_APPS:0]OFFX 之类不算段头 */
-        if (*rest == '\0' || *rest == '\n') return i;
-        if (strncmp(rest, "ON", 2) == 0 &&
-            (rest[2] == '\0' || rest[2] == '\n' || isspace((unsigned char)rest[2])))
-            return i;
-        if (strncmp(rest, "OFF", 3) == 0 &&
-            (rest[3] == '\0' || rest[3] == '\n' || isspace((unsigned char)rest[3])))
-            return i;
-    }
-    return -1;
-}
-
-static int find_switch_in_section(char** lines, int count, int header_idx, const char* type) {
-    size_t tlen = strlen(type);
-    for (int i = header_idx + 1; i < count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (p[0] == '[') break;
-        if (strncasecmp(p, type, tlen) == 0 &&
-            (p[tlen] == ' ' || p[tlen] == '\t' || p[tlen] == '\n')) {
-            return i;
-        }
-    }
-    return -1;
-}
+/* 行级读写与段编辑统一走 nsp_rule_file（与 rule_server 共享同一实现；
+   语义基准为 rule_server：开关在作用域内唯一、规则行全文件去重、落盘原子写）。 */
 
 static void handle_set_rule(bool api_mode, const char* pkg, const char* type, const char* value,
                             int user_id) {
@@ -727,16 +586,14 @@ static void handle_set_rule(bool api_mode, const char* pkg, const char* type, co
         return;
     }
     bool is_global = (strcmp(pkg, "GLOBAL") == 0);
-    bool is_cat = (!is_global && is_category_pkg(pkg));
+    bool is_cat = (!is_global && nsp_rule_file_is_category_pkg(pkg));
     char rule_path[PATH_MAX];
     if (is_global || is_cat) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
-        char rule_dir[PATH_MAX];
-        get_app_rule_dir(rule_dir, sizeof(rule_dir), user_id);
-        mkdir_recursive(rule_dir);
     }
+
     char line[1024];
     if (strcmp(type, "REDIRECT") == 0) {
         char src[512], dst[512];
@@ -768,127 +625,43 @@ static void handle_set_rule(bool api_mode, const char* pkg, const char* type, co
         return;
     }
 
-    bool is_global_switch = (strcmp(type, "MONITOR") == 0 || strcmp(type, "SANDBOX") == 0 ||
-                             strcmp(type, "GLOBAL_INJECT") == 0);
+    bool is_switch = (strcmp(type, "MONITOR") == 0 || strcmp(type, "SANDBOX") == 0 ||
+                      strcmp(type, "GLOBAL_INJECT") == 0);
+    int rc;
     if (is_global || is_cat) {
-        char sec_hdr[64], sec_line[72];
+        /* 段名不含方括号（段头由共享实现按 [段名] 构造）：GLOBAL 用前缀匹配
+           以兼容 [GLOBAL:...]；类别段用精确匹配，避免与裸 [USER_APPS] 混淆 */
+        char sec_name[64];
+        NspRuleSectionMatch sec_match;
         if (is_cat) {
-            category_section_header(pkg, user_id, sec_hdr, sizeof sec_hdr);
-            snprintf(sec_line, sizeof sec_line, "%s\n", sec_hdr);
+            nsp_rule_file_category_name(pkg, user_id, sec_name, sizeof sec_name);
+            sec_match = NSP_RULE_SEC_EXACT;
         } else {
-            snprintf(sec_hdr, sizeof sec_hdr, "[GLOBAL]");
-            snprintf(sec_line, sizeof sec_line, "[GLOBAL]\n");
+            snprintf(sec_name, sizeof sec_name, "GLOBAL");
+            sec_match = NSP_RULE_SEC_PREFIX;
         }
-        int line_count = 0, line_cap = 0;
-        char** lines = read_file_lines(rule_path, &line_count, &line_cap);
-        if (!lines) {
-            FILE* fp = fopen(rule_path, "w");
-            if (!fp) {
-                char err_buf[256];
-                snprintf(err_buf, sizeof(err_buf), "无法创建规则文件 %s: %s", rule_path,
-                         strerror(errno));
-                json_api_error(api_mode, "\"set-rule\"", err_buf);
-                return;
-            }
-            fputs(sec_line, fp);
-            fputs(line, fp);
-            fclose(fp);
-            goto report_success;
-        }
-        int hdr = is_global ? find_section_header(lines, line_count, "GLOBAL")
-                            : find_header_line(lines, line_count, sec_hdr);
-        bool changed = false;
-        if (is_global_switch && hdr >= 0) {
-            int old = find_switch_in_section(lines, line_count, hdr, type);
-            if (old >= 0) {
-                if (strcmp(lines[old], line) != 0) {
-                    free(lines[old]);
-                    lines[old] = strdup(line);
-                    if (!lines[old]) {
-                        free_file_lines(lines, line_count);
-                        json_api_error(api_mode, "\"set-rule\"", "内存不足");
-                        return;
-                    }
-                    changed = true;
-                }
-            } else {
-                int new_count = insert_line_at(&lines, &line_cap, line_count, hdr + 1, line);
-                if (new_count < 0) {
-                    free_file_lines(lines, line_count);
-                    json_api_error(api_mode, "\"set-rule\"", "内存不足");
-                    return;
-                }
-                line_count = new_count;
-                changed = true;
-            }
-        } else if (hdr >= 0) {
-            bool dup = false;
-            for (int i = hdr + 1; i < line_count; i++) {
-                char* p = lines[i];
-                while (isspace((unsigned char)*p)) p++;
-                if (p[0] == '[') break;
-                if (strcmp(p, line) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                int new_count = insert_line_at(&lines, &line_cap, line_count, hdr + 1, line);
-                if (new_count < 0) {
-                    free_file_lines(lines, line_count);
-                    json_api_error(api_mode, "\"set-rule\"", "内存不足");
-                    return;
-                }
-                line_count = new_count;
-                changed = true;
-            }
-        } else {
-            int new_count = append_line(&lines, &line_cap, line_count, sec_line);
-            if (new_count < 0) {
-                free_file_lines(lines, line_count);
-                json_api_error(api_mode, "\"set-rule\"", "内存不足");
-                return;
-            }
-            line_count = new_count;
-            new_count = append_line(&lines, &line_cap, line_count, line);
-            if (new_count < 0) {
-                free_file_lines(lines, line_count);
-                json_api_error(api_mode, "\"set-rule\"", "内存不足");
-                return;
-            }
-            line_count = new_count;
-            changed = true;
-        }
-        if (changed) {
-            if (!write_file_lines(rule_path, lines, line_count)) {
-                char err_buf[256];
-                snprintf(err_buf, sizeof(err_buf), "无法写入规则文件 %s: %s", rule_path,
-                         strerror(errno));
-                free_file_lines(lines, line_count);
-                json_api_error(api_mode, "\"set-rule\"", err_buf);
-                return;
-            }
-        }
-        free_file_lines(lines, line_count);
+        nsp_mkdir_p(g_config_dir, 0755);
+        rc = nsp_rule_file_upsert_in_section(rule_path, sec_name, sec_match, is_switch, type, line,
+                                             NULL);
     } else {
-        FILE* fp = fopen(rule_path, "a");
-        if (!fp) {
+        /* 应用段：无段结构文件（规则行去重追加、开关就地替换） */
+        char rule_dir[PATH_MAX];
+        get_app_rule_dir(rule_dir, sizeof(rule_dir), user_id);
+        if (nsp_mkdir_p(rule_dir, 0755) != 0) {
             char err_buf[256];
-            snprintf(err_buf, sizeof(err_buf), "无法打开规则文件 %s: %s", rule_path,
-                     strerror(errno));
+            snprintf(err_buf, sizeof(err_buf), "无法创建目录 %s: %s", rule_dir, strerror(errno));
             json_api_error(api_mode, "\"set-rule\"", err_buf);
             return;
         }
-        if (fputs(line, fp) < 0) {
-            char err_buf[256];
-            snprintf(err_buf, sizeof(err_buf), "写入规则文件失败: %s", strerror(errno));
-            fclose(fp);
-            json_api_error(api_mode, "\"set-rule\"", err_buf);
-            return;
-        }
-        fclose(fp);
+        rc = nsp_rule_file_upsert_line(rule_path, is_switch, type, line, NULL);
     }
-report_success:
+    if (rc != NSP_RULE_FILE_OK) {
+        char err_buf[256];
+        snprintf(err_buf, sizeof(err_buf), "无法写入规则文件 %s: %s", rule_path, strerror(errno));
+        json_api_error(api_mode, "\"set-rule\"", err_buf);
+        return;
+    }
+
     if (!api_mode) {
         /* 通知注入器重新加载配置 */
         const char* err = send_reload_signal();
@@ -922,51 +695,26 @@ static void handle_remove_rule(bool api_mode, const char* pkg, const char* type,
         return;
     }
     char rule_path[PATH_MAX];
-    if (strcmp(pkg, "GLOBAL") == 0 || is_category_pkg(pkg)) {
+    if (strcmp(pkg, "GLOBAL") == 0 || nsp_rule_file_is_category_pkg(pkg)) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
         get_app_rule_path(rule_path, sizeof(rule_path), pkg, user_id);
     }
-    int line_count = 0, line_cap = 0;
-    char** lines = read_file_lines(rule_path, &line_count, &line_cap);
-    if (!lines) {
-        char err_buf[256];
-        snprintf(err_buf, sizeof(err_buf), "无法打开规则文件 %s: %s", rule_path, strerror(errno));
-        json_api_error(api_mode, "\"remove-rule\"", err_buf);
-        return;
-    }
-    int found_idx = -1, skip_idx = 0;
-    size_t tlen = strlen(type);
-    for (int i = 0; i < line_count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (p[0] == '#') continue;
-        bool is_type_rule =
-            (strncasecmp(p, type, tlen) == 0 && (p[tlen] == ' ' || p[tlen] == '\t'));
-        if (is_type_rule) {
-            if (skip_idx == index) {
-                found_idx = i;
-                break;
-            }
-            skip_idx++;
-        }
-    }
-    if (found_idx < 0) {
-        free_file_lines(lines, line_count);
+    /* 索引计入已停用行（与 rule_server / LIST 输出一致） */
+    int rc = nsp_rule_file_remove_nth(rule_path, type, index, NULL, 0);
+    if (rc == NSP_RULE_FILE_ENOTFND) {
         char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "未找到 %s 类型的第 %d 条规则", type, index);
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
-    remove_line_at(lines, &line_count, found_idx);
-    if (!write_file_lines(rule_path, lines, line_count)) {
+    if (rc != NSP_RULE_FILE_OK) {
         char err_buf[256];
         snprintf(err_buf, sizeof(err_buf), "无法写入规则文件 %s: %s", rule_path, strerror(errno));
-        free_file_lines(lines, line_count);
         json_api_error(api_mode, "\"remove-rule\"", err_buf);
         return;
     }
-    free_file_lines(lines, line_count);
+
     if (!api_mode) {
         const char* err = send_reload_signal();
         if (err) {

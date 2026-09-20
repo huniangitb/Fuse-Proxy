@@ -29,6 +29,7 @@
 
 #include "common.h"
 #include "nsp_util.h"
+#include "nsp_rule_file.h"
 #include "nsp_ini_store.h"
 #include <json-c/json.h>
 #include <sys/epoll.h>
@@ -690,168 +691,9 @@ static const char* rule_line_value(const char* line, char* out, size_t sz) {
     return out;
 }
 
-/* ==================== 文件行级工具 ==================== */
-static char** read_file_lines(const char* path, int* out_count, int* out_cap) {
-    FILE* fp = fopen(path, "r");
-    if (!fp) {
-        *out_count = 0;
-        *out_cap = 0;
-        return NULL;
-    }
-    char** lines = NULL;
-    int count = 0, cap = 0;
-    char buf[MAX_LINE];
-    while (fgets(buf, sizeof(buf), fp)) {
-        if (count >= cap) {
-            cap = cap == 0 ? 64 : cap * 2;
-            char** new_lines = realloc(lines, cap * sizeof(char*));
-            if (!new_lines) {
-                for (int j = 0; j < count; j++) free(lines[j]);
-                free(lines);
-                fclose(fp);
-                *out_count = 0;
-                *out_cap = 0;
-                return NULL;
-            }
-            lines = new_lines;
-        }
-        lines[count] = strdup(buf);
-        if (!lines[count]) {
-            for (int j = 0; j < count; j++) free(lines[j]);
-            free(lines);
-            fclose(fp);
-            *out_count = 0;
-            *out_cap = 0;
-            return NULL;
-        }
-        count++;
-    }
-    fclose(fp);
-    *out_count = count;
-    *out_cap = cap;
-    return lines;
-}
-
-/* 原子写入：先写临时文件再 rename，避免 inotify 读到半截配置 */
-static bool write_file_lines_atomic(const char* path, char** lines, int count) {
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE* fp = fopen(tmp, "w");
-    if (!fp) return false;
-    for (int i = 0; i < count; i++) {
-        if (fputs(lines[i], fp) < 0) {
-            fclose(fp);
-            unlink(tmp);
-            return false;
-        }
-    }
-    if (fclose(fp) != 0) {
-        unlink(tmp);
-        return false;
-    }
-    if (rename(tmp, path) != 0) {
-        unlink(tmp);
-        return false;
-    }
-    return true;
-}
-
-static void free_file_lines(char** lines, int count) {
-    for (int i = 0; i < count; i++) free(lines[i]);
-    free(lines);
-}
-
-static int insert_line_at(char*** lines, int* cap, int count, int pos, const char* text) {
-    if (pos < 0 || pos > count) return -1;
-    if (count >= *cap) {
-        int new_cap = *cap == 0 ? 64 : *cap * 2;
-        if (new_cap > 65536) return -1; /* 防止无界 realloc */
-        char** new_lines = realloc(*lines, (size_t)new_cap * sizeof(char*));
-        if (!new_lines) return -1;
-        *lines = new_lines;
-        *cap = new_cap;
-    }
-    memmove(&(*lines)[pos + 1], &(*lines)[pos], (count - pos) * sizeof(char*));
-    (*lines)[pos] = strdup(text);
-    return (*lines)[pos] ? count + 1 : -1;
-}
-
-static void remove_line_at(char** lines, int* count, int pos) {
-    if (pos < 0 || pos >= *count) return;
-    free(lines[pos]);
-    memmove(&lines[pos], &lines[pos + 1], (*count - pos - 1) * sizeof(char*));
-    (*count)--;
-}
-
-static int append_line(char*** lines, int* cap, int count, const char* text) {
-    return insert_line_at(lines, cap, count, count, text);
-}
-
-/* 类别段判定：[USER_APPS[:uid]] / [SYSTEM_APPS]（rule_server 读写均走主文件）。
- * P2：大小写敏感（strcmp），与 config_parser 及 GLOBAL 段保持一致——
- * [user_apps:0] 会被 parser 当普通应用加载，控制面不得将其当类别写入 */
-static bool is_category_pkg(const char* pkg) {
-    return pkg && (strcmp(pkg, "USER_APPS") == 0 || strcmp(pkg, "SYSTEM_APPS") == 0);
-}
-
-/* 类别段头文本：USER_APPS 恒带显式 :uid（默认 0），SYSTEM_APPS 无参 */
-static void category_section_header(const char* pkg, int uid, char* out, size_t sz) {
-    if (strcmp(pkg, "SYSTEM_APPS") == 0)
-        snprintf(out, sz, "[SYSTEM_APPS]");
-    else
-        snprintf(out, sz, "[USER_APPS:%d]", uid < 0 ? 0 : uid);
-}
-
-/* 精确段头行匹配（含可选 ON/OFF 后缀）：整行去空白后以 hdr_text 开头、
-   余部为空或 ON/OFF——避免把 [USER_APPS] 与 [USER_APPS:0] 混淆 */
-static int find_header_line(char** lines, int count, const char* hdr_text) {
-    size_t hlen = strlen(hdr_text);
-    for (int i = 0; i < count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (strncmp(p, hdr_text, hlen) != 0) continue;
-        char* rest = p + hlen;
-        while (isspace((unsigned char)*rest)) rest++;
-        /* P2：ON/OFF 须有边界（空白/NUL/换行），[USER_APPS:0]OFFX 之类不算段头 */
-        if (*rest == '\0' || *rest == '\n') return i;
-        if (strncmp(rest, "ON", 2) == 0 &&
-            (rest[2] == '\0' || rest[2] == '\n' || isspace((unsigned char)rest[2])))
-            return i;
-        if (strncmp(rest, "OFF", 3) == 0 &&
-            (rest[3] == '\0' || rest[3] == '\n' || isspace((unsigned char)rest[3])))
-            return i;
-    }
-    return -1;
-}
-
-/* 查找段头 [name]（或 [name:uid]），返回行号，未找到返回 -1 */
-static int find_section_header(char** lines, int count, const char* name) {
-    size_t nlen = strlen(name);
-    for (int i = 0; i < count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (p[0] == '[' && strncmp(p + 1, name, nlen) == 0) {
-            char after = p[1 + nlen];
-            if (after == ']' || after == ':') return i;
-        }
-    }
-    return -1;
-}
-
-/* 在段头之后查找指定开关行（MONITOR 等），返回行号，未找到返回 -1 */
-static int find_switch_in_section(char** lines, int count, int header_idx, const char* type) {
-    size_t tlen = strlen(type);
-    for (int i = header_idx + 1; i < count; i++) {
-        char* p = lines[i];
-        while (isspace((unsigned char)*p)) p++;
-        if (p[0] == '[') break;
-        if (strncasecmp(p, type, tlen) == 0 &&
-            (p[tlen] == ' ' || p[tlen] == '\t' || p[tlen] == '\n')) {
-            return i;
-        }
-    }
-    return -1;
-}
+/* 行级读写与段编辑统一走 nsp_rule_file（与 log_ctl 共享同一实现；
+   语义基准即本文件既有语义：开关在作用域内唯一、规则行全文件去重、
+   按 (类型,索引) 删除时索引计入已停用行、落盘原子写）。 */
 
 /* ==================== 路径工具 ==================== */
 static void main_conf_path(char* out, size_t sz) {
@@ -985,26 +827,27 @@ static void build_lines_rules(char** lines, int count, json_object* rules, json_
 /* 构建单个规则文件的 rules 数组 + switches 对象 */
 static void build_file_rules(const char* path, json_object* rules, json_object* switches) {
     int count = 0, cap = 0;
-    char** lines = read_file_lines(path, &count, &cap);
+    char** lines = nsp_rule_file_read(path, &count, &cap);
     if (!lines) return;
     build_lines_rules(lines, count, rules, switches);
-    free_file_lines(lines, count);
+    nsp_rule_file_free(lines, count);
 }
 
 /* 类别段 JSON：只取主文件内精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]）
    到下一段头之间的行；段不存在返回空规则（file 照样回主文件路径） */
 static json_object* build_category_json(const char* pkg, int uid) {
     char path[PATH_MAX];
-    char hdr[64];
+    char sec_name[64], hdr[72];
     main_conf_path(path, sizeof(path));
-    category_section_header(pkg, uid, hdr, sizeof hdr);
+    nsp_rule_file_category_name(pkg, uid, sec_name, sizeof sec_name);
+    snprintf(hdr, sizeof hdr, "[%s]", sec_name);
     json_object* cat = json_object_new_object();
     json_object* switches = json_object_new_object();
     json_object* rules = json_object_new_array();
     int count = 0, cap = 0;
-    char** lines = read_file_lines(path, &count, &cap);
+    char** lines = nsp_rule_file_read(path, &count, &cap);
     if (lines) {
-        int hdr_idx = find_header_line(lines, count, hdr);
+        int hdr_idx = nsp_rule_file_find_header(lines, count, hdr);
         if (hdr_idx >= 0) {
             int end = hdr_idx + 1;
             while (end < count) {
@@ -1015,7 +858,7 @@ static json_object* build_category_json(const char* pkg, int uid) {
             }
             build_lines_rules(lines + hdr_idx + 1, end - hdr_idx - 1, rules, switches);
         }
-        free_file_lines(lines, count);
+        nsp_rule_file_free(lines, count);
     }
     json_object_object_add(cat, "pkg", json_object_new_string(pkg));
     json_object_object_add(cat, "uid", json_object_new_int(uid));
@@ -1162,21 +1005,6 @@ static bool valid_uid(int uid) {
     return uid >= 0 && uid <= 100000;
 }
 
-/* ==================== 规则定位（按类型+索引） ==================== */
-/* 在**已读取**的 lines 中定位第 index 条 type 规则（含已停用行，与 LIST 索引一致），
-   返回行号；未找到返回 -1。调用方已持有 lines（避免重复读文件）。 */
-static int find_rule_line(char** lines, int count, RuleType type, int index) {
-    if (!lines) return -1;
-    int seen = 0;
-    for (int i = 0; i < count; i++) {
-        if (classify_line(lines[i]) == type) {
-            if (seen == index) return i;
-            seen++;
-        }
-    }
-    return -1;
-}
-
 /* ==================== 命令处理 ==================== */
 /* 构建当前支持规则类型列表（含动态模块类型），供 PING/LIST/STATUS 返回。
    lang：前端请求的语言（如 "en"），为空默认 "zh"；
@@ -1299,7 +1127,7 @@ static void handle_get(int fd, json_object* req) {
     }
     /* 类别段视图：主文件内精确段头切片（索引为段内局部序号，仅展示用；
        REMOVE/TOGGLE 仍用主文件全局索引，与 pkg=GLOBAL 语义一致） */
-    if (is_category_pkg(pkg)) {
+    if (nsp_rule_file_is_category_pkg(pkg)) {
         json_object* data = json_object_new_object();
         json_object_object_add(data, "category", build_category_json(pkg, uid));
         reply_ok(fd, "GET", data);
@@ -1397,7 +1225,7 @@ static void handle_add(int fd, json_object* req) {
     }
     bool is_global = (strcasecmp(pkg, "GLOBAL") == 0);
     /* 类别段（[USER_APPS:<uid>]/[SYSTEM_APPS]）：写主文件精确段头 */
-    bool is_category = (!is_global && is_category_pkg(pkg));
+    bool is_category = (!is_global && nsp_rule_file_is_category_pkg(pkg));
 
     /* INJECT_ENABLE：应用规则启用/停用总开关。
        通过重命名 App-rules/<pkg>.conf ↔ <pkg>.conf.disabled 实现：
@@ -1482,121 +1310,32 @@ static void handle_add(int fd, json_object* req) {
     }
 
     if (is_global || is_category) {
-        /* GLOBAL/类别段：写入 injector.conf 的对应段（开关替换/规则去重插入）。
-           类别段用精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]），避免与裸
-           [USER_APPS] 混淆；USER_APPS 按请求 uid 落段（默认 0）。 */
-        char sec_hdr[64], sec_line[MAX_LINE];
+        /* GLOBAL/类别段：写入 injector.conf 的对应段（开关段内替换/规则去重插入）。
+           段名不含方括号（段头由共享实现构造）：GLOBAL 用前缀匹配以兼容
+           [GLOBAL:...]；类别段用精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]），
+           避免与裸 [USER_APPS] 混淆；USER_APPS 按请求 uid 落段（默认 0）。 */
+        char sec_name[64];
+        NspRuleSectionMatch sec_match;
         if (is_category) {
-            category_section_header(pkg, uid, sec_hdr, sizeof sec_hdr);
-            snprintf(sec_line, sizeof sec_line, "%s\n", sec_hdr);
+            nsp_rule_file_category_name(pkg, uid, sec_name, sizeof sec_name);
+            sec_match = NSP_RULE_SEC_EXACT;
         } else {
-            snprintf(sec_hdr, sizeof sec_hdr, "[GLOBAL]");
-            snprintf(sec_line, sizeof sec_line, "[GLOBAL]\n");
+            snprintf(sec_name, sizeof sec_name, "GLOBAL");
+            sec_match = NSP_RULE_SEC_PREFIX;
         }
         char conf[PATH_MAX];
         main_conf_path(conf, sizeof(conf));
-        int count = 0, cap = 0;
-        char** lines = read_file_lines(conf, &count, &cap);
-        if (!lines) {
-            if (nsp_mkdir_p(g_config_dir, 0755) != 0) {
-                reply_error(fd, "ADD", "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
-                return;
-            }
-            if (append_line(&lines, &cap, 0, sec_line) < 0 ||
-                append_line(&lines, &cap, 1, line) < 0) {
-                free_file_lines(lines, count);
-                reply_error(fd, "ADD", "内存不足");
-                return;
-            }
-            count = 2;
-            if (!write_file_lines_atomic(conf, lines, count)) {
-                reply_error(fd, "ADD", "写入 %s 失败: %s", conf, strerror(errno));
-                free_file_lines(lines, count);
-                return;
-            }
-            free_file_lines(lines, count);
-            json_object* data = json_object_new_object();
-            json_object_object_add(data, "file", json_object_new_string(conf));
-            json_object_object_add(data, "line", json_object_new_string(line));
-            reply_ok(fd, "ADD", data);
+        if (nsp_mkdir_p(g_config_dir, 0755) != 0) {
+            reply_error(fd, "ADD", "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
             return;
         }
-        int hdr = is_global ? find_section_header(lines, count, "GLOBAL")
-                            : find_header_line(lines, count, sec_hdr);
         bool changed = false;
-        if (is_switch_type(t)) {
-            const char* tname = rule_type_name(t);
-            if (hdr >= 0) {
-                int old = find_switch_in_section(lines, count, hdr, tname);
-                if (old >= 0) {
-                    if (strcmp(lines[old], line) != 0) {
-                        free(lines[old]);
-                        lines[old] = strdup(line);
-                        if (!lines[old]) {
-                            free_file_lines(lines, count);
-                            reply_error(fd, "ADD", "内存不足");
-                            return;
-                        }
-                        changed = true;
-                    }
-                } else {
-                    int nc = insert_line_at(&lines, &cap, count, hdr + 1, line);
-                    if (nc < 0) {
-                        free_file_lines(lines, count);
-                        reply_error(fd, "ADD", "内存不足");
-                        return;
-                    }
-                    count = nc;
-                    changed = true;
-                }
-            } else {
-                if (append_line(&lines, &cap, count, sec_line) < 0 ||
-                    append_line(&lines, &cap, count + 1, line) < 0) {
-                    free_file_lines(lines, count);
-                    reply_error(fd, "ADD", "内存不足");
-                    return;
-                }
-                count += 2;
-                changed = true;
-            }
-        } else {
-            /* 规则行：去重后插入段头之后 */
-            bool dup = false;
-            for (int i = 0; i < count; i++) {
-                if (strcmp(lines[i], line) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                int pos = hdr >= 0 ? hdr + 1 : count;
-                if (hdr < 0) {
-                    if (append_line(&lines, &cap, count, sec_line) < 0) {
-                        free_file_lines(lines, count);
-                        reply_error(fd, "ADD", "内存不足");
-                        return;
-                    }
-                    count++;
-                    pos = count;
-                }
-                int nc = insert_line_at(&lines, &cap, count, pos, line);
-                if (nc < 0) {
-                    free_file_lines(lines, count);
-                    reply_error(fd, "ADD", "内存不足");
-                    return;
-                }
-                count = nc;
-                changed = true;
-            }
+        int rc = nsp_rule_file_upsert_in_section(conf, sec_name, sec_match, is_switch_type(t),
+                                                 rule_type_name(t), line, &changed);
+        if (rc != NSP_RULE_FILE_OK) {
+            reply_error(fd, "ADD", "写入 %s 失败: %s", conf, strerror(errno));
+            return;
         }
-        if (changed) {
-            if (!write_file_lines_atomic(conf, lines, count)) {
-                reply_error(fd, "ADD", "写入 %s 失败: %s", conf, strerror(errno));
-                free_file_lines(lines, count);
-                return;
-            }
-        }
-        free_file_lines(lines, count);
         json_object* data = json_object_new_object();
         json_object_object_add(data, "file", json_object_new_string(conf));
         json_object_object_add(data, "line", json_object_new_string(line));
@@ -1619,70 +1358,14 @@ static void handle_add(int fd, json_object* req) {
         return;
     }
     {
-        int count = 0, cap = 0;
-        char** lines = read_file_lines(path, &count, &cap);
+        /* 无段结构文件：开关就地替换（保持唯一），规则行全文件去重后追加 */
         bool changed = false;
-        if (is_switch_type(t)) {
-            /* 开关类型：替换文件中已存在的同类型开关行（保持唯一，后写覆盖），
-               无则追加——与 GLOBAL 段语义一致，避免 MONITOR ON/OFF 并存 */
-            int old = -1;
-            for (int i = 0; i < count; i++) {
-                if (classify_line(lines[i]) == t) {
-                    old = i;
-                    break;
-                }
-            }
-            if (old >= 0) {
-                if (strcmp(lines[old], line) != 0) {
-                    free(lines[old]);
-                    lines[old] = strdup(line);
-                    if (!lines[old]) {
-                        free_file_lines(lines, count);
-                        reply_error(fd, "ADD", "内存不足");
-                        return;
-                    }
-                    changed = true;
-                }
-            } else {
-                int nc = append_line(&lines, &cap, count, line);
-                if (nc < 0) {
-                    free_file_lines(lines, count);
-                    reply_error(fd, "ADD", "内存不足");
-                    return;
-                }
-                count = nc;
-                changed = true;
-            }
-        } else {
-            /* 规则行：去重后追加 */
-            bool dup = false;
-            if (lines) {
-                for (int i = 0; i < count; i++) {
-                    if (strcmp(lines[i], line) == 0) {
-                        dup = true;
-                        break;
-                    }
-                }
-            }
-            if (!dup) {
-                int nc = append_line(&lines, &cap, count, line);
-                if (nc < 0) {
-                    free_file_lines(lines, count);
-                    reply_error(fd, "ADD", "内存不足");
-                    return;
-                }
-                count = nc;
-                changed = true;
-            }
+        int rc =
+            nsp_rule_file_upsert_line(path, is_switch_type(t), rule_type_name(t), line, &changed);
+        if (rc != NSP_RULE_FILE_OK) {
+            reply_error(fd, "ADD", "写入 %s 失败: %s", path, strerror(errno));
+            return;
         }
-        if (changed) {
-            if (!write_file_lines_atomic(path, lines, count)) {
-                reply_error(fd, "ADD", "写入 %s 失败: %s", path, strerror(errno));
-                free_file_lines(lines, count);
-                return;
-            }
-        }
-        free_file_lines(lines, count);
         json_object* data = json_object_new_object();
         json_object_object_add(data, "file", json_object_new_string(path));
         json_object_object_add(data, "line", json_object_new_string(line));
@@ -1695,7 +1378,7 @@ static void handle_add(int fd, json_object* req) {
    **当前生效**文件（停用状态返回 .conf.disabled，保证后续操作写入同一文件、
    不丢规则）。类别段 REMOVE/TOGGLE 用主文件全局索引（与 GLOBAL 一致）。 */
 static void resolve_rule_path(const char* pkg, int uid, bool* is_global, char* out, size_t sz) {
-    if (!pkg || strcasecmp(pkg, "GLOBAL") == 0 || is_category_pkg(pkg)) {
+    if (!pkg || strcasecmp(pkg, "GLOBAL") == 0 || nsp_rule_file_is_category_pkg(pkg)) {
         *is_global = true;
         main_conf_path(out, sz);
     } else {
@@ -1728,7 +1411,7 @@ static void handle_remove(int fd, json_object* req) {
         reply_error(fd, "REMOVE", "索引必须 >= 0");
         return;
     }
-    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !is_category_pkg(pkg) &&
+    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !nsp_rule_file_is_category_pkg(pkg) &&
         !valid_pkg(pkg)) {
         reply_error(fd, "REMOVE", "非法包名: %s", pkg);
         return;
@@ -1736,27 +1419,17 @@ static void handle_remove(int fd, json_object* req) {
     bool is_global = false;
     char path[PATH_MAX];
     resolve_rule_path(pkg, uid, &is_global, path, sizeof(path));
-    int count = 0, cap = 0;
-    char** lines = read_file_lines(path, &count, &cap);
-    if (!lines) {
-        reply_error(fd, "REMOVE", "无法打开规则文件 %s", path);
-        return;
-    }
-    int found = find_rule_line(lines, count, t, index);
-    if (found < 0) {
-        free_file_lines(lines, count);
+    /* 索引计入已停用行（与 LIST 输出一致） */
+    char removed[MAX_LINE];
+    int rc = nsp_rule_file_remove_nth(path, rule_type_name(t), index, removed, sizeof removed);
+    if (rc == NSP_RULE_FILE_ENOTFND) {
         reply_error(fd, "REMOVE", "未找到 %s 类型的第 %d 条规则", type_s, index);
         return;
     }
-    char removed[MAX_LINE];
-    snprintf(removed, sizeof(removed), "%s", lines[found]);
-    remove_line_at(lines, &count, found);
-    if (!write_file_lines_atomic(path, lines, count)) {
+    if (rc != NSP_RULE_FILE_OK) {
         reply_error(fd, "REMOVE", "写入 %s 失败: %s", path, strerror(errno));
-        free_file_lines(lines, count);
         return;
     }
-    free_file_lines(lines, count);
     json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "removed", json_object_new_string(removed));
@@ -1792,7 +1465,7 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
         reply_error(fd, cmd, "索引必须 >= 0");
         return;
     }
-    if (strcmp(pkg, "GLOBAL") != 0 && !is_category_pkg(pkg) && !valid_pkg(pkg)) {
+    if (strcmp(pkg, "GLOBAL") != 0 && !nsp_rule_file_is_category_pkg(pkg) && !valid_pkg(pkg)) {
         reply_error(fd, cmd, "非法包名: %s", pkg);
         return;
     }
@@ -1800,14 +1473,14 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
     char path[PATH_MAX];
     resolve_rule_path(pkg, uid, &is_global, path, sizeof(path));
     int count = 0, cap = 0;
-    char** lines = read_file_lines(path, &count, &cap);
+    char** lines = nsp_rule_file_read(path, &count, &cap);
     if (!lines) {
         reply_error(fd, cmd, "无法打开规则文件 %s", path);
         return;
     }
-    int found = find_rule_line(lines, count, t, index);
+    int found = nsp_rule_file_find_nth(lines, count, rule_type_name(t), index);
     if (found < 0) {
-        free_file_lines(lines, count);
+        nsp_rule_file_free(lines, count);
         reply_error(fd, cmd, "未找到 %s 类型的第 %d 条规则", type_s, index);
         return;
     }
@@ -1828,13 +1501,13 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
             size_t prefix = (size_t)(p - lines[found]);
             size_t len = strlen(lines[found]);
             if (len + 2 >= MAX_LINE) {
-                free_file_lines(lines, count);
+                nsp_rule_file_free(lines, count);
                 reply_error(fd, cmd, "规则行过长，无法停用");
                 return;
             }
             char* nl = malloc(len + 2);
             if (!nl) {
-                free_file_lines(lines, count);
+                nsp_rule_file_free(lines, count);
                 reply_error(fd, cmd, "内存不足");
                 return;
             }
@@ -1844,15 +1517,15 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
             free(lines[found]);
             lines[found] = nl;
         }
-        if (!write_file_lines_atomic(path, lines, count)) {
+        if (!nsp_rule_file_write(path, lines, count)) {
             reply_error(fd, cmd, "写入 %s 失败: %s", path, strerror(errno));
-            free_file_lines(lines, count);
+            nsp_rule_file_free(lines, count);
             return;
         }
     }
     char updated[MAX_LINE];
     snprintf(updated, sizeof(updated), "%s", lines[found]);
-    free_file_lines(lines, count);
+    nsp_rule_file_free(lines, count);
     json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "line", json_object_new_string(updated));

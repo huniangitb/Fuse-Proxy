@@ -330,6 +330,17 @@ nsp_comm_lib = static_library('nsp_comm',
 nsp_comm_dep = declare_dependency(link_with: nsp_comm_lib,
                                   include_directories: all_inc_dirs)
 
+# nsp_rule_file 规则配置文件行级读写（纯 libc，零项目全局依赖）：合并
+# log_ctl 与 rule_server 中两份逐字同构的私有行数组原语与段编辑逻辑，
+# 语义基准取 rule_server（权威控制面）。两处编辑同一个 injector.conf，
+# 共享后落盘一律原子写，避免 inotify 监听端读到半截配置。
+nsp_rule_file_lib = static_library('nsp_rule_file',
+  'src/core/nsp_rule_file.c',
+  include_directories: all_inc_dirs,
+)
+nsp_rule_file_dep = declare_dependency(link_with: nsp_rule_file_lib,
+                                       include_directories: all_inc_dirs)
+
 executable('fuse_daemon',
   fuse_daemon_sources + ['src/core/common.c'],
   include_directories: all_inc_dirs,
@@ -376,7 +387,7 @@ executable('log_monitor',
 executable('log_ctl',
   ['src/log/log_ctl.c'] + common_sources,
   include_directories: all_inc_dirs,
-  dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
+  dependencies: project_deps + [nsp_util_dep, nsp_comm_dep, nsp_rule_file_dep],
   install: true,
   install_dir: install_bin_dir
 )
@@ -391,7 +402,7 @@ executable('rule_server',
   ['src/rule/rule_server.c', 'src/core/nsp_ini_store.c', 'src/core/common.c',
    'src/core/build_info.c'],
   include_directories: all_inc_dirs,
-  dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep],
+  dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep, nsp_rule_file_dep],
   install: true,
   install_dir: install_bin_dir
 )
