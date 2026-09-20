@@ -13,16 +13,16 @@
 #include <time.h>
 
 typedef struct FtpConn {
-    int ctrl_fd;              /* 控制连接 fd（-1 = 未连接） */
-    int timeout_s;            /* 网络超时（秒） */
-    int last_code;            /* 最近响应码（如 220/230/226/550） */
-    char last_reply[2048];    /* 最近完整响应文本 */
-    char pasv_host[256];      /* 原服务器主机名（PASV 数据连接使用，防返回不可达 IP） */
+    int ctrl_fd;           /* 控制连接 fd（-1 = 未连接） */
+    int timeout_s;         /* 网络超时（秒） */
+    int last_code;         /* 最近响应码（如 220/230/226/550） */
+    char last_reply[2048]; /* 最近完整响应文本 */
+    char pasv_host[256];   /* 原服务器主机名（PASV 数据连接使用，防返回不可达 IP） */
 } FtpConn;
 
 /* 连接 + 登录（匿名 user="anonymous"）。返回 0 成功；负值失败。 */
-int ftp_connect(FtpConn* c, const char* host, int port,
-                const char* user, const char* pass, int timeout_s);
+int ftp_connect(FtpConn* c, const char* host, int port, const char* user, const char* pass,
+                int timeout_s);
 void ftp_close(FtpConn* c);
 
 /* 发一条命令并读完整响应；返回响应码（>=0），网络错误返回负值 */
@@ -48,10 +48,10 @@ int ftp_stor(FtpConn* c, const char* path, const char* buf, size_t size);
 int ftp_size(FtpConn* c, const char* path, long long* size_out);
 /* MDTM 查询。返回 0 成功，*out 填 mtime。 */
 int ftp_mdtm(FtpConn* c, const char* path, time_t* out);
-int ftp_dele(FtpConn* c, const char* path);          /* 删除文件 */
-int ftp_mkd(FtpConn* c, const char* path);           /* 建目录 */
-int ftp_rmd(FtpConn* c, const char* path);           /* 删空目录 */
-int ftp_rename(FtpConn* c, const char* from, const char* to);  /* 重命名/移动 */
+int ftp_dele(FtpConn* c, const char* path);                   /* 删除文件 */
+int ftp_mkd(FtpConn* c, const char* path);                    /* 建目录 */
+int ftp_rmd(FtpConn* c, const char* path);                    /* 删空目录 */
+int ftp_rename(FtpConn* c, const char* from, const char* to); /* 重命名/移动 */
 
 /* ---- LIST 输出解析（vsftpd 默认 Unix 风格） ---- */
 

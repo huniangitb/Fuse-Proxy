@@ -47,7 +47,10 @@ void log_ns_error(const char* format, ...) {
 /* 解析子进程回传日志行（格式 "<level>|<msg>\n"）并写入父进程环形缓冲 */
 static void replay_child_log_line(char* line) {
     char* sep = strchr(line, '|');
-    if (!sep) { LOG("[ns子进程] %s", line); return; }
+    if (!sep) {
+        LOG("[ns子进程] %s", line);
+        return;
+    }
     *sep = '\0';
     int lv = atoi(line);
     const char* msg = sep + 1;
@@ -59,7 +62,8 @@ static void replay_child_log_line(char* line) {
 
 /* 非 static 导出：ns_global_replace.c（全局替换方案）在目标命名空间内
    执行 replace/restore 时共用本命名空间执行原语 */
-int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* child_err, int timeout_ms) {
+int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* child_err,
+                          int timeout_ms) {
     struct timespec t_start;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
     int status_pipe[2];
@@ -72,27 +76,30 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
        统一写入环形缓冲，保证 ns 操作子进程日志在 log_ctl 可见 */
     int log_pipe[2];
     if (pipe2(log_pipe, O_CLOEXEC) < 0) {
-        close(status_pipe[0]); close(status_pipe[1]);
+        close(status_pipe[0]);
+        close(status_pipe[1]);
         log_ns_error("[ns_error] Failed to create log pipe: %s\n", strerror(errno));
         return -1;
     }
     pid_t child = fork();
     if (child < 0) {
-        close(status_pipe[0]); close(status_pipe[1]);
-        close(log_pipe[0]); close(log_pipe[1]);
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        close(log_pipe[0]);
+        close(log_pipe[1]);
         return -1;
     }
     if (child == 0) {
         close(status_pipe[0]);
         close(log_pipe[0]);
-        g_log_forward_fd = log_pipe[1];   /* 子进程日志转发到管道 */
+        g_log_forward_fd = log_pipe[1]; /* 子进程日志转发到管道 */
         char ns_path[64];
         snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", target_pid);
         int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) _exit(10);
-        if (setns(fd, CLONE_NEWNS) != 0) { 
-            close(fd); 
-            _exit(11); 
+        if (setns(fd, CLONE_NEWNS) != 0) {
+            close(fd);
+            _exit(11);
         }
         close(fd);
         int ret = func(args);
@@ -114,16 +121,16 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
     long elapsed = 0;
     /* 循环 poll：日志管道可能先就绪而 status 未就绪，必须继续等 status */
     for (;;) {
-        struct pollfd pfd[2] = {
-            { .fd = status_pipe[0], .events = POLLIN | POLLHUP },
-            { .fd = log_pipe[0],    .events = POLLIN | POLLHUP }
-        };
+        struct pollfd pfd[2] = {{.fd = status_pipe[0], .events = POLLIN | POLLHUP},
+                                {.fd = log_pipe[0], .events = POLLIN | POLLHUP}};
         int poll_ret = poll(pfd, 2, timeout_ms);
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        elapsed = (now.tv_sec - t_start.tv_sec) * 1000 +
-                  (now.tv_nsec - t_start.tv_nsec) / 1000000;
-        if (poll_ret < 0) { ret_val = -1; break; }
+        elapsed = (now.tv_sec - t_start.tv_sec) * 1000 + (now.tv_nsec - t_start.tv_nsec) / 1000000;
+        if (poll_ret < 0) {
+            ret_val = -1;
+            break;
+        }
         /* 排空子进程回传日志（非阻塞，EAGAIN/EOF 即止） */
         if (poll_ret > 0 && (pfd[1].revents & (POLLIN | POLLHUP))) {
             char line[2048];
@@ -131,7 +138,10 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
             char chunk[1024];
             for (;;) {
                 ssize_t r = read(log_pipe[0], chunk, sizeof(chunk));
-                if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; break; }
+                if (r < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    break;
+                }
                 if (r == 0) break;
                 for (ssize_t i = 0; i < r; i++) {
                     if (chunk[i] == '\n') {
@@ -143,20 +153,26 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
                     }
                 }
             }
-            if (plen > 0) { line[plen] = '\0'; replay_child_log_line(line); }
+            if (plen > 0) {
+                line[plen] = '\0';
+                replay_child_log_line(line);
+            }
         }
-        if (poll_ret > 0 && (pfd[0].revents & (POLLIN | POLLHUP))) { status_ready = true; break; }
-        if (poll_ret == 0 || elapsed >= timeout_ms) break;   /* 超时 */
+        if (poll_ret > 0 && (pfd[0].revents & (POLLIN | POLLHUP))) {
+            status_ready = true;
+            break;
+        }
+        if (poll_ret == 0 || elapsed >= timeout_ms) break; /* 超时 */
         /* 仅日志就绪而 status 未就绪：继续轮询 */
     }
     if (status_ready) {
         int child_ret = -1;
         ssize_t r_len = read(status_pipe[0], &child_ret, sizeof(child_ret));
         int status;
-        waitpid(child, &status, 0); 
+        waitpid(child, &status, 0);
         if (r_len == sizeof(child_ret)) {
             ret_val = child_ret;
-            if (child_err) *child_err = child_ret; 
+            if (child_err) *child_err = child_ret;
             if (ret_val != 0) {
                 if (ret_val == 1) {
                     LOG_DBG("ns操作 pid=%d 耗时: %ldms, 结果: 跳过(1)", target_pid, elapsed);
@@ -174,7 +190,8 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
                 int code = WEXITSTATUS(status);
                 if (child_err) *child_err = code;
                 ret_val = (code == 0) ? 0 : (code == 255 ? -1 : code);
-                LOG_WRN("ns操作子进程未写入管道异常退出, pid=%d, code: %d (ret=%d)", target_pid, code, ret_val);
+                LOG_WRN("ns操作子进程未写入管道异常退出, pid=%d, code: %d (ret=%d)", target_pid,
+                        code, ret_val);
             } else if (WIFSIGNALED(status)) {
                 LOG_WRN("ns操作子进程被信号杀死, pid=%d, signal=%d", target_pid, WTERMSIG(status));
                 ret_val = -1;
@@ -199,14 +216,16 @@ static int run_in_mnt_ns(int target_pid, int (*func)(void*), void* args, int* ch
     return run_in_mnt_ns_timeout(target_pid, func, args, child_err, 500);
 }
 /* 核心优化：高并发非阻塞异步 fork 机制 */
-int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), void* args, void* mount_args) {
+int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), void* args,
+                        void* mount_args) {
     int status_pipe[2];
     if (pipe2(status_pipe, O_CLOEXEC | O_NONBLOCK) < 0) {
         return -1;
     }
     pid_t child = fork();
     if (child < 0) {
-        close(status_pipe[0]); close(status_pipe[1]);
+        close(status_pipe[0]);
+        close(status_pipe[1]);
         return -1;
     }
     if (child == 0) {
@@ -215,9 +234,9 @@ int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), voi
         snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", target_pid);
         int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) _exit(10);
-        if (setns(fd, CLONE_NEWNS) != 0) { 
-            close(fd); 
-            _exit(11); 
+        if (setns(fd, CLONE_NEWNS) != 0) {
+            close(fd);
+            _exit(11);
         }
         close(fd);
         int ret = func(args);
@@ -227,7 +246,7 @@ int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), voi
         _exit(ret == 0 ? 0 : 1);
     }
     close(status_pipe[1]);
-    MountTaskCtx *ctx = malloc(sizeof(MountTaskCtx));
+    MountTaskCtx* ctx = malloc(sizeof(MountTaskCtx));
     if (!ctx) {
         close(status_pipe[0]);
         kill(child, SIGKILL);
@@ -240,10 +259,7 @@ int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), voi
     strncpy(ctx->pkg_name, pkg, sizeof(ctx->pkg_name) - 1);
     ctx->pkg_name[sizeof(ctx->pkg_name) - 1] = '\0';
     ctx->mount_args = mount_args;
-    struct epoll_event ev = {
-        .events = EPOLLIN | EPOLLONESHOT,
-        .data.fd = status_pipe[0] 
-    };
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.fd = status_pipe[0]};
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, status_pipe[0], &ev) < 0) {
         close(status_pipe[0]);
         free(ctx);
@@ -261,14 +277,16 @@ int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), voi
     }
     return 0;
 }
-struct MountArgs { const char *src; const char *target; };
+struct MountArgs {
+    const char* src;
+    const char* target;
+};
 static int do_bind_mount(void* raw_args) {
     struct MountArgs* args = (struct MountArgs*)raw_args;
     if (access(args->src, F_OK) != 0) return errno;
     struct stat st;
     if (stat(args->target, &st) != 0) mkdir(args->target, 0755);
-    if (mount(args->src, args->target, nullptr, MS_BIND | MS_REC, nullptr) != 0)
-        return errno;
+    if (mount(args->src, args->target, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
     return 0;
 }
 static int do_umount_recursive(void* raw_args) {
@@ -283,8 +301,7 @@ static int do_umount_recursive(void* raw_args) {
             char mp[PATH_MAX] = {0};
             if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
             if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 &&
-                (mp[tlen] == '/' || mp[tlen] == '\0')) {
+            if (strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
                 strncpy(mounts[count], mp, PATH_MAX - 1);
                 count++;
             }
@@ -348,7 +365,7 @@ static int do_force_umount_stale(void* raw_args) {
         while (fgets(line, sizeof(line), fp) && count < 64) {
             char mp[PATH_MAX] = {0};
             if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;           /* 目标本身稍后处理 */
+            if (strcmp(mp, target) == 0) continue; /* 目标本身稍后处理 */
             if (strncmp(mp, target, tlen) == 0 && mp[tlen] == '/') {
                 strncpy(mounts[count], mp, sizeof(mounts[count]) - 1);
                 mounts[count][sizeof(mounts[count]) - 1] = '\0';
@@ -360,14 +377,14 @@ static int do_force_umount_stale(void* raw_args) {
         for (int i = count - 1; i >= 0; i--) {
             for (int t = 0; t < 8; t++) {
                 if (umount2(mounts[i], MNT_DETACH) == 0) break;
-                if (errno == EINVAL) break;  /* 本就不是挂载点 */
+                if (errno == EINVAL) break; /* 本就不是挂载点 */
             }
         }
     }
     /* 2. 强制卸载目标挂载点本身 */
     for (int t = 0; t < 8; t++) {
         if (umount2(target, MNT_DETACH) == 0) break;
-        if (errno == EINVAL) break;  /* 本就不是挂载点，静默通过 */
+        if (errno == EINVAL) break; /* 本就不是挂载点，静默通过 */
     }
     return 0;
 }
@@ -388,8 +405,8 @@ int ns_force_umount_stale(int pid, const char* target) {
     /* 在目标命名空间中执行卸载（超时 5 秒） */
     int ret = run_in_mnt_ns_timeout(pid, do_force_umount_stale, (void*)target, &child_err, 5000);
     if (ret != 0) {
-        LOG_DBG("force_umount_stale pid=%d target=%s 子进程异常退出, err=%d",
-                pid, target, child_err);
+        LOG_DBG("force_umount_stale pid=%d target=%s 子进程异常退出, err=%d", pid, target,
+                child_err);
     }
     /* 自己也卸载一次，覆盖 pid 就是当前进程自身的情况 */
     do_force_umount_stale((void*)target);
@@ -412,12 +429,11 @@ static int do_move_mount(void* raw_args) {
         mkdir(parent, 0755);
     }
     mkdir(args->target, 0755);
-    if (mount(args->src, args->target, nullptr, MS_MOVE, nullptr) != 0)
-        return errno;
+    if (mount(args->src, args->target, nullptr, MS_MOVE, nullptr) != 0) return errno;
     return 0;
 }
 int ns_bind_mount(int pid, const char* source, const char* target) {
-    struct MountArgs args = { source, target };
+    struct MountArgs args = {source, target};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_bind_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -430,7 +446,7 @@ int ns_umount_and_rmdir(int pid, const char* target) {
     return run_in_mnt_ns(pid, do_umount_and_rmdir, (void*)target, nullptr);
 }
 int ns_move_mount(int pid, const char* source, const char* target) {
-    struct MountArgs args = { source, target };
+    struct MountArgs args = {source, target};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_move_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -442,7 +458,8 @@ int ns_make_shared(int pid, const char* target) {
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
 }
-int ns_find_native_submounts(int pid, const char* base_path, char mount_points[][256], int max_count) {
+int ns_find_native_submounts(int pid, const char* base_path, char mount_points[][256],
+                             int max_count) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
     size_t nread = 0;
@@ -525,8 +542,9 @@ static int do_bind_mount_with_preserve(void* raw_args) {
     }
     return 0;
 }
-int ns_bind_mount_with_preserve(int pid, const char* source, const char* target, char preserve_paths[][256], int preserve_count) {
-    struct PreserveMountArgs args = { source, target, preserve_paths, preserve_count };
+int ns_bind_mount_with_preserve(int pid, const char* source, const char* target,
+                                char preserve_paths[][256], int preserve_count) {
+    struct PreserveMountArgs args = {source, target, preserve_paths, preserve_count};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_bind_mount_with_preserve, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -562,8 +580,7 @@ static int do_backup_and_clear_target(void* raw_args) {
     }
     for (int t = 0; t < 8; t++)
         if (umount2(backup, MNT_DETACH) == 0) break;
-    if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0)
-        return errno;
+    if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
     fp = fopen("/proc/self/mountinfo", "re");
     if (fp) {
         char line[4096], mounts[128][PATH_MAX];
@@ -587,7 +604,7 @@ static int do_backup_and_clear_target(void* raw_args) {
     return 0;
 }
 int ns_backup_and_clear_target(int pid, const char* target, const char* backup) {
-    struct BackupTargetArgs bargs = { target, backup };
+    struct BackupTargetArgs bargs = {target, backup};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_backup_and_clear_target, &bargs, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -600,8 +617,8 @@ struct CombinedMountArgs {
     const char* backup;
     char (*preserve_paths)[256];
     int preserve_count;
-    pid_t target_pid;      /* 就绪等待期间的存活检查目标 */
-    bool readiness_gate;   /* 进程生命周期首次注入：挂载前先等 /storage/emulated 出现 */
+    pid_t target_pid;    /* 就绪等待期间的存活检查目标 */
+    bool readiness_gate; /* 进程生命周期首次注入：挂载前先等 /storage/emulated 出现 */
 };
 
 /* 就绪门控记录（父进程侧）：同一 pid 仅首次注入执行存在性等待，后续
@@ -617,7 +634,10 @@ static bool ns_readiness_done(pid_t pid) {
     bool done = false;
     pthread_mutex_lock(&g_readiness_mutex);
     for (int i = 0; i < g_readiness_count; i++) {
-        if (g_readiness_done[i] == pid) { done = true; break; }
+        if (g_readiness_done[i] == pid) {
+            done = true;
+            break;
+        }
     }
     pthread_mutex_unlock(&g_readiness_mutex);
     return done;
@@ -626,13 +646,15 @@ static bool ns_readiness_done(pid_t pid) {
 static void ns_readiness_mark(pid_t pid) {
     pthread_mutex_lock(&g_readiness_mutex);
     for (int i = 0; i < g_readiness_count; i++) {
-        if (g_readiness_done[i] == pid) { pthread_mutex_unlock(&g_readiness_mutex); return; }
+        if (g_readiness_done[i] == pid) {
+            pthread_mutex_unlock(&g_readiness_mutex);
+            return;
+        }
     }
     if (g_readiness_count < NS_READINESS_SLOTS) {
         g_readiness_done[g_readiness_count++] = pid;
     } else {
-        memmove(g_readiness_done, g_readiness_done + 1,
-                sizeof(pid_t) * (NS_READINESS_SLOTS - 1));
+        memmove(g_readiness_done, g_readiness_done + 1, sizeof(pid_t) * (NS_READINESS_SLOTS - 1));
         g_readiness_done[NS_READINESS_SLOTS - 1] = pid;
     }
     pthread_mutex_unlock(&g_readiness_mutex);
@@ -664,11 +686,16 @@ static int do_combined_mount(void* raw_args) {
                 return ESRCH;
             }
             usleep(100 * 1000);
-            if (access(target, F_OK) == 0) { ready = true; break; }
+            if (access(target, F_OK) == 0) {
+                ready = true;
+                break;
+            }
         }
         if (!ready) {
-            log_ns_error("[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列\n", pkg, target);
-            log_internal(LOG_WARN, "[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列", pkg, target);
+            log_ns_error("[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列\n", pkg,
+                         target);
+            log_internal(LOG_WARN, "[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列",
+                         pkg, target);
             return ENOENT;
         }
         LOG_DBG("[%s] %s 已就绪（等待后出现），继续合并挂载", pkg, target);
@@ -680,7 +707,8 @@ static int do_combined_mount(void* raw_args) {
     char* buf = read_file_dynamic("/proc/self/mountinfo", &nread);
     if (!buf) {
         log_ns_error("[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d\n", pkg, errno);
-        log_internal(LOG_ERROR, "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg, errno);
+        log_internal(LOG_ERROR, "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg,
+                     errno);
         return errno;
     }
     char backup_mounts[128][256];
@@ -710,12 +738,14 @@ static int do_combined_mount(void* raw_args) {
                     char mp[256];
                     memcpy(mp, mp_start, mp_len);
                     mp[mp_len] = '\0';
-                    if (strcmp(mp, backup) != 0 && strncmp(mp, backup, blen) == 0 && (mp[blen] == '/' || mp[blen] == '\0')) {
+                    if (strcmp(mp, backup) != 0 && strncmp(mp, backup, blen) == 0 &&
+                        (mp[blen] == '/' || mp[blen] == '\0')) {
                         if (backup_count < 128) {
                             strcpy(backup_mounts[backup_count++], mp);
                         }
                     }
-                    if (strcmp(mp, target) != 0 && strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
+                    if (strcmp(mp, target) != 0 && strncmp(mp, target, tlen) == 0 &&
+                        (mp[tlen] == '/' || mp[tlen] == '\0')) {
                         if (target_count < 128) {
                             strcpy(target_mounts[target_count++], mp);
                         }
@@ -733,7 +763,7 @@ static int do_combined_mount(void* raw_args) {
             if (umount2(backup_mounts[i], MNT_DETACH) == 0) break;
         }
     }
-   // log_ns_error("[combined] Step C: umount2 backup=%s\n", backup);
+    // log_ns_error("[combined] Step C: umount2 backup=%s\n", backup);
     for (int t = 0; t < 8; t++) {
         if (umount2(backup, MNT_DETACH) == 0) break;
     }
@@ -742,13 +772,13 @@ static int do_combined_mount(void* raw_args) {
        Step J）。收益：免一次 bind 复制 + 免备份管理，缩短挂载周期延迟；
        且规避部分设备/ROM 应用命名空间内源路径不可见（ENOENT/EROFS）误报。
        backup 目录仍由父进程 ns_combined_mount 预先 mkdir（保留挂载点占位）。 */
-  //  log_ns_error("[combined] Step F: umount2 sub-target mounts, count=%d\n", target_count);
+    //  log_ns_error("[combined] Step F: umount2 sub-target mounts, count=%d\n", target_count);
     for (int i = target_count - 1; i >= 0; i--) {
         for (int t = 0; t < 8; t++) {
             if (umount2(target_mounts[i], MNT_DETACH) == 0) break;
         }
     }
- //   log_ns_error("[combined] Step G: umount2 target=%s\n", target);
+    //   log_ns_error("[combined] Step G: umount2 target=%s\n", target);
     for (int t = 0; t < 8; t++) {
         if (umount2(target, MNT_DETACH) == 0) break;
     }
@@ -756,16 +786,19 @@ static int do_combined_mount(void* raw_args) {
        就绪性由函数头部门控保证——首次注入在卸载前等待条目出现；重试注入
        时目录通常已存在（裸挂载点可直接 bind）。此处若仍缺失，Step I 的
        mount 以 ENOENT 真实裁决 */
-  //  log_ns_error("[combined] Step I: mount(source->target) source=%s target=%s\n", source, target);
+    //  log_ns_error("[combined] Step I: mount(source->target) source=%s target=%s\n", source, target);
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
-        log_ns_error("[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)\n",
-                     pkg, source, target, err, strerror(err));
-        log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)",
-                     pkg, source, target, err, strerror(err));
+        log_ns_error(
+            "[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)\n",
+            pkg, source, target, err, strerror(err));
+        log_internal(
+            LOG_ERROR,
+            "[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)",
+            pkg, source, target, err, strerror(err));
         return err;
     }
-  //  log_ns_error("[combined] Step J: preserve sub-mounts, count=%d\n", preserve_count);
+    //  log_ns_error("[combined] Step J: preserve sub-mounts, count=%d\n", preserve_count);
     if (preserve_count > 0) {
         /* 备份机制已移除（不再 mount target→backup 复制原生视图）：preserve
            恢复直接 bind /mnt/ 下系统 fuse 挂载视图（Android 多用户族根
@@ -789,7 +822,10 @@ static int do_combined_mount(void* raw_args) {
                 /* 解析 rel 首段 user id（如 /0/Android/data → 0） */
                 int user = 0;
                 if (ns_is_digit_char(*rel)) {
-                    while (ns_is_digit_char(*rel)) { user = user * 10 + (*rel - '0'); rel++; }
+                    while (ns_is_digit_char(*rel)) {
+                        user = user * 10 + (*rel - '0');
+                        rel++;
+                    }
                     while (*rel == '/') rel++;
                 }
                 /* 匹配该 user 的族根（优先 user 族，其次 androidwritable/installer） */
@@ -797,14 +833,17 @@ static int do_combined_mount(void* raw_args) {
                 for (int fam = 2; fam >= 0 && !sys_src; fam--) {
                     for (int k = 0; k < root_count; k++) {
                         int ruid = 0;
-                        if (ns_parse_family_root(roots[k].mount_point, &ruid) == fam && ruid == user) {
+                        if (ns_parse_family_root(roots[k].mount_point, &ruid) == fam &&
+                            ruid == user) {
                             sys_src = roots[k].mount_point;
                             break;
                         }
                     }
                 }
                 if (!sys_src) {
-                    log_ns_error("[ns_error] [%s] Combined mount preserve skip: no /mnt family root for user %d (%s)\n", pkg, user, mp);
+                    log_ns_error(
+                        "[ns_error] [%s] Combined mount preserve skip: no /mnt family root for user %d (%s)\n",
+                        pkg, user, mp);
                     continue;
                 }
                 char src[256];
@@ -812,19 +851,24 @@ static int do_combined_mount(void* raw_args) {
                 mkdir_recursive(mp);
                 if (mount(src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
                     int err = errno;
-                    log_ns_error("[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n", pkg, src, mp, err, strerror(err));
-                    log_internal(LOG_ERROR, "[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)", pkg, src, mp, err, strerror(err));
+                    log_ns_error(
+                        "[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)\n",
+                        pkg, src, mp, err, strerror(err));
+                    log_internal(
+                        LOG_ERROR,
+                        "[ns_error] [%s] Combined mount preserve path failed: mount(%s -> %s) errno=%d (%s)",
+                        pkg, src, mp, err, strerror(err));
                 }
             }
             free(all);
             free(roots);
         }
     }
-  //  log_ns_error("[combined] Step Z: done\n");
+    //  log_ns_error("[combined] Step Z: done\n");
     return 0;
 }
-int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
-                      char preserve_paths[][256], int preserve_count) {
+int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target,
+                      const char* backup, char preserve_paths[][256], int preserve_count) {
     /* 父进程命名空间先行 mkdir backup：确保目标目录在宿主存在——
        子进程 do_combined_mount 的 mkdir 在目标应用命名空间执行，
        若 /data/Namespace-Proxy 在该命名空间不可见会连带 mount 目标失败 */
@@ -833,8 +877,8 @@ int ns_combined_mount(int pid, const char* pkg, const char* source, const char* 
     }
     bool gate = !ns_readiness_done(pid);
     if (gate) ns_readiness_mark(pid);
-    struct CombinedMountArgs args = { pkg, source, target, backup,
-                                      preserve_paths, preserve_count, pid, gate };
+    struct CombinedMountArgs args = {pkg, source, target, backup, preserve_paths, preserve_count,
+                                     pid, gate};
     int child_err = 0;
     /* 门控最坏等待 ~1s（就绪性检查在子进程内）：默认 500ms 预算会在等待中
        SIGKILL 子进程，此处放宽到 2s——健康路径门控仅一次 access(<µs) 无感，
@@ -849,33 +893,41 @@ static int do_global_mount(void* raw_args) {
     const char* source = args->source;
     const char* target = args->target;
     /* 先尝试直接 bind mount（依赖 mount propagation） */
-    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) == 0)
-        return 0;
+    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) return 0;
     /* ENOENT 表示源路径在当前命名空间不可见 —— 通过父进程的 /proc/<ppid>/root 跨命名空间访问 */
     if (errno == ENOENT) {
         char src_buf[256];
         snprintf(src_buf, sizeof(src_buf), "/proc/%d/root%s", getppid(), source);
         struct stat st;
-        if (stat(src_buf, &st) == 0 && mount(src_buf, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+        if (stat(src_buf, &st) == 0 &&
+            mount(src_buf, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) {
             LOG_DBG("全局注入跨 ns 挂载成功: %s(proc) -> %s", source, target);
             return 0;
         }
-        log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s), proc fallback also failed\n",
-                     source, target, errno, strerror(errno));
+        log_ns_error(
+            "[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s), proc fallback also failed\n",
+            source, target, errno, strerror(errno));
         return errno;
     }
-    log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s)\n",
-                 source, target, errno, strerror(errno));
+    log_ns_error("[ns_error] Global mount failed: mount(%s -> %s) errno=%d (%s)\n", source, target,
+                 errno, strerror(errno));
     return errno;
 }
 
 int ns_global_mount_async(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs *args = malloc(sizeof(struct CombinedMountArgs));
+    struct CombinedMountArgs* args = malloc(sizeof(struct CombinedMountArgs));
     if (!args) return -1;
     args->source = strdup(source);
-    if (!args->source) { free(args); return -1; }
+    if (!args->source) {
+        free(args);
+        return -1;
+    }
     args->target = strdup(target);
-    if (!args->target) { free((void*)args->source); free(args); return -1; }
+    if (!args->target) {
+        free((void*)args->source);
+        free(args);
+        return -1;
+    }
     args->backup = NULL;
     args->preserve_paths = NULL;
     args->preserve_count = 0;
@@ -893,7 +945,7 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
 
 /* 同步版全局挂载：挂载完成才返回，用于 IPC 线程 */
 int ns_global_mount(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs args = { pkg, source, target, NULL, NULL, 0, pid, false };
+    struct CombinedMountArgs args = {pkg, source, target, NULL, NULL, 0, pid, false};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_global_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -901,9 +953,9 @@ int ns_global_mount(int pid, const char* pkg, const char* source, const char* ta
 }
 
 /* 核心优化：异步非阻塞合并挂载启动函数 */
-int ns_combined_mount_async(int pid, const char* pkg, const char* source, const char* target, const char* backup,
-                            char preserve_paths[][256], int preserve_count) {
-    struct CombinedMountArgs *args = malloc(sizeof(struct CombinedMountArgs));
+int ns_combined_mount_async(int pid, const char* pkg, const char* source, const char* target,
+                            const char* backup, char preserve_paths[][256], int preserve_count) {
+    struct CombinedMountArgs* args = malloc(sizeof(struct CombinedMountArgs));
     if (!args) return -1;
     args->pkg = pkg ? strdup(pkg) : NULL;
     args->source = strdup(source);
@@ -961,7 +1013,8 @@ static int do_debug_log_mounts(void* raw_args) {
     localtime_r(&now, &tm_buf);
     char time_buf[64];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
-    fprintf(log_fp, "[%s] [PKG: %s] [PID: %d] [STAGE: %s]\n", time_buf, args->pkg, args->pid, args->stage);
+    fprintf(log_fp, "[%s] [PKG: %s] [PID: %d] [STAGE: %s]\n", time_buf, args->pkg, args->pid,
+            args->stage);
     FILE* mounts_fp = fopen("/proc/self/mounts", "re");
     if (mounts_fp) {
         char line[1024];
@@ -985,7 +1038,7 @@ static int do_debug_log_mounts(void* raw_args) {
     return 0;
 }
 int ns_debug_log_mounts(int pid, const char* pkg, const char* stage) {
-    struct DebugMountArgs args = { pkg, pid, stage };
+    struct DebugMountArgs args = {pkg, pid, stage};
     return run_in_mnt_ns(pid, do_debug_log_mounts, &args, nullptr);
 }
 struct SysFuseArgs {
@@ -1025,13 +1078,15 @@ static int do_restore_sys_fuse(void* raw_args) {
     mount(args->backup_path, "/storage/emulated", nullptr, MS_BIND | MS_REC, nullptr);
     return 0;
 }
-int ns_backup_and_remove_system_fuse(int mnt_ns_pid, const char* fuse_src, const char* backup_path) {
+int ns_backup_and_remove_system_fuse(int mnt_ns_pid, const char* fuse_src,
+                                     const char* backup_path) {
     struct SysFuseArgs args;
     memset(&args, 0, sizeof(args));
     strncpy(args.fuse_src, fuse_src, sizeof(args.fuse_src) - 1);
     strncpy(args.backup_path, backup_path, sizeof(args.backup_path) - 1);
     int child_err = 0;
-    int ret = run_in_mnt_ns_timeout(mnt_ns_pid, do_backup_and_remove_sys_fuse, &args, &child_err, 2000);
+    int ret =
+        run_in_mnt_ns_timeout(mnt_ns_pid, do_backup_and_remove_sys_fuse, &args, &child_err, 2000);
     if (ret != 0) {
         LOG_ERR("系统 FUSE 备份/卸载失败 (ret=%d, err=%d)", ret, child_err);
     } else {
@@ -1051,17 +1106,17 @@ int ns_restore_system_fuse(int mnt_ns_pid, const char* fuse_src, const char* bac
     return ret;
 }
 /* 核心优化：异步合并挂载完成后，用于回收父进程内存的全局回调 */
-void handle_async_mount_event(void *ptr) {
-    MountTaskCtx *ctx = (MountTaskCtx*)ptr;
+void handle_async_mount_event(void* ptr) {
+    MountTaskCtx* ctx = (MountTaskCtx*)ptr;
     int child_ret = -1;
     ssize_t r = read(ctx->status_pipe_fd, &child_ret, sizeof(child_ret));
     int status;
-    waitpid(ctx->child_pid, &status, 0); 
+    waitpid(ctx->child_pid, &status, 0);
     if (r == sizeof(child_ret) && child_ret == 0) {
         LOG_DBG("异步挂载成功: App=%s, PID=%d", ctx->pkg_name, ctx->target_pid);
     } else {
-        LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%zd, exit_status=%d", 
-                ctx->pkg_name, ctx->target_pid, r, child_ret);
+        LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%zd, exit_status=%d", ctx->pkg_name,
+                ctx->target_pid, r, child_ret);
         /*
          * 只在以下条件满足时才调度重试：
          * 1) 进程仍然存活
@@ -1082,14 +1137,16 @@ void handle_async_mount_event(void *ptr) {
             remove_tracked(ctx->target_pid);
         } else {
             if (!alive) {
-                LOG_DBG("异步挂载失败，进程已死，不重试: %s(PID:%d)", ctx->pkg_name, ctx->target_pid);
+                LOG_DBG("异步挂载失败，进程已死，不重试: %s(PID:%d)", ctx->pkg_name,
+                        ctx->target_pid);
                 remove_tracked(ctx->target_pid);
             } else {
-                LOG_DBG("异步挂载失败但目标已存在FUSE挂载，不重试: %s(PID:%d)", ctx->pkg_name, ctx->target_pid);
+                LOG_DBG("异步挂载失败但目标已存在FUSE挂载，不重试: %s(PID:%d)", ctx->pkg_name,
+                        ctx->target_pid);
             }
         }
     }
-    struct CombinedMountArgs *args = (struct CombinedMountArgs *)ctx->mount_args;
+    struct CombinedMountArgs* args = (struct CombinedMountArgs*)ctx->mount_args;
     if (args) {
         free((void*)args->source);
         free((void*)args->target);

@@ -15,10 +15,10 @@
 #define DIRENT_BUF_SIZE (1024 * 1024)
 static char* g_dirent_buf = nullptr;
 #define MAX_CACHED_PIDS 65536
-#define PID_BITMAP_MAX 1048576 // Android 常规 PID 支持最高至 1048575
+#define PID_BITMAP_MAX  1048576 // Android 常规 PID 支持最高至 1048575
 static uint8_t* g_pid_bitmap = nullptr;
 static int* g_cached_pids = nullptr;
-static int g_cached_count = -1; 
+static int g_cached_count = -1;
 int fast_pid_init() {
     if (g_dirent_buf) return 0;
     g_dirent_buf = malloc(DIRENT_BUF_SIZE);
@@ -110,14 +110,14 @@ int fast_pid_find(const char* target_package) {
         if (nread == 0) break;
         for (long bpos = 0; bpos < nread;) {
             struct linux_dirent64* d = (struct linux_dirent64*)(g_dirent_buf + bpos);
-            if (d->d_reclen == 0) break; 
+            if (d->d_reclen == 0) break;
             if (d->d_type == DT_DIR) {
                 char first = d->d_name[0];
                 if (first >= '1' && first <= '9') {
                     int pid = atoi(d->d_name);
-                    if (check_cmdline(pid, target_package)) { 
-                        found_pid = pid; 
-                        goto cleanup; 
+                    if (check_cmdline(pid, target_package)) {
+                        found_pid = pid;
+                        goto cleanup;
                     }
                 }
             }
@@ -129,29 +129,29 @@ cleanup:
     return found_pid;
 }
 void fast_pid_each(pid_callback_t callback, void* data) {
-    if (!g_dirent_buf) { 
-        if (fast_pid_init() != 0) return; 
+    if (!g_dirent_buf) {
+        if (fast_pid_init() != 0) return;
     }
     int proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (proc_fd < 0) return;
     char cmd_buf[256];
     while (true) {
         long nread = syscall(SYS_getdents64, proc_fd, g_dirent_buf, DIRENT_BUF_SIZE);
-        if (nread == -1) { 
-            if (errno == EINTR) continue; 
-            break; 
+        if (nread == -1) {
+            if (errno == EINTR) continue;
+            break;
         }
         if (nread == 0) break;
         for (long bpos = 0; bpos < nread;) {
             struct linux_dirent64* d = (struct linux_dirent64*)(g_dirent_buf + bpos);
-            if (d->d_reclen == 0) break; 
+            if (d->d_reclen == 0) break;
             if (d->d_type == DT_DIR) {
                 char first = d->d_name[0];
                 if (first >= '1' && first <= '9') {
                     int pid = atoi(d->d_name);
-                    if (is_pid_cached(pid)) { 
-                        bpos += d->d_reclen; 
-                        continue; 
+                    if (is_pid_cached(pid)) {
+                        bpos += d->d_reclen;
+                        continue;
                     }
                     if (proc_get_cmdline(pid, cmd_buf, sizeof(cmd_buf))) {
                         int cb_ret = callback(pid, cmd_buf, data);

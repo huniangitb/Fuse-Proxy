@@ -22,12 +22,12 @@
 
 /* FTP 服务器配置（FtpServerCfg：段名/连接/远程根） */
 typedef struct FtpServerCfg {
-    char name[64];          /* 服务器名（ftp.conf 段名）：虚拟前缀 /<name> + 变量名 FTP_<name> */
+    char name[64]; /* 服务器名（ftp.conf 段名）：虚拟前缀 /<name> + 变量名 FTP_<name> */
     char host[256];
     int port;
     char user[64];
     char pass[128];
-    char remote_dir[512];   /* 远程根目录（默认 "/"） */
+    char remote_dir[512]; /* 远程根目录（默认 "/"） */
 } FtpServerCfg;
 
 typedef struct FtpServerList {

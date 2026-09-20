@@ -3,7 +3,7 @@
 #include "ftp_backend.h"
 #include "nsp_module.h"
 #include "nsp_module.h"
-#include "nsp_util.h"   /* nsp_set_thread_name（线程语义化命名） */
+#include "nsp_util.h" /* nsp_set_thread_name（线程语义化命名） */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,9 +80,9 @@ static void reload_ftp_conf(void) {
         if (ftp_backend_add(&list.servers[i]) != 0) continue;
         snprintf(g_var_names[vi], sizeof g_var_names[vi], "FTP_%s", list.servers[i].name);
         snprintf(g_var_values[vi], sizeof g_var_values[vi], "/%s", list.servers[i].name);
-        LOG("ftp_module: 注册后端 /%s → FTP %s:%d%s (server=%s)",
-            list.servers[i].name, list.servers[i].host, list.servers[i].port,
-            list.servers[i].remote_dir, list.servers[i].name);
+        LOG("ftp_module: 注册后端 /%s → FTP %s:%d%s (server=%s)", list.servers[i].name,
+            list.servers[i].host, list.servers[i].port, list.servers[i].remote_dir,
+            list.servers[i].name);
         vi++;
     }
     if (ftp_backend_count() == 0)
@@ -119,14 +119,14 @@ static void* ftp_conf_watch_thread(void* arg) {
         close(fd);
         return NULL;
     }
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
     char buf[4096];
     while (!g_hotload_stop) {
         int r = poll(&pfd, 1, 1000);
         if (r <= 0) continue;
         ssize_t n = read(fd, buf, sizeof buf);
         if (n <= 0) continue;
-        for (size_t off = 0; off + sizeof(struct inotify_event) <= (size_t)n; ) {
+        for (size_t off = 0; off + sizeof(struct inotify_event) <= (size_t)n;) {
             struct inotify_event* ev = (struct inotify_event*)(buf + off);
             if (ev->len > 0 && strcmp(ev->name, fname) == 0) {
                 LOG("ftp_module: 检测到 ftp.conf 变更，热重载");
@@ -151,8 +151,7 @@ static int ftp_module_init(const NspFrameworkApi* api) {
             char* slash = strrchr(dir, '/');
             if (slash) {
                 *slash = '\0';
-                if (dir[0])
-                    snprintf(g_ftp_conf_path, sizeof g_ftp_conf_path, "%s/ftp.conf", dir);
+                if (dir[0]) snprintf(g_ftp_conf_path, sizeof g_ftp_conf_path, "%s/ftp.conf", dir);
             }
         }
     }
@@ -182,20 +181,13 @@ static void ftp_module_exit(void) {
 
 static const NspModuleOps ftp_module_ops = {
     /* 后端 I/O：只提供方法，执行由框架 FUSE 回调驱动 */
-    .backend_match    = ftp_backend_match,
-    .backend_getattr  = ftp_backend_getattr,
-    .backend_readdir  = ftp_backend_readdir,
-    .backend_open     = ftp_backend_open,
-    .backend_read     = ftp_backend_read,
-    .backend_write    = ftp_backend_write,
-    .backend_flush    = ftp_backend_flush,
-    .backend_release  = ftp_backend_release,
-    .backend_create   = ftp_backend_create,
-    .backend_unlink   = ftp_backend_unlink,
-    .backend_mkdir    = ftp_backend_mkdir,
-    .backend_rmdir    = ftp_backend_rmdir,
-    .backend_rename   = ftp_backend_rename,
-    .backend_truncate = ftp_backend_truncate,
+    .backend_match = ftp_backend_match,     .backend_getattr = ftp_backend_getattr,
+    .backend_readdir = ftp_backend_readdir, .backend_open = ftp_backend_open,
+    .backend_read = ftp_backend_read,       .backend_write = ftp_backend_write,
+    .backend_flush = ftp_backend_flush,     .backend_release = ftp_backend_release,
+    .backend_create = ftp_backend_create,   .backend_unlink = ftp_backend_unlink,
+    .backend_mkdir = ftp_backend_mkdir,     .backend_rmdir = ftp_backend_rmdir,
+    .backend_rename = ftp_backend_rename,   .backend_truncate = ftp_backend_truncate,
     .get_vars = ftp_module_get_vars,
 };
 

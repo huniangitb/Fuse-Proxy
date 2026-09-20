@@ -1,0 +1,54 @@
+# Fuse-Proxy C 代码格式化配置
+#
+# 从既有代码反推（非套用上游默认值），按各风格的主导写法取值：
+#   - 4 空格缩进、不用 Tab、大括号 Attach（实测函数定义行尾带 `{`，
+#     如 src/core/nsp_util.c:20）
+#   - 指针靠类型（`const char* s`）：实测 1237 处 vs 名字侧 576 处，取多数
+#   - 短 if / 短 for / 短 case 允许单行（实测
+#     `if (st == nullptr) VFS_RETURN(-EINVAL);`、global_replace_ctl.c:52）
+#   - `{0}` 无空格初始化（实测 92 处 vs 1 处）
+#   - case 标签缩进 4 空格
+#   - 宏值连续对齐（实测 include/nsp_module.h 的 NSP_CAP_* 组）
+#   - 禁止重排 include：项目用 compat/ 转接头把 <fuse3/...> 映射到子模块，
+#     顺序与分组有语义
+#   - 禁止重排注释：源文件含大量中文注释且刻意对齐，重排会破坏可读性
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+BreakBeforeBraces: Attach
+AllowShortIfStatementsOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Never
+IndentCaseLabels: true
+
+PointerAlignment: Left
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+
+AlignAfterOpenBracket: Align
+AlignConsecutiveMacros: Consecutive
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+
+SortIncludes: false
+ReflowComments: false
+# 不拆分超长字符串字面量：拆分虽在 C 里语义等价（相邻字面量编译期拼接），
+# 但会让中文日志文本在源码中断开，且使"格式化 = 纯空白变更"这一校验判据失效
+BreakStringLiterals: false
+
+BinPackArguments: true
+BinPackParameters: true
+Cpp11BracedListStyle: true
+
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1

@@ -1,0 +1,38 @@
+# Fuse-Proxy 编辑器基础约定（格式细则以 .clang-format 为准）
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{c,h}]
+indent_size = 4
+
+[*.{py}]
+indent_size = 4
+
+[*.{md,json,yaml,yml,ini,conf,rules}]
+indent_size = 2
+trim_trailing_whitespace = false
+
+[*.{sh,bash}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+# 第三方子模块与收录头：不施加本项目风格
+[subprojects/**]
+indent_style = unset
+indent_size = unset
+end_of_line = unset
+trim_trailing_whitespace = unset
+insert_final_newline = unset
+
+[src/zygisk/zygisk.hpp]
+indent_style = unset
+indent_size = unset

@@ -1,5 +1,5 @@
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE   /* pthread_setname_np 声明所需（模块侧无 -D_GNU_SOURCE 时） */
+#define _GNU_SOURCE /* pthread_setname_np 声明所需（模块侧无 -D_GNU_SOURCE 时） */
 #endif
 #include "nsp_util.h"
 #include <ctype.h>
@@ -17,20 +17,20 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-char *nsp_str_trim(char *s) {
+char* nsp_str_trim(char* s) {
     if (!s) return s;
     while (*s && isspace((unsigned char)*s)) s++;
-    char *end = s + strlen(s);
+    char* end = s + strlen(s);
     while (end > s && isspace((unsigned char)end[-1])) end--;
     *end = '\0';
     return s;
 }
 
-void nsp_send_all(int fd, const char *buf, size_t len) {
+void nsp_send_all(int fd, const char* buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR) continue;   /* 信号中断继续，防止大 JSON 应答截断 */
+            if (errno == EINTR) continue; /* 信号中断继续，防止大 JSON 应答截断 */
             return;
         }
         if (n == 0) return;
@@ -39,7 +39,7 @@ void nsp_send_all(int fd, const char *buf, size_t len) {
     }
 }
 
-socklen_t nsp_uds_abstract_addr(struct sockaddr_un *addr, const char *name) {
+socklen_t nsp_uds_abstract_addr(struct sockaddr_un* addr, const char* name) {
     memset(addr, 0, sizeof(*addr));
     addr->sun_family = AF_UNIX;
     addr->sun_path[0] = '\0';
@@ -50,17 +50,20 @@ socklen_t nsp_uds_abstract_addr(struct sockaddr_un *addr, const char *name) {
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(addr->sun_path + 1));
 }
 
-int nsp_mkdir_p(const char *path, mode_t mode) {
+int nsp_mkdir_p(const char* path, mode_t mode) {
     if (!path || !*path) return -1;
     char tmp[4096];
     size_t n = strlen(path);
-    if (n >= sizeof(tmp)) return -1;   /* 拒绝超长输入，杜绝 snprintf 静默截断 */
+    if (n >= sizeof(tmp)) return -1; /* 拒绝超长输入，杜绝 snprintf 静默截断 */
     memcpy(tmp, path, n + 1);
     if (n > 0 && tmp[n - 1] == '/') tmp[n - 1] = '\0';
-    for (char *p = tmp + 1; *p; p++) {
+    for (char* p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            if (mkdir(tmp, mode) != 0 && errno != EEXIST) { *p = '/'; return -1; }
+            if (mkdir(tmp, mode) != 0 && errno != EEXIST) {
+                *p = '/';
+                return -1;
+            }
             *p = '/';
         }
     }
@@ -71,7 +74,7 @@ int nsp_mkdir_p(const char *path, mode_t mode) {
 void nsp_escape_cgroup(void) {
     char pid_s[32];
     snprintf(pid_s, sizeof(pid_s), "%d", (int)getpid());
-    const char *targets[] = {
+    const char* targets[] = {
         "/sys/fs/cgroup/cgroup.procs", /* v2 根 cgroup */
         "/dev/cpuctl/tasks",           /* v1 cpu */
         "/dev/cpuset/tasks",           /* v1 cpuset */
@@ -90,9 +93,9 @@ void nsp_escape_cgroup(void) {
 void nsp_daemonize(int preserve_fd) {
     pid_t pid = fork();
     if (pid < 0) exit(1);
-    if (pid > 0) exit(0);   /* 父进程退出，service.sh 无需 & 即返回 */
+    if (pid > 0) exit(0); /* 父进程退出，service.sh 无需 & 即返回 */
     setsid();
-    pid = fork();           /* 二次 fork 确保不重新获得控制终端 */
+    pid = fork(); /* 二次 fork 确保不重新获得控制终端 */
     if (pid < 0) exit(1);
     if (pid > 0) exit(0);
     /* SIGPIPE 忽略必须在 daemonize 后设置：fork 子进程继承信号表，
@@ -113,7 +116,7 @@ void nsp_daemonize(int preserve_fd) {
     }
 }
 
-void nsp_set_thread_name(const char *name) {
+void nsp_set_thread_name(const char* name) {
     if (!name || !name[0]) return;
 #ifdef __linux__
     /* TASK_COMM_LEN=16（含 NUL）：超长截断，调用方无需预处理 */

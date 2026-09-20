@@ -29,8 +29,7 @@ static int fixed_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
-        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s",
-                 test_storage(), rest);
+        snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
         snprintf(out->redir_target, sizeof out->redir_target, "/virt");
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
@@ -51,17 +50,17 @@ static int fixed_probe(const NspQueryCtx* q, NspProbeResult* out) {
 
 static const NspModuleOps fixed_ops = {
     .resolve = fixed_resolve,
-    .probe   = fixed_probe,
+    .probe = fixed_probe,
 };
 
 const NspModuleInfo nsp_module_info = {
-    .magic       = NSP_MODULE_MAGIC,
+    .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type        = NSP_MODULE_TYPE_RULES,
-    .caps        = NSP_CAP_REDIRECT,
-    .name        = "bad_rules",
-    .version     = "1.1-fixed",
-    .init        = NULL,
-    .exit        = NULL,
-    .ops         = &fixed_ops,
+    .type = NSP_MODULE_TYPE_RULES,
+    .caps = NSP_CAP_REDIRECT,
+    .name = "bad_rules",
+    .version = "1.1-fixed",
+    .init = NULL,
+    .exit = NULL,
+    .ops = &fixed_ops,
 };

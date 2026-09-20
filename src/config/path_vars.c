@@ -18,14 +18,13 @@ bool pkg_resolvable(const char* pkg) {
 static bool starts_with_root(const char* path, const char* root) {
     size_t rl = strlen(root);
     if (strncmp(path, root, rl) != 0) return false;
-    char c = path[rl];  /* strncmp 已保证 strlen(path) >= rl，此处不越界 */
+    char c = path[rl]; /* strncmp 已保证 strlen(path) >= rl，此处不越界 */
     return c == '\0' || c == '/';
 }
 
 bool is_system_abs_path(const char* path) {
     if (!path || path[0] != '/') return false;
-    return starts_with_root(path, "/data") ||
-           starts_with_root(path, "/mnt") ||
+    return starts_with_root(path, "/data") || starts_with_root(path, "/mnt") ||
            starts_with_root(path, "/storage");
 }
 
@@ -41,7 +40,7 @@ bool parse_var_assignment(const char* line, char* name, size_t nname, char* valu
     if (name_len == 0 || name_len >= nname) return false;
     memcpy(name, name_start, name_len);
     name[name_len] = '\0';
-    p++;  /* 跳过 '=' */
+    p++; /* 跳过 '=' */
     strncpy(value, p, nval - 1);
     value[nval - 1] = '\0';
     return true;
@@ -54,7 +53,7 @@ typedef struct {
     const AppConfig* app_cfg;
     const AppConfig* global_cfg;
     const char* current_pkg;
-    char stack[32][64];   /* 展开栈，循环检测 */
+    char stack[32][64]; /* 展开栈，循环检测 */
     int stack_n;
 } expand_ctx;
 
@@ -76,8 +75,11 @@ static const char* parse_dollar(const char* p, char* buf, size_t bufsz, bool* ok
         size_t k = 0;
         while (*p && *p != '}' && k + 1 < bufsz) buf[k++] = *p++;
         buf[k] = '\0';
-        if (*p == '}') { p++; *ok = (k > 0); }
-        else *ok = false;   /* 未闭合 */
+        if (*p == '}') {
+            p++;
+            *ok = (k > 0);
+        } else
+            *ok = false; /* 未闭合 */
     } else if (isalpha((unsigned char)*p) || *p == '_') {
         size_t k = 0;
         while ((isalnum((unsigned char)*p) || *p == '_') && k + 1 < bufsz) buf[k++] = *p++;
@@ -94,14 +96,14 @@ static const char* parse_dollar(const char* p, char* buf, size_t bufsz, bool* ok
 static const char* lookup_var(expand_ctx* c, const char* name, bool* is_resolved) {
     *is_resolved = false;
     if (strcmp(name, "package") == 0) return c->current_pkg;
-    const AppConfig* arrs[2] = { c->app_cfg, c->global_cfg };
+    const AppConfig* arrs[2] = {c->app_cfg, c->global_cfg};
     for (int a = 0; a < 2; a++) {
         const AppConfig* cfg = arrs[a];
         if (!cfg || !cfg->var_names) continue;
         for (int i = 0; i < cfg->var_count; i++) {
             if (cfg->var_names[i] && strcmp(cfg->var_names[i], name) == 0) {
-                if (cfg->var_is_static && cfg->var_is_static[i] &&
-                    cfg->var_resolved && cfg->var_resolved[i]) {
+                if (cfg->var_is_static && cfg->var_is_static[i] && cfg->var_resolved &&
+                    cfg->var_resolved[i]) {
                     *is_resolved = true;
                     return cfg->var_resolved[i];
                 }
@@ -122,17 +124,17 @@ static void expand_into(expand_ctx* c, const char* in) {
             bool ok;
             p = parse_dollar(p, name, sizeof name, &ok);
             if (!ok || name[0] == '\0') {
-                out_raw(c, before, (size_t)(p - before));   /* 保留原字面 */
+                out_raw(c, before, (size_t)(p - before)); /* 保留原字面 */
                 continue;
             }
             bool is_resolved;
             const char* val = lookup_var(c, name, &is_resolved);
             if (!val) {
-                out_raw(c, before, (size_t)(p - before));   /* 未知变量保留字面 */
+                out_raw(c, before, (size_t)(p - before)); /* 未知变量保留字面 */
                 continue;
             }
             if (is_resolved) {
-                out_raw(c, val, strlen(val));   /* 静态变量，直接拷入 */
+                out_raw(c, val, strlen(val)); /* 静态变量，直接拷入 */
                 continue;
             }
             /* 动态变量：递归展开，带循环检测 */
@@ -142,7 +144,10 @@ static void expand_into(expand_ctx* c, const char* in) {
             }
             bool loop = false;
             for (int i = 0; i < c->stack_n; i++) {
-                if (strcmp(c->stack[i], name) == 0) { loop = true; break; }
+                if (strcmp(c->stack[i], name) == 0) {
+                    loop = true;
+                    break;
+                }
             }
             if (loop) {
                 out_raw(c, before, (size_t)(p - before));
@@ -162,11 +167,10 @@ static void expand_into(expand_ctx* c, const char* in) {
     }
 }
 
-size_t expand_path_vars(const char* in, char* out, size_t outsz,
-                        const AppConfig* app_cfg, const AppConfig* global_cfg,
-                        const char* current_pkg) {
+size_t expand_path_vars(const char* in, char* out, size_t outsz, const AppConfig* app_cfg,
+                        const AppConfig* global_cfg, const char* current_pkg) {
     if (!in || !out || outsz == 0) return 0;
-    if (!strchr(in, '$')) {   /* memchr 短路 */
+    if (!strchr(in, '$')) { /* memchr 短路 */
         size_t n = strlen(in);
         if (n >= outsz) n = outsz - 1;
         memcpy(out, in, n);
@@ -175,8 +179,10 @@ size_t expand_path_vars(const char* in, char* out, size_t outsz,
     }
     expand_ctx c;
     memset(&c, 0, sizeof c);
-    c.out = out; c.outsz = outsz;
-    c.app_cfg = app_cfg; c.global_cfg = global_cfg;
+    c.out = out;
+    c.outsz = outsz;
+    c.app_cfg = app_cfg;
+    c.global_cfg = global_cfg;
     c.current_pkg = current_pkg;
     expand_into(&c, in);
     if (c.pos >= outsz) c.pos = outsz - 1;
@@ -198,12 +204,13 @@ static int scan_value_state(const char* val, const AppConfig* cfg, const int* st
                             const AppConfig* global, bool* pending) {
     *pending = false;
     if (!val) return 1;
-    for (const char* p = val; *p; ) {
+    for (const char* p = val; *p;) {
         if (*p == '$') {
-            char name[128]; bool ok;
+            char name[128];
+            bool ok;
             const char* after = parse_dollar(p, name, sizeof name, &ok);
             if (ok && name[0]) {
-                if (strcmp(name, "package") == 0) return 2;   /* 系统动态变量 */
+                if (strcmp(name, "package") == 0) return 2; /* 系统动态变量 */
                 int idx = find_var_index(cfg, name);
                 if (idx >= 0) {
                     if (state[idx] == 2) return 2;
@@ -219,30 +226,36 @@ static int scan_value_state(const char* val, const AppConfig* cfg, const int* st
                 }
                 p = after;
             } else {
-                p = after;   /* 非合法引用，按字面处理 */
+                p = after; /* 非合法引用，按字面处理 */
             }
         } else {
             p++;
         }
     }
-    return *pending ? 0 : 1;   /* 无动态因素：无 pending 则静态 */
+    return *pending ? 0 : 1; /* 无动态因素：无 pending 则静态 */
 }
 
 void analyze_var_staticness(AppConfig* cfg, const AppConfig* global_cfg) {
     int n = cfg->var_count;
     if (n <= 0) return;
-    int* state = calloc((size_t)n, sizeof(int));   /* 0=unknown */
+    int* state = calloc((size_t)n, sizeof(int)); /* 0=unknown */
     if (!state) return;
     bool changed = true;
     int rounds = 0;
     while (changed && rounds <= n) {
-        changed = false; rounds++;
+        changed = false;
+        rounds++;
         for (int i = 0; i < n; i++) {
             if (state[i] != 0) continue;
             bool pending = false;
             int st = scan_value_state(cfg->var_values[i], cfg, state, global_cfg, &pending);
-            if (st == 2) { state[i] = 2; changed = true; }
-            else if (st == 1) { state[i] = 1; changed = true; }
+            if (st == 2) {
+                state[i] = 2;
+                changed = true;
+            } else if (st == 1) {
+                state[i] = 1;
+                changed = true;
+            }
             /* st==0 保持未定 */
         }
     }
@@ -253,7 +266,8 @@ void analyze_var_staticness(AppConfig* cfg, const AppConfig* global_cfg) {
         if (state[i] == 1) {
             cfg->var_resolved[i] = malloc(PATH_MAX);
             if (cfg->var_resolved[i]) {
-                expand_path_vars(cfg->var_values[i], cfg->var_resolved[i], PATH_MAX, cfg, global_cfg, "pkg");
+                expand_path_vars(cfg->var_values[i], cfg->var_resolved[i], PATH_MAX, cfg,
+                                 global_cfg, "pkg");
             }
         }
     }
@@ -268,7 +282,7 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
     char expanded[PATH_MAX * 4];
     const char* t = target;
     if (has_path_var(target)) {
-        if (!pkg_resolvable(current_pkg)) return false;   /* 规则失效 */
+        if (!pkg_resolvable(current_pkg)) return false; /* 规则失效 */
         expand_path_vars(target, expanded, sizeof expanded, app_cfg, global_cfg, current_pkg);
         t = expanded;
     }

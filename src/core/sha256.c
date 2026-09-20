@@ -15,16 +15,21 @@ static const uint32_t K[64] = {
     0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
     0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-};
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
 
-static inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+static inline uint32_t rotr32(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
 
 void sha256_init(Sha256Ctx* c) {
-    c->state[0] = 0x6a09e667; c->state[1] = 0xbb67ae85;
-    c->state[2] = 0x3c6ef372; c->state[3] = 0xa54ff53a;
-    c->state[4] = 0x510e527f; c->state[5] = 0x9b05688c;
-    c->state[6] = 0x1f83d9ab; c->state[7] = 0x5be0cd19;
+    c->state[0] = 0x6a09e667;
+    c->state[1] = 0xbb67ae85;
+    c->state[2] = 0x3c6ef372;
+    c->state[3] = 0xa54ff53a;
+    c->state[4] = 0x510e527f;
+    c->state[5] = 0x9b05688c;
+    c->state[6] = 0x1f83d9ab;
+    c->state[7] = 0x5be0cd19;
     c->len = 0;
     c->buflen = 0;
 }
@@ -49,10 +54,23 @@ static void sha256_block(Sha256Ctx* c, const uint8_t* p) {
         uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
         uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
         uint32_t t2 = S0 + maj;
-        h = g; g = f; f = e; e = d + t1; d = cc; cc = b; b = a; a = t1 + t2;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = cc;
+        cc = b;
+        b = a;
+        a = t1 + t2;
     }
-    c->state[0] += a; c->state[1] += b; c->state[2] += cc; c->state[3] += d;
-    c->state[4] += e; c->state[5] += f; c->state[6] += g; c->state[7] += h;
+    c->state[0] += a;
+    c->state[1] += b;
+    c->state[2] += cc;
+    c->state[3] += d;
+    c->state[4] += e;
+    c->state[5] += f;
+    c->state[6] += g;
+    c->state[7] += h;
 }
 
 void sha256_update(Sha256Ctx* c, const void* data, size_t len) {
@@ -98,13 +116,11 @@ void sha256_final(Sha256Ctx* c, uint8_t out[32]) {
     uint8_t lenb[8];
     int i;
     sha256_update(c, &pad, 1);
-    while (c->buflen != 56)
-        sha256_update(c, &z, 1);
-    for (i = 0; i < 8; i++)
-        lenb[i] = (uint8_t)(bits >> (56 - i * 8));
+    while (c->buflen != 56) sha256_update(c, &z, 1);
+    for (i = 0; i < 8; i++) lenb[i] = (uint8_t)(bits >> (56 - i * 8));
     sha256_update(c, lenb, 8);
     for (i = 0; i < 8; i++) {
-        out[i * 4]     = (uint8_t)(c->state[i] >> 24);
+        out[i * 4] = (uint8_t)(c->state[i] >> 24);
         out[i * 4 + 1] = (uint8_t)(c->state[i] >> 16);
         out[i * 4 + 2] = (uint8_t)(c->state[i] >> 8);
         out[i * 4 + 3] = (uint8_t)c->state[i];
@@ -127,14 +143,13 @@ int sha256_file_hex(const char* path, char out_hex[65]) {
     int i;
     if (fd < 0) return -1;
     sha256_init(&c);
-    while ((n = read(fd, buf, sizeof buf)) > 0)
-        sha256_update(&c, buf, (size_t)n);
-    close(fd);   /* fd 用后即关：不长期持有磁盘模块文件句柄 */
+    while ((n = read(fd, buf, sizeof buf)) > 0) sha256_update(&c, buf, (size_t)n);
+    close(fd); /* fd 用后即关：不长期持有磁盘模块文件句柄 */
     if (n < 0) return -1;
     sha256_final(&c, d);
     for (i = 0; i < 32; i++) {
         static const char* hex = "0123456789abcdef";
-        out_hex[i * 2]     = hex[d[i] >> 4];
+        out_hex[i * 2] = hex[d[i] >> 4];
         out_hex[i * 2 + 1] = hex[d[i] & 15];
     }
     out_hex[64] = '\0';

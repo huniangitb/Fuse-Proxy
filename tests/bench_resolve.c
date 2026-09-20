@@ -23,43 +23,65 @@
    注意：必须非 static，且编译加 -Wl,--export-dynamic，dlopen 才能解析 */
 volatile int g_log_shutdown;
 const char* g_real_root = "/tmp/fuse_rules_test/storage";
-int is_media_provider(const char* p) { (void)p; return 0; }
-void log_internal(int level, const char* fmt, ...) { (void)level; (void)fmt; }
-int mkdir_recursive_p(const char* p) { (void)p; return 0; }
-int path_contains_invalid_chars(const char* p) { (void)p; return 0; }
+int is_media_provider(const char* p) {
+    (void)p;
+    return 0;
+}
+void log_internal(int level, const char* fmt, ...) {
+    (void)level;
+    (void)fmt;
+}
+int mkdir_recursive_p(const char* p) {
+    (void)p;
+    return 0;
+}
+int path_contains_invalid_chars(const char* p) {
+    (void)p;
+    return 0;
+}
 int path_sanitize(char* dst, size_t n, const char* src) {
-    (void)n; snprintf(dst, n, "%s", src); return 0;
+    (void)n;
+    snprintf(dst, n, "%s", src);
+    return 0;
 }
 /* nsp_module.h 的 LOG 宏转发到 log_internal（桩已提供） */
 
 static const char* g_rules_path = "/tmp/fuse_rules_test/injector.conf";
-static const char* api_get_rules_path(void) { return g_rules_path; }
-static uint32_t api_get_flags(void) { return 0; }
-static void api_log(int level, const char* fmt, ...) { (void)level; (void)fmt; }
+static const char* api_get_rules_path(void) {
+    return g_rules_path;
+}
+static uint32_t api_get_flags(void) {
+    return 0;
+}
+static void api_log(int level, const char* fmt, ...) {
+    (void)level;
+    (void)fmt;
+}
 
 static const NspModuleOps* g_ops = NULL;
 
 /* ---- 压测参数 ---- */
-#define QN 100000       /* 每线程 resolve 次数 */
-#define PN 200000       /* 每线程 probe 次数 */
+#define QN 100000 /* 每线程 resolve 次数 */
+#define PN 200000 /* 每线程 probe 次数 */
 static const char* g_paths[] = {
-    "/0/云盘/photo.jpg",          /* REDIRECT 命中（全局） */
-    "/0/Download/Pics/a.jpg",     /* RO 命中 */
-    "/0/secret/x.txt",            /* HIDE 命中 */
-    "/0/Download/Music/s.mp3",    /* ALLOW 命中 */
-    "/0/DCIM/camera/IMG_1.jpg",   /* 未命中规则：默认路径 */
+    "/0/云盘/photo.jpg",                         /* REDIRECT 命中（全局） */
+    "/0/Download/Pics/a.jpg",                    /* RO 命中 */
+    "/0/secret/x.txt",                           /* HIDE 命中 */
+    "/0/Download/Music/s.mp3",                   /* ALLOW 命中 */
+    "/0/DCIM/camera/IMG_1.jpg",                  /* 未命中规则：默认路径 */
     "/0/Android/data/com.other.app/files/a.txt", /* 其他应用 */
-    "/10123/Download/f.mp4",      /* app uid + 无规则 */
-    "/0/",                        /* 根 */
+    "/10123/Download/f.mp4",                     /* app uid + 无规则 */
+    "/0/",                                       /* 根 */
 };
 #define NPATH (int)(sizeof(g_paths) / sizeof(g_paths[0]))
-static const uid_t g_uids[] = { 2000, 10123, 10123, 2000, 10123, 2000, 10123, 10123 };
+static const uid_t g_uids[] = {2000, 10123, 10123, 2000, 10123, 2000, 10123, 10123};
 
 static pthread_barrier_t g_bar;
 static atomic_ullong g_total_ns;
 
 static double now_ns(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
 }
 
@@ -70,8 +92,7 @@ static void* resolve_worker(void* arg) {
     NspResolveResult out;
     for (int i = 0; i < QN; i++) {
         int k = (int)((seed * 31 + i) % NPATH);
-        NspQueryCtx q = { .uid = g_uids[k], .pid = (pid_t)getpid(),
-                          .gid = 0, .path = g_paths[k] };
+        NspQueryCtx q = {.uid = g_uids[k], .pid = (pid_t)getpid(), .gid = 0, .path = g_paths[k]};
         g_ops->resolve(&q, &out);
     }
     double dt = now_ns() - t0;
@@ -86,8 +107,7 @@ static void* probe_worker(void* arg) {
     NspProbeResult out;
     for (int i = 0; i < PN; i++) {
         int k = (int)((seed * 17 + i) % NPATH);
-        NspQueryCtx q = { .uid = g_uids[k], .pid = (pid_t)getpid(),
-                          .gid = 0, .path = g_paths[k] };
+        NspQueryCtx q = {.uid = g_uids[k], .pid = (pid_t)getpid(), .gid = 0, .path = g_paths[k]};
         g_ops->probe(&q, &out);
     }
     double dt = now_ns() - t0;
@@ -107,8 +127,8 @@ static void run_bench(const char* name, void* (*fn)(void*), int n, long iters) {
     double total_work = (double)n * (double)iters;
     double ops = total_work / (wall / 1e9);
     double per = (double)g_total_ns / total_work;
-    printf("  %-8s %2d 线程: %10.0f ops/s   单次均值 %7.0f ns   墙钟 %6.3f s\n",
-           name, n, ops, per, wall / 1e9);
+    printf("  %-8s %2d 线程: %10.0f ops/s   单次均值 %7.0f ns   墙钟 %6.3f s\n", name, n, ops, per,
+           wall / 1e9);
     fflush(stdout);
 }
 
@@ -121,9 +141,15 @@ int main(int argc, char** argv) {
     if (!module_path) module_path = getenv("BENCH_MODULE");
     if (!module_path) module_path = "build_gnu/basic_rules.so";
     void* h = dlopen(module_path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) { fprintf(stderr, "dlopen 失败(%s): %s\n", module_path, dlerror()); return 1; }
+    if (!h) {
+        fprintf(stderr, "dlopen 失败(%s): %s\n", module_path, dlerror());
+        return 1;
+    }
     NspModuleInfo* info = (NspModuleInfo*)dlsym(h, "nsp_module_info");
-    if (!info) { fprintf(stderr, "dlsym 失败\n"); return 1; }
+    if (!info) {
+        fprintf(stderr, "dlsym 失败\n");
+        return 1;
+    }
     NspFrameworkApi api = {
         .api_version = NSP_FRAMEWORK_API_VERSION,
         .log = api_log,
@@ -131,11 +157,14 @@ int main(int argc, char** argv) {
         .get_rules_path = api_get_rules_path,
         .get_flags = api_get_flags,
     };
-    if (info->init(&api) != 0) { fprintf(stderr, "模块 init 失败\n"); return 1; }
+    if (info->init(&api) != 0) {
+        fprintf(stderr, "模块 init 失败\n");
+        return 1;
+    }
     g_ops = info->ops;
     printf("规则引擎: %s (rules=%s)\n", info->name, g_rules_path);
 
-    int threads[] = { 1, 2, 4, 8 };
+    int threads[] = {1, 2, 4, 8};
     int nt = (argc > 2) ? atoi(argv[2]) : 4;
     printf("resolve 压测（每线程 %d 次）:\n", QN);
     for (int i = 0; i < nt; i++) run_bench("resolve", resolve_worker, threads[i], QN);

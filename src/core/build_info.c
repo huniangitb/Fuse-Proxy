@@ -27,41 +27,35 @@ const char* nsp_git_hash(void) {
 /* 采集行不带 [proc] 前缀：LOG() 路径由 log_frame_packet 按 g_proc_name
  * 自动添加，直推 log_monitor 环形缓冲的调用方自行拼接（见 log_monitor.c，
  * 与 "[log_monitor] 加载监控忽略规则完成" 等既有行格式对齐）。 */
-int nsp_collect_build_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],
-                              int max_lines) {
+int nsp_collect_build_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX], int max_lines) {
     if (!out || max_lines <= 0) return 0;
     (void)proc;
     int n = 0;
-    snprintf(out[n], NSP_BUILD_LINE_MAX,
-             "build: git=%s version=%s mode=%s built=%s %s",
-             NSP_GIT_HASH, NSP_PROJECT_VERSION, NSP_BUILD_MODE,
-             __DATE__, __TIME__);
+    snprintf(out[n], NSP_BUILD_LINE_MAX, "build: git=%s version=%s mode=%s built=%s %s",
+             NSP_GIT_HASH, NSP_PROJECT_VERSION, NSP_BUILD_MODE, __DATE__, __TIME__);
     n++;
     if (n >= max_lines) return n;
 #ifdef TARGET_ANDROID
-    snprintf(out[n], NSP_BUILD_LINE_MAX, "build: target=android compiler=%s",
-             __VERSION__);
+    snprintf(out[n], NSP_BUILD_LINE_MAX, "build: target=android compiler=%s", __VERSION__);
 #else
-    snprintf(out[n], NSP_BUILD_LINE_MAX, "build: target=gnu compiler=%s",
-             __VERSION__);
+    snprintf(out[n], NSP_BUILD_LINE_MAX, "build: target=gnu compiler=%s", __VERSION__);
 #endif
     n++;
     return n;
 }
 
 /* 首个 "key:" 行的值（去首尾空白），未找到返回 false */
-static bool cpuinfo_first(const char* data, const char* key,
-                          char* out, size_t out_sz) {
+static bool cpuinfo_first(const char* data, const char* key, char* out, size_t out_sz) {
     size_t klen = strlen(key);
-    for (const char* p = data; p && *p; ) {
+    for (const char* p = data; p && *p;) {
         const char* nl = strchr(p, '\n');
         size_t llen = nl ? (size_t)(nl - p) : strlen(p);
         if (llen > klen && strncmp(p, key, klen) == 0 && p[klen] == ':') {
             const char* v = p + klen + 1;
             while (*v == ' ' || *v == '\t') v++;
             size_t vlen = (p + llen) - v;
-            while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t' ||
-                                v[vlen - 1] == '\r')) vlen--;
+            while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t' || v[vlen - 1] == '\r'))
+                vlen--;
             if (vlen >= out_sz) vlen = out_sz - 1;
             memcpy(out, v, vlen);
             out[vlen] = '\0';
@@ -73,8 +67,7 @@ static bool cpuinfo_first(const char* data, const char* key,
     return false;
 }
 
-int nsp_collect_env_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],
-                            int max_lines) {
+int nsp_collect_env_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX], int max_lines) {
     if (!out || max_lines <= 0) return 0;
     (void)proc;
     int n = 0;
@@ -82,9 +75,8 @@ int nsp_collect_env_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],
     /* 内核：uname 一次调用（失败则跳过，不阻断） */
     struct utsname u;
     if (uname(&u) == 0 && n < max_lines) {
-        snprintf(out[n], NSP_BUILD_LINE_MAX,
-                 "env: uname=%s %s %s %s",
-                 u.sysname, u.release, u.version, u.machine);
+        snprintf(out[n], NSP_BUILD_LINE_MAX, "env: uname=%s %s %s %s", u.sysname, u.release,
+                 u.version, u.machine);
         n++;
     }
 
@@ -100,16 +92,14 @@ int nsp_collect_env_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],
             int ncpu = 0;
             cpuinfo_first(data, "Hardware", hw, sizeof hw);
             cpuinfo_first(data, "model name", model, sizeof model);
-            for (const char* p = data; (p = strstr(p, "processor")) != NULL; ) {
+            for (const char* p = data; (p = strstr(p, "processor")) != NULL;) {
                 /* 仅统计行首 "processor\t:" 形态，避免误数正文 */
                 if (p == data || *(p - 1) == '\n') ncpu++;
                 p += 9;
             }
             if ((hw[0] || model[0] || ncpu > 0) && n < max_lines) {
-                snprintf(out[n], NSP_BUILD_LINE_MAX,
-                         "env: cpu: hardware=%s model=%s ncpu=%d",
-                         hw[0] ? hw : "-",
-                         model[0] ? model : "-", ncpu);
+                snprintf(out[n], NSP_BUILD_LINE_MAX, "env: cpu: hardware=%s model=%s ncpu=%d",
+                         hw[0] ? hw : "-", model[0] ? model : "-", ncpu);
                 n++;
             }
         }
@@ -128,12 +118,10 @@ int nsp_collect_env_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],
         fclose(fp);
         if (total_kb >= 0 && n < max_lines) {
             if (avail_kb >= 0)
-                snprintf(out[n], NSP_BUILD_LINE_MAX,
-                         "env: mem: total=%ldkB avail=%ldkB",
-                         total_kb, avail_kb);
+                snprintf(out[n], NSP_BUILD_LINE_MAX, "env: mem: total=%ldkB avail=%ldkB", total_kb,
+                         avail_kb);
             else
-                snprintf(out[n], NSP_BUILD_LINE_MAX,
-                         "env: mem: total=%ldkB", total_kb);
+                snprintf(out[n], NSP_BUILD_LINE_MAX, "env: mem: total=%ldkB", total_kb);
             n++;
         }
     }
@@ -152,9 +140,8 @@ int nsp_collect_env_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],
     if (n < max_lines) {
         snprintf(out[n], NSP_BUILD_LINE_MAX,
                  "env: android release=%s sdk=%s brand=%s model=%s device=%s display=%s",
-                 rel[0] ? rel : "-", sdk[0] ? sdk : "-",
-                 brand[0] ? brand : "-", model[0] ? model : "-",
-                 device[0] ? device : "-", display[0] ? display : "-");
+                 rel[0] ? rel : "-", sdk[0] ? sdk : "-", brand[0] ? brand : "-",
+                 model[0] ? model : "-", device[0] ? device : "-", display[0] ? display : "-");
         n++;
     }
     if (fpv[0] && n < max_lines) {

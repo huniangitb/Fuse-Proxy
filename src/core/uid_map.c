@@ -18,10 +18,10 @@ static int compare_entries(const void* a, const void* b) {
  * 返回加载的条目数（不超过 max_entries）。
  * 调用方须保证 entries 指向至少能容纳 max_entries 个条目的内存。
  */
-int uid_map_load(UidMapEntry *entries, int max_entries) {
+int uid_map_load(UidMapEntry* entries, int max_entries) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), CONFIG_DIR "/uid.map");
-    FILE *fp = fopen(path, "re");
+    FILE* fp = fopen(path, "re");
     if (!fp) return 0;
     int count = 0;
     char line[256];
@@ -53,7 +53,7 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
     snprintf(tmp_path, sizeof(tmp_path), CONFIG_DIR "/uid.map.tmp");
 
     size_t capacity = UID_MAP_INIT_CAPACITY;
-    UidMapEntry *entries = malloc(capacity * sizeof(UidMapEntry));
+    UidMapEntry* entries = malloc(capacity * sizeof(UidMapEntry));
     if (!entries) {
         LOG_ERR("uid_map_upsert: malloc(%zu) 失败", capacity * sizeof(UidMapEntry));
         return UID_MAP_ERR_IO;
@@ -63,7 +63,7 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
     int count = uid_map_load(entries, capacity);
     while (count > 0 && count == (int)capacity) {
         capacity *= 2;
-        UidMapEntry *new_entries = realloc(entries, capacity * sizeof(UidMapEntry));
+        UidMapEntry* new_entries = realloc(entries, capacity * sizeof(UidMapEntry));
         if (!new_entries) {
             LOG_ERR("uid_map_upsert: realloc(%zu) 失败", capacity * sizeof(UidMapEntry));
             free(entries);
@@ -92,7 +92,7 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
     if (!updated) {
         if ((size_t)count >= capacity) {
             capacity = (capacity < UID_MAP_MAX_ENTRIES) ? UID_MAP_MAX_ENTRIES : capacity * 2;
-            UidMapEntry *new_entries = realloc(entries, capacity * sizeof(UidMapEntry));
+            UidMapEntry* new_entries = realloc(entries, capacity * sizeof(UidMapEntry));
             if (!new_entries) {
                 LOG_ERR("uid_map_upsert: realloc(%zu) 失败", capacity * sizeof(UidMapEntry));
                 free(entries);
@@ -107,7 +107,7 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
     }
 
     /* 4. 核心安全优化：先写入临时文件，确保写入动作的鲁棒性 */
-    FILE *fp = fopen(tmp_path, "we");
+    FILE* fp = fopen(tmp_path, "we");
     if (!fp) {
         LOG_ERR("uid_map_upsert: fopen(%s) 失败: %s", tmp_path, strerror(errno));
         free(entries);
@@ -141,7 +141,7 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
     return 0;
 }
 /* O(log N) 二分折半快速检索 */
-const char* uid_map_lookup(const UidMapEntry *entries, int count, uid_t uid) {
+const char* uid_map_lookup(const UidMapEntry* entries, int count, uid_t uid) {
     int low = 0;
     int high = count - 1;
     while (low <= high) {

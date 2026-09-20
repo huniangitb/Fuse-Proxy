@@ -20,7 +20,7 @@ static int bc_match(const char* path) {
     if (!path) return 0;
     if (strstr(path, "bcrash") != NULL) {
         volatile int* p = (int*)0;
-        *p = 1;                /* SIGSEGV → 围栏恢复（修复前此处带崩框架） */
+        *p = 1; /* SIGSEGV → 围栏恢复（修复前此处带崩框架） */
         return 1;
     }
     if (strstr(path, "bmatch") != NULL) return 1;
@@ -37,24 +37,26 @@ static int bc_getattr(const char* path, struct stat* st) {
 }
 
 static int bc_readdir(const char* path, NspDirEntry* entries, int max) {
-    (void)path; (void)entries; (void)max;
+    (void)path;
+    (void)entries;
+    (void)max;
     return 0; /* 空目录 */
 }
 
 static const NspModuleOps bc_ops = {
-    .backend_match   = bc_match,
+    .backend_match = bc_match,
     .backend_getattr = bc_getattr,
     .backend_readdir = bc_readdir,
 };
 
 const NspModuleInfo nsp_module_info = {
-    .magic       = NSP_MODULE_MAGIC,
+    .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type        = NSP_MODULE_TYPE_BACKEND,
-    .caps        = NSP_CAP_BACKEND_IO,
-    .name        = "backend_crash",
-    .version     = "1.0",
-    .init        = NULL,
-    .exit        = NULL,
-    .ops         = &bc_ops,
+    .type = NSP_MODULE_TYPE_BACKEND,
+    .caps = NSP_CAP_BACKEND_IO,
+    .name = "backend_crash",
+    .version = "1.0",
+    .init = NULL,
+    .exit = NULL,
+    .ops = &bc_ops,
 };

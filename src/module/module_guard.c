@@ -31,12 +31,12 @@ static int g_guard_window_sec = 10;
 static int g_guard_err_max = 5;
 
 /* 限流参数 */
-#define GUARD_LOG_BURST    5    /* 窗口内前 N 条明细全打 */
-#define GUARD_LOG_THROTTLE 100  /* 之后每 N 条打 1 条汇总 */
+#define GUARD_LOG_BURST    5   /* 窗口内前 N 条明细全打 */
+#define GUARD_LOG_THROTTLE 100 /* 之后每 N 条打 1 条汇总 */
 
 typedef struct {
     _Atomic unsigned err_count;   /* 当前滑动窗口内计数 */
-    _Atomic time_t   window_start;/* 窗口起点（0=无活动窗口） */
+    _Atomic time_t window_start;  /* 窗口起点（0=无活动窗口） */
     _Atomic unsigned total_count; /* 本加载周期累计（限流驱动 + 健康快照） */
     char last_op[32];             /* 最近错误 op（展示用；撕裂可接受） */
     _Atomic time_t last_err_time; /* 最近错误时刻（多线程读写，需原子访问） */
@@ -50,8 +50,9 @@ void module_guard_init(void) {
     if (ws && atoi(ws) > 0) g_guard_window_sec = atoi(ws);
     if (em && atoi(em) > 0) g_guard_err_max = atoi(em);
     for (int i = 0; i < MAX_MODULES; i++) module_guard_reset(i);
-    LOG_DBG("module_guard: 熔断参数 window=%ds max=%d (env: NSP_GUARD_WINDOW_SEC/NSP_GUARD_ERR_MAX)",
-            g_guard_window_sec, g_guard_err_max);
+    LOG_DBG(
+        "module_guard: 熔断参数 window=%ds max=%d (env: NSP_GUARD_WINDOW_SEC/NSP_GUARD_ERR_MAX)",
+        g_guard_window_sec, g_guard_err_max);
 }
 
 void module_guard_reset(int slot) {
@@ -82,13 +83,34 @@ bool nsp_guard_path_ok(const char* p) {
 int nsp_guard_validate_resolve(const NspResolveResult* r, char* detail, size_t dsz) {
     if (!r) return 8;
     /* 字符串字段 NUL 终止检查（模块写坏终止符 = 野指针/越界写指纹） */
-    if (!nsp_guard_str_ok(r->sub_path, PATH_MAX))         { if (detail) snprintf(detail, dsz, "sub_path 未终止"); return 1; }
-    if (!nsp_guard_str_ok(r->pkg, 128))                   { if (detail) snprintf(detail, dsz, "pkg 未终止"); return 2; }
-    if (!nsp_guard_str_ok(r->redir_target, PATH_MAX))     { if (detail) snprintf(detail, dsz, "redir_target 未终止"); return 3; }
-    if (!nsp_guard_str_ok(r->sandbox_target, PATH_MAX))   { if (detail) snprintf(detail, dsz, "sandbox_target 未终止"); return 4; }
-    if (!nsp_guard_str_ok(r->real_path, PATH_MAX))        { if (detail) snprintf(detail, dsz, "real_path 未终止"); return 5; }
-    if (!nsp_guard_str_ok(r->ftp_backend, 64))            { if (detail) snprintf(detail, dsz, "ftp_backend 未终止"); return 6; }
-    if (r->user_id < -1 || r->user_id > 0x7FFFFFFF)       { if (detail) snprintf(detail, dsz, "user_id 值域非法"); return 7; }
+    if (!nsp_guard_str_ok(r->sub_path, PATH_MAX)) {
+        if (detail) snprintf(detail, dsz, "sub_path 未终止");
+        return 1;
+    }
+    if (!nsp_guard_str_ok(r->pkg, 128)) {
+        if (detail) snprintf(detail, dsz, "pkg 未终止");
+        return 2;
+    }
+    if (!nsp_guard_str_ok(r->redir_target, PATH_MAX)) {
+        if (detail) snprintf(detail, dsz, "redir_target 未终止");
+        return 3;
+    }
+    if (!nsp_guard_str_ok(r->sandbox_target, PATH_MAX)) {
+        if (detail) snprintf(detail, dsz, "sandbox_target 未终止");
+        return 4;
+    }
+    if (!nsp_guard_str_ok(r->real_path, PATH_MAX)) {
+        if (detail) snprintf(detail, dsz, "real_path 未终止");
+        return 5;
+    }
+    if (!nsp_guard_str_ok(r->ftp_backend, 64)) {
+        if (detail) snprintf(detail, dsz, "ftp_backend 未终止");
+        return 6;
+    }
+    if (r->user_id < -1 || r->user_id > 0x7FFFFFFF) {
+        if (detail) snprintf(detail, dsz, "user_id 值域非法");
+        return 7;
+    }
     return 0;
 }
 
@@ -113,8 +135,8 @@ static void persist_module_error(const char* mod_name, const char* kind, const c
         struct tm tmv;
         localtime_r(&now, &tmv);
         strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
-        fprintf(fp, "%s [MOD] module=%s kind=%s reason=%s\n",
-                ts, mod_name ? mod_name : "?", kind ? kind : "?", reason ? reason : "?");
+        fprintf(fp, "%s [MOD] module=%s kind=%s reason=%s\n", ts, mod_name ? mod_name : "?",
+                kind ? kind : "?", reason ? reason : "?");
         fclose(fp);
     }
     pthread_mutex_unlock(&g_persist_mu);
@@ -124,23 +146,22 @@ static void persist_module_error(const char* mod_name, const char* kind, const c
 
 /* MOD_ERR 日志限流：total（本加载周期累计）驱动——
  * total <= BURST：明细全打；total % THROTTLE == 0：打 1 条汇总；其余抑制。 */
-static void guard_log_mod_err(const char* mod_name, const char* op, int rc,
-                              const char* path, const char* detail, unsigned total) {
+static void guard_log_mod_err(const char* mod_name, const char* op, int rc, const char* path,
+                              const char* detail, unsigned total) {
     if (total <= GUARD_LOG_BURST) {
-        LOG_WRN("[MOD_ERR] module=%s op=%s rc=%d path=%s detail=%s",
-                mod_name, op, rc, path ? path : "(null)", detail ? detail : "(null)");
+        LOG_WRN("[MOD_ERR] module=%s op=%s rc=%d path=%s detail=%s", mod_name, op, rc,
+                path ? path : "(null)", detail ? detail : "(null)");
         return;
     }
     if (total % GUARD_LOG_THROTTLE == 0) {
-        LOG_WRN("[MOD_ERR] module=%s op=%s rc=%d path=%s detail=已抑制 %u 条同类错误(每%d条汇总),熔断阈值 %d 次/%ds",
-                mod_name, op, rc, path ? path : "(null)",
-                total - GUARD_LOG_BURST, GUARD_LOG_THROTTLE,
-                g_guard_err_max, g_guard_window_sec);
+        LOG_WRN(
+            "[MOD_ERR] module=%s op=%s rc=%d path=%s detail=已抑制 %u 条同类错误(每%d条汇总),熔断阈值 %d 次/%ds",
+            mod_name, op, rc, path ? path : "(null)", total - GUARD_LOG_BURST, GUARD_LOG_THROTTLE,
+            g_guard_err_max, g_guard_window_sec);
     }
 }
 
-void module_guard_error(int slot, const char* op, int rc,
-                        const char* path, const char* detail) {
+void module_guard_error(int slot, const char* op, int rc, const char* path, const char* detail) {
     if (slot < 0 || slot >= MAX_MODULES) return;
     GuardSlot* g = &g_guard[slot];
     time_t now = time(NULL);
@@ -152,9 +173,8 @@ void module_guard_error(int slot, const char* op, int rc,
     time_t ws = atomic_load_explicit(&g->window_start, memory_order_relaxed);
     unsigned count;
     if (ws == 0 || (now - ws) >= g_guard_window_sec) {
-        if (atomic_compare_exchange_strong_explicit(
-                &g->window_start, &ws, now,
-                memory_order_relaxed, memory_order_relaxed)) {
+        if (atomic_compare_exchange_strong_explicit(&g->window_start, &ws, now,
+                                                    memory_order_relaxed, memory_order_relaxed)) {
             /* 本线程赢得 CAS：重置计数 */
             atomic_store_explicit(&g->err_count, 1, memory_order_relaxed);
             count = 1;
@@ -178,11 +198,11 @@ void module_guard_error(int slot, const char* op, int rc,
     if (count >= (unsigned)g_guard_err_max) {
         /* 熔断：滑动窗口内错误达阈值 → 置毒卸载（规则自动失效 + ban 落盘） */
         char reason[96];
-        snprintf(reason, sizeof reason, "circuit:%u errs in %ds(op=%s)",
-                 count, g_guard_window_sec, g->last_op[0] ? g->last_op : "?");
+        snprintf(reason, sizeof reason, "circuit:%u errs in %ds(op=%s)", count, g_guard_window_sec,
+                 g->last_op[0] ? g->last_op : "?");
         LOG_ERR("[MOD_ERR] module=%s op=%s rc=%d path=%s detail=熔断触发(%s),立即卸载:规则全部失效",
-                mod_name, g->last_op[0] ? g->last_op : (op ? op : "?"), rc,
-                path ? path : "(null)", reason);
+                mod_name, g->last_op[0] ? g->last_op : (op ? op : "?"), rc, path ? path : "(null)",
+                reason);
         persist_module_error(mod_name, "circuit_break", reason);
         module_fault_poison(slot, reason);
         atomic_store_explicit(&g->err_count, 0, memory_order_relaxed);
@@ -198,7 +218,8 @@ void module_guard_health(int slot, unsigned* err_count, unsigned* err_total,
     GuardSlot* g = &g_guard[slot];
     if (err_count) *err_count = atomic_load_explicit(&g->err_count, memory_order_relaxed);
     if (err_total) *err_total = atomic_load_explicit(&g->total_count, memory_order_relaxed);
-    if (last_err_time) *last_err_time = atomic_load_explicit(&g->last_err_time, memory_order_relaxed);
+    if (last_err_time)
+        *last_err_time = atomic_load_explicit(&g->last_err_time, memory_order_relaxed);
 }
 
 void module_guard_fault(int slot, const char* op, const char* path) {
@@ -215,8 +236,9 @@ void module_guard_fault(int slot, const char* op, const char* path) {
 
     char reason[96];
     snprintf(reason, sizeof reason, "crash:op=%s 崩溃被围栏恢复", op ? op : "?");
-    LOG_ERR("[MOD_ERR] module=%s op=%s rc=-EIO path=%s detail=模块崩溃(SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT)被调用围栏恢复,立即卸载:规则全部失效",
-            mod_name, op ? op : "(null)", path ? path : "(null)");
+    LOG_ERR(
+        "[MOD_ERR] module=%s op=%s rc=-EIO path=%s detail=模块崩溃(SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT)被调用围栏恢复,立即卸载:规则全部失效",
+        mod_name, op ? op : "(null)", path ? path : "(null)");
     persist_module_error(mod_name, "crash", reason);
     module_fault_poison(slot, reason);
 }

@@ -20,8 +20,7 @@ static int br_module_init(const NspFrameworkApi* api) {
     if (!api) return -1;
     /* 规则路径与启动标志由框架经 api 提供（--rules= 与 --disable-sandbox） */
     const char* rules_path = NULL;
-    if (api->api_version >= 2 && api->get_rules_path)
-        rules_path = api->get_rules_path();
+    if (api->api_version >= 2 && api->get_rules_path) rules_path = api->get_rules_path();
     bool disable_sandbox = false;
     if (api->api_version >= 2 && api->get_flags)
         disable_sandbox = (api->get_flags() & NSP_FLAG_DISABLE_SANDBOX) != 0;
@@ -57,7 +56,7 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     out->sub_path[sizeof out->sub_path - 1] = '\0';
     strncpy(out->pkg, r.pkg, sizeof out->pkg - 1);
     out->pkg[sizeof out->pkg - 1] = '\0';
-    out->monitor_on = r.monitor_on;   /* 修复：漏拷贝导致全局 MONITOR ON 时 IO 监控失效 */
+    out->monitor_on = r.monitor_on; /* 修复：漏拷贝导致全局 MONITOR ON 时 IO 监控失效 */
     out->hidden = r.hidden;
     out->ro = r.ro;
     out->has_redir = r.has_redir;
@@ -134,8 +133,8 @@ const NspModuleInfo nsp_module_info = {
     .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
     .type = NSP_MODULE_TYPE_RULES,
-    .caps = NSP_CAP_REDIRECT | NSP_CAP_SANDBOX | NSP_CAP_HIDE |
-            NSP_CAP_ALLOW | NSP_CAP_RO | NSP_CAP_READDIR_EXTRA | NSP_CAP_VIRTUAL_DIR,
+    .caps = NSP_CAP_REDIRECT | NSP_CAP_SANDBOX | NSP_CAP_HIDE | NSP_CAP_ALLOW | NSP_CAP_RO |
+            NSP_CAP_READDIR_EXTRA | NSP_CAP_VIRTUAL_DIR,
     .name = "basic_rules",
     .version = "1.0.0",
     .init = br_module_init,
