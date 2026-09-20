@@ -24,7 +24,6 @@
 #define PUBSUB_SOCKET_NAME  CONFIG_BROADCAST_SOCKET
 #define MAX_SUBSCRIBERS     32
 #define MAX_SNAPSHOT_APPS   256
-#define MAX_SNAPSHOT_UIDMAP 1024
 struct Subscriber {
     struct sockaddr_un addr;
     socklen_t addr_len;
@@ -175,20 +174,6 @@ static void build_templates_json(json_object* root) {
     json_object_object_add(root, "templates", templates);
     config_unlock_read();
 }
-#ifdef CONFIG_PUBLISHER_ENABLE_UIDMAP
-static void build_uidmap_json(json_object* root) {
-    UidMapEntry entries[MAX_SNAPSHOT_UIDMAP];
-    int count = get_uid_map_snapshot(entries, MAX_SNAPSHOT_UIDMAP);
-    json_object* uid_map = json_object_new_array();
-    for (int i = 0; i < count; i++) {
-        json_object* entry = json_object_new_object();
-        json_object_object_add(entry, "uid", json_object_new_int(entries[i].uid));
-        json_object_object_add(entry, "pkg", json_object_new_string(entries[i].pkg));
-        json_object_array_add(uid_map, entry);
-    }
-    json_object_object_add(root, "uid_map", uid_map);
-}
-#endif /* CONFIG_PUBLISHER_ENABLE_UIDMAP */
 static char* build_config_json_payload(int* out_len) {
     json_object* root = json_object_new_object();
     json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));

@@ -3,7 +3,6 @@
 
 #include <sys/types.h>
 #include "config_parser.h"
-#include "uid_map.h"
 
 bool is_isolated_uid(uid_t uid);
 bool is_system_app(uid_t uid);
@@ -62,11 +61,6 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
  * 用于外部模块（如 config_publisher）读取注入状态。
  */
 int get_injected_snapshot(int *out_pids, char (*out_pkgs)[256], uid_t *out_uids, int max_count);
-/*
- * 获取 UID 映射表的快照。
- * 基于 inject_target 内部的内存缓存。
- */
-int get_uid_map_snapshot(UidMapEntry *out, int max_count);
 
 /*
  * 核心检查：判断当前配置中 com.android.providers.media.module 是否为注入目标对象。
