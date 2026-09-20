@@ -463,7 +463,7 @@ int ns_find_native_submounts(int pid, const char* base_path, char mount_points[]
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
     size_t nread = 0;
-    char* buf = read_file_dynamic(path, &nread);
+    char* buf = read_file_dynamic(path, &nread, 0);
     if (!buf) return 0;
     int count = 0;
     size_t base_len = strlen(base_path);
@@ -703,7 +703,7 @@ static int do_combined_mount(void* raw_args) {
     size_t tlen = strlen(target);
     size_t blen = strlen(backup);
     size_t nread = 0;
-    char* buf = read_file_dynamic("/proc/self/mountinfo", &nread);
+    char* buf = read_file_dynamic("/proc/self/mountinfo", &nread, 0);
     if (!buf) {
         log_ns_error("[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d\n", pkg, errno);
         log_internal(LOG_ERROR, "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg,

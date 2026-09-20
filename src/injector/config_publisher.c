@@ -21,9 +21,9 @@
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <json-c/json.h>
-#define PUBSUB_SOCKET_NAME  CONFIG_BROADCAST_SOCKET
-#define MAX_SUBSCRIBERS     32
-#define MAX_SNAPSHOT_APPS   256
+#define PUBSUB_SOCKET_NAME CONFIG_BROADCAST_SOCKET
+#define MAX_SUBSCRIBERS    32
+#define MAX_SNAPSHOT_APPS  256
 struct Subscriber {
     struct sockaddr_un addr;
     socklen_t addr_len;
@@ -315,53 +315,15 @@ void config_publisher_broadcast(void) {
 }
 #define MAX_FILE_SIZE    (256 * 1024)
 #define MAX_STATIC_FILES 256
-static int read_file_content(const char* path, char** out_buf) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    size_t cap = 4096;
-    size_t total_read = 0;
-    char* buf = malloc(cap);
-    if (!buf) {
-        close(fd);
-        return -1;
-    }
-    while (1) {
-        if (total_read >= cap) {
-            cap *= 2;
-            if (cap > MAX_FILE_SIZE) cap = MAX_FILE_SIZE;
-            char* new_buf = realloc(buf, cap);
-            if (!new_buf) {
-                free(buf);
-                close(fd);
-                return -1;
-            }
-            buf = new_buf;
-        }
-        size_t remaining = cap - total_read;
-        ssize_t n = read(fd, buf + total_read, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            free(buf);
-            close(fd);
-            return -1;
-        }
-        if (n == 0) break;
-        total_read += (size_t)n;
-    }
-    buf[total_read] = '\0';
-    close(fd);
-    *out_buf = buf;
-    return (int)total_read;
-}
 static void handle_static_request(int sock_fd, struct sockaddr_un* cli_addr, socklen_t cli_len) {
     json_object* root = json_object_new_object();
     json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
     json_object_object_add(root, "type", json_object_new_string("static"));
 
     /* 解析 injector.conf */
-    char* conf_content = NULL;
-    int conf_len = read_file_content(INJECTOR_CONFIG_PATH, &conf_content);
-    if (conf_len >= 0 && conf_content) {
+    size_t conf_len = 0;
+    char* conf_content = read_file_dynamic(INJECTOR_CONFIG_PATH, &conf_len, MAX_FILE_SIZE);
+    if (conf_content) {
         json_object* global = json_object_new_object();
         json_object* switches = json_object_new_object();
         json_object* ro_rules = json_object_new_array();
@@ -470,8 +432,7 @@ static void handle_static_request(int sock_fd, struct sockaddr_un* cli_addr, soc
         struct dirent* de;
         while ((de = readdir(dir)) != nullptr) {
             if (de->d_type != DT_DIR) continue;
-            if (strcmp(de->d_name, "App-rules") != 0 && strncmp(de->d_name, "App-rules-", 10) != 0)
-                continue;
+            if (!nsp_is_app_rules_dirname(de->d_name)) continue;
             char rules_dir[PATH_MAX];
             snprintf(rules_dir, sizeof(rules_dir), "%s/%s", CONFIG_DIR, de->d_name);
             DIR* rdir = opendir(rules_dir);
@@ -486,9 +447,9 @@ static void handle_static_request(int sock_fd, struct sockaddr_un* cli_addr, soc
                 json_object* rule = json_object_new_object();
                 json_object_object_add(rule, "file", json_object_new_string(rde->d_name));
                 json_object_object_add(rule, "user_dir", json_object_new_string(de->d_name));
-                char* fc = NULL;
-                int fc_len = read_file_content(file_path, &fc);
-                if (fc_len >= 0 && fc) {
+                size_t fc_len = 0;
+                char* fc = read_file_dynamic(file_path, &fc_len, MAX_FILE_SIZE);
+                if (fc) {
                     json_object_object_add(rule, "content", json_object_new_string(fc));
                     free(fc);
                 } else {

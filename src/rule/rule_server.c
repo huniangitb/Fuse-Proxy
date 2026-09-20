@@ -700,27 +700,13 @@ static void main_conf_path(char* out, size_t sz) {
     snprintf(out, sz, "%s/injector.conf", g_config_dir);
 }
 
-static void app_rule_path(char* out, size_t sz, const char* pkg, int uid) {
-    if (uid == 0)
-        snprintf(out, sz, "%s/App-rules/%s.conf", g_config_dir, pkg);
-    else
-        snprintf(out, sz, "%s/App-rules-%d/%s.conf", g_config_dir, uid, pkg);
-}
-
-static void app_rule_dir(char* out, size_t sz, int uid) {
-    if (uid == 0)
-        snprintf(out, sz, "%s/App-rules", g_config_dir);
-    else
-        snprintf(out, sz, "%s/App-rules-%d", g_config_dir, uid);
-}
-
 /* 返回应用规则当前生效文件：.conf 存在（启用）→ .conf；否则 .conf.disabled 存在
    （停用）→ .disabled；两者皆无 → .conf（新建时使用）。
    保证停用状态下 ADD/SET/REMOVE/TOGGLE 继续操作 .disabled 文件，
    不会新建残缺 .conf 导致规则丢失或注入状态异常开启。 */
 static void resolve_app_rule_active_path(const char* pkg, int uid, char* out, size_t sz) {
     char path[PATH_MAX];
-    app_rule_path(path, sizeof(path), pkg, uid);
+    nsp_app_rule_path(g_config_dir, uid, pkg, path, sizeof(path));
     if (access(path, F_OK) == 0) {
         snprintf(out, sz, "%s", path);
         return;
@@ -736,7 +722,7 @@ static void resolve_app_rule_active_path(const char* pkg, int uid, char* out, si
 /* 应用规则状态：true=启用（.conf 存在），false=停用（仅 .conf.disabled） */
 static bool app_rule_is_enabled(const char* pkg, int uid) {
     char path[PATH_MAX];
-    app_rule_path(path, sizeof(path), pkg, uid);
+    nsp_app_rule_path(g_config_dir, uid, pkg, path, sizeof(path));
     return (access(path, F_OK) == 0);
 }
 
@@ -920,7 +906,7 @@ static json_object* build_apps_json_filtered(int uid_filter) {
         }
         if (uid_filter >= 0 && uid != uid_filter) continue;
         char dir[PATH_MAX];
-        app_rule_dir(dir, sizeof(dir), uid);
+        nsp_app_rule_dir(g_config_dir, uid, dir, sizeof(dir));
         DIR* ad = opendir(dir);
         if (!ad) continue;
         struct dirent* ae;
@@ -976,7 +962,7 @@ static json_object* build_users_json(void) {
         }
         if (uid < 0) continue;
         char dir[PATH_MAX];
-        app_rule_dir(dir, sizeof(dir), uid);
+        nsp_app_rule_dir(g_config_dir, uid, dir, sizeof(dir));
         int app_cnt = 0;
         DIR* ad = opendir(dir);
         if (ad) {
@@ -1244,8 +1230,8 @@ static void handle_add(int fd, json_object* req) {
         }
         bool on = (value && strcasecmp(value, "ON") == 0);
         char dir[PATH_MAX], path[PATH_MAX], dis_path[PATH_MAX];
-        app_rule_dir(dir, sizeof(dir), uid);
-        app_rule_path(path, sizeof(path), pkg, uid);
+        nsp_app_rule_dir(g_config_dir, uid, dir, sizeof(dir));
+        nsp_app_rule_path(g_config_dir, uid, pkg, path, sizeof(path));
         snprintf(dis_path, sizeof(dis_path), "%s.disabled", path);
         bool active_exists = (access(path, F_OK) == 0);
         bool disabled_exists = (access(dis_path, F_OK) == 0);
@@ -1351,7 +1337,7 @@ static void handle_add(int fd, json_object* req) {
         return;
     }
     char dir[PATH_MAX], path[PATH_MAX];
-    app_rule_dir(dir, sizeof(dir), uid);
+    nsp_app_rule_dir(g_config_dir, uid, dir, sizeof(dir));
     resolve_app_rule_active_path(pkg, uid, path, sizeof(path));
     if (nsp_mkdir_p(dir, 0755) != 0) {
         reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
