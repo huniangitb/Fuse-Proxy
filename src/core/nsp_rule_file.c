@@ -52,7 +52,22 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
             lines = grown;
             cap = ncap;
         }
-        lines[count] = strdup(buf);
+        /* 行尾换行归一：末行无换行（文件不以 \n 结尾）时，任何"插到该行之后"
+           的写入会与之粘连成同一行（如 "[USER_APPS:0]REDIRECT ..."），产出畸形
+           配置且后续匹配全线失配。统一在此补齐，使写入路径面对的行数组恒满足
+           "行尾带 \n"（写入本就会重写整个文件，补一个缺失的收尾换行无副作用）。 */
+        size_t blen = strlen(buf);
+        if (blen > 0 && buf[blen - 1] != '\n') {
+            char* fixed = malloc(blen + 2);
+            if (fixed) {
+                memcpy(fixed, buf, blen);
+                fixed[blen] = '\n';
+                fixed[blen + 1] = '\0';
+            }
+            lines[count] = fixed;
+        } else {
+            lines[count] = strdup(buf);
+        }
         if (!lines[count]) {
             nsp_rule_file_free(lines, count);
             fclose(fp);
@@ -227,8 +242,15 @@ int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
     if (is_switch && !type_name) return NSP_RULE_FILE_EINVAL;
     if (out_changed) *out_changed = false;
 
-    char sec_hdr[128];
-    int hn = snprintf(sec_hdr, sizeof sec_hdr, "[%s]\n", sec_name);
+    /* 匹配文本与写入文本必须分开：find_header 靠"段头之后为空白或 ON/OFF"
+       来容忍 [X] OFF / [X]␠␠ / 末行无换行，传入带 \n 的文本会让这些形态全部
+       失配（\n 与行内的空白/ON/OFF 首字符不等），误判段头缺失后追加重复段 ——
+       而重复段的段头是默认 ON，会把显式 [X] OFF 的类别悄悄重新使能 */
+    char sec_match_hdr[128];
+    int mn = snprintf(sec_match_hdr, sizeof sec_match_hdr, "[%s]", sec_name);
+    if (mn < 0 || (size_t)mn >= sizeof sec_match_hdr) return NSP_RULE_FILE_EINVAL;
+    char sec_hdr[132];
+    int hn = snprintf(sec_hdr, sizeof sec_hdr, "%s\n", sec_match_hdr);
     if (hn < 0 || (size_t)hn >= sizeof sec_hdr) return NSP_RULE_FILE_EINVAL;
 
     int count = 0, cap = 0;
@@ -237,7 +259,7 @@ int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
 
     int hdr = (sec_match == NSP_RULE_SEC_PREFIX)
                   ? nsp_rule_file_find_section(lines, count, sec_name)
-                  : nsp_rule_file_find_header(lines, count, sec_hdr);
+                  : nsp_rule_file_find_header(lines, count, sec_match_hdr);
 
     if (is_switch) {
         /* 开关：段内就地替换（保持唯一），无则插段头后；段头缺失则新建段 */

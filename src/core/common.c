@@ -295,7 +295,12 @@ static void inherit_from_parent(const char* real_path) {
 static int mkdir_p_impl(const char* path, mode_t mode, bool inherit) {
     if (!path || !path[0]) return -1;
     char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    /* 放不下即拒绝（同"路径合成不截断"约定）：静默截断后会沿错误路径逐级建目录 */
+    int wn = snprintf(tmp, sizeof(tmp), "%s", path);
+    if (wn < 0 || (size_t)wn >= sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     size_t len = strlen(tmp);
     if (len == 0) return -1;
     if (tmp[len - 1] == '/') tmp[len - 1] = '\0';

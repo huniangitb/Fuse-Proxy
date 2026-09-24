@@ -69,6 +69,15 @@ void fault_fence_rearm(void);
 typedef void (*NspOrigCrashHandler)(int sig, siginfo_t* info, void* uctx);
 void fault_fence_set_orig_handler(NspOrigCrashHandler h);
 
+/* 围栏槽位表容量：MAX_MODULES 个模块槽位（索引 0..MAX_MODULES-1，与 loader
+   槽位一一对应）+ 1 个未绑定槽位（见下）。 */
+#define NSP_FENCE_MAX_SLOTS 17
+/* 未绑定槽位索引：供"尚无正式模块槽位"的过渡期调用归因——init 试探期与
+   commit 失败（注册表满）时的 exit。与任何模块槽位不重叠，故不会覆盖在册
+   模块的归因信息；过渡期调用串行（仅 monitor 线程），单槽位足够。
+   fault_fence.c 以 _Static_assert 与 MAX_MODULES 对齐。 */
+#define NSP_FENCE_UNBOUND_SLOT 16
+
 /* 模块加载/卸载时更新静态注册表（信号安全），供崩溃恢复日志与
    归因查询输出模块名。dl_handle 保留供映射段判定扩展。 */
 void fault_fence_register_slot(int slot, const char* name, void* dl_handle);
