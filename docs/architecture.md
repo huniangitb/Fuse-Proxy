@@ -114,6 +114,8 @@ src/
 ├── modules/              # 热插拔模块（.so）
 │   ├── basic_rules/      # 规则引擎：REDIRECT/SANDBOX/HIDE/ALLOW/RO
 │   └── ftp/              # FTP 存储后端（纯方法模块，无 FUSE 实现）
+│       ├── ftp_mux.c     #   控制面 epoll + curl_multi 复用器（连接复用/并发）
+│       └── ftp_backend_libcurl.c  #   路径映射 + 读写（数据面每文件独立句柄）
 ├── injector/             # 注入器（injector/inject_target/mount_manager/
 │   │                     #   ns_utils/ns_global_replace/ipc_server/config_publisher）
 │   └── global_replace_ctl.c  # 全局替换挂载测试驱动（仅 GNU）

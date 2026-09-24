@@ -270,7 +270,9 @@ ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 
 | 模块 | 源码 | 说明 |
 |------|------|------|
 | `basic_rules.so` | `src/modules/basic_rules/` | 规则引擎（原 `vfs_core` 迁移，匹配语义逐行等价）：`basic_rules.c` 模块入口（订阅规则类型 + 注册配置监听器）、`br_rules.c` 决策引擎（uid 缓存 / uid.map / Trie + 线性通道 / sandbox / 虚拟目录）；配置热重载由**框架**驱动（见 §6.1.1） |
-| `ftp_module.so` | `src/modules/ftp/` | FTP 后端（libcurl，**不依赖 libfuse3**）：含 `backend_flush` 两阶段收尾与弱网重试示例；写路径为本地临时文件缓存 + release 时 STOR 全量上传 |
+| `ftp_module.so` | `src/modules/ftp/` | FTP 后端（libcurl，**不依赖 libfuse3**）：`ftp_mux.c` 是控制面「epoll + curl_multi」复用器（见下），`ftp_backend_libcurl.c` 是路径映射与读写实现（含 `backend_flush` 两阶段收尾与弱网重试）；写路径为本地临时文件缓存 + 流式 STOR/APPE 上传 |
+
+**FTP 控制面并发模型（`src/modules/ftp/ftp_mux.c`）**：`getattr`/`readdir`/`DELE`/`MKD`/`RMD`/`RNFR`/空文件 `STOR`/`TRUNCATE` 等控制操作交给每后端一个 `CURLM` 句柄，由**一个 epoll 事件线程**驱动（`curl_multi_socket_action` + `CURLMOPT_SOCKET/TIMERFUNCTION` 接入 epoll；提交线程只入队 + eventfd 唤醒，绝不触碰 multi——libcurl 多接口非线程安全）。收益：控制连接在 multi 的连接缓存里长期复用（免重复 USER/PASS 登录），多个 FUSE 线程的控制操作并行在飞（同服务器并发控制连接上限 `CURLMOPT_MAX_HOST_CONNECTIONS`，默认 4），且**业务失败不再重建连接**——旧实现在任何失败（含 550 不存在）都 `curl_easy_cleanup` 重建共享句柄，让下一次操作白付一次 TCP + 登录往返。数据面（读下载线程 / 写流式上传）仍用每文件独立句柄 + 阻塞 `curl_easy_perform`：它们本就互不竞争，且背压模型是「缓冲满即中止传输」（`write_cb` 返回 0 → `CURLE_WRITE_ERROR`），与事件循环驱动不兼容。回归用例 `test_ftp_parallel.py`（并发正确性 / 连接数 / 延迟收敛 / 热重载竞态）。
 
 FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。命中后 `resolve` 回传 `is_ftp`，框架据此把该路径分派给 FTP 后端模块（不再有 `FTP_<段名>` 变量注册机制）。
 

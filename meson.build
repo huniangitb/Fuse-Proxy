@@ -455,6 +455,7 @@ install_data('src/modules/basic_rules/basic_rules.rules',
 ftp_module_sources = [
     'src/modules/ftp/ftp_module.c',
     'src/modules/ftp/ftp_conf.c',
+    'src/modules/ftp/ftp_mux.c',
     'src/modules/ftp/ftp_backend_libcurl.c',
     'src/core/sha256.c',
     'src/modules/nsp_self_hash.c',
