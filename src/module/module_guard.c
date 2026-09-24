@@ -91,21 +91,9 @@ int nsp_guard_validate_resolve(const NspResolveResult* r, char* detail, size_t d
         if (detail) snprintf(detail, dsz, "pkg 未终止");
         return 2;
     }
-    if (!nsp_guard_str_ok(r->redir_target, PATH_MAX)) {
-        if (detail) snprintf(detail, dsz, "redir_target 未终止");
-        return 3;
-    }
-    if (!nsp_guard_str_ok(r->sandbox_target, PATH_MAX)) {
-        if (detail) snprintf(detail, dsz, "sandbox_target 未终止");
-        return 4;
-    }
     if (!nsp_guard_str_ok(r->real_path, PATH_MAX)) {
         if (detail) snprintf(detail, dsz, "real_path 未终止");
         return 5;
-    }
-    if (!nsp_guard_str_ok(r->ftp_backend, 64)) {
-        if (detail) snprintf(detail, dsz, "ftp_backend 未终止");
-        return 6;
     }
     if (r->user_id < -1 || r->user_id > 0x7FFFFFFF) {
         if (detail) snprintf(detail, dsz, "user_id 值域非法");

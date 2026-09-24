@@ -1,6 +1,6 @@
 # 热插拔模块架构与开发
 
-`fuse_daemon` 只是框架——FUSE 回调骨架 + 路径清洗 + 模块调度 + 本地存储原语，**不内置任何规则语义**。规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）与存储后端（如 FTP）均由 dlopen 的热插拔模块提供。第三方模块**仅依赖 `include/nsp_module.h`**，可在独立仓库独立编译。
+`fuse_daemon` 只是框架——FUSE 回调骨架 + 路径清洗 + 模块调度 + 本地存储原语，**不内置任何规则语义**。规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）与存储后端（如 FTP）均由 dlopen 的热插拔模块提供。第三方模块**只以 `include/nsp_module.h` 为唯一入口**（该头代含 `nsp_log.h` / `nsp_constants.h`，见 §6.1），可在独立仓库独立编译。
 
 ## 1. 设计要点
 
@@ -41,11 +41,14 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 - 旧行格式 `<TYPE> <FORMAT> [属性...]` 仍兼容，两种格式可在同一文件混用；畸形声明（如 `argc=abc`）被跳过。
 - rule_server 带目录/文件 mtime 缓存，未变化时零扫描复用类型表；`.rules` 增删改即热更新，无需重启。
 - `argc_min/argc_max` 用于 ADD 参数校验，`global_only` 限制作用域，`desc` 按请求 `lang` 回传（默认中文，未知语言回退 zh）并附 `desc_map` 全语言映射。
-- 内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT）始终存在；未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE。无 `.rules` 的模块正常加载，仅跳过类型注册。
+- 内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT/SKIP_SYSTEM_APPS）始终存在；未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE。无 `.rules` 的模块正常加载，仅跳过类型注册。
+- **`log_ctl` 与 `rule_server` 的类型集合刻意不同**：`rule_server` 是权威控制面，读取 `.rules` 合并模块动态类型；`log_ctl` 的 `set-rule`/`remove-rule` 只认内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT，不含 SKIP_SYSTEM_APPS），不扫描模块目录。两者对同一内置类型的编辑语义一致（行级实现共享，见 §6.1）。
 
 ## 3. 模块 ABI（`include/nsp_module.h`）
 
-当前 `NSP_MODULE_ABI_VERSION = 1`、`NSP_FRAMEWORK_API_VERSION = 2`。
+当前 `NSP_MODULE_ABI_VERSION = 2`、`NSP_FRAMEWORK_API_VERSION = 3`。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志改由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等），是**不兼容变更**——V1 模块必须按 V2 头重编译，否则加载被拒（见下方加载校验顺序、§6.5）。
+
+加载校验顺序（`module_prepare`）：`dlopen` → `dlsym(nsp_module_info)` → 魔数/ABI 版本 → 名字一致 → 自哈希 → `init`。**ABI 校验发生在 `dlopen` 之后**：`RTLD_NOW` 会立即解析模块的全部符号，V1 模块引用已删除的导出符号时可能在 ABI 检查之前就解析失败；模块的构造器也已在 `dlopen` 期间运行。因此"拒绝旧 ABI"是加载失败，不是加载前拦截。
 
 ### 3.1 类型与能力位
 
@@ -57,24 +60,25 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 | 位 | 能力 | 归属 |
 |----|------|------|
 | 0-4 | `NSP_CAP_REDIRECT` / `SANDBOX` / `HIDE` / `ALLOW` / `RO` | 规则 |
-| 5-6 | `NSP_CAP_READDIR_EXTRA`（readdir 虚拟目录补充）/ `VIRTUAL_DIR`（虚拟目录合成） | 规则 |
-| 10 | `NSP_CAP_MOUNT_POINT` 提供虚拟前缀路径 | 后端 |
-| 11 | `NSP_CAP_VAR` 向框架注册变量（如 `FTP_云盘=/mnt/nsp_ftp/云盘`） | 后端 |
+| 5 | `NSP_CAP_READDIR_EXTRA`（readdir 虚拟目录补充） | 规则 |
 | 12 | `NSP_CAP_BACKEND_IO` 路径命中时由框架调用模块方法完成文件操作 | 后端 |
+
+位图按整组判断：0-4 位任一置位即视为规则模块（参与 `resolve`/`probe` 分派）。V2 删除了 `VIRTUAL_DIR`（位 6）、`MOUNT_POINT`（位 10）、`VAR`（位 11）——虚拟目录标志由 `NspResolveResult` 的 `is_virtual_ancestor`/`is_redirect_target` 表达，无需单独能力位；后端虚拟前缀不再由模块注册变量，改由 `FTP <虚拟前缀> <段名>` 规则 + `is_ftp` 表达。
 
 ### 3.2 框架服务表 `NspFrameworkApi`（框架 → 模块）
 
-`init` 时注入，模块**仅经它使用框架设施**（版本化，新增字段追加尾部）：
+`init` 时注入，模块**仅经它取用框架参数**（版本化，兼容新增字段追加尾部）：
 
 ```c
 typedef struct NspFrameworkApi {
     uint32_t api_version;                       /* NSP_FRAMEWORK_API_VERSION */
-    void (*log)(int level, const char* fmt, ...);  /* 0=DEBUG 1=INFO 2=WARN 3=ERROR */
-    const char* (*get_real_root)(void);         /* 真实存储根（--root） */
     const char* (*get_rules_path)(void);        /* 规则配置路径（--rules） */
     uint32_t (*get_flags)(void);                /* NSP_FLAG_DISABLE_SANDBOX 等 */
 } NspFrameworkApi;
 ```
+
+- `api_version` 是模块 `init` 的第一道自检（`basic_rules` 在 `api->api_version < NSP_FRAMEWORK_API_VERSION` 时拒绝初始化）。
+- 日志**不再经服务表**：`nsp_module.h` 代含 `nsp_log.h`，模块直接调用 `log_internal(LogLevel, ...)` / `LOG`/`LOG_WRN`/`LOG_ERR`/`LOG_DBG` 宏，与框架同一套 `LogLevel`（0=DEBUG 1=INFO 2=WARN 3=ERROR）。真实存储根不再经服务表暴露——路径合成用导出表里的 `common_default_real_path` / `common_sandbox_path`（见 §6.1）。
 
 ### 3.3 接口表 `NspModuleOps`（模块 → 框架）
 
@@ -87,11 +91,12 @@ int (*resolve)(const NspQueryCtx* q, NspResolveResult* out);  /* 路径决策，
 int (*probe)(const NspQueryCtx* q, NspProbeResult* out);      /* readdir 逐条目轻量过滤 */
 int (*readdir_extra)(const NspQueryCtx*, const char* sub_path, int user_id,
                      const char* pkg, bool is_root, NspDirEntry* out, int max);
-int (*reload)(void);                                          /* 配置热重载通知 */
 int (*get_pkg)(uid_t uid, pid_t tid, char* out, size_t size); /* uid→包名（框架日志用） */
 ```
 
-`resolve` 输入 FUSE 原始路径 + uid/pid/gid，输出完整决策（hidden / ro / allow / redir / sandbox / 最终真实路径 / 虚拟目录标志 / monitor 状态）——**一次调用返回全部结果**，保住「一次查询多路复用」的性能语义。`probe` 只判 hidden/重定向目标/虚拟目录标志，不构建真实路径、不触发 sandbox 目录创建。
+`resolve` 输入 FUSE 原始路径 + uid/pid/gid，输出框架真正消费的决策字段：`valid` / `user_id` / `sub_path` / `pkg` / `hidden` / `ro` / `real_path` / `is_redir` / `is_virtual_ancestor` / `is_redirect_target` / `is_ftp` / `monitor_on`——**一次调用返回全部结果**，保住「一次查询多路复用」的性能语义。ALLOW 与 SANDBOX 不再单独回传：模块已把它们落实进 `real_path`。`probe` 只判 `valid`/`hidden`/`is_redirect_target`/`is_virtual_ancestor`/`is_other_app_pkg`，不构建真实路径、不触发 sandbox 目录创建。
+
+> **初始化不变量**：`resolve` 输出必须**逐字段**重置（框架经 `nsp_resolve_result_init` 统一初始化，`NspResolveGuard` 与之共用同一实现），不能只置 `valid=false`。FUSE 回调在模块未命中时仍会读 `ro`/`is_ftp`/虚拟目录等标志；历史上"未命中只置 valid + 固定栈填充恰好稳定"曾把不存在的路径合成为目录，逐字段初始化是回归防线。
 
 后端模块（`NSP_CAP_BACKEND_IO`）：
 
@@ -106,7 +111,6 @@ int (*backend_write)(uint64_t h, const char* buf, size_t size, off_t off, size_t
 int (*backend_flush)(uint64_t h);              /* 收尾数据但保留句柄 */
 int (*backend_release)(uint64_t h);            /* 句柄销毁唯一入口 */
 int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
-int (*get_vars)(const char*** names, const char*** values, int* count);
 ```
 
 `backend_flush` 与 `backend_release` 的分工是易错点：FLUSH 可因 dup/fork **多次调用**，只能收尾数据（如上传完成），销毁必须等 RELEASE。
@@ -128,15 +132,15 @@ int (*get_vars)(const char*** names, const char*** values, int* count);
 ## 4. 加载与热插拔
 
 1. `module_system_init(rules_path, modules_dir, flags)`：mkdir 模块目录 → 全量扫描 → 启动 inotify 监控线程。
-2. 每个 `<name>/<name>.so`：`dlopen(RTLD_NOW|RTLD_LOCAL)` → `dlsym(nsp_module_info)` → 校验魔数/ABI 版本/名字一致 → `init(api)` → 按能力位登记注册表。
+2. 每个 `<name>/<name>.so`：0.5s 文件稳定性校验（防加载半写入的 .so）→ `dlopen(RTLD_NOW|RTLD_LOCAL)` → `dlsym(nsp_module_info)` → 校验魔数/ABI 版本/名字一致/自哈希 → `init(api)`（经围栏）→ 按能力位登记注册表。顺序见 §3：ABI 校验在 `dlopen` 之后、`init`/`ops` 之前。
 3. inotify 监听模块目录：新增加载、删除卸载、`.so` 覆盖（mtime 变化）重载。**watch 不递归子目录**，故 monitor 线程每 5s poll 超时做兜底全量扫描。
-4. 模块变更经 IPC 上报 `MODULE_CHANGED <name>` 给 injector（启动初始扫描不上报），injector 全量重挂追踪应用。`LIST_MODULES` 可查询当前模块列表。
+4. 模块变更**不再经 IPC 上报 injector**：`fuse_daemon` 的规则/后端分派走槽位原子快照，热插拔即时生效，无需 injector 重挂。`LIST_MODULES` 仍可查询当前模块列表（由 injector 扫描模块目录应答，与 fuse_daemon 的加载约定一致）。
 
 ## 5. 故障隔离（框架层防护）
 
 框架对全部模块调用（`resolve`/`probe`/`readdir_extra`/`get_pkg`/`backend_*`/`init`/`exit`）做三层防护，**模块错误不会带崩 fuse_daemon**：
 
-1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 `sigsetjmp` 围栏 + 全局 `sigaltstack`。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
+1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 TLS `sigsetjmp` 围栏；`sigaltstack` 是 **per-thread** 的——`fault_fence_init` 设置的全局 altstack 只覆盖主线程，每个首次调用围栏的线程还会为自己设置独立 TLS altstack（worker 不继承主线程的 altstack）。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
 2. **输出校验**（`src/module/module_guard.c`）：`NspResolveResult` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `user_id` 值域检查 + readdir 条目名校验。
 3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。
 
@@ -148,11 +152,11 @@ int (*get_vars)(const char*** names, const char*** values, int* count);
 
 ### 6.1 依赖与前置
 
-- **唯一接口头**：`include/nsp_module.h`，源码只依赖本头 + 标准库。
-- **许可证**：框架以 GPL-3.0-or-later 发布，但**对模块 ABI 授予链接例外**——仅通过本头文件公开 ABI 结合的独立模块，可按任意条款发布（含闭源），不因此受 GPL 约束。前提是不编入框架源码、不依赖本头以外的内部头、不引用未声明的内部符号。完整条款见 `LICENSE.module-exception`。
-- **编译宏**：必须定义 `-DNSP_MODULE_BUILD`，激活头内「模块公共运行时 ABI」段（日志宏 `LOG/LOG_WRN/LOG_ERR/LOG_DBG`、`CONFIG_DIR`/`STORAGE_BASE`、框架导出符号声明）。
-- **运行时符号**：日志/路径等框架符号经 fuse_daemon 的 `-Wl,--export-dynamic` 导出表在 dlopen 时解析，模块无需链接框架，**不得把 `src/core/common.c` 等框架源编入自身**。
-- **可借用的公共抽象**：通用 INI 段式存储（`nsp_ini_open/close/get/set/del_key/del_section/save`，经 `nsp_module.h` 代含 `nsp_ini_store.h`）——模块自有配置文件（如 `ftp.conf`）可直接调用，注释保留 + 原子落盘，语义见该头注释。
+- **唯一接口头**：`include/nsp_module.h`，源码只依赖本头 + 标准库。该头在 `NSP_MODULE_BUILD` 段**代含** `nsp_log.h`（`LogLevel` 与 `log_internal`）与 `nsp_constants.h`（`NSP_CONFIG_DIR`/`NSP_STORAGE_BASE`/`NSP_LOG_DIR` 等共享常量）；分发 SDK 时必须把这两个代含头一并给出，否则模块无法编译。
+- **许可证**：框架以 GPL-3.0-or-later 发布，但**对模块 ABI 授予链接例外**——仅通过本头文件公开 ABI 结合的独立模块，可按任意条款发布（含闭源），不因此受 GPL 约束。前提是不编入框架源码、不依赖本头以外的内部头、不引用未声明的内部符号。**代含的 `nsp_log.h` / `nsp_constants.h` 同属公开 ABI 头**，链接例外同样覆盖。完整条款见 `LICENSE.module-exception`。
+- **编译宏**：必须定义 `-DNSP_MODULE_BUILD`，激活头内「模块公共运行时 ABI」段（`LogLevel`/日志宏、平台常量、框架导出符号声明）。框架自身 TU 不定义该宏，声明与宏以 `common.h` 为准。
+- **运行时符号**：日志/路径等框架符号经 fuse_daemon 的 `-Wl,--export-dynamic` 导出表在 dlopen 时解析，模块无需链接框架，**不得把 `src/core/common.c` 等框架源编入自身**。模块也**不链接 `nsp_comm`**——统一通讯线程是框架各进程的内部设施，不属于模块 ABI。
+- **公开 ABI 只有 `nsp_module.h` 及其代含头**，不包含任何 `src/` 下的项目工具。`nsp_util`（`nsp_mkdir_p`、`nsp_set_thread_name`、App-rules 路径合成等）**不是 SDK 公共 ABI**：树内以 GPL 发布的模块可以链接它，但**第三方模块若要保留链接例外，就不能因此 include `nsp_util.h` 或编入任何项目源码**——例外只覆盖 `nsp_module.h` 声明的接口（含代含的 `nsp_log.h`/`nsp_constants.h`），越界即落入 GPL（见 `LICENSE.module-exception` 的「独立模块」定义）。通用 INI 段式存储（`nsp_ini_open/...`）与规则文件行级读写（`nsp_rule_file.h`）同样**不在模块 ABI 内**：`nsp_ini_store` 是 rule_server 的私有静态库（log_ctl 不使用），`nsp_rule_file` 是 rule_server/log_ctl 的控制面共享实现，两者都不经 `nsp_module.h` 暴露。
 
 ### 6.2 最小骨架
 
@@ -160,7 +164,7 @@ int (*get_vars)(const char*** names, const char*** values, int* count);
 #include "nsp_module.h"   /* NSP_MODULE_BUILD 已定义 */
 
 static int my_init(const NspFrameworkApi* api) {
-    g_api = api;                    /* 保存框架服务表（唯一访问通道） */
+    g_api = api;                    /* 保存框架参数表（get_rules_path / get_flags） */
     return 0;                       /* 非 0 拒绝加载 */
 }
 static void my_exit(void) { /* 清理（可为 NULL） */ }
@@ -189,23 +193,25 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
    -DNSP_MODULE_BUILD -I<项目>/include my_module.c -o my_module.so
 ```
 
-放入 `<MODULES_DIR>/my_module/my_module.so` 即热加载。项目内模块走 meson：`shared_library('<name>', ..., name_prefix: '', c_args: ['-DNSP_MODULE_BUILD'])`（`b_lundef` 项目级已关，允许引用主程序导出符号）。
+放入 `<MODULES_DIR>/my_module/my_module.so` 即热加载。项目内模块走 meson：`shared_library('<name>', ..., name_prefix: '', c_args: ['-DNSP_MODULE_BUILD'])`（`b_lundef` 项目级已关，允许引用主程序导出符号）；树内模块可另加 `nsp_util_dep`（共享工具，非公开 ABI，见 §6.1），第三方模块不要这样做。
 
 ### 6.4 契约（违反即被熔断）
 
 - 返回值：`0` 成功 / 负值 errno 失败（**返回正数非 0 会被计为错误**）。
 - 输出字符串字段**必须 NUL 终止**，越界写会破坏 canary 触发置毒。
 - 回调内**不得阻塞**：围栏窗口内不可恢复地持锁会破坏 longjmp 安全性（框架侧已保证分派路径不持锁）。
-- 置毒时框架**不调用** `exit()`（崩溃模块代码不可信），模块进程级资源需自行保证幂等。
+- 置毒时框架**仍会调用 `exit()`**（经围栏，崩溃会被 longjmp 收敛）——模块可能持有自己的 pthread，`exit` 是停掉它们的唯一途径，不调就 `dlclose` 会让残留线程踩空带崩 daemon。仅当 `exit` 自身崩溃（无法确认线程已停）才保留 `.so` 映射不 `dlclose`。因此模块 `exit` 必须幂等、且负责 join 自己创建的线程。
 
 ### 6.5 ABI 演进
 
 | 场景 | 机制 |
 |------|------|
-| 不兼容变更（改表结构/删字段） | `NSP_MODULE_ABI_VERSION` 递增 → 旧模块被校验拒绝 |
+| 不兼容变更（改表结构/删字段） | `NSP_MODULE_ABI_VERSION` 递增 → 旧模块被校验拒绝，须重编译 |
 | 兼容新增框架能力 | `NspFrameworkApi` 尾部追加字段 + `NSP_FRAMEWORK_API_VERSION` 递增 |
 | 新能力 / 新模块类型 | `caps` 位图扩展（32 位预留），框架按位判断 |
 | 模块自身版本 | `NspModuleInfo.version` 字符串（不影响加载兼容性） |
+
+ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspResolveResult`/`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（实测 `NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节，字段布局已变）。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。
 
 ## 7. 参考实现
 
@@ -214,9 +220,9 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 | `basic_rules.so` | `src/modules/basic_rules/` | 规则引擎（原 `vfs_core` 迁移，匹配语义逐行等价）：`basic_rules.c` 模块入口、`br_rules.c` 决策引擎（uid 缓存 / uid.map / Trie + 线性通道 / sandbox / 虚拟目录 / inotify 规则热重载） |
 | `ftp_module.so` | `src/modules/ftp/` | FTP 后端（libcurl，**不依赖 libfuse3**）：含 `backend_flush` 两阶段收尾与弱网重试示例；写路径为本地临时文件缓存 + release 时 STOR 全量上传 |
 
-FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。变量 `FTP_<段名>` 经 `get_vars` 注册。
+FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。命中后 `resolve` 回传 `is_ftp`，框架据此把该路径分派给 FTP 后端模块（不再有 `FTP_<段名>` 变量注册机制）。
 
-basic_rules 的关键语义（修改时必须保持）：hidden/ro 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`br_resolve` 读规则前持 `config_lock_read()`。
+basic_rules 的关键语义（修改时必须保持）：hidden/ro 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`br_resolve`/`br_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不再持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
 
 ## 8. 相关文档
 

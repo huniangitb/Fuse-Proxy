@@ -292,13 +292,16 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
        （由框架 loader.c 的 path_has_uid_layer 拦截兜底）；
        仅允许 <uid>/ 之后的路径（与其他目录合成逻辑分开，避免混淆） */
     const char* rest = nullptr;
+    /* "/storage/emulated/" 前缀长度（含尾斜杠 = 18），剥离与比较共用。
+       必须用 "ROOT \"/\"" 的字面量：ROOT 本身 17 字符，sizeof-1 会少 1 */
+    const size_t emu_prefix_len = sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1;
     if (t[0] == '?') {
         /* 相对当前 user 存储（ALLOW/相对路径在 parse 阶段转成的 ? 前缀，
            等价原 vfs_core.c:271-274）。t+1 以 '/' 开头，剥离后即剩余 */
         rest = t + 1;
         if (*rest == '/') rest++;
-    } else if (strncmp(t, "/storage/emulated/", 18) == 0) {
-        rest = t + 18;
+    } else if (strncmp(t, NSP_ANDROID_EMULATED_ROOT "/", emu_prefix_len) == 0) {
+        rest = t + emu_prefix_len;
         while (*rest && isdigit((unsigned char)*rest)) rest++;
         if (*rest == '/') rest++;
     } else if (is_system_abs_path(t)) {

@@ -574,7 +574,7 @@ static int do_restore_app_fuse(void* raw) {
         free(sub);
         return -1;
     }
-    const char* target = "/storage/emulated";
+    const char* target = NSP_ANDROID_EMULATED_ROOT;
     /* 项目 FUSE 源（fuse_src 挂载点）的 major:minor：bind 视图与源共享 superblock，
        以此识别顶层是否为项目 FUSE（mountinfo source 字段是 devname/fsname，
        非 bind 源路径，不能直接比较字符串） */

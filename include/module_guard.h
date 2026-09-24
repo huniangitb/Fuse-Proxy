@@ -21,7 +21,7 @@
 #include "nsp_module.h"
 
 /* ================= 输出守卫（canary） =================
- * NspResolveResult ≈16KB 结构体：调用方（FUSE 回调栈）用本守卫包裹，
+ * NspResolveResult：调用方（FUSE 回调栈）用本守卫包裹，
  * 前后 canary 被模块整块越界写破坏时 loader 逐模块调用后检测——
  * 破坏精确归因到"刚调用完的模块"。canary 值取黄金比例常量，
  * 与正常数据碰撞概率可忽略。 */
@@ -32,12 +32,27 @@ typedef struct {
     uint64_t back;
 } NspResolveGuard;
 
-/* 初始化守卫（只写 canary 与 r.valid——16KB 缓冲不做全量 memset，
-   与 nsp_resolve_result_init 的按需清零策略一致） */
+/* 标量与字符串首字节必须在每次分派、直通回退前重置；回调也会在无命中时
+   读取 ro/is_ftp/虚拟目录标志，不能只重置 valid。 */
+static inline void nsp_resolve_result_init(NspResolveResult* r) {
+    r->valid = false;
+    r->user_id = -1;
+    r->sub_path[0] = '\0';
+    r->pkg[0] = '\0';
+    r->hidden = false;
+    r->ro = false;
+    r->real_path[0] = '\0';
+    r->is_redir = false;
+    r->is_virtual_ancestor = false;
+    r->is_redirect_target = false;
+    r->is_ftp = false;
+    r->monitor_on = false;
+}
+
 static inline void nsp_guard_resolve_init(NspResolveGuard* g) {
     g->front = NSP_GUARD_CANARY;
-    g->back  = NSP_GUARD_CANARY;
-    g->r.valid = false;
+    g->back = NSP_GUARD_CANARY;
+    nsp_resolve_result_init(&g->r);
 }
 /* canary 完整性检查（loader 每次模块调用后调用） */
 static inline bool nsp_guard_resolve_ok(const NspResolveGuard* g) {
@@ -65,14 +80,12 @@ void module_guard_reset(int slot);
 /* 模块错误上报（逻辑错误路径：rc 异常/输出校验失败/canary 破坏）。
    限流 MOD_ERR 日志 + 滑动窗口计数；窗口内达阈值 → 熔断置毒
    （module_fault_poison：规则立即失效 + ban 落盘）。幂等安全。 */
-void module_guard_error(int slot, const char* op, int rc,
-                        const char* path, const char* detail);
+void module_guard_error(int slot, const char* op, int rc, const char* path, const char* detail);
 /* 模块崩溃上报（围栏恢复路径）：单次即置毒（不计数）+ 高危日志 */
 void module_guard_fault(int slot, const char* op, const char* path);
 
 /* 健康查询（Phase 1c 快照接口用）：填充当前窗口错误数/累计错误数/
    最近错误时刻。slot 无效时全 0 返回。 */
-void module_guard_health(int slot, unsigned* err_count, unsigned* err_total,
-                         time_t* last_err_time);
+void module_guard_health(int slot, unsigned* err_count, unsigned* err_total, time_t* last_err_time);
 
 #endif /* MODULE_GUARD_H */

@@ -21,7 +21,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define NSP_INI_MAX_LINE 2048   /* 可解析行上限；超长行原样保留但不参与段/键匹配 */
+#include "nsp_constants.h"
+
+/* 可解析行上限（= 配置规范单行上限，超长行原样保留但不参与段/键匹配） */
+#define NSP_INI_MAX_LINE NSP_CONFIG_LINE_MAX
 
 /* 不透明句柄（内部行数组可演进，不影响 ABI） */
 typedef struct NspIniStore NspIniStore;
@@ -32,42 +35,40 @@ extern "C" {
 
 /* 打开存储：文件不存在视为空存储（路径已记住，set 后 save 即创建）；
  * 仅参数非法/OOM 返回 NULL */
-NspIniStore *nsp_ini_open(const char *path);
-void nsp_ini_close(NspIniStore *s);
-const char *nsp_ini_path(const NspIniStore *s);
+NspIniStore* nsp_ini_open(const char* path);
+void nsp_ini_close(NspIniStore* s);
+const char* nsp_ini_path(const NspIniStore* s);
 
 /* 段遍历（file 出现顺序，含 [GLOBAL] 等一切段头） */
-int nsp_ini_section_count(const NspIniStore *s);
-const char *nsp_ini_section_name(const NspIniStore *s, int idx); /* 越界返回 NULL */
-int nsp_ini_find_section(const NspIniStore *s, const char *name); /* 精确匹配，-1=无 */
+int nsp_ini_section_count(const NspIniStore* s);
+const char* nsp_ini_section_name(const NspIniStore* s, int idx);  /* 越界返回 NULL */
+int nsp_ini_find_section(const NspIniStore* s, const char* name); /* 精确匹配，-1=无 */
 
 /* 段内键遍历 */
-int nsp_ini_key_count(const NspIniStore *s, int sec_idx);
-const char *nsp_ini_key_name(const NspIniStore *s, int sec_idx, int key_idx);
+int nsp_ini_key_count(const NspIniStore* s, int sec_idx);
+const char* nsp_ini_key_name(const NspIniStore* s, int sec_idx, int key_idx);
 
 /* 取值：0=命中（out 写入剥注释去空白后的值，out 可为 NULL 表仅探测存在性），
  * -1=段/键不存在 */
-int nsp_ini_get(const NspIniStore *s, const char *section, const char *key,
-                char *out, size_t sz);
+int nsp_ini_get(const NspIniStore* s, const char* section, const char* key, char* out, size_t sz);
 
 /* 设值：段/键不存在则分别追加（段追文件尾、键追段尾），存在则首命中行改写为
  * `key = value` 规范形式；0=成功，-1=参数非法/OOM */
-int nsp_ini_set(NspIniStore *s, const char *section, const char *key,
-                const char *value);
+int nsp_ini_set(NspIniStore* s, const char* section, const char* key, const char* value);
 /* 删键：0=已删，-1=不存在 */
-int nsp_ini_del_key(NspIniStore *s, const char *section, const char *key);
+int nsp_ini_del_key(NspIniStore* s, const char* section, const char* key);
 /* 删段：连段头与其下属行一并移除（首命中段块）；0=已删，-1=不存在 */
-int nsp_ini_del_section(NspIniStore *s, const char *section);
+int nsp_ini_del_section(NspIniStore* s, const char* section);
 
 /* 原子落盘（tmp+rename）：0=成功，-1=IO 失败（原文件不动） */
-int nsp_ini_save(const NspIniStore *s);
+int nsp_ini_save(const NspIniStore* s);
 
 /* 通用合法性：非空、去空白后非空、不含 \n \r [ ]（段名/键名通用）；
  * 键名另禁 `=`；长度上限：段名/键名 255，值 2047（调用方可再收紧，如 FTP
  * 段名 ≤63 受 FtpServerCfg.name[64] 约束） */
-bool nsp_ini_valid_section(const char *name);
-bool nsp_ini_valid_key(const char *key);
-bool nsp_ini_valid_value(const char *value);
+bool nsp_ini_valid_section(const char* name);
+bool nsp_ini_valid_key(const char* key);
+bool nsp_ini_valid_value(const char* value);
 
 #ifdef __cplusplus
 }

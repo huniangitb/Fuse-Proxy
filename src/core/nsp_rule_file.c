@@ -13,6 +13,7 @@
  * injector 的 inotify 监听读到半截配置。
  */
 #include "nsp_rule_file.h"
+#include "nsp_constants.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -22,10 +23,6 @@
 #include <string.h>
 #include <strings.h> /* strncasecmp */
 #include <unistd.h>
-
-/* 单行缓冲上限：与配置规范一致（docs/config.md「单行 ≤2048 字节」）。
-   超长行按上限截断读取——配置文件本就不接受超长行，截断不影响合法输入。 */
-#define NSP_RULE_LINE_MAX 2048
 
 /* 行数组初始容量与扩容因子（与合并前两份实现一致） */
 #define NSP_RULE_LINES_INIT_CAP 64
@@ -42,7 +39,7 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
 
     char** lines = NULL;
     int count = 0, cap = 0;
-    char buf[NSP_RULE_LINE_MAX];
+    char buf[NSP_CONFIG_LINE_MAX];
     while (fgets(buf, sizeof buf, fp)) {
         if (count >= cap) {
             int ncap = cap == 0 ? NSP_RULE_LINES_INIT_CAP : cap * 2;

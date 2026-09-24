@@ -98,8 +98,11 @@ def main():
         """运行中移除模块 → 规则失效（直通）"""
         if not (m/"0/云盘/hi.txt").exists():
             return fail("前置", "模块未生效，无法测热插拔")
+        got = (m/"0/云盘/hi.txt").read_text()
+        ok("热拔前已打开并读取文件") if got == "redirected" else fail("热拔前读取", got)
         rm_module()
         ok("热拔：规则失效") if wait_check(m, "0/云盘/hi.txt", False) else fail("热拔", "/0/云盘/hi.txt 仍可见（直通应不可见）")
+        ok("热拔：缺失路径不合成目录") if not (m/"0/never-existed").exists() else fail("热拔-虚假目录")
         ok("热拔：普通路径不受影响") if (m/"0/normal/n.txt").exists() else fail("热拔-普通", "直通后普通文件不可见")
     run_case("2. 运行中移除模块（热拔）", case2)
 

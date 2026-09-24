@@ -2,6 +2,7 @@
 #define _GNU_SOURCE /* pthread_setname_np 声明所需（模块侧无 -D_GNU_SOURCE 时） */
 #endif
 #include "nsp_util.h"
+#include "nsp_constants.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -135,19 +136,22 @@ void nsp_set_thread_name(const char* name) {
 void nsp_app_rule_dir(const char* config_dir, int uid, char* out, size_t sz) {
     if (!out || sz == 0) return;
     if (uid == 0)
-        snprintf(out, sz, "%s/App-rules", config_dir);
+        snprintf(out, sz, "%s/%s", config_dir, NSP_APP_RULES_DIRNAME);
     else
-        snprintf(out, sz, "%s/App-rules-%d", config_dir, uid);
+        snprintf(out, sz, "%s/%s-%d", config_dir, NSP_APP_RULES_DIRNAME, uid);
 }
 
 void nsp_app_rule_path(const char* config_dir, int uid, const char* pkg, char* out, size_t sz) {
     if (!out || sz == 0) return;
     if (uid == 0)
-        snprintf(out, sz, "%s/App-rules/%s.conf", config_dir, pkg);
+        snprintf(out, sz, "%s/%s/%s.conf", config_dir, NSP_APP_RULES_DIRNAME, pkg);
     else
-        snprintf(out, sz, "%s/App-rules-%d/%s.conf", config_dir, uid, pkg);
+        snprintf(out, sz, "%s/%s-%d/%s.conf", config_dir, NSP_APP_RULES_DIRNAME, uid, pkg);
 }
 
 bool nsp_is_app_rules_dirname(const char* name) {
-    return name && (strcmp(name, "App-rules") == 0 || strncmp(name, "App-rules-", 10) == 0);
+    /* "-" 后缀形态长度 = "App-rules-" 字面量长度（sizeof-1 = 10） */
+    return name &&
+           (strcmp(name, NSP_APP_RULES_DIRNAME) == 0 ||
+            strncmp(name, NSP_APP_RULES_DIRNAME "-", sizeof(NSP_APP_RULES_DIRNAME "-") - 1) == 0);
 }

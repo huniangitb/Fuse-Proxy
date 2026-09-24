@@ -32,35 +32,11 @@
 
 #define FTP_MAX_BACKENDS FTP_CONF_MAX_SERVERS
 
-static const NspFrameworkApi* g_api = NULL;
 static char g_ftp_conf_path[PATH_MAX] = CONFIG_DIR "/ftp.conf";
-static char g_var_names[FTP_MAX_BACKENDS][64];
-static char g_var_values[FTP_MAX_BACKENDS][PATH_MAX];
 
 /* ftp.conf 热加载监控线程 */
 static pthread_t g_hotload_tid = 0;
 static volatile sig_atomic_t g_hotload_stop = 0;
-
-/* FTP 服务器不可用时每 1 分钟重连探活线程 */
-/* 持久化会话自动处理重连（ftp_session_ensure + NOOP 保活），无需 retry 线程 */
-
-/* get_vars：向框架注册 FTP_<段名>=<挂载前缀> 变量 */
-static int ftp_module_get_vars(const char*** names, const char*** values, int* count) {
-    static const char* name_ptrs[FTP_MAX_BACKENDS];
-    static const char* value_ptrs[FTP_MAX_BACKENDS];
-    int n = ftp_backend_count();
-    if (n > FTP_MAX_BACKENDS) n = FTP_MAX_BACKENDS;
-    for (int i = 0; i < n; i++) {
-        /* g_var_names[i] 已由 reload_ftp_conf 填为 "FTP_<段名>"，勿再格式化
-           （重叠 snprintf 同缓冲读写为 UB，且会叠加出 FTP_FTP_ 前缀） */
-        name_ptrs[i] = g_var_names[i];
-        value_ptrs[i] = g_var_values[i];
-    }
-    *names = name_ptrs;
-    *values = value_ptrs;
-    *count = n;
-    return 0;
-}
 
 /* 重新解析 ftp.conf 并重建后端前缀表（init 与热加载共用） */
 static void reload_ftp_conf(void) {
@@ -70,19 +46,11 @@ static void reload_ftp_conf(void) {
         return;
     }
     ftp_backend_clear();
-    memset(g_var_names, 0, sizeof g_var_names);
-    memset(g_var_values, 0, sizeof g_var_values);
-    /* 独立索引 vi：与 ftp_backend_add 成功数一致，保证 g_var_names/
-       g_var_values 与 get_vars 的循环（ftp_backend_count()）对齐 */
-    int vi = 0;
     for (int i = 0; i < list.count && i < FTP_MAX_BACKENDS; i++) {
         if (ftp_backend_add(&list.servers[i]) != 0) continue;
-        snprintf(g_var_names[vi], sizeof g_var_names[vi], "FTP_%s", list.servers[i].name);
-        snprintf(g_var_values[vi], sizeof g_var_values[vi], "/%s", list.servers[i].name);
         LOG("ftp_module: 注册后端 /%s → FTP %s:%d%s (server=%s)", list.servers[i].name,
             list.servers[i].host, list.servers[i].port, list.servers[i].remote_dir,
             list.servers[i].name);
-        vi++;
     }
     if (ftp_backend_count() == 0)
         LOG_WRN("ftp_module: 无可用 server，请检查 ftp.conf");
@@ -140,7 +108,7 @@ static void* ftp_conf_watch_thread(void* arg) {
 }
 
 static int ftp_module_init(const NspFrameworkApi* api) {
-    g_api = api;
+    if (!api || api->api_version < NSP_FRAMEWORK_API_VERSION) return -1;
     /* ftp.conf 与规则配置同目录：--rules=<dir>/injector.conf → <dir>/ftp.conf */
     if (api && api->get_rules_path) {
         const char* rp = api->get_rules_path();
@@ -173,8 +141,6 @@ static void ftp_module_exit(void) {
         pthread_join(g_hotload_tid, NULL);
         g_hotload_tid = 0;
     }
-    /* 无 retry 线程 */
-    /* 无 retry 线程不需 join */
     ftp_backend_clear();
 }
 
@@ -187,7 +153,6 @@ static const NspModuleOps ftp_module_ops = {
     .backend_create = ftp_backend_create,   .backend_unlink = ftp_backend_unlink,
     .backend_mkdir = ftp_backend_mkdir,     .backend_rmdir = ftp_backend_rmdir,
     .backend_rename = ftp_backend_rename,   .backend_truncate = ftp_backend_truncate,
-    .get_vars = ftp_module_get_vars,
 };
 
 /* 必须为非 static 动态符号（loader 经 dlsym 查找） */
@@ -195,7 +160,7 @@ const NspModuleInfo nsp_module_info = {
     .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
     .type = NSP_MODULE_TYPE_BACKEND,
-    .caps = NSP_CAP_MOUNT_POINT | NSP_CAP_VAR | NSP_CAP_BACKEND_IO,
+    .caps = NSP_CAP_BACKEND_IO,
     .name = "ftp_module",
     .version = "2.0-test",
     .init = ftp_module_init,

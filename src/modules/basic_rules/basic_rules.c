@@ -1,7 +1,5 @@
 #define _GNU_SOURCE
 #include "nsp_module.h"
-#include "module_loader.h"
-#include "nsp_module.h"
 #include "br_rules.h"
 
 /*
@@ -13,17 +11,14 @@
  */
 
 static bool g_br_inited = false;
-static const NspFrameworkApi* g_api = NULL;
 
 static int br_module_init(const NspFrameworkApi* api) {
-    g_api = api;
-    if (!api) return -1;
+    if (!api || api->api_version < NSP_FRAMEWORK_API_VERSION) return -1;
     /* 规则路径与启动标志由框架经 api 提供（--rules= 与 --disable-sandbox） */
     const char* rules_path = NULL;
-    if (api->api_version >= 2 && api->get_rules_path) rules_path = api->get_rules_path();
+    if (api->get_rules_path) rules_path = api->get_rules_path();
     bool disable_sandbox = false;
-    if (api->api_version >= 2 && api->get_flags)
-        disable_sandbox = (api->get_flags() & NSP_FLAG_DISABLE_SANDBOX) != 0;
+    if (api->get_flags) disable_sandbox = (api->get_flags() & NSP_FLAG_DISABLE_SANDBOX) != 0;
     int rc = br_rules_init(rules_path, disable_sandbox);
     if (rc == 0) g_br_inited = true;
     return rc;
@@ -42,7 +37,6 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         .path = q->path,
         .uid = q->uid,
         .pid = q->pid,
-        .gid = q->gid,
     };
     BrResult r;
     br_resolve(&bq, &r);
@@ -59,21 +53,12 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     out->monitor_on = r.monitor_on; /* 修复：漏拷贝导致全局 MONITOR ON 时 IO 监控失效 */
     out->hidden = r.hidden;
     out->ro = r.ro;
-    out->has_redir = r.has_redir;
-    strncpy(out->redir_target, r.redir_target, sizeof out->redir_target - 1);
-    out->redir_target[sizeof out->redir_target - 1] = '\0';
-    out->has_sandbox = r.has_sandbox;
-    strncpy(out->sandbox_target, r.sandbox_target, sizeof out->sandbox_target - 1);
-    out->sandbox_target[sizeof out->sandbox_target - 1] = '\0';
     strncpy(out->real_path, r.real_path, sizeof out->real_path - 1);
     out->real_path[sizeof out->real_path - 1] = '\0';
     out->is_redir = r.is_redir;
     out->is_virtual_ancestor = r.is_virtual_ancestor;
     out->is_redirect_target = r.is_redirect_target;
-    out->is_other_app_pkg = r.is_other_app_pkg;
     out->is_ftp = r.is_ftp;
-    strncpy(out->ftp_backend, r.ftp_backend, sizeof out->ftp_backend - 1);
-    out->ftp_backend[sizeof out->ftp_backend - 1] = '\0';
     return 0;
 }
 
@@ -83,7 +68,6 @@ static int br_module_probe(const NspQueryCtx* q, NspProbeResult* out) {
         .path = q->path,
         .uid = q->uid,
         .pid = q->pid,
-        .gid = q->gid,
     };
     BrProbeResult r;
     br_probe(&bq, &r);
@@ -106,14 +90,8 @@ static int br_module_readdir_extra(const NspQueryCtx* q, const char* sub_path, i
         .path = sub_path,
         .uid = q->uid,
         .pid = q->pid,
-        .gid = q->gid,
     };
     return br_readdir_extra(&bq, sub_path, user_id, pkg, is_root, out, max);
-}
-
-static int br_module_reload(void) {
-    br_reload_config();
-    return 0;
 }
 
 static int br_module_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {
@@ -124,7 +102,6 @@ static const NspModuleOps g_br_ops = {
     .resolve = br_module_resolve,
     .probe = br_module_probe,
     .readdir_extra = br_module_readdir_extra,
-    .reload = br_module_reload,
     .get_pkg = br_module_get_pkg,
 };
 
@@ -134,7 +111,7 @@ const NspModuleInfo nsp_module_info = {
     .abi_version = NSP_MODULE_ABI_VERSION,
     .type = NSP_MODULE_TYPE_RULES,
     .caps = NSP_CAP_REDIRECT | NSP_CAP_SANDBOX | NSP_CAP_HIDE | NSP_CAP_ALLOW | NSP_CAP_RO |
-            NSP_CAP_READDIR_EXTRA | NSP_CAP_VIRTUAL_DIR,
+            NSP_CAP_READDIR_EXTRA,
     .name = "basic_rules",
     .version = "1.0.0",
     .init = br_module_init,

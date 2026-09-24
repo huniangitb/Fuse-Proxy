@@ -28,7 +28,7 @@
 #include "common.h"
 #include "nsp_comm.h"
 #include "nsp_util.h"
-#define MAX_MSG_LEN 4096
+#define MAX_MSG_LEN NSP_LOG_MSG_MAX /* 单条日志上限，与 common.c 组帧同源（nsp_constants.h） */
 /* 滑动日志缓冲：按字节上限控制（超出丢弃最旧日志）。
    IO 日志最大 128MB，普通日志（sys/logcat）各 16MB。
    条数上限 = 字节上限 / 单条固定大小（LogEntry ≈ MAX_MSG_LEN+16），

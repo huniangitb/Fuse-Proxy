@@ -53,10 +53,6 @@ static const char* api_get_rules_path(void) {
 static uint32_t api_get_flags(void) {
     return 0;
 }
-static void api_log(int level, const char* fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
 
 static const NspModuleOps* g_ops = NULL;
 
@@ -152,8 +148,6 @@ int main(int argc, char** argv) {
     }
     NspFrameworkApi api = {
         .api_version = NSP_FRAMEWORK_API_VERSION,
-        .log = api_log,
-        .get_real_root = NULL,
         .get_rules_path = api_get_rules_path,
         .get_flags = api_get_flags,
     };

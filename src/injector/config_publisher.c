@@ -46,7 +46,7 @@ static void build_global_fuse_json(json_object* root) {
                            json_object_new_boolean(g_global_fuse.disabled));
     json_object_object_add(root, "global_fuse", global_fuse);
 }
-static void append_redir_rules_json(json_object* arr, AppConfig* cfg) {
+static void append_redir_rules_json(json_object* arr, const AppConfig* cfg) {
     for (int i = 0; i < cfg->redir_count; i++) {
         if (cfg->redir_rules[i].is_allow) continue; // ALLOW 规则单独输出
         json_object* rule = json_object_new_object();
@@ -62,13 +62,13 @@ static void append_redir_rules_json(json_object* arr, AppConfig* cfg) {
     }
 }
 
-static void append_allow_rules_json(json_object* arr, AppConfig* cfg) {
+static void append_allow_rules_json(json_object* arr, const AppConfig* cfg) {
     for (int i = 0; i < cfg->redir_count; i++) {
         if (!cfg->redir_rules[i].is_allow) continue; // 只输出 ALLOW 规则
         json_object_array_add(arr, json_object_new_string(cfg->redir_rules[i].virtual_prefix));
     }
 }
-static void append_str_array_json(json_object* arr, char** rules, int count) {
+static void append_str_array_json(json_object* arr, char* const* rules, int count) {
     for (int i = 0; i < count; i++) {
         json_object_array_add(arr, json_object_new_string(rules[i]));
     }
@@ -315,115 +315,84 @@ void config_publisher_broadcast(void) {
 }
 #define MAX_FILE_SIZE    (256 * 1024)
 #define MAX_STATIC_FILES 256
+/* 静态重定向规则字符串（"<虚拟前缀> <目标>"）：目标的 '?' 是 parse 阶段内部
+   前缀（相对当前用户存储），对外展示时剥离；ALLOW 单独输出 */
+static void append_static_redirect_json(json_object* arr, const AppConfig* cfg) {
+    for (int i = 0; i < cfg->redir_count; i++) {
+        if (cfg->redir_rules[i].is_allow) continue;
+        const char* raw_target = cfg->redir_rules[i].real_target;
+        char buf[2 * MAX_PATH_LEN];
+        snprintf(buf, sizeof buf, "%s %s", cfg->redir_rules[i].virtual_prefix,
+                 raw_target[0] == '?' ? raw_target + 1 : raw_target);
+        json_object_array_add(arr, json_object_new_string(buf));
+    }
+}
+
+/* STATIC 的 global 段：复用 config_parser 已加载的 AppConfig 快照（调用方须持
+   读锁）。发布器禁止调用 load_config_rules——那会替换 injector 的 live 配置，
+   破坏实时规则（对照 log_ctl 的查询路径，后者是独立进程可自行加载）。 */
+static void build_static_global_json(json_object* root) {
+    json_object* global = json_object_new_object();
+
+    json_object* switches = json_object_new_object();
+    json_object_object_add(switches, "global_inject",
+                           json_object_new_string(g_global_cfg.global_inject ? "ON" : "OFF"));
+    json_object_object_add(switches, "monitor",
+                           json_object_new_string(g_global_cfg.monitor ? "ON" : "OFF"));
+    json_object_object_add(switches, "sandbox",
+                           json_object_new_string(g_global_cfg.sandbox ? "ON" : "OFF"));
+    json_object_object_add(global, "switches", switches);
+
+    json_object* ro_rules = json_object_new_array();
+    append_str_array_json(ro_rules, g_global_cfg.ro_rules, g_global_cfg.ro_count);
+    json_object_object_add(global, "ro_rules", ro_rules);
+
+    json_object* hide_rules = json_object_new_array();
+    append_str_array_json(hide_rules, g_global_cfg.hide_rules, g_global_cfg.hide_count);
+    json_object_object_add(global, "hide_rules", hide_rules);
+
+    json_object* redirect_rules = json_object_new_array();
+    append_static_redirect_json(redirect_rules, &g_global_cfg);
+    json_object_object_add(global, "redirect_rules", redirect_rules);
+
+    json_object* allow_rules = json_object_new_array();
+    append_allow_rules_json(allow_rules, &g_global_cfg);
+    json_object_object_add(global, "allow_rules", allow_rules);
+
+    json_object_object_add(root, "global", global);
+}
+
+/* STATIC 的 apps 段：同样取已加载快照（含 App-rules 分文件与类别段），
+   不再对 injector.conf 做 strtok_r + sscanf 旁路解析；类别段补 scope 标记，
+   与 GET 模板的表示保持一致 */
+static void build_static_apps_json(json_object* root) {
+    json_object* apps = json_object_new_array();
+    for (int i = 0; i < g_app_cfg_count; i++) {
+        const AppConfig* cfg = g_app_cfgs[i];
+        if (!cfg) continue;
+        json_object* app = json_object_new_object();
+        json_object_object_add(app, "pkg", json_object_new_string(cfg->pkg_name));
+        json_object_object_add(app, "user_id", json_object_new_int(cfg->user_id));
+        json_object_object_add(app, "inject_enable",
+                               json_object_new_string(cfg->inject_enable ? "ON" : "OFF"));
+        if (strcmp(cfg->pkg_name, "USER_APPS") == 0 || strcmp(cfg->pkg_name, "SYSTEM_APPS") == 0)
+            json_object_object_add(app, "scope", json_object_new_string("category"));
+        json_object_array_add(apps, app);
+    }
+    json_object_object_add(root, "apps", apps);
+}
+
 static void handle_static_request(int sock_fd, struct sockaddr_un* cli_addr, socklen_t cli_len) {
     json_object* root = json_object_new_object();
     json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
     json_object_object_add(root, "type", json_object_new_string("static"));
 
-    /* 解析 injector.conf */
-    size_t conf_len = 0;
-    char* conf_content = read_file_dynamic(INJECTOR_CONFIG_PATH, &conf_len, MAX_FILE_SIZE);
-    if (conf_content) {
-        json_object* global = json_object_new_object();
-        json_object* switches = json_object_new_object();
-        json_object* ro_rules = json_object_new_array();
-        json_object* hide_rules = json_object_new_array();
-        json_object* redirect_rules = json_object_new_array();
-        json_object* allow_rules = json_object_new_array();
-        json_object* apps = json_object_new_array();
-
-        bool in_global = false;
-        char* saveptr1 = NULL;
-        char* tok = strtok_r(conf_content, "\n", &saveptr1);
-
-        while (tok) {
-            while (*tok == ' ' || *tok == '\t') tok++;
-            if (*tok == '\0' || *tok == '#') {
-                tok = strtok_r(nullptr, "\n", &saveptr1);
-                continue;
-            }
-
-            if (tok[0] == '[') {
-                in_global = (strcmp(tok, "[GLOBAL]") == 0);
-                if (!in_global) {
-                    /* 解析 [pkg:uid] ON/OFF */
-                    char pkg[128] = {0};
-                    int uid = 0;
-                    char state[8] = {0};
-                    char* end = strchr(tok + 1, ']');
-                    if (end) {
-                        size_t len = end - (tok + 1);
-                        char inner[256];
-                        snprintf(inner, sizeof(inner), "%.*s", (int)len, tok + 1);
-                        char* colon = strrchr(inner, ':');
-                        if (colon) {
-                            *colon = '\0';
-                            uid = atoi(colon + 1);
-                        }
-                        snprintf(pkg, sizeof(pkg), "%s", inner);
-                        char* rest = end + 1;
-                        while (*rest == ' ' || *rest == '\t') rest++;
-                        sscanf(rest, "%7s", state);
-                    }
-                    if (pkg[0]) {
-                        json_object* app = json_object_new_object();
-                        json_object_object_add(app, "pkg", json_object_new_string(pkg));
-                        json_object_object_add(app, "user_id", json_object_new_int(uid));
-                        json_object_object_add(app, "inject_enable",
-                                               json_object_new_string(state[0] ? state : "OFF"));
-                        json_object_array_add(apps, app);
-                    }
-                }
-                tok = strtok_r(nullptr, "\n", &saveptr1);
-                continue;
-            }
-
-            if (in_global) {
-                char val[4096];
-                if (sscanf(tok, "GLOBAL_INJECT = %4095s", val) == 1 ||
-                    sscanf(tok, "GLOBAL_INJECT %4095s", val) == 1)
-                    json_object_object_add(switches, "global_inject", json_object_new_string(val));
-                else if (sscanf(tok, "MONITOR = %4095s", val) == 1 ||
-                         sscanf(tok, "MONITOR %4095s", val) == 1)
-                    json_object_object_add(switches, "monitor", json_object_new_string(val));
-                else if (sscanf(tok, "SANDBOX = %4095s", val) == 1 ||
-                         sscanf(tok, "SANDBOX %4095s", val) == 1)
-                    json_object_object_add(switches, "sandbox", json_object_new_string(val));
-                else if (strncmp(tok, "RO ", 3) == 0 || strncmp(tok, "RO\t", 2) == 0) {
-                    char* path = tok + 3;
-                    while (*path == ' ' || *path == '\t') path++;
-                    if (*path) json_object_array_add(ro_rules, json_object_new_string(path));
-                } else if (strncmp(tok, "HIDE ", 5) == 0 || strncmp(tok, "HIDE\t", 5) == 0) {
-                    char* path = tok + 5;
-                    while (*path == ' ' || *path == '\t') path++;
-                    if (*path) json_object_array_add(hide_rules, json_object_new_string(path));
-                } else if (strncmp(tok, "REDIRECT ", 9) == 0 ||
-                           strncmp(tok, "REDIRECT\t", 9) == 0) {
-                    char* path = tok + 9;
-                    while (*path == ' ' || *path == '\t') path++;
-                    if (*path) json_object_array_add(redirect_rules, json_object_new_string(path));
-                } else if (strncmp(tok, "ALLOW ", 6) == 0 || strncmp(tok, "ALLOW\t", 6) == 0) {
-                    char* path = tok + 6;
-                    while (*path == ' ' || *path == '\t') path++;
-                    if (*path) json_object_array_add(allow_rules, json_object_new_string(path));
-                }
-            }
-            tok = strtok_r(nullptr, "\n", &saveptr1);
-        }
-
-        json_object_object_add(global, "switches", switches);
-        json_object_object_add(global, "ro_rules", ro_rules);
-        json_object_object_add(global, "hide_rules", hide_rules);
-        json_object_object_add(global, "redirect_rules", redirect_rules);
-        json_object_object_add(global, "allow_rules", allow_rules);
-        json_object_object_add(root, "global", global);
-        json_object_object_add(root, "apps", apps);
-
-        free(conf_content);
-    } else {
-        json_object_object_add(root, "global", NULL);
-        json_object_object_add(root, "apps", json_object_new_array());
-    }
+    /* global/apps 复用已加载快照（读锁下取一致视图）；app_rules 仍读磁盘原始
+       文件内容——STATIC 的语义就是"原始规则文件" */
+    config_lock_read();
+    build_static_global_json(root);
+    build_static_apps_json(root);
+    config_unlock_read();
 
     /* app_rules: 扫描文件系统读取每个应用规则文件内容 */
     json_object* app_rules = json_object_new_array();

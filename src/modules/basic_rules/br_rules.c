@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "br_rules.h"
 #include "nsp_module.h" /* LOG_*、g_log_shutdown、g_real_root、STORAGE_BASE 等 */
+#include "nsp_constants.h"
 #include "path_vars.h"
 #include "uid_map.h"
 #include "fast_pid.h"
@@ -132,7 +133,7 @@ static void clear_uid_cache(void) {
 }
 
 /* 配置热重载（含 uid.map 与 uid 缓存重建） */
-void br_reload_config(void) {
+static void br_reload_config(void) {
     config_lock_write();
     /* S1：先失效 uid 缓存与目录级 probe 缓存（g_br_cfg_gen++），再清空
        uid 缓存中的 cfg 指针——load_config_rules 的 COW 发布随后会释放旧
@@ -280,7 +281,7 @@ void br_rules_exit(void) {
  * 无类别段时直接 NULL：零额外开销、行为与旧版一致 */
 static AppConfig* br_pick_category(uid_t uid, int user_id, const char* base_pkg) {
     if (!config_has_category_rules()) return nullptr;
-    if (uid < 10000 || strcmp(base_pkg, "system") == 0)
+    if (uid < NSP_SYSTEM_APP_UID_MIN || strcmp(base_pkg, "system") == 0)
         return find_category_cfg_locked(true, user_id);
     if (!pkg_resolvable(base_pkg)) return nullptr;
     if (sys_pkg_is_system(base_pkg)) return find_category_cfg_locked(true, user_id);
@@ -289,11 +290,12 @@ static AppConfig* br_pick_category(uid_t uid, int user_id, const char* base_pkg)
 
 static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, AppConfig** cat_out) {
     if (cat_out) *cat_out = nullptr;
-    if (uid < 10000) {
+    if (uid < NSP_SYSTEM_APP_UID_MIN) {
         strncpy(current_pkg_out, "system", 127);
         current_pkg_out[127] = '\0';
         /* 系统伪包同样参与类别层：SYSTEM_APPS 对 uid<10000 生效 */
-        if (cat_out) *cat_out = br_pick_category(uid, (int)(uid / 100000), "system");
+        if (cat_out)
+            *cat_out = br_pick_category(uid, (int)(uid / NSP_PER_USER_UID_STRIDE), "system");
         return nullptr;
     }
     int slot = uid % UID_CACHE_SIZE;
@@ -328,7 +330,7 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, Ap
         break;
     }
 
-    int user_id = uid / 100000;
+    int user_id = uid / NSP_PER_USER_UID_STRIDE;
     char final_pkg[256] = {0};
     pid_t main_pid = tid;
     const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
@@ -762,7 +764,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
         }
         int effective_uid = user_id;
         if (effective_uid < 0) {
-            if (uid >= 10000) effective_uid = (int)(uid / 100000);
+            if (uid >= NSP_SYSTEM_APP_UID_MIN) effective_uid = (int)(uid / NSP_PER_USER_UID_STRIDE);
         }
         if (effective_uid < 0) effective_uid = 0;
         char sandbox_target[MAX_PATH_LEN];
@@ -1060,17 +1062,6 @@ static bool br_virtual_ancestor_linear(AppConfig* cfg, AppConfig* cat, const cha
     return res;
 }
 
-/* ALLOW 豁免匹配：通配规则（含 * ? [ ]，从第二字符起检测）fnmatch 全路径
-   匹配；非通配规则保持前缀匹配（含 / 根豁免）——与 br_is_path_hidden_internal
-   的 HIDE 动态规则语义一致 */
-static bool br_allow_rule_match(const char* prefix, const char* sub_path) {
-    if (!prefix || !sub_path) return false;
-    if (br_is_wildcard(prefix)) return fnmatch(prefix, sub_path, 0) == 0;
-    size_t len = strlen(prefix);
-    return strcmp(prefix, "/") == 0 ||
-           (strncmp(sub_path, prefix, len) == 0 && (sub_path[len] == '\0' || sub_path[len] == '/'));
-}
-
 /* redirect_target 判定的线性规则部分（redir 前缀精确匹配 + 根 sandbox），不含 trie */
 static bool br_redirect_target_linear(AppConfig* cfg, AppConfig* cat, const char* sub_path) {
     bool res = false;
@@ -1149,10 +1140,7 @@ static bool br_effective_monitor(AppConfig* cfg, AppConfig* cat) {
 
 /* ============ 核心决策入口 ============ */
 
-/* 按需初始化 BrResult（≈16.5KB）：只写标量字段与各字符串首字节，
-   替代 memset(out, sizeof *out) 的全量擦写——resolve 为 FUSE 每请求热路径，
-   全量 16KB memset 会被高频放大。成功路径会用 strcpy 覆盖各字符串，
-   失败（hidden）路径保持空串（适配层 strncpy 依赖其 NUL 结尾）。 */
+/* 字符串仅需首字节清零；成功路径负责覆盖，隐藏路径保留空串。 */
 static inline void br_result_init(BrResult* out) {
     out->valid = false;
     out->user_id = -1;
@@ -1160,17 +1148,11 @@ static inline void br_result_init(BrResult* out) {
     out->pkg[0] = '\0';
     out->hidden = false;
     out->ro = false;
-    out->has_redir = false;
-    out->redir_target[0] = '\0';
-    out->has_sandbox = false;
-    out->sandbox_target[0] = '\0';
     out->real_path[0] = '\0';
     out->is_redir = false;
     out->is_virtual_ancestor = false;
     out->is_redirect_target = false;
-    out->is_other_app_pkg = false;
     out->is_ftp = false;
-    out->ftp_backend[0] = '\0';
     out->monitor_on = false;
 }
 
@@ -1215,38 +1197,6 @@ void br_resolve(const BrQuery* q, BrResult* out) {
         out->ro = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
         out->is_redir = is_redir;
         strcpy(out->real_path, p); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
-        if (tm.has_redir) {
-            out->has_redir = true;
-            strcpy(out->redir_target, tm.redir); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
-        }
-        /* ALLOW 豁免：静态 ALLOW（无通配/变量）已入 trie 并以 "?<prefix>" 自引用
-       redir 形式命中（上方 tm.has_redir 已置 has_redir），此处线性扫描仅覆盖
-       **动态** ALLOW（通配/路径变量，未入 trie）。通配规则 fnmatch 全路径匹配，
-       非通配保持原前缀匹配（含 / 根豁免）。应用 > 类别 > GLOBAL（与
-       REDIRECT 作用域一致）；全静态配置（常见）跳过 O(N) 扫描 */
-        bool allow_hit = false;
-        if (cfg && cfg->redir_rules && cfg->dyn_redir) {
-            for (int i = 0; i < cfg->redir_count && !allow_hit; i++) {
-                if (cfg->redir_rules[i].is_allow &&
-                    br_allow_rule_match(cfg->redir_rules[i].virtual_prefix, sub_path))
-                    allow_hit = true;
-            }
-        }
-        if (!allow_hit && cat && cat->redir_rules && cat->dyn_redir) {
-            for (int i = 0; i < cat->redir_count && !allow_hit; i++) {
-                if (cat->redir_rules[i].is_allow &&
-                    br_allow_rule_match(cat->redir_rules[i].virtual_prefix, sub_path))
-                    allow_hit = true;
-            }
-        }
-        if (!allow_hit && g_global_cfg.redir_rules && g_global_cfg.dyn_redir) {
-            for (int i = 0; i < g_global_cfg.redir_count && !allow_hit; i++) {
-                if (g_global_cfg.redir_rules[i].is_allow &&
-                    br_allow_rule_match(g_global_cfg.redir_rules[i].virtual_prefix, sub_path))
-                    allow_hit = true;
-            }
-        }
-        if (allow_hit) out->has_redir = true;
         /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/类别/global 完整匹配节点），
        直接判定 virtual_ancestor / redirect_target，避免各自再全路径遍历：
        - virtual_ancestor：最深节点下存在带规则子节点（trie_is_ancestor 语义）
@@ -1266,18 +1216,7 @@ void br_resolve(const BrQuery* q, BrResult* out) {
        （与 REDIRECT 作用域语义一致）；命中结果由 br_trie_resolve 的 trie
        下降一次取得（替代 config_ftp_match 每请求 O(N) 线性扫描）；
        命中后由框架分派给 FTP 后端模块 */
-        const char* ftp_bk = NULL;
-        if (tm.ftp_app[0] != '\0')
-            ftp_bk = tm.ftp_app;
-        else if (tm.ftp_cat[0] != '\0')
-            ftp_bk = tm.ftp_cat;
-        else if (tm.ftp_global[0] != '\0')
-            ftp_bk = tm.ftp_global;
-        if (ftp_bk) {
-            out->is_ftp = true;
-            strcpy(out->ftp_backend, ftp_bk); /* 源为 TrieMatch 64B 字段，NUL 结尾 */
-        }
-        out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
+        out->is_ftp = tm.ftp_app[0] || tm.ftp_cat[0] || tm.ftp_global[0];
         out->monitor_on = br_effective_monitor(cfg, cat);
         if (config_read_end(cfg_gen)) return;
         /* 读期间发生发布：整体重试 */

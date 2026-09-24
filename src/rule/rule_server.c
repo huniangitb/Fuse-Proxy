@@ -897,10 +897,11 @@ static json_object* build_apps_json_filtered(int uid_filter) {
     while ((de = readdir(d)) != NULL) {
         const char* name = de->d_name;
         int uid = 0;
-        if (strcmp(name, "App-rules") == 0) {
+        if (strcmp(name, NSP_APP_RULES_DIRNAME) == 0) {
             uid = 0;
-        } else if (strncmp(name, "App-rules-", 10) == 0) {
-            uid = atoi(name + 10);
+        } else if (strncmp(name, NSP_APP_RULES_DIRNAME "-",
+                           sizeof(NSP_APP_RULES_DIRNAME "-") - 1) == 0) {
+            uid = atoi(name + sizeof(NSP_APP_RULES_DIRNAME "-") - 1);
         } else {
             continue;
         }
@@ -953,11 +954,12 @@ static json_object* build_users_json(void) {
     while ((de = readdir(d)) != NULL) {
         const char* name = de->d_name;
         int uid = -1;
-        if (strcmp(name, "App-rules") == 0) {
+        if (strcmp(name, NSP_APP_RULES_DIRNAME) == 0) {
             uid = 0;
-        } else if (strncmp(name, "App-rules-", 10) == 0) {
+        } else if (strncmp(name, NSP_APP_RULES_DIRNAME "-",
+                           sizeof(NSP_APP_RULES_DIRNAME "-") - 1) == 0) {
             char* end = NULL;
-            long v = strtol(name + 10, &end, 10);
+            long v = strtol(name + sizeof(NSP_APP_RULES_DIRNAME "-") - 1, &end, 10);
             if (end && *end == '\0' && v >= 0 && v <= 100000) uid = (int)v;
         }
         if (uid < 0) continue;

@@ -152,7 +152,7 @@ static void* ipc_mount_thread(void* raw) {
         free(arg);
         return NULL;
     }
-    if (arg->uid >= 10000) update_uid_map(arg->uid, arg->pkg);
+    if (arg->uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(arg->uid, arg->pkg);
 
     /* 再做一次配置匹配（主线程已检查过，但线程内重检保证一致性） */
     if (!is_target_app(arg->pkg, arg->uid, arg->pid, true)) {
@@ -273,7 +273,7 @@ void handle_ipc_client_readable(int client_fd) {
         clean_pkg[sizeof(clean_pkg) - 1] = '\0';
         char* colon = strchr(clean_pkg, ':');
         if (colon) *colon = '\0';
-        if (uid >= 10000) update_uid_map(uid, clean_pkg);
+        if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, clean_pkg);
         send(client_fd, "OK", 2, MSG_NOSIGNAL);
         close(client_fd); // 快速释放客户端连接
 
@@ -303,7 +303,7 @@ void handle_ipc_client_readable(int client_fd) {
             }
             return;
         }
-        if (access("/storage/emulated/", F_OK) != 0) return;
+        if (access(NSP_ANDROID_EMULATED_ROOT "/", F_OK) != 0) return;
 
         if (g_global_replace_mode) {
             /* 新挂载方案（全局替换模式）：全局 FUSE 已挂载 /storage/emulated，

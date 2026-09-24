@@ -282,10 +282,10 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspResolveRe
     sub_path[0] = '\0';
     real_path[0] = '\0';
     strcpy(current_pkg, "unknown");
-    /* 免 16KB 全量 memset：module_dispatch_resolve 返回 OK 前已用 memset 过的
-       局部 r 完整拷贝 out（聚合路径亦从已初始化 out 累积），返回 NONE 时
-       调用方 `*nsp_ok` 短路不读 rr 其它字段——只需保证 valid 有定义值 */
-    rr->valid = false;
+    /* module_dispatch_resolve 统一经 nsp_resolve_result_init 初始化默认输出
+       （valid/user_id/sub_path/pkg/real_path 等全部有定义值），无论是否命中
+       模块都无需调用方预置；返回 NSP_DISPATCH_NONE 时 `*nsp_ok` 短路，
+       调用方不读 rr 决策字段（rr.is_ftp 等亦已初始化为 false） */
     NspQueryCtx nsp_q = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val};
     if (module_dispatch_resolve(&nsp_q, rr) == NSP_DISPATCH_OK && rr->valid) {
         *nsp_ok = true;
@@ -456,39 +456,45 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
     if (st == nullptr) VFS_RETURN(-EINVAL);
     /* 后端分派：路径命中 BACKEND 模块时由模块方法提供元数据（模块不实现 FUSE） */
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_getattr) {
-        memset(st, 0, sizeof *st);
-        int bslot = module_ops_slot(bops);
-        int brc = nsp_fence_backend_getattr(bslot, "backend_getattr", bops->backend_getattr,
-                                            sub_path, st);
-        module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_getattr", sub_path);
-            VFS_RETURN(-EIO);
-        }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN)
-                module_guard_error(bslot, "backend_getattr", brc, sub_path, "getattr 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
-        if (!g_preserve_perms) {
-            st->st_uid = ctx->uid;
-            st->st_gid = ctx->gid;
-        } else if (st->st_uid == 0 && st->st_gid == 0) {
-            /* 权限完全镜像：FTP 后端未提供真实属主（uid/gid=0），FTP 虚拟目录
-               （如前缀"云盘"及其子项）权限继承其本地上级——用户存储根
-               /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录
-               lstat 必失败，故取用户存储根的真实属主，而非固定 root） */
-            int root_uid = (path_user_id >= 0) ? path_user_id : 0;
-            char root_path[PATH_MAX];
-            common_storage_root(root_uid, root_path, sizeof(root_path));
-            struct stat pst;
-            if (lstat(root_path, &pst) == 0) {
-                st->st_uid = pst.st_uid;
-                st->st_gid = pst.st_gid;
+    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
+        if (!bops->backend_getattr) {
+            /* 模块未提供 getattr 回调：释放 lookup 在途引用后按未命中走本地 lstat
+               （否则 backend_refs 不归零，模块无法热卸载） */
+            module_backend_put(bops);
+        } else {
+            memset(st, 0, sizeof *st);
+            int bslot = module_ops_slot(bops);
+            int brc = nsp_fence_backend_getattr(bslot, "backend_getattr", bops->backend_getattr,
+                                                sub_path, st);
+            module_backend_put(bops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_getattr", sub_path);
+                VFS_RETURN(-EIO);
             }
+            if (brc != 0) {
+                if (brc != NSP_FENCE_BADFN)
+                    module_guard_error(bslot, "backend_getattr", brc, sub_path, "getattr 返回异常");
+                VFS_RETURN(brc < 0 ? brc : -EIO);
+            }
+            if (!g_preserve_perms) {
+                st->st_uid = ctx->uid;
+                st->st_gid = ctx->gid;
+            } else if (st->st_uid == 0 && st->st_gid == 0) {
+                /* 权限完全镜像：FTP 后端未提供真实属主（uid/gid=0），FTP 虚拟目录
+                   （如前缀"云盘"及其子项）权限继承其本地上级——用户存储根
+                   /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录
+                   lstat 必失败，故取用户存储根的真实属主，而非固定 root） */
+                int root_uid = (path_user_id >= 0) ? path_user_id : 0;
+                char root_path[PATH_MAX];
+                common_storage_root(root_uid, root_path, sizeof(root_path));
+                struct stat pst;
+                if (lstat(root_path, &pst) == 0) {
+                    st->st_uid = pst.st_uid;
+                    st->st_gid = pst.st_gid;
+                }
+            }
+            VFS_RETURN(0);
         }
-        VFS_RETURN(0);
     }
     if (lstat(p, st) == -1) {
         int err = errno;
@@ -597,6 +603,290 @@ static void readdir_join(char* dst, size_t cap, const char* base, const char* na
     }
 }
 
+/* ================= readdir 分阶段实现 =================
+ * vfs_readdir 拆为：后端分派 → 本地目录扫描（probe 过滤/去重/filler）
+ * → 骨架与虚拟目录合成 → . / .. 收尾。各阶段共享 VfsReaddirCtx，
+ * 任一 filler 返回非 0（内核缓冲已满）即短路结束本次 readdir（返回 0）。 */
+typedef struct {
+    struct fuse_context* ctx;
+    const char* sub_path;  /* 剥离 <uid>/ 后的虚拟路径 */
+    const char* real_path; /* 本地真实目录（opendir/lstat 用） */
+    const char* current_pkg;
+    void* buf;
+    fuse_fill_dir_t filler;
+    DirHashTable ht; /* 条目去重表 */
+    bool is_root;    /* sub_path 为挂载点根 */
+    bool is_android_dir;
+    bool hide_others; /* 跨应用隔离生效（沙盒开启 + 非 root/未知访问者） */
+    bool has_data, has_obb, has_android, has_pkg;
+} VfsReaddirCtx;
+
+/* readdir 后端分派：rr.is_ftp 且路径命中 BACKEND 模块时由模块方法返回条目，
+   框架负责 . / .. 与 filler 输出。返回 true = 已处理（*rc_out 为 FUSE 返回码）；
+   false = 未命中后端，交回本地目录路径。 */
+static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, bool is_ftp,
+                                void* buf, fuse_fill_dir_t filler, int* rc_out) {
+    if (!is_ftp) return false;
+    const NspModuleOps* bops = NULL;
+    if (module_backend_lookup(sub_path, &bops) != 0) return false;
+    if (!bops->backend_readdir) {
+        /* 模块未提供 readdir 回调：释放 lookup 在途引用后走本地目录路径 */
+        module_backend_put(bops);
+        return false;
+    }
+    /* 512×NspDirEntry ≈ 135KB：必须堆分配——FUSE 线程栈（Android 常为
+       1MB）上放 135KB 栈数组仍有风险。calloc 同时提供清零防御
+       （防后端未填充字段残留垃圾）。原 1024×270KB：readdir 缓冲
+       每请求一次性分配，FTP 目录条目数通常远小于 512（超限时
+       FUSE 分页续读），减半降低每请求堆分配开销 */
+    NspDirEntry* entries = calloc(512, sizeof(NspDirEntry));
+    if (!entries) {
+        module_backend_put(bops); /* calloc 失败：释放引用再报错 */
+        *rc_out = -ENOMEM;
+        return true;
+    }
+    int bslot = module_ops_slot(bops);
+    int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir, sub_path,
+                                      entries, 512);
+    module_backend_put(bops);
+    if (n == NSP_FENCE_FAULT) {
+        module_guard_fault(bslot, "backend_readdir", sub_path);
+        free(entries);
+        *rc_out = -EIO;
+        return true;
+    }
+    if (n == NSP_FENCE_BADFN) {
+        free(entries);
+        *rc_out = -EIO;
+        return true;
+    }
+    if (n < 0) {
+        module_guard_error(bslot, "backend_readdir", n, sub_path, "readdir 返回异常");
+        free(entries);
+        *rc_out = n;
+        return true;
+    }
+    if (n > 512) {
+        module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
+        free(entries);
+        *rc_out = -EIO;
+        return true;
+    }
+    /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致） */
+    struct stat dirst;
+    memset(&dirst, 0, sizeof dirst);
+    dirst.st_mode = S_IFDIR | 0755;
+    if (!g_preserve_perms) {
+        dirst.st_uid = ctx->uid;
+        dirst.st_gid = ctx->gid;
+    }
+    filler(buf, ".", &dirst, 0, 0);
+    filler(buf, "..", &dirst, 0, 0);
+    for (int i = 0; i < n; i++) {
+        struct stat st;
+        memset(&st, 0, sizeof st);
+        st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+        if (!g_preserve_perms) {
+            st.st_uid = ctx->uid;
+            st.st_gid = ctx->gid;
+        }
+        if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
+    }
+    free(entries);
+    *rc_out = 0;
+    return true;
+}
+
+static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, const char* sub_path,
+                                 const char* real_path, const char* current_pkg, int path_user_id,
+                                 void* buf, fuse_fill_dir_t filler) {
+    d->ctx = ctx;
+    d->sub_path = sub_path;
+    d->real_path = real_path;
+    d->current_pkg = current_pkg;
+    d->buf = buf;
+    d->filler = filler;
+    vfs_hash_init(&d->ht);
+    d->is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
+    /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑；无用户层（user_id<0）同理 */
+    bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
+    d->is_android_dir = (!skip_sandbox &&
+                         (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0));
+    d->hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
+                      strcmp(current_pkg, "unknown") != 0);
+    d->has_data = d->has_obb = d->has_android = d->has_pkg = false;
+}
+
+/* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束 */
+static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
+    if (!vfs_hash_insert(&d->ht, name)) return true; /* 已存在：跳过 */
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    st.st_ino = synthetic_inode(name);
+    st.st_mode = S_IFDIR | 0755;
+    st.st_uid = d->ctx->uid;
+    st.st_gid = d->ctx->gid;
+    return d->filler(d->buf, name, &st, 0, 0) == 0;
+}
+
+/* 合成目录条目输出（不经 ht 去重）：data/obb 骨架沿用原语义——物理扫描未
+   出现即补，不与后续虚拟目录条目去重。返回 false = filler 缓冲已满 */
+static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    st.st_ino = synthetic_inode(name);
+    st.st_mode = S_IFDIR | 0755;
+    st.st_uid = d->ctx->uid;
+    st.st_gid = d->ctx->gid;
+    return d->filler(d->buf, name, &st, 0, 0) == 0;
+}
+
+/* 本地目录扫描：probe 条目级过滤（hidden/redirect_target）+ ht 去重 +
+   lstat + filler，并记录 Android/data/obb/自身包名骨架项是否已出现。
+   dp 由调用方打开并负责关闭。返回 false = filler 缓冲已满，须立即结束。 */
+static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
+    char item_sub_path[2048], item_real_path[2048];
+    /* 循环外复用查询上下文，只改 path——省每条目结构初始化 */
+    NspQueryCtx probe_q = {
+        .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = NULL};
+    struct dirent* de;
+    while ((de = readdir(dp)) != nullptr) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (d->is_root)
+            readdir_join(item_sub_path, 2047, "", de->d_name);
+        else
+            readdir_join(item_sub_path, 2047, d->sub_path, de->d_name);
+        if (path_contains_invalid_chars(de->d_name)) continue;
+        /* 子项轻量探测（probe）：只判 hidden/redirect_target，不构建真实路径、
+           不触发 sandbox 目录创建（无模块时直通不过滤）。
+           user_id 目录条目（/0、/1...）旧语义用原始串判 redirect_target 恒 false
+           （Trie 无数字前缀规则）；剥离 /0/ 后会误判为根目录 sandbox 重定向目标，
+           故豁免其 redirect_target 检查（仅 hidden 生效）。
+           hidden 过滤对所有访问者生效（含 root，与 getattr 的 hidden 拒绝一致）：
+           否则 root ls 时被 HIDE 的条目仍出现在列表（stat 却失败），隐藏不彻底 */
+        bool uid_dir = false;
+        if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
+            const char* dg = item_sub_path + 1;
+            while (isdigit((unsigned char)*dg)) dg++;
+            uid_dir = (*dg == '\0' || *dg == '/');
+        }
+        probe_q.path = item_sub_path;
+        NspProbeResult ir;
+        memset(&ir, 0, sizeof ir);
+        if (module_dispatch_probe(&probe_q, &ir) == NSP_DISPATCH_OK && ir.valid) {
+            if (ir.hidden || (!uid_dir && ir.is_redirect_target)) continue;
+        }
+        if (d->is_root && strcmp(de->d_name, "Android") == 0) d->has_android = true;
+        if (d->is_android_dir) {
+            if (strcmp(de->d_name, "data") == 0)
+                d->has_data = true;
+            else if (strcmp(de->d_name, "obb") == 0)
+                d->has_obb = true;
+        }
+        if (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
+                               strcmp(d->sub_path, "/Android/data/") == 0 ||
+                               strcmp(d->sub_path, "/Android/obb") == 0 ||
+                               strcmp(d->sub_path, "/Android/obb/") == 0)) {
+            if (strcmp(de->d_name, d->current_pkg) != 0) continue;
+            d->has_pkg = true;
+        }
+        if (vfs_hash_insert(&d->ht, de->d_name)) {
+            struct stat st;
+            memset(&st, 0, sizeof(st));
+            readdir_join(item_real_path, 2047, d->real_path, de->d_name);
+            if (lstat(item_real_path, &st) == 0) {
+                if (!g_preserve_perms) {
+                    st.st_uid = d->ctx->uid;
+                    st.st_gid = d->ctx->gid;
+                }
+                if (d->filler(d->buf, de->d_name, &st, 0, 0) != 0) return false;
+            } else {
+                if (d->filler(d->buf, de->d_name, nullptr, 0, 0) != 0) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* 根目录虚拟 Android 骨架：物理循环未出现 Android 时补合成。ALLOW /Android 会
+   使物理循环按 redirect_target 跳过真实 Android（has_android=false），而虚拟
+   目录补充仍会经 ht 合成 Android——必须走同一 ht 去重，否则出现两个 Android。 */
+static bool vfs_readdir_fill_android_skel(VfsReaddirCtx* d) {
+    if (!(d->is_root && d->hide_others && !d->has_android)) return true;
+    return vfs_readdir_emit_dedup(d, "Android");
+}
+
+/* /Android 下 data/obb 骨架补齐（无用户层/沙盒关闭时不合成） */
+static bool vfs_readdir_fill_android_children(VfsReaddirCtx* d) {
+    if (!d->is_android_dir) return true;
+    if (!d->has_data && !vfs_readdir_emit_raw(d, "data")) return false;
+    if (!d->has_obb && !vfs_readdir_emit_raw(d, "obb")) return false;
+    return true;
+}
+
+/* /Android/data|obb 下访问者自身包名骨架补齐（跨应用隔离下仅见自身） */
+static bool vfs_readdir_fill_own_pkg(VfsReaddirCtx* d) {
+    if (!(d->hide_others && !d->has_pkg &&
+          (strcmp(d->sub_path, "/Android/data") == 0 ||
+           strcmp(d->sub_path, "/Android/data/") == 0 || strcmp(d->sub_path, "/Android/obb") == 0 ||
+           strcmp(d->sub_path, "/Android/obb/") == 0)))
+        return true;
+    return vfs_readdir_emit_dedup(d, d->current_pkg);
+}
+
+/* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler。
+   虚拟条目（如 FTP 前缀目录）权限继承其本地上级——用户存储根
+   /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录 lstat 必失败），
+   而非固定 root/访问者属主 */
+static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
+    NspDirEntry virt[MAX_MODULES * 8];
+    NspQueryCtx vq = {
+        .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = d->sub_path};
+    struct stat parent_st;
+    memset(&parent_st, 0, sizeof(parent_st));
+    bool have_parent = false;
+    {
+        int root_uid = (path_user_id >= 0) ? path_user_id : 0;
+        char root_path[PATH_MAX];
+        common_storage_root(root_uid, root_path, sizeof(root_path));
+        have_parent = (lstat(root_path, &parent_st) == 0);
+    }
+    int vn = module_dispatch_readdir(&vq, d->sub_path, path_user_id, d->current_pkg, d->is_root,
+                                     virt, MAX_MODULES * 8);
+    /* 纵深防御：dispatch 已钳制，但仍钳制 vn 防栈越界读 */
+    if (vn < 0) vn = 0;
+    if (vn > MAX_MODULES * 8) vn = MAX_MODULES * 8;
+    for (int vi = 0; vi < vn; vi++) {
+        if (virt[vi].name[0] == '\0') continue;
+        if (!vfs_hash_insert(&d->ht, virt[vi].name)) continue;
+        struct stat st_dir;
+        memset(&st_dir, 0, sizeof(st_dir));
+        st_dir.st_ino = synthetic_inode(virt[vi].name);
+        st_dir.st_mode = S_IFDIR;
+        if (g_preserve_perms && have_parent) {
+            /* 权限完全镜像模式：虚拟条目（如 FTP 前缀目录）继承
+               用户存储根属主/组与权限位——与 vfs_getattr FTP 分支
+               语义一致（默认伪造模式下两者均用访问者属主） */
+            st_dir.st_mode |= (parent_st.st_mode & 07777);
+            st_dir.st_uid = parent_st.st_uid;
+            st_dir.st_gid = parent_st.st_gid;
+        } else {
+            st_dir.st_mode |= 0755;
+            st_dir.st_uid = d->ctx->uid;
+            st_dir.st_gid = d->ctx->gid;
+        }
+        if (d->filler(d->buf, virt[vi].name, &st_dir, 0, 0) != 0) return false;
+    }
+    return true;
+}
+
+/* POSIX readdir 收尾：恒含 . / ..（与本地文件系统 readdir 路径一致） */
+static bool vfs_readdir_fill_dots(VfsReaddirCtx* d) {
+    if (d->filler(d->buf, ".", nullptr, 0, 0) != 0) return false;
+    if (d->filler(d->buf, "..", nullptr, 0, 0) != 0) return false;
+    return true;
+}
+
 static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset,
                        struct fuse_file_info* fi, enum fuse_readdir_flags flags) {
     vfs_flush_pending_closes();
@@ -609,280 +899,32 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
 
     /* 后端分派：readdir 由模块方法返回条目，框架负责 filler */
-    const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_readdir) {
-        /* 512×NspDirEntry ≈ 135KB：必须堆分配——FUSE 线程栈（Android 常为
-           1MB）上放 135KB 栈数组仍有风险。calloc 同时提供清零防御
-           （防后端未填充字段残留垃圾）。原 1024×270KB：readdir 缓冲
-           每请求一次性分配，FTP 目录条目数通常远小于 512（超限时
-           FUSE 分页续读），减半降低每请求堆分配开销 */
-        NspDirEntry* entries = calloc(512, sizeof(NspDirEntry));
-        if (!entries) VFS_RETURN(-ENOMEM);
-        int bslot = module_ops_slot(bops);
-        int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir, sub_path,
-                                          entries, 512);
-        module_backend_put(bops);
-        if (n == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_readdir", sub_path);
-            free(entries);
-            VFS_RETURN(-EIO);
-        }
-        if (n == NSP_FENCE_BADFN) {
-            free(entries);
-            VFS_RETURN(-EIO);
-        }
-        if (n < 0) {
-            module_guard_error(bslot, "backend_readdir", n, sub_path, "readdir 返回异常");
-            free(entries);
-            VFS_RETURN(n);
-        }
-        if (n > 512) {
-            module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
-            free(entries);
-            VFS_RETURN(-EIO);
-        }
-        /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致） */
-        struct stat dirst;
-        memset(&dirst, 0, sizeof dirst);
-        dirst.st_mode = S_IFDIR | 0755;
-        if (!g_preserve_perms) {
-            dirst.st_uid = ctx->uid;
-            dirst.st_gid = ctx->gid;
-        }
-        filler(buf, ".", &dirst, 0, 0);
-        filler(buf, "..", &dirst, 0, 0);
-        for (int i = 0; i < n; i++) {
-            struct stat st;
-            memset(&st, 0, sizeof st);
-            st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-            if (!g_preserve_perms) {
-                st.st_uid = ctx->uid;
-                st.st_gid = ctx->gid;
-            }
-            if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
-        }
-        free(entries);
-        VFS_RETURN(0);
-    }
+    int brc = 0;
+    if (vfs_readdir_backend(ctx, sub_path, rr.is_ftp, buf, filler, &brc)) VFS_RETURN(brc);
 
-    /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑 */
-    bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
-
-    DirHashTable ht;
-    vfs_hash_init(&ht);
+    VfsReaddirCtx d;
+    vfs_readdir_ctx_init(&d, ctx, sub_path, p, current_pkg, path_user_id, buf, filler);
     DIR* dp = opendir(p);
-    char item_sub_path[2048], item_real_path[2048];
-    bool is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
-    bool is_android_dir = (!skip_sandbox && (strcmp(sub_path, "/Android") == 0 ||
-                                             strcmp(sub_path, "/Android/") == 0));
-    bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
-                        strcmp(current_pkg, "unknown") != 0);
-    bool force_android_skel = hide_others;
-    bool has_data = false, has_obb = false, has_android = false, has_pkg = false;
-
     if (!dp) {
         int err = errno;
+        /* 骨架/虚拟目录允许无真实底层目录，不视为错误 */
         if (!is_android_skel_dir(sub_path) &&
             !(err == ENOENT && (rr.is_virtual_ancestor || rr.is_redirect_target))) {
             log_fuse_err("READDIR", path, err);
         }
     } else {
-        /* 批量 probe：循环外取一次模块读锁（无规则模块返回 -1 跳过），
-           循环内复用查询上下文与 locked 版本——大目录省 O(n) 次 rwlock 往返。
-           probe 锁只在主循环内持有：提前返回（filler 满）与正常结束均配对 unlock */
-        NspQueryCtx probe_q = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = NULL};
-        bool probe_held = (module_probe_lock() == 0);
-        struct dirent* de;
-        while ((de = readdir(dp)) != nullptr) {
-            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-            if (is_root)
-                readdir_join(item_sub_path, 2047, "", de->d_name);
-            else
-                readdir_join(item_sub_path, 2047, sub_path, de->d_name);
-            if (path_contains_invalid_chars(de->d_name)) continue;
-            /* 子项轻量探测（probe）：只判 hidden/redirect_target，不构建真实路径、
-               不触发 sandbox 目录创建（无模块时直通不过滤）。
-               user_id 目录条目（/0、/1...）旧语义用原始串判 redirect_target 恒 false
-               （Trie 无数字前缀规则）；剥离 /0/ 后会误判为根目录 sandbox 重定向目标，
-               故豁免其 redirect_target 检查（仅 hidden 生效）。
-               hidden 过滤对所有访问者生效（含 root，与 getattr 的 hidden 拒绝一致）：
-               否则 root ls 时被 HIDE 的条目仍出现在列表（stat 却失败），隐藏不彻底 */
-            {
-                bool uid_dir = false;
-                if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
-                    const char* d = item_sub_path + 1;
-                    while (isdigit((unsigned char)*d)) d++;
-                    uid_dir = (*d == '\0' || *d == '/');
-                }
-                if (probe_held) {
-                    probe_q.path = item_sub_path;
-                    NspProbeResult ir;
-                    memset(&ir, 0, sizeof ir);
-                    if (module_dispatch_probe_locked(&probe_q, &ir) == NSP_DISPATCH_OK &&
-                        ir.valid) {
-                        if (ir.hidden || (!uid_dir && ir.is_redirect_target)) continue;
-                    }
-                }
-            }
-            if (is_root && strcmp(de->d_name, "Android") == 0) has_android = true;
-            if (is_android_dir) {
-                if (strcmp(de->d_name, "data") == 0)
-                    has_data = true;
-                else if (strcmp(de->d_name, "obb") == 0)
-                    has_obb = true;
-            }
-            if (hide_others &&
-                (strcmp(sub_path, "/Android/data") == 0 ||
-                 strcmp(sub_path, "/Android/data/") == 0 || strcmp(sub_path, "/Android/obb") == 0 ||
-                 strcmp(sub_path, "/Android/obb/") == 0)) {
-                if (strcmp(de->d_name, current_pkg) != 0) continue;
-                has_pkg = true;
-            }
-            if (vfs_hash_insert(&ht, de->d_name)) {
-                struct stat st;
-                memset(&st, 0, sizeof(st));
-                readdir_join(item_real_path, 2047, p, de->d_name);
-                if (lstat(item_real_path, &st) == 0) {
-                    if (!g_preserve_perms) {
-                        st.st_uid = ctx->uid;
-                        st.st_gid = ctx->gid;
-                    }
-                    if (filler(buf, de->d_name, &st, 0, 0) != 0) {
-                        closedir(dp);
-                        if (probe_held) module_probe_unlock();
-                        vfs_hash_free(&ht);
-                        VFS_RETURN(0);
-                    }
-                } else {
-                    if (filler(buf, de->d_name, nullptr, 0, 0) != 0) {
-                        closedir(dp);
-                        if (probe_held) module_probe_unlock();
-                        vfs_hash_free(&ht);
-                        VFS_RETURN(0);
-                    }
-                }
-            }
-        }
+        bool scan_ok = vfs_readdir_scan_local(&d, dp);
         closedir(dp);
-        if (probe_held) module_probe_unlock();
-    }
-
-    if (is_root && force_android_skel && !has_android) {
-        /* 经 ht 去重：ALLOW /Android 会使 vfs_is_redirect_target 在物理循环里跳过真实
-           Android（:191），has_android 因此为 false；但 vfs_fill_virtual_dirs 会经 ht
-           合成虚拟 Android。此处若不经 ht 直接 filler，将与后者各填一份 → 出现两个 Android。
-           与 :246 hide_others 合成 current_pkg 的做法对齐：先 vfs_hash_insert 再 filler。 */
-        if (vfs_hash_insert(&ht, "Android")) {
-            struct stat st_dir;
-            memset(&st_dir, 0, sizeof(st_dir));
-            st_dir.st_ino = synthetic_inode("Android");
-            st_dir.st_mode = S_IFDIR | 0755;
-            st_dir.st_uid = ctx->uid;
-            st_dir.st_gid = ctx->gid;
-            if (filler(buf, "Android", &st_dir, 0, 0) != 0) {
-                vfs_hash_free(&ht);
-                VFS_RETURN(0);
-            }
+        if (!scan_ok) {
+            vfs_hash_free(&d.ht);
+            VFS_RETURN(0);
         }
     }
-    if (is_android_dir) {
-        if (!has_data) {
-            struct stat st_dir;
-            memset(&st_dir, 0, sizeof(st_dir));
-            st_dir.st_ino = synthetic_inode("data");
-            st_dir.st_mode = S_IFDIR | 0755;
-            st_dir.st_uid = ctx->uid;
-            st_dir.st_gid = ctx->gid;
-            if (filler(buf, "data", &st_dir, 0, 0) != 0) {
-                vfs_hash_free(&ht);
-                VFS_RETURN(0);
-            }
-        }
-        if (!has_obb) {
-            struct stat st_dir;
-            memset(&st_dir, 0, sizeof(st_dir));
-            st_dir.st_ino = synthetic_inode("obb");
-            st_dir.st_mode = S_IFDIR | 0755;
-            st_dir.st_uid = ctx->uid;
-            st_dir.st_gid = ctx->gid;
-            if (filler(buf, "obb", &st_dir, 0, 0) != 0) {
-                vfs_hash_free(&ht);
-                VFS_RETURN(0);
-            }
-        }
-    }
-    if (hide_others && !has_pkg &&
-        (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
-         strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)) {
-        struct stat st_dir;
-        memset(&st_dir, 0, sizeof(st_dir));
-        st_dir.st_ino = synthetic_inode(current_pkg);
-        st_dir.st_mode = S_IFDIR | 0755;
-        st_dir.st_uid = ctx->uid;
-        st_dir.st_gid = ctx->gid;
-        if (vfs_hash_insert(&ht, current_pkg)) {
-            if (filler(buf, current_pkg, &st_dir, 0, 0) != 0) {
-                vfs_hash_free(&ht);
-                VFS_RETURN(0);
-            }
-        }
-    }
-    /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler。
-       虚拟条目（如 FTP 前缀目录）权限继承其本地上级——用户存储根
-       /data/media/<uid>/（FTP 虚拟路径本地不存在，直接父目录 lstat 必失败），
-       而非固定 root/访问者属主 */
-    {
-        NspDirEntry virt[MAX_MODULES * 8];
-        NspQueryCtx vq = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = sub_path};
-        struct stat parent_st;
-        memset(&parent_st, 0, sizeof(parent_st));
-        bool have_parent = false;
-        {
-            int root_uid = (path_user_id >= 0) ? path_user_id : 0;
-            char root_path[PATH_MAX];
-            common_storage_root(root_uid, root_path, sizeof(root_path));
-            have_parent = (lstat(root_path, &parent_st) == 0);
-        }
-        int vn = module_dispatch_readdir(&vq, sub_path, path_user_id, current_pkg, is_root, virt,
-                                         MAX_MODULES * 8);
-        /* 纵深防御：dispatch 已钳制，但仍钳制 vn 防栈越界读 */
-        if (vn < 0) vn = 0;
-        if (vn > MAX_MODULES * 8) vn = MAX_MODULES * 8;
-        for (int vi = 0; vi < vn; vi++) {
-            if (virt[vi].name[0] == '\0') continue;
-            if (vfs_hash_insert(&ht, virt[vi].name)) {
-                struct stat st_dir;
-                memset(&st_dir, 0, sizeof(st_dir));
-                st_dir.st_ino = synthetic_inode(virt[vi].name);
-                st_dir.st_mode = S_IFDIR;
-                if (g_preserve_perms && have_parent) {
-                    /* 权限完全镜像模式：虚拟条目（如 FTP 前缀目录）继承
-                       用户存储根属主/组与权限位——与 vfs_getattr FTP 分支
-                       语义一致（默认伪造模式下两者均用访问者属主） */
-                    st_dir.st_mode |= (parent_st.st_mode & 07777);
-                    st_dir.st_uid = parent_st.st_uid;
-                    st_dir.st_gid = parent_st.st_gid;
-                } else {
-                    st_dir.st_mode |= 0755;
-                    st_dir.st_uid = ctx->uid;
-                    st_dir.st_gid = ctx->gid;
-                }
-                if (filler(buf, virt[vi].name, &st_dir, 0, 0) != 0) {
-                    vfs_hash_free(&ht);
-                    VFS_RETURN(0);
-                }
-            }
-        }
-    }
-    if (filler(buf, ".", nullptr, 0, 0) != 0) {
-        vfs_hash_free(&ht);
-        VFS_RETURN(0);
-    }
-    if (filler(buf, "..", nullptr, 0, 0) != 0) {
-        vfs_hash_free(&ht);
-        VFS_RETURN(0);
-    }
-    vfs_hash_free(&ht);
+    /* 合成阶段：任一 filler 缓冲已满即短路停止（各阶段返回码同为 0） */
+    (void)(vfs_readdir_fill_android_skel(&d) && vfs_readdir_fill_android_children(&d) &&
+           vfs_readdir_fill_own_pkg(&d) && vfs_readdir_fill_virtual(&d, path_user_id) &&
+           vfs_readdir_fill_dots(&d));
+    vfs_hash_free(&d.ht);
     VFS_RETURN(0);
 }
 
@@ -936,34 +978,39 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
     /* 后端分派：open 由模块方法打开，fi->fh 存后端句柄（read/write 经槽位快速分派） */
     int bslot = -1;
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup_slot(sub_path, &bslot, &bops) == 0 &&
-        bops->backend_open) {
-        uint64_t h = 0;
-        int brc = nsp_fence_backend_open(bslot, "backend_open", bops->backend_open, sub_path,
-                                         fi->flags, &h);
-        module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_open", sub_path);
-            VFS_RETURN(-EIO);
+    if (rr.is_ftp && module_backend_lookup_slot(sub_path, &bslot, &bops) == 0) {
+        if (!bops->backend_open) {
+            /* 模块未提供 open 回调：释放 lookup_slot 在途引用后走本地 open */
+            module_backend_put(bops);
+        } else {
+            uint64_t h = 0;
+            int brc = nsp_fence_backend_open(bslot, "backend_open", bops->backend_open, sub_path,
+                                             fi->flags, &h);
+            module_backend_put(bops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_open", sub_path);
+                VFS_RETURN(-EIO);
+            }
+            if (brc != 0) {
+                if (brc != NSP_FENCE_BADFN)
+                    module_guard_error(bslot, "backend_open", brc, sub_path, "open 返回异常");
+                VFS_RETURN(brc < 0 ? brc : -EIO);
+            }
+            /* FTP 路径：句柄为模块小整数 ID（非 fd），不设 FD 透传等本地
+               文件系统才可用的优化（passthrough 仅对下方本地 open 的 fd）；
+               设 direct_io 绕过内核 page cache——FUSE 内核在 close 后可能
+               失效 page cache，但 dentry 缓存仍命中第二次 open 导致 read
+               返回空（复用缓存的 fh 但 page cache 已空）。
+               fh 高位编码模块槽位：read/write/flush/release/fsync 经
+               module_backend_acquire_slot 无锁快速分派，免每 IO 路径解析
+               与线性扫描（模块卸载时快照置空→快速失败，不悬垂） */
+            fi->fh =
+                h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
+            fi->direct_io = 1;
+            FTP_DBG("vfs_open: 后端命中 sub=%s fh=%llu slot=%d flags=%o direct_io=1\n", sub_path,
+                    (unsigned long long)fi->fh, bslot, fi->flags);
+            VFS_RETURN(0);
         }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN)
-                module_guard_error(bslot, "backend_open", brc, sub_path, "open 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
-        /* FTP 路径：句柄为模块小整数 ID（非 fd），不设 FD 透传等本地
-           文件系统才可用的优化（passthrough 仅对下方本地 open 的 fd）；
-           设 direct_io 绕过内核 page cache——FUSE 内核在 close 后可能
-           失效 page cache，但 dentry 缓存仍命中第二次 open 导致 read
-           返回空（复用缓存的 fh 但 page cache 已空）。
-           fh 高位编码模块槽位：read/write/flush/release/fsync 经
-           module_backend_acquire_slot 无锁快速分派，免每 IO 路径解析
-           与线性扫描（模块卸载时快照置空→快速失败，不悬垂） */
-        fi->fh = h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
-        fi->direct_io = 1;
-        FTP_DBG("vfs_open: 后端命中 sub=%s fh=%llu slot=%d flags=%o direct_io=1\n", sub_path,
-                (unsigned long long)fi->fh, bslot, fi->flags);
-        VFS_RETURN(0);
     }
     int fd = open(p, fi->flags | O_CLOEXEC, is_redir ? 0666 : 0);
     if (fd == -1) {
@@ -1003,23 +1050,28 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
     /* 后端分派：create 由模块方法创建，fi->fh 存后端句柄（含模块槽位） */
     int bslot = -1;
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup_slot(sub_path, &bslot, &bops) == 0 &&
-        bops->backend_create) {
-        uint64_t h = 0;
-        int brc = nsp_fence_backend_create(bslot, "backend_create", bops->backend_create, sub_path,
-                                           mode, &h);
-        module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_create", sub_path);
-            VFS_RETURN(-EIO);
+    if (rr.is_ftp && module_backend_lookup_slot(sub_path, &bslot, &bops) == 0) {
+        if (!bops->backend_create) {
+            /* 模块未提供 create 回调：释放 lookup_slot 在途引用后走本地创建 */
+            module_backend_put(bops);
+        } else {
+            uint64_t h = 0;
+            int brc = nsp_fence_backend_create(bslot, "backend_create", bops->backend_create,
+                                               sub_path, mode, &h);
+            module_backend_put(bops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_create", sub_path);
+                VFS_RETURN(-EIO);
+            }
+            if (brc != 0) {
+                if (brc != NSP_FENCE_BADFN)
+                    module_guard_error(bslot, "backend_create", brc, sub_path, "create 返回异常");
+                VFS_RETURN(brc < 0 ? brc : -EIO);
+            }
+            fi->fh =
+                h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
+            VFS_RETURN(0);
         }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN)
-                module_guard_error(bslot, "backend_create", brc, sub_path, "create 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
-        fi->fh = h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
-        VFS_RETURN(0);
     }
     int fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, is_redir ? 0666 : mode);
     if (fd == -1) {
@@ -1113,20 +1165,26 @@ static int vfs_unlink(const char* path) {
     }
     /* 后端分派：unlink 由模块方法删除 */
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_unlink) {
-        int bslot = module_ops_slot(bops);
-        int brc = nsp_fence_backend_simple(bslot, "backend_unlink", bops->backend_unlink, sub_path);
-        module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_unlink", sub_path);
-            VFS_RETURN(-EIO);
+    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
+        if (!bops->backend_unlink) {
+            /* 模块未提供 unlink 回调：释放 lookup 在途引用后走本地 unlink */
+            module_backend_put(bops);
+        } else {
+            int bslot = module_ops_slot(bops);
+            int brc =
+                nsp_fence_backend_simple(bslot, "backend_unlink", bops->backend_unlink, sub_path);
+            module_backend_put(bops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_unlink", sub_path);
+                VFS_RETURN(-EIO);
+            }
+            if (brc != 0) {
+                if (brc != NSP_FENCE_BADFN)
+                    module_guard_error(bslot, "backend_unlink", brc, sub_path, "unlink 返回异常");
+                VFS_RETURN(brc < 0 ? brc : -EIO);
+            }
+            VFS_RETURN(0);
         }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN)
-                module_guard_error(bslot, "backend_unlink", brc, sub_path, "unlink 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
-        VFS_RETURN(0);
     }
     int ret = unlink(p);
     if (ret == -1) {
@@ -1160,20 +1218,26 @@ static int vfs_rmdir(const char* path) {
     }
     /* 后端分派：rmdir 由模块方法删除 */
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_rmdir) {
-        int bslot = module_ops_slot(bops);
-        int brc = nsp_fence_backend_simple(bslot, "backend_rmdir", bops->backend_rmdir, sub_path);
-        module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_rmdir", sub_path);
-            VFS_RETURN(-EIO);
+    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
+        if (!bops->backend_rmdir) {
+            /* 模块未提供 rmdir 回调：释放 lookup 在途引用后走本地 rmdir */
+            module_backend_put(bops);
+        } else {
+            int bslot = module_ops_slot(bops);
+            int brc =
+                nsp_fence_backend_simple(bslot, "backend_rmdir", bops->backend_rmdir, sub_path);
+            module_backend_put(bops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_rmdir", sub_path);
+                VFS_RETURN(-EIO);
+            }
+            if (brc != 0) {
+                if (brc != NSP_FENCE_BADFN)
+                    module_guard_error(bslot, "backend_rmdir", brc, sub_path, "rmdir 返回异常");
+                VFS_RETURN(brc < 0 ? brc : -EIO);
+            }
+            VFS_RETURN(0);
         }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN)
-                module_guard_error(bslot, "backend_rmdir", brc, sub_path, "rmdir 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
-        VFS_RETURN(0);
     }
     int ret = rmdir(p);
     if (ret == -1) {
@@ -1579,11 +1643,10 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     /* from/to 各走一次分派器决策（无模块时直通回退） */
     NspQueryCtx q1 = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = from};
     NspQueryCtx q2 = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = to};
-    /* 免 16KB×2 全量 memset：module_dispatch_resolve 返回 OK 前已完整初始化
-       out，返回 NONE 时下方 `&& r1.valid` 短路不读 r1/r2（同 VFS_SETUP_CORE） */
+    /* 免 16KB×2 全量 memset：module_dispatch_resolve 统一经
+       nsp_resolve_result_init 初始化默认输出（valid=false 等），调用方无需
+       预置；未命中时下方 `&& rX.valid` 短路，不读 r1/r2 决策字段 */
     NspResolveResult r1, r2;
-    r1.valid = false;
-    r2.valid = false;
     bool ok1 = (module_dispatch_resolve(&q1, &r1) == NSP_DISPATCH_OK && r1.valid);
     bool ok2 = (module_dispatch_resolve(&q2, &r2) == NSP_DISPATCH_OK && r2.valid);
     if ((ok1 && r1.hidden) || (ok2 && r2.hidden)) return -ENOENT;
@@ -1635,7 +1698,9 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
             int bslot = module_ops_slot(bf_ops);
             int brc = nsp_fence_backend_rename(bslot, "backend_rename", bf_ops->backend_rename,
                                                sub_from, sub_to);
+            /* from/to 各 lookup 一次，同模块时槽位引用计数为 2：逐次配对释放 */
             module_backend_put(bf_ops);
+            module_backend_put(bt_ops);
             if (brc == NSP_FENCE_FAULT) {
                 module_guard_fault(bslot, "backend_rename", sub_from);
                 return -EIO;
@@ -1646,9 +1711,11 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
             }
             return brc < 0 ? brc : 0;
         }
+        /* 跨后端/后端↔本地重命名不支持；两次 lookup 的在途引用逐次配对释放
+           （同模块亦为两次引用，不可按指针去重只 put 一次） */
         if (bf_hit) module_backend_put(bf_ops);
-        if (bt_hit && bt_ops != bf_ops) module_backend_put(bt_ops);
-        return -EXDEV; /* 跨后端/后端↔本地重命名不支持 */
+        if (bt_hit) module_backend_put(bt_ops);
+        return -EXDEV;
     }
 #ifdef SYS_renameat2
     if (flags && syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
@@ -1737,21 +1804,27 @@ static int vfs_truncate(const char* path, off_t size, struct fuse_file_info* fi)
     }
     /* 后端分派：truncate 由模块方法截断 */
     const NspModuleOps* bops = NULL;
-    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0 && bops->backend_truncate) {
-        int bslot = module_ops_slot(bops);
-        int brc = nsp_fence_backend_truncate(bslot, "backend_truncate", bops->backend_truncate,
-                                             sub_path, size);
-        module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_truncate", sub_path);
-            VFS_RETURN(-EIO);
+    if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
+        if (!bops->backend_truncate) {
+            /* 模块未提供 truncate 回调：释放 lookup 在途引用后走本地 truncate */
+            module_backend_put(bops);
+        } else {
+            int bslot = module_ops_slot(bops);
+            int brc = nsp_fence_backend_truncate(bslot, "backend_truncate", bops->backend_truncate,
+                                                 sub_path, size);
+            module_backend_put(bops);
+            if (brc == NSP_FENCE_FAULT) {
+                module_guard_fault(bslot, "backend_truncate", sub_path);
+                VFS_RETURN(-EIO);
+            }
+            if (brc != 0) {
+                if (brc != NSP_FENCE_BADFN)
+                    module_guard_error(bslot, "backend_truncate", brc, sub_path,
+                                       "truncate 返回异常");
+                VFS_RETURN(brc < 0 ? brc : -EIO);
+            }
+            VFS_RETURN(0);
         }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN)
-                module_guard_error(bslot, "backend_truncate", brc, sub_path, "truncate 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
-        VFS_RETURN(0);
     }
     int ret = truncate(p, size);
     if (ret == -1) {

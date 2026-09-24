@@ -350,7 +350,3 @@ int nsp_fence_exit_call(int slot, const char* op_name, void (*fn)(void)) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP_VOID(slot, op_name, fn());
 }
-int nsp_fence_reload_call(int slot, const char* op_name, int (*fn)(void)) {
-    if (!fn) return NSP_FENCE_BADFN;
-    NSP_FENCE_WRAP(slot, op_name, fn());
-}

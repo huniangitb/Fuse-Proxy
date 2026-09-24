@@ -1012,7 +1012,7 @@ static int do_debug_log_mounts(void* raw_args) {
         char line[1024];
         bool found = false;
         while (fgets(line, sizeof(line), mounts_fp)) {
-            if (fast_strstr(line, "/storage/emulated") != nullptr) {
+            if (fast_strstr(line, NSP_ANDROID_EMULATED_ROOT) != nullptr) {
                 fprintf(log_fp, "  %s", line);
                 found = true;
             }
@@ -1040,34 +1040,35 @@ struct SysFuseArgs {
 static int do_backup_and_remove_sys_fuse(void* raw_args) {
     struct SysFuseArgs* args = (struct SysFuseArgs*)raw_args;
     struct stat st;
-    if (stat("/storage/emulated", &st) != 0) return -1;
+    if (stat(NSP_ANDROID_EMULATED_ROOT, &st) != 0) return -1;
     if (mkdir_recursive(args->backup_path) != 0) {
         return -1;
     }
-    if (mount("/storage/emulated", args->backup_path, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+    if (mount(NSP_ANDROID_EMULATED_ROOT, args->backup_path, nullptr, MS_BIND | MS_REC, nullptr) !=
+        0) {
         return -2;
     }
-    if (umount2("/storage/emulated", MNT_DETACH) != 0) {
+    if (umount2(NSP_ANDROID_EMULATED_ROOT, MNT_DETACH) != 0) {
         umount2(args->backup_path, MNT_DETACH);
         return -1;
     }
-    if (mount(args->fuse_src, "/storage/emulated", nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        mount(args->backup_path, "/storage/emulated", nullptr, MS_BIND | MS_REC, nullptr);
+    if (mount(args->fuse_src, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        mount(args->backup_path, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr);
         return -2;
     }
-    mount(nullptr, "/storage/emulated", nullptr, MS_SHARED, nullptr);
+    mount(nullptr, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_SHARED, nullptr);
     return 0;
 }
 static int do_restore_sys_fuse(void* raw_args) {
     struct SysFuseArgs* args = (struct SysFuseArgs*)raw_args;
     if (access(args->backup_path, F_OK) != 0) return -1;
-    umount2("/storage/emulated", MNT_DETACH);
+    umount2(NSP_ANDROID_EMULATED_ROOT, MNT_DETACH);
     struct stat st;
-    if (stat("/storage/emulated", &st) != 0) {
-        mount(args->backup_path, "/storage/emulated", nullptr, MS_BIND | MS_REC, nullptr);
+    if (stat(NSP_ANDROID_EMULATED_ROOT, &st) != 0) {
+        mount(args->backup_path, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr);
         return 0;
     }
-    mount(args->backup_path, "/storage/emulated", nullptr, MS_BIND | MS_REC, nullptr);
+    mount(args->backup_path, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr);
     return 0;
 }
 int ns_backup_and_remove_system_fuse(int mnt_ns_pid, const char* fuse_src,

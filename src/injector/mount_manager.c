@@ -22,7 +22,7 @@
    此处不再重复实现 */
 
 bool app_has_active_rules(const char* pkg, uid_t uid) {
-    int user_id = uid / 100000;
+    int user_id = uid / NSP_PER_USER_UID_STRIDE;
     config_lock_read();
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     bool has_rules = false;
@@ -31,7 +31,7 @@ bool app_has_active_rules(const char* pkg, uid_t uid) {
             (cfg->redir_count > 0 || cfg->hide_count > 0 || cfg->ro_count > 0 || cfg->sandbox);
     /* 类别层（与 br_pick_category 同口径）：应用段无规则时看类别段 */
     if (!has_rules) {
-        bool is_sys = (uid < 10000) || (pkg && sys_pkg_is_system(pkg));
+        bool is_sys = (uid < NSP_SYSTEM_APP_UID_MIN) || (pkg && sys_pkg_is_system(pkg));
         has_rules = category_has_rules_locked(is_sys, user_id);
     }
     if (!has_rules) {
@@ -340,7 +340,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
 
     if (mnt.target_has_fuse || mnt.target_has_fuse_daemon) {
         LOG_DBG("挂载跳过: %s (PID: %d, %s) - 已经存在程序自身的 FUSE 挂载", target_path, pid, pkg);
-        if (uid >= 10000) update_uid_map(uid, pkg);
+        if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, pkg);
         mark_injected(pid);
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
@@ -357,7 +357,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
     bool has_rules = app_has_active_rules(pkg, uid);
     if (mnt.target_is_mounted && !has_rules) {
         LOG_DBG("挂载保留: %s (PID: %d, %s) - 无规则冲突，保留原生视图", target_path, pid, pkg);
-        if (uid >= 10000) update_uid_map(uid, pkg);
+        if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, pkg);
         add_tracked(pid);
         print_active_rules(pkg, pid, uid, trigger);
         return 0;
@@ -374,7 +374,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
         int n = ns_find_native_submounts(pid, target_path, found, 16);
         if (n > 0) {
             config_lock_read();
-            AppConfig* cfg = find_app_cfg_locked(pkg, uid / 100000);
+            AppConfig* cfg = find_app_cfg_locked(pkg, uid / NSP_PER_USER_UID_STRIDE);
             size_t tlen = strlen(target_path);
             for (int i = 0; i < n; i++) {
                 const char* rel = found[i] + tlen;
@@ -389,7 +389,7 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
     }
     if (ns_combined_mount_async(pid, pkg, mnt_src, target_path, backup_path, preserve_paths,
                                 preserve_count) == 0) {
-        if (uid >= 10000) update_uid_map(uid, pkg);
+        if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, pkg);
         mark_injected(pid);
         invalidate_mount_cache(pid);
         print_active_rules(pkg, pid, uid, trigger);
@@ -469,7 +469,7 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         int n = ns_find_native_submounts(pid, target_path, found, 16);
         if (n > 0) {
             config_lock_read();
-            AppConfig* cfg = find_app_cfg_locked(pkg, uid / 100000);
+            AppConfig* cfg = find_app_cfg_locked(pkg, uid / NSP_PER_USER_UID_STRIDE);
             size_t tlen = strlen(target_path);
             for (int i = 0; i < n; i++) {
                 const char* rel = found[i] + tlen;
@@ -508,7 +508,7 @@ int perform_app_restore(const char* pkg, int pid, uid_t uid) {
     /* 还原不依赖全局 FUSE 实例是否存在：目标顶层是否为项目 FUSE（fuse_daemon）
        由 ns_restore_app_fuse 基于目标挂载状态判断（fstype/source 特征），
        fuse_src 仅用于精确 dev 匹配，可为空（全局 FUSE 不可用时走特征兜底） */
-    int user_id = (int)(uid / 100000);
+    int user_id = (int)(uid / NSP_PER_USER_UID_STRIDE);
     int ret = ns_restore_app_fuse(pid, get_active_mnt_src(), GLOBAL_BACKUP_ROOT, user_id);
     if (ret == 0) {
         LOG_DBG("非目标应用已还原系统视图: %s(PID:%d, user=%d)", pkg, pid, user_id);

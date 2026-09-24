@@ -33,8 +33,6 @@ static char g_proc_name[64] = "unknown";
 static bool g_log_inited = false;
 static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define LOG_MSG_MAX_LEN 4096
-
 /* LOG 通道载荷组帧（与 log_monitor 行协议对齐，旧 log_entry_packet 语义）：
    kind=0 普通：level==LOG_IO → "LOG_IO:%s\n"；LOG_LOGCAT → "LOG_LOGCAT:%s\n"；
      否则 "LOG_SYS:<level>:[proc] <msg>\n"
@@ -62,7 +60,7 @@ void log_batch_end(void) {
     /* 取走累积内容 */
     pthread_mutex_lock(&g_log_batch_mutex);
     size_t n = g_log_batch_len;
-    char merged[LOG_MSG_MAX_LEN];
+    char merged[NSP_LOG_MSG_MAX];
     if (n >= sizeof(merged)) n = sizeof(merged) - 1;
     memcpy(merged, g_log_batch_buf, n);
     merged[n] = '\0';
@@ -72,9 +70,9 @@ void log_batch_end(void) {
     /* 合并为单条经 comm 线程发送（kind=MERGED，log_monitor 整块接收合并为
        一条入库，前端只显示一条）。单行输出：[proc] <条目1>\t<条目2>...
        （条目间以制表符连接，不用换行，避免前端按行拆分导致长内容截断/中文乱码） */
-    char line[LOG_MSG_MAX_LEN];
+    char line[NSP_LOG_MSG_MAX];
     snprintf(line, sizeof(line), "[%s] %s", g_proc_name, merged);
-    uint8_t buf[2 + LOG_MSG_MAX_LEN];
+    uint8_t buf[2 + NSP_LOG_MSG_MAX];
     buf[0] = LOG_KIND_MERGED;
     buf[1] = (uint8_t)LOG_DEBUG; /* 合并日志归为 debug 级别，--level>=1 不显示 */
     size_t llen = strlen(line);
@@ -415,11 +413,11 @@ static int nsp_log_emit(void* ctx, const void* data, size_t len) {
     log_be_ctx_t* c = ctx;
     if (len < 2 || c->sock < 0) return -1;
     const uint8_t* p = data;
-    char packet[LOG_MSG_MAX_LEN * 2 + 128];
+    char packet[NSP_LOG_MSG_MAX * 2 + 128];
     /* msg 段以 NUL 截断防越界（post 载荷恒以 NUL 结尾，见 log_internal） */
     size_t mlen = len - 2;
-    if (mlen >= LOG_MSG_MAX_LEN) mlen = LOG_MSG_MAX_LEN - 1;
-    char msg[LOG_MSG_MAX_LEN];
+    if (mlen >= NSP_LOG_MSG_MAX) mlen = NSP_LOG_MSG_MAX - 1;
+    char msg[NSP_LOG_MSG_MAX];
     memcpy(msg, p + 2, mlen);
     msg[mlen] = '\0';
     int plen = log_frame_packet(p[0], p[1], msg, packet, sizeof(packet));
@@ -502,7 +500,7 @@ void log_close(void) {
 
 void log_internal(LogLevel level, const char* format, ...) {
     if (level < g_min_log_level && level != LOG_DEBUG) return;
-    char msg_buf[LOG_MSG_MAX_LEN];
+    char msg_buf[NSP_LOG_MSG_MAX];
     va_list args;
     va_start(args, format);
     vsnprintf(msg_buf, sizeof(msg_buf), format, args);
@@ -514,7 +512,7 @@ void log_internal(LogLevel level, const char* format, ...) {
        环形缓冲写了也没人消费；检测到 g_log_forward_fd 时把日志行写入管道，
        由父进程读取后统一写入环形缓冲（保持行格式 [时间]|[进程]|msg） */
     if (g_log_forward_fd >= 0) {
-        char fwd_buf[LOG_MSG_MAX_LEN + 96];
+        char fwd_buf[NSP_LOG_MSG_MAX + 96];
         int flen = snprintf(fwd_buf, sizeof(fwd_buf), "%d|%s\n", (int)level, msg_buf);
         if (flen > 0) {
             ssize_t w = write(g_log_forward_fd, fwd_buf, (size_t)flen);
@@ -553,7 +551,7 @@ void log_internal(LogLevel level, const char* format, ...) {
         return;
     }
     /* 调用线程仅组帧头 + post（永不碰 socket/mutex 长临界区/eventfd 细则） */
-    uint8_t buf[2 + LOG_MSG_MAX_LEN];
+    uint8_t buf[2 + NSP_LOG_MSG_MAX];
     buf[0] = LOG_KIND_NORMAL;
     buf[1] = (uint8_t)level;
     size_t mlen2 = strlen(msg_buf);

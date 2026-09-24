@@ -23,7 +23,8 @@ GNU 通用公共许可证第 3 版或更新版本约束。
 2. 它与 Fuse-Proxy 之间的全部接口，均限于 `include/nsp_module.h` 所声明
    的公开 ABI——即 `NspModuleInfo`、`NspModuleOps`、`NspFrameworkApi`、
    `NspQueryCtx`、`NspResolveResult`、`NspProbeResult`、`NspDirEntry`
-   等结构体，`NSP_CAP_*` 能力位，以及该头文件声明的框架导出符号；
+   等结构体，`NSP_CAP_*` 能力位，以及该头文件声明的框架导出符号。
+   由该入口代含的 `include/nsp_log.h`、`include/nsp_constants.h` 同属公开 ABI 头；
 3. 它不包含取自 Fuse-Proxy 其他源码的代码，亦非 Fuse-Proxy 其他部分的
    派生作品。
 
