@@ -163,7 +163,18 @@ FUSE 回调（如 getattr）
 
 ### 4.4 跨应用隔离
 
-`br_is_other_app_pkg` 判定应用访问 `/Android/data|obb/<其他包>/`。隔离**只作用于列举**——readdir 条目级 probe 过滤；resolve（getattr/open）**不判隐藏**，已知路径的文件可正常打开（修复 MT 管理器跨应用列表可见但打开 ENOENT）。该标志只存在于 `NspProbeResult`（`is_other_app_pkg`），`NspResolveResult` 不携带。`CONFIG_DIR` 下所有访问无条件隐藏。
+`br_is_other_app_pkg` 判定应用访问 `/Android/data|obb/<其他包>/`。隔离**只作用于列举**——readdir 条目级 probe 过滤；resolve（getattr/open）**不判隐藏**，已知路径的文件可正常打开（修复 MT 管理器跨应用列表可见但打开 ENOENT）。该标志只存在于 `NspProbeResult`（`is_other_app_pkg`），`NspPathDecision` 不携带。`CONFIG_DIR` 下所有访问无条件隐藏。
+
+### 4.5 决策强制（框架单点）
+
+模块只声明「路径该怎么表现」（`NspPathDecision`），**errno 映射与权限策略不由模块决定**，集中在框架：
+
+- `fw_route()`（`fuse_daemon.c`）是所有回调的唯一入口，按操作类别 `VFS_OP_READ` / `VFS_OP_MUTATE` 强制：`appear_missing` → `ENOENT`（**所有**回调统一，写类不再是 `EACCES`）、`read_only` → `EROFS`（root 豁免由框架持有）。`open`/`access` 是否算「写」取决于 `flags`/`mask`（`O_RDONLY` 打开只读路径必须放行），触发条件留在回调内，但判定统一走 `vfs_check_read_only()`。
+- `vfs_apply_attr_override()` 在框架既有权限策略**之后**落实 `attr_override`（`NSP_OV_MODE/UID/GID` 位图），故模块的显式声明优先于伪造模式属主=访问者、skel 目录 0755、`/Android/data|obb` 保留真实属主等默认；`mode` 只取 `07777`，类型位始终取自真实属性。
+
+> 位图而非「特殊值哨兵」：若用 `mode == UNSET` 表示不改，模块惯用的 `memset(out,0,...)` 会静默变成「权限清 0 + 属主 root」。位图让零初始化等于「什么都不改」。
+
+收敛前，`hidden`/`ro` 判定散落在 27 个回调里各写一遍（写类还各自映射 `EACCES`），新增回调极易漂移。回归见 `tests/test_module_overrides.py`（逐回调 errno 矩阵）。
 
 ## 5. 进程协作
 
@@ -193,10 +204,19 @@ injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫�
 ### 5.2 配置热重载
 
 - injector 用 inotify 监听 `injector.conf` 与 `App-rules*/*.conf`。
-- fuse_daemon 内的 basic_rules 独立用 inotify 监听规则目录（`config_monitor_thread`），变更后 `br_reload_config` 重建 AppConfig 与 Trie、清空 uid 缓存、重读 `uid.map`。
+- fuse_daemon 框架侧（`src/daemon/fw_config.c`）**唯一负责**读取与解析规则配置：单个 `config_monitor_thread` 监听规则目录，变更后经 `config_read_view()` 重新解析为扁平视图、原子换入并递增代际，再**按各模块在 `init` 内的订阅**（`api->subscribe_rules`）过滤后回调其监听器（`api->set_config_listener`）。模块不再各自读文件、各自跑 inotify——同一份配置在进程内只有一份实例（`basic_rules` 用下发的视图经 `config_build_from_view()` 重建自己的 AppConfig/Trie/uid 缓存）。
 - injector 经 `config_publisher` 向订阅者广播；`global_inject` 切换则广播全量变更（`changed_count=-1`）触发全应用重挂，否则仅通知受影响包。
 
-### 5.3 UDS 一览
+### 5.3 路径缓存失效（内核侧）
+
+两层语义互补，框架收口在 `vfs_inval_path()`（`fuse_daemon.c`）：
+
+- **inode 级** `fuse_invalidate_path()`：丢属性/数据缓存，对已打开的文件立即生效（句柄直接持 inode，不再经名字查找）。
+- **entry 级** `fuse_invalidate_path_entry()`：丢内核 dentry，使「名字 → inode」重新 lookup。远端增删/改名后**只有它**能让旧映射立即失效——inode 级不触碰名字映射，旧 dentry 会一直命中到 `entry_timeout` 到期。
+
+entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导出版本节点 `FUSE_3.19`），上游/系统/预构建库都没有，故框架侧**弱引用**：符号缺失时自动退化为仅 inode 级。负缓存另由框架把 `negative_timeout` 保持为 libfuse 默认的 `0.0` 关闭（早期版本曾抬到 0.5，导致 FTP「上传后立即 open」命中陈旧 ENOENT）。行为回归见 `tests/test_libfuse_inval.py`。
+
+### 5.4 UDS 一览
 
 | Socket | 类型 | 用途 |
 |--------|------|------|
@@ -211,6 +231,7 @@ injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫�
 | `g_global_cfg` / `g_app_cfgs` | config_parser | S1 无锁快照（代际 + per-thread 读者计数）；冷路径查询与写者仍走 `g_rules_lock` rwlock |
 | `g_uid_maps` / `g_uid_map_count` | basic_rules | 同一 S1 代际协议（COW + `config_publish_begin/drain_readers/publish_end` 后换指针），二分查询 |
 | `g_uid_cache[2048]` | basic_rules | seqlock（写者 wlock+seq 翻转，读者无锁），slot = `uid % 2048`，带配置代际校验 |
+| `g_recs` / `g_subs` / `g_gen` | fuse_daemon `fw_config` | 单一 `g_lock` 互斥 + 原子代际；发布路径「读锁内换视图 + 递增两槽引用计数 → 锁外回调模块」，故模块卸载的 drain 会等回调结束 |
 | `g_global_fuse` / `g_media_fuse` | injector | 各自字段（pid/mnt_path/disabled/crash_count） |
 
 FUSE 回调多线程并发执行。热路径（`br_resolve`/`br_probe`）**不取 rwlock**：`config_read_begin()` 持槽返回稳定代际，`config_read_end(gen)` 返回 false（读期间发生发布）则整个 resolve 重试；持槽期间旧配置不会被释放。写者 `config_publish_begin()` 置奇数封锁新读者 → `config_drain_readers()` 等旧代际归零 → 非原子交换 → `config_publish_end()` 放行并再等旧槽归零，之后才释放旧配置。读者计数按代际奇偶分槽、每线程独占 64B 缓存行，并发读不产生缓存行颠簸。**冷路径**（`config_publisher`/`log_ctl` 查询）仍走 `config_lock_read()` rwlock；框架层不再统一加读锁，`VFS_RETURN` 只是普通返回。
