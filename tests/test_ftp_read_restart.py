@@ -59,6 +59,9 @@ def main():
             "-I", str(ROOT / "include"),
             "-I", str(ROOT / "src" / "modules" / "ftp"),
             str(DRIVER),
+            # 后端源码由 FTP_BACKEND_SRC 直接编入驱动；ftp_mux.c 是独立编译单元
+            # （控制面 epoll 复用器，本用例不驱动它，但引用符号须可解析）
+            str(ROOT / "src" / "modules" / "ftp" / "ftp_mux.c"),
             "-o", str(exe),
             "-pthread", "-lcurl", "-lm",
         ]

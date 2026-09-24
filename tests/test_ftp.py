@@ -232,6 +232,22 @@ def main():
                 if fp.exists(): fp.unlink()
             fail("随机读写", str(e))
 
+        # 11. 缺失路径探测不计入内部熔断（熔断防误杀）：16 个**不同**缺失
+        #     路径连续探测须全为 ENOENT；若误计失败，第 8 次即进静默，随后
+        #     真实文件会在探测窗口内被快速失败（应用会把完好文件当消失）
+        try:
+            for i in range(16):
+                try:
+                    (m/"0"/SERVER/f"nsp_missing_{i}.txt").stat()
+                    raise AssertionError(f"缺失路径 nsp_missing_{i} 竟然存在")
+                except FileNotFoundError:
+                    pass
+            got = (m/"0"/SERVER/orig).read_text().strip()
+            ok("缺失路径 16 连发不入内部熔断（真实文件仍可读，无误杀）") if \
+                got == "ftp-original-content" else fail("熔断误杀", f"got='{got}'")
+        except Exception as e:
+            fail("缺失路径不入内部熔断（防误杀）", str(e))
+
     finally:
         stop_fuse(p)   # fuse_daemon 退出 → 模块 exit 清理后端
         # 清理测试残留

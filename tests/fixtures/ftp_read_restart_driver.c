@@ -188,7 +188,7 @@ static void setup_file(FtpBackendFile* f, FtpBackend* bk, off_t start_off) {
     f->bk = bk;
     f->tmp_fd = -1;
     f->file_size = 1u << 20;
-    f->read_curl = (CURL*)&bk->curl; /* 非 NULL 即可：perform/setopt 已 mock */
+    f->read_curl = (CURL*)&bk->mux; /* 非 NULL 即可：perform/setopt 已 mock */
     pthread_mutex_init(&f->f_lock, NULL);
     pthread_cond_init(&f->dl_cond, NULL);
     f->rbuf_cap = FTP_RBUF_MIN;

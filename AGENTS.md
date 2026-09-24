@@ -37,8 +37,8 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | 改动 | 测试 |
 |---|---|
 | `basic_rules` / `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀/沙盒/热重载）、`test_config_snapshot.py`（解析快照 + STATIC 输出） |
-| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（13，需 vsftpd）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd） |
-| `backend_rc_is_business`（后端业务 errno 豁免）/ `fuse_daemon.c` 后端分派 | `test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
+| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（14，需 vsftpd）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd）、`test_ftp_parallel.py`（11，控制面并发/连接复用/延迟收敛/热重载竞态/断连熔断自愈，需 vsftpd；自起延迟中继，占用 127.0.0.1:2121） |
+| `src/modules/ftp/ftp_mux.c`（epoll + curl_multi 控制面复用器）或 `backend_rc_is_business`（业务 errno 豁免） | `test_ftp_parallel.py`（连接复用与延迟收敛）、`test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
 | `src/config/path_vars.c` | `test_path_vars.py` |
 | `src/module/`（加载器/围栏/熔断/ABI） | `test_modules.py`（12，热插拔）、`test_module_circuit.py`（55，故障隔离）、`test_module_abi.py`（V3 契约/默认值/输出校验/V1+V2 拒载） |
 | 决策结构 / 框架单点强制（`NspPathDecision`、`fw_route` 的 appear_missing·read_only、`vfs_apply_attr_override`） | `test_module_overrides.py`（42，逐回调 errno 矩阵：appear_missing 统一 ENOENT、read_only 统一 EROFS、属性覆盖与类型位保持） |
