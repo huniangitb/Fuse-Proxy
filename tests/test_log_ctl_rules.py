@@ -16,6 +16,8 @@
     - REDIRECT "a|b" → "REDIRECT a b"；单值 v → "REDIRECT v v"
     - 应用段规则落 App-rules/<pkg>.conf；--uid 落 App-rules-<uid>/
     - USER_APPS 落主文件 [USER_APPS:<uid>]；SYSTEM_APPS 落 [SYSTEM_APPS]
+    - 类别段头带 ON/OFF 后缀、尾空白或末行无换行时，写入仍命中该段：
+      不追加重复段、不改写原段头、不与末行粘连
     - 未知类型报错且不改动文件
 
   已统一的分叉（log_ctl 现与 rule_server 同语义）
@@ -165,6 +167,37 @@ def test_category_scope():
     c.close()
 
 
+def test_category_header_variants():
+    """类别段头的容错形态：写入不得另起重复段、不得破坏原段头、不得粘连末行。
+
+    回归背景：共享实现曾把"带 \\n 的段头文本"传给精确匹配器，导致
+    [USER_APPS:0] OFF / [USER_APPS:0]␠␠ / 末行无换行 三种形态全部匹配失败，
+    于是追加一个**默认 ON** 的同名重复段——显式 OFF 的类别会被静默重新使能。
+    """
+    print("── 类别段头容错形态（OFF 后缀 / 尾空白 / 末行无换行） ──")
+    for label, initial in [
+        ("OFF 后缀", "[GLOBAL]\n[USER_APPS:0] OFF\n"),
+        ("尾空白", "[GLOBAL]\n[USER_APPS:0]  \n"),
+        ("末行无换行", "[GLOBAL]\n[USER_APPS:0]"),
+    ]:
+        c = Cfg(initial)
+        rc, out = c.run("set-rule", "USER_APPS", "HIDE", "/hdrprobe")
+        check(f"[{label}] 写入成功", rc, 0)
+        ls = lines_of(c.main_text())
+        check(f"[{label}] 未另起重复段",
+              len([x for x in ls if x.startswith("[USER_APPS:0]")]), 1)
+        check(f"[{label}] 规则落入该段", "HIDE /hdrprobe" in ls, True)
+        check(f"[{label}] 规则在段头之后",
+              ls.index("HIDE /hdrprobe") > ls.index(
+                  next(x for x in ls if x.startswith("[USER_APPS:0]"))), True)
+        if label == "OFF 后缀":
+            check("OFF 后缀未被改写为默认 ON", "OFF" in ls[ls.index("[USER_APPS:0] OFF")], True)
+        if label == "末行无换行":
+            # 段头行与规则行必须是两行，而非粘连成 "[USER_APPS:0]HIDE /hdrprobe"
+            check("未与末行粘连", "[USER_APPS:0]HIDE /hdrprobe" in ls, False)
+        c.close()
+
+
 def test_unknown_type():
     print("── 未知类型：报错且不改动文件 ──")
     c = Cfg("[GLOBAL]\nHIDE /keep\n")
@@ -222,6 +255,7 @@ def main():
     test_redirect_forms()
     test_app_scope()
     test_category_scope()
+    test_category_header_variants()
     test_unknown_type()
     test_remove_index_semantics()
     test_redirect_remove_by_index()

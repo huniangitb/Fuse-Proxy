@@ -46,12 +46,15 @@ typedef enum {
 
 /* ==================== 行数组原语 ==================== */
 
-/* 读取文件为行数组（保留行内空白与换行，不做 trim）。每行 strdup。
+/* 读取文件为行数组（保留行内空白，不做 trim）。每行 strdup。
+ * 行尾换行已归一：文件末行缺少 \n 时会补齐，故数组内每行均以 \n 结尾
+ * （避免"插到末行之后"的写入与之粘连成同一行）。
  * 文件不存在或读取失败：*out_count = *out_cap = 0，返回 NULL（调用方按空文件处理）。
  * 成功返回数组（调用方经 nsp_rule_file_free 释放）。 */
 char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap);
 
-/* 原子落盘：写 <path>.tmp → fsync → rename。失败时清理 tmp 并保留原文件。
+/* 原子落盘：写 <path>.tmp → rename（同目录 rename 保证读端不见半截文件）。
+ * 失败时清理 tmp 并保留原文件。
  * true = 成功，false = 失败（errno 有效）。 */
 bool nsp_rule_file_write(const char* path, char** lines, int count);
 
@@ -74,7 +77,9 @@ int nsp_rule_file_append(char*** lines, int* cap, int count, const char* text);
 int nsp_rule_file_find_section(char** lines, int count, const char* name);
 
 /* 精确段头文本匹配（允许尾部空白或 ON/OFF 后缀，且须有边界——[USER_APPS:0]OFFX
- * 不算段头）；未找到返回 NSP_RULE_FILE_ENOTFND */
+ * 不算段头）；未找到返回 NSP_RULE_FILE_ENOTFND。
+ * hdr_text 须为**不含换行**的段头文本（如 "[USER_APPS:0]"）：带 \n 会因"其后
+ * 须为空白/ON/OFF"的判定与行内空白不再相等而失配。 */
 int nsp_rule_file_find_header(char** lines, int count, const char* hdr_text);
 
 /* 段头之后、下一个段头之前查找开关行（大小写不敏感，类型名后须为空白/行尾）；

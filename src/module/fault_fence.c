@@ -18,6 +18,7 @@
  */
 #include "fault_fence.h"
 #include "common.h"
+#include "module_loader.h" /* MAX_MODULES：与 NSP_FENCE_UNBOUND_SLOT 对齐断言 */
 #include <setjmp.h>
 #include <signal.h>
 #include <string.h>
@@ -67,23 +68,23 @@ static FenceTls* ensure_fence(void) {
 
 /* ================= 静态槽位注册表（信号安全） ================= */
 
-#define FENCE_MAX_SLOTS 16 /* 与 MAX_MODULES 一致（module_loader.h） */
+_Static_assert(NSP_FENCE_UNBOUND_SLOT == MAX_MODULES, "未绑定槽位须紧随模块槽位之后");
 
 typedef struct {
     char name[64];
     void* handle;
 } FenceSlot;
 
-static FenceSlot g_slots[FENCE_MAX_SLOTS];
+static FenceSlot g_slots[NSP_FENCE_MAX_SLOTS];
 
 void fault_fence_register_slot(int slot, const char* name, void* dl_handle) {
-    if (slot < 0 || slot >= FENCE_MAX_SLOTS) return;
+    if (slot < 0 || slot >= NSP_FENCE_MAX_SLOTS) return;
     memset(&g_slots[slot], 0, sizeof(FenceSlot));
     if (name) strncpy(g_slots[slot].name, name, sizeof(g_slots[slot].name) - 1);
     g_slots[slot].handle = dl_handle;
 }
 void fault_fence_unregister_slot(int slot) {
-    if (slot < 0 || slot >= FENCE_MAX_SLOTS) return;
+    if (slot < 0 || slot >= NSP_FENCE_MAX_SLOTS) return;
     g_slots[slot].handle = NULL;
     g_slots[slot].name[0] = '\0';
 }
@@ -100,7 +101,7 @@ void fault_fence_attribution(int* slot_out, const char** op_out, const char** na
     if (slot_out) *slot_out = slot;
     if (op_out) *op_out = f->op;
     if (name_out)
-        *name_out = (slot >= 0 && slot < FENCE_MAX_SLOTS && g_slots[slot].name[0])
+        *name_out = (slot >= 0 && slot < NSP_FENCE_MAX_SLOTS && g_slots[slot].name[0])
                         ? g_slots[slot].name
                         : "(unknown)";
 }
@@ -124,7 +125,7 @@ bool fault_fence_handle_fault(void) {
     int slot = -1;
     const char *op = NULL, *name = NULL;
     fault_fence_attribution(&slot, &op, &name);
-    if (slot < 0 || slot >= FENCE_MAX_SLOTS) return false;
+    if (slot < 0 || slot >= NSP_FENCE_MAX_SLOTS) return false;
     FenceTls* f = tls_fence;
     if (!f) return false;
     /* longjmp 回本线程围栏。此后 nsp_fence_* 宏返回 NSP_FENCE_FAULT，
