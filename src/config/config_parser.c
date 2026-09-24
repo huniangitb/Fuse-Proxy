@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "config_parser.h"
+#include "nsp_constants.h"
 #include "common.h"
 #include "nsp_util.h"
 #include "path_vars.h"
@@ -319,9 +320,11 @@ static char* get_next_token(char** ptr) {
     }
     return start;
 }
-static char* strip_storage_prefix(char* path) {
-    if (strncmp(path, "/storage/emulated/", 18) == 0) {
-        char* p = path + 18;
+static const char* strip_storage_prefix(const char* path) {
+    /* 前缀含尾斜杠：sizeof(字面量)-1 = 18（NSP_ANDROID_EMULATED_ROOT 本身 17 字符） */
+    if (strncmp(path, NSP_ANDROID_EMULATED_ROOT "/", sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1) ==
+        0) {
+        const char* p = path + sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1;
         while (*p && isdigit((unsigned char)*p)) p++;
         if (*p == '/') return p;    /* /storage/emulated/0/Download -> /Download */
         if (*p == '\0') return "/"; /* /storage/emulated/0 -> / */
@@ -340,293 +343,305 @@ static int cmp_hide(const void* a, const void* b) {
     const char* str_b = *(const char**)b;
     return (int)strlen(str_b) - (int)strlen(str_a);
 }
+/* ============ 规则解析辅助（按类型拆分后的公共收敛点） ============
+   parse_config_line 只做类型分派；每类规则的路径归一、数组增长、trie 插入/
+   动态兜底逻辑收敛到下列函数，避免 HIDE/RO、ALLOW/REDIRECT 及四处 realloc
+   增长分支各写一份。 */
+
+/* 规则数组容量倍增：count < *cap 时原样返回；否则 realloc 到 2 倍并回写 *cap。
+   失败返回 NULL（*cap 与调用方原指针均不变，不丢数据）。 */
+static void* grow_rule_array(void* arr, int* cap, int count, size_t elem_size) {
+    if (count < *cap) return arr;
+    int new_cap = *cap == 0 ? 8 : *cap * 2;
+    void* grown = realloc(arr, (size_t)new_cap * elem_size);
+    if (!grown) return NULL;
+    *cap = new_cap; /* 必须回写：否则下次仍按旧容量判断，越界写入 */
+    return grown;
+}
+
+/* 规则路径前缀归一（HIDE/RO/ALLOW/REDIRECT 共用）：剥离 /storage/emulated/<uid>、
+   补前导 '/'、不含通配符时去尾斜杠。keep_star_head=true 保留以 '*' 开头的写法
+   （HIDE/RO 语义：'*' 视为通配起始，不补 '/'）。 */
+static void normalize_rule_path(const char* in, char* out, size_t outsz, bool keep_star_head) {
+    const char* p = strip_storage_prefix(in);
+    if (p[0] == '/' || (keep_star_head && p[0] == '*'))
+        snprintf(out, outsz, "%s", p);
+    else
+        snprintf(out, outsz, "/%s", p);
+    if (strpbrk(out, "*?[]") == nullptr) strip_trailing_slash(out);
+}
+
+/* FTP 前缀归一：FTP 虚拟前缀是后端段名入口而非存储路径，故不做
+   /storage/emulated 剥离，仅补前导 '/' 并无条件去尾斜杠。 */
+static void normalize_ftp_prefix(const char* in, char* out, size_t outsz) {
+    snprintf(out, outsz, "%s%s", in[0] == '/' ? "" : "/", in);
+    strip_trailing_slash(out);
+    if (out[0] == '\0') snprintf(out, outsz, "/");
+}
+
+/* 追加字符串规则到 char** 数组（HIDE/RO 共用）：false = 增长或 strdup 失败
+   （失败时不递增 count，避免把 NULL 计入规则数） */
+static bool append_str_rule(char*** rules, int* count, int* capacity, const char* value) {
+    char** grown = grow_rule_array(*rules, capacity, *count, sizeof(char*));
+    if (!grown) return false;
+    *rules = grown; /* 先接管新缓冲：strdup 失败时旧指针已失效，不能悬垂 */
+    char* copy = strdup(value);
+    if (!copy) return false;
+    (*rules)[(*count)++] = copy;
+    return true;
+}
+
+/* HIDE/RO：追加路径规则 + trie 插入（含通配/变量时仅线性兜底） */
+static void append_path_rule(AppConfig* cur, const char* path, bool is_hide, int line_num,
+                             const char* file_path) {
+    bool ok = is_hide
+                  ? append_str_rule(&cur->hide_rules, &cur->hide_count, &cur->hide_capacity, path)
+                  : append_str_rule(&cur->ro_rules, &cur->ro_count, &cur->ro_capacity, path);
+    if (!ok) {
+        LOG_ERR("追加 %s_rules 失败（内存不足） (行 %d, 文件 %s)", is_hide ? "hide" : "ro",
+                line_num, file_path);
+        return;
+    }
+    if (!is_wildcard_string(path) && !has_path_var(path)) {
+        trie_insert(cur->trie_root, path, NULL, is_hide, !is_hide);
+    } else if (is_hide) {
+        cur->dyn_hide = true; /* 通配/变量规则未入 trie，须线性兜底 */
+    } else {
+        cur->dyn_ro = true;
+    }
+}
+
+/* REDIRECT/ALLOW：追加重定向规则 + trie 插入（含通配/变量时仅线性兜底） */
+static void append_redirect_rule(AppConfig* cur, const char* virtual_prefix,
+                                 const char* real_target, bool is_allow, int line_num,
+                                 const char* file_path) {
+    RedirectRule* grown = grow_rule_array(cur->redir_rules, &cur->redir_capacity, cur->redir_count,
+                                          sizeof(RedirectRule));
+    if (!grown) {
+        LOG_ERR("realloc redir_rules 失败 (行 %d, 文件 %s)", line_num, file_path);
+        return;
+    }
+    cur->redir_rules = grown;
+    RedirectRule* r = &cur->redir_rules[cur->redir_count++];
+    snprintf(r->virtual_prefix, sizeof(r->virtual_prefix), "%s", virtual_prefix);
+    snprintf(r->real_target, sizeof(r->real_target), "%s", real_target);
+    r->is_allow = is_allow;
+    if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) &&
+        !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
+        trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
+    } else {
+        cur->dyn_redir = true; /* 通配/变量 redir 未入 trie，须线性兜底 */
+    }
+}
+
+/* 变量四平行数组增长：全部新数组分配成功才替换（realloc 就地扩展会使旧
+   指针失效，逐个 realloc 在部分失败时留下悬垂指针）。false = OOM。 */
+static bool grow_var_arrays(AppConfig* cur) {
+    if (cur->var_count < cur->var_capacity) return true;
+    int new_cap = cur->var_capacity == 0 ? 8 : cur->var_capacity * 2;
+    char** names = malloc((size_t)new_cap * sizeof(char*));
+    char** values = malloc((size_t)new_cap * sizeof(char*));
+    char** resolved = malloc((size_t)new_cap * sizeof(char*));
+    bool* is_static = malloc((size_t)new_cap * sizeof(bool));
+    if (!names || !values || !resolved || !is_static) {
+        free(names);
+        free(values);
+        free(resolved);
+        free(is_static);
+        return false;
+    }
+    if (cur->var_count > 0) {
+        memcpy(names, cur->var_names, (size_t)cur->var_count * sizeof(char*));
+        memcpy(values, cur->var_values, (size_t)cur->var_count * sizeof(char*));
+        memcpy(resolved, cur->var_resolved, (size_t)cur->var_count * sizeof(char*));
+        memcpy(is_static, cur->var_is_static, (size_t)cur->var_count * sizeof(bool));
+    }
+    free(cur->var_names);
+    free(cur->var_values);
+    free(cur->var_resolved);
+    free(cur->var_is_static);
+    cur->var_names = names;
+    cur->var_values = values;
+    cur->var_resolved = resolved;
+    cur->var_is_static = is_static;
+    cur->var_capacity = new_cap;
+    return true;
+}
+
+/* NAME=VALUE 赋值（紧凑形式，无空格围绕 =）：识别即返回 true（含保留名告警） */
+static bool parse_variable_rule(AppConfig* cur, const char* line, int line_num,
+                                const char* file_path) {
+    char vname[128], vvalue[MAX_PATH_LEN];
+    if (!parse_var_assignment(line, vname, sizeof vname, vvalue, sizeof vvalue)) return false;
+    if (strcmp(vname, "package") == 0) {
+        LOG_WRN("不允许覆盖系统保留变量 package (行 %d, 文件 %s)", line_num, file_path);
+        return true;
+    }
+    if (!grow_var_arrays(cur)) {
+        LOG_ERR("realloc 变量数组失败 (行 %d)", line_num);
+        return true;
+    }
+    /* strdup 失败时不递增 var_count，避免把 NULL 计入变量数 */
+    char* name_copy = strdup(vname);
+    char* value_copy = strdup(vvalue);
+    if (!name_copy || !value_copy) {
+        free(name_copy);
+        free(value_copy);
+        LOG_ERR("strdup 变量失败（内存不足） (行 %d, 文件 %s)", line_num, file_path);
+        return true;
+    }
+    cur->var_names[cur->var_count] = name_copy;
+    cur->var_values[cur->var_count] = value_copy;
+    cur->var_resolved[cur->var_count] = NULL;
+    cur->var_is_static[cur->var_count] = false;
+    cur->var_count++;
+    return true;
+}
+
+/* MONITOR / SANDBOX：取 ON/1 为开，其余（含缺省）为关；写一次即标记 explicit */
+static void parse_switch_rule(bool* field, bool* explicit_flag, char* p_ptr) {
+    char* val = get_next_token(&p_ptr);
+    *field = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+    *explicit_flag = true;
+}
+
+/* GLOBAL_INJECT / SKIP_SYSTEM_APPS：仅 [GLOBAL] 段有效，写在别处忽略并告警 */
+static void parse_global_switch_rule(AppConfig* cur, bool* field, const char* name, char* p_ptr,
+                                     int line_num, const char* file_path) {
+    char* val = get_next_token(&p_ptr);
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("%s 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", name, line_num, file_path);
+        return;
+    }
+    *field = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+}
+
+/* FUSE_EXTRA_ARGS：仅 [GLOBAL] 段有效；取行尾原样内容（不分词，上限 512 字节） */
+static void parse_fuse_extra_args_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                       const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("FUSE_EXTRA_ARGS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                file_path);
+        return;
+    }
+    char* p = p_ptr;
+    while (p && isspace((unsigned char)*p)) p++;
+    if (!p || !*p) return;
+    size_t len = strlen(p);
+    while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
+    if (len == 0) return;
+    size_t copy_len =
+        len < sizeof(cur->fuse_extra_args) - 1 ? len : sizeof(cur->fuse_extra_args) - 1;
+    memcpy(cur->fuse_extra_args, p, copy_len);
+    cur->fuse_extra_args[copy_len] = '\0';
+}
+
+/* HIDE <path> / RO <path> */
+static void parse_path_rule(AppConfig* cur, char* p_ptr, bool is_hide, int line_num,
+                            const char* file_path) {
+    char* val = get_next_token(&p_ptr);
+    if (!val) return;
+    char path[MAX_PATH_LEN];
+    normalize_rule_path(val, path, sizeof path, true);
+    append_path_rule(cur, path, is_hide, line_num, file_path);
+}
+
+/* ALLOW <path>：等价"重定向回自身真实存储"，real_target 为 ?<path> 内部前缀 */
+static void parse_allow_rule(AppConfig* cur, char* p_ptr, int line_num, const char* file_path) {
+    char* val = get_next_token(&p_ptr);
+    if (!val) return;
+    char virtual_prefix[MAX_PATH_LEN];
+    normalize_rule_path(val, virtual_prefix, sizeof virtual_prefix, false);
+    char real_target[MAX_PATH_LEN];
+    snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
+    if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
+    append_redirect_rule(cur, virtual_prefix, real_target, true, line_num, file_path);
+}
+
+/* REDIRECT <vpath> <target>：目标含变量时原样存入（分类延迟到运行时
+   build_real_base_from_target），否则按路径归一规则生成 ? 内部前缀 */
+static void parse_redirect_rule(AppConfig* cur, char* p_ptr, int line_num, const char* file_path) {
+    char* v1 = get_next_token(&p_ptr);
+    char* v2 = get_next_token(&p_ptr);
+    if (!v1 || !v2) return;
+    char virtual_prefix[MAX_PATH_LEN];
+    normalize_rule_path(v1, virtual_prefix, sizeof virtual_prefix, false);
+    char real_target[MAX_PATH_LEN];
+    if (has_path_var(v2)) {
+        snprintf(real_target, MAX_PATH_LEN, "%s", v2);
+    } else if (strncmp(v2, NSP_ANDROID_EMULATED_ROOT "/",
+                       sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1) == 0) {
+        const char* p = v2 + sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1;
+        while (*p && isdigit((unsigned char)*p)) p++;
+        if (*p == '/') p++;
+        snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
+    } else if (is_system_abs_path(v2)) {
+        snprintf(real_target, MAX_PATH_LEN, "%s", v2);
+    } else {
+        snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
+    }
+    if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
+    append_redirect_rule(cur, virtual_prefix, real_target, false, line_num, file_path);
+}
+
+/* FTP <虚拟前缀> <段名>：虚拟前缀命中时由 FTP 后端（段名）提供。
+   规则所在段决定作用域：GLOBAL=全局，应用段=仅该应用 */
+static void parse_ftp_rule(AppConfig* cur, char* p_ptr, int line_num, const char* file_path) {
+    char* v1 = get_next_token(&p_ptr);
+    char* v2 = get_next_token(&p_ptr);
+    if (!v1 || !v2) {
+        LOG_WRN("FTP 规则缺少参数 (行 %d, 文件 %s)", line_num, file_path);
+        return;
+    }
+    char virtual_prefix[MAX_PATH_LEN];
+    normalize_ftp_prefix(v1, virtual_prefix, sizeof virtual_prefix);
+    FtpRule* grown =
+        grow_rule_array(cur->ftp_rules, &cur->ftp_capacity, cur->ftp_count, sizeof(FtpRule));
+    if (!grown) {
+        LOG_ERR("realloc ftp_rules 失败 (行 %d)", line_num);
+        return;
+    }
+    cur->ftp_rules = grown;
+    FtpRule* fr = &cur->ftp_rules[cur->ftp_count++];
+    memset(fr, 0, sizeof *fr);
+    snprintf(fr->virtual_prefix, sizeof fr->virtual_prefix, "%s", virtual_prefix);
+    snprintf(fr->backend_name, sizeof fr->backend_name, "%s", v2);
+    /* 同时入 trie：resolve 热路径经 trie 下降一次取得 FTP 命中
+       （替代 config_ftp_match 每请求 O(N) 线性扫描）；
+       FTP 前缀为静态字面段（无通配/变量），与线性匹配语义一致 */
+    if (cur->trie_root) trie_insert_ftp(cur->trie_root, virtual_prefix, v2);
+}
+
 static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_num,
                               const char* file_path) {
     (void)user_id;
+    if (parse_variable_rule(cur, line, line_num, file_path)) return;
     char* p_ptr = line;
-    /* 先尝试 NAME=VALUE 赋值（紧凑形式，无空格围绕 =） */
-    {
-        char vname[128], vvalue[MAX_PATH_LEN];
-        if (parse_var_assignment(line, vname, sizeof vname, vvalue, sizeof vvalue)) {
-            if (strcmp(vname, "package") == 0) {
-                LOG_WRN("不允许覆盖系统保留变量 package (行 %d, 文件 %s)", line_num, file_path);
-            } else {
-                if (cur->var_count >= cur->var_capacity) {
-                    int newcap = cur->var_capacity == 0 ? 8 : cur->var_capacity * 2;
-                    char** new_names = realloc(cur->var_names, newcap * sizeof(char*));
-                    char** new_values = realloc(cur->var_values, newcap * sizeof(char*));
-                    char** new_resolved = realloc(cur->var_resolved, newcap * sizeof(char*));
-                    bool* new_is_static = realloc(cur->var_is_static, newcap * sizeof(bool));
-                    if (!new_names || !new_values || !new_resolved || !new_is_static) {
-                        LOG_ERR("realloc 变量数组失败 (行 %d)", line_num);
-                        free(new_names);
-                        free(new_values);
-                        free(new_resolved);
-                        free(new_is_static);
-                        return;
-                    }
-                    cur->var_names = new_names;
-                    cur->var_values = new_values;
-                    cur->var_resolved = new_resolved;
-                    cur->var_is_static = new_is_static;
-                    cur->var_capacity = newcap;
-                }
-                cur->var_names[cur->var_count] = strdup(vname);
-                cur->var_values[cur->var_count] = strdup(vvalue);
-                cur->var_resolved[cur->var_count] = NULL;
-                cur->var_is_static[cur->var_count] = false;
-                cur->var_count++;
-            }
-            return;
-        }
-    }
     char* tok = get_next_token(&p_ptr);
     if (!tok) return;
-    if (strcmp(tok, "MONITOR") == 0) {
-        char* val = get_next_token(&p_ptr);
-        cur->monitor = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
-        cur->monitor_explicit = true;
-    } else if (strcmp(tok, "SANDBOX") == 0) {
-        char* val = get_next_token(&p_ptr);
-        cur->sandbox = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
-        cur->sandbox_explicit = true;
-    } else if (strcmp(tok, "GLOBAL_INJECT") == 0) {
-        char* val = get_next_token(&p_ptr);
-        if (cur != &g_global_cfg_stage) {
-            LOG_WRN("GLOBAL_INJECT 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
-                    file_path);
-        } else {
-            cur->global_inject = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
-        }
-    } else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0) {
-        char* val = get_next_token(&p_ptr);
-        if (cur != &g_global_cfg_stage) {
-            LOG_WRN("SKIP_SYSTEM_APPS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
-                    file_path);
-        } else {
-            cur->skip_system_apps = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
-        }
-    } else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0) {
-        if (cur != &g_global_cfg_stage) {
-            LOG_WRN("FUSE_EXTRA_ARGS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
-                    file_path);
-            return;
-        }
-        /* 读取行尾剩余全部内容，不做分词（原样透传给 fuse_daemon） */
-        char* p = p_ptr;
-        while (p && isspace((unsigned char)*p)) p++;
-        if (p && *p) {
-            size_t len = strlen(p);
-            while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
-            if (len > 0) {
-                size_t copy_len =
-                    len < sizeof(cur->fuse_extra_args) - 1 ? len : sizeof(cur->fuse_extra_args) - 1;
-                memcpy(cur->fuse_extra_args, p, copy_len);
-                cur->fuse_extra_args[copy_len] = '\0';
-            }
-        }
-    } else if (strcmp(tok, "HIDE") == 0) {
-        char* val = get_next_token(&p_ptr);
-        if (val) {
-            char* v_ptr = strip_storage_prefix(val);
-            char clean_rule[MAX_PATH_LEN];
-            if (v_ptr[0] != '/' && v_ptr[0] != '*')
-                snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
-            else {
-                strncpy(clean_rule, v_ptr, MAX_PATH_LEN - 1);
-                clean_rule[MAX_PATH_LEN - 1] = '\0';
-            }
-            if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
-            if (cur->hide_count >= cur->hide_capacity) {
-                int new_cap = cur->hide_capacity == 0 ? 8 : cur->hide_capacity * 2;
-                char** new_hide = realloc(cur->hide_rules, new_cap * sizeof(char*));
-                if (!new_hide) {
-                    LOG_ERR("realloc hide_rules 失败");
-                    return;
-                }
-                cur->hide_rules = new_hide;
-                cur->hide_capacity = new_cap;
-            }
-            cur->hide_rules[cur->hide_count] = strdup(clean_rule);
-            cur->hide_count++;
-            if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
-                trie_insert(cur->trie_root, clean_rule, NULL, true, false);
-            } else {
-                cur->dyn_hide = true; /* 通配/变量规则未入 trie，须线性兜底 */
-            }
-        }
-    } else if (strcmp(tok, "RO") == 0) {
-        char* val = get_next_token(&p_ptr);
-        if (val) {
-            char* v_ptr = strip_storage_prefix(val);
-            char clean_rule[MAX_PATH_LEN];
-            if (v_ptr[0] != '/' && v_ptr[0] != '*')
-                snprintf(clean_rule, MAX_PATH_LEN, "/%s", v_ptr);
-            else {
-                strncpy(clean_rule, v_ptr, MAX_PATH_LEN - 1);
-                clean_rule[MAX_PATH_LEN - 1] = '\0';
-            }
-            if (strpbrk(clean_rule, "*?[]") == nullptr) strip_trailing_slash(clean_rule);
-            if (cur->ro_count >= cur->ro_capacity) {
-                int new_cap = cur->ro_capacity == 0 ? 8 : cur->ro_capacity * 2;
-                char** new_ro = realloc(cur->ro_rules, new_cap * sizeof(char*));
-                if (!new_ro) {
-                    LOG_ERR("realloc ro_rules 失败");
-                    return;
-                }
-                cur->ro_rules = new_ro;
-                cur->ro_capacity = new_cap;
-            }
-            cur->ro_rules[cur->ro_count] = strdup(clean_rule);
-            cur->ro_count++;
-            if (!is_wildcard_string(clean_rule) && !has_path_var(clean_rule)) {
-                trie_insert(cur->trie_root, clean_rule, NULL, false, true);
-            } else {
-                cur->dyn_ro = true; /* 通配/变量规则未入 trie，须线性兜底 */
-            }
-        }
-    } else if (strcmp(tok, "ALLOW") == 0) {
-        char* val = get_next_token(&p_ptr);
-        if (val) {
-            char* v_ptr = strip_storage_prefix(val);
-            char virtual_prefix[MAX_PATH_LEN];
-            if (v_ptr[0] == '\0')
-                strcpy(virtual_prefix, "/");
-            else {
-                if (v_ptr[0] != '/')
-                    snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
-                else {
-                    strncpy(virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
-                    virtual_prefix[MAX_PATH_LEN - 1] = '\0';
-                }
-            }
-            /* 通配规则（含 * ? [ ]）不 strip 尾斜杠：尾斜杠是通配模式的组成部分
-               （如 /Download/*.mp3/ 与 /Download/*.mp3 语义不同），与 HIDE/RO 一致 */
-            if (strpbrk(virtual_prefix, "*?[]") == nullptr) strip_trailing_slash(virtual_prefix);
-            char real_target[MAX_PATH_LEN];
-            snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
-            if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
-            if (cur->redir_count >= cur->redir_capacity) {
-                int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                RedirectRule* new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
-                if (!new_redir) {
-                    LOG_ERR("realloc redir_rules 失败 (ALLOW)");
-                    return;
-                }
-                cur->redir_rules = new_redir;
-                cur->redir_capacity = new_cap;
-            }
-            RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-            strncpy(r->virtual_prefix, virtual_prefix, sizeof(r->virtual_prefix) - 1);
-            r->virtual_prefix[sizeof(r->virtual_prefix) - 1] = '\0';
-            strncpy(r->real_target, real_target, sizeof(r->real_target) - 1);
-            r->real_target[sizeof(r->real_target) - 1] = '\0';
-            r->is_allow = true;
-            if (!is_wildcard_string(virtual_prefix) && !has_path_var(virtual_prefix)) {
-                trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
-            } else {
-                cur->dyn_redir = true; /* 通配/变量 redir 未入 trie，须线性兜底 */
-            }
-        }
-    } else if (strcmp(tok, "REDIRECT") == 0) {
-        char* v1 = get_next_token(&p_ptr);
-        char* v2 = get_next_token(&p_ptr);
-        if (v1 && v2) {
-            char* v_ptr = strip_storage_prefix(v1);
-            char virtual_prefix[MAX_PATH_LEN];
-            if (v_ptr[0] == '\0')
-                strcpy(virtual_prefix, "/");
-            else {
-                if (v_ptr[0] != '/')
-                    snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v_ptr);
-                else {
-                    strncpy(virtual_prefix, v_ptr, MAX_PATH_LEN - 1);
-                    virtual_prefix[MAX_PATH_LEN - 1] = '\0';
-                }
-            }
-            /* 通配规则（含 * ? [ ]）不 strip 尾斜杠（尾斜杠是模式组成部分） */
-            if (strpbrk(virtual_prefix, "*?[]") == nullptr) strip_trailing_slash(virtual_prefix);
-            char real_target[MAX_PATH_LEN];
-            if (has_path_var(v2)) {
-                /* 含变量：原样存入，路径分类延迟到运行时 build_real_base_from_target */
-                strncpy(real_target, v2, MAX_PATH_LEN - 1);
-                real_target[MAX_PATH_LEN - 1] = '\0';
-            } else if (strncmp(v2, "/storage/emulated/", 18) == 0) {
-                char* p = v2 + 18;
-                while (*p && isdigit((unsigned char)*p)) p++;
-                if (*p == '/') p++;
-                snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
-            } else if (is_system_abs_path(v2)) {
-                strncpy(real_target, v2, MAX_PATH_LEN - 1);
-                real_target[MAX_PATH_LEN - 1] = '\0';
-            } else {
-                snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
-            }
-            if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
-            if (cur->redir_count >= cur->redir_capacity) {
-                int new_cap = cur->redir_capacity == 0 ? 8 : cur->redir_capacity * 2;
-                RedirectRule* new_redir = realloc(cur->redir_rules, new_cap * sizeof(RedirectRule));
-                if (!new_redir) {
-                    LOG_ERR("realloc redir_rules 失败 (ALLOW)");
-                    return;
-                }
-                cur->redir_rules = new_redir;
-                cur->redir_capacity = new_cap;
-            }
-            RedirectRule* r = &cur->redir_rules[cur->redir_count++];
-            strncpy(r->virtual_prefix, virtual_prefix, sizeof(r->virtual_prefix) - 1);
-            r->virtual_prefix[sizeof(r->virtual_prefix) - 1] = '\0';
-            strncpy(r->real_target, real_target, sizeof(r->real_target) - 1);
-            r->real_target[sizeof(r->real_target) - 1] = '\0';
-            r->is_allow = false;
-            if (!is_wildcard_string(virtual_prefix) && !is_wildcard_string(real_target) &&
-                !has_path_var(virtual_prefix) && !has_path_var(real_target)) {
-                trie_insert(cur->trie_root, virtual_prefix, real_target, false, false);
-            } else {
-                cur->dyn_redir = true; /* 通配/变量 redir 未入 trie，须线性兜底 */
-            }
-        }
-    } else if (strcmp(tok, "FTP") == 0) {
-        /* FTP <虚拟前缀> <段名>：虚拟前缀命中时由 FTP 后端（段名）提供。
-           规则所在段决定作用域：GLOBAL=全局，应用段=仅该应用 */
-        char* v1 = get_next_token(&p_ptr);
-        char* v2 = get_next_token(&p_ptr);
-        if (!v1 || !v2) {
-            LOG_WRN("FTP 规则缺少参数 (行 %d, 文件 %s)", line_num, file_path);
-            return;
-        }
-        char virtual_prefix[MAX_PATH_LEN];
-        if (v1[0] != '/')
-            snprintf(virtual_prefix, MAX_PATH_LEN, "/%s", v1);
-        else {
-            strncpy(virtual_prefix, v1, MAX_PATH_LEN - 1);
-            virtual_prefix[MAX_PATH_LEN - 1] = '\0';
-        }
-        strip_trailing_slash(virtual_prefix);
-        if (virtual_prefix[0] == '\0') strcpy(virtual_prefix, "/");
-        if (cur->ftp_count >= cur->ftp_capacity) {
-            int newcap = cur->ftp_capacity == 0 ? 8 : cur->ftp_capacity * 2;
-            FtpRule* new_rules = realloc(cur->ftp_rules, newcap * sizeof(FtpRule));
-            if (!new_rules) {
-                LOG_ERR("realloc ftp_rules 失败 (行 %d)", line_num);
-                return;
-            }
-            cur->ftp_rules = new_rules;
-            cur->ftp_capacity = newcap;
-        }
-        FtpRule* fr = &cur->ftp_rules[cur->ftp_count++];
-        memset(fr, 0, sizeof *fr);
-        strncpy(fr->virtual_prefix, virtual_prefix, sizeof fr->virtual_prefix - 1);
-        fr->virtual_prefix[sizeof fr->virtual_prefix - 1] = '\0';
-        strncpy(fr->backend_name, v2, sizeof fr->backend_name - 1);
-        fr->backend_name[sizeof fr->backend_name - 1] = '\0';
-        /* 同时入 trie：resolve 热路径经 trie 下降一次取得 FTP 命中
-           （替代 config_ftp_match 每请求 O(N) 线性扫描）；
-           FTP 前缀为静态字面段（无通配/变量），与线性匹配语义一致 */
-        if (cur->trie_root) trie_insert_ftp(cur->trie_root, virtual_prefix, v2);
-    } else {
+    /* 按规则类型分派：路径归一/数组增长/trie 插入收敛在各 parse_<type>_rule 内 */
+    if (strcmp(tok, "MONITOR") == 0)
+        parse_switch_rule(&cur->monitor, &cur->monitor_explicit, p_ptr);
+    else if (strcmp(tok, "SANDBOX") == 0)
+        parse_switch_rule(&cur->sandbox, &cur->sandbox_explicit, p_ptr);
+    else if (strcmp(tok, "GLOBAL_INJECT") == 0)
+        parse_global_switch_rule(cur, &cur->global_inject, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0)
+        parse_global_switch_rule(cur, &cur->skip_system_apps, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
+        parse_fuse_extra_args_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "HIDE") == 0)
+        parse_path_rule(cur, p_ptr, true, line_num, file_path);
+    else if (strcmp(tok, "RO") == 0)
+        parse_path_rule(cur, p_ptr, false, line_num, file_path);
+    else if (strcmp(tok, "ALLOW") == 0)
+        parse_allow_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "REDIRECT") == 0)
+        parse_redirect_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "FTP") == 0)
+        parse_ftp_rule(cur, p_ptr, line_num, file_path);
+    else
         LOG_WRN("不支持的规则 \"%s\" (行 %d, 文件 %s)", tok, line_num, file_path);
-    }
 }
 
 /* FTP 规则最长前缀优先匹配：sub_path 命中 FTP 规则时输出后端段名 */
@@ -846,7 +861,7 @@ void load_config_rules(const char* path) {
     FILE* fp = fopen(path, "r");
     if (fp) {
         AppConfig* cur = &g_global_cfg_stage;
-        char line[2048];
+        char line[NSP_CONFIG_LINE_MAX];
         int current_user_id = -1;
         int line_num = 0;
         while (fgets(line, sizeof(line), fp)) {
@@ -918,7 +933,7 @@ void load_config_rules(const char* path) {
                                  de->d_name);
                         FILE* afp = fopen(app_conf_path, "r");
                         if (afp) {
-                            char line[2048];
+                            char line[NSP_CONFIG_LINE_MAX];
                             int app_line_num = 0;
                             while (fgets(line, sizeof(line), afp)) {
                                 app_line_num++;
@@ -1158,10 +1173,10 @@ bool has_wildcard_enabled_locked(int user_id) {
 }
 void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* trigger_source) {
     config_lock_read();
-    int user_id = linux_uid / 100000;
+    int user_id = linux_uid / NSP_PER_USER_UID_STRIDE;
     AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
     /* 类别层归属（与 br_pick_category 同口径，sys_pkg 在各进程均可用） */
-    bool is_sys = (linux_uid < 10000) || (pkg && sys_pkg_is_system(pkg));
+    bool is_sys = (linux_uid < NSP_SYSTEM_APP_UID_MIN) || (pkg && sys_pkg_is_system(pkg));
     AppConfig* cat = find_category_cfg_locked(is_sys, user_id);
     bool is_wildcard = (cfg == NULL) && has_wildcard_enabled_locked(user_id);
     int final_redir_count =

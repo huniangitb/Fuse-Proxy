@@ -127,9 +127,9 @@ int main(int argc, char* argv[]) {
         add_tracked(pid);
         all_apps_upsert(pid, (uid_t)atoi(argv[4]), argv[5]);
         audit_tracked_apps();
-        int audit_mounted = (ns_is_mounted(pid, "/storage/emulated", nullptr) > 0);
+        int audit_mounted = (ns_is_mounted(pid, NSP_ANDROID_EMULATED_ROOT, nullptr) > 0);
         force_recover_tracked_mounts();
-        int force_mounted = (ns_is_mounted(pid, "/storage/emulated", nullptr) > 0);
+        int force_mounted = (ns_is_mounted(pid, NSP_ANDROID_EMULATED_ROOT, nullptr) > 0);
         printf("audit_mounted=%d force_mounted=%d (global_replace=%d)\n", audit_mounted,
                force_mounted, (int)g_global_replace_mode);
         return 0;

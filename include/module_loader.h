@@ -16,8 +16,8 @@
 #define MAX_MODULES 16
 
 /* 分派返回值 */
-#define NSP_DISPATCH_NONE 0   /* 无规则模块注册 / 无命中 → 框架回退默认路径 */
-#define NSP_DISPATCH_OK   1   /* 已填充决策结果 */
+#define NSP_DISPATCH_NONE 0 /* 无规则模块注册 / 无命中 → 框架回退默认路径 */
+#define NSP_DISPATCH_OK   1 /* 已填充决策结果 */
 
 /* 初始化：mkdir 模块目录 + 全量扫描 + 启动热插拔监控线程。
    rules_path 为框架规则配置路径（--rules=），modules_dir 为模块目录
@@ -35,14 +35,6 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out);
    无模块时返回 NSP_DISPATCH_NONE）。 */
 int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out);
 
-/* readdir 批量过滤：循环外取一次模块读锁（module_probe_lock），循环内复用
-   locked 版本逐条目探测，结束时 unlock——大目录省 O(n) 次 rwlock 往返。
-   module_probe_lock 返回 0 成功（调用方须配对 unlock）；-1 = 无规则模块，
-   调用方可跳过探测（不须 unlock）。 */
-int module_probe_lock(void);
-void module_probe_unlock(void);
-int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out);
-
 /* readdir 虚拟目录补充：遍历声明 READDIR_EXTRA 的模块合并条目，返回总条目数 */
 int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max);
@@ -58,11 +50,11 @@ int module_snapshot(char names[][64], int max);
    banned 模块（规则已失效但仍需展示 ban 状态），active 标志区分。 */
 typedef struct {
     char name[64];
-    char version[32];       /* 模块自述版本字符串（NspModuleInfo.version） */
+    char version[32]; /* 模块自述版本字符串（NspModuleInfo.version） */
     uint32_t caps;
     bool active;
-    unsigned err_count;     /* 当前滑动窗口内错误数 */
-    unsigned err_total;     /* 本加载周期累计错误数 */
+    unsigned err_count; /* 当前滑动窗口内错误数 */
+    unsigned err_total; /* 本加载周期累计错误数 */
     bool banned;
     char ban_reason[96];
     time_t last_err_time;

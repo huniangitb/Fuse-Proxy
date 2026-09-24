@@ -280,9 +280,6 @@ common_sources = [
 ]
 
 fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
-  # nsp_ini_store 逐源编入（非静态库）：fuse_daemon 自身不调用，但须常驻导出表
-  # 供 dlopen 的第三方模块借用——静态库无人引用会被链接器丢弃，逐源编译则常驻
-  'src/core/nsp_ini_store.c',
   # pthread_create 截持：libfuse worker 默认命名 fuse_worker（见文件头），
   # 仅 fuse_daemon 编入（injector/log_monitor 自有线程均已自命名，无需截持）
   'src/daemon/fuse_thread_naming.c']
@@ -341,6 +338,15 @@ nsp_rule_file_lib = static_library('nsp_rule_file',
 nsp_rule_file_dep = declare_dependency(link_with: nsp_rule_file_lib,
                                        include_directories: all_inc_dirs)
 
+# INI 文件编辑仅由 rule_server 使用，不属于模块 V2 运行时 ABI。
+nsp_ini_store_lib = static_library('nsp_ini_store',
+  'src/core/nsp_ini_store.c',
+  include_directories: all_inc_dirs,
+  dependencies: nsp_util_dep,
+)
+nsp_ini_store_dep = declare_dependency(link_with: nsp_ini_store_lib,
+                                       dependencies: nsp_util_dep)
+
 executable('fuse_daemon',
   fuse_daemon_sources + ['src/core/common.c'],
   include_directories: all_inc_dirs,
@@ -395,14 +401,14 @@ executable('log_ctl',
 # rule_server：规则控制守护进程（前端经 nsp_rule_socket 抽象 UDS 以 JSON 行协议
 # 动态增删/启停规则、重载配置、停止注入，还管 ftp.conf 服务器账号）。
 # 纯文件级操作，仅依赖 json-c，不链接 libfuse3；Android/GNU 均构建
-# （路径经 CONFIG_DIR 宏适配）。nsp_ini_store 逐源编入，与 fuse_daemon 导出表同实现。
+# （路径经 CONFIG_DIR 宏适配）。INI 编辑由私有静态库提供。
 # 日志统一走 comm 线程（common.c 的 log_init/log_internal，sys.log 显 [rule_server]），
 # 与 injector/fuse_daemon 同通道，不再各写 stderr。
 executable('rule_server',
-  ['src/rule/rule_server.c', 'src/core/nsp_ini_store.c', 'src/core/common.c',
+  ['src/rule/rule_server.c', 'src/core/common.c',
    'src/core/build_info.c'],
   include_directories: all_inc_dirs,
-  dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep, nsp_rule_file_dep],
+  dependencies: [json_c, dependency('threads'), nsp_util_dep, nsp_comm_dep, nsp_rule_file_dep, nsp_ini_store_dep],
   install: true,
   install_dir: install_bin_dir
 )
@@ -427,7 +433,7 @@ basic_rules_sources = [
 shared_library('basic_rules',
   basic_rules_sources,
   include_directories: all_inc_dirs,
-  dependencies: [dependency('threads'), cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep, nsp_comm_dep],
+  dependencies: [dependency('threads'), cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
   install: true,
@@ -523,7 +529,7 @@ endif
 shared_library('ftp_module',
   ftp_module_sources,
   include_directories: [all_inc_dirs, ftp_curl_inc],
-  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep, nsp_comm_dep],
+  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,

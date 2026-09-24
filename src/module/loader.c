@@ -73,7 +73,7 @@ static int g_cap_chain[32][MAX_MODULES];
 static int g_cap_chain_count[32];
 
 /* 注册了规则能力的活跃模块数：分派快速路径用（无锁读） */
-static volatile int g_active_rules_count = 0;
+static _Atomic int g_active_rules_count = 0;
 /* 活跃后端 I/O 模块数：vfs_read/write 快速路径无锁读（原子），
    模块加载/卸载（写锁内）时更新 */
 static _Atomic(int) g_backend_active_count = 0;
@@ -94,25 +94,6 @@ static volatile sig_atomic_t g_boot_scan_done = 0;
 
 /* ================= 框架服务表 ================= */
 
-static void api_log(int level, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    char buf[1024];
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    size_t l = strlen(buf);
-    /* 仅当换行放得下才追加，防止 buf 满（l==1023）时 buf[1024]='\0' 越界 1 字节 */
-    if (l > 0 && l + 1 < sizeof buf && buf[l - 1] != '\n') {
-        buf[l] = '\n';
-        buf[l + 1] = '\0';
-    }
-    log_internal((LogLevel)level, "%s", buf);
-}
-
-static const char* api_get_real_root(void) {
-    return g_real_root;
-}
-
 /* 框架参数（module_system_init 传入） */
 static char g_fw_rules_path[PATH_MAX] = {0};
 static uint32_t g_fw_flags = 0;
@@ -128,8 +109,6 @@ static uint32_t api_get_flags(void) {
 
 static const NspFrameworkApi g_api = {
     .api_version = NSP_FRAMEWORK_API_VERSION,
-    .log = api_log,
-    .get_real_root = api_get_real_root,
     .get_rules_path = api_get_rules_path,
     .get_flags = api_get_flags,
 };
@@ -934,33 +913,10 @@ void module_system_shutdown(void) {
     g_module_count = 0;
 }
 
-/* NspResolveResult 按需初始化（≈16.5KB 结构免全量 memset）：
-   只清零标量字段与各字符串首字节，保证模块未写字段（如 basic_rules 不
-   输出的 allow）有定义值；字符串本体由模块 resolve 写入后才被框架读取。 */
-static inline void nsp_resolve_result_init(NspResolveResult* r) {
-    r->valid = false;
-    r->user_id = -1;
-    r->sub_path[0] = '\0';
-    r->pkg[0] = '\0';
-    r->hidden = false;
-    r->ro = false;
-    r->allow = false;
-    r->has_redir = false;
-    r->redir_target[0] = '\0';
-    r->has_sandbox = false;
-    r->sandbox_target[0] = '\0';
-    r->real_path[0] = '\0';
-    r->is_redir = false;
-    r->is_virtual_ancestor = false;
-    r->is_redirect_target = false;
-    r->is_other_app_pkg = false;
-    r->is_ftp = false;
-    r->ftp_backend[0] = '\0';
-    r->monitor_on = false;
-}
-
 int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
-    if (!q || !out) return NSP_DISPATCH_NONE;
+    if (!out) return NSP_DISPATCH_NONE;
+    nsp_resolve_result_init(out);
+    if (!q) return NSP_DISPATCH_NONE;
     /* 快速路径：无规则模块注册，零开销回退默认路径（先于 uid 层判断，
        避免无规则模块时每个请求都做路径扫描） */
     if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
@@ -973,11 +929,8 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
        往返）：acquire 在途引用 + 二次确认快照未变 → 围栏调用（崩溃
        longjmp 恢复）→ canary/字符串/值域校验（野指针/越界写指纹）→
        异常计入熔断器（窗口内达阈值 → 置毒卸载，规则自动失效）。
-       结果统一经 canary 守卫缓冲中转：模块越界写破坏 canary 即弃用
-       该模块结果（16KB 拷贝仅在模块命中时发生，代价 ~1µs，换取对
-       调用方栈缓冲的完整性保护——原"首模块直写 out"快路径移除。
-       调用方约定：out 已置 rr.valid=false（VFS_SETUP_CORE），首模块
-       命中时整结构拷贝覆盖全部字段，无需额外初始化。 */
+       结果统一经已初始化的 canary 守卫缓冲中转，首模块命中后整结构
+       拷贝到 out；无命中时保留分派入口设置的安全默认值。 */
     bool any = false;
     bool first = true;
     for (int i = 0; i < MAX_MODULES; i++) {
@@ -1020,59 +973,21 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
             continue;
         }
         const NspResolveResult* r = &gd.r;
-        /* 多模块并集聚合：hidden/ro/allow 任一命中即生效；
-           redir/sandbox 取第一个命中（模块注册顺序即优先级） */
+        /* 上下文由首个命中模块独占；限制取并集，真实重定向取首个命中。 */
         out->hidden = out->hidden || r->hidden;
         out->ro = out->ro || r->ro;
-        out->allow = out->allow || r->allow;
-        if (!out->has_redir && r->has_redir) {
-            out->has_redir = true;
-            strcpy(out->redir_target, r->redir_target); /* 模块 out 字段，NUL 结尾（已校验） */
-        }
-        if (!out->has_sandbox && r->has_sandbox) {
-            out->has_sandbox = true;
-            strcpy(out->sandbox_target, r->sandbox_target);
-        }
         if (!out->is_redir && r->is_redir) {
             out->is_redir = true;
             strcpy(out->real_path, r->real_path);
         }
         out->is_virtual_ancestor = out->is_virtual_ancestor || r->is_virtual_ancestor;
         out->is_redirect_target = out->is_redirect_target || r->is_redirect_target;
-        out->is_other_app_pkg = out->is_other_app_pkg || r->is_other_app_pkg;
     }
     return any ? NSP_DISPATCH_OK : NSP_DISPATCH_NONE;
 }
 
+/* 条目探测也使用原子槽位快照；不存在需要调用方持有的批量读锁。 */
 int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out) {
-    if (!q || !out) return NSP_DISPATCH_NONE;
-    /* 快速路径：无规则模块注册，零开销回退（不过滤任何条目） */
-    if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
-    /* 注意：不做 path_has_uid_layer 拦截——vfs_readdir 的条目级 probe 传入
-       的是剥离 <uid>/ 后的条目路径（如 /secret.txt），拦截会误伤隐藏判定；
-       probe 只判 hidden/redirect_target，不合成虚拟目录，挂载点根由
-       resolve/readdir_extra 的拦截兜底 */
-    /* S2：probe 已无锁化（规则槽位快照），直接复用 locked 实现 */
-    return module_dispatch_probe_locked(q, out);
-}
-
-/* readdir 批量过滤：S2 无锁化后不再持有模块锁（槽位快照自保护），
-   返回 0 成功（调用方仍须配对 module_probe_unlock，现为空操作）；
-   -1 = 无规则模块。 */
-int module_probe_lock(void) {
-    if (g_active_rules_count == 0) return -1;
-    return 0;
-}
-
-void module_probe_unlock(void) {
-    /* S2：无锁化后无需解锁 */
-}
-
-/* 条目级探测：基于规则槽位原子快照无锁分派（免 readdir 循环持有
-   g_module_lock）+ Phase 1b 守卫（围栏 + 熔断）。probe 输出为 5 个
-   bool 的小结构体，无字符串字段——越界写由栈 canary 之外的 rc/值域
-   检查兜底（bool 字段被写坏只会影响过滤判定，不构成崩溃风险） */
-int module_dispatch_probe_locked(const NspQueryCtx* q, NspProbeResult* out) {
     if (!q || !out) return NSP_DISPATCH_NONE;
     if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
     bool any = false;

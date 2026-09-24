@@ -7,7 +7,7 @@
  * 严重错误无法被 C 语言"预防"。本围栏把"模块只在框架调它的窗口期
  * 作恶"这一事实转化为防御手段：
  *
- *   1. 框架把全部模块调用点（init/exit/reload/resolve/probe/
+ *   1. 框架把全部模块调用点（init/exit/resolve/probe/
  *      readdir_extra/get_pkg/backend_*）收口到 nsp_fence_*()：
  *         登记"本线程正在调用模块 slot 的 op"（TLS）
  *         → sigsetjmp 布防 → 调 ops → 注销。
@@ -52,9 +52,9 @@
    计数（终致置毒 ban + 卸载模块），又使 `rc == 1` 的命中分支永不可达
    （后端形同未注册）。故取远高于任何计数/标志上界的正值，同时保持
    "正数族"以维持既有 `rc < 0 ? rc : -EIO` 泄漏路径的降级行为。 */
-#define NSP_FENCE_OK      0                    /* = 模块返回码 0（成功）；透传 */
-#define NSP_FENCE_FAULT   (1 << 24)            /* 模块崩溃被围栏恢复：out 参数视为已破坏 */
-#define NSP_FENCE_BADFN   ((1 << 24) + 1)      /* 函数指针为 NULL（防御）：未调用 */
+#define NSP_FENCE_OK    0               /* = 模块返回码 0（成功）；透传 */
+#define NSP_FENCE_FAULT (1 << 24)       /* 模块崩溃被围栏恢复：out 参数视为已破坏 */
+#define NSP_FENCE_BADFN ((1 << 24) + 1) /* 函数指针为 NULL（防御）：未调用 */
 
 /* 初始化：设置全局 sigaltstack，安装归因处理器（包在 install_crash_handlers
    原处理器外层）。须在 install_crash_handlers() 之前调用——原处理器
@@ -82,8 +82,7 @@ bool fault_fence_handle_fault(void);
 /* 崩溃归因查询（信号安全：仅读 TLS 与静态注册表）。
  * 处理器线程 == 肇事线程（Linux 信号投递到肇事线程），读本线程 TLS。
  * slot 输出 -1 = 不在窗口。name 指向 loader 静态槽位数组（恒有效）。 */
-void fault_fence_attribution(int* slot_out, const char** op_out,
-                             const char** name_out);
+void fault_fence_attribution(int* slot_out, const char** op_out, const char** name_out);
 
 /* ================= 围栏调用（签名与 NspModuleOps 回调一一对应） ========= */
 /* 模板：登记窗口 → sigsetjmp 布防 → fn(...) → 注销。故障恢复后 out 参数
@@ -92,66 +91,53 @@ void fault_fence_attribution(int* slot_out, const char** op_out,
 
 /* ---- 规则能力 ---- */
 int nsp_fence_resolve(int slot, const char* op_name,
-                      int (*fn)(const NspQueryCtx*, NspResolveResult*),
-                      const NspQueryCtx* q, NspResolveResult* out);
-int nsp_fence_probe(int slot, const char* op_name,
-                    int (*fn)(const NspQueryCtx*, NspProbeResult*),
+                      int (*fn)(const NspQueryCtx*, NspResolveResult*), const NspQueryCtx* q,
+                      NspResolveResult* out);
+int nsp_fence_probe(int slot, const char* op_name, int (*fn)(const NspQueryCtx*, NspProbeResult*),
                     const NspQueryCtx* q, NspProbeResult* out);
 int nsp_fence_readdir_extra(int slot, const char* op_name,
-                            int (*fn)(const NspQueryCtx*, const char*, int,
-                                      const char*, bool, NspDirEntry*, int),
-                            const NspQueryCtx* q, const char* sub_path,
-                            int user_id, const char* pkg, bool is_root,
-                            NspDirEntry* out, int max);
-int nsp_fence_get_pkg(int slot, const char* op_name,
-                      int (*fn)(uid_t, pid_t, char*, size_t),
+                            int (*fn)(const NspQueryCtx*, const char*, int, const char*, bool,
+                                      NspDirEntry*, int),
+                            const NspQueryCtx* q, const char* sub_path, int user_id,
+                            const char* pkg, bool is_root, NspDirEntry* out, int max);
+int nsp_fence_get_pkg(int slot, const char* op_name, int (*fn)(uid_t, pid_t, char*, size_t),
                       uid_t uid, pid_t tid, char* out, size_t sz);
 
 /* ---- 后端能力（NspModuleOps 一一对应） ---- */
-int nsp_fence_backend_match(int slot, const char* op_name,
-                            int (*fn)(const char*), const char* path);
-int nsp_fence_backend_getattr(int slot, const char* op_name,
-                              int (*fn)(const char*, struct stat*),
+int nsp_fence_backend_match(int slot, const char* op_name, int (*fn)(const char*),
+                            const char* path);
+int nsp_fence_backend_getattr(int slot, const char* op_name, int (*fn)(const char*, struct stat*),
                               const char* path, struct stat* st);
 int nsp_fence_backend_readdir(int slot, const char* op_name,
-                              int (*fn)(const char*, NspDirEntry*, int),
-                              const char* path, NspDirEntry* entries, int max);
-int nsp_fence_backend_open(int slot, const char* op_name,
-                           int (*fn)(const char*, int, uint64_t*),
+                              int (*fn)(const char*, NspDirEntry*, int), const char* path,
+                              NspDirEntry* entries, int max);
+int nsp_fence_backend_open(int slot, const char* op_name, int (*fn)(const char*, int, uint64_t*),
                            const char* path, int flags, uint64_t* h);
 int nsp_fence_backend_read(int slot, const char* op_name,
-                           int (*fn)(uint64_t, char*, size_t, off_t, size_t*),
-                           uint64_t h, char* buf, size_t size, off_t off,
-                           size_t* got);
+                           int (*fn)(uint64_t, char*, size_t, off_t, size_t*), uint64_t h,
+                           char* buf, size_t size, off_t off, size_t* got);
 int nsp_fence_backend_write(int slot, const char* op_name,
-                            int (*fn)(uint64_t, const char*, size_t, off_t, size_t*),
-                            uint64_t h, const char* buf, size_t size, off_t off,
-                            size_t* wrote);
-int nsp_fence_backend_flush(int slot, const char* op_name,
-                            int (*fn)(uint64_t), uint64_t h);
-int nsp_fence_backend_release(int slot, const char* op_name,
-                              int (*fn)(uint64_t), uint64_t h);
+                            int (*fn)(uint64_t, const char*, size_t, off_t, size_t*), uint64_t h,
+                            const char* buf, size_t size, off_t off, size_t* wrote);
+int nsp_fence_backend_flush(int slot, const char* op_name, int (*fn)(uint64_t), uint64_t h);
+int nsp_fence_backend_release(int slot, const char* op_name, int (*fn)(uint64_t), uint64_t h);
 int nsp_fence_backend_create(int slot, const char* op_name,
-                             int (*fn)(const char*, mode_t, uint64_t*),
-                             const char* path, mode_t mode, uint64_t* h);
-int nsp_fence_backend_simple(int slot, const char* op_name,
-                             int (*fn)(const char*), const char* path);
+                             int (*fn)(const char*, mode_t, uint64_t*), const char* path,
+                             mode_t mode, uint64_t* h);
+int nsp_fence_backend_simple(int slot, const char* op_name, int (*fn)(const char*),
+                             const char* path);
 /* 用于 backend_unlink / backend_rmdir */
-int nsp_fence_backend_mkdir(int slot, const char* op_name,
-                            int (*fn)(const char*, mode_t),
+int nsp_fence_backend_mkdir(int slot, const char* op_name, int (*fn)(const char*, mode_t),
                             const char* path, mode_t mode);
-int nsp_fence_backend_rename(int slot, const char* op_name,
-                             int (*fn)(const char*, const char*),
+int nsp_fence_backend_rename(int slot, const char* op_name, int (*fn)(const char*, const char*),
                              const char* from, const char* to);
-int nsp_fence_backend_truncate(int slot, const char* op_name,
-                               int (*fn)(const char*, off_t),
+int nsp_fence_backend_truncate(int slot, const char* op_name, int (*fn)(const char*, off_t),
                                const char* path, off_t size);
 
-/* ---- 生命周期（init/exit/reload 也围栏：崩溃=加载/卸载失败，不崩框架） ---- */
-int nsp_fence_init_call(int slot, const char* op_name,
-                        int (*fn)(const NspFrameworkApi*), const NspFrameworkApi* api);
+/* ---- 生命周期（init/exit 也围栏：崩溃=加载/卸载失败，不崩框架） ---- */
+int nsp_fence_init_call(int slot, const char* op_name, int (*fn)(const NspFrameworkApi*),
+                        const NspFrameworkApi* api);
 /* void 返回型：正常返回 0；崩溃返回 NSP_FENCE_FAULT */
 int nsp_fence_exit_call(int slot, const char* op_name, void (*fn)(void));
-int nsp_fence_reload_call(int slot, const char* op_name, int (*fn)(void));
 
 #endif /* FAULT_FENCE_H */

@@ -7,10 +7,10 @@
 | 用途 | 路径 |
 |------|------|
 | 主规则文件 | `<CONFIG_DIR>/injector.conf` |
-| 应用规则（user 0） | `<CONFIG_DIR>/App-rules/<pkg>.conf` |
-| 应用规则（多用户） | `<CONFIG_DIR>/App-rules-<uid>/<pkg>.conf` |
+| 应用规则（uid 0） | `<CONFIG_DIR>/App-rules/<pkg>.conf` |
+| 应用规则（其他用户） | `<CONFIG_DIR>/App-rules-<uid>/<pkg>.conf` |
 
-`CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/common.h`）。主文件先加载，再扫描各 `App-rules*/` 目录；一个 `<pkg>.conf` 对应一个应用；目录缺失自动创建。
+`CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/nsp_constants.h`，`common.h` 以别名暴露）。目录名约定：**uid 0 用 `App-rules`，uid 非 0 用 `App-rules-<uid>`**（由 `nsp_app_rule_dir` 合成）。主文件先加载，再扫描各 `App-rules*/` 目录；一个 `<pkg>.conf` 对应一个应用；目录缺失时仅 injector 会创建（只读加载方不 mkdir）。
 
 **所有功能都可只写在单一 `injector.conf` 内**（全局段 + 各应用段并列），规则膨胀后再平滑迁移到分文件，解析语义一致。
 
@@ -19,13 +19,14 @@
 | 写法 | 含义 |
 |------|------|
 | `[GLOBAL]` | 全局段，对所有应用生效 |
-| `[<pkg>]` | 应用段，如 `[com.tencent.mm]`（省略 `:uid` 即 user 0） |
+| `[<pkg>]` | 应用段，如 `[com.tencent.mm]`（省略 `:uid` 记为 **user_id=-1**，跨用户 fallback，见下） |
 | `[<pkg>:<uid>]` | 指定用户的应用段，如 `[com.tencent.mm:999]`（多开/分身常用） |
 | `[USER_APPS:<uid>]` | 类别段：该用户全部**用户应用**；裸 `[USER_APPS]` 对所有用户生效 |
 | `[SYSTEM_APPS]` | 类别段：全部**系统应用**（忽略 uid；带 `:uid` 会被归一并告警） |
 
 - 段头后可加 `ON` / `OFF` 控制该段是否注入使能，缺省为 **ON**。解析器只识别紧跟 `]` 后（忽略空格）的 `ON` / `OFF`，其他字符按默认 ON。
 - **优先级：应用专属 > 类别 > GLOBAL**。REDIRECT/FTP 取首命中；HIDE/RO 取并集；MONITOR/SANDBOX 显式覆盖按同序（应用段 `SANDBOX OFF` 显式否决类别+全局）。
+- **裸 `[<pkg>]` 是跨用户 fallback（user_id=-1），不是 user 0**：查找同名包时先精确匹配 `[<pkg>:<uid>]`，未命中再回退到 `[<pkg>]`。因此 `[com.tencent.mm]` 对 0/999 等所有用户生效，而 `[com.tencent.mm:999]` 只对 999 生效。注意这与 App-rules **文件目录**不同：uid 0 的规则文件放在 `App-rules/`（`0` 是目录默认值），不要据此把裸段头的 user_id 当成 0。
 - 类别判定复用 `SKIP_SYSTEM_APPS` 逻辑：`pm list packages -s` 缓存（injector 落盘 `sys_pkgs.cache` 供 FUSE 侧只读），失败回退 `uid < 10000`。
 - 包名不可解析时（`system`/`unknown`/过短/`zygote`）类别段不生效，仅 GLOBAL 适用。
 - 类别段有实质规则（REDIRECT/HIDE/RO/SANDBOX）即视为点名注入（跳过 `SKIP_SYSTEM_APPS` 过滤）；段头 `OFF` 显式否决该类别注入。

@@ -353,12 +353,12 @@ void init_uid_map_cache(void) {
 }
 
 bool is_isolated_uid(uid_t uid) {
-    uid_t app_id = uid % 100000;
+    uid_t app_id = uid % NSP_PER_USER_UID_STRIDE;
     return (app_id >= 90000 && app_id <= 99999);
 }
 
 bool is_system_app(uid_t uid) {
-    return (uid < 10000);
+    return (uid < NSP_SYSTEM_APP_UID_MIN);
 }
 
 bool is_system_app_by_pkg(const char* cmdline, uid_t uid) {
@@ -409,7 +409,7 @@ bool is_zygote_child(pid_t pid) {
 }
 
 bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc) {
-    int user_id = uid / 100000;
+    int user_id = uid / NSP_PER_USER_UID_STRIDE;
     AppConfig* cfg = find_app_cfg_locked(cmdline, user_id);
     if (cfg) return cfg->inject_enable;
     /* 类别段点名（[USER_APPS[:uid]] / [SYSTEM_APPS]）：与应用段同优先级——
@@ -446,11 +446,11 @@ uid_t get_app_uid(int pid) {
 
 void get_target_storage_path(uid_t uid, char* path, size_t size) {
     (void)uid;
-    snprintf(path, size, "%s", "/storage/emulated");
+    snprintf(path, size, "%s", NSP_ANDROID_EMULATED_ROOT);
 }
 
 void update_uid_map(uid_t uid, const char* pkg) {
-    if (uid < 10000 || is_isolated_uid(uid)) return;
+    if (uid < NSP_SYSTEM_APP_UID_MIN || is_isolated_uid(uid)) return;
     if (uid_has_failed(uid)) return;
     char clean_pkg[128];
     strncpy(clean_pkg, pkg, sizeof(clean_pkg) - 1);
@@ -643,7 +643,7 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                 continue;
             }
             uid_t uid = get_app_uid(pid);
-            int user_id = uid / 100000;
+            int user_id = uid / NSP_PER_USER_UID_STRIDE;
             bool matched = false;
             for (int c = 0; c < count; c++) {
                 if ((changed[c].user_id == -1 || changed[c].user_id == user_id) &&
@@ -698,7 +698,7 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
         if (is_tracked(pid)) continue; /* 追踪列表已处理 */
         char cmd[256] = {0};
         if (!proc_get_cmdline(pid, cmd, sizeof cmd)) continue;
-        int user_id = uid / 100000;
+        int user_id = uid / NSP_PER_USER_UID_STRIDE;
         if (changed[c].user_id != -1 && changed[c].user_id != user_id) continue;
         if (!is_target_app(cmd, uid, pid, false)) continue;
         char target_path[128];
@@ -752,7 +752,7 @@ void handle_list_injected(int client_fd) {
             if (colon) *colon = '\0';
             int app_redir = 0, app_hide = 0, app_ro = 0;
             config_lock_read();
-            AppConfig* cfg = find_app_cfg_locked(cmdline, uid / 100000);
+            AppConfig* cfg = find_app_cfg_locked(cmdline, uid / NSP_PER_USER_UID_STRIDE);
             if (cfg) {
                 app_redir = cfg->redir_count;
                 app_hide = cfg->hide_count;

@@ -43,7 +43,6 @@ typedef struct {
     const char* path; /* 原始路径 */
     uid_t uid;
     pid_t pid;
-    gid_t gid;
 } BrQuery;
 
 typedef struct {
@@ -53,17 +52,11 @@ typedef struct {
     char pkg[128];
     bool hidden;
     bool ro;
-    bool has_redir;
-    char redir_target[PATH_MAX];
-    bool has_sandbox;
-    char sandbox_target[PATH_MAX];
     char real_path[PATH_MAX];
     bool is_redir;
     bool is_virtual_ancestor;
     bool is_redirect_target;
-    bool is_other_app_pkg;
-    bool is_ftp;          /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定） */
-    char ftp_backend[64]; /* FTP 段名（ftp.conf [段名]） */
+    bool is_ftp; /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定） */
     bool monitor_on;
 } BrResult;
 
@@ -86,9 +79,6 @@ void br_probe(const BrQuery* q, BrProbeResult* out);
     g_disable_sandbox/current_pkg 自行合成，模块无需提供） */
 int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id, const char* pkg,
                      bool is_root, NspDirEntry* out, int max);
-
-/* 配置热重载 */
-void br_reload_config(void);
 
 /* uid → 包名解析（框架日志用） */
 int br_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);

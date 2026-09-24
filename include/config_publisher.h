@@ -7,7 +7,14 @@
  *
  * 使用方式:
  *   - 发送空 datagram 或 "GET"           → 接收方立即收到全量运行时解析后 JSON
- *   - 发送 "STATIC"                      → 接收方收到磁盘上的原始配置文件及内容
+ *   - 发送 "STATIC"                      → 已解析视图 + 磁盘原始文件（两者不要混淆）：
+ *                                         · global/apps 段 = 已加载 AppConfig 快照
+ *                                           （与 GET 同一来源；含默认值、路径归一与
+ *                                           分文件应用），**不是** injector.conf 的
+ *                                           原始 global/apps 文本，不可按"原始内容"消费；
+ *                                         · 主文件裸 [pkg]（省略 :uid）的 user_id 为 -1
+ *                                           （跨用户 fallback 语义），不是 0；
+ *                                         · 仅 app_rules 段是磁盘 App-rules* 的原始内容。
  *   - 发送 "SUBSCRIBE"                   → 注册为订阅者，立即推送一次，后续配置变更自动推送
  *   - 发送 "UNSUBSCRIBE"                 → 取消订阅
  *

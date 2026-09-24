@@ -26,11 +26,9 @@ static int ov_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
         snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
-        snprintf(out->redir_target, sizeof out->redir_target, "/virt");
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
         out->user_id = 0;
-        out->has_redir = true;
         out->is_redir = true;
         return 0;
     }
