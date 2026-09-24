@@ -172,7 +172,7 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 TLS `sigsetjmp` 围栏；`sigaltstack` 是 **per-thread** 的——`fault_fence_init` 设置的全局 altstack 只覆盖主线程，每个首次调用围栏的线程还会为自己设置独立 TLS altstack（worker 不继承主线程的 altstack）。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
 2. **输出校验**（`src/module/module_guard.c`）：`NspPathDecision` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `virtual_kind` 值域与 `attr_override` 未知位检查 + readdir 条目名校验。
-3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。
+3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（哈希不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。规则模块不同：`resolve`/`probe` 走决策字段（`appear_missing` 等）回传业务结果，返回非 0 仍判契约违规。
 
 **ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|SHA256|原因|时间戳`）。扫描线程见哈希与 ban 记录一致即跳过加载；哈希变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
 
