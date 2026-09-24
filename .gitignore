@@ -6,3 +6,10 @@ build
 fuse3-android
 __pycache__/
 *.pyc
+
+# ZCode 本地计划与索引配置
+.zcode/
+.zcodeignore
+
+# Meson wrap 锁文件（本机生成）
+subprojects/.wraplock
