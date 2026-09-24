@@ -19,7 +19,7 @@ static const char* test_storage(void) {
     return (s && s[0]) ? s : "/tmp/fuse_circuit_test/storage";
 }
 
-static int bad_resolve(const NspQueryCtx* q, NspResolveResult* out) {
+static int bad_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (!q || !out || !q->path) return -EINVAL;
     memset(out, 0, sizeof *out);
     const char* vp = q->path;
@@ -33,12 +33,10 @@ static int bad_resolve(const NspQueryCtx* q, NspResolveResult* out) {
     if (strncmp(vp, "errtest", 7) == 0) return -EIO;
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
-        snprintf(out->sub_path, sizeof out->sub_path, "/virt%s", rest);
         snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
         snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
-        out->user_id = 0;
-        out->is_redir = true;
+        out->is_redirect = true;
         return 0;
     }
     return 0; /* 其余路径：合法"无命中"（框架直通） */

@@ -19,9 +19,10 @@
  *      提供的参数；日志与路径工具经公开运行时导出表解析。
  *   2. 可扩展：能力位图（32 位）与接口表按 ABI 版本演进；旧模块在框架
  *      ABI 不一致时拒绝加载，兼容新增服务追加在框架表尾部。
- *   3. 高性能：规则决策是 FUSE 热路径，一次 resolve 调用返回全部决策
- *      （hidden/ro/allow/redir/sandbox/最终真实路径），避免多次查询；
- *      框架在无模块注册时走快速路径，不产生任何函数指针调用开销。
+ *   3. 高性能：规则决策是 FUSE 热路径，一次 resolve 调用返回全部声明式决策
+ *      （NspPathDecision：是否视为不存在/只读/属性覆盖/虚拟目录性质/最终真实
+ *      路径），避免多次查询；框架在无模块注册时走快速路径，不产生任何函数
+ *      指针调用开销。模块只声明"该怎么表现"，强制与 errno 映射由框架单点完成。
  *
  * 模块约定：
  *   - 模块为共享库（.so），放在 MODULES_DIR/<模块名>/<模块名>.so
@@ -60,7 +61,11 @@
 
 /* ================= ABI 版本与魔数 ================= */
 
-#define NSP_MODULE_ABI_VERSION 2u
+/* V3：决策结果改为声明式 NspPathDecision（取代 NspResolveResult），
+   删除 hidden/ro/is_virtual_ancestor/is_redirect_target/user_id/sub_path，
+   新增 appear_missing/read_only/mode/uid/gid/virtual_kind。属不兼容变更，
+   加载器拒绝 V2 模块——**V2 模块须重编译**。 */
+#define NSP_MODULE_ABI_VERSION 3u
 #define NSP_MODULE_MAGIC       0x4E53504Du /* "NSPM" */
 
 /* ================= 模块类型 ================= */
@@ -127,32 +132,62 @@ typedef struct NspQueryCtx {
 
 /* ================= 决策结果（模块 → 框架） ================= */
 
-/* 多模块合并：hidden/ro/虚拟目录标志取并集；real_path 取首次重定向。
-   user_id/sub_path/pkg/is_ftp/monitor_on 由首个 valid 模块独占。 */
-typedef struct NspResolveResult {
-    bool valid;              /* false = 模块无法解析该路径，框架回退默认行为 */
-    int user_id;             /* 剥离 /0/ 前缀后的 user id */
-    char sub_path[PATH_MAX]; /* 剥离后的虚拟路径（规则匹配使用） */
-    char pkg[128];           /* uid 解析出的包名（可能为 unknown/system） */
+/* 属性覆盖开关位：默认 0 = 不覆盖任何属性，故模块 `memset(out, 0, sizeof *out)`
+   这类零初始化是安全的（若用"特殊值哨兵"表示不改，零初始化会静默变成
+   "权限清 0 + 属主 root"）。要覆盖哪个字段就置对应位，字段值才被读取。 */
+#define NSP_OV_MODE (1u << 0) /* 读 mode（仅权限位，文件类型位由框架保留） */
+#define NSP_OV_UID  (1u << 1) /* 读 uid */
+#define NSP_OV_GID  (1u << 2) /* 读 gid */
+#define NSP_OV_ALL  (NSP_OV_MODE | NSP_OV_UID | NSP_OV_GID)
 
-    /* HIDE / RO；ALLOW 与 SANDBOX 已由模块落实为 real_path。 */
-    bool hidden; /* HIDE 命中 → 框架返回 ENOENT */
-    bool ro;     /* RO 命中 → 写操作返回 EROFS */
+/* 虚拟路径性质（合成目录判定）：单字段取代原先两个并列 bool，
+   模块按需声明，框架据此决定合成目录 / readdir 条目过滤 */
+typedef enum {
+    NSP_VK_NONE = 0,     /* 普通路径 */
+    NSP_VK_ANCESTOR = 1, /* 某 REDIRECT 前缀的祖先（合成目录） */
+    NSP_VK_TARGET = 2,   /* 路径本身是某 REDIRECT 的真实目标 */
+} NspVirtualKind;
 
+/* 声明式决策：模块只声明"这个路径该怎么表现"，由框架单点强制
+   （vfs_apply_decision）。这样模块无需了解 FUSE 回调类别与 errno 映射，
+   也不会出现"读类回调 ENOENT、写类回调 EACCES"这类不一致。
+
+   框架自算字段（**不在本结构内**，模块无需也不得回填）：
+     user_id / sub_path —— 框架由原始路径解析（fw_parse_path），与模块侧
+     剥离逻辑逐行等价，故无需跨 ABI 传递。
+
+   多模块合并：appear_missing / read_only 取并集；real_path 取首次重定向；
+   pkg / is_ftp / monitor_on / virtual_kind 由首个 valid 模块独占。 */
+typedef struct NspPathDecision {
+    bool valid;          /* false = 模块无法解析该路径，框架回退默认行为 */
+    bool appear_missing; /* 视为不存在 → 框架在**所有**回调统一返回 ENOENT */
+    bool read_only;      /* 只读 → 框架在所有变更操作统一返回 EROFS
+                            （root 豁免与 --preserve-perms 等策略由框架持有） */
+    /* 属性覆盖（可选）：attr_override 的位决定 mode/uid/gid 是否被采用。
+       mode 只取 07777 权限位，S_IFMT 类型位一律忽略——文件类型始终取自真实
+       属性（声明 S_IFDIR 也不会把文件变成目录；要让路径"表现成目录"应走重定向/
+       虚拟目录，而不是改类型位）。 */
+    uint32_t attr_override; /* NSP_OV_* 位图，0 = 不改任何属性 */
+    uint32_t mode;          /* NSP_OV_MODE 置位时生效 */
+    int32_t uid;            /* NSP_OV_UID 置位时生效 */
+    int32_t gid;            /* NSP_OV_GID 置位时生效 */
+    uint8_t virtual_kind; /* NspVirtualKind：合成目录判定 */
+    char pkg[128];        /* uid 解析出的包名（日志/沙箱用）。
+                             留在结果内是因为它随 resolve 一次返回；移到框架侧
+                             需要每个请求额外一次 get_pkg 模块调用（围栏+校验
+                             开销），得不偿失 */
     /* 最终真实路径（模块负责把以上决策落实为最终可操作路径；
        未命中任何规则时为默认存储路径 STORAGE_BASE/<uid><sub>） */
     char real_path[PATH_MAX];
-    bool is_redir; /* 最终路径是否经重定向（日志/权限处理用） */
-
-    /* 虚拟目录合成辅助 */
-    bool is_virtual_ancestor; /* 路径是某 REDIRECT 前缀的祖先（合成目录） */
-    bool is_redirect_target;  /* 路径本身是某 REDIRECT 的真实目标 */
+    bool is_redirect; /* 最终路径是否经重定向（日志/权限处理用） */
     /* FTP 后端规则命中（injector.conf 的 `FTP <虚拟前缀> <段名>` 规则）：
        规则所在段决定作用域（[GLOBAL]=全局，[应用段]=仅该应用）；
-       命中后框架将该路径操作分派给对应 FTP 后端模块 */
+       命中后框架将该路径操作分派给对应 FTP 后端模块。
+       ⚠ 过渡字段：FTP 归属迁移到 ftp_module 后删除（见 docs/modules.md）。 */
     bool is_ftp;
     bool monitor_on; /* 模块配置的 MONITOR 状态（框架 I/O 日志开关） */
-} NspResolveResult;
+} NspPathDecision;
+
 
 /* ================= readdir 虚拟目录补充 =================
    模块填充条目数组，框架负责 filler 与去重（不依赖 fuse 类型，便于解耦）。 */
@@ -163,15 +198,14 @@ typedef struct NspDirEntry {
 } NspDirEntry;
 
 /* ================= 轻量路径探测 =================
-   readdir 逐条目过滤用（性能敏感）：只判 hidden/重定向目标/虚拟目录标志，
-   不构建最终真实路径、不触发 sandbox 目录创建等副作用。 */
+   readdir 逐条目过滤用（性能敏感）：只判 appear_missing/虚拟目录性质/
+   跨应用隔离，不构建最终真实路径、不触发 sandbox 目录创建等副作用。 */
 
 typedef struct NspProbeResult {
-    bool valid;               /* false = 模块无法解析，框架视为不过滤 */
-    bool hidden;              /* HIDE 命中 → 条目跳过 */
-    bool is_redirect_target;  /* 条目是重定向目标 → 跳过（避免与虚拟目录重复） */
-    bool is_virtual_ancestor; /* 条目是重定向前缀祖先 */
-    bool is_other_app_pkg;    /* 跨应用隔离 */
+    bool valid;              /* false = 模块无法解析，框架视为不过滤 */
+    bool appear_missing;     /* 条目应视为不存在 → 跳过 */
+    uint8_t virtual_kind;    /* NspVirtualKind：TARGET 条目跳过（避免与虚拟目录重复） */
+    bool is_other_app_pkg;   /* 跨应用隔离 */
 } NspProbeResult;
 
 /* ================= 模块接口表（模块 → 框架） =================
@@ -179,8 +213,8 @@ typedef struct NspProbeResult {
 
 typedef struct NspModuleOps {
     /* ---- 规则能力（对应 NSP_CAP_*）---- */
-    /* 路径决策：一次调用返回全部结果。返回 0 成功；负值错误码。 */
-    int (*resolve)(const NspQueryCtx* q, NspResolveResult* out);
+    /* 路径决策：一次调用返回全部决策（见 NspPathDecision）。返回 0 成功；负值错误码。 */
+    int (*resolve)(const NspQueryCtx* q, NspPathDecision* out);
     /* 轻量路径探测（readdir 逐条目过滤，性能敏感）：只判 hidden/重定向目标/
        虚拟目录标志，不构建真实路径、不触发 sandbox 目录创建。返回 0 成功。 */
     int (*probe)(const NspQueryCtx* q, NspProbeResult* out);

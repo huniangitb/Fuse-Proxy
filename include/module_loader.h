@@ -29,7 +29,7 @@ void module_system_shutdown(void);
 
 /* 规则决策分派：遍历注册了规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）的模块，
    聚合填充 out。返回 NSP_DISPATCH_OK / NSP_DISPATCH_NONE。 */
-int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out);
+int module_dispatch_resolve(const NspQueryCtx* q, NspPathDecision* out);
 
 /* 轻量路径探测分派：readdir 逐条目过滤用（只判 hidden/redirect_target 等，
    无模块时返回 NSP_DISPATCH_NONE）。 */

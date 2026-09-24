@@ -92,7 +92,7 @@ RULES_SRC = r'''
 #error "编译需 -DNSP_TEST_STORAGE=\"/path\""
 #endif
 
-static int lr_resolve(const NspQueryCtx* q, NspResolveResult* out) {
+static int lr_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (!q || !q->path || !out) return -22; /* -EINVAL */
     const char* p = q->path;
     int user_id = -1;
@@ -107,9 +107,9 @@ static int lr_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         }
     }
     if (user_id < 0) return 0; /* 无用户层：valid 保持 false，框架直通 */
+    /* V3：user_id/sub_path 由框架自算，模块只回传 real_path/is_ftp 等
+       真正由规则决定的字段 */
     out->valid = true;
-    out->user_id = user_id;
-    snprintf(out->sub_path, sizeof out->sub_path, "%s", sub);
     snprintf(out->real_path, sizeof out->real_path, "%s/%d%s", NSP_TEST_STORAGE, user_id, sub);
     out->is_ftp = (strncmp(sub, "/blife", 6) == 0);
     return 0;

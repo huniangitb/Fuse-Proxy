@@ -85,7 +85,7 @@ static void* resolve_worker(void* arg) {
     long seed = (long)arg;
     pthread_barrier_wait(&g_bar);
     double t0 = now_ns();
-    NspResolveResult out;
+    NspPathDecision out;
     for (int i = 0; i < QN; i++) {
         int k = (int)((seed * 31 + i) % NPATH);
         NspQueryCtx q = {.uid = g_uids[k], .pid = (pid_t)getpid(), .gid = 0, .path = g_paths[k]};

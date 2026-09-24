@@ -80,13 +80,9 @@ bool nsp_guard_path_ok(const char* p) {
     return l > 0 && l < PATH_MAX;
 }
 
-int nsp_guard_validate_resolve(const NspResolveResult* r, char* detail, size_t dsz) {
+int nsp_guard_validate_decision(const NspPathDecision* r, char* detail, size_t dsz) {
     if (!r) return 8;
     /* 字符串字段 NUL 终止检查（模块写坏终止符 = 野指针/越界写指纹） */
-    if (!nsp_guard_str_ok(r->sub_path, PATH_MAX)) {
-        if (detail) snprintf(detail, dsz, "sub_path 未终止");
-        return 1;
-    }
     if (!nsp_guard_str_ok(r->pkg, 128)) {
         if (detail) snprintf(detail, dsz, "pkg 未终止");
         return 2;
@@ -95,9 +91,27 @@ int nsp_guard_validate_resolve(const NspResolveResult* r, char* detail, size_t d
         if (detail) snprintf(detail, dsz, "real_path 未终止");
         return 5;
     }
-    if (r->user_id < -1 || r->user_id > 0x7FFFFFFF) {
-        if (detail) snprintf(detail, dsz, "user_id 值域非法");
+    /* 枚举值域：越界值会让框架走进未定义分支（virtual_kind 直接决定合成目录
+       与 readdir 过滤判定） */
+    if (r->virtual_kind > NSP_VK_TARGET) {
+        if (detail) snprintf(detail, dsz, "virtual_kind 值域非法");
+        return 6;
+    }
+    /* 属性覆盖位图：未知位 = 模块写坏（越界/未初始化）指纹；置位字段再查值域 */
+    if (r->attr_override & ~(uint32_t)NSP_OV_ALL) {
+        if (detail) snprintf(detail, dsz, "attr_override 未知位");
         return 7;
+    }
+    /* mode 不做值域拒绝：框架只取 07777（S_IFMT 类型位一律忽略），任何值都
+       不会导致未定义行为。模块按 stat 习惯写 S_IFDIR | 0755 是自然写法，若因此
+       丢弃整个决策反而是坏失败模式。 */
+    if ((r->attr_override & NSP_OV_UID) && r->uid < 0) {
+        if (detail) snprintf(detail, dsz, "uid 值域非法");
+        return 10;
+    }
+    if ((r->attr_override & NSP_OV_GID) && r->gid < 0) {
+        if (detail) snprintf(detail, dsz, "gid 值域非法");
+        return 11;
     }
     return 0;
 }

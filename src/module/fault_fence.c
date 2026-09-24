@@ -246,8 +246,8 @@ void fault_fence_init(void) {
 /* ================= 规则能力 ================= */
 
 int nsp_fence_resolve(int slot, const char* op_name,
-                      int (*fn)(const NspQueryCtx*, NspResolveResult*), const NspQueryCtx* q,
-                      NspResolveResult* out) {
+                      int (*fn)(const NspQueryCtx*, NspPathDecision*), const NspQueryCtx* q,
+                      NspPathDecision* out) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(q, out));
 }

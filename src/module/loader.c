@@ -1040,9 +1040,9 @@ void module_system_shutdown(void) {
     fw_config_shutdown();
 }
 
-int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
+int module_dispatch_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (!out) return NSP_DISPATCH_NONE;
-    nsp_resolve_result_init(out);
+    nsp_decision_init(out);
     if (!q) return NSP_DISPATCH_NONE;
     /* 快速路径：无规则模块注册，零开销回退默认路径（先于 uid 层判断，
        避免无规则模块时每个请求都做路径扫描） */
@@ -1069,8 +1069,8 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
             atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
-        NspResolveGuard gd;
-        nsp_guard_resolve_init(&gd);
+        NspDecisionGuard gd;
+        nsp_guard_decision_init(&gd);
         int rc = nsp_fence_resolve(i, "resolve", ops->resolve, q, &gd.r);
         atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         if (rc == NSP_FENCE_FAULT) {
@@ -1082,12 +1082,12 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
             module_guard_error(i, "resolve", rc, q->path, "模块返回异常");
             continue;
         }
-        if (!nsp_guard_resolve_ok(&gd)) {
+        if (!nsp_guard_decision_ok(&gd)) {
             module_guard_error(i, "resolve", 0, q->path, "输出 canary 破坏(越界写)");
             continue;
         }
         char det[64];
-        if (nsp_guard_validate_resolve(&gd.r, det, sizeof det) != 0) {
+        if (nsp_guard_validate_decision(&gd.r, det, sizeof det) != 0) {
             module_guard_error(i, "resolve", 0, q->path, det);
             continue;
         }
@@ -1099,16 +1099,25 @@ int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {
             any = true;
             continue;
         }
-        const NspResolveResult* r = &gd.r;
-        /* 上下文由首个命中模块独占；限制取并集，真实重定向取首个命中。 */
-        out->hidden = out->hidden || r->hidden;
-        out->ro = out->ro || r->ro;
-        if (!out->is_redir && r->is_redir) {
-            out->is_redir = true;
+        const NspPathDecision* r = &gd.r;
+        /* 上下文由首个命中模块独占；限制取并集，真实重定向取首个命中。
+           属性覆盖同理"首个声明者生效"：多模块同时声明同一字段时结果确定，
+           不依赖槽位遍历顺序之外的时序。 */
+        out->appear_missing = out->appear_missing || r->appear_missing;
+        out->read_only = out->read_only || r->read_only;
+        if (!out->is_redirect && r->is_redirect) {
+            out->is_redirect = true;
             strcpy(out->real_path, r->real_path);
         }
-        out->is_virtual_ancestor = out->is_virtual_ancestor || r->is_virtual_ancestor;
-        out->is_redirect_target = out->is_redirect_target || r->is_redirect_target;
+        /* 属性覆盖按位合并：未声明过的位才接受后续模块的值（首个声明者生效，
+           与 real_path 策略一致） */
+        uint32_t take = r->attr_override & ~out->attr_override;
+        if (take & NSP_OV_MODE) out->mode = r->mode;
+        if (take & NSP_OV_UID) out->uid = r->uid;
+        if (take & NSP_OV_GID) out->gid = r->gid;
+        out->attr_override |= r->attr_override;
+        if (out->virtual_kind == NSP_VK_NONE && r->virtual_kind != NSP_VK_NONE)
+            out->virtual_kind = r->virtual_kind;
     }
     return any ? NSP_DISPATCH_OK : NSP_DISPATCH_NONE;
 }
@@ -1145,10 +1154,11 @@ int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out) {
             any = true;
             continue;
         }
-        /* 多模块并集：hidden/redirect_target 任一命中即生效 */
-        out->hidden = out->hidden || r.hidden;
-        out->is_redirect_target = out->is_redirect_target || r.is_redirect_target;
-        out->is_virtual_ancestor = out->is_virtual_ancestor || r.is_virtual_ancestor;
+        /* 多模块并集：appear_missing 任一命中即生效；虚拟目录性质取首个非 NONE
+           （与 resolve 的合并策略一致） */
+        out->appear_missing = out->appear_missing || r.appear_missing;
+        if (out->virtual_kind == NSP_VK_NONE && r.virtual_kind != NSP_VK_NONE)
+            out->virtual_kind = r.virtual_kind;
         out->is_other_app_pkg = out->is_other_app_pkg || r.is_other_app_pkg;
     }
     return any ? NSP_DISPATCH_OK : NSP_DISPATCH_NONE;

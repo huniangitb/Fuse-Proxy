@@ -201,7 +201,7 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
         NspProbeResult r0;
         memset(&r0, 0, sizeof r0);
         if (module_dispatch_probe(&q0, &r0) == NSP_DISPATCH_OK && r0.valid &&
-            r0.is_virtual_ancestor)
+            r0.virtual_kind == NSP_VK_ANCESTOR)
             return false;
     }
     struct stat st;
@@ -236,7 +236,7 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
             NspProbeResult ir;
             memset(&ir, 0, sizeof ir);
             if (module_dispatch_probe(&iq, &ir) == NSP_DISPATCH_OK && ir.valid) {
-                if (ir.hidden || (!uid_dir && ir.is_redirect_target)) continue;
+                if (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)) continue;
             }
         }
         if (hide_others &&
@@ -263,7 +263,8 @@ static bool is_android_skel_dir(const char* sub_path) {
 /* ================= 三层数据路径（Phase 2 重构） =================
  *   FUSE 节点（内核）→ FUSE 守护进程：
  *     ① 路由层   fw_route()：FUSE 上下文 + 原始路径 → 路由决策
- *                （user_id 剥离 / 模块分派 / 直通回退 / hidden 拦截）
+ *                （user_id 剥离 / 模块分派 / 直通回退 / 决策强制：appear_missing
+ *                 → ENOENT、read_only → EROFS）
  *     ② 模块层   module_dispatch_resolve / module_backend_*（loader）：
  *                原子槽位快照 + 在途引用（S2 无锁分派）+ 调用围栏
  *                （崩溃→longjmp 恢复）+ 输出校验 + 熔断（错误→卸载）
@@ -273,58 +274,96 @@ static bool is_android_skel_dir(const char* sub_path) {
  * 路由层（局部变量名保持与原实现一致，回调体零改动）。
  * 线程安全：三层全部无全局可变状态依赖（路由层纯函数 + 模块层原子
  * 快照），FUSE 多线程（fuse_session_loop_mt）下任意 worker 并发进入。 */
-static int fw_route(struct fuse_context* ctx, const char* path_val, NspResolveResult* rr,
+/* ================= 决策强制（框架单点） =================
+ * V3 起模块只声明"这个路径该怎么表现"（NspPathDecision），errno 映射与权限
+ * 策略集中在此，不再散落在各回调里各判一遍：
+ *   - appear_missing → 所有回调统一 ENOENT。V2 时代读类回调 ENOENT、写类回调
+ *     EACCES，同一声明两种结果；统一后与"存在变不存在"的语义一致。
+ *   - read_only → 变更操作统一 EROFS，root 豁免由框架持有（模块无需关心）。
+ * "何时算变更"由操作类别给出；open/access 这类"是否写"取决于 flags/mask 的
+ * 操作自行判定触发条件，但策略仍走 vfs_check_read_only 这一个出口。 */
+typedef enum {
+    VFS_OP_READ = 0,  /* 查询/读取：不受 read_only 限制 */
+    VFS_OP_MUTATE = 1 /* 变更：read_only 命中时（非 root）返回 EROFS */
+} VfsOpKind;
+
+/* 只读检查：0 放行，-EROFS 拒绝。root 豁免是框架策略，模块无需关心。 */
+static inline int vfs_check_read_only(const NspPathDecision* d, uid_t uid) {
+    return (uid != 0 && d->read_only) ? -EROFS : 0;
+}
+
+/* 属性覆盖落实（getattr 用）：在框架既有权限策略**之后**应用，故模块的显式
+   声明优先于框架默认（伪造模式属主=访问者、skel 目录 0755、/Android/data 保留
+   真实属主等）。只改权限位，文件类型位始终取自真实属性——不允许模块把一个
+   文件声明成目录（那属于 appear_missing/重定向该解决的问题）。 */
+static inline void vfs_apply_attr_override(const NspPathDecision* d, struct stat* st) {
+    if (!d->valid) return;
+    if (d->attr_override & NSP_OV_MODE) st->st_mode = (st->st_mode & S_IFMT) | (d->mode & 07777);
+    if (d->attr_override & NSP_OV_UID) st->st_uid = (uid_t)d->uid;
+    if (d->attr_override & NSP_OV_GID) st->st_gid = (gid_t)d->gid;
+}
+
+static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
                     bool* nsp_ok, char* current_pkg, int* user_id, char* sub_path, char* real_path,
-                    bool* is_redir) {
+                    bool* is_redir, VfsOpKind op) {
     *nsp_ok = false;
+    /* user_id 必须先置 -1：fw_parse_path 只在路径含完整 <uid>/ 用户层时才写它，
+       挂载点根（"/"）等无用户层路径不会赋值——漏置会让调用方拿到未初始化值，
+       下游（如 readdir 的 user_id<0 判定）据此误判为"在用户层内" */
     *user_id = -1;
     *is_redir = false;
     sub_path[0] = '\0';
     real_path[0] = '\0';
     strcpy(current_pkg, "unknown");
-    /* module_dispatch_resolve 统一经 nsp_resolve_result_init 初始化默认输出
-       （valid/user_id/sub_path/pkg/real_path 等全部有定义值），无论是否命中
-       模块都无需调用方预置；返回 NSP_DISPATCH_NONE 时 `*nsp_ok` 短路，
-       调用方不读 rr 决策字段（rr.is_ftp 等亦已初始化为 false） */
+    /* 用户层剥离与虚拟路径归一由框架自算：与模块侧剥离逻辑
+       （br_strip_and_sanitize）逐行等价，故 V3 起不经 ABI 回传——
+       模块只回传它真正能决定的字段 */
+    if (fw_parse_path(path_val, user_id, sub_path, PATH_MAX) != 0) return -ENOENT;
+    /* module_dispatch_resolve 统一经 nsp_decision_init 初始化默认输出
+       （valid/appear_missing/read_only/mode/uid/gid 等全部有定义值），无论
+       是否命中模块都无需调用方预置；返回 NSP_DISPATCH_NONE 时 `*nsp_ok`
+       短路，调用方不读 rr 决策字段 */
     NspQueryCtx nsp_q = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val};
     if (module_dispatch_resolve(&nsp_q, rr) == NSP_DISPATCH_OK && rr->valid) {
         *nsp_ok = true;
-        if (rr->hidden) return -EPERM; /* 调用方（宏）映射为各自 err_code */
         if (rr->pkg[0]) {
             strncpy(current_pkg, rr->pkg, 128 - 1);
             current_pkg[128 - 1] = '\0';
         }
-        *user_id = rr->user_id;
-        strcpy(sub_path, rr->sub_path);
         strcpy(real_path, rr->real_path);
-        *is_redir = rr->is_redir;
+        *is_redir = rr->is_redirect;
+        /* ---- 决策强制（单点）---- */
+        if (rr->appear_missing) return -ENOENT;
+        if (op == VFS_OP_MUTATE) {
+            int rc = vfs_check_read_only(rr, ctx->uid);
+            if (rc != 0) {
+                /* 拒绝日志也收口在此：原先每个变更回调各写一条
+                   <OP>_RO_DENIED，同一声明散成 11 处重复代码 */
+                log_fuse_err("RO_DENIED", path_val, -rc);
+                return rc;
+            }
+        }
         return 0;
     }
     /* 框架直通回退（无规则模块 / 模块未命中） */
-    if (fw_parse_path(path_val, user_id, sub_path, PATH_MAX) != 0) return -ENOENT;
     fw_default_real_path(*user_id, sub_path, real_path, PATH_MAX);
     return 0;
 }
 
-#define VFS_SETUP_CORE(path_val, err_code)                                             \
-    struct fuse_context* ctx = fuse_get_context();                                     \
-    if (!ctx) return err_code;                                                         \
-    NspResolveResult rr;                                                               \
-    bool nsp_ok = false;                                                               \
-    char current_pkg[128];                                                             \
-    int path_user_id;                                                                  \
-    char sub_path[PATH_MAX];                                                           \
-    char p[PATH_MAX];                                                                  \
-    bool is_redir;                                                                     \
-    if (fw_route(ctx, path_val, &rr, &nsp_ok, current_pkg, &path_user_id, sub_path, p, \
-                 &is_redir) != 0)                                                      \
-        return err_code;                                                               \
+#define VFS_SETUP_CORE(path_val, op_kind)                                         \
+    struct fuse_context* ctx = fuse_get_context();                                \
+    if (!ctx) return -EIO; /* 不可达：libfuse 在每个回调内均设置上下文 */          \
+    NspPathDecision rr;                                                           \
+    bool nsp_ok = false;                                                          \
+    char current_pkg[128];                                                        \
+    int path_user_id;                                                             \
+    char sub_path[PATH_MAX];                                                      \
+    char p[PATH_MAX];                                                             \
+    bool is_redir;                                                                \
+    int fw_rc = fw_route(ctx, path_val, &rr, &nsp_ok, current_pkg, &path_user_id, \
+                         sub_path, p, &is_redir, op_kind);                        \
+    if (fw_rc != 0) return fw_rc;                                                 \
     (void)is_redir; /* 部分回调不使用 is_redir，抑制未使用警告 */
-
-#define VFS_SETUP_LOG(path_val, err_code, op)                                                   \
-    VFS_SETUP_CORE(path_val, err_code)                                                          \
-    vfs_log_io(current_pkg, ctx->uid, op, sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL, \
-               nsp_ok ? rr.monitor_on : false);
 
 #define VFS_RETURN(val) \
     do {                \
@@ -452,7 +491,7 @@ static inline ino_t synthetic_inode(const char* path) {
 static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
     vfs_flush_pending_closes();
     (void)fi;
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     if (st == nullptr) VFS_RETURN(-EINVAL);
     /* 后端分派：路径命中 BACKEND 模块时由模块方法提供元数据（模块不实现 FUSE） */
     const NspModuleOps* bops = NULL;
@@ -493,13 +532,14 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                     st->st_gid = pst.st_gid;
                 }
             }
+            vfs_apply_attr_override(&rr, st);
             VFS_RETURN(0);
         }
     }
     if (lstat(p, st) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
+            (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             /* 虚拟目录（无真实底层文件，如 FTP 前缀/重定向祖先）：权限继承
                上级目录（父路径的真实 mode/uid/gid），而非固定 root/访问者 */
             memset(st, 0, sizeof(struct stat));
@@ -524,6 +564,7 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                 st->st_uid = ctx->uid;
                 st->st_gid = ctx->gid;
             }
+            vfs_apply_attr_override(&rr, st);
             VFS_RETURN(0);
         }
         log_fuse_err("GETATTR", path, err);
@@ -554,19 +595,23 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
         }
         /* 权限完全镜像模式（--preserve-perms）：保留底层真实目录权限与属主 */
     }
+            vfs_apply_attr_override(&rr, st);
     VFS_RETURN(0);
 }
 
 static int vfs_access(const char* path, int mask) {
     vfs_flush_pending_closes();
-    VFS_SETUP_CORE(path, -ENOENT);
-    /* 与 open/create 等写路径的 RO 拦截保持语义一致：access(W_OK) 在 RO
-       规则路径上必须报不可写，否则应用预检通过后真实写入却收 EROFS。
-       POSIX 对 access 明确允许返回 EROFS（只读文件系统请求写访问）；
-       与 vfs_open 相同先于后端分派检查（root 调用者豁免） */
-    if (ctx->uid != 0 && rr.ro && (mask & W_OK)) {
-        log_fuse_err("ACCESS_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
+    /* access 归类 VFS_OP_READ（F_OK/R_OK 在 RO 路径上必须放行），只在请求
+       写访问时走框架的只读策略——"何时算写"由 mask 决定属 FUSE 语义，
+       策略本身（root 豁免 + EROFS）仍在 vfs_check_read_only 单点。
+       与 vfs_open 相同先于后端分派检查 */
+    if (mask & W_OK) {
+        int ro_rc = vfs_check_read_only(&rr, ctx->uid);
+        if (ro_rc != 0) {
+            log_fuse_err("ACCESS_RO_DENIED", path, -ro_rc);
+            VFS_RETURN(ro_rc);
+        }
     }
     /* 后端路径：访问检查由后端语义决定，框架默认放行 */
     const NspModuleOps* bops = NULL;
@@ -577,7 +622,7 @@ static int vfs_access(const char* path, int mask) {
     if (access(p, mask) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
+            (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             VFS_RETURN(0);
         }
         log_fuse_err("ACCESS", path, err);
@@ -774,7 +819,7 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         NspProbeResult ir;
         memset(&ir, 0, sizeof ir);
         if (module_dispatch_probe(&probe_q, &ir) == NSP_DISPATCH_OK && ir.valid) {
-            if (ir.hidden || (!uid_dir && ir.is_redirect_target)) continue;
+            if (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)) continue;
         }
         if (d->is_root && strcmp(de->d_name, "Android") == 0) d->has_android = true;
         if (d->is_android_dir) {
@@ -893,7 +938,7 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     (void)offset;
     (void)flags;
     (void)fi;
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "READDIR", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
@@ -909,7 +954,7 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
         int err = errno;
         /* 骨架/虚拟目录允许无真实底层目录，不视为错误 */
         if (!is_android_skel_dir(sub_path) &&
-            !(err == ENOENT && (rr.is_virtual_ancestor || rr.is_redirect_target))) {
+            !(err == ENOENT && (rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET))) {
             log_fuse_err("READDIR", path, err);
         }
     } else {
@@ -963,16 +1008,21 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
 static int vfs_open(const char* path, struct fuse_file_info* fi) {
     FTP_DBG("vfs_open: 入口 path=%s\n", path);
     vfs_flush_pending_closes();
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "OPEN", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                nsp_ok ? rr.monitor_on : false);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
-    if (ctx->uid != 0 && rr.ro) {
+    /* open 归类 VFS_OP_READ（O_RDONLY 打开 RO 路径必须放行），只在 flags 表明
+       要写时走框架只读策略；策略本身仍在 vfs_check_read_only 单点 */
+    {
         int accmode = fi->flags & O_ACCMODE;
         if (accmode == O_WRONLY || accmode == O_RDWR || (fi->flags & O_CREAT) ||
             (fi->flags & O_TRUNC) || (fi->flags & O_APPEND)) {
-            log_fuse_err("OPEN_RO_DENIED", path, EROFS);
-            VFS_RETURN(-EROFS);
+            int ro_rc = vfs_check_read_only(&rr, ctx->uid);
+            if (ro_rc != 0) {
+                log_fuse_err("OPEN_RO_DENIED", path, -ro_rc);
+                VFS_RETURN(ro_rc);
+            }
         }
     }
     /* 后端分派：open 由模块方法打开，fi->fh 存后端句柄（read/write 经槽位快速分派） */
@@ -1039,13 +1089,9 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
 }
 
 static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-    VFS_SETUP_CORE(path, -EACCES);
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "CREATE", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("CREATE_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
     /* 后端分派：create 由模块方法创建，fi->fh 存后端句柄（含模块槽位） */
     int bslot = -1;
@@ -1108,13 +1154,9 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
 }
 
 static int vfs_mkdir(const char* path, mode_t mode) {
-    VFS_SETUP_CORE(path, -EACCES);
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "MKDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                nsp_ok ? rr.monitor_on : false);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("MKDIR_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
     /* 后端分派：mkdir 由模块方法创建（rr.is_ftp 短路，避免非 FTP 路径付出
        无条件 rwlock + backend_match 扫描） */
     const NspModuleOps* bops = NULL;
@@ -1156,13 +1198,9 @@ static int vfs_mkdir(const char* path, mode_t mode) {
 }
 
 static int vfs_unlink(const char* path) {
-    VFS_SETUP_CORE(path, -EACCES);
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "UNLINK", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("UNLINK_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
     /* 后端分派：unlink 由模块方法删除 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
@@ -1196,14 +1234,10 @@ static int vfs_unlink(const char* path) {
 }
 
 static int vfs_rmdir(const char* path) {
-    VFS_SETUP_CORE(path, -EACCES);
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "RMDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                nsp_ok ? rr.monitor_on : false);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("RMDIR_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
-    if (rr.is_virtual_ancestor || rr.is_redirect_target) {
+    if (rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET) {
         if (!fw_virtual_dir_empty(sub_path, p, current_pkg, path_user_id, ctx->uid)) {
             log_fuse_err("RMDIR_NOT_EMPTY", path, ENOTEMPTY);
             VFS_RETURN(-ENOTEMPTY);
@@ -1445,7 +1479,7 @@ static int vfs_flush(const char* path, struct fuse_file_info* fi) {
 }
 
 static int vfs_readlink(const char* path, char* buf, size_t size) {
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "READLINK", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
     ssize_t res = readlink(p, buf, size - 1);
@@ -1458,7 +1492,7 @@ static int vfs_readlink(const char* path, char* buf, size_t size) {
 }
 
 static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "OPENDIR", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
     /* 后端分派：目录由后端模块管理时直接放行（readdir 条目由模块方法提供，
@@ -1477,7 +1511,7 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
     }
     int err = errno;
     if ((err == ENOENT || err == EACCES) &&
-        (is_android_skel_dir(sub_path) || rr.is_virtual_ancestor || rr.is_redirect_target)) {
+        (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
         VFS_RETURN(0);
     }
     log_fuse_err("OPENDIR", path, err);
@@ -1485,13 +1519,9 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
 }
 
 static int vfs_symlink(const char* target, const char* linkpath) {
-    VFS_SETUP_CORE(linkpath, -EACCES);
+    VFS_SETUP_CORE(linkpath, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "SYMLINK", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("SYMLINK_RO_DENIED", linkpath, EROFS);
-        VFS_RETURN(-EROFS);
-    }
     if (symlink(target, p) == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *p_dir = dirname(p_dup);
@@ -1658,50 +1688,20 @@ static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* s
 static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     struct fuse_context* ctx = fuse_get_context();
     if (!ctx) return -EACCES;
-    /* from/to 各走一次分派器决策（无模块时直通回退） */
-    NspQueryCtx q1 = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = from};
-    NspQueryCtx q2 = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = to};
-    /* 免 16KB×2 全量 memset：module_dispatch_resolve 统一经
-       nsp_resolve_result_init 初始化默认输出（valid=false 等），调用方无需
-       预置；未命中时下方 `&& rX.valid` 短路，不读 r1/r2 决策字段 */
-    NspResolveResult r1, r2;
-    bool ok1 = (module_dispatch_resolve(&q1, &r1) == NSP_DISPATCH_OK && r1.valid);
-    bool ok2 = (module_dispatch_resolve(&q2, &r2) == NSP_DISPATCH_OK && r2.valid);
-    if ((ok1 && r1.hidden) || (ok2 && r2.hidden)) return -ENOENT;
+    /* from/to 各走一次路由（无模块时直通回退）。rename 属变更操作，故两端
+       任一 appear_missing/read_only 都由 fw_route 单点拒绝——旧实现在此
+       手写两遍 hidden/ro 判定，与其它回调的判定容易漂移 */
+    NspPathDecision r1, r2;
+    bool ok1 = false, ok2 = false;
     char sub_from[PATH_MAX], sub_to[PATH_MAX], p_from[PATH_MAX], p_to[PATH_MAX];
     int u_from = -1, u_to = -1;
     bool redir_from = false, redir_to = false;
-    char pkg_from[128] = "unknown", pkg_to[128] = "unknown";
-    if (ok1) {
-        strncpy(pkg_from, r1.pkg[0] ? r1.pkg : "unknown", 127);
-        pkg_from[127] = '\0';
-        u_from = r1.user_id;
-        strncpy(sub_from, r1.sub_path, sizeof sub_from - 1);
-        sub_from[sizeof sub_from - 1] = '\0';
-        strncpy(p_from, r1.real_path, sizeof p_from - 1);
-        p_from[sizeof p_from - 1] = '\0';
-        redir_from = r1.is_redir;
-    } else {
-        if (fw_parse_path(from, &u_from, sub_from, sizeof sub_from) != 0) return -ENOENT;
-        fw_default_real_path(u_from, sub_from, p_from, sizeof p_from);
-    }
-    if (ok2) {
-        strncpy(pkg_to, r2.pkg[0] ? r2.pkg : "unknown", 127);
-        pkg_to[127] = '\0';
-        u_to = r2.user_id;
-        strncpy(sub_to, r2.sub_path, sizeof sub_to - 1);
-        sub_to[sizeof sub_to - 1] = '\0';
-        strncpy(p_to, r2.real_path, sizeof p_to - 1);
-        p_to[sizeof p_to - 1] = '\0';
-        redir_to = r2.is_redir;
-    } else {
-        if (fw_parse_path(to, &u_to, sub_to, sizeof sub_to) != 0) return -ENOENT;
-        fw_default_real_path(u_to, sub_to, p_to, sizeof p_to);
-    }
-    if (ctx->uid != 0 && ((ok1 && r1.ro) || (ok2 && r2.ro))) {
-        log_fuse_err("RENAME_RO_DENIED", from, EROFS);
-        return -EROFS;
-    }
+    char pkg_from[128], pkg_to[128];
+    int rrc = fw_route(ctx, from, &r1, &ok1, pkg_from, &u_from, sub_from, p_from, &redir_from,
+                       VFS_OP_MUTATE);
+    if (rrc != 0) return rrc;
+    rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, VFS_OP_MUTATE);
+    if (rrc != 0) return rrc;
     vfs_log_io(pkg_from, ctx->uid, "RENAME_FROM", sub_from,
                (ok1 && redir_from) ? r1.real_path : NULL, ok1 ? r1.monitor_on : false);
     vfs_log_io(pkg_to, ctx->uid, "RENAME_TO", sub_to, (ok2 && redir_to) ? r2.real_path : NULL,
@@ -1783,11 +1783,7 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
 
 static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("CHMOD_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     int ret = chmod(p, mode);
     if (ret == -1) {
         int err = errno;
@@ -1799,11 +1795,7 @@ static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
 
 static int vfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("CHOWN_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     int ret = lchown(p, uid, gid);
     if (ret == -1) {
         int err = errno;
@@ -1815,11 +1807,7 @@ static int vfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_in
 
 static int vfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("TRUNCATE_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     /* 后端分派：truncate 由模块方法截断 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
@@ -1855,11 +1843,7 @@ static int vfs_truncate(const char* path, off_t size, struct fuse_file_info* fi)
 
 static int vfs_utimens(const char* path, const struct timespec ts[2], struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, -EACCES);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("UTIMENS_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     int ret = utimensat(AT_FDCWD, p, ts, AT_SYMLINK_NOFOLLOW);
     if (ret == -1) {
         int err = errno;
@@ -1877,7 +1861,7 @@ static int vfs_statfs(const char* path, struct statvfs* st) {
 }
 
 static int vfs_getxattr(const char* path, const char* name, char* value, size_t size) {
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     ssize_t res = lgetxattr(p, name, value, size);
     if (res == -1) {
         if (errno == ENODATA || errno == EOPNOTSUPP) {
@@ -1905,7 +1889,7 @@ static int vfs_getxattr(const char* path, const char* name, char* value, size_t 
 }
 
 static int vfs_listxattr(const char* path, char* list, size_t size) {
-    VFS_SETUP_CORE(path, -ENOENT);
+    VFS_SETUP_CORE(path, VFS_OP_READ);
     ssize_t res = llistxattr(p, list, size);
     if (res == -1) {
         int err = errno;
@@ -1917,11 +1901,7 @@ static int vfs_listxattr(const char* path, char* list, size_t size) {
 
 static int vfs_setxattr(const char* path, const char* name, const char* value, size_t size,
                         int flags) {
-    VFS_SETUP_CORE(path, -ENOENT);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("SETXATTR_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     int ret = lsetxattr(p, name, value, size, flags);
     if (ret == -1) {
         int err = errno;
@@ -1932,11 +1912,7 @@ static int vfs_setxattr(const char* path, const char* name, const char* value, s
 }
 
 static int vfs_removexattr(const char* path, const char* name) {
-    VFS_SETUP_CORE(path, -ENOENT);
-    if (ctx->uid != 0 && rr.ro) {
-        log_fuse_err("REMOVEXATTR_RO_DENIED", path, EROFS);
-        VFS_RETURN(-EROFS);
-    }
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     int ret = lremovexattr(p, name);
     if (ret == -1) {
         int err = errno;
