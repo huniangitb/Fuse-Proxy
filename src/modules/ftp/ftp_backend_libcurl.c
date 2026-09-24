@@ -1337,6 +1337,16 @@ static void* ftp_dl_thread(void* arg) {
         curl_easy_setopt(f->read_curl, CURLOPT_RESUME_FROM, 0L);
 
         pthread_mutex_lock(&f->f_lock);
+        /* 随机跳变竞态：perform 期间 read 可能已把缓冲重置到新偏移（置
+           dl_restart），本次传输的 EOF/错误结论对应的是已作废的旧偏移，
+           必须整体丢弃——否则陈旧 rbuf_eof 会被套到新偏移上，read 直接
+           走 EOF 分支静默返回 0 字节（随机 pread 假短读）。丢弃后由循环
+           顶部的 restart 分支按新偏移重建缓冲并重新下载。 */
+        if (f->dl_restart) {
+            pthread_cond_broadcast(&f->dl_cond);
+            pthread_mutex_unlock(&f->f_lock);
+            continue;
+        }
         if (res == CURLE_OK || res == CURLE_REMOTE_FILE_NOT_FOUND) {
             f->rbuf_eof = true;  /* 读到文件尾 */
             mark_success(f->bk); /* 连接成功：清零熔断计数（网络恢复退出静默） */
@@ -1878,7 +1888,7 @@ int ftp_backend_rename(const char* from, const char* to) {
     if (res != CURLE_OK) {
         reset_curl(bk, true);
         return -EIO;
-    }                         /* 重命名失败：计入熔断 */
+    } /* 重命名失败：计入熔断 */
     ftp_stat_cache_clear(bk); /* RNFR/RNTO 成功：整表失效（from/to 均可能被缓存） */
     return 0;
 }
@@ -1912,7 +1922,7 @@ int ftp_backend_truncate(const char* path, off_t size) {
         if (res != CURLE_OK) {
             reset_curl(bk, true);
             return -EIO;
-        }                         /* 截断失败：计入熔断 */
+        } /* 截断失败：计入熔断 */
         ftp_stat_cache_clear(bk); /* STOR 空文件截断成功：整表失效 */
         return 0;
     }
