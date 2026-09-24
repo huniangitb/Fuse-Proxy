@@ -4,6 +4,7 @@
 #include "nsp_util.h"
 #include "fault_fence.h"
 #include "module_guard.h"
+#include "../daemon/fw_config.h"
 #include "../core/sha256.h"
 #include <dlfcn.h>
 #include <dirent.h>
@@ -107,11 +108,69 @@ static uint32_t api_get_flags(void) {
     return g_fw_flags;
 }
 
+/* 正在初始化的模块名：subscribe_rules / set_config_listener 只在 init 内调用，
+   框架以本变量为上下文归属（无需模块传名；加载由 monitor 线程串行执行） */
+static char g_preparing_name[64] = {0};
+
+static void api_subscribe_rules(const char* const* types, int count) {
+    if (g_preparing_name[0]) fw_config_set_subscription(g_preparing_name, types, count);
+}
+static void api_set_config_listener(void (*cb)(const NspModuleConfig*)) {
+    if (g_preparing_name[0]) fw_config_set_listener(g_preparing_name, cb);
+}
+
 static const NspFrameworkApi g_api = {
     .api_version = NSP_FRAMEWORK_API_VERSION,
     .get_rules_path = api_get_rules_path,
     .get_flags = api_get_flags,
+    .subscribe_rules = api_subscribe_rules,
+    .set_config_listener = api_set_config_listener,
 };
+
+/* ================= 配置下发（框架读取 → 模块建索引） ================= */
+
+/* 向单个模块推送当前过滤视图。经围栏调用模块监听器（模块代码可能崩溃）。
+   返回 0 = 已推送或该模块未注册监听器；NSP_FENCE_FAULT = 监听器崩溃。 */
+static int push_config_to_slot(int slot, const char* name) {
+    void (*cb)(const NspModuleConfig*) = fw_config_listener_for(name);
+    if (!cb) return 0;
+    const NspModuleConfig* cfg = fw_config_view_for(name);
+    if (!cfg) return 0;
+    int rc = nsp_fence_config_update(slot, "config_update", cb, cfg);
+    if (rc == NSP_FENCE_FAULT) {
+        module_guard_fault(slot, "config_update", name);
+        return rc;
+    }
+    if (rc != 0 && rc != NSP_FENCE_BADFN)
+        module_guard_error(slot, "config_update", rc, name, "config_update 返回异常");
+    return 0;
+}
+
+/* 配置重载钩子：遍历活跃模块推送新视图（fw_config 监听线程内同步调用）。
+   跨模块调用不得持框架锁（围栏 longjmp 会跳过解锁 → 死锁），故在**读锁内**取
+   槽位/名字快照并同时抬升槽位引用（unload 的排空会等待引用归零，避免推送期间
+   模块被 dlclose），锁外逐个推送。 */
+static void on_config_reload(void) {
+    int slots[MAX_MODULES];
+    char names[MAX_MODULES][64];
+    int n = 0;
+    pthread_rwlock_rdlock(&g_module_lock);
+    for (int i = 0; i < g_module_count && n < MAX_MODULES; i++) {
+        if (!g_modules[i].active) continue;
+        atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
+        atomic_fetch_add_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
+        slots[n] = i;
+        strncpy(names[n], g_modules[i].name, sizeof(names[n]) - 1);
+        names[n][sizeof(names[n]) - 1] = '\0';
+        n++;
+    }
+    pthread_rwlock_unlock(&g_module_lock);
+    for (int k = 0; k < n; k++) {
+        push_config_to_slot(slots[k], names[k]);
+        atomic_fetch_sub_explicit(&g_backend_slot_refs[slots[k]], 1, memory_order_acq_rel);
+        atomic_fetch_sub_explicit(&g_rule_slot_refs[slots[k]], 1, memory_order_acq_rel);
+    }
+}
 
 /* ================= 工具 ================= */
 
@@ -224,24 +283,61 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         }
     }
     /* init 在锁外调用（经调用围栏：init 崩溃被 longjmp 恢复而非带崩
-       框架），成功后才登记。init 尚未 commit（无正式槽位），用试探槽位
-       g_module_count 注册归因（monitor 线程单线程扫描，与 commit 无竞态）。
-       init 崩溃落盘 ban：防 5s 扫描循环反复重试加载崩溃模块。 */
+       框架），成功后才登记。init 尚未 commit（无正式槽位），用**未绑定槽位**
+       注册归因：它不与任何模块槽位重叠，故不会覆盖在册模块的归因信息
+       （旧实现取 g_module_count，注册表满时该值等于 MAX_MODULES 而回退到 0，
+       会覆盖槽位 0 并在 init 结束时清空它）。monitor 线程单线程扫描，与
+       commit 无竞态。init 崩溃落盘 ban：防 5s 扫描循环反复重试加载崩溃模块。 */
     if (info->init) {
-        int tent_slot = g_module_count < MAX_MODULES ? g_module_count : 0;
+        const int tent_slot = NSP_FENCE_UNBOUND_SLOT;
         fault_fence_register_slot(tent_slot, name, h);
+        /* 订阅/监听注册以"正在初始化的模块"为上下文（api_subscribe_rules /
+           api_set_config_listener 只允许在 init 内调用），故此处设定归属名 */
+        strncpy(g_preparing_name, name, sizeof g_preparing_name - 1);
+        g_preparing_name[sizeof g_preparing_name - 1] = '\0';
         int irc = nsp_fence_init_call(tent_slot, "init", info->init, &g_api);
+        g_preparing_name[0] = '\0';
         if (irc == NSP_FENCE_FAULT) {
             LOG_ERR(
                 "[MOD_ERR] module=%s op=init reason=init 崩溃被围栏恢复 detail=拒绝加载并落盘 ban",
                 name);
             module_ban_record(name, hash_out, "init crash");
+            /* init 崩溃时模块可能已创建自有线程（如 ftp_module 的 ftp.conf
+               监视线程）——那是它唯一的停止途径，故仍须经围栏调 exit，否则
+               dlclose 解除映射后残留线程踩空即带崩框架。exit 自身崩溃则无法
+               确认线程已停，保持 .so 映射不 dlclose（同置毒路径策略）。 */
+            bool can_unload = true;
+            if (info->exit) {
+                int erc = nsp_fence_exit_call(tent_slot, "exit", info->exit);
+                if (erc == NSP_FENCE_FAULT) can_unload = false;
+            }
+            fault_fence_unregister_slot(tent_slot);
+            if (can_unload) {
+                dlclose(h);
+            } else {
+                LOG_ERR("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
+                        "detail=无法确认模块线程已停,保持 .so 映射不 dlclose",
+                        name);
+            }
+            return -5;
+        }
+        if (irc != 0) {
+            /* init 返回非 0：模块自认初始化失败，清理责任在模块侧（约定不为
+               失败路径留线程）。不调 exit——对半初始化状态再调模块代码可能
+               造成重复清理。 */
+            LOG_ERR("模块 %s init 失败 (rc=%d)", name, irc);
             fault_fence_unregister_slot(tent_slot);
             dlclose(h);
             return -5;
         }
-        if (irc != 0) {
-            LOG_ERR("模块 %s init 失败 (rc=%d)", name, irc);
+        /* 首份配置推送：模块在 init 内 subscribe_rules + set_config_listener，
+           框架此时立即下发一次过滤视图（模块据此建索引）。推送崩溃=模块建不了
+           索引，按 init 失败处理并落盘 ban（否则每次扫描都会再崩一次）。 */
+        if (push_config_to_slot(tent_slot, name) == NSP_FENCE_FAULT) {
+            LOG_ERR("[MOD_ERR] module=%s op=config_update reason=配置下发监听器崩溃 "
+                    "detail=拒绝加载并落盘 ban",
+                    name);
+            module_ban_record(name, hash_out, "config_update crash");
             fault_fence_unregister_slot(tent_slot);
             dlclose(h);
             return -5;
@@ -285,8 +381,23 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, c
         if (g_module_count >= MAX_MODULES) {
             pthread_rwlock_unlock(&g_module_lock);
             LOG_ERR("模块注册表已满，拒绝 %s", name);
-            if (info->exit) info->exit();
-            dlclose(h);
+            /* init 已成功执行，模块可能持有自有线程：exit 必须调且必须过围栏
+               （用未绑定槽位归因——正式槽位尚未分配，不能占用在册模块的槽位）。
+               exit 崩溃则无法确认线程已停，保持 .so 映射不 dlclose。 */
+            bool can_unload = true;
+            if (info->exit) {
+                fault_fence_register_slot(NSP_FENCE_UNBOUND_SLOT, name, h);
+                int erc = nsp_fence_exit_call(NSP_FENCE_UNBOUND_SLOT, "exit", info->exit);
+                if (erc == NSP_FENCE_FAULT) can_unload = false;
+                fault_fence_unregister_slot(NSP_FENCE_UNBOUND_SLOT);
+            }
+            if (can_unload) {
+                dlclose(h);
+            } else {
+                LOG_ERR("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
+                        "detail=注册表满且无法确认模块线程已停,保持 .so 映射不 dlclose",
+                        name);
+            }
             return -6;
         }
         slot = g_module_count++;
@@ -415,21 +526,29 @@ static int module_unload_one(const char* name) {
     }
 
     /* exit 经围栏：正常模块 exit 崩溃概率极低，但崩溃同样不可带崩
-       框架（longjmp 恢复后继续 dlclose）。注意：此处 slot 仍有效
-       （槽位快照已置空但注册表保留至 dlclose 后注销）。 */
+       框架。注意：此处 slot 仍有效（槽位快照已置空但注册表保留至注销后）。
+       exit 崩溃说明模块自有线程已无法确认停止，保持 .so 映射不 dlclose——
+       否则残留线程执行失效代码即 SIGSEGV（同置毒路径策略，两条卸载路径
+       对 exit 崩溃必须同策，否则热卸载会成为同一崩溃的另一入口）。 */
+    bool can_unload = true;
     if (info.exit) {
         int erc = nsp_fence_exit_call(slot, "exit", info.exit);
-        if (erc == NSP_FENCE_FAULT)
-            LOG_WRN(
-                "[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 detail=跳过 exit 直接 dlclose",
-                name);
+        if (erc == NSP_FENCE_FAULT) {
+            can_unload = false;
+            LOG_WRN("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
+                    "detail=无法确认模块线程已停,保持 .so 映射不 dlclose",
+                    name);
+        }
     }
-    dlclose(h);
+    if (can_unload) {
+        dlclose(h);
+    }
     fault_fence_unregister_slot(slot);
     /* 复位熔断器记账：重载时窗口计数/累计错误不应继承上一轮加载周期的数据，
        否则旧错误会跨加载周期累积，误触熔断 */
     module_guard_reset(slot);
-    LOG("模块已卸载: %s", name);
+    fw_config_forget_module(name); /* 注销订阅/监听与过滤视图 */
+    if (can_unload) LOG("模块已卸载: %s", name);
     return 0;
 }
 
@@ -684,6 +803,7 @@ int module_fault_poison(int slot, const char* reason) {
     }
     if (!can_unload) {
         fault_fence_unregister_slot(slot);
+        fw_config_forget_module(name); /* 注销订阅/监听与过滤视图 */
         LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=槽位已置空,规则立即失效,"
                 ".so 保持映射（exit 崩溃故不 dlclose）",
                 name, reason ? reason : "(null)");
@@ -691,6 +811,7 @@ int module_fault_poison(int slot, const char* reason) {
     }
     dlclose(h);
     fault_fence_unregister_slot(slot);
+    fw_config_forget_module(name); /* 注销订阅/监听与过滤视图 */
     LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=exit 完成,dlclose 完成,ban 已落盘",
             name, reason ? reason : "(null)");
     return 0;
@@ -892,6 +1013,10 @@ int module_system_init(const char* rules_path, const char* modules_dir, uint32_t
         strncpy(g_modules_dir, modules_dir, sizeof g_modules_dir - 1);
     g_fw_flags = flags;
     mkdir_recursive(g_modules_dir);
+    /* 配置读取在框架侧完成：先建视图与监听，再扫描模块——模块 init 内
+       subscribe/set_config_listener 后由 module_prepare 立即推送首份视图 */
+    fw_config_set_reload_hook(on_config_reload);
+    fw_config_init(g_fw_rules_path);
     module_scan_diff();
     pthread_t tid;
     if (pthread_create(&tid, NULL, module_monitor_thread, NULL) == 0) pthread_detach(tid);
@@ -911,6 +1036,8 @@ void module_system_shutdown(void) {
         if (g_modules[i].active) module_unload_one(g_modules[i].name);
     }
     g_module_count = 0;
+    /* 模块已全部卸载（订阅/监听随之注销），最后停监听线程并释放视图 */
+    fw_config_shutdown();
 }
 
 int module_dispatch_resolve(const NspQueryCtx* q, NspResolveResult* out) {

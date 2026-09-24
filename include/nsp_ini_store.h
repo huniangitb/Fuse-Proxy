@@ -1,19 +1,19 @@
 #ifndef NSP_INI_STORE_H
 #define NSP_INI_STORE_H
 /*
- * nsp_ini_store.h — 通用 INI 段式配置文件行级存储（公共抽象）
+ * nsp_ini_store.h — INI 段式配置文件行级存储
  *
- * 定位：与 nsp_util 同约束的公共设施（纯 libc，零项目全局依赖），供
- * rule_server 控制面与第三方热插拔模块共用，实现"注释保留的行级读写"：
+ * 定位：纯 libc、零项目全局依赖的公共设施。**已退出模块 ABI**（模块 ABI V2
+ * 起）：本实现只编入 rule_server（私有静态库），fuse_daemon 导出表不再提供
+ * nsp_ini_* 符号，故第三方模块**不得**引用本 API——引用会在 dlopen 阶段因
+ * 符号无法解析而被拒（详见 docs/modules.md §6.1）。模块侧请用 nsp_util 的
+ * 行处理原语自建存储。
+ *
+ * 当前唯一使用者是 rule_server 控制面，实现"注释保留的行级读写"：
  *   - 读：按 [段名] / key 取值（value 语义与 ftp_conf 对齐：剥离行内 `#`
  *     注释后去首尾空白）；
  *   - 写：set/del 保持注释与空行原样，仅改目标行；save 经临时文件 + rename
  *     原子落盘（inotify 监听端永不读到半截文件）。
- *
- * 第三方模块借用方式：模块源码仅依赖 nsp_module.h（本头由其在
- * NSP_MODULE_BUILD 下引入），编译加 -DNSP_MODULE_BUILD、不链接本实现——
- * 符号由 fuse_daemon 导出表在 dlopen 时解析（与 log_internal 等公共符号
- * 同机制）。修改本 API 签名会破坏已编译模块，需同步评估 ABI 影响。
  *
  * 非目标：ON/OFF 后缀段头（如 [USER_APPS:0] OFF）超出通用范畴，
  * 仍由各调用方自备匹配器；重复段仅操作首个命中（调用方应避免写重复段）。

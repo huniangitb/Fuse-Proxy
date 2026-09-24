@@ -148,5 +148,8 @@ int nsp_fence_init_call(int slot, const char* op_name, int (*fn)(const NspFramew
                         const NspFrameworkApi* api);
 /* void 返回型：正常返回 0；崩溃返回 NSP_FENCE_FAULT */
 int nsp_fence_exit_call(int slot, const char* op_name, void (*fn)(void));
+/* 配置下发监听器（回调体为模块代码）：正常返回 0；崩溃返回 NSP_FENCE_FAULT */
+int nsp_fence_config_update(int slot, const char* op_name, void (*fn)(const NspModuleConfig*),
+                            const NspModuleConfig* cfg);
 
 #endif /* FAULT_FENCE_H */

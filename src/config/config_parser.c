@@ -834,7 +834,213 @@ void config_set_scan_users_skip_pm(bool skip) {
     LOG_DBG("活跃用户 pm 探测: %s", skip ? "跳过(仅/data/media)" : "启用(pm list users)");
 }
 
-void load_config_rules(const char* path) {
+/* ================= 配置扁平视图：读取阶段 ================= */
+
+typedef struct {
+    NspCfgRec* recs;
+    int count;
+    int cap;
+} ViewAcc;
+
+/* 追加一条记录（text/type/file 各自 strdup 归视图所有）。OOM 时静默丢弃该记录：
+   配置加载非热路径，且丢弃只影响该行规则，不破坏已收集部分的结构完整性。 */
+static void view_push(ViewAcc* va, uint8_t kind, uint8_t enabled, int32_t uid, int32_t line_no,
+                      const char* file, const char* type, const char* text) {
+    if (va->count >= va->cap) {
+        int ncap = va->cap == 0 ? 64 : va->cap * 2;
+        NspCfgRec* grown = realloc(va->recs, (size_t)ncap * sizeof(NspCfgRec));
+        if (!grown) return;
+        va->recs = grown;
+        va->cap = ncap;
+    }
+    NspCfgRec* r = &va->recs[va->count++];
+    memset(r, 0, sizeof *r);
+    r->kind = kind;
+    r->enabled = enabled;
+    r->uid = uid;
+    r->line_no = line_no;
+    if (file) r->file = strdup(file);
+    if (type) r->type = strdup(type);
+    if (text) r->text = strdup(text);
+}
+
+/* 首 token 作为规则类型名（供按模块订阅过滤）；含 '=' 视为变量定义行归一为 "VAR" */
+static void view_first_token(const char* line, char* out, size_t sz) {
+    size_t i = 0;
+    while (line[i] && !isspace((unsigned char)line[i]) && i + 1 < sz) {
+        out[i] = line[i];
+        i++;
+    }
+    out[i] = '\0';
+    if (strchr(out, '=')) snprintf(out, sz, "VAR");
+}
+
+/* 段头行 → (段名, :uid, ON/OFF)；非段头返回 false。
+   段名与 :uid 就地切分（入参为可写行缓冲，调用方已在行内原地清理）。 */
+static bool view_parse_section(char* p, char** name_out, int* uid_out, bool* enabled_out) {
+    if (p[0] != '[') return false;
+    char* end = strchr(p, ']');
+    if (!end) return false;
+    *end = '\0';
+    char* sec = p + 1;
+    char* after = end + 1;
+    bool enabled = true;
+    while (isspace((unsigned char)*after)) after++;
+    if (strncmp(after, "OFF", 3) == 0)
+        enabled = false;
+    else if (strncmp(after, "ON", 2) == 0)
+        enabled = true;
+    int uid = -1;
+    char* colon = strchr(sec, ':');
+    if (colon) {
+        *colon = '\0';
+        uid = atoi(colon + 1);
+    }
+    *name_out = sec;
+    *uid_out = uid;
+    *enabled_out = enabled;
+    return true;
+}
+
+/* 主文件：段头 → SECTION，其余行 → RULE */
+static void view_scan_main_file(ViewAcc* va, const char* path) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        LOG_ERR("无法打开主规则文件: %s (%s)", path, strerror(errno));
+        return;
+    }
+    char line[NSP_CONFIG_LINE_MAX];
+    int line_num = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        line_num++;
+        char* p = clean_path_string(line);
+        if (!p || p[0] == '#' || p[0] == 0) continue;
+        char* sec = nullptr;
+        int uid = -1;
+        bool enabled = true;
+        if (view_parse_section(p, &sec, &uid, &enabled)) {
+            view_push(va, NSP_CFG_REC_SECTION, enabled ? 1 : 0, uid, line_num, path, nullptr, sec);
+            continue;
+        }
+        char type[64];
+        view_first_token(p, type, sizeof type);
+        view_push(va, NSP_CFG_REC_RULE, 0, -1, line_num, path, type, p);
+    }
+    fclose(fp);
+}
+
+/* App-rules* 目录：<pkg>.conf → APP_FILE + 其内行；<pkg>.conf.disabled → APP_DISABLED */
+static void view_scan_app_rules(ViewAcc* va) {
+    for (int i = 0; i < g_active_user_count; i++) {
+        int uid = g_active_users[i];
+        char app_rules_dir[PATH_MAX];
+        nsp_app_rule_dir(CONFIG_DIR, uid, app_rules_dir, sizeof(app_rules_dir));
+        DIR* dir = opendir(app_rules_dir);
+        if (!dir) continue;
+        struct dirent* de;
+        while ((de = readdir(dir)) != nullptr) {
+            if (de->d_type != DT_REG && de->d_type != DT_LNK) continue;
+            char* ext = strrchr(de->d_name, '.');
+            if (ext && strcmp(ext, ".conf") == 0) {
+                char pkg[128];
+                size_t len = ext - de->d_name;
+                if (len >= sizeof(pkg)) len = sizeof(pkg) - 1;
+                strncpy(pkg, de->d_name, len);
+                pkg[len] = '\0';
+                char app_conf_path[PATH_MAX];
+                snprintf(app_conf_path, sizeof(app_conf_path), "%s/%s", app_rules_dir, de->d_name);
+                /* 存在 <pkg>.conf（未被重命名 .disabled）即启用该应用注入，不依赖段头 ON。
+                   文件内若含 [pkg] OFF 段头会在后续 SECTION 记录处覆盖为 false */
+                view_push(va, NSP_CFG_REC_APP_FILE, 0, uid, 0, app_conf_path, nullptr, pkg);
+                FILE* afp = fopen(app_conf_path, "r");
+                if (afp) {
+                    char line[NSP_CONFIG_LINE_MAX];
+                    int app_line_num = 0;
+                    while (fgets(line, sizeof(line), afp)) {
+                        app_line_num++;
+                        char* p = clean_path_string(line);
+                        if (!p || p[0] == '#' || p[0] == 0) continue;
+                        char* sec = nullptr;
+                        int sub_uid = uid; /* 分文件内段头默认归属该文件用户 */
+                        bool enabled = true;
+                        if (view_parse_section(p, &sec, &sub_uid, &enabled)) {
+                            view_push(va, NSP_CFG_REC_SECTION, enabled ? 1 : 0, sub_uid,
+                                      app_line_num, app_conf_path, nullptr, sec);
+                            continue;
+                        }
+                        char type[64];
+                        view_first_token(p, type, sizeof type);
+                        view_push(va, NSP_CFG_REC_RULE, 0, uid, app_line_num, app_conf_path, type,
+                                  p);
+                    }
+                    fclose(afp);
+                }
+            } else if (ext && strcmp(ext, ".disabled") == 0) {
+                /* 停用状态识别：<pkg>.conf.disabled = 该应用规则被停用
+                   （rule_server INJECT_ENABLE OFF 重命名而来）。
+                   仅当无对应 <pkg>.conf（未被启用）时才记停用——使 is_target_app
+                   能识别停用状态并触发热卸载（此前 cfg 消失导致有通配符/全局注入时
+                   停用应用仍被判为目标无法卸载） */
+                size_t nlen = strlen(de->d_name);
+                const char* suffix = ".conf.disabled";
+                size_t slen = strlen(suffix);
+                if (nlen > slen && strcmp(de->d_name + nlen - slen, suffix) == 0) {
+                    char pkg[128];
+                    size_t len = nlen - slen;
+                    if (len >= sizeof(pkg)) len = sizeof(pkg) - 1;
+                    strncpy(pkg, de->d_name, len);
+                    pkg[len] = '\0';
+                    char conf_path[PATH_MAX];
+                    snprintf(conf_path, sizeof(conf_path), "%s/%s.conf", app_rules_dir, pkg);
+                    if (access(conf_path, F_OK) != 0)
+                        view_push(va, NSP_CFG_REC_APP_DISABLED, 0, uid, 0, nullptr, nullptr, pkg);
+                }
+            }
+        }
+        closedir(dir);
+    }
+}
+
+int config_read_view(const char* main_path, NspCfgRec** out_recs, int* out_count) {
+    if (out_recs) *out_recs = nullptr;
+    if (out_count) *out_count = 0;
+    if (!main_path) return -1;
+    scan_active_users();
+    /* App-rules 目录存在性检查：只读消费方（fuse_daemon/log_ctl）不创建目录，
+       缺失目录由 injector 负责创建——仅记录反馈，不 mkdir */
+    for (int i = 0; i < g_active_user_count; i++) {
+        char app_rules_dir[PATH_MAX];
+        nsp_app_rule_dir(CONFIG_DIR, g_active_users[i], app_rules_dir, sizeof(app_rules_dir));
+        if (access(app_rules_dir, F_OK) != 0) {
+            if (!g_allow_app_rules_mkdir) {
+                LOG_DBG("只读模式跳过创建应用规则目录: %s（由 injector 创建）", app_rules_dir);
+                continue;
+            }
+            mkdir(app_rules_dir, 0755);
+            LOG("自动为多用户 %d 创建应用规则目录: %s", g_active_users[i], app_rules_dir);
+        }
+    }
+    ViewAcc va = {.recs = nullptr, .count = 0, .cap = 0};
+    view_scan_main_file(&va, main_path);
+    view_scan_app_rules(&va);
+    if (out_recs) *out_recs = va.recs;
+    if (out_count) *out_count = va.count;
+    return va.count;
+}
+
+void config_free_view(NspCfgRec* recs, int count) {
+    if (!recs) return;
+    for (int i = 0; i < count; i++) {
+        free((void*)recs[i].file);
+        free((void*)recs[i].type);
+        free((void*)recs[i].text);
+    }
+    free(recs);
+}
+
+/* ================= 配置扁平视图：建索引阶段 ================= */
+
+void config_build_from_view(const NspCfgRec* recs, int count) {
     /* S1 COW：构建进暂存区，末尾 config_publish 整体换入 live 并延迟释放旧配置 */
     memset(&g_global_cfg_stage, 0, sizeof(AppConfig));
     g_global_cfg_stage.trie_root = trie_create_node(NULL);
@@ -842,169 +1048,54 @@ void load_config_rules(const char* path) {
     g_app_cfgs_stage = nullptr;
     g_app_cfg_count_stage = 0;
     g_app_cfg_capacity_stage = 0;
-    scan_active_users();
-    for (int i = 0; i < g_active_user_count; i++) {
-        int uid = g_active_users[i];
-        char app_rules_dir[PATH_MAX];
-        nsp_app_rule_dir(CONFIG_DIR, uid, app_rules_dir, sizeof(app_rules_dir));
-        if (access(app_rules_dir, F_OK) != 0) {
-            if (!g_allow_app_rules_mkdir) {
-                /* 只读加固：本进程（如 fuse_daemon/log_ctl）无权创建应用规则目录，
-                   缺失目录由 injector 负责创建——仅记录反馈，不 mkdir */
-                LOG_DBG("只读模式跳过创建应用规则目录: %s（由 injector 创建）", app_rules_dir);
-                continue;
+
+    AppConfig* cur = &g_global_cfg_stage;
+    int current_user_id = -1;
+    for (int i = 0; i < count; i++) {
+        const NspCfgRec* r = &recs[i];
+        switch (r->kind) {
+        case NSP_CFG_REC_SECTION: {
+            if (!r->text) break;
+            char pkg[128];
+            strncpy(pkg, r->text, sizeof(pkg) - 1);
+            pkg[sizeof(pkg) - 1] = '\0';
+            current_user_id = r->uid;
+            if (strcmp(pkg, "GLOBAL") == 0) {
+                cur = &g_global_cfg_stage;
+            } else {
+                /* 类别段经归一后与普通包同走 get_or_create（特殊 pkg 名天然去重）；
+                   SYSTEM_APPS 带 :uid 在此归一为 -1 */
+                classify_category_section(pkg, &current_user_id, r->file, r->line_no);
+                cur = get_or_create_app_cfg(pkg, current_user_id);
+                if (cur) cur->inject_enable = (r->enabled != 0);
             }
-            mkdir(app_rules_dir, 0755);
-            LOG("自动为多用户 %d 创建应用规则目录: %s", uid, app_rules_dir);
+            break;
         }
-    }
-    FILE* fp = fopen(path, "r");
-    if (fp) {
-        AppConfig* cur = &g_global_cfg_stage;
-        char line[NSP_CONFIG_LINE_MAX];
-        int current_user_id = -1;
-        int line_num = 0;
-        while (fgets(line, sizeof(line), fp)) {
-            line_num++;
-            char* p = clean_path_string(line);
-            if (!p || p[0] == '#' || p[0] == 0) continue;
-            if (p[0] == '[') {
-                char* end = strchr(p, ']');
-                if (end) {
-                    *end = '\0';
-                    char* sec = p + 1;
-                    char* after = end + 1;
-                    bool enabled = true;
-                    while (isspace(*after)) after++;
-                    if (strncmp(after, "OFF", 3) == 0)
-                        enabled = false;
-                    else if (strncmp(after, "ON", 2) == 0)
-                        enabled = true;
-                    char pkg[128];
-                    current_user_id = -1;
-                    char* colon = strchr(sec, ':');
-                    if (colon) {
-                        *colon = '\0';
-                        current_user_id = atoi(colon + 1);
-                    }
-                    strncpy(pkg, sec, sizeof(pkg) - 1);
-                    if (strcmp(pkg, "GLOBAL") == 0) {
-                        cur = &g_global_cfg_stage;
-                    } else {
-                        /* 类别段经归一后与普通包同走 get_or_create（特殊 pkg 名
-                           天然去重）；SYSTEM_APPS 带 :uid 在此归一为 -1 */
-                        classify_category_section(pkg, &current_user_id, path, line_num);
-                        cur = get_or_create_app_cfg(pkg, current_user_id);
-                        if (cur) cur->inject_enable = enabled;
-                    }
-                }
-                continue;
-            }
-            if (cur) parse_config_line(cur, p, current_user_id, line_num, path);
+        case NSP_CFG_REC_RULE: {
+            if (!r->text) break;
+            /* 复制后再解析：parse_config_line 及其下 parse_*_rule 会就地切分入参，
+               视图须保持只读（模块可能持有框架下发的视图） */
+            char line[NSP_CONFIG_LINE_MAX];
+            snprintf(line, sizeof(line), "%s", r->text);
+            if (cur) parse_config_line(cur, line, current_user_id, r->line_no, r->file);
+            break;
         }
-        fclose(fp);
-    } else {
-        LOG_ERR("无法打开主规则文件: %s (%s)", path, strerror(errno));
-    }
-    for (int i = 0; i < g_active_user_count; i++) {
-        int uid = g_active_users[i];
-        char app_rules_dir[PATH_MAX];
-        nsp_app_rule_dir(CONFIG_DIR, uid, app_rules_dir, sizeof(app_rules_dir));
-        DIR* dir = opendir(app_rules_dir);
-        if (dir) {
-            struct dirent* de;
-            while ((de = readdir(dir)) != nullptr) {
-                if (de->d_type == DT_REG || de->d_type == DT_LNK) {
-                    char* ext = strrchr(de->d_name, '.');
-                    if (ext && strcmp(ext, ".conf") == 0) {
-                        char pkg[128];
-                        size_t len = ext - de->d_name;
-                        if (len >= sizeof(pkg)) len = sizeof(pkg) - 1;
-                        strncpy(pkg, de->d_name, len);
-                        pkg[len] = '\0';
-                        AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
-                        /* 存在 <pkg>.conf（未被重命名 .disabled）即启用该应用注入，
-                           不依赖段头 ON。文件内若含 [pkg] OFF 段头会在下方
-                           解析时覆盖为 false */
-                        file_cur->inject_enable = true;
-                        AppConfig* cur = file_cur;
-                        char app_conf_path[PATH_MAX];
-                        snprintf(app_conf_path, sizeof(app_conf_path), "%s/%s", app_rules_dir,
-                                 de->d_name);
-                        FILE* afp = fopen(app_conf_path, "r");
-                        if (afp) {
-                            char line[NSP_CONFIG_LINE_MAX];
-                            int app_line_num = 0;
-                            while (fgets(line, sizeof(line), afp)) {
-                                app_line_num++;
-                                char* p = clean_path_string(line);
-                                if (!p || p[0] == '#' || p[0] == 0) continue;
-                                if (p[0] == '[') {
-                                    char* end = strchr(p, ']');
-                                    if (end) {
-                                        *end = '\0';
-                                        char* sec = p + 1;
-                                        char* after = end + 1;
-                                        bool enabled = true;
-                                        while (isspace(*after)) after++;
-                                        if (strncmp(after, "OFF", 3) == 0)
-                                            enabled = false;
-                                        else if (strncmp(after, "ON", 2) == 0)
-                                            enabled = true;
-                                        char sub_pkg[128];
-                                        int sub_uid = uid;
-                                        char* colon = strchr(sec, ':');
-                                        if (colon) {
-                                            *colon = '\0';
-                                            sub_uid = atoi(colon + 1);
-                                        }
-                                        strncpy(sub_pkg, sec, sizeof(sub_pkg) - 1);
-                                        if (strcmp(sub_pkg, "GLOBAL") == 0)
-                                            cur = &g_global_cfg_stage;
-                                        else {
-                                            /* 分文件内类别段同样归一（SYSTEM_APPS :uid→-1）；
-                                               类别段一般只写主文件，此处为语义一致兜底 */
-                                            classify_category_section(sub_pkg, &sub_uid,
-                                                                      app_conf_path, app_line_num);
-                                            cur = get_or_create_app_cfg(sub_pkg, sub_uid);
-                                            if (cur) cur->inject_enable = enabled;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                if (cur)
-                                    parse_config_line(cur, p, uid, app_line_num, app_conf_path);
-                            }
-                            fclose(afp);
-                        }
-                    } else if (ext && strcmp(ext, ".disabled") == 0) {
-                        /* 停用状态识别：<pkg>.conf.disabled = 该应用规则被停用
-                           （rule_server INJECT_ENABLE OFF 重命名而来）。
-                           仅当无对应 <pkg>.conf（未被启用）时创建 cfg 并置
-                           inject_enable=false——使 is_target_app 能识别停用
-                           状态并触发热卸载（此前 cfg 消失导致有通配符/全局
-                           注入时停用应用仍被判为目标无法卸载） */
-                        size_t nlen = strlen(de->d_name);
-                        const char* suffix = ".conf.disabled";
-                        size_t slen = strlen(suffix);
-                        if (nlen > slen && strcmp(de->d_name + nlen - slen, suffix) == 0) {
-                            char pkg[128];
-                            size_t len = nlen - slen;
-                            if (len >= sizeof(pkg)) len = sizeof(pkg) - 1;
-                            strncpy(pkg, de->d_name, len);
-                            pkg[len] = '\0';
-                            char conf_path[PATH_MAX];
-                            snprintf(conf_path, sizeof(conf_path), "%s/%s.conf", app_rules_dir,
-                                     pkg);
-                            if (access(conf_path, F_OK) != 0) {
-                                AppConfig* file_cur = get_or_create_app_cfg(pkg, uid);
-                                file_cur->inject_enable = false; /* 明确停用 */
-                            }
-                        }
-                    }
-                }
-            }
-            closedir(dir);
+        case NSP_CFG_REC_APP_FILE: {
+            if (!r->text) break;
+            AppConfig* file_cur = get_or_create_app_cfg(r->text, r->uid);
+            if (!file_cur) break;
+            file_cur->inject_enable = true;
+            cur = file_cur;
+            current_user_id = r->uid;
+            break;
+        }
+        case NSP_CFG_REC_APP_DISABLED: {
+            if (!r->text) break;
+            AppConfig* file_cur = get_or_create_app_cfg(r->text, r->uid);
+            if (file_cur) file_cur->inject_enable = false; /* 明确停用 */
+            break;
+        }
+        default: break;
         }
     }
     qsort(g_global_cfg_stage.redir_rules, g_global_cfg_stage.redir_count, sizeof(RedirectRule),
@@ -1025,6 +1116,14 @@ void load_config_rules(const char* path) {
     }
     /* S1 COW 发布：暂存区 → live，旧配置延迟释放 */
     config_publish();
+}
+
+void load_config_rules(const char* path) {
+    NspCfgRec* recs = nullptr;
+    int count = 0;
+    config_read_view(path, &recs, &count);
+    config_build_from_view(recs, count);
+    config_free_view(recs, count);
 }
 int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
     /* S1：load_config_rules 内部完成 COW 发布（旧配置在发布后即被释放），

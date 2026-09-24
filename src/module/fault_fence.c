@@ -351,3 +351,10 @@ int nsp_fence_exit_call(int slot, const char* op_name, void (*fn)(void)) {
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP_VOID(slot, op_name, fn());
 }
+
+/* 配置下发监听器：回调体是模块代码（可能重建索引时崩溃），故同样围栏 */
+int nsp_fence_config_update(int slot, const char* op_name, void (*fn)(const NspModuleConfig*),
+                            const NspModuleConfig* cfg) {
+    if (!fn) return NSP_FENCE_BADFN;
+    NSP_FENCE_WRAP_VOID(slot, op_name, fn(cfg));
+}

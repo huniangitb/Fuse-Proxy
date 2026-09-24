@@ -12,16 +12,43 @@
 
 static bool g_br_inited = false;
 
+/* 本模块申请的规则类型：框架只下发这些类型的记录，其他模块声明的类型
+   不会出现在本模块的视图里（模块间规则隔离）。
+   VAR = 变量定义行（REDIRECT 目标中的 $name 展开需要）。
+   FTP 暂列在内：FTP 规则当前仍由本模块解析为 is_ftp 供框架路由；
+   FTP 归属迁移到 ftp_module 后即可从此表移除。 */
+static const char* const g_br_subscribe[] = {
+    "HIDE",       "RO",           "REDIRECT",   "ALLOW",
+    "MONITOR",    "SANDBOX",      "GLOBAL_INJECT", "SKIP_SYSTEM_APPS",
+    "FUSE_EXTRA_ARGS", "FTP",     "VAR",
+};
+
+/* 框架配置下发监听器：框架在 init 后与每次热重载后按订阅过滤后调用 */
+static void br_module_config(const NspModuleConfig* cfg) {
+    br_rules_apply_config(cfg);
+}
+
 static int br_module_init(const NspFrameworkApi* api) {
     if (!api || api->api_version < NSP_FRAMEWORK_API_VERSION) return -1;
-    /* 规则路径与启动标志由框架经 api 提供（--rules= 与 --disable-sandbox） */
+    if (!api->set_config_listener) {
+        LOG_ERR("basic_rules: 框架未提供配置下发接口，规则引擎无法工作");
+        return -1;
+    }
+    /* 规则路径与启动标志由框架经 api 提供（--rules= 与 --disable-sandbox）；
+       配置本身不再自读——先声明订阅与监听器，框架在 init 返回后立即下发 */
     const char* rules_path = NULL;
     if (api->get_rules_path) rules_path = api->get_rules_path();
     bool disable_sandbox = false;
     if (api->get_flags) disable_sandbox = (api->get_flags() & NSP_FLAG_DISABLE_SANDBOX) != 0;
+    if (api->subscribe_rules) {
+        api->subscribe_rules(g_br_subscribe,
+                             (int)(sizeof g_br_subscribe / sizeof *g_br_subscribe));
+    }
     int rc = br_rules_init(rules_path, disable_sandbox);
-    if (rc == 0) g_br_inited = true;
-    return rc;
+    if (rc != 0) return rc;
+    api->set_config_listener(br_module_config);
+    g_br_inited = true;
+    return 0;
 }
 
 static void br_module_exit(void) {

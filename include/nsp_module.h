@@ -56,6 +56,7 @@
 #include <sys/stat.h> /* struct stat（后端 getattr，系统类型与 fuse 无关） */
 #include <limits.h>
 #include <linux/limits.h> /* Linux/Android ABI 的 PATH_MAX，不依赖 libc 特性宏。 */
+#include "nsp_cfg_view.h" /* 配置扁平视图（框架下发规则/变量给模块） */
 
 /* ================= ABI 版本与魔数 ================= */
 
@@ -93,9 +94,24 @@ typedef struct NspFrameworkApi {
     uint32_t api_version;                /* 当前 NSP_FRAMEWORK_API_VERSION */
     const char* (*get_rules_path)(void); /* 规则配置文件路径（--rules= 参数） */
     uint32_t (*get_flags)(void);         /* 框架启动标志（NSP_FLAG_*） */
+
+    /* ---- API V4 追加（尾部新增，旧模块按 api_version 决定是否使用）----
+       配置读取完全由框架完成：框架读 injector.conf / App-rules* 及模块目录下的
+       模块配置文件，按订阅过滤后以扁平视图下发；模块不再读文件、不再跑 inotify。
+
+       两者都**只在 init 内调用**（框架以"当前正在初始化的模块"为上下文记录，
+       故无需额外参数）。订阅缺失 = 申请全部规则（不推荐，失去隔离）。 */
+
+    /* 声明本模块申请的规则类型（如 "HIDE"/"REDIRECT"/"FTP"/"VAR"）。
+       框架只下发这些类型的记录，实现模块间规则隔离——A 模块看不到 B 模块的规则。 */
+    void (*subscribe_rules)(const char* const* types, int count);
+    /* 注册配置变更回调：框架在每次发布新配置后、按本模块订阅过滤后调用；
+       回调内应重建索引。cfg 仅在回调期间有效（框架持有，模块不得留存指针）。
+       注册后框架会立即回调一次（init 期间）以完成首次加载。 */
+    void (*set_config_listener)(void (*cb)(const NspModuleConfig* cfg));
 } NspFrameworkApi;
 
-#define NSP_FRAMEWORK_API_VERSION 3u
+#define NSP_FRAMEWORK_API_VERSION 4u
 
 /* 框架启动标志（get_flags 返回） */
 #define NSP_FLAG_DISABLE_SANDBOX (1u << 0) /* --disable-sandbox */
