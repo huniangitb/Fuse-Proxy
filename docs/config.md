@@ -58,6 +58,8 @@
 
 > 内置隐藏：`CONFIG_DIR` 下所有访问无条件返回 ENOENT；应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用（跨应用隔离，仅作用于列举）。
 
+> **`HIDE` 的 errno 在所有操作上统一为 `ENOENT`**（含 `mkdir`/`create`/`unlink`/`chmod` 等写类操作）。早期版本写类操作用 `EACCES`，同一条 `HIDE` 声明会因操作类别不同而产生两种 errno；自 ABI V3 起由框架单点强制（`fw_route`）统一为 `ENOENT`，与「存在变不存在」的语义一致。若前端曾按 `EACCES` 判定隐藏路径，需改为按 `ENOENT` 判定。
+
 后端模块可追加规则类型（如 FTP 模块的 `FTP <虚拟前缀> <段名>`），见 `modules.md` §2.1。
 
 ### 路径前缀归一
