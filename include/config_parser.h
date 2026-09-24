@@ -63,6 +63,27 @@ typedef struct {
     int user_id;
 } ChangedPkg;
 
+/* ================= 配置扁平视图（读文件 与 建索引 分离） =================
+ * 目的：配置的**读取**（文件 I/O + 行级词法 + 段头识别）与**建索引**
+ * （关键字 → 规则对象 → trie/变量静态性 → COW 发布）拆成两段，两段共用同一
+ * 构建逻辑，语义零漂移。框架读文件产出视图，消费者（含 dlopen 模块）由视图
+ * 重建配置而无需触碰文件系统——模块不再自行读文件/跑 inotify。
+ *
+ * 记录类型（NspCfgRec / NspCfgRecKind）与下发载荷（NspModuleConfig）定义在
+ * nsp_cfg_view.h——该头是框架侧与模块侧的共享契约，属模块 ABI 的一部分。
+ *
+ * 视图为只读：config_build_from_view 内部复制行文本后再解析，不修改入参。 */
+#include "nsp_cfg_view.h"
+
+/* 读主文件 + App-rules* 目录为扁平视图（读文件；框架/单进程消费者调用）。
+   返回记录数（>=0）；视图与其中字符串经 config_free_view 释放。
+   主文件缺失不致命：仍返回 App-rules 记录（与逐文件解析行为一致）。 */
+int config_read_view(const char* main_path, NspCfgRec** out_recs, int* out_count);
+void config_free_view(NspCfgRec* recs, int count);
+/* 由扁平视图重建配置并 COW 发布（不读文件系统；模块消费框架下发的视图）。
+   视图仅 RULE 记录被逐行复制后解析，其余记录按值读取。 */
+void config_build_from_view(const NspCfgRec* recs, int count);
+
 extern AppConfig g_global_cfg;
 extern AppConfig** g_app_cfgs;
 extern int g_app_cfg_count;

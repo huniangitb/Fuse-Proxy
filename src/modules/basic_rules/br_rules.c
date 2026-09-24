@@ -6,7 +6,6 @@
 #include "uid_map.h"
 #include "fast_pid.h"
 #include "sys_pkg.h"
-#include "nsp_util.h" /* nsp_set_thread_name（线程语义化命名） */
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,17 +15,13 @@
 #include <fnmatch.h>
 #include <pthread.h>
 #include <dirent.h>
-#include <sys/inotify.h>
-#include <poll.h>
 
 /* ============ 模块内部状态（从 vfs_core.c 适配，不再依赖 fuse_context） ============ */
 
 static char g_br_rules_path[PATH_MAX] = {0};
 static bool g_br_disable_sandbox = false;
-/* 模块退出标志与监控线程句柄：exit 时置标志并 join，确保 dlclose 前线程已退出
-   （否则线程仍在已卸载的 .so 代码页中运行 → SIGSEGV） */
-static volatile bool g_br_stop = false;
-static pthread_t g_br_monitor_tid;
+/* 无自有监控线程：配置读取与监听已收归框架（fw_config），模块经
+   config_update 监听器被动接收下发的视图——dlclose 前无需 join 任何线程 */
 
 #define UID_CACHE_SIZE 2048
 /* uid → AppConfig 缓存槽。热路径（每次 resolve/probe 均查）用 seqlock 无锁读：
@@ -61,7 +56,7 @@ static int g_uid_map_count = 0;
    配置重载（g_br_cfg_gen 递增，写锁内）后失效，杜绝 trie/cfg 悬垂。 */
 typedef struct {
     bool valid;
-    uint64_t gen; /* 配置代际（br_reload_config 递增） */
+    uint64_t gen; /* 配置代际（br_rules_apply_config 递增） */
     uid_t uid;
     pid_t pid;
     char dir[PATH_MAX]; /* 父目录 sub_path（"/" 或 "/a/b"） */
@@ -132,108 +127,30 @@ static void clear_uid_cache(void) {
     }
 }
 
-/* 配置热重载（含 uid.map 与 uid 缓存重建） */
-static void br_reload_config(void) {
+/* 应用框架下发的配置视图：重建索引 + 失效缓存。
+   由 basic_rules.c 的 config_update 监听器在框架推送时调用（init 期间一次，
+   之后每次热重载一次）。框架已完成文件读取与词法/段头识别，本函数只做
+   "行 → 规则对象 → trie" 的索引构建，语义与原自读实现完全一致。 */
+void br_rules_apply_config(const NspModuleConfig* cfg) {
+    if (!cfg) return;
     config_lock_write();
-    /* S1：先失效 uid 缓存与目录级 probe 缓存（g_br_cfg_gen++），再清空
-       uid 缓存中的 cfg 指针——load_config_rules 的 COW 发布随后会释放旧
-       AppConfig，必须在此之前让缓存作废，否则无锁读者可能命中悬垂指针 */
+    /* S1：先失效 uid 缓存与目录级 probe 缓存（g_br_cfg_gen++），再重建配置——
+       config_build_from_view 的 COW 发布会释放旧 AppConfig，必须在此之前让
+       缓存作废，否则无锁读者可能命中悬垂指针 */
     atomic_fetch_add_explicit(&g_br_cfg_gen, 1, memory_order_release);
     clear_uid_cache();
-    load_config_rules(g_br_rules_path);
+    config_build_from_view(cfg->recs, cfg->count);
     load_uid_map();
     sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     config_unlock_write();
-    LOG_DBG("已检测到配置变更，重新加载配置，全局监控状态: %s",
+    LOG_DBG("已应用框架下发的配置 (代际 %llu, %d 条记录)，全局监控状态: %s",
+            (unsigned long long)cfg->generation, cfg->count,
             g_global_cfg.monitor ? "开启" : "关闭");
-}
-
-/* inotify 监听规则目录，热重载（沿用 vfs_core 的 watch 重建/归并模式） */
-static void* config_monitor_thread(void* arg) {
-    (void)arg;
-    nsp_set_thread_name("nsp_cfgmon");
-    int inotify_fd = -1;
-    int wd = -1;
-    while (!g_log_shutdown && !g_br_stop) {
-        if (inotify_fd < 0) {
-            inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-            if (inotify_fd < 0) {
-                sleep(2);
-                continue;
-            }
-        }
-        if (wd < 0) {
-            char dir[PATH_MAX];
-            strncpy(dir, g_br_rules_path, sizeof(dir) - 1);
-            dir[sizeof(dir) - 1] = '\0';
-            char* slash = strrchr(dir, '/');
-            if (!slash) {
-                close(inotify_fd);
-                inotify_fd = -1;
-                sleep(2);
-                continue;
-            }
-            *slash = '\0';
-            wd = inotify_add_watch(inotify_fd, dir,
-                                   IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO | IN_MOVED_FROM |
-                                       IN_CREATE | IN_DELETE | IN_DELETE_SELF);
-            if (wd < 0) {
-                close(inotify_fd);
-                inotify_fd = -1;
-                sleep(2);
-                continue;
-            }
-        }
-        struct pollfd pfd = {.fd = inotify_fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, 5000);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            inotify_rm_watch(inotify_fd, wd);
-            wd = -1;
-            close(inotify_fd);
-            inotify_fd = -1;
-            continue;
-        }
-        if (pr == 0) continue;
-        char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-        ssize_t len = read(inotify_fd, buf, sizeof(buf));
-        if (len < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            inotify_rm_watch(inotify_fd, wd);
-            wd = -1;
-            close(inotify_fd);
-            inotify_fd = -1;
-            continue;
-        }
-        if (len == 0) continue;
-        bool watch_invalidated = false;
-        for (char* p = buf; p < buf + len;) {
-            struct inotify_event* ev = (struct inotify_event*)p;
-            if (ev->mask & IN_IGNORED) watch_invalidated = true;
-            p += sizeof(struct inotify_event) + ev->len;
-        }
-        sleep(1);
-        br_reload_config();
-        if (watch_invalidated) wd = -1;
-    }
-    if (inotify_fd >= 0) {
-        if (wd >= 0) inotify_rm_watch(inotify_fd, wd);
-        close(inotify_fd);
-    }
-    return nullptr;
 }
 
 int br_rules_init(const char* rules_path, bool disable_sandbox) {
     strncpy(g_br_rules_path, rules_path ? rules_path : "", sizeof(g_br_rules_path) - 1);
     g_br_disable_sandbox = disable_sandbox;
-    g_br_stop = false;
-    /* 只读加固：fuse_daemon 侧不创建 App-rules 目录、不做 pm 探测——
-       pm list users 需 binder 通信 system_server，在 fuse_daemon 受限
-       环境会挂起，而 load_config_rules 在写锁内执行（br_rules_init 位于
-       fuse_main 之前同步调用），popen 阻塞将导致 FUSE 会话永不启动；
-       热重载（config_monitor_thread → br_reload_config）同理会卡死 */
-    config_set_allow_app_rules_mkdir(false);
-    config_set_scan_users_skip_pm(true);
     /* 只读消费系统应用表（injector 落盘的 sys_pkgs.cache）：本进程永不
        popen pm（binder 挂起风险），无表时回退 uid<10000 */
     sys_pkg_init(false);
@@ -246,23 +163,15 @@ int br_rules_init(const char* rules_path, bool disable_sandbox) {
         g_uid_cache[i].gen = 0;
         g_uid_cache[i].pkg[0] = '\0';
     }
-    /* 不 detach：exit 时需要 join，确保 dlclose 前监控线程已退出 */
-    if (pthread_create(&g_br_monitor_tid, nullptr, config_monitor_thread, nullptr) != 0)
-        LOG_WRN("basic_rules: 配置监控线程创建失败，规则热重载不可用");
-    config_lock_write();
-    load_config_rules(g_br_rules_path);
-    load_uid_map();
-    config_unlock_write();
-    LOG("basic_rules: 规则引擎已初始化 (rules=%s, sandbox=%s)",
+    /* 配置不在此读取：框架在 init 返回后经 config_update 监听器下发首份视图
+       （见 basic_rules.c 的 subscribe + set_config_listener） */
+    LOG("basic_rules: 规则引擎已就绪 (rules=%s, sandbox=%s)，等待框架下发配置",
         g_br_rules_path[0] ? g_br_rules_path : "(none)", disable_sandbox ? "off" : "on");
     return 0;
 }
 
 void br_rules_exit(void) {
-    /* 先停止并 join 监控线程（最迟等其 poll 5s 超时退出），
-       再销毁锁/释放内存——线程可能正持锁或正在 .so 代码中 */
-    g_br_stop = true;
-    pthread_join(g_br_monitor_tid, nullptr);
+    /* 无自有线程（配置监听已收归框架），直接销毁锁与释放内存 */
     config_destroy_lock();
     sys_pkg_cleanup();
     free(g_uid_maps);

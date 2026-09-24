@@ -34,9 +34,15 @@ typedef struct {
     const TrieNode* global_node;
 } TrieMatch;
 
-/* 模块初始化：rules_path = --rules= 参数，disable_sandbox = --disable-sandbox 标志 */
+/* 模块初始化：disable_sandbox = --disable-sandbox 标志。
+   **不读配置**：框架经 config_update 监听器下发过滤后的扁平视图，见
+   br_rules_apply_config。rules_path 仅用于诊断日志。 */
 int br_rules_init(const char* rules_path, bool disable_sandbox);
 void br_rules_exit(void);
+
+/* 应用框架下发的配置视图（重建 AppConfig 索引 + uid 缓存失效 + 代际递增）。
+   由 basic_rules.c 的 config_update 监听器调用；cfg 仅在回调期间有效。 */
+void br_rules_apply_config(const NspModuleConfig* cfg);
 
 /* 核心决策：替代 vfs_core 的三连调用（sanitize + hidden + to_real_path + ro） */
 typedef struct {

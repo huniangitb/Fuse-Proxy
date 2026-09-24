@@ -1870,8 +1870,8 @@ static void handle_quit(int fd, json_object* req) {
 }
 
 /* ==================== FTP 服务器账号管理（ftp.conf） ====================
- * 基于公共 nsp_ini_store 抽象（第三方模块可借用，见 nsp_ini_store.h）：
- * 注释保留的行级读写 + 临时文件 rename 原子落盘；ftp_module 经 inotify
+ * 基于 nsp_ini_store 抽象（rule_server 私有静态库，已退出模块 ABI——见
+ * nsp_ini_store.h）：注释保留的行级读写 + 临时文件 rename 原子落盘；ftp_module 经 inotify
  * 监听目录自动热重载，无需 RELOAD。
  * 安全：password 只写不读——LIST/GET 仅回 has_password 布尔；ftp.conf
  * 本身明文落盘（与模块解析现状一致），文档中明确提示。
