@@ -38,8 +38,9 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 |---|---|
 | `basic_rules` / `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀/沙盒/热重载）、`test_config_snapshot.py`（解析快照 + STATIC 输出） |
 | `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（13，需 vsftpd）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd） |
+| `backend_rc_is_business`（后端业务 errno 豁免）/ `fuse_daemon.c` 后端分派 | `test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
 | `src/config/path_vars.c` | `test_path_vars.py` |
-| `src/module/`（加载器/围栏/熔断/ABI） | `test_modules.py`（12，热插拔）、`test_module_circuit.py`（52，故障隔离）、`test_module_abi.py`（V3 契约/默认值/输出校验/V1+V2 拒载） |
+| `src/module/`（加载器/围栏/熔断/ABI） | `test_modules.py`（12，热插拔）、`test_module_circuit.py`（55，故障隔离）、`test_module_abi.py`（V3 契约/默认值/输出校验/V1+V2 拒载） |
 | 决策结构 / 框架单点强制（`NspPathDecision`、`fw_route` 的 appear_missing·read_only、`vfs_apply_attr_override`） | `test_module_overrides.py`（42，逐回调 errno 矩阵：appear_missing 统一 ENOENT、read_only 统一 EROFS、属性覆盖与类型位保持） |
 | `log_ctl` / `rule_server` 规则编辑（`nsp_rule_file`） | `test_log_ctl_rules.py`（30）、`test_rule_server.py` |
 | `subprojects/libfuse`（fork 追加接口）或框架缓存失效 | `test_libfuse_inval.py`（需 `-Dlibfuse_source=subproject` 的产物，缺失自动跳过） |
@@ -56,5 +57,6 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 - **模块化**：fuse_daemon 是零规则功能的框架——规则能力由 dlopen 的 `basic_rules.so` 提供，存储后端（FTP）由 `ftp_module.so` 提供。模块**不实现 FUSE**，只提供 `backend_*` 方法；FTP 映射由 `FTP <虚拟前缀> <段名>` 规则决定，作用域随所在段（`[GLOBAL]` 全局 / `[包名]` 仅该应用）。模块目录 `<CONFIG_DIR>/modules/<名>/<名>.so`，inotify 热插拔。
 - **模块 ABI**：第三方模块只以 `include/nsp_module.h` 为唯一入口（该头代含 `nsp_log.h` / `nsp_constants.h` / `nsp_cfg_view.h`，分发 SDK 须一并给出），编译须带 `-DNSP_MODULE_BUILD`；日志等公共符号经导出表解析——改签名会破坏已编译模块。当前 `NSP_MODULE_ABI_VERSION=3`、`NSP_FRAMEWORK_API_VERSION=4`。**V3 是决策结果的不兼容重构**：声明式 `NspPathDecision` 取代 `NspResolveResult`（`hidden`→`appear_missing`、`ro`→`read_only`、两个虚拟目录 bool→`virtual_kind`、删 `user_id`/`sub_path`（框架自算）、新增 `attr_override`+`mode`/`uid`/`gid`），**V1/V2 模块须重编译**；`appear_missing` 在所有回调统一 ENOENT（V2 写类是 EACCES，属有意行为修正）。V4 是 `NspFrameworkApi` 尾部兼容新增（`subscribe_rules` / `set_config_listener`），不单独要求重编译。加载器在 `dlopen` 之后、`init`/`ops` 之前校验 ABI。模块不链接 `nsp_comm`；`nsp_ini_store` 已退出模块 ABI，是 rule_server 的私有静态库（log_ctl 不用）。
 - **决策强制归属**：模块只声明「路径该怎么表现」，errno 映射与权限策略在框架单点——`fw_route()` 统一 `appear_missing`→ENOENT 与 `read_only`→EROFS（含 root 豁免），`vfs_apply_attr_override()` 在框架既有权限策略之后落实 `attr_override`（故模块显式声明优先于伪造模式/skel 等默认）。**新增回调时必须走 `VFS_SETUP_CORE(path, VFS_OP_READ|VFS_OP_MUTATE)`**，不要在各回调里手写 hidden/ro 判定——那正是 V3 收敛掉的漂移来源。
+- **后端 errno 契约**：`backend_*` 以 errno 风格返回码回传业务失败（`-ENOENT`/`-EPERM`/`-ENOTEMPTY`/`-EIO`……），框架**不把它计入模块熔断窗口**（`backend_rc_is_business()`，`-1..-4095` 即业务码）；否则应用探测若干缺失路径就会把健康模块置毒卸载 + ban（`test_module_circuit.py` §9 守护）。规则模块反之：`resolve`/`probe` 用决策字段回传业务结果，返回非 0 仍判契约违规。新增 `backend_*` 分派分支时，`module_guard_error` 必须带上这一豁免。
 - **配置读取归属**：配置的**读取**（文件 I/O + inotify + 词法/段头识别）完全在框架侧（`src/daemon/fw_config.c` + `config_read_view`），模块**不读文件、不跑 inotify**；框架按模块经 `subscribe_rules` 申请的规则类型过滤后以 `NspModuleConfig` 下发，模块据此建索引（`config_build_from_view`）。**建索引仍在模块**（规则对象/trie 是模块的索引表示，框架不建 AppConfig）。改动 `config_parser.c` 的读取/词法部分须同时跑 `test_rules.py` 与 `test_config_snapshot.py`。
 - **规则**：INI 格式，`[GLOBAL]` / `[包名]` / `[包名:userid]` / `[USER_APPS:uid]` / `[SYSTEM_APPS]` 段；关键字 `REDIRECT`/`ALLOW`/`HIDE`/`RO`/`SANDBOX`/`MONITOR`。裸 `[包名]` 记为 user_id=-1 跨用户 fallback。`CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（常量权威在 `include/nsp_constants.h`，`common.h` 以别名暴露）。

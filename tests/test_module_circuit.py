@@ -396,7 +396,8 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
         shutil.copy(basic_so, d / "basic_rules.so")
         stage_module("backend_crash")
-        CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\nFTP /bcrash seg1\nFTP /bmatch seg1\n")
+        CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\nFTP /bcrash seg1\n"
+                        "FTP /bmatch seg1\nFTP /biznoent seg1\n")
         time.sleep(0.6)
         p = start()
     if p:
@@ -409,6 +410,29 @@ def main():
             except OSError:
                 is_dir = False
             ok("正常 FTP 后端路径可用") if (is_dir or p.poll() is None) else fail("bmatch", "后端路径不可用且进程异常")
+            # 业务 errno 不触发熔断：连续 6 次 -ENOENT（> 阈值 5/10s）后模块须仍
+            # 在线（修复前这会把"应用探测缺失路径"判为模块异常 → 置毒卸载 + ban）
+            enoents = 0
+            for i in range(6):
+                try:
+                    (MNT / "0" / "biznoent" / f"miss{i}").stat()
+                except FileNotFoundError:
+                    enoents += 1
+                except OSError as e:
+                    fail("业务 errno 探测", f"{i}: {e!r}")
+                    break
+                time.sleep(0.1)
+            ok("缺失路径探测返回 ENOENT（6/6）") if enoents == 6 else fail("缺失路径探测", f"仅 {enoents}/6 报 ENOENT")
+            time.sleep(0.5)
+            if "backend_crash" not in banned_text():
+                ok("业务 errno 未触发熔断 ban")
+            else:
+                fail("业务 errno 误判为模块错误", f".banned: {banned_text()!r}")
+            try:
+                still_dir = (MNT / "0" / "bmatch").is_dir()
+            except OSError:
+                still_dir = False
+            ok("模块仍在线（后端路径继续可用）") if still_dir else fail("模块被误置毒", "/0/bmatch 不可用")
             # 触发 backend_match 崩溃路径
             try: (MNT / "0" / "bcrash" / "x").stat()
             except OSError: pass
