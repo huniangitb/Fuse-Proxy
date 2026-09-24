@@ -2101,9 +2101,15 @@ static int passthrough_enable_fixed_method(int fd) {
 
 static void* vfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     cfg->use_ino = 1;
-    cfg->entry_timeout = 1.0;
-    cfg->attr_timeout = 1.0;
-    cfg->negative_timeout = 0.5;
+    /* 缓存超时不在此处写死：`fuse_new` 已按 libfuse 默认值填好 conf
+       （entry/attr=1.0、negative=0.0）**并已解析用户经 -o 传入的值**
+       （fuse.c: 默认值 → fuse_opt_parse → fuse_fs_init 才回调本函数），
+       此处再无条件赋值会覆盖用户的 -o attr_timeout=... 等设置。
+       特别注意 negative_timeout：libfuse 默认 0.0（不缓存 ENOENT），旧代码
+       把它抬到 0.5，正是"上传成功后立即 open 命中陈旧负缓存报 ENOENT"的根因
+       （FTP 后端只能靠 open 内 2×10ms 重试兜底）。保持默认 0 后该竞态消失；
+       后端自有 stat 缓存（含负条目）吸收内核层未命中的重复查询，无吞吐回退。
+       需要负缓存时经 FUSE_EXTRA_ARGS 传 -o negative_timeout=N 即可生效。 */
     signal(SIGPIPE, SIG_IGN);
     g_passthrough_enabled = false;
 

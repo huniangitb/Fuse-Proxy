@@ -1146,18 +1146,11 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     // read 拿到覆盖数据立即回传（不等缓冲满）；缓冲仅作慢速消费端背压粘合
     struct stat st;
     int grc = ftp_backend_getattr(path, &st);
-    /* 写后立即读：FLUSH 的 fuse_invalidate_path 是异步通知，close() 返回后
-       立即 open 可能短暂命中内核 negative 缓存（并发多 FLUSH 时处理延迟），
-       导致刚上传成功的文件 ENOENT——短重试覆盖该 close-to-open 窗口；
-       文件真不存在时 2×10ms 后仍 ENOENT，正确性不变（重试降频：原 5×20ms
-       =100ms 同步阻塞 FUSE open 线程，对缺失路径的存在性检查是热路径） */
-    if (grc != 0 || !S_ISREG(st.st_mode)) {
-        for (int retry = 0; retry < 2; retry++) {
-            usleep(10000);
-            grc = ftp_backend_getattr(path, &st);
-            if (grc == 0 && S_ISREG(st.st_mode)) break;
-        }
-    }
+    /* 曾在此处做 2×10ms 重试，覆盖"上传成功后立即 open 命中内核 negative 缓存
+       报 ENOENT"的 close-to-open 窗口。该竞态的根因是框架把 libfuse 默认的
+       negative_timeout=0.0 抬到了 0.5，已由框架侧修正（见 vfs_init），
+       ENOENT 不再被内核缓存，故重试去除——缺失路径的存在性检查恢复为
+       单次查询（此前重试会让每次缺失查询同步阻塞 FUSE open 线程 ≥20ms） */
     if (grc != 0 || !S_ISREG(st.st_mode)) {
         pthread_mutex_destroy(&f->f_lock);
         free(f);
