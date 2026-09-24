@@ -21,41 +21,42 @@
 #include "nsp_module.h"
 
 /* ================= 输出守卫（canary） =================
- * NspResolveResult：调用方（FUSE 回调栈）用本守卫包裹，
+ * NspPathDecision：调用方（FUSE 回调栈）用本守卫包裹，
  * 前后 canary 被模块整块越界写破坏时 loader 逐模块调用后检测——
  * 破坏精确归因到"刚调用完的模块"。canary 值取黄金比例常量，
  * 与正常数据碰撞概率可忽略。 */
 #define NSP_GUARD_CANARY 0x9E3779B97F4A7C15ULL
 typedef struct {
     uint64_t front;
-    NspResolveResult r;
+    NspPathDecision r;
     uint64_t back;
-} NspResolveGuard;
+} NspDecisionGuard;
 
 /* 标量与字符串首字节必须在每次分派、直通回退前重置；回调也会在无命中时
-   读取 ro/is_ftp/虚拟目录标志，不能只重置 valid。 */
-static inline void nsp_resolve_result_init(NspResolveResult* r) {
+   读取 read_only/is_ftp/虚拟目录性质，不能只重置 valid。 */
+static inline void nsp_decision_init(NspPathDecision* r) {
     r->valid = false;
-    r->user_id = -1;
-    r->sub_path[0] = '\0';
+    r->appear_missing = false;
+    r->read_only = false;
+    r->attr_override = 0;
+    r->mode = 0;
+    r->uid = 0;
+    r->gid = 0;
+    r->virtual_kind = NSP_VK_NONE;
     r->pkg[0] = '\0';
-    r->hidden = false;
-    r->ro = false;
     r->real_path[0] = '\0';
-    r->is_redir = false;
-    r->is_virtual_ancestor = false;
-    r->is_redirect_target = false;
+    r->is_redirect = false;
     r->is_ftp = false;
     r->monitor_on = false;
 }
 
-static inline void nsp_guard_resolve_init(NspResolveGuard* g) {
+static inline void nsp_guard_decision_init(NspDecisionGuard* g) {
     g->front = NSP_GUARD_CANARY;
     g->back = NSP_GUARD_CANARY;
-    nsp_resolve_result_init(&g->r);
+    nsp_decision_init(&g->r);
 }
 /* canary 完整性检查（loader 每次模块调用后调用） */
-static inline bool nsp_guard_resolve_ok(const NspResolveGuard* g) {
+static inline bool nsp_guard_decision_ok(const NspDecisionGuard* g) {
     return g->front == NSP_GUARD_CANARY && g->back == NSP_GUARD_CANARY;
 }
 
@@ -64,9 +65,10 @@ static inline bool nsp_guard_resolve_ok(const NspResolveGuard* g) {
 bool nsp_guard_str_ok(const char* s, size_t len);
 /* 路径入参检查：非 NULL 且长度 < PATH_MAX */
 bool nsp_guard_path_ok(const char* p);
-/* resolve 输出校验：全部字符串字段 NUL 终止 + user_id 值域。
-   返回 0 通过；非 0 = 失败字段编号（detail 经 out 输出，可 NULL） */
-int nsp_guard_validate_resolve(const NspResolveResult* r, char* detail, size_t dsz);
+/* decision 输出校验：字符串字段 NUL 终止 + virtual_kind 值域 +
+   attr_override 未知位与置位字段值域。返回 0 通过；非 0 = 失败字段编号
+   （detail 经 out 输出，可 NULL） */
+int nsp_guard_validate_decision(const NspPathDecision* r, char* detail, size_t dsz);
 /* readdir_extra 单条目校验：name NUL 终止 */
 bool nsp_guard_dir_entry_ok(const NspDirEntry* e);
 

@@ -58,7 +58,7 @@ static void br_module_exit(void) {
     }
 }
 
-static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
+static int br_module_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (!q || !out) return -1;
     BrQuery bq = {
         .path = q->path,
@@ -71,21 +71,23 @@ static int br_module_resolve(const NspQueryCtx* q, NspResolveResult* out) {
         out->valid = false;
         return 0;
     }
+    /* 逐字段显式拷贝：BrResult 与 NspPathDecision 一一对应（user_id/sub_path
+       是本模块内部匹配用，不跨 ABI——框架自算，见 nsp_module.h） */
     out->valid = true;
-    out->user_id = r.user_id;
-    strncpy(out->sub_path, r.sub_path, sizeof out->sub_path - 1);
-    out->sub_path[sizeof out->sub_path - 1] = '\0';
+    out->appear_missing = r.appear_missing;
+    out->read_only = r.read_only;
+    out->attr_override = r.attr_override;
+    out->mode = r.mode;
+    out->uid = r.uid;
+    out->gid = r.gid;
     strncpy(out->pkg, r.pkg, sizeof out->pkg - 1);
     out->pkg[sizeof out->pkg - 1] = '\0';
-    out->monitor_on = r.monitor_on; /* 修复：漏拷贝导致全局 MONITOR ON 时 IO 监控失效 */
-    out->hidden = r.hidden;
-    out->ro = r.ro;
     strncpy(out->real_path, r.real_path, sizeof out->real_path - 1);
     out->real_path[sizeof out->real_path - 1] = '\0';
-    out->is_redir = r.is_redir;
-    out->is_virtual_ancestor = r.is_virtual_ancestor;
-    out->is_redirect_target = r.is_redirect_target;
+    out->virtual_kind = r.virtual_kind;
+    out->is_redirect = r.is_redirect;
     out->is_ftp = r.is_ftp;
+    out->monitor_on = r.monitor_on; /* 漏拷贝会导致全局 MONITOR ON 时 IO 监控失效 */
     return 0;
 }
 
@@ -103,9 +105,8 @@ static int br_module_probe(const NspQueryCtx* q, NspProbeResult* out) {
         return 0;
     }
     out->valid = true;
-    out->hidden = r.hidden;
-    out->is_redirect_target = r.is_redirect_target;
-    out->is_virtual_ancestor = r.is_virtual_ancestor;
+    out->appear_missing = r.appear_missing;
+    out->virtual_kind = r.virtual_kind;
     out->is_other_app_pkg = r.is_other_app_pkg;
     return 0;
 }

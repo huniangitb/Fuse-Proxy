@@ -100,8 +100,8 @@ void fault_fence_attribution(int* slot_out, const char** op_out, const char** na
 
 /* ---- 规则能力 ---- */
 int nsp_fence_resolve(int slot, const char* op_name,
-                      int (*fn)(const NspQueryCtx*, NspResolveResult*), const NspQueryCtx* q,
-                      NspResolveResult* out);
+                      int (*fn)(const NspQueryCtx*, NspPathDecision*), const NspQueryCtx* q,
+                      NspPathDecision* out);
 int nsp_fence_probe(int slot, const char* op_name, int (*fn)(const NspQueryCtx*, NspProbeResult*),
                     const NspQueryCtx* q, NspProbeResult* out);
 int nsp_fence_readdir_extra(int slot, const char* op_name,

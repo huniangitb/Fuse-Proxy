@@ -1052,15 +1052,16 @@ static bool br_effective_monitor(AppConfig* cfg, AppConfig* cat) {
 /* 字符串仅需首字节清零；成功路径负责覆盖，隐藏路径保留空串。 */
 static inline void br_result_init(BrResult* out) {
     out->valid = false;
-    out->user_id = -1;
-    out->sub_path[0] = '\0';
+    out->appear_missing = false;
+    out->read_only = false;
+    out->attr_override = 0;
+    out->mode = 0;
+    out->uid = 0;
+    out->gid = 0;
     out->pkg[0] = '\0';
-    out->hidden = false;
-    out->ro = false;
     out->real_path[0] = '\0';
-    out->is_redir = false;
-    out->is_virtual_ancestor = false;
-    out->is_redirect_target = false;
+    out->is_redirect = false;
+    out->virtual_kind = NSP_VK_NONE;
     out->is_ftp = false;
     out->monitor_on = false;
 }
@@ -1083,10 +1084,8 @@ void br_resolve(const BrQuery* q, BrResult* out) {
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0) {
             out->valid = true;
-            out->hidden = true;
-            out->user_id = path_user_id;
-            strcpy(out->sub_path, sub_path); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
-            strcpy(out->pkg, current_pkg);   /* 源为 128B 栈缓冲，NUL 结尾 */
+            out->appear_missing = true;
+            strcpy(out->pkg, current_pkg); /* 源为 128B 栈缓冲，NUL 结尾 */
             out->monitor_on = br_effective_monitor(cfg, cat);
             if (config_read_end(cfg_gen)) return;
             continue;
@@ -1100,27 +1099,28 @@ void br_resolve(const BrQuery* q, BrResult* out) {
             continue;
         }
         out->valid = true;
-        out->user_id = path_user_id;
-        strcpy(out->sub_path, sub_path); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
-        strcpy(out->pkg, current_pkg);   /* 源为 128B 栈缓冲，NUL 结尾 */
-        out->ro = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
-        out->is_redir = is_redir;
+        strcpy(out->pkg, current_pkg); /* 源为 128B 栈缓冲，NUL 结尾 */
+        out->read_only = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
+        out->is_redirect = is_redir;
         strcpy(out->real_path, p); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/类别/global 完整匹配节点），
-       直接判定 virtual_ancestor / redirect_target，避免各自再全路径遍历：
-       - virtual_ancestor：最深节点下存在带规则子节点（trie_is_ancestor 语义）
-       - redirect_target：最深节点本身是重定向目标（trie_is_redirect_target 语义）
+       直接判定虚拟目录性质，避免各自再全路径遍历：
+       - ANCESTOR：最深节点下存在带规则子节点（trie_is_ancestor 语义）
+       - TARGET：最深节点本身是重定向目标（trie_is_redirect_target 语义）
        （节点为 NULL = 路径未完整命中，两语义均为 false，与 trie_* 一致）
-       线性兜底仅覆盖通配/变量 redir 规则（未入 trie），全静态时跳过 */
+       线性兜底仅覆盖通配/变量 redir 规则（未入 trie），全静态时跳过。
+       ANCESTOR 优先于 TARGET：祖先性质决定是否合成目录，语义更强 */
         bool dyn_any = (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
-        out->is_virtual_ancestor = ((tm.app_node && trie_any_child_has_rules(tm.app_node)) ||
-                                    (tm.cat_node && trie_any_child_has_rules(tm.cat_node)) ||
-                                    (tm.global_node && trie_any_child_has_rules(tm.global_node))) ||
-                                   (dyn_any && br_virtual_ancestor_linear(cfg, cat, sub_path));
-        out->is_redirect_target = ((tm.app_node && tm.app_node->redir_target) ||
-                                   (tm.cat_node && tm.cat_node->redir_target) ||
-                                   (tm.global_node && tm.global_node->redir_target)) ||
-                                  (dyn_any && br_redirect_target_linear(cfg, cat, sub_path));
+        bool is_ancestor = ((tm.app_node && trie_any_child_has_rules(tm.app_node)) ||
+                            (tm.cat_node && trie_any_child_has_rules(tm.cat_node)) ||
+                            (tm.global_node && trie_any_child_has_rules(tm.global_node))) ||
+                           (dyn_any && br_virtual_ancestor_linear(cfg, cat, sub_path));
+        bool is_target = ((tm.app_node && tm.app_node->redir_target) ||
+                          (tm.cat_node && tm.cat_node->redir_target) ||
+                          (tm.global_node && tm.global_node->redir_target)) ||
+                         (dyn_any && br_redirect_target_linear(cfg, cat, sub_path));
+        out->virtual_kind = is_ancestor ? NSP_VK_ANCESTOR
+                                        : (is_target ? NSP_VK_TARGET : NSP_VK_NONE);
         /* FTP 规则（`FTP <虚拟前缀> <段名>`）：应用 > 类别 > GLOBAL
        （与 REDIRECT 作用域语义一致）；命中结果由 br_trie_resolve 的 trie
        下降一次取得（替代 config_ftp_match 每请求 O(N) 线性扫描）；
@@ -1223,7 +1223,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
                 bool hidden = br_hidden_static_part(sub_path, current_pkg, &tm, &is_skel) ||
                               br_is_other_app_pkg(sub_path, current_pkg);
                 out->valid = true;
-                out->hidden = hidden;
+                out->appear_missing = hidden;
                 out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
                 if (config_read_end(cfg_gen)) return;
                 continue;
@@ -1247,21 +1247,23 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
             if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, &tm) ||
                 br_is_other_app_pkg(sub_path, current_pkg)) {
                 out->valid = true;
-                out->hidden = true;
+                out->appear_missing = true;
                 if (config_read_end(cfg_gen)) return;
                 continue;
             }
             out->valid = true;
-            out->hidden = trie_hidden || br_is_other_app_pkg(sub_path, current_pkg);
+            out->appear_missing = trie_hidden || br_is_other_app_pkg(sub_path, current_pkg);
             bool dyn_any =
                 (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
-            out->is_redirect_target = ((ca && ca->redir_target) || (cc && cc->redir_target) ||
-                                       (cg && cg->redir_target)) ||
-                                      (dyn_any && br_redirect_target_linear(cfg, cat, sub_path));
-            out->is_virtual_ancestor =
+            bool p_target = ((ca && ca->redir_target) || (cc && cc->redir_target) ||
+                             (cg && cg->redir_target)) ||
+                            (dyn_any && br_redirect_target_linear(cfg, cat, sub_path));
+            bool p_ancestor =
                 ((ca && trie_any_child_has_rules(ca)) || (cc && trie_any_child_has_rules(cc)) ||
                  (cg && trie_any_child_has_rules(cg))) ||
                 (dyn_any && br_virtual_ancestor_linear(cfg, cat, sub_path));
+            out->virtual_kind = p_ancestor ? NSP_VK_ANCESTOR
+                                           : (p_target ? NSP_VK_TARGET : NSP_VK_NONE);
             out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
             if (config_read_end(cfg_gen)) return;
             continue;
@@ -1275,14 +1277,16 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
             br_is_other_app_pkg(sub_path, current_pkg)) {
             out->valid = true;
-            out->hidden = true;
+            out->appear_missing = true;
             if (config_read_end(cfg_gen)) return;
             continue;
         }
         out->valid = true;
-        out->hidden = tm.hidden || br_is_other_app_pkg(sub_path, current_pkg);
-        out->is_redirect_target = br_is_redirect_target(cfg, cat, sub_path);
-        out->is_virtual_ancestor = br_is_virtual_ancestor(cfg, cat, sub_path);
+        out->appear_missing = tm.hidden || br_is_other_app_pkg(sub_path, current_pkg);
+        out->virtual_kind = br_is_virtual_ancestor(cfg, cat, sub_path)
+                                ? NSP_VK_ANCESTOR
+                                : (br_is_redirect_target(cfg, cat, sub_path) ? NSP_VK_TARGET
+                                                                            : NSP_VK_NONE);
         out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
 
         /* 填充目录缓存（trie 沿父目录一次下降，后续条目复用） */

@@ -51,26 +51,30 @@ typedef struct {
     pid_t pid;
 } BrQuery;
 
+/* 决策结果（模块内部类型，字段与 ABI 的 NspPathDecision 对齐）。
+   user_id/sub_path 只在本模块内部用于规则匹配，不回传框架——框架自算
+   （见 include/nsp_module.h 的 NspPathDecision 说明）。 */
 typedef struct {
     bool valid;
-    int user_id;
-    char sub_path[PATH_MAX];
-    char pkg[128];
-    bool hidden;
-    bool ro;
+    bool appear_missing; /* HIDE 命中 */
+    bool read_only;      /* RO 命中 */
+    uint32_t attr_override; /* NSP_OV_* 位图；0 = 不改属性（本模块暂不设置） */
+    uint32_t mode;
+    int32_t uid;
+    int32_t gid;
+    char pkg[128]; /* uid 解析出的包名 */
     char real_path[PATH_MAX];
-    bool is_redir;
-    bool is_virtual_ancestor;
-    bool is_redirect_target;
-    bool is_ftp; /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定） */
+    bool is_redirect;
+    uint8_t virtual_kind; /* NspVirtualKind */
+    bool is_ftp; /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定）。
+                    ⚠ 过渡字段：FTP 归属迁移到 ftp_module 后删除 */
     bool monitor_on;
 } BrResult;
 
 typedef struct {
     bool valid;
-    bool hidden;
-    bool is_redirect_target;
-    bool is_virtual_ancestor;
+    bool appear_missing;  /* 条目应视为不存在 → 跳过 */
+    uint8_t virtual_kind; /* NspVirtualKind：TARGET 条目跳过（避免与虚拟目录重复） */
     bool is_other_app_pkg;
 } BrProbeResult;
 
