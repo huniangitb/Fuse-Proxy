@@ -1384,6 +1384,26 @@ static int vfs_fsync(const char* path, int datasync, struct fuse_file_info* fi) 
     return 0;
 }
 
+/* ================= 路径缓存失效（框架侧唯一出口） =================
+ * 两级语义互补，需同时做：
+ *   - inode 级 fuse_invalidate_path：丢属性/数据缓存。对已打开的文件
+ *     立即生效（句柄直接持 inode，不再经名字查找）；
+ *   - entry 级 fuse_invalidate_path_entry：丢内核 dentry，使「名字 →
+ *     inode」重新 lookup。远端增删/改名后只有它能让旧映射立刻失效——
+ *     inode 级不触碰名字映射，旧 dentry 会一直命中到 entry_timeout 到期。
+ * entry 级是项目内 libfuse 分支（subprojects/libfuse，master-Android）追加
+ * 的接口，上游/系统/预构建 libfuse 均无此符号，故用弱引用：缺失时自动
+ * 退化为仅 inode 级，不影响在系统库上的构建与运行。行为回归见
+ * tests/test_libfuse_inval.py。 */
+extern int fuse_invalidate_path_entry(struct fuse* f, const char* path)
+    __attribute__((weak));
+
+static void vfs_inval_path(struct fuse* f, const char* path) {
+    if (!f) return;
+    fuse_invalidate_path(f, path);
+    if (fuse_invalidate_path_entry) fuse_invalidate_path_entry(f, path);
+}
+
 static int vfs_flush(const char* path, struct fuse_file_info* fi) {
     /* close() 同步等待 FLUSH 返回——写模式 STOR 上传必须在此完成（FLUSH
        错误会传播给 close() → 应用读到 EIO）。backend_flush 只收尾数据、
@@ -1406,12 +1426,10 @@ static int vfs_flush(const char* path, struct fuse_file_info* fi) {
             } else if (rc != 0 && rc != NSP_FENCE_BADFN)
                 module_guard_error(slot, "backend_flush", rc, path, "flush 返回异常");
             if (rc == 0) {
-                /* 数据已落盘（上传完成）：使路径缓存失效。
-                   attr_timeout=1.0 下旧大小/不存在缓存会让立即读取
-                   getattr 命中旧值；libfuse3 仅有 fuse_invalidate_path
-                   （同时失效 attr+entry） */
+                /* 数据已落盘（上传完成）：使路径缓存失效，否则立即读取
+                   会命中旧属性/旧 dentry */
                 struct fuse_context* ctx = fuse_get_context();
-                if (ctx && ctx->fuse) fuse_invalidate_path(ctx->fuse, path);
+                if (ctx) vfs_inval_path(ctx->fuse, path);
             }
             return rc < 0 ? rc : 0;
         }
