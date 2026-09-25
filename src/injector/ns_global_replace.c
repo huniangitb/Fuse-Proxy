@@ -367,6 +367,21 @@ static int do_global_replace(void* raw) {
             }
             LOG_DBG("全局替换: 备份 %s -> %s", sub[k].mount_point, target);
         }
+        /* 备份树脱离传播组（MS_PRIVATE|MS_REC）：备份 bind 的源（族根/子挂载）为
+           共享挂载，绑定后与源同处一个传播组；随后替换步骤以 MNT_DETACH 卸族根
+           顶层时，内核沿传播组杀掉“同位置的子挂载”（顶层存活、备份子节点消失
+           → 还原时丢失 0/Android/data）。置私有后备份成为独立快照，卸载传播
+           不再命中；此后新起的应用经 ns 克隆看到的备份同样为私有副本 */
+        if (mount(nullptr, backup_top, nullptr, MS_PRIVATE | MS_REC, nullptr) != 0) {
+            log_ns_error("[global_replace] MS_PRIVATE %s failed errno=%d (%s)\n", backup_top, errno,
+                         strerror(errno));
+            LOG_ERR("全局替换: 置 MS_PRIVATE %s 失败: %s（备份将被替换卸载传播破坏）", backup_top,
+                    strerror(errno));
+            free(all);
+            free(roots);
+            free(sub);
+            return -1;
+        }
     }
 
     /* 4. 替换：三族全部族根，最深优先卸载后 bind fuse_src，并置 MS_SHARED 传播 */

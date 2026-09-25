@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mount.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -280,6 +281,7 @@ int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), voi
 struct MountArgs {
     const char* src;
     const char* target;
+    int tree_fd; /* ns_bind_mount_cross：调用方命名空间预克隆的源树 fd（-1=无） */
 };
 static int do_bind_mount(void* raw_args) {
     struct MountArgs* args = (struct MountArgs*)raw_args;
@@ -433,9 +435,78 @@ static int do_move_mount(void* raw_args) {
     return 0;
 }
 int ns_bind_mount(int pid, const char* source, const char* target) {
-    struct MountArgs args = {source, target};
+    struct MountArgs args = {source, target, -1};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_bind_mount, &args, &child_err);
+    if (ret < 0 && child_err != 0) errno = child_err;
+    return ret;
+}
+/* open_tree/move_mount 常量：宿主 glibc <sys/mount.h>/<fcntl.h> 已提供，
+   NDK bionic 缺失时按 UAPI 值补齐（Linux 5.2+ 系统调用） */
+#ifndef SYS_open_tree
+#if defined(__x86_64__) || defined(__aarch64__)
+#define SYS_open_tree 428
+#endif
+#endif
+#ifndef SYS_move_mount
+#if defined(__x86_64__) || defined(__aarch64__)
+#define SYS_move_mount 429
+#endif
+#endif
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+#ifndef OPEN_TREE_CLOEXEC
+#define OPEN_TREE_CLOEXEC O_CLOEXEC
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+/* 在调用方（源）命名空间内克隆 source 处的挂载树：open_tree 克隆以路径为根、
+   AT_RECURSIVE 含全部子挂载，语义与 mount(2) MS_BIND|MS_REC 逐字节等价 */
+static int open_tree_clone(const char* source) {
+    return (int)syscall(SYS_open_tree, AT_FDCWD, source,
+                        OPEN_TREE_CLONE | AT_RECURSIVE | OPEN_TREE_CLOEXEC);
+}
+static int do_cross_bind(void* raw_args) {
+    struct MountArgs* args = (struct MountArgs*)raw_args;
+    if (args->tree_fd >= 0) {
+        struct stat st;
+        if (stat(args->target, &st) != 0 && mkdir_recursive(args->target) != 0 && errno != EEXIST) {
+            return errno;
+        }
+        if (syscall(SYS_move_mount, args->tree_fd, "", AT_FDCWD, args->target,
+                    MOVE_MOUNT_F_EMPTY_PATH) == 0) {
+            return 0;
+        }
+        int err = errno;
+        log_ns_error("[ns_error] cross bind move_mount(fd -> %s) errno=%d (%s)\n", args->target,
+                     err, strerror(err));
+        return err;
+    }
+    /* 兜底：源无法在调用方命名空间克隆（如缺 open_tree 的老内核）时退回旧式
+       mount(2)——仅在允许源路径穿越 /proc/<pid>/root 的内核上可用 */
+    return do_bind_mount(raw_args);
+}
+/* 跨命名空间 bind：内核拒绝 mount(2) 的源路径经 /proc/<pid>/root 穿越到外层
+   命名空间（源必须位于当前命名空间，一律 EINVAL），合法机制是「源命名空间
+   open_tree(OPEN_TREE_CLONE) 克隆 → 目标命名空间 move_mount」。fd 在调用方
+   命名空间打开，fork 后由 setns 到目标命名空间的子进程继承；父进程在
+   run_in_mnt_ns 返回后关闭自身副本 */
+int ns_bind_mount_cross(int pid, const char* source, const char* target) {
+    struct MountArgs args = {source, target, -1};
+    args.tree_fd = open_tree_clone(source);
+    if (args.tree_fd < 0) {
+        int e = errno;
+        log_ns_error("[ns_error] open_tree(%s) errno=%d (%s)，退回 mount(2) 源穿越\n", source, e,
+                     strerror(e));
+    }
+    int child_err = 0;
+    int ret = run_in_mnt_ns(pid, do_cross_bind, &args, &child_err);
+    if (args.tree_fd >= 0) close(args.tree_fd);
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
 }
@@ -446,7 +517,7 @@ int ns_umount_and_rmdir(int pid, const char* target) {
     return run_in_mnt_ns(pid, do_umount_and_rmdir, (void*)target, nullptr);
 }
 int ns_move_mount(int pid, const char* source, const char* target) {
-    struct MountArgs args = {source, target};
+    struct MountArgs args = {source, target, -1};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_move_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -812,6 +883,10 @@ static int do_combined_mount(void* raw_args) {
                 if (mp[0] == '\0') continue;
                 const char* rel = mp + tlen;
                 while (*rel == '/') rel++;
+                /* rel_full：含 user id 段的原始相对路径。源路径合成必须保留 uid
+                   （族根镜像为 <族根>/<uid>/Android/data），下面的 rel 解析仅消费
+                   uid 用于族根匹配，不可再用于拼源路径（否则丢 uid → ENOENT） */
+                const char* rel_full = rel;
                 /* 解析 rel 首段 user id（如 /0/Android/data → 0） */
                 int user = 0;
                 if (ns_is_digit_char(*rel)) {
@@ -840,7 +915,7 @@ static int do_combined_mount(void* raw_args) {
                     continue;
                 }
                 char src[256];
-                snprintf(src, sizeof src, "%s/%s", sys_src, rel);
+                snprintf(src, sizeof src, "%s/%s", sys_src, rel_full);
                 mkdir_recursive(mp);
                 if (mount(src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
                     int err = errno;

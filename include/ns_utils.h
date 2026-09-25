@@ -15,6 +15,10 @@ typedef struct {
 
 /* 绑定挂载 */
 int ns_bind_mount(int pid, const char* source, const char* target);
+/* 跨命名空间绑定挂载：源路径位于调用方（init）命名空间（如 /proc/1/root<target>）。
+   内核拒绝 mount(2) 源路径穿越（EINVAL），改走源命名空间 open_tree 克隆 +
+   目标命名空间 move_mount */
+int ns_bind_mount_cross(int pid, const char* source, const char* target);
 /* 递归卸载 */
 int ns_umount_recursive(int pid, const char* target);
 /* 卸载并删除目录 */
