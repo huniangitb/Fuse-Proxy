@@ -53,7 +53,6 @@
 #include <sys/ioctl.h>
 
 bool g_passthrough_enabled = false;
-bool g_preserve_perms = false;
 bool g_disable_sandbox = false; /* 新增：禁用沙盒功能标志 */
 
 static int g_ready_fd = -1;
@@ -292,10 +291,10 @@ static inline int vfs_check_read_only(const NspPathDecision* d, uid_t uid) {
     return (uid != 0 && d->read_only) ? -EROFS : 0;
 }
 
-/* 属性覆盖落实（getattr 用）：在框架既有权限策略**之后**应用，故模块的显式
-   声明优先于框架默认（伪造模式属主=访问者、skel 目录 0755、/Android/data 保留
-   真实属主等）。只改权限位，文件类型位始终取自真实属性——不允许模块把一个
-   文件声明成目录（那属于 appear_missing/重定向该解决的问题）。 */
+/* 属性覆盖落实（getattr 用）：在框架既有属性来源**之后**应用，故模块的显式
+   声明优先于框架默认（底层真实属性、虚拟目录继承上级、FTP 继承用户存储根等）。
+   只改权限位，文件类型位始终取自真实属性——不允许模块把一个文件声明成目录
+   （那属于 appear_missing/重定向该解决的问题）。 */
 static inline void vfs_apply_attr_override(const NspPathDecision* d, struct stat* st) {
     if (!d->valid) return;
     if (d->attr_override & NSP_OV_MODE) st->st_mode = (st->st_mode & S_IFMT) | (d->mode & 07777);
@@ -531,14 +530,10 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                     module_guard_error(bslot, "backend_getattr", brc, sub_path, "getattr 返回异常");
                 VFS_RETURN(brc < 0 ? brc : -EIO);
             }
-            if (!g_preserve_perms) {
-                st->st_uid = ctx->uid;
-                st->st_gid = ctx->gid;
-            } else if (st->st_uid == 0 && st->st_gid == 0) {
-                /* 权限完全镜像：FTP 后端未提供真实属主（uid/gid=0），FTP 虚拟目录
-                   （如前缀"云盘"及其子项）权限继承其本地上级——用户存储根
-                   /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录
-                   lstat 必失败，故取用户存储根的真实属主，而非固定 root） */
+            /* 后端不提供真实属主（uid/gid=0）时继承其本地上级——用户存储根
+               /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录 lstat
+               必失败，故取用户存储根的真实属主，而非固定 root） */
+            if (st->st_uid == 0 && st->st_gid == 0) {
                 int root_uid = (path_user_id >= 0) ? path_user_id : 0;
                 char root_path[PATH_MAX];
                 common_storage_root(root_uid, root_path, sizeof(root_path));
@@ -576,9 +571,9 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                 st->st_uid = pst.st_uid;
                 st->st_gid = pst.st_gid;
             } else {
+                /* 上级也取不到：属主未知，保持 memset 的 0（root/未知），
+                   不伪造为访问者属主 */
                 st->st_mode |= 0755;
-                st->st_uid = ctx->uid;
-                st->st_gid = ctx->gid;
             }
             vfs_apply_attr_override(&rr, st);
             VFS_RETURN(0);
@@ -592,26 +587,12 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             vfs_log_io_err(current_pkg, "GETATTR", sub_path, "errno=%d real='%s'", err, p);
         VFS_RETURN(-err);
     }
-    bool is_data_or_obb =
-        (strncmp(sub_path, "/Android/data", 13) == 0 || strncmp(sub_path, "/Android/obb", 12) == 0);
-    if (!g_preserve_perms && !is_data_or_obb) {
-        st->st_uid = ctx->uid;
-        st->st_gid = ctx->gid;
-    } else if (!g_preserve_perms && is_redir && S_ISDIR(st->st_mode)) {
-        /* 权限完全镜像模式下（--preserve-perms）保留底层真实目录权限，
-           不强制 0777；仅伪造模式才放开重定向目录写权限 */
-        st->st_mode = (st->st_mode & ~07777) | 0777;
-    }
-    if (is_android_skel_dir(sub_path)) {
-        if (!g_preserve_perms) {
-            /* 伪造模式：skel 骨架目录统一 0755 + 访问者属主 */
-            st->st_mode = (st->st_mode & ~07777) | S_IFDIR | 0755;
-            st->st_uid = ctx->uid;
-            st->st_gid = ctx->gid;
-        }
-        /* 权限完全镜像模式（--preserve-perms）：保留底层真实目录权限与属主 */
-    }
-            vfs_apply_attr_override(&rr, st);
+    /* 属性一律原样上报底层真实值。旧的「默认伪造模式」（属主改写为访问者、
+       重定向目录强制 0777、skel 目录强制 0755 + 访问者属主）已删除：
+       挂载未开 default_permissions，内核本就不做 DAC 判定（fuse_permission
+       对 open/read/write 直接放行，仅 access(2) 才下发 FUSE_ACCESS），模块
+       也不具备 POSIX DAC——伪造属主拦不住任何访问，纯属误导读取方。 */
+    vfs_apply_attr_override(&rr, st);
     VFS_RETURN(0);
 }
 
@@ -734,24 +715,18 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
         *rc_out = -EIO;
         return true;
     }
-    /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致） */
+    /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致）。
+       filler 只消费 st_ino 与 st_mode 的类型位（fuse_add_direntry 不读 uid/gid），
+       此处仅用于给出 d_type，属主由 getattr 决定 */
     struct stat dirst;
     memset(&dirst, 0, sizeof dirst);
     dirst.st_mode = S_IFDIR | 0755;
-    if (!g_preserve_perms) {
-        dirst.st_uid = ctx->uid;
-        dirst.st_gid = ctx->gid;
-    }
     filler(buf, ".", &dirst, 0, 0);
     filler(buf, "..", &dirst, 0, 0);
     for (int i = 0; i < n; i++) {
         struct stat st;
         memset(&st, 0, sizeof st);
         st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-        if (!g_preserve_perms) {
-            st.st_uid = ctx->uid;
-            st.st_gid = ctx->gid;
-        }
         if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
     }
     free(entries);
@@ -779,15 +754,14 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     d->has_data = d->has_obb = d->has_android = d->has_pkg = false;
 }
 
-/* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束 */
+/* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束。
+   只给 st_ino + 类型位：fuse_add_direntry 不读 uid/gid（属主看 getattr） */
 static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
     if (!vfs_hash_insert(&d->ht, name)) return true; /* 已存在：跳过 */
     struct stat st;
     memset(&st, 0, sizeof(st));
     st.st_ino = synthetic_inode(name);
     st.st_mode = S_IFDIR | 0755;
-    st.st_uid = d->ctx->uid;
-    st.st_gid = d->ctx->gid;
     return d->filler(d->buf, name, &st, 0, 0) == 0;
 }
 
@@ -798,8 +772,6 @@ static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
     memset(&st, 0, sizeof(st));
     st.st_ino = synthetic_inode(name);
     st.st_mode = S_IFDIR | 0755;
-    st.st_uid = d->ctx->uid;
-    st.st_gid = d->ctx->gid;
     return d->filler(d->buf, name, &st, 0, 0) == 0;
 }
 
@@ -857,10 +829,6 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
             memset(&st, 0, sizeof(st));
             readdir_join(item_real_path, 2047, d->real_path, de->d_name);
             if (lstat(item_real_path, &st) == 0) {
-                if (!g_preserve_perms) {
-                    st.st_uid = d->ctx->uid;
-                    st.st_gid = d->ctx->gid;
-                }
                 if (d->filler(d->buf, de->d_name, &st, 0, 0) != 0) return false;
             } else {
                 if (d->filler(d->buf, de->d_name, nullptr, 0, 0) != 0) return false;
@@ -897,22 +865,12 @@ static bool vfs_readdir_fill_own_pkg(VfsReaddirCtx* d) {
 }
 
 /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler。
-   虚拟条目（如 FTP 前缀目录）权限继承其本地上级——用户存储根
-   /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录 lstat 必失败），
-   而非固定 root/访问者属主 */
+   条目只给 st_ino 与目录类型位——fuse_add_direntry 不读 uid/gid 与权限位，
+   属主/权限由 getattr 决定（虚拟路径无底层文件，getattr 侧继承用户存储根） */
 static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
     NspDirEntry virt[MAX_MODULES * 8];
     NspQueryCtx vq = {
         .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = d->sub_path};
-    struct stat parent_st;
-    memset(&parent_st, 0, sizeof(parent_st));
-    bool have_parent = false;
-    {
-        int root_uid = (path_user_id >= 0) ? path_user_id : 0;
-        char root_path[PATH_MAX];
-        common_storage_root(root_uid, root_path, sizeof(root_path));
-        have_parent = (lstat(root_path, &parent_st) == 0);
-    }
     int vn = module_dispatch_readdir(&vq, d->sub_path, path_user_id, d->current_pkg, d->is_root,
                                      virt, MAX_MODULES * 8);
     /* 纵深防御：dispatch 已钳制，但仍钳制 vn 防栈越界读 */
@@ -924,19 +882,7 @@ static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
         struct stat st_dir;
         memset(&st_dir, 0, sizeof(st_dir));
         st_dir.st_ino = synthetic_inode(virt[vi].name);
-        st_dir.st_mode = S_IFDIR;
-        if (g_preserve_perms && have_parent) {
-            /* 权限完全镜像模式：虚拟条目（如 FTP 前缀目录）继承
-               用户存储根属主/组与权限位——与 vfs_getattr FTP 分支
-               语义一致（默认伪造模式下两者均用访问者属主） */
-            st_dir.st_mode |= (parent_st.st_mode & 07777);
-            st_dir.st_uid = parent_st.st_uid;
-            st_dir.st_gid = parent_st.st_gid;
-        } else {
-            st_dir.st_mode |= 0755;
-            st_dir.st_uid = d->ctx->uid;
-            st_dir.st_gid = d->ctx->gid;
-        }
+        st_dir.st_mode = S_IFDIR; /* filler 只取类型位给出 d_type */
         if (d->filler(d->buf, virt[vi].name, &st_dir, 0, 0) != 0) return false;
     }
     return true;
@@ -2324,8 +2270,6 @@ int main(int argc, char* argv[]) {
             g_ready_fd = atoi(argv[i] + 11);
         } else if (strncmp(argv[i], "--global-root-fd=", 17) == 0) {
             g_global_root_fd = atoi(argv[i] + 17);
-        } else if (strcmp(argv[i], "--preserve-perms") == 0) {
-            g_preserve_perms = true;
         } else if (strcmp(argv[i], "--strip-o-direct") == 0) {
             g_strip_o_direct = true;
 #ifdef TARGET_ANDROID

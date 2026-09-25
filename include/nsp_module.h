@@ -162,7 +162,7 @@ typedef struct NspPathDecision {
     bool valid;          /* false = 模块无法解析该路径，框架回退默认行为 */
     bool appear_missing; /* 视为不存在 → 框架在**所有**回调统一返回 ENOENT */
     bool read_only;      /* 只读 → 框架在所有变更操作统一返回 EROFS
-                            （root 豁免与 --preserve-perms 等策略由框架持有） */
+                            （root 豁免等策略由框架持有） */
     /* 属性覆盖（可选）：attr_override 的位决定 mode/uid/gid 是否被采用。
        mode 只取 07777 权限位，S_IFMT 类型位一律忽略——文件类型始终取自真实
        属性（声明 S_IFDIR 也不会把文件变成目录；要让路径"表现成目录"应走重定向/

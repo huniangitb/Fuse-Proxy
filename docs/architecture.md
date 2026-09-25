@@ -172,7 +172,8 @@ FUSE 回调（如 getattr）
 模块只声明「路径该怎么表现」（`NspPathDecision`），**errno 映射与权限策略不由模块决定**，集中在框架：
 
 - `fw_route()`（`fuse_daemon.c`）是所有回调的唯一入口，按操作类别 `VFS_OP_READ` / `VFS_OP_MUTATE` 强制：`appear_missing` → `ENOENT`（**所有**回调统一，写类不再是 `EACCES`）、`read_only` → `EROFS`（root 豁免由框架持有）。`open`/`access` 是否算「写」取决于 `flags`/`mask`（`O_RDONLY` 打开只读路径必须放行），触发条件留在回调内，但判定统一走 `vfs_check_read_only()`。
-- `vfs_apply_attr_override()` 在框架既有权限策略**之后**落实 `attr_override`（`NSP_OV_MODE/UID/GID` 位图），故模块的显式声明优先于伪造模式属主=访问者、skel 目录 0755、`/Android/data|obb` 保留真实属主等默认；`mode` 只取 `07777`，类型位始终取自真实属性。
+- `vfs_apply_attr_override()` 在框架既有属性来源**之后**落实 `attr_override`（`NSP_OV_MODE/UID/GID` 位图），故模块的显式声明优先于框架默认（底层真实属性、虚拟目录继承上级目录、FTP 条目继承用户存储根）；`mode` 只取 `07777`，类型位始终取自真实属性。
+- **属性一律原样上报底层真实值**：早期的「默认伪造模式」（属主改写为访问者、重定向目录强制 0777、skel 目录强制 0755）连同 `--preserve-perms` 开关已删除。理由：挂载只带 `allow_other` 而无 `default_permissions`，内核对 `open/read/write` 本就不做 DAC 判定（仅 `access(2)` 下发 `FUSE_ACCESS`，且由 root 守护进程执行的 `access()` 必然通过），模块也不具备 POSIX DAC——伪造属主拦不住任何访问，只会误导读取方。`readdir` 的 filler 只消费 `st_ino` 与类型位（`fuse_add_direntry` 不读 uid/gid），故条目侧的属主赋值同样是死代码。
 
 > 位图而非「特殊值哨兵」：若用 `mode == UNSET` 表示不改，模块惯用的 `memset(out,0,...)` 会静默变成「权限清 0 + 属主 root」。位图让零初始化等于「什么都不改」。
 

@@ -65,11 +65,6 @@ struct GlobalFuseInfo g_media_fuse = {.pid = 1,
 /* 全局替换式挂载方案开关（--global-replace）：默认关闭，沿用逐应用挂载 */
 bool g_global_replace_mode = false;
 
-/* 权限完全镜像开关（--preserve-perms）：injector 命令行解析，启动
-   fuse_daemon 时传递 --preserve-perms，使 FUSE 保留底层真实文件的
-   uid/gid/权限（不伪造为访问者权限） */
-static bool g_preserve_perms_flag = false;
-
 /* 回退处理标记：INIT 回包被内核拒绝（就绪验证 ECONNREFUSED 且 daemon 进程存活）时置位，
    之后启动 fuse_daemon 一律附加 --no-passthrough，以标准 FUSE 模式规避透传协商位被拒 */
 static bool g_no_passthrough_fallback = false;
@@ -410,7 +405,6 @@ static void inject_global_fuse() {
         args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
-        if (g_preserve_perms_flag) args[ai++] = "--preserve-perms";
         if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
@@ -533,7 +527,6 @@ static void inject_media_fuse() {
         args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
-        if (g_preserve_perms_flag) args[ai++] = "--preserve-perms";
         if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
@@ -999,8 +992,6 @@ static void parse_cli_args(int argc, char* argv[], bool* start_passive_out) {
             g_min_log_level = LOG_WARN;
         else if (strcmp(argv[i], "--strip-o-direct") == 0)
             g_strip_o_direct = true;
-        else if (strcmp(argv[i], "--preserve-perms") == 0)
-            g_preserve_perms_flag = true;
         else if (strcmp(argv[i], "--crash-test") == 0)
             g_crash_test = true;
         else if (strcmp(argv[i], "--passive") == 0 || strcmp(argv[i], "passive") == 0)
