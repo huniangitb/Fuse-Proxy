@@ -244,10 +244,11 @@ def main():
 
         print("\n── D. 未声明覆盖的路径：框架默认策略不变 ──")
         nst = os.stat(normal / "n.txt")
-        if nst.st_uid == os.getuid() and nst.st_gid == os.getgid():
-            ok("直通路径属主仍为访问者（框架默认伪造策略未被破坏）")
+        real = os.lstat(STORAGE / "0" / "normal" / "n.txt")
+        if nst.st_uid == real.st_uid and nst.st_gid == real.st_gid:
+            ok("直通路径属主取自底层真实属性（伪造属主=访问者的模式已删除）")
         else:
-            fail("直通属主", f"实际 {nst.st_uid}/{nst.st_gid}，期望 {os.getuid()}/{os.getgid()}")
+            fail("直通属主", f"实际 {nst.st_uid}/{nst.st_gid}，底层 {real.st_uid}/{real.st_gid}")
         if nst.st_mode & 0o7777 == 0o644:
             ok("直通路径权限仍为 0644")
         else:

@@ -122,7 +122,7 @@ int (*get_pkg)(uid_t uid, pid_t tid, char* out, size_t size); /* uid→包名（
 |---|---|
 | `appear_missing` | 所有回调统一 `ENOENT`（含写类；V2 写类为 `EACCES`） |
 | `read_only` | 变更操作统一 `EROFS`；root 豁免由框架持有。`open`/`access` 是否算"写"由 `flags`/`mask` 判定（`O_RDONLY` 打开只读路径必须放行） |
-| `attr_override` | 位图（`NSP_OV_MODE`/`NSP_OV_UID`/`NSP_OV_GID`），默认 0 = 不改——故 `memset(out, 0, sizeof *out)` 这类零初始化是安全的。在框架既有权限策略**之后**应用，模块的显式声明优先于框架默认（伪造模式属主=访问者、skel 目录 0755 等）。`mode` 只取 `07777`，`S_IFMT` 类型位一律忽略 |
+| `attr_override` | 位图（`NSP_OV_MODE`/`NSP_OV_UID`/`NSP_OV_GID`），默认 0 = 不改——故 `memset(out, 0, sizeof *out)` 这类零初始化是安全的。在框架既有属性来源**之后**应用，模块的显式声明优先于框架默认（底层真实属性、虚拟目录继承上级、FTP 继承用户存储根）。`mode` 只取 `07777`，`S_IFMT` 类型位一律忽略 |
 
 > **属性覆盖为何用位图而非"特殊值哨兵"**：若用 `mode == UNSET`/`uid == -1` 表示"不改"，模块惯用的 `memset` 零初始化会静默变成"权限清 0 + 属主 root"。位图让"零初始化 = 什么都不改"成立。
 
