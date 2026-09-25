@@ -15,9 +15,12 @@ typedef struct {
 
 /* 绑定挂载 */
 int ns_bind_mount(int pid, const char* source, const char* target);
-/* 跨命名空间绑定挂载：源路径位于调用方（init）命名空间（如 /proc/1/root<target>）。
-   内核拒绝 mount(2) 源路径穿越（EINVAL），改走源命名空间 open_tree 克隆 +
-   目标命名空间 move_mount */
+/* 在目标 ns 内查找应用 uid 对应的族根挂载点（同 ns 重建目标视图的首选源），
+   族优先级 user > androidwritable > installer；命中返回 0，未找到 ENOENT */
+int ns_find_family_root(int pid, uid_t app_uid, char* out, size_t outsz);
+/* 跨命名空间绑定挂载（族根缺失时的兜底）：源路径位于调用方（init）命名空间
+   （如 /proc/1/root<target>）。内核拒绝 mount(2) 源路径穿越（EINVAL），
+   改走源命名空间 open_tree 克隆 + 目标命名空间 move_mount */
 int ns_bind_mount_cross(int pid, const char* source, const char* target);
 /* 递归卸载 */
 int ns_umount_recursive(int pid, const char* target);

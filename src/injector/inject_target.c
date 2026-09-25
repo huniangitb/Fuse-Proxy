@@ -534,10 +534,24 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
         ns_umount_recursive(pid, backup_path);
     }
     if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
-        char init_src[256];
-        snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
-        /* 跨 ns 重建：mount(2) 源穿越被内核拒绝（EINVAL），须走 open_tree+move_mount */
-        ns_bind_mount_cross(pid, init_src, target_path);
+        /* 首选同 ns 族根重建：目标的系统视图就是族根的传播副本
+           （/storage/emulated ← rbind /mnt/user/<uid>/emulated），族根在应用
+           ns 内始终存活，直接 MS_REC bind 即可，完全不涉及跨 ns */
+        char fam_src[PATH_MAX];
+        int fr = ns_find_family_root(pid, uid, fam_src, sizeof(fam_src));
+        if (fr == 0) {
+            ns_bind_mount(pid, fam_src, target_path);
+        } else {
+            LOG_DBG("应用清理: 应用 ns 内无 uid %u 对应族根(rc=%d)，走跨 ns 兜底重建",
+                    (unsigned)uid, fr);
+        }
+        if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
+            /* 兜底：应用 ns 内无可用族根（异常态）→ 拉 init 视图。mount(2) 源
+               穿越被内核拒绝（EINVAL），须走 open_tree+move_mount */
+            char init_src[256];
+            snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
+            ns_bind_mount_cross(pid, init_src, target_path);
+        }
     }
     /* 卸载/还原即解除注入状态（显式标志清除，列表不再误报） */
     unmark_injected(pid);
