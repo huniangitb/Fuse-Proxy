@@ -536,7 +536,8 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
     if (ns_is_mounted(pid, target_path, nullptr) <= 0) {
         char init_src[256];
         snprintf(init_src, sizeof(init_src), "/proc/1/root%s", target_path);
-        ns_bind_mount(pid, init_src, target_path);
+        /* 跨 ns 重建：mount(2) 源穿越被内核拒绝（EINVAL），须走 open_tree+move_mount */
+        ns_bind_mount_cross(pid, init_src, target_path);
     }
     /* 卸载/还原即解除注入状态（显式标志清除，列表不再误报） */
     unmark_injected(pid);
