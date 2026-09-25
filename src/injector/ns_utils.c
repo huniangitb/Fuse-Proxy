@@ -491,6 +491,34 @@ static int do_cross_bind(void* raw_args) {
        mount(2)——仅在允许源路径穿越 /proc/<pid>/root 的内核上可用 */
     return do_bind_mount(raw_args);
 }
+/* 在目标 pid 的挂载命名空间内查找应用 uid 对应的族根挂载点
+   （/mnt/<family>/<user_id>/emulated，user_id = uid/100000）。族根即目标存储
+   路径（/storage/emulated）的系统视图本体，且在应用 ns 内始终存活——逐应用
+   注入/清理只动 target、不碰族根——同 ns 内 MS_REC bind 即可重建目标，无需跨
+   ns 拉 /proc/<pid>/root<target>。族优先级与 preserve 一致：
+   user > androidwritable > installer。命中返回 0 并填充 out，否则 ENOENT */
+int ns_find_family_root(int pid, uid_t app_uid, char* out, size_t outsz) {
+    if (!out || outsz == 0) return EINVAL;
+    out[0] = '\0';
+    int user_id = (int)(app_uid / 100000u);
+    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+    if (!all) return ENOMEM;
+    int n = ns_read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
+    int ret = ENOENT;
+    for (int fam = 2; fam >= 0 && ret == ENOENT; fam--) {
+        for (int i = 0; i < n; i++) {
+            int ruid = 0;
+            if (ns_is_family_root(all[i].mount_point) &&
+                ns_parse_family_root(all[i].mount_point, &ruid) == fam && ruid == user_id) {
+                snprintf(out, outsz, "%s", all[i].mount_point);
+                ret = 0;
+                break;
+            }
+        }
+    }
+    free(all);
+    return ret;
+}
 /* 跨命名空间 bind：内核拒绝 mount(2) 的源路径经 /proc/<pid>/root 穿越到外层
    命名空间（源必须位于当前命名空间，一律 EINVAL），合法机制是「源命名空间
    open_tree(OPEN_TREE_CLONE) 克隆 → 目标命名空间 move_mount」。fd 在调用方
