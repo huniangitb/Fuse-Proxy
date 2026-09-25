@@ -1,4 +1,4 @@
-/* ================= 全局替换式挂载方案（--global-replace，卸载优先） =================
+/* ================= 全局替换式挂载方案（注入方法 v2/v3，卸载优先） =================
  * 对应 scripts/global.sh 的 replace/restore/status，injector 内建实现。
  * 目标设备不支持 MS_REC：备份/替换/恢复全部逐节点枚举 mountinfo 后单个
  * MS_BIND（父先子后 bind、最深优先 MNT_DETACH 卸载），确保不遗漏系统
@@ -20,7 +20,7 @@
 #include <errno.h>
 #include <sys/mount.h>
 
-/* ================= 全局替换式挂载方案（--global-replace，卸载优先） =================
+/* ================= 全局替换式挂载方案（注入方法 v2/v3，卸载优先） =================
  * 对应 scripts/global.sh 的 replace/restore/status，injector 内建实现。
  * 目标设备不支持 MS_REC：备份/替换/恢复全部逐节点枚举 mountinfo 后单个
  * MS_BIND（父先子后 bind、最深优先 MNT_DETACH 卸载），确保不遗漏系统

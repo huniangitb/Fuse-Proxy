@@ -54,7 +54,7 @@
 #define IPC_SOCKET_NAME         "nsp_ipc_socket"
 #define CONFIG_BROADCAST_SOCKET "nsp_config_broadcast"
 #define RULE_SOCKET_NAME        "nsp_rule_socket"
-/* 全局替换式挂载方案（--global-replace）的备份根目录：位于项目配置路径下 */
+/* 全局替换式挂载方案（注入方法 v2/v3）的备份根目录：位于项目配置路径下 */
 #define GLOBAL_BACKUP_ROOT BACKUP_DIR "/global_emulated"
 
 #include "nsp_log.h"
