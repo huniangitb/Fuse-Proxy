@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-全局替换式挂载方案（--global-replace）测试
+注入方法 v2（全局替换）测试
 ===========================================
 在**私有挂载命名空间**中模拟安卓 emulated 挂载视图，驱动
 build_gnu/global_replace_ctl 验证新方法的完整生命周期：
@@ -294,12 +294,12 @@ def run_tests():
             fail("审查子进程准备", "/storage/emulated 未挂载")
         # 单进程组合：set-src + add-tracked + audit + force-recover 一次调用完成，
         # 状态（追踪表/fuse_src）在进程内共享，避免跨进程状态丢失导致空洞通过
-        r = sh(CTL, "audit-run", str(child2), FUSE_SRC, "10000", "com.audit.test", "on",
+        r = sh(CTL, "audit-run", str(child2), FUSE_SRC, "10000", "com.audit.test", "v2",
                check=False)
         if r.returncode == 0:
             ok("audit-run(全局替换) 命令返回 0")
         else:
-            fail("audit-run(on)", f"rc={r.returncode} {r.stdout.strip()}")
+            fail("audit-run(v2)", f"rc={r.returncode} {r.stdout.strip()}")
         out = r.stdout.strip()
         import re as _re
         m = _re.search(r"audit_mounted=(\d+) force_mounted=(\d+)", out)
@@ -312,7 +312,7 @@ def run_tests():
             if force_mounted == 1:
                 ok("全局替换模式: force-recover 跳过逐应用卸载（挂载保持）")
             else:
-                fail("force-recover(on) 跳过卸载", f"force_mounted={force_mounted}")
+                fail("force-recover(v2) 跳过卸载", f"force_mounted={force_mounted}")
         else:
             fail("audit-run 输出解析", f"无法解析: {out}")
     if not child2_reaped:

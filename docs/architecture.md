@@ -189,6 +189,21 @@ FUSE 回调（如 getattr）
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
 5. 此后该应用对 `/sdcard` 的访问经 FUSE → basic_rules 匹配。
 
+#### 注入方法（`--inject-method=v1|v2|v3`）
+
+上列 1–5 步描述的是**逐应用挂载**，即默认的 v1；injector 另有两种注入方法（`include/injector.h` 的 `g_inject_method`，派生 `inject_is_global_replace()` / `inject_restore_nontarget()`）：
+
+| 方法 | 机制 | 非目标应用 | 目标判定 |
+|---|---|---|---|
+| `v1`（默认） | 发现目标应用 → 进其 mount namespace 挂 FUSE | 保持系统视图 | 按配置 |
+| `v2` | 在 init 命名空间把 emulated 三族族根整体替换为项目 FUSE（`ns_global_replace_system`，卸载优先），目标应用无需逐应用挂载 | 进其命名空间卸载项目 FUSE 并 bind 回系统视图备份（`perform_app_restore`） | 按配置 |
+| `v3` | 同 v2 的全局替换 | **不还原、不卸载**——所有应用（含系统应用）默认见代理视图 | 忽略 `GLOBAL_INJECT` / `SKIP_SYSTEM_APPS`；应用段/类别段头显式 `OFF`、隔离进程与 zygote 排除照旧生效 |
+
+- `v3` 即「默认全局挂载」：规则命中仍由 FUSE 框架按调用方 uid/pkg 判定，**框架侧零改动**——无规则的应用走默认 ALLOW，只是视图同样经项目 FUSE。
+- 旧 `--global-replace` 参数已删除，其行为等价于 `--inject-method=v2`。
+- 退出与崩溃恢复路径（`do_cleanup`、FUSE 连续崩溃超限、`force_recover_tracked_mounts`）在 v2/v3 下统一走 `ns_global_restore_system` 还原系统视图，与注入时的替换配对。
+- GNU 侧无法运行 injector，三种方法的判定与审查逻辑经测试驱动 `global_replace_ctl` 覆盖（`tests/test_inject_method.py`、`tests/test_global_replace.py`）。
+
 #### 主动扫描与被动通知
 
 第 2 步有两条并存的途径。除周期扫描外，Zygisk 模块（`src/zygisk/`）在应用创建时即时上报：

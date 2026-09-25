@@ -494,7 +494,8 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
 }
 
 /*
- * 全局替换模式（--global-replace）下的非目标应用还原：
+ * 注入方法 v2（全局替换且还原非目标）下的非目标应用还原：
+ * （v3 不调用本函数——不对非目标应用做任何还原）
  * 进入应用命名空间，卸载项目 FUSE 并 bind 回该用户备份的系统视图。
  * 幂等：仅当 /storage/emulated 顶层源为项目 FUSE（nsp_global 或 fuse_daemon）
  * 时才操作；非目标应用已还原/未受影响时直接跳过。

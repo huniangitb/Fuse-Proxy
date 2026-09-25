@@ -76,7 +76,7 @@ int ns_global_mount(int pid, const char* pkg, const char* source, const char* ta
  */
 int ns_force_umount_stale(int pid, const char* target);
 
-/* ================= 全局替换式挂载方案（--global-replace，卸载优先） =================
+/* ================= 全局替换式挂载方案（注入方法 v2/v3，卸载优先） =================
  * 对应 scripts/global.sh 的 status/replace/restore，但改为 injector 内建能力：
  *  - 替换：在 init 命名空间（pid=1）中，将 installer/androidwritable/user 三族
  *    所有用户的 emulated 族根替换为项目 FUSE 源（fuse_src），使所有应用默认

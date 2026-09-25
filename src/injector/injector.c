@@ -62,8 +62,9 @@ struct GlobalFuseInfo g_media_fuse = {.pid = 1,
                                       .last_crash_time = 0,
                                       .disabled = false};
 
-/* 全局替换式挂载方案开关（--global-replace）：默认关闭，沿用逐应用挂载 */
-bool g_global_replace_mode = false;
+/* 注入方法（--inject-method=v1|v2|v3）：默认 v1 逐应用挂载；
+   v2 全局替换 + 非目标应用还原；v3 全局替换且不还原（默认全局挂载） */
+InjectMethod g_inject_method = INJECT_METHOD_V1;
 
 /* 回退处理标记：INIT 回包被内核拒绝（就绪验证 ECONNREFUSED 且 daemon 进程存活）时置位，
    之后启动 fuse_daemon 一律附加 --no-passthrough，以标准 FUSE 模式规避透传协商位被拒 */
@@ -287,7 +288,7 @@ void handle_fuse_ready_event(void* ptr) {
                 g_fuse_ready = 1;
                 LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
                 /* 全局替换模式：FUSE 就绪后立即将 emulated 族根替换为代理视图 */
-                if (g_global_replace_mode) {
+                if (inject_is_global_replace()) {
                     LOG("全局替换模式: 执行 emulated 全局替换 (fuse_src=%s)",
                         g_global_fuse.mnt_path);
                     if (ns_global_replace_system(g_global_fuse.pid, g_global_fuse.mnt_path,
@@ -444,7 +445,7 @@ static void inject_global_fuse() {
 }
 
 static void inject_media_fuse() {
-    if (g_global_replace_mode) return; /* 新挂载方案（全局替换）无需媒体专属 FUSE */
+    if (inject_is_global_replace()) return; /* 新挂载方案（全局替换）无需媒体专属 FUSE */
     if (g_media_fuse.disabled) return;
     if (g_media_fuse.fuse_pid > 0) {
         kill(g_media_fuse.fuse_pid, SIGTERM);
@@ -618,7 +619,7 @@ static void check_and_recover_fuse() {
             g_global_fuse.disabled = true;
             /* 全局替换模式：崩溃超限禁用 FUSE 前必须恢复系统 emulated 视图，
                避免系统停留在失效的代理 bind 上 */
-            if (g_global_replace_mode) {
+            if (inject_is_global_replace()) {
                 LOG("FUSE 崩溃超限，恢复系统 emulated 视图");
                 ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT);
             }
@@ -639,7 +640,7 @@ static void check_and_recover_fuse() {
     /* 新挂载方案（全局替换模式）：媒体专属 FUSE 仅传统逐应用挂载方案需要。
        全局替换下 /storage/emulated 已整体由全局 FUSE 提供代理视图，媒体模块
        自动继承，无需专属 FUSE——整体跳过启动/崩溃恢复/热重载终结管理。 */
-    if (g_global_replace_mode) return;
+    if (inject_is_global_replace()) return;
 
     /* 
      * 媒体 FUSE 专属崩溃恢复：
@@ -659,12 +660,12 @@ static void check_and_recover_fuse() {
             g_media_fuse.disabled = true;
             return;
         }
-        if (!g_global_replace_mode && is_media_module_injected_target()) {
+        if (!inject_is_global_replace() && is_media_module_injected_target()) {
             LOG("专用媒体 FUSE 异常退出，执行重新拉起任务");
             inject_media_fuse();
         }
     } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready &&
-               !g_global_replace_mode) {
+               !inject_is_global_replace()) {
         /* 
          * 媒体 FUSE 惰性启动：
          * 初始时未启动，在定时轮询中检测到 com.android.providers.media.module 变动为注入目标时，惰性启动媒体 FUSE。
@@ -836,10 +837,11 @@ int scan_zygote_children() {
     for (int i = 0; i < entry_count && m_count < MAX_ASYNC_MOUNTS_LOCAL; i++) {
         bool is_target =
             is_target_app_locked(entries[i].cmdline, entries[i].uid, entries[i].pid, false);
-        if (g_global_replace_mode) {
-            /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
-               非目标应用需主动卸载项目 FUSE 并还原系统视图（卸载优先） */
-            if (!is_target) {
+        if (inject_is_global_replace()) {
+            /* 全局替换：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
+               非目标应用仅 v2 主动卸载项目 FUSE 并还原系统视图（卸载优先），
+               v3 不还原——默认全局挂载，故 v3 下不产生任何任务 */
+            if (inject_restore_nontarget() && !is_target) {
                 m_tasks[m_count].pid = entries[i].pid;
                 m_tasks[m_count].uid = entries[i].uid;
                 strncpy(m_tasks[m_count].cmdline, entries[i].cmdline,
@@ -865,18 +867,19 @@ int scan_zygote_children() {
             struct timespec ts_mnt;
             if (first_scan) clock_gettime(CLOCK_MONOTONIC, &ts_mnt);
 
-            if (g_global_replace_mode) {
-                /* 增量还原：还原成功（或已还原跳过）后标记追踪，
+            if (inject_restore_nontarget()) {
+                /* v2 增量还原：还原成功（或已还原跳过）后标记追踪，
                    后续周期扫描经 is_tracked 直接跳过，避免反复检测；
                    还原即解除注入状态（显式标志清除） */
                 if (perform_app_restore(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid) >= 0) {
                     add_tracked(m_tasks[i].pid);
                     unmark_injected(m_tasks[i].pid);
                 }
-            } else {
+            } else if (!inject_is_global_replace()) {
                 perform_app_mount(m_tasks[i].cmdline, m_tasks[i].pid, m_tasks[i].uid, nullptr,
                                   "主动扫描");
             }
+            /* v3 不入队（上方分支），故不存在第三类任务 */
 
             if (first_scan) {
                 struct timespec ts_mnt_end;
@@ -884,8 +887,8 @@ int scan_zygote_children() {
                 long el = (ts_mnt_end.tv_sec - ts_mnt.tv_sec) * 1000 +
                           (ts_mnt_end.tv_nsec - ts_mnt.tv_nsec) / 1000000;
                 LOG_DBG("初次扫描 - %s %s(PID:%d) 完成, 耗时: %ldms",
-                        g_global_replace_mode ? "还原" : "挂载", m_tasks[i].cmdline, m_tasks[i].pid,
-                        el);
+                        inject_is_global_replace() ? "还原" : "挂载", m_tasks[i].cmdline,
+                        m_tasks[i].pid, el);
             }
         }
     }
@@ -916,7 +919,7 @@ static void do_cleanup() {
     }
     force_recover_tracked_mounts();
     /* 全局替换模式：退出前先恢复系统 emulated 视图，再终结 FUSE */
-    if (g_global_replace_mode && g_fuse_ready) {
+    if (inject_is_global_replace() && g_fuse_ready) {
         LOG("退出前恢复系统 emulated 视图");
         ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT);
     }
@@ -996,8 +999,21 @@ static void parse_cli_args(int argc, char* argv[], bool* start_passive_out) {
             g_crash_test = true;
         else if (strcmp(argv[i], "--passive") == 0 || strcmp(argv[i], "passive") == 0)
             start_passive = true;
-        else if (strcmp(argv[i], "--global-replace") == 0)
-            g_global_replace_mode = true;
+        else if (strncmp(argv[i], "--inject-method=", 16) == 0) {
+            const char* v = argv[i] + 16;
+            if (strcmp(v, "v1") == 0)
+                g_inject_method = INJECT_METHOD_V1;
+            else if (strcmp(v, "v2") == 0)
+                g_inject_method = INJECT_METHOD_V2;
+            else if (strcmp(v, "v3") == 0)
+                g_inject_method = INJECT_METHOD_V3;
+            else {
+                /* 静默回退 v1 会让生产配置与预期完全不符（尤其 service.sh），
+                   故参数错值直接拒绝启动 */
+                fprintf(stderr, "injector: 未知注入方法 '%s'（可用 v1/v2/v3）\n", v);
+                exit(1);
+            }
+        }
     }
     *start_passive_out = start_passive;
 }
@@ -1083,7 +1099,7 @@ static void injector_start_fuses(bool start_passive) {
     inject_global_fuse();
     if (g_global_fuse.fuse_pid <= 0) exit(1);
 
-    if (!g_global_replace_mode && is_media_module_injected_target()) {
+    if (!inject_is_global_replace() && is_media_module_injected_target()) {
         LOG("检测到 com.android.providers.media.module 在注入目标之列，正在启动专用媒体 FUSE 实例。");
         inject_media_fuse();
     } else {
@@ -1115,16 +1131,17 @@ static void on_signal_event(int sig_fd) {
 }
 
 static void maybe_periodic_scan(void) {
-    if (!g_passive_mode || (g_global_replace_mode && !g_global_replace_scanned_once)) {
-        /* 被动模式下禁用周期扫描（新应用由 zygisk IPC 通知即时还原）；
-           全局替换模式仅在程序生命周期开始时执行一次兜底扫描，
-           还原存量非目标应用，之后不再反复周期检测 */
+    if (!g_passive_mode || (inject_is_global_replace() && !g_global_replace_scanned_once)) {
+        /* 被动模式下禁用周期扫描（新应用由 zygisk IPC 通知即时处理）；
+           全局替换（v2/v3）仅在程序生命周期开始时执行一次兜底扫描——
+           v2 用于还原存量非目标应用、v3 用于刷新全量应用 PID 缓存，
+           之后不再反复周期检测 */
         if (seconds_until_next_scan > 0) {
             seconds_until_next_scan--;
         }
         if (seconds_until_next_scan == 0) {
             int found_now = scan_zygote_children();
-            if (g_global_replace_mode) {
+            if (inject_is_global_replace()) {
                 g_global_replace_scanned_once = true;
             }
             if (found_now > 0) {
@@ -1272,7 +1289,7 @@ static void handle_pending_reload(void) {
             waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
             g_media_fuse.fuse_pid = 0;
             ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
-        } else if (g_media_fuse.fuse_pid <= 0 && !g_global_replace_mode &&
+        } else if (g_media_fuse.fuse_pid <= 0 && !inject_is_global_replace() &&
                    is_media_module_injected_target() && g_fuse_ready) {
             LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
             inject_media_fuse();
@@ -1335,6 +1352,10 @@ int main(int argc, char* argv[]) {
     bool start_passive = false;
     parse_cli_args(argc, argv, &start_passive);
     injector_early_init();
+    const char* method_desc = g_inject_method == INJECT_METHOD_V1   ? "逐应用挂载"
+                              : g_inject_method == INJECT_METHOD_V2 ? "全局替换，非目标应用还原"
+                                                                    : "全局替换，不还原非目标（默认全局挂载）";
+    LOG("注入方法: v%d（%s）", (int)g_inject_method, method_desc);
     InjectorFds fds = {.sig_fd = -1, .timer_fd = -1, .ipc_sock = -1};
     injector_setup_epoll(&fds);
     injector_start_fuses(start_passive);

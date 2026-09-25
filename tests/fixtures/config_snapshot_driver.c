@@ -45,7 +45,7 @@ volatile sig_atomic_t g_passive_mode = 0;
 volatile sig_atomic_t g_fuse_ready = 0;
 int g_epoll_fd = -1;
 int g_global_root_fd = -1;
-bool g_global_replace_mode = false;
+InjectMethod g_inject_method = INJECT_METHOD_V1;
 
 static int g_pass = 0;
 static int g_fail = 0;

@@ -44,8 +44,22 @@ void set_ctl_mnt_src(const char* src) {
     g_ctl_mnt_src = src;
 }
 
-/* 全局替换模式开关（injector.c 定义，本驱动自行提供便于测试控制） */
-bool g_global_replace_mode = false;
+/* 注入方法（injector.c 定义，本驱动自行提供便于测试控制） */
+InjectMethod g_inject_method = INJECT_METHOD_V1;
+
+/* 解析 v1|v2|v3：非法值直接报错退出，与 injector 参数解析一致（不静默回退 v1） */
+static InjectMethod parse_method(const char* s) {
+    if (strcmp(s, "v1") == 0) return INJECT_METHOD_V1;
+    if (strcmp(s, "v2") == 0) return INJECT_METHOD_V2;
+    if (strcmp(s, "v3") == 0) return INJECT_METHOD_V3;
+    fprintf(stderr, "global_replace_ctl: 未知注入方法 '%s'（可用 v1/v2/v3）\n", s);
+    exit(2);
+}
+
+static void print_method(void) {
+    printf("method=v%d global_replace=%d restore_nontarget=%d\n", (int)g_inject_method,
+           (int)inject_is_global_replace(), (int)inject_restore_nontarget());
+}
 
 /* 媒体 FUSE 源 stub：audit/force_recover 路径测试不涉及媒体实例 */
 const char* get_media_mnt_src(void) {
@@ -72,7 +86,9 @@ static void usage(const char* prog) {
         "  collect <pid> <base> <include_self> <include_fuse>  列出 base 下挂载点(最深优先)\n"
         "  set-src <fuse_src>                         设置 audit 用项目 FUSE 源\n"
         "  add-tracked <pid> <uid> <pkg>              注册一个追踪应用（供 audit 验证）\n"
-        "  audit-run <pid> <fuse_src> <uid> <pkg> <on|off>  单进程执行审查+强制回收并报告\n"
+        "  is-target <v1|v2|v3> <conf> <pkg> <uid> <pid> <ipc0|1>  装载配置后查询目标判定（0/1）\n"
+        "  method <v1|v2|v3>                          打印注入方法派生标志\n"
+        "  audit-run <pid> <fuse_src> <uid> <pkg> <v1|v2|v3>  单进程执行审查+强制回收并报告\n"
         "                                            挂载状态（audit_mounted= force_mounted=）\n",
         prog);
 }
@@ -96,25 +112,48 @@ int main(int argc, char* argv[]) {
         printf("add-tracked ok\n");
         return 0;
     }
+    if (strcmp(cmd, "is-target") == 0 && argc >= 8) {
+        /* 配置须与判定同进程（本驱动无常驻状态）：每次调用先装载配置，
+           再持读锁查询——与 injector 早期初始化/审查路径一致 */
+        g_inject_method = parse_method(argv[2]);
+        config_init_lock();
+        config_lock_write();
+        load_config_rules(argv[3]);
+        config_unlock_write();
+        config_lock_read();
+        bool target = is_target_app_locked(argv[4], (uid_t)atoi(argv[5]), atoi(argv[6]),
+                                           strcmp(argv[7], "1") == 0);
+        config_unlock_read();
+        printf("target=%d\n", target ? 1 : 0);
+        return 0;
+    }
+    if (strcmp(cmd, "method") == 0 && argc >= 3) {
+        g_inject_method = parse_method(argv[2]);
+        print_method();
+        return 0;
+    }
     if (strcmp(cmd, "audit-tracked") == 0 && argc >= 3) {
-        g_global_replace_mode = (strcmp(argv[2], "on") == 0);
+        g_inject_method = parse_method(argv[2]);
         audit_tracked_apps();
-        printf("audit-tracked done (global_replace=%d)\n", (int)g_global_replace_mode);
+        printf("audit-tracked done ");
+        print_method();
         return 0;
     }
     if (strcmp(cmd, "audit-specific") == 0 && argc >= 4) {
-        g_global_replace_mode = (strcmp(argv[2], "on") == 0);
+        g_inject_method = parse_method(argv[2]);
         ChangedPkg c = {.user_id = -1};
         strncpy(c.pkg_name, argv[3], sizeof(c.pkg_name) - 1);
         c.pkg_name[sizeof(c.pkg_name) - 1] = '\0';
         audit_and_remount_specific_apps(&c, 1);
-        printf("audit-specific done (global_replace=%d)\n", (int)g_global_replace_mode);
+        printf("audit-specific done ");
+        print_method();
         return 0;
     }
     if (strcmp(cmd, "force-recover") == 0 && argc >= 3) {
-        g_global_replace_mode = (strcmp(argv[2], "on") == 0);
+        g_inject_method = parse_method(argv[2]);
         force_recover_tracked_mounts();
-        printf("force-recover done (global_replace=%d)\n", (int)g_global_replace_mode);
+        printf("force-recover done ");
+        print_method();
         return 0;
     }
     if (strcmp(cmd, "audit-run") == 0 && argc >= 7) {
@@ -123,15 +162,16 @@ int main(int argc, char* argv[]) {
            /storage/emulated 挂载状态供测试断言 */
         int pid = atoi(argv[2]);
         set_ctl_mnt_src(argv[3]);
-        g_global_replace_mode = (strcmp(argv[6], "on") == 0);
+        g_inject_method = parse_method(argv[6]);
         add_tracked(pid);
         all_apps_upsert(pid, (uid_t)atoi(argv[4]), argv[5]);
         audit_tracked_apps();
         int audit_mounted = (ns_is_mounted(pid, NSP_ANDROID_EMULATED_ROOT, nullptr) > 0);
         force_recover_tracked_mounts();
         int force_mounted = (ns_is_mounted(pid, NSP_ANDROID_EMULATED_ROOT, nullptr) > 0);
-        printf("audit_mounted=%d force_mounted=%d (global_replace=%d)\n", audit_mounted,
-               force_mounted, (int)g_global_replace_mode);
+        printf("audit_mounted=%d force_mounted=%d (global_replace=%d restore_nontarget=%d)\n",
+               audit_mounted, force_mounted, (int)inject_is_global_replace(),
+               (int)inject_restore_nontarget());
         return 0;
     }
     if (strcmp(cmd, "batch-test") == 0) {

@@ -132,9 +132,9 @@ static void* ipc_mount_thread(void* raw) {
         }
     }
 
-    /* 防御性短路：全局替换模式下目标应用无需逐应用挂载
+    /* 防御性短路：全局替换（v2/v3）下目标应用无需逐应用挂载
        （全局 FUSE 已提供代理视图），即使被误调也直接跳过挂载操作 */
-    if (g_global_replace_mode) {
+    if (inject_is_global_replace()) {
         mark_injected(arg->pid);
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
         free(arg);
@@ -280,10 +280,10 @@ void handle_ipc_client_readable(int client_fd) {
         /* 核心修复：使用 clean_pkg 而非原始 pkg 进行配置匹配，
            避免带 ':process' 后缀的包名误判为未配置应用 */
         if (!is_target_app(clean_pkg, uid, pid, true)) {
-            /* 全局替换模式：非目标应用需主动卸载项目 FUSE 并还原系统视图
+            /* 注入方法 v2：非目标应用需主动卸载项目 FUSE 并还原系统视图
                （IPC 通知是最常见的应用启动路径，必须覆盖，否则非目标应用
-               永远停留在项目 FUSE 视图上） */
-            if (g_global_replace_mode) {
+               永远停留在项目 FUSE 视图上）；v3 不还原——默认全局挂载 */
+            if (inject_restore_nontarget()) {
                 IpcMountArg* arg = malloc(sizeof(IpcMountArg));
                 if (arg) {
                     strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
@@ -305,11 +305,11 @@ void handle_ipc_client_readable(int client_fd) {
         }
         if (access(NSP_ANDROID_EMULATED_ROOT "/", F_OK) != 0) return;
 
-        if (g_global_replace_mode) {
-            /* 新挂载方案（全局替换模式）：全局 FUSE 已挂载 /storage/emulated，
+        if (inject_is_global_replace()) {
+            /* 新挂载方案（全局替换 v2/v3）：全局 FUSE 已挂载 /storage/emulated，
                目标应用自动继承代理视图，无需 injector 逐应用挂载——
                仅标记注入状态并打印规则即可（避免 perform_app_mount 的
-               mountinfo 全量读取等 20ms+ 耗时）；非目标应用还原走上方分支 */
+               mountinfo 全量读取等 20ms+ 耗时）；非目标应用还原走上方分支（仅 v2） */
             mark_injected(pid);
             print_active_rules(clean_pkg, pid, uid, "IPC通知");
             LOG_DBG("全局替换模式: 目标应用 %s(PID:%d) 无需挂载，已由全局 FUSE 提供代理视图",

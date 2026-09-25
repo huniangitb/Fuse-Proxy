@@ -422,9 +422,15 @@ bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_i
         if (category_has_rules_locked(is_sys, user_id)) return true;
     }
     if (has_wildcard_enabled_locked(user_id)) return true;
-    if (g_global_cfg.global_inject && !is_isolated_uid(uid) && !strstr(cmdline, "zygote")) {
+    /* 注入方法 v3（默认全局挂载，含系统应用）：忽略 GLOBAL_INJECT 与
+       SKIP_SYSTEM_APPS 两个全局参数；应用段/类别段头的显式 OFF、隔离进程
+       与 zygote 排除照旧生效 */
+    bool v3 = (g_inject_method == INJECT_METHOD_V3);
+    if ((v3 || g_global_cfg.global_inject) && !is_isolated_uid(uid) &&
+        !strstr(cmdline, "zygote")) {
         /* 默认跳过系统应用，pm list packages -s 查询失败时回退到 uid < 10000 */
-        if (g_global_cfg.skip_system_apps && is_system_app_by_pkg(cmdline, uid)) return false;
+        if (!v3 && g_global_cfg.skip_system_apps && is_system_app_by_pkg(cmdline, uid))
+            return false;
         if (from_ipc || is_zygote_child(pid)) return true;
     }
     return false;
@@ -537,10 +543,11 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
 }
 
 void force_recover_tracked_mounts() {
-    if (g_global_replace_mode) {
-        /* 全局替换模式：系统 emulated 视图由 ns_global_restore_system 统一还原，
-           逐应用旧式 cleanup_app_mounts 会造成重复/冲突卸载，此处仅清理追踪表 */
-        LOG_DBG("全局替换模式: force_recover 跳过逐应用卸载，由全局恢复统一处理");
+    if (inject_is_global_replace()) {
+        /* 注入方法 v2/v3（全局替换）：系统 emulated 视图由 ns_global_restore_system
+           统一还原，逐应用旧式 cleanup_app_mounts 会造成重复/冲突卸载，
+           此处仅清理追踪表 */
+        LOG_DBG("全局替换: force_recover 跳过逐应用卸载，由全局恢复统一处理");
     } else {
         for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
             TrackedEntry* e = g_tracked_hash[i];
@@ -599,19 +606,27 @@ void audit_tracked_apps() {
                 LOG_DBG("配置审查: %s (PID: %d) 已非注入目标，清除注入标志。", cmd, pid);
             }
             if (!is_target && has_fuse) {
-                if (g_global_replace_mode) {
-                    /* 全局替换模式：非目标应用需卸载项目 FUSE 并还原系统视图备份 */
+                if (inject_restore_nontarget()) {
+                    /* 注入方法 v2：非目标应用需卸载项目 FUSE 并还原系统视图备份 */
                     perform_app_restore(cmd, pid, uid);
+                    LOG_DBG(
+                            "配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。",
+                            cmd, pid);
+                } else if (inject_is_global_replace()) {
+                    /* 注入方法 v3：不对非目标应用还原/卸载，保持全局代理视图 */
+                    LOG_DBG("配置审查(v3): %s (PID: %d) 非目标应用保持全局代理视图，不还原。", cmd,
+                            pid);
                 } else {
                     char backup_path[PATH_MAX];
                     snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
                     cleanup_app_mounts(pid, target_path, backup_path, uid);
+                    LOG_DBG(
+                            "配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。",
+                            cmd, pid);
                 }
-                LOG_DBG("配置审查: %s (PID: %d) 已取消注入，视图已安全解挂恢复，继续保持运行追踪。",
-                        cmd, pid);
             } else if (is_target && !has_fuse) {
-                if (g_global_replace_mode) {
-                    /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载 */
+                if (inject_is_global_replace()) {
+                    /* 全局替换（v2/v3）：目标应用已由全局替换自动获得代理视图，无需逐应用挂载 */
                     LOG_DBG("配置审查: %s (PID: %d) 全局替换模式，目标应用无需逐应用挂载。", cmd,
                             pid);
                 } else {
@@ -654,17 +669,22 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
             }
             if (matched) {
                 bool is_target = is_target_app(cmd, uid, pid, false);
-                if (g_global_replace_mode) {
-                    /* 全局替换模式：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
-                       非目标应用需主动卸载项目 FUSE 并还原系统视图备份 */
+                if (inject_is_global_replace()) {
+                    /* 全局替换（v2/v3）：目标应用已由全局替换自动获得代理视图，无需逐应用挂载；
+                       非目标应用仅 v2 主动卸载项目 FUSE 并还原系统视图备份，
+                       v3 一律不还原（默认全局挂载，含系统应用） */
                     if (is_target) {
                         LOG_DBG(
                             "局部规则审查: 全局替换模式，目标应用 %s (PID: %d) 无需逐应用挂载。",
                             cmd, pid);
-                    } else {
+                    } else if (inject_restore_nontarget()) {
                         perform_app_restore(cmd, pid, uid);
                         LOG_DBG(
                             "局部规则审查: 全局替换模式，非目标应用 %s (PID: %d) 已还原系统视图。",
+                            cmd, pid);
+                    } else {
+                        LOG_DBG(
+                            "局部规则审查(v3): 非目标应用 %s (PID: %d) 保持全局代理视图，不还原。",
                             cmd, pid);
                     }
                 } else {
