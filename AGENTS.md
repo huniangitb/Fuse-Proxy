@@ -41,6 +41,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | `src/modules/ftp/ftp_mux.c`（epoll + curl_multi 控制面复用器）或 `backend_rc_is_business`（业务 errno 豁免） | `test_ftp_parallel.py`（连接复用与延迟收敛）、`test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
 | `src/config/path_vars.c` | `test_path_vars.py` |
 | injector 目标判定 / 注入方法（`inject_target.c`、`--inject-method=v1\|v2\|v3`） | `test_inject_method.py`（31，v1/v2/v3 判定矩阵：v3 忽略 `GLOBAL_INJECT`/`SKIP_SYSTEM_APPS` 而段头 `OFF` 仍生效、派生标志、非法值拒绝）、`test_global_replace.py`（需 root，v2 替换/还原/审查生命周期，无权限自动跳过） |
+| injector 挂载/清理序列（`ns_utils.c` 跨 ns bind 与 preserve 路径、`ns_global_replace.c` 替换/备份/还原、`cleanup_app_mounts`） | `test_inject_mount_env.py`（38/42/41，rootless unshare 沙箱仿真安卓拓扑内 v1/v2/v3 全生命周期：注入→REQ→SIGTERM 清理→退出后宿主 mountinfo 前后比对零污染，缺产物/userns 不可用自动跳过） |
 | `src/module/`（加载器/围栏/熔断/ABI） | `test_modules.py`（12，热插拔）、`test_module_circuit.py`（55，故障隔离）、`test_module_abi.py`（V3 契约/默认值/输出校验/V1+V2 拒载） |
 | 决策结构 / 框架单点强制（`NspPathDecision`、`fw_route` 的 appear_missing·read_only、`vfs_apply_attr_override`） | `test_module_overrides.py`（42，逐回调 errno 矩阵：appear_missing 统一 ENOENT、read_only 统一 EROFS、属性覆盖与类型位保持） |
 | `log_ctl` / `rule_server` 规则编辑（`nsp_rule_file`） | `test_log_ctl_rules.py`（30）、`test_rule_server.py` |

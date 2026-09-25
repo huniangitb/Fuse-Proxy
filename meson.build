@@ -374,6 +374,15 @@ if target_os == 'android'
     install_dir: install_bin_dir
   )
 else
+  # injector GNU 测试目标（test-only，不 install）：injector 本体只随 Android 模块
+  # 分发，但同一份源码在 GNU 下可编译，供 tests/test_inject_mount_env.py 在 rootless
+  # 容器沙箱（unshare user+mount+pid ns）里真实跑挂载/卸载流程。Android 分支不改动。
+  executable('injector',
+    injector_sources + common_sources,
+    include_directories: all_inc_dirs,
+    dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
+    install: false
+  )
   # 全局替换式挂载方案测试驱动（仅 GNU 构建）：injector 本体仅 Android 交叉构建，
   # GNU 测试无法直接运行它；本驱动链接 ns_utils 的全局替换原语并以 CLI 暴露，
   # 供 tests/test_global_replace.py 在私有挂载命名空间中模拟安卓视图验证。
