@@ -317,6 +317,24 @@ def check(proc, sock_name, conf_dir):
            and ftp_type["module"] == "ftp_module" and ftp_type["format"] == "pair", types)
     expect("PING 类型表含内置 HIDE", any(t["type"] == "HIDE" and t["builtin"] is True for t in types), types)
 
+    # 0. 内建类型的元数据随二进制内嵌（原 basic_rules.rules 的内容）：规则引擎
+    #    内建后模块目录里不再有该文件，若改回在 C 里裸注册类型名，desc 会全空
+    #    （前端按 desc 渲染类型说明），argc/global-only 只能靠格式默认值兜着。
+    hide_t = next((t for t in types if t["type"] == "HIDE"), None)
+    expect("内建 HIDE desc 中文", hide_t is not None and hide_t.get("desc") == "隐藏路径", hide_t)
+    expect("内建 HIDE desc_map 含英文",
+           hide_t is not None and hide_t.get("desc_map", {}).get("en") == "Hide path", hide_t)
+    expect("内建 MONITOR switch 1:1",
+           any(t["type"] == "MONITOR" and t["format"] == "switch" and t["argc_min"] == 1
+               and t["argc_max"] == 1 for t in types), types)
+    expect("内建 global_only 仅 GLOBAL_INJECT/SKIP_SYSTEM_APPS",
+           {t["type"] for t in types if t["global_only"]} == {"GLOBAL_INJECT", "SKIP_SYSTEM_APPS"},
+           types)
+    expect("内建类型 8 个且全部标 builtin",
+           {t["type"] for t in types if t["builtin"]} ==
+           {"HIDE", "RO", "REDIRECT", "ALLOW", "MONITOR", "SANDBOX",
+            "GLOBAL_INJECT", "SKIP_SYSTEM_APPS"}, types)
+
     # 1.1 多语言描述：默认（不传 lang）回传中文 desc；lang=en 回传英文 desc；
     #     同时含 desc_map 全语言映射与 argc 参数约束
     expect("FTP desc 默认中文",
@@ -332,6 +350,9 @@ def check(proc, sock_name, conf_dir):
     expect("FTP desc lang=en",
            ftp_en is not None and ftp_en.get("desc") == "FTP storage mapping: <virtual prefix>|<section>",
            ftp_en)
+    hide_en = next((t for t in r_en["data"]["rule_types"] if t["type"] == "HIDE"), None)
+    expect("内建 HIDE desc lang=en",
+           hide_en is not None and hide_en.get("desc") == "Hide path", hide_en)
     # 1.2 未知语言回退中文
     r_xx = send_cmd(proc, sock_name, {"cmd": "PING", "lang": "ja"})
     ftp_xx = next((t for t in r_xx["data"]["rule_types"] if t["type"] == "FTP"), None)
