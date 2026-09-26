@@ -84,6 +84,12 @@ static volatile sig_atomic_t g_boot_scan_done = 0;
 static char g_fw_rules_path[PATH_MAX] = {0};
 /* 模块目录（默认 MODULES_DIR 宏，可经 --modules-dir 覆盖） */
 static char g_modules_dir[PATH_MAX] = MODULES_DIR;
+/* 监听线程停止标志与自唤醒管道（同 fw_config.c 机制）：shutdown 需要**立即**
+   停住扫描线程再卸载模块，否则退出期间仍有扫描在 dlopen。 */
+static volatile bool g_mod_stop = false;
+static int g_mod_wake[2] = {-1, -1};
+static pthread_t g_mod_tid;
+static bool g_mod_thread_started = false;
 
 static const char* api_get_rules_path(void) {
     return g_fw_rules_path[0] ? g_fw_rules_path : NULL;
@@ -942,7 +948,7 @@ static void* module_monitor_thread(void* arg) {
     nsp_set_thread_name("nsp_modmon");
     int inotify_fd = -1;
     int wd = -1;
-    while (!g_log_shutdown) {
+    while (!g_mod_stop && !g_log_shutdown) {
         if (inotify_fd < 0) {
             inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
             if (inotify_fd < 0) {
@@ -961,8 +967,10 @@ static void* module_monitor_thread(void* arg) {
                 continue;
             }
         }
-        struct pollfd pfd = {.fd = inotify_fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, 5000);
+        struct pollfd pfds[2] = {{.fd = inotify_fd, .events = POLLIN},
+                                 {.fd = g_mod_wake[0], .events = POLLIN}};
+        int pr = poll(pfds, 2, 5000);
+        if (pr >= 0 && pfds[1].revents) break; /* 关闭唤醒：退出前不再扫描 */
         if (pr < 0) {
             if (errno == EINTR) continue;
             inotify_rm_watch(inotify_fd, wd);
@@ -1017,8 +1025,10 @@ int module_system_init(const char* rules_path, const char* modules_dir) {
     fw_config_set_reload_hook(on_config_reload);
     fw_config_init(g_fw_rules_path);
     module_scan_diff();
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, module_monitor_thread, NULL) == 0) pthread_detach(tid);
+    if (pipe2(g_mod_wake, O_NONBLOCK | O_CLOEXEC) != 0) g_mod_wake[0] = g_mod_wake[1] = -1;
+    if (pthread_create(&g_mod_tid, NULL, module_monitor_thread, NULL) == 0) {
+        g_mod_thread_started = true; /* 不 detach：shutdown 要 join，确保退出前线程已停 */
+    }
     /* 初始扫描完成后标记，后续热插拔变更才通知 injector */
     g_boot_scan_done = 1;
     int active = 0;
@@ -1031,6 +1041,16 @@ int module_system_init(const char* rules_path, const char* modules_dir) {
 }
 
 void module_system_shutdown(void) {
+    /* 先停扫描线程（唤醒 + join）：避免卸载/退出期间仍有扫描在 dlopen 模块 */
+    g_mod_stop = true;
+    if (g_mod_wake[1] >= 0) (void)!write(g_mod_wake[1], "x", 1);
+    if (g_mod_thread_started) {
+        pthread_join(g_mod_tid, nullptr);
+        g_mod_thread_started = false;
+    }
+    if (g_mod_wake[0] >= 0) close(g_mod_wake[0]);
+    if (g_mod_wake[1] >= 0) close(g_mod_wake[1]);
+    g_mod_wake[0] = g_mod_wake[1] = -1;
     for (int i = g_module_count - 1; i >= 0; i--) {
         if (!g_modules[i].active) continue;
         module_unload_one(g_modules[i].name);
