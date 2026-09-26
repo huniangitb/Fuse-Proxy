@@ -264,11 +264,6 @@ int nsp_fence_readdir_extra(int slot, const char* op_name,
     if (!fn) return NSP_FENCE_BADFN;
     NSP_FENCE_WRAP(slot, op_name, fn(q, sub_path, user_id, pkg, is_root, out, max));
 }
-int nsp_fence_get_pkg(int slot, const char* op_name, int (*fn)(uid_t, pid_t, char*, size_t),
-                      uid_t uid, pid_t tid, char* out, size_t sz) {
-    if (!fn) return NSP_FENCE_BADFN;
-    NSP_FENCE_WRAP(slot, op_name, fn(uid, tid, out, sz));
-}
 
 /* ================= 后端能力 ================= */
 

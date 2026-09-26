@@ -1,7 +1,6 @@
 /* badfn_rules.c — BADFN 测试模块：
  *   - /0/virt/<rest>  → 虚拟重定向（验证模块加载后规则生效）
  *   - readdir_extra   → 未实现（NULL）：验证 BADFN 不触发毒化
- *   - get_pkg         → 未实现（NULL）：验证 BADFN 不触发毒化
  *
  * 编译：gcc -shared -fPIC -O1 -DNSP_MODULE_BUILD -Iinclude badfn_rules.c -o badfn_rules.so
  */
@@ -38,12 +37,12 @@ static int badfn_probe(const NspQueryCtx* q, NspProbeResult* out) {
     return 0;
 }
 
-/* 只实现 resolve + probe，故意不实现 readdir_extra 和 get_pkg
-   → nsp_fence_readdir_extra / nsp_fence_get_pkg 返回 NSP_FENCE_BADFN */
+/* 只实现 resolve + probe，故意不实现 readdir_extra
+   → nsp_fence_readdir_extra 返回 NSP_FENCE_BADFN */
 static const NspModuleOps badfn_ops = {
     .resolve = badfn_resolve,
     .probe = badfn_probe,
-    /* readdir_extra = NULL, get_pkg = NULL */
+    /* readdir_extra = NULL */
 };
 
 const NspModuleInfo nsp_module_info = {

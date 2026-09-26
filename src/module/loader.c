@@ -1334,57 +1334,6 @@ int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user
     return n;
 }
 
-int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {
-    if (!pkg_out || pkg_size == 0) return -1;
-    /* Phase 1b：同 readdir_extra——读锁仅枚举，ops 调用不持锁（围栏窗口
-       内禁锁），异常经熔断上报（日志降级路径，崩溃恢复后返回 "unknown"） */
-    int active_slots[MAX_MODULES];
-    const NspModuleOps* active_ops[MAX_MODULES];
-    int scount = 0;
-    pthread_rwlock_rdlock(&g_module_lock);
-    for (int i = 0; i < g_module_count && scount < MAX_MODULES; i++) {
-        ModuleEntry* m = &g_modules[i];
-        if (!m->active || !m->info.ops || !m->info.ops->get_pkg) continue;
-        active_slots[scount] = i;
-        active_ops[scount] = m->info.ops;
-        scount++;
-    }
-    pthread_rwlock_unlock(&g_module_lock);
-    int rc = -1;
-    for (int s = 0; s < scount && rc != 0; s++) {
-        int i = active_slots[s];
-        const NspModuleOps* ops = active_ops[s];
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) continue;
-        atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) {
-            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
-        pkg_out[0] = '\0';
-        int crc = nsp_fence_get_pkg(i, "get_pkg", ops->get_pkg, uid, tid, pkg_out, pkg_size);
-        atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (crc == NSP_FENCE_FAULT) {
-            module_guard_fault(i, "get_pkg", NULL);
-            continue;
-        }
-        if (crc == NSP_FENCE_BADFN) continue; /* 函数指针 NULL：未实现，静默跳过 */
-        if (crc != 0) {
-            module_guard_error(i, "get_pkg", crc, NULL, "模块返回异常");
-            continue;
-        }
-        if (!nsp_guard_str_ok(pkg_out, pkg_size)) {
-            module_guard_error(i, "get_pkg", 0, NULL, "pkg 输出未终止");
-            continue;
-        }
-        rc = 0;
-    }
-    if (rc != 0) {
-        strncpy(pkg_out, "unknown", pkg_size - 1);
-        pkg_out[pkg_size - 1] = '\0';
-    }
-    return rc;
-}
-
 /* 健康快照（Phase 1c）：含 banned 非活跃槽位（规则已失效仍需展示） */
 int module_health_snapshot(NspModuleHealth** info_out) {
     if (!info_out) return -1;
