@@ -542,6 +542,15 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             /* 后端不提供真实属主（uid/gid=0）时继承其本地上级——用户存储根
                /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录 lstat
                必失败，故取用户存储根的真实属主，而非固定 root） */
+            /* st_ino 兜底：后端模块普遍只填 mode/size/mtime（FTP 即如此），
+               而框架以 use_ino=1 挂载 → libfuse 不会回填 st_ino（见其
+               set_stat：仅 !use_ino 时才用 nodeid），**0 会原样进内核**：
+               该 inode 的 i_ino 变 0，`ls -i` 显示 0，按 inode 去重的工具
+               （find -samefile / rsync / tar）会把不同文件当成同一个。
+               故后端未给出非 0 ino 时，用**路径派生**的稳定值兜底——与
+               readdir 条目同一套算法，保证「目录项 d_ino == 该路径 getattr
+               的 st_ino」，避免内核反复重查。 */
+            if (st->st_ino == 0) st->st_ino = synthetic_inode(sub_path);
             if (st->st_uid == 0 && st->st_gid == 0) {
                 int root_uid = (path_user_id >= 0) ? path_user_id : 0;
                 char root_path[PATH_MAX];
@@ -742,6 +751,14 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
         struct stat st;
         memset(&st, 0, sizeof st);
         st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+        /* d_ino 必须非 0（use_ino=1 下直接进内核）且与该路径 getattr 一致：
+           按「父 sub_path + 名字」派生，与 getattr 的 synthetic_inode(sub_path) 同源 */
+        char entry_sub[PATH_MAX];
+        if (strcmp(sub_path, "/") == 0)
+            snprintf(entry_sub, sizeof entry_sub, "/%s", entries[i].name);
+        else
+            snprintf(entry_sub, sizeof entry_sub, "%s/%s", sub_path, entries[i].name);
+        st.st_ino = synthetic_inode(entry_sub);
         if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
     }
     free(entries);
