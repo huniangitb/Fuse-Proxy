@@ -114,9 +114,11 @@ done
 
 # ============================ 2. 同步 .rules 与 conf ============================
 echo "== 同步 .rules 规则类型注册文件 ..."
-# 源目录名与模块目录名可能不同（ftp_module.rules 位于 src/modules/ftp/）
-# 格式：<源目录>|<模块目录>。规则能力已内建（V4），只剩后端模块自带 .rules
-for pair in "ftp|ftp_module"; do
+# 模块目录映射：<源目录>|<模块目录>。源目录名与模块目录名可能不同
+# （ftp_module.rules 位于 src/modules/ftp/）；规则能力已内建（V4），
+# 只剩后端模块自带 .rules。第 2.1 步的白名单与这里同源，避免两处漂移。
+MODULE_PAIRS=("ftp|ftp_module")
+for pair in "${MODULE_PAIRS[@]}"; do
     src_mod="${pair%%|*}"
     dst_mod="${pair##*|}"
     src="$RULES_DIR/$src_mod/$dst_mod.rules"
@@ -127,6 +129,30 @@ for pair in "ftp|ftp_module"; do
     else
         echo "   - $dst_mod.rules (缺失，跳过)"
     fi
+done
+
+# ===================== 2.1 清理骨架中已不再产出的模块目录 =====================
+# 骨架是增量同步目录（只 cp 不删），已删除的目标会一直躺在 bin/modules/ 里随包
+# 分发——basic_rules 内建进框架后就是这样残留的。后果不是"多个无用文件"：
+# 加载器 dlopen 后按 abi_version 判定，旧 ABI 的 .so 每次启动都打一条
+# "模块 X ABI 不匹配" ERROR（对正在用 sys.log 排查的人纯属噪音），其 .rules
+# 还会被 rule_server 当作有效规则类型注册。故按白名单清理，使包内容与本次
+# 产物一致。
+echo "== 清理骨架中已不再产出的模块 ..."
+KNOWN_MODULES=""
+for pair in "${MODULE_PAIRS[@]}"; do
+    KNOWN_MODULES="$KNOWN_MODULES ${pair##*|}"
+done
+for d in "$MODULE_DIR"/bin/modules/*/; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    case " $KNOWN_MODULES " in
+        *" $name "*) ;;
+        *)
+            rm -rf "$d"
+            echo "   - 移除陈旧模块: $name"
+            ;;
+    esac
 done
 
 echo "== 同步 conf 配置 ..."
@@ -283,6 +309,11 @@ check("rule_server 存在", any("bin/rule_server" in n for n in names))
 check("injector 存在", any("bin/injector" in n for n in names))
 check("fuse_daemon 存在", any("bin/fuse_daemon" in n for n in names))
 check("ftp_module.rules 存在", any(n.endswith("ftp_module/ftp_module.rules") for n in names))
+# 骨架是增量同步目录，已删除的目标（如内建化后的 basic_rules）若残留会随包
+# 分发：旧 ABI 的 .so 每次启动打一条 "ABI 不匹配" ERROR。此处钉住白名单。
+mod_dirs = sorted({n.split("/")[2] for n in names
+                   if n.startswith("bin/modules/") and n.count("/") >= 3})
+check("bin/modules 下只有当前模块 (%s)" % (",".join(mod_dirs) or "空"), mod_dirs == ["ftp_module"])
 check("zygisk 存在", any(n.startswith("zygisk/") and n.endswith(".so") for n in names))
 check("zygisk arm64-v8a 存在", "zygisk/arm64-v8a.so" in names)
 check("zygisk armeabi-v7a 存在", "zygisk/armeabi-v7a.so" in names)
