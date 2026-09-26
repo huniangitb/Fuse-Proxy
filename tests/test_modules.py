@@ -36,6 +36,20 @@ def build_module():
     if r.returncode != 0:
         print(f"!! 测试模块编译失败:\n{r.stderr}"); sys.exit(2)
 
+def build_abi_variants():
+    """同一份 backend_abi.c 编两份：合法 ABI 与旧 ABI（-DNSP_TEST_ABI=1）。
+
+    旧 ABI 那份模拟设备上残留的旧 basic_rules.so：模块目录里这类 .so 不随包
+    更新消失，而加载器每 5s 扫描一次就重试一次。"""
+    for tag, extra in (("", []), ("_stale", ["-DNSP_TEST_ABI=1"])):
+        out = ROOT / "build_gnu" / f"backend_abi{tag}.so"
+        r = subprocess.run(["gcc", "-shared", "-fPIC", "-O1", "-DNSP_MODULE_BUILD",
+                            f"-I{ROOT}/include", *extra, "-o", str(out),
+                            str(HERE / "backend_abi.c")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"!! backend_abi{tag} 编译失败:\n{r.stderr}"); sys.exit(2)
+
 def setup():
     shutil.rmtree("/tmp/fuse_mod_test", ignore_errors=True)
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
@@ -60,6 +74,37 @@ def put_module(name=MODULE):
 def rm_module(name=MODULE):
     p = Path(f"{MODDIR}/{name}/{name}.so")
     if p.exists(): p.unlink()
+
+def put_so(src, name):
+    """把任意 .so 装成模块 <name>（原子 rename，见 put_module 的说明）。"""
+    os.makedirs(f"{MODDIR}/{name}", exist_ok=True)
+    tmp = f"{MODDIR}/{name}/{name}.so.tmp"
+    shutil.copy(src, tmp)
+    os.replace(tmp, f"{MODDIR}/{name}/{name}.so")
+
+def fd_count(proc):
+    """daemon 当前打开的 fd 总数（含内存副本 memfd）。"""
+    try:
+        return len(os.listdir(f"/proc/{proc.pid}/fd"))
+    except OSError:
+        return -1
+
+def memfd_count(proc, name=None):
+    """映射中的模块内存副本数（/proc/<pid>/maps 的 memfd:nsp_module_<名>）。
+
+    模块是否真在册、是否真卸载，都以它为证据（路径名不进 maps）。"""
+    pat = f"memfd:nsp_module_{name}" if name else "memfd:nsp_module_"
+    try:
+        with open(f"/proc/{proc.pid}/maps") as f:
+            return sum(1 for line in f if pat in line)
+    except OSError:
+        return -1
+
+def ban_lines(name):
+    """<modules_dir>/.banned 里该模块的记录（name|hash|reason|ts）。"""
+    p = Path(MODDIR) / ".banned"
+    if not p.exists(): return []
+    return [l for l in p.read_text().splitlines() if l.startswith(name + "|")]
 
 def start():
     p = subprocess.Popen([DAEMON, "--root="+STORAGE, "--rules="+CONF,
@@ -128,6 +173,7 @@ FTP /bhealth seg1
 def main():
     global PASS, FAIL
     build_module()
+    build_abi_variants()
     setup()
 
     def case1(p, m):
@@ -170,6 +216,50 @@ def main():
         ok("普通路径正常") if (m/"0/normal/n.txt").exists() else fail("普通路径", "坏模块后普通文件不可见")
         rm_module("broken")
     run_case("4. 损坏 .so 容错", case4)
+
+    def case5(p, m):
+        """残留的旧 ABI 模块：加载前拒绝 + 按哈希落 ban + 不泄漏内存副本 fd
+
+        设备现场：规则引擎内建进框架后删掉了 basic_rules，但 CONFIG_DIR/modules
+        不在 Magisk 模块目录内，卸载/更新都不会动它，安装脚本也只 cp 不删 →
+        旧 .so 永久残留。加载器每 5s 扫描一次就重试一次：修复前每次留一条
+        ERROR 并泄漏一个 memfd（1 个/5s，累积到 nofile 上限即 EMFILE），
+        修复后只报一次、之后按文件哈希静默跳过。"""
+        put_so(ROOT / "build_gnu" / "backend_abi_stale.so", "backend_abi")
+        # 首次扫描：拒绝 + 落 ban（扫描周期 5s，留足两轮）
+        deadline = time.time() + 20
+        while time.time() < deadline and not ban_lines("backend_abi"):
+            time.sleep(0.5)
+        lines = ban_lines("backend_abi")
+        ok("旧 ABI 模块被拒绝并落 ban") if lines else fail(
+            "旧 ABI 模块未落 ban", f".banned={lines}")
+        if lines:
+            ok("ban 原因标注 ABI 不匹配") if "ABI mismatch" in lines[0] else fail(
+                "ban 原因", lines[0])
+        ok("旧 ABI 模块未加载") if memfd_count(p, "backend_abi") == 0 else fail(
+            "旧 ABI 模块被加载了", f"maps 含 {memfd_count(p,'backend_abi')} 个 memfd")
+
+        # 跨两个扫描周期：fd 不得增长（修复前每轮泄漏一个 memfd）
+        fd0 = fd_count(p)
+        time.sleep(12)
+        fd1 = fd_count(p)
+        ok("拒绝后 fd 不增长（跨 2 个扫描周期）") if fd0 == fd1 else fail(
+            "fd 泄漏", f"{fd0} → {fd1}（每 5s 一轮扫描各泄漏一个 memfd）")
+        ok("拒绝后无残留内存副本") if memfd_count(p, "backend_abi") == 0 else fail(
+            "内存副本泄漏", f"maps 含 {memfd_count(p,'backend_abi')} 个 memfd")
+
+        # ban 按文件哈希：同名文件换了内容（真更新）必须放行，不能挡升级
+        put_so(ROOT / "build_gnu" / "backend_abi.so", "backend_abi")
+        deadline = time.time() + 20
+        while time.time() < deadline and memfd_count(p, "backend_abi") == 0:
+            time.sleep(0.5)
+        ok("哈希变化后放行（旧 ban 不挡真更新）") if memfd_count(p, "backend_abi") > 0 else fail(
+            "更新被 ban 挡住", "换成合法 ABI 的同名模块后仍未加载")
+        ok("放行后陈旧 ban 记录被清除") if not ban_lines("backend_abi") else fail(
+            "陈旧 ban 未清除", str(ban_lines("backend_abi")))
+        ok("旧 ABI 期间规则/普通路径不受影响") if (m/"0/normal/n.txt").exists() else fail(
+            "普通路径", "旧 ABI 模块在场时 /0/normal/n.txt 不可见")
+    run_case("5. 残留旧 ABI 模块（拒绝/落 ban/不泄漏 fd/不挡更新）", case5)
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")
