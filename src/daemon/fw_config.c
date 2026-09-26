@@ -123,6 +123,10 @@ bool fw_config_monitor_for(uid_t uid, pid_t tid) {
 static volatile bool g_stop = false;
 static pthread_t g_monitor_tid;
 static bool g_thread_started = false;
+/* 自唤醒管道：监听线程用 poll(...,5000) 等 inotify，只在循环顶部看 g_stop——
+   不唤醒的话 shutdown 的 join 要干等最长 5s（实测每次启停多花 5s）。管道让
+   关闭即时可见，join 立即返回。 */
+static int g_wake[2] = {-1, -1};
 
 static ModuleSub* find_sub(const char* name) {
     if (!name) return nullptr;
@@ -261,8 +265,10 @@ static void* config_monitor_thread(void* arg) {
                 continue;
             }
         }
-        struct pollfd pfd = {.fd = inotify_fd, .events = POLLIN};
-        int pr = poll(&pfd, 1, 5000);
+        struct pollfd pfds[2] = {{.fd = inotify_fd, .events = POLLIN},
+                                 {.fd = g_wake[0], .events = POLLIN}};
+        int pr = poll(pfds, 2, 5000);
+        if (pr >= 0 && pfds[1].revents) break; /* 关闭唤醒：立即退出，不等超时 */
         if (pr < 0) {
             if (errno == EINTR) continue;
             inotify_rm_watch(inotify_fd, wd);
@@ -320,6 +326,7 @@ int fw_config_init(const char* rules_path) {
     }
     reload_once();
     g_stop = false;
+    if (pipe2(g_wake, O_NONBLOCK | O_CLOEXEC) != 0) g_wake[0] = g_wake[1] = -1;
     if (pthread_create(&g_monitor_tid, nullptr, config_monitor_thread, nullptr) == 0) {
         g_thread_started = true;
     } else {
@@ -331,10 +338,14 @@ int fw_config_init(const char* rules_path) {
 
 void fw_config_shutdown(void) {
     g_stop = true;
+    if (g_wake[1] >= 0) (void)!write(g_wake[1], "x", 1); /* 唤醒 poll，避免 join 干等 */
     if (g_thread_started) {
         pthread_join(g_monitor_tid, nullptr);
         g_thread_started = false;
     }
+    if (g_wake[0] >= 0) close(g_wake[0]);
+    if (g_wake[1] >= 0) close(g_wake[1]);
+    g_wake[0] = g_wake[1] = -1;
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MAX_MODULES; i++) {
         if (!g_subs[i].used) continue;
