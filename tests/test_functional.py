@@ -13,8 +13,6 @@ STORAGE = "/tmp/fuse_proxy_test/storage"
 CONF    = "/tmp/Namespace-Proxy/injector.conf"
 DAEMON  = os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
-BASIC_RULES = os.environ.get("BASIC_RULES_SO") or os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "build_gnu", "basic_rules.so"))
 TEST_ID = str(uuid.uuid4())[:8]
 PASS = 0
 FAIL = 0
@@ -60,12 +58,7 @@ def setup_env():
         os.makedirs(f"{STORAGE}/{d}", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
     os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
-    # 热插拔模块：basic_rules.so 放入模块目录（fuse_daemon 启动时 dlopen 加载）
-    os.makedirs(f"{MODDIR}/basic_rules", exist_ok=True)
-    if os.path.exists(BASIC_RULES):
-        shutil.copy(BASIC_RULES, f"{MODDIR}/basic_rules/basic_rules.so")
-    else:
-        print("  ⚠ basic_rules.so 未找到，规则模块不会加载")
+    # 规则引擎已内建（fw_rules）：无需模块目录
     # 预置文件
     for f in ["hello.txt", "Pictures/photo1.jpg", "Documents/report.pdf", "Music/song.mp3"]:
         p = f"{STORAGE}/0/Download/{f}"

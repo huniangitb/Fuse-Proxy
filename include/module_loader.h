@@ -15,29 +15,13 @@
 
 #define MAX_MODULES 16
 
-/* 分派返回值 */
-#define NSP_DISPATCH_NONE 0 /* 无规则模块注册 / 无命中 → 框架回退默认路径 */
-#define NSP_DISPATCH_OK   1 /* 已填充决策结果 */
-
 /* 初始化：mkdir 模块目录 + 全量扫描 + 启动热插拔监控线程。
    rules_path 为框架规则配置路径（--rules=），modules_dir 为模块目录
-   （NULL 用默认 MODULES_DIR，可经 --modules-dir 覆盖），flags 为启动标志
-   （NSP_FLAG_*），均经 NspFrameworkApi 提供给模块。 */
-int module_system_init(const char* rules_path, const char* modules_dir, uint32_t flags);
+   （NULL 用默认 MODULES_DIR，可经 --modules-dir 覆盖），均经 NspFrameworkApi
+   提供给模块。V4 起无启动标志位（唯一消费者是已内建的规则模块）。 */
+int module_system_init(const char* rules_path, const char* modules_dir);
 /* 卸载全部模块并停止监控 */
 void module_system_shutdown(void);
-
-/* 规则决策分派：遍历注册了规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）的模块，
-   聚合填充 out。返回 NSP_DISPATCH_OK / NSP_DISPATCH_NONE。 */
-int module_dispatch_resolve(const NspQueryCtx* q, NspPathDecision* out);
-
-/* 轻量路径探测分派：readdir 逐条目过滤用（只判 hidden/redirect_target 等，
-   无模块时返回 NSP_DISPATCH_NONE）。 */
-int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out);
-
-/* readdir 虚拟目录补充：遍历声明 READDIR_EXTRA 的模块合并条目，返回总条目数 */
-int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
-                            const char* pkg, bool is_root, NspDirEntry* out, int max);
 
 /* 已加载模块快照（供 IPC LIST_MODULES）：填充 names，返回数量 */
 int module_snapshot(char names[][64], int max);
@@ -48,7 +32,6 @@ int module_snapshot(char names[][64], int max);
 typedef struct {
     char name[64];
     char version[32]; /* 模块自述版本字符串（NspModuleInfo.version） */
-    uint32_t caps;
     bool active;
     unsigned err_count; /* 当前滑动窗口内错误数 */
     unsigned err_total; /* 本加载周期累计错误数 */

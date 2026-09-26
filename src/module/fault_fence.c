@@ -243,28 +243,6 @@ void fault_fence_init(void) {
         return 0;                                        \
     } while (0)
 
-/* ================= 规则能力 ================= */
-
-int nsp_fence_resolve(int slot, const char* op_name,
-                      int (*fn)(const NspQueryCtx*, NspPathDecision*), const NspQueryCtx* q,
-                      NspPathDecision* out) {
-    if (!fn) return NSP_FENCE_BADFN;
-    NSP_FENCE_WRAP(slot, op_name, fn(q, out));
-}
-int nsp_fence_probe(int slot, const char* op_name, int (*fn)(const NspQueryCtx*, NspProbeResult*),
-                    const NspQueryCtx* q, NspProbeResult* out) {
-    if (!fn) return NSP_FENCE_BADFN;
-    NSP_FENCE_WRAP(slot, op_name, fn(q, out));
-}
-int nsp_fence_readdir_extra(int slot, const char* op_name,
-                            int (*fn)(const NspQueryCtx*, const char*, int, const char*, bool,
-                                      NspDirEntry*, int),
-                            const NspQueryCtx* q, const char* sub_path, int user_id,
-                            const char* pkg, bool is_root, NspDirEntry* out, int max) {
-    if (!fn) return NSP_FENCE_BADFN;
-    NSP_FENCE_WRAP(slot, op_name, fn(q, sub_path, user_id, pkg, is_root, out, max));
-}
-
 /* ================= 后端能力 ================= */
 
 int nsp_fence_backend_match(int slot, const char* op_name, int (*fn)(const char*),

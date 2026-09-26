@@ -5,12 +5,15 @@
 #include "fault_fence.h"
 #include "module_guard.h"
 #include "../daemon/fw_config.h"
+#include "../daemon/fw_rules.h"
 #include "../core/sha256.h"
 #include <dlfcn.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <sys/inotify.h>
 #include <sys/file.h>
+#include <sys/mman.h> /* memfd_create：模块从内存副本加载 */
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <errno.h>
@@ -22,24 +25,18 @@
 
 /* ================= 注册表 ================= */
 
-/* 路径是否含 <uid>/ 用户层（如 /0/foo、/10/、或 /0 本身）：
-   FUSE 挂载点根（/、/obb 等非 uid 顶层）不进行任何规则合成，
-   仅 <uid>/ 之后的路径才允许规则模块响应——从框架源头规避
-   挂载点根下出现额外虚拟目录（如 FTP 前缀条目被合到根下） */
-static bool path_has_uid_layer(const char* path) {
-    if (!path || path[0] != '/' || path[1] < '0' || path[1] > '9') return false;
-    const char* d = path + 1;
-    while (*d >= '0' && *d <= '9') d++;
-    return (*d == '\0' || *d == '/');
-}
-
 typedef struct {
     char name[64];
     void* handle;       /* dlopen 句柄 */
     NspModuleInfo info; /* 静态信息拷贝 */
     time_t mtime;       /* .so 文件 mtime，热重载检测 */
+
     bool active;
     _Atomic int backend_refs; /* 后端 ops 在途引用计数（防热卸载 dlclose 悬垂） */
+    int mfd; /* 模块映像的 memfd（-1 = 无）：**加载期间必须保持打开**——
+                模块自哈希 API（nsp_module_self_hash）经 dladdr 取自身路径后读文件，
+                而内存副本的路径是 /proc/self/fd/N，提前 close 会让它读不到 → 自哈希
+                返回 NULL → 框架判定"哈希不一致"而拒绝加载（ftp_module 实测如此）。 */
     int (*active_handles_fn)(void); /* 可选：活跃句柄查询（模块导出 nsp_module_active_handles），
                                         热重载 quiescence 门控——有应用 open 时延迟卸载/重载 */
     char hash[65]; /* 已加载 .so 文件的 SHA-256（框架计算，加载时存入）：
@@ -69,12 +66,6 @@ static ModuleEntry g_modules[MAX_MODULES];
 static int g_module_count = 0;
 static pthread_rwlock_t g_module_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-/* 能力位 → 模块索引链（bit 序号 0..31） */
-static int g_cap_chain[32][MAX_MODULES];
-static int g_cap_chain_count[32];
-
-/* 注册了规则能力的活跃模块数：分派快速路径用（无锁读） */
-static _Atomic int g_active_rules_count = 0;
 /* 活跃后端 I/O 模块数：vfs_read/write 快速路径无锁读（原子），
    模块加载/卸载（写锁内）时更新 */
 static _Atomic(int) g_backend_active_count = 0;
@@ -84,12 +75,6 @@ static _Atomic(int) g_backend_active_count = 0;
    槽位号由 open 时编码进 fh 高位（见 fuse_daemon.c NSP_FH_BACKEND_SLOT_*）。 */
 static _Atomic(const NspModuleOps*) g_backend_slot_ops[MAX_MODULES];
 static _Atomic(int) g_backend_slot_refs[MAX_MODULES]; /* 槽位在途引用（acquire 配对 release） */
-/* 规则模块槽位原子快照：与后端槽位同模式，供 resolve 分派无锁读取——
-   消除每请求 g_module_lock rwlock 往返（S2 热路径优化）。
-   load 写锁内置 ops；unload 先置 NULL 再等 g_rule_slot_refs 归零后 dlclose。
-   调用方 acquire 在途引用 → 二次确认快照未变 → 调用 ops → release。 */
-static _Atomic(const NspModuleOps*) g_rule_slot_ops[MAX_MODULES];
-static _Atomic(int) g_rule_slot_refs[MAX_MODULES];
 /* 初始扫描是否完成：完成前不向 injector 上报模块变更（避免启动时误触发全量重挂） */
 static volatile sig_atomic_t g_boot_scan_done = 0;
 
@@ -97,15 +82,11 @@ static volatile sig_atomic_t g_boot_scan_done = 0;
 
 /* 框架参数（module_system_init 传入） */
 static char g_fw_rules_path[PATH_MAX] = {0};
-static uint32_t g_fw_flags = 0;
 /* 模块目录（默认 MODULES_DIR 宏，可经 --modules-dir 覆盖） */
 static char g_modules_dir[PATH_MAX] = MODULES_DIR;
 
 static const char* api_get_rules_path(void) {
     return g_fw_rules_path[0] ? g_fw_rules_path : NULL;
-}
-static uint32_t api_get_flags(void) {
-    return g_fw_flags;
 }
 
 /* 正在初始化的模块名：subscribe_rules / set_config_listener 只在 init 内调用，
@@ -122,7 +103,6 @@ static void api_set_config_listener(void (*cb)(const NspModuleConfig*)) {
 static const NspFrameworkApi g_api = {
     .api_version = NSP_FRAMEWORK_API_VERSION,
     .get_rules_path = api_get_rules_path,
-    .get_flags = api_get_flags,
     .subscribe_rules = api_subscribe_rules,
     .set_config_listener = api_set_config_listener,
 };
@@ -157,7 +137,6 @@ static void on_config_reload(void) {
     pthread_rwlock_rdlock(&g_module_lock);
     for (int i = 0; i < g_module_count && n < MAX_MODULES; i++) {
         if (!g_modules[i].active) continue;
-        atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
         atomic_fetch_add_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
         slots[n] = i;
         strncpy(names[n], g_modules[i].name, sizeof(names[n]) - 1);
@@ -168,7 +147,6 @@ static void on_config_reload(void) {
     for (int k = 0; k < n; k++) {
         push_config_to_slot(slots[k], names[k]);
         atomic_fetch_sub_explicit(&g_backend_slot_refs[slots[k]], 1, memory_order_acq_rel);
-        atomic_fetch_sub_explicit(&g_rule_slot_refs[slots[k]], 1, memory_order_acq_rel);
     }
 }
 
@@ -183,35 +161,10 @@ static bool is_valid_module_name(const char* n) {
     return true;
 }
 
-#define RULE_CAPS (NSP_CAP_REDIRECT | NSP_CAP_SANDBOX | NSP_CAP_HIDE | NSP_CAP_ALLOW | NSP_CAP_RO)
-
 static int find_slot(const char* name) {
     for (int i = 0; i < g_module_count; i++)
         if (g_modules[i].active && strcmp(g_modules[i].name, name) == 0) return i;
     return -1;
-}
-
-static void chain_add(uint32_t caps, int slot) {
-    for (uint32_t bit = 1u; bit; bit <<= 1u) {
-        if (caps & bit) {
-            int bi = __builtin_ctz(bit);
-            if (bi >= 0 && bi < 32 && g_cap_chain_count[bi] < MAX_MODULES)
-                g_cap_chain[bi][g_cap_chain_count[bi]++] = slot;
-        }
-    }
-}
-
-static void chain_remove(int slot) {
-    for (int bi = 0; bi < 32; bi++) {
-        int n = g_cap_chain_count[bi];
-        for (int i = 0; i < n; i++) {
-            if (g_cap_chain[bi][i] == slot) {
-                g_cap_chain[bi][i] = g_cap_chain[bi][n - 1];
-                g_cap_chain_count[bi] = n - 1;
-                break;
-            }
-        }
-    }
 }
 
 /* ================= 加载 / 卸载 ================= */
@@ -222,7 +175,7 @@ static void chain_remove(int slot) {
    设计：热重载"先验后换"——先加载校验新模块，通过才卸载旧模块并登记，
    校验失败保留内存中的旧模块。 */
 static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_out,
-                          char hash_out[65]) {
+                          char hash_out[65], int* mfd_out) {
     char so_path[PATH_MAX];
     snprintf(so_path, sizeof so_path, "%s/%s/%s.so", g_modules_dir, name, name);
     /* 热加载防御：dlopen 前校验 .so 文件稳定性（两次 stat 大小/时间一致）。
@@ -246,11 +199,74 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         LOG_WRN("模块 %s 文件哈希计算失败，跳过哈希校验", name);
         hash_out[0] = '\0';
     }
-    void* h = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) {
-        LOG_ERR("模块加载失败 %s: %s", so_path, dlerror());
+    /* **从内存副本加载**（memfd + /proc/self/fd）：模块一旦加载，其映像就只属于
+       本进程，磁盘上那份文件无论被原子替换还是**就地覆盖**（truncate + 重写）都
+       伤不到运行中的模块。
+       为何不能直接 dlopen(路径)：ELF 是按文件 mmap 的（file-backed），磁盘文件被
+       truncate 时内核会连**已重定位**的私有页一起丢弃（unmap_mapping_range 的
+       even_cows），再次访问从文件重新缺页得到的是**未重定位**的链接期值——函数
+       指针变成 0x1166 之类，调用即野指针跳转；更糟的是这份损坏映像还会被 dlclose
+       时的析构器（.fini_array）与进程退出时的 `_dl_fini` 再次调用，连"退出"都不
+       安全（core dump 实测 `exit → _dl_fini → 0x10b0`）。内存副本彻底消除该路径。
+       读入期间文件仍在写入（大小/时间与稳定性窗口观察到的不同）→ 放弃本次加载。 */
+    /* memfd 名字带模块名：/proc/<pid>/maps 里呈现为 "memfd:nsp_module_<名>"，
+       既能区分模块，也让"模块是否真卸载"有可观测证据（文件路径不再出现在 maps） */
+    char mfd_name[128];
+    snprintf(mfd_name, sizeof mfd_name, "nsp_module_%.100s", name);
+    int mfd = memfd_create(mfd_name, MFD_CLOEXEC);
+    if (mfd < 0) {
+        LOG_ERR("模块 %s memfd_create 失败: %s", name, strerror(errno));
         return -1;
     }
+    int src = open(so_path, O_RDONLY | O_CLOEXEC);
+    if (src < 0) {
+        LOG_ERR("模块 %s 打开失败: %s", so_path, strerror(errno));
+        close(mfd);
+        return -1;
+    }
+    char cbuf[65536];
+    for (;;) {
+        ssize_t rn = read(src, cbuf, sizeof cbuf);
+        if (rn < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERR("模块 %s 读取失败: %s", so_path, strerror(errno));
+            close(src);
+            close(mfd);
+            return -1;
+        }
+        if (rn == 0) break;
+        for (ssize_t off = 0; off < rn;) {
+            ssize_t wn = write(mfd, cbuf + off, (size_t)(rn - off));
+            if (wn < 0) {
+                if (errno == EINTR) continue;
+                LOG_ERR("模块 %s 写入内存副本失败: %s", name, strerror(errno));
+                close(src);
+                close(mfd);
+                return -1;
+            }
+            off += wn;
+        }
+    }
+    close(src);
+    struct stat st3;
+    if (stat(so_path, &st3) == 0 &&
+        (st3.st_size != st2.st_size || st3.st_mtim.tv_sec != st2.st_mtim.tv_sec ||
+         st3.st_mtim.tv_nsec != st2.st_mtim.tv_nsec)) {
+        LOG_WRN("模块 %s 的 .so 在读取期间被写入，放弃本次加载", name);
+        close(mfd);
+        return -1;
+    }
+    char fdp[64];
+    snprintf(fdp, sizeof fdp, "/proc/self/fd/%d", mfd);
+    void* h = dlopen(fdp, RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        LOG_ERR("模块加载失败 %s(内存副本): %s", so_path, dlerror());
+        close(mfd);
+        return -1;
+    }
+    *mfd_out = mfd;
+    /* fd 不关闭：mfd_out 交给 commit 记入 ModuleEntry，直到模块卸载才 close
+       （模块自哈希经 dladdr → /proc/self/fd/N 读自身，见 ModuleEntry.mfd） */
     NspModuleInfo* info = (NspModuleInfo*)dlsym(h, NSP_MODULE_INFO_SYMBOL);
     if (!info) {
         LOG_ERR("模块 %s 未导出 %s 符号", name, NSP_MODULE_INFO_SYMBOL);
@@ -350,7 +366,8 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
 }
 
 /* 登记已校验模块到槽位（写锁内发布原子快照/链），并存入文件哈希 */
-static int module_commit(const char* name, void* h, const NspModuleInfo* info, const char* hash) {
+static int module_commit(const char* name, void* h, const NspModuleInfo* info, const char* hash,
+                         int mfd) {
     char so_path[PATH_MAX];
     snprintf(so_path, sizeof so_path, "%s/%s/%s.so", g_modules_dir, name, name);
     pthread_rwlock_wrlock(&g_module_lock);
@@ -361,8 +378,7 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, c
     int slot = -1;
     for (int i = 0; i < g_module_count; i++) {
         if (!g_modules[i].active && strcmp(g_modules[i].name, name) == 0 &&
-            atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0 &&
-            atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) {
+            atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0) {
             slot = i;
             break;
         }
@@ -370,8 +386,7 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, c
     if (slot < 0) {
         for (int i = 0; i < g_module_count; i++) {
             if (!g_modules[i].active &&
-                atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0 &&
-                atomic_load_explicit(&g_rule_slot_refs[i], memory_order_acquire) == 0) {
+                atomic_load_explicit(&g_backend_slot_refs[i], memory_order_acquire) == 0) {
                 slot = i;
                 break;
             }
@@ -409,6 +424,7 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, c
     memset(m, 0, sizeof *m);
     strncpy(m->name, name, sizeof m->name - 1);
     m->handle = h;
+    m->mfd = mfd;
     m->info = *info; /* 浅拷贝：info->ops 指针有效 */
     /* 可选活跃句柄查询（热重载 quiescence 门控）：模块导出则使用，缺省视为 0 */
     m->active_handles_fn = (int (*)(void))dlsym(h, "nsp_module_active_handles");
@@ -417,21 +433,17 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, c
     struct stat st;
     if (stat(so_path, &st) == 0) m->mtime = st.st_mtime;
     fault_fence_register_slot(slot, name, h);
-    chain_add(m->info.caps, slot);
-    if (m->info.caps & RULE_CAPS) {
-        g_active_rules_count++;
-        /* 规则槽位快照：写锁内发布，resolve 分派无锁读取 */
-        atomic_store_explicit(&g_rule_slot_ops[slot], m->info.ops, memory_order_release);
-    }
-    if (m->info.type == NSP_MODULE_TYPE_BACKEND && (m->info.caps & NSP_CAP_BACKEND_IO)) {
+    /* 后端能力判定：声明了 backend_match 即视为后端模块（ABI V4 起不再有
+       type/caps 声明，少两处必须与实现保持一致的冗余字段） */
+    if (m->info.ops && m->info.ops->backend_match) {
         atomic_fetch_add_explicit(&g_backend_active_count, 1, memory_order_release);
         /* 槽位快照：写锁内发布，read/write 热路径无锁读取 */
         atomic_store_explicit(&g_backend_slot_ops[slot], m->info.ops, memory_order_release);
     }
     pthread_rwlock_unlock(&g_module_lock);
 
-    LOG("模块已加载: %s v%s (类型=%u caps=0x%x)", name, info->version ? info->version : "?",
-        info->type, info->caps);
+    LOG("模块已加载: %s v%s%s", name, info->version ? info->version : "?",
+        (info->ops && info->ops->backend_match) ? " (后端 I/O)" : "");
     return 0;
 }
 
@@ -458,8 +470,9 @@ static int module_load_one(const char* name) {
     void* h = NULL;
     NspModuleInfo info;
     char hash[65] = {0};
-    if (module_prepare(name, &h, &info, hash) != 0) return -1;
-    return module_commit(name, h, &info, hash);
+    int mfd = -1;
+    if (module_prepare(name, &h, &info, hash, &mfd) != 0) return -1;
+    return module_commit(name, h, &info, hash, mfd);
 }
 
 static int module_unload_one(const char* name) {
@@ -472,21 +485,18 @@ static int module_unload_one(const char* name) {
     ModuleEntry* m = &g_modules[slot];
     void* h = m->handle;
     NspModuleInfo info = m->info;
-    if (info.caps & RULE_CAPS) {
-        if (g_active_rules_count > 0) g_active_rules_count--;
-    }
-    if (info.type == NSP_MODULE_TYPE_BACKEND && (info.caps & NSP_CAP_BACKEND_IO))
+    if (info.ops && info.ops->backend_match)
         atomic_fetch_sub_explicit(&g_backend_active_count, 1, memory_order_release);
     /* 先置空槽位快照（写锁内）：后续 acquire 立即失败，不再获得新引用；
-       在途 acquire（已取到 ops 且二次确认未变）持有 g_backend_slot_refs /
-       g_rule_slot_refs，由下方等待循环保证归零后才 dlclose，杜绝函数指针悬垂 */
+       在途 acquire（已取到 ops 且二次确认未变）持有 g_backend_slot_refs，
+       由下方等待循环保证归零后才 dlclose，杜绝函数指针悬垂 */
     atomic_store_explicit(&g_backend_slot_ops[slot], NULL, memory_order_release);
-    if (info.caps & RULE_CAPS)
-        atomic_store_explicit(&g_rule_slot_ops[slot], NULL, memory_order_release);
-    chain_remove(slot);
+    int mfd = m->mfd;
+    m->mfd = -1;
     m->active = false;
     m->handle = NULL;
     pthread_rwlock_unlock(&g_module_lock);
+    if (mfd >= 0) close(mfd); /* dlclose 后映像无人引用，可安全关闭 */
 
     /* 等待后端在途调用完成（防 ops 指针悬垂 SIGSEGV）。FTP 等后端网络操作
        可能远超 100ms（弱网/指数退避重试），若等待超时仍强行 dlclose，会让
@@ -499,8 +509,7 @@ static int module_unload_one(const char* name) {
         pthread_rwlock_rdlock(&g_module_lock);
         busy = (m->backend_refs > 0);
         pthread_rwlock_unlock(&g_module_lock);
-        if (!busy && atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_acquire) == 0 &&
-            atomic_load_explicit(&g_rule_slot_refs[slot], memory_order_acquire) == 0) {
+        if (!busy && atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_acquire) == 0) {
             drained = true;
             break;
         }
@@ -509,15 +518,10 @@ static int module_unload_one(const char* name) {
     if (!drained) {
         /* 仍有在途调用：回滚标记，保持模块加载，绝不 dlclose */
         pthread_rwlock_wrlock(&g_module_lock);
-        if (info.caps & RULE_CAPS) {
-            g_active_rules_count++;
-            atomic_store_explicit(&g_rule_slot_ops[slot], info.ops, memory_order_release);
-        }
-        if (info.type == NSP_MODULE_TYPE_BACKEND && (info.caps & NSP_CAP_BACKEND_IO)) {
+        if (info.ops && info.ops->backend_match) {
             atomic_fetch_add_explicit(&g_backend_active_count, 1, memory_order_release);
             atomic_store_explicit(&g_backend_slot_ops[slot], info.ops, memory_order_release);
         }
-        chain_add(info.caps, slot);
         m->active = true;
         m->handle = h;
         pthread_rwlock_unlock(&g_module_lock);
@@ -745,30 +749,26 @@ int module_fault_poison(int slot, const char* reason) {
         return 0;
     }
 
-    LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=置毒卸载:槽位快照置空,规则立即失效",
+    LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=置毒卸载:槽位快照置空,该模块立即失效",
             name, reason ? reason : "(null)");
 
     /* 写锁内：计数回退 + 快照置空 + 摘链（与 unload 同序，防在途 acquire） */
     pthread_rwlock_wrlock(&g_module_lock);
-    if (info.caps & RULE_CAPS) {
-        if (g_active_rules_count > 0) g_active_rules_count--;
-    }
-    if (info.type == NSP_MODULE_TYPE_BACKEND && (info.caps & NSP_CAP_BACKEND_IO))
+    if (info.ops && info.ops->backend_match)
         atomic_fetch_sub_explicit(&g_backend_active_count, 1, memory_order_release);
     atomic_store_explicit(&g_backend_slot_ops[slot], NULL, memory_order_release);
-    if (info.caps & RULE_CAPS)
-        atomic_store_explicit(&g_rule_slot_ops[slot], NULL, memory_order_release);
-    chain_remove(slot);
+    int mfd = m->mfd;
+    m->mfd = -1;
     m->active = false;
     m->handle = NULL;
     pthread_rwlock_unlock(&g_module_lock);
+    if (mfd >= 0) close(mfd); /* 与 unload 同序：dlclose 后映像无人引用 */
 
     /* 等待在途引用归零（崩溃线程已 longjmp 返回会释放；其他线程的合法
        在途 backend 调用完成即释放）。超时不恢复（区别于 unload） */
     bool drained = false;
     for (int i = 0; i < 2000; i++) {
-        if (atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_acquire) == 0 &&
-            atomic_load_explicit(&g_rule_slot_refs[slot], memory_order_acquire) == 0) {
+        if (atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_acquire) == 0) {
             drained = true;
             break;
         }
@@ -905,31 +905,31 @@ static void module_scan_diff(void) {
                     LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟热重载", present[p]);
                     continue;
                 }
-                /* 哈希判定：磁盘内容与已加载模块哈希一致（mtime 变化但内容
-                   未变——chmod/触摸/重复复制同一文件）→ 跳过热加载 */
-                char fhash[65];
-                if (sha256_file_hex(so, fhash) == 0 && g_modules[slot].hash[0] &&
-                    strcmp(fhash, g_modules[slot].hash) == 0) {
-                    LOG_DBG("模块 %s 文件内容未变化（哈希一致），跳过热重载", present[p]);
-                    g_modules[slot].mtime = st.st_mtime;
-                    continue;
-                }
+                /* 文件已被替换即重载：**不能**用"内容哈希相同"做跳过判据。
+                   就地覆盖（truncate + 重写，非 tmp+rename）会让已映射页失效——
+                   MAP_PRIVATE 映射下页在文件被截断时被丢弃，再次访问从"正在写入"
+                   的文件重新缺页，把半写内容固化成私有页且此后不再更新；模块的
+                   ops 表若落在这类页上，函数指针会变成链接期残值 → 调用即野指针
+                   跳转（实测 PC=垃圾地址）。换新映射是唯一解法：dlopen 新文件 +
+                   dlclose 旧映射；延迟不敏感，故不做"哈希相同就跳过"的优化。 */
                 LOG("模块文件已更新，热重载: %s", present[p]);
                 /* 先验后换：先加载校验新模块，通过才卸载旧模块——
                    校验失败/旧模块在途调用未归零时保留内存中的旧模块 */
                 void* nh = NULL;
                 NspModuleInfo ninfo;
                 char nhash[65] = {0};
-                if (module_prepare(present[p], &nh, &ninfo, nhash) != 0) {
+                int nmfd = -1;
+                if (module_prepare(present[p], &nh, &ninfo, nhash, &nmfd) != 0) {
                     LOG_ERR("模块 %s 校验未通过，保留内存中的旧模块", present[p]);
                     continue;
                 }
                 if (module_unload_one(present[p]) != 0) {
                     dlclose(nh); /* 旧模块在途引用未归零（回滚保留旧）→ 放弃新模块 */
+                    if (nmfd >= 0) close(nmfd);
                     LOG_WRN("模块 %s 旧实例仍有在途调用，热重载放弃（保留旧模块）", present[p]);
                     continue;
                 }
-                module_commit(present[p], nh, &ninfo, nhash);
+                module_commit(present[p], nh, &ninfo, nhash, nmfd);
             }
         }
     }
@@ -1007,11 +1007,10 @@ static void* module_monitor_thread(void* arg) {
 
 /* ================= 对外接口 ================= */
 
-int module_system_init(const char* rules_path, const char* modules_dir, uint32_t flags) {
+int module_system_init(const char* rules_path, const char* modules_dir) {
     if (rules_path) strncpy(g_fw_rules_path, rules_path, sizeof g_fw_rules_path - 1);
     if (modules_dir && modules_dir[0])
         strncpy(g_modules_dir, modules_dir, sizeof g_modules_dir - 1);
-    g_fw_flags = flags;
     mkdir_recursive(g_modules_dir);
     /* 配置读取在框架侧完成：先建视图与监听，再扫描模块——模块 init 内
        subscribe/set_config_listener 后由 module_prepare 立即推送首份视图 */
@@ -1033,135 +1032,14 @@ int module_system_init(const char* rules_path, const char* modules_dir, uint32_t
 
 void module_system_shutdown(void) {
     for (int i = g_module_count - 1; i >= 0; i--) {
-        if (g_modules[i].active) module_unload_one(g_modules[i].name);
+        if (!g_modules[i].active) continue;
+        module_unload_one(g_modules[i].name);
     }
     g_module_count = 0;
-    /* 模块已全部卸载（订阅/监听随之注销），最后停监听线程并释放视图 */
+    /* 模块已全部卸载（订阅/监听随之注销），最后停监听线程并释放视图，
+       再退出内建规则引擎（缓存归零；索引内存由 fw_config 释放） */
     fw_config_shutdown();
-}
-
-int module_dispatch_resolve(const NspQueryCtx* q, NspPathDecision* out) {
-    if (!out) return NSP_DISPATCH_NONE;
-    nsp_decision_init(out);
-    if (!q) return NSP_DISPATCH_NONE;
-    /* 快速路径：无规则模块注册，零开销回退默认路径（先于 uid 层判断，
-       避免无规则模块时每个请求都做路径扫描） */
-    if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
-    /* 框架源头规避：无 <uid>/ 用户层（挂载点根）不进行任何规则合成，
-       仅 <uid>/ 之后的路径才允许规则模块响应 */
-    if (!path_has_uid_layer(q->path)) return NSP_DISPATCH_NONE;
-
-    /* S2 无锁分派 + Phase 1b 守卫：规则模块 ops 由加载/卸载（写锁内）
-       发布进 g_rule_slot_ops 原子快照，此处无锁遍历（免每请求 rwlock
-       往返）：acquire 在途引用 + 二次确认快照未变 → 围栏调用（崩溃
-       longjmp 恢复）→ canary/字符串/值域校验（野指针/越界写指纹）→
-       异常计入熔断器（窗口内达阈值 → 置毒卸载，规则自动失效）。
-       结果统一经已初始化的 canary 守卫缓冲中转，首模块命中后整结构
-       拷贝到 out；无命中时保留分派入口设置的安全默认值。 */
-    bool any = false;
-    bool first = true;
-    for (int i = 0; i < MAX_MODULES; i++) {
-        const NspModuleOps* ops = atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire);
-        if (!ops || !ops->resolve) continue;
-        atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) {
-            /* 快照刚被 unload 置空：放弃引用，不调用 ops */
-            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
-        NspDecisionGuard gd;
-        nsp_guard_decision_init(&gd);
-        int rc = nsp_fence_resolve(i, "resolve", ops->resolve, q, &gd.r);
-        atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (rc == NSP_FENCE_FAULT) {
-            module_guard_fault(i, "resolve", q->path); /* 崩溃：单次即置毒 */
-            continue;
-        }
-        if (rc != 0) {
-            /* 负值错误码 / 围栏 BADFN（防御）：计入熔断窗口 */
-            module_guard_error(i, "resolve", rc, q->path, "模块返回异常");
-            continue;
-        }
-        if (!nsp_guard_decision_ok(&gd)) {
-            module_guard_error(i, "resolve", 0, q->path, "输出 canary 破坏(越界写)");
-            continue;
-        }
-        char det[64];
-        if (nsp_guard_validate_decision(&gd.r, det, sizeof det) != 0) {
-            module_guard_error(i, "resolve", 0, q->path, det);
-            continue;
-        }
-        if (!gd.r.valid) continue;
-        if (first) {
-            /* 首个命中模块：整结构拷贝到调用方 out（canary 校验通过后） */
-            *out = gd.r;
-            first = false;
-            any = true;
-            continue;
-        }
-        const NspPathDecision* r = &gd.r;
-        /* 上下文由首个命中模块独占；限制取并集，真实重定向取首个命中。
-           属性覆盖同理"首个声明者生效"：多模块同时声明同一字段时结果确定，
-           不依赖槽位遍历顺序之外的时序。 */
-        out->appear_missing = out->appear_missing || r->appear_missing;
-        out->read_only = out->read_only || r->read_only;
-        if (!out->is_redirect && r->is_redirect) {
-            out->is_redirect = true;
-            strcpy(out->real_path, r->real_path);
-        }
-        /* 属性覆盖按位合并：未声明过的位才接受后续模块的值（首个声明者生效，
-           与 real_path 策略一致） */
-        uint32_t take = r->attr_override & ~out->attr_override;
-        if (take & NSP_OV_MODE) out->mode = r->mode;
-        if (take & NSP_OV_UID) out->uid = r->uid;
-        if (take & NSP_OV_GID) out->gid = r->gid;
-        out->attr_override |= r->attr_override;
-        if (out->virtual_kind == NSP_VK_NONE && r->virtual_kind != NSP_VK_NONE)
-            out->virtual_kind = r->virtual_kind;
-    }
-    return any ? NSP_DISPATCH_OK : NSP_DISPATCH_NONE;
-}
-
-/* 条目探测也使用原子槽位快照；不存在需要调用方持有的批量读锁。 */
-int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out) {
-    if (!q || !out) return NSP_DISPATCH_NONE;
-    if (g_active_rules_count == 0) return NSP_DISPATCH_NONE;
-    bool any = false;
-    for (int i = 0; i < MAX_MODULES; i++) {
-        const NspModuleOps* ops = atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire);
-        if (!ops || !ops->probe) continue;
-        atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) {
-            /* 快照刚被 unload 置空：放弃引用，不调用 ops */
-            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
-        NspProbeResult r;
-        memset(&r, 0, sizeof r);
-        int rc = nsp_fence_probe(i, "probe", ops->probe, q, &r);
-        atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (rc == NSP_FENCE_FAULT) {
-            module_guard_fault(i, "probe", q->path);
-            continue;
-        }
-        if (rc != 0) {
-            module_guard_error(i, "probe", rc, q->path, "模块返回异常");
-            continue;
-        }
-        if (!r.valid) continue;
-        if (!any) {
-            *out = r;
-            any = true;
-            continue;
-        }
-        /* 多模块并集：appear_missing 任一命中即生效；虚拟目录性质取首个非 NONE
-           （与 resolve 的合并策略一致） */
-        out->appear_missing = out->appear_missing || r.appear_missing;
-        if (out->virtual_kind == NSP_VK_NONE && r.virtual_kind != NSP_VK_NONE)
-            out->virtual_kind = r.virtual_kind;
-        out->is_other_app_pkg = out->is_other_app_pkg || r.is_other_app_pkg;
-    }
-    return any ? NSP_DISPATCH_OK : NSP_DISPATCH_NONE;
+    fw_rules_exit();
 }
 
 /* 后端路径查找：基于后端槽位原子快照无锁分派（免每请求 rwlock + 线性扫描）。
@@ -1262,78 +1140,6 @@ bool module_backend_active(void) {
     return atomic_load_explicit(&g_backend_active_count, memory_order_acquire) > 0;
 }
 
-int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
-                            const char* pkg, bool is_root, NspDirEntry* out, int max) {
-    if (!q || !out || max <= 0) return 0;
-    /* 框架源头规避：无 <uid>/ 用户层（挂载点根，user_id<0）不合成任何模块
-       虚拟目录条目，仅 <uid>/ 之后的路径才允许模块 readdir_extra 响应。
-       注意：此处用 user_id 判断而非 q->path——vfs_readdir 传入的 q->path 是
-       剥离 <uid>/ 后的 sub_path（如 /0/ → /），不能反映是否在用户层内 */
-    if (user_id < 0) return 0;
-    if (g_module_count == 0) return 0;
-    /* Phase 1b：读锁仅用于枚举快照（槽位号/能力位），ops 调用本身不持锁
-       （围栏调用窗口内不得持锁——longjmp 会跳过解锁）。
-       崩溃/错误经围栏+熔断上报（此时已释放读锁，无死锁风险）。 */
-    int active_slots[MAX_MODULES];
-    const NspModuleOps* active_ops[MAX_MODULES];
-    int scount = 0;
-    pthread_rwlock_rdlock(&g_module_lock);
-    for (int i = 0; i < g_module_count && scount < MAX_MODULES; i++) {
-        ModuleEntry* m = &g_modules[i];
-        if (!m->active || !(m->info.caps & NSP_CAP_READDIR_EXTRA)) continue;
-        if (!m->info.ops || !m->info.ops->readdir_extra) continue;
-        active_slots[scount] = i;
-        active_ops[scount] = m->info.ops;
-        scount++;
-    }
-    pthread_rwlock_unlock(&g_module_lock);
-    int n = 0;
-    for (int s = 0; s < scount && n < max; s++) {
-        int i = active_slots[s];
-        const NspModuleOps* ops = active_ops[s];
-        /* 槽位快照二次确认（unload 置空则跳过，与 S2 分派一致） */
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) continue;
-        atomic_fetch_add_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) != ops) {
-            atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-            continue;
-        }
-        int got = nsp_fence_readdir_extra(i, "readdir_extra", ops->readdir_extra, q, sub_path,
-                                          user_id, pkg, is_root, out + n, max - n);
-        atomic_fetch_sub_explicit(&g_rule_slot_refs[i], 1, memory_order_acq_rel);
-        if (got == NSP_FENCE_FAULT) {
-            module_guard_fault(i, "readdir_extra", sub_path);
-            continue;
-        }
-        if (got == NSP_FENCE_BADFN) continue; /* 函数指针 NULL：未实现，静默跳过 */
-        if (got < 0) {
-            module_guard_error(i, "readdir_extra", got, sub_path, "模块返回异常");
-            continue;
-        }
-        if (got > 0) {
-            /* 越界钳制：模块超额返回时已越界写 out+n，必须丢弃整批并熔断，
-               否则上层栈数组 vn 累加超 max 导致栈越界读+filler 垃圾 */
-            if (got > max - n) {
-                module_guard_error(i, "readdir_extra", 0, sub_path, "返回条目数超限(越界写)");
-                continue;
-            }
-            /* 条目校验：坏条目名（未终止）丢弃该批次（计入熔断） */
-            bool entries_ok = true;
-            for (int k = 0; k < got; k++)
-                if (!nsp_guard_dir_entry_ok(out + n + k)) {
-                    entries_ok = false;
-                    break;
-                }
-            if (!entries_ok) {
-                module_guard_error(i, "readdir_extra", 0, sub_path, "条目名未终止(越界写)");
-                continue;
-            }
-            n += got;
-        }
-    }
-    return n;
-}
-
 /* 健康快照（Phase 1c）：含 banned 非活跃槽位（规则已失效仍需展示） */
 int module_health_snapshot(NspModuleHealth** info_out) {
     if (!info_out) return -1;
@@ -1357,7 +1163,6 @@ int module_health_snapshot(NspModuleHealth** info_out) {
         memset(h, 0, sizeof *h);
         strncpy(h->name, m->name, sizeof h->name - 1);
         if (m->info.version) strncpy(h->version, m->info.version, sizeof h->version - 1);
-        h->caps = m->info.caps;
         h->active = m->active;
         h->banned = atomic_load_explicit(&m->banned, memory_order_acquire);
         strncpy(h->ban_reason, m->ban_reason, sizeof h->ban_reason - 1);
@@ -1395,9 +1200,7 @@ bool module_any_loaded(void) {
 int module_ops_slot(const NspModuleOps* ops) {
     if (!ops) return -1;
     for (int i = 0; i < MAX_MODULES; i++) {
-        if (atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire) == ops ||
-            atomic_load_explicit(&g_rule_slot_ops[i], memory_order_acquire) == ops)
-            return i;
+        if (atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire) == ops) return i;
     }
     return -1;
 }

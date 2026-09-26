@@ -46,7 +46,7 @@ void nsp_set_thread_name(const char* name);
 
 /* ---- 应用规则目录/文件路径合成（App-rules 家族）----
  *
- * config_dir 由调用方传入而非读取全局：config_parser.c 编入的 basic_rules.so
+ * config_dir 由调用方传入而非读取全局：编入多个二进制的 config_parser.c
  * 只链接 nsp_util 而不链接 common.c，不得依赖框架全局配置目录。
  * uid == 0 → <config_dir>/App-rules[/<pkg>.conf]；
  * uid != 0 → <config_dir>/App-rules-<uid>[/<pkg>.conf]。

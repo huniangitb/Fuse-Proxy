@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FTP 模块端到端测试 — ftp_module(FTP-FUSE) + basic_rules 变量 + REDIRECT。
+"""FTP 模块端到端测试 — ftp_module(FTP-FUSE) + 内建引擎变量 + REDIRECT。
 
 链路：
   ftp.conf([云盘]) → ftp_module 挂载 storage/0/云盘（FTP-FUSE）
@@ -24,7 +24,6 @@ SERVER   = "云盘"
 REPO     = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DAEMON   = os.environ.get("FUSE_DAEMON") or f"{REPO}/build_gnu/fuse_daemon"
 FTP_MOD_SO = os.environ.get("FTP_MODULE_SO") or f"{REPO}/build_gnu/ftp_module.so"
-BASIC_RULES = os.environ.get("BASIC_RULES_SO") or f"{REPO}/build_gnu/basic_rules.so"
 
 PASS = 0; FAIL = 0; ERRS = []
 def ok(d): global PASS; PASS += 1; print(f"  ✅ {d}")
@@ -36,12 +35,7 @@ def setup():
     os.makedirs(f"{STORAGE}/0", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
     os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
-    os.makedirs(f"{MODDIR}/basic_rules", exist_ok=True)
     os.makedirs(f"{MODDIR}/ftp_module", exist_ok=True)
-    if os.path.exists(BASIC_RULES):
-        shutil.copy(BASIC_RULES, f"{MODDIR}/basic_rules/basic_rules.so")
-    else:
-        print("  ⚠ basic_rules.so 未找到")
     if os.path.exists(FTP_MOD_SO):
         shutil.copy(FTP_MOD_SO, f"{MODDIR}/ftp_module/ftp_module.so")
     else:

@@ -32,12 +32,13 @@ SUITE_MAP = [
      "通用回归基线"),
 
     # ── AGENTS.md 映射表 ──
-    (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py"),
-     ("src/modules/basic_rules/", "src/config/config_parser.c", "src/daemon/fuse_daemon.c"),
-     ("br_rules", "config_build_from_view", "parse_config_line"),
-     "basic_rules / fuse_daemon.c / config_parser.c"),
+    (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
+      "test_decision_enforce.py"),
+     ("src/daemon/fw_rules.c", "src/config/config_parser.c", "src/daemon/fuse_daemon.c"),
+     ("fw_rules_resolve", "config_build_from_view", "parse_config_line"),
+     "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
 
-    (("test_ftp.py", "test_backend_lifecycle.py", "test_ftp_read_restart.py"),
+    (("test_ftp.py", "test_ftp_read_restart.py"),
      ("src/modules/ftp/",),
      ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read"),
      "src/modules/ftp/ 或框架后端分派"),
@@ -59,23 +60,18 @@ SUITE_MAP = [
      ("cleanup_app_mounts",),
      "injector 挂载/清理序列"),
 
-    (("test_modules.py", "test_module_circuit.py", "test_module_abi.py"),
-     ("src/module/",), (),
-     "src/module/（加载器/围栏/熔断/ABI）"),
+    (("test_modules.py", "test_module_circuit.py", "test_module_abi.py",
+      "test_backend_lifecycle.py"),
+     ("src/module/",), ("memfd_create", "module_backend_", "module_fault_poison"),
+     "src/module/（加载器/内存副本加载/围栏/熔断/ABI）"),
 
-    (("test_module_overrides.py",), (),
-     ("NspPathDecision", "fw_route", "vfs_apply_attr_override", "appear_missing"),
-     "决策结构 / 框架单点强制"),
+    (("test_decision_enforce.py",), (),
+     ("fw_route", "appear_missing", "vfs_check_read_only"), "决策强制单点（errno 矩阵）"),
 
     (("test_log_ctl_rules.py", "test_rule_server.py"),
      ("src/rule/", "src/log/log_ctl.c"),
      ("nsp_rule_file",),
      "log_ctl / rule_server 规则编辑"),
-
-    (("test_libfuse_inval.py",),
-     ("subprojects/libfuse",),
-     ("fuse_invalidate_path", "invalidate_path_entry"),
-     "libfuse 子模块（fork 追加接口）/ 框架缓存失效"),
 
     (("test_log_pipeline.py",),
      ("src/log/", "src/core/nsp_comm.c", "include/nsp_comm.h", "include/nsp_log.h",

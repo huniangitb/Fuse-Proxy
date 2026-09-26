@@ -6,11 +6,11 @@
 锁定三类行为，均来自「框架运行期间监控日志凭空消失、只有历史遗留记录」的现场：
 
 1. **框架闸门不得静默关闭监控**（`fw_route` 单点给出 `monitor_on`，且由框架自算）
-   - 规则模块未加载/被拒载（`g_active_rules_count == 0`）时，`[GLOBAL] MONITOR ON`
+   - 规则文件里没有任何规则记录（引擎直通分支）时，`[GLOBAL] MONITOR ON`
      仍须记录 IO：修复前该情形文件读写一切正常、监控日志却是 0；
    - 路径无 `<uid>/` 用户层（挂载点根）时同样须记录（修复前为 0）；
    - `MONITOR OFF` 必须**仍然**不记录——兜底不能退化成无条件开；
-   - 类别段（`[SYSTEM_APPS]`）在模块缺席时同样生效：全局 OFF + 类别 ON 要记录、
+   - 类别段（`[SYSTEM_APPS]`）在引擎直通时同样生效：全局 OFF + 类别 ON 要记录、
      全局 ON + 类别 OFF 要不记录（三层合并在框架侧完成，不依赖模块）。
      `[USER_APPS:<uid>]` 分支需要 uid>=10000 的请求者，端到端测不到——那一层由
      `test_monitor_layers.py` 用合成 uid 直接验证框架合并函数。
@@ -21,7 +21,7 @@
 
 前置：GNU 产物 `build_gnu/{fuse_daemon,log_monitor,log_ctl,basic_rules.so}`、
       `fusermount3`、`/dev/fuse`。非默认产物路径用环境变量覆盖：
-      `FUSE_DAEMON`、`LOG_MONITOR`、`LOG_CTL`、`BASIC_RULES_SO`。
+      `FUSE_DAEMON`、`LOG_MONITOR`、`LOG_CTL`。
 
 副作用：抽象套接字 `nsp_log_socket` 全局唯一，本测试会**重启 log_monitor**
         （记录并还原被停掉的实例），并备份/还原 `<LOG_DIR>/io.log{,.1}`。
@@ -42,7 +42,6 @@ BUILD = os.environ.get("BUILD_DIR") or os.path.join(ROOT, "build_gnu")
 DAEMON = os.environ.get("FUSE_DAEMON") or os.path.join(BUILD, "fuse_daemon")
 LOG_MON = os.environ.get("LOG_MONITOR") or os.path.join(BUILD, "log_monitor")
 LOG_CTL = os.environ.get("LOG_CTL") or os.path.join(BUILD, "log_ctl")
-RULES_SO = os.environ.get("BASIC_RULES_SO") or os.path.join(BUILD, "basic_rules.so")
 
 LOG_DIR = os.environ.get("NSP_LOG_DIR") or "/var/fuse-proxy/log"
 IO_LOG = os.path.join(LOG_DIR, "io.log")
@@ -216,14 +215,13 @@ def stream_io_dump(key, timeout=6.0):
 # ───────────────────────────────────────────────────────────
 # fuse_daemon 生命周期
 # ───────────────────────────────────────────────────────────
-def fresh_env(with_module, conf_text):
+def fresh_env(conf_text):
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
     shutil.rmtree(BASE, ignore_errors=True)
     os.makedirs(STORAGE + "/0/Download", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
-    if with_module:
-        os.makedirs(MODDIR + "/basic_rules", exist_ok=True)
-        shutil.copy(RULES_SO, os.path.join(MODDIR, "basic_rules", "basic_rules.so"))
+    # 规则引擎内建（fw_rules），模块目录留空——规则不依赖模块
+    os.makedirs(MODDIR, exist_ok=True)
     os.makedirs(os.path.dirname(CONF), exist_ok=True)
     with open(CONF, "w") as f:
         f.write(conf_text)
@@ -285,10 +283,9 @@ def ops_root():
         return False
 
 
-def run_gate_case(name, conf_text, with_module, ops, expect_log, search_key=None,
-                  expect_ops=True):
+def run_gate_case(name, conf_text, ops, expect_log, search_key=None, expect_ops=True):
     """起一套独立环境 → clear-io → 执行操作 → 断言 IO 日志条数与文件操作结果。"""
-    fresh_env(with_module, conf_text)
+    fresh_env(conf_text)
     proc = start_fuse()
     if not proc:
         fail("%s: fuse_daemon 未能挂载" % name)
@@ -325,23 +322,24 @@ CAT_UA_OFF = "[GLOBAL]\nMONITOR ON\n[USER_APPS:0] ON\nMONITOR OFF\n"
 
 def test_gate_matrix():
     log("\n━━━ 用例组1: 框架闸门矩阵（monitor_on 不得随决策失效一起丢） ━━━")
-    run_gate_case("1.1 基准(模块+uid路径)", MON_ON, True, ops_uid, expect_log=True)
-    run_gate_case("1.2 规则模块未注册", MON_ON, False, ops_uid, expect_log=True)
+    run_gate_case("1.1 基准(uid 路径)", MON_ON, ops_uid, expect_log=True)
+    # 规则文件只有 [GLOBAL]（无任何规则记录）：引擎走"无规则"直通分支，开关仍须生效
+    run_gate_case("1.2 无规则记录（引擎直通）", MON_ON, ops_uid, expect_log=True)
     # 挂载点根没有测试 ID 可作检索键，用操作名本身做键（clear-io 后它是唯一来源）
-    run_gate_case("1.3 路径无 uid 层", MON_ON, True, ops_root, expect_log=True,
+    run_gate_case("1.3 路径无 uid 层", MON_ON, ops_root, expect_log=True,
                   search_key="READDIR")
-    run_gate_case("1.4 MONITOR OFF", MON_OFF, True, ops_uid, expect_log=False)
+    run_gate_case("1.4 MONITOR OFF", MON_OFF, ops_uid, expect_log=False)
     # 类别层：MONITOR 的三层合并归框架，模块缺席时也必须算得对
     if os.getuid() >= 10000:
         log("⚠ 本进程 uid=%d 属用户应用，类别段用例（1.5/1.6）语义不同，跳过",
             os.getuid())
     else:
-        run_gate_case("1.5 类别段不越界(USER_APPS vs system)", CAT_UA_OFF, False, ops_uid,
+        run_gate_case("1.5 类别段不越界(USER_APPS vs system)", CAT_UA_OFF, ops_uid,
                       expect_log=True)
-        run_gate_case("1.6 类别段可开启(全局 OFF + SYSTEM_APPS ON)", CAT_SYS_ON, False,
-                      ops_uid, expect_log=True)
-    run_gate_case("1.7 类别段否决(全局 ON + SYSTEM_APPS OFF, 模块在场)", CAT_SYS_OFF, True,
-                  ops_uid, expect_log=False)
+        run_gate_case("1.6 类别段可开启(全局 OFF + SYSTEM_APPS ON)", CAT_SYS_ON, ops_uid,
+                      expect_log=True)
+    run_gate_case("1.7 类别段否决(全局 ON + SYSTEM_APPS OFF)", CAT_SYS_OFF, ops_uid,
+                  expect_log=False)
 
 
 # ───────────────────────────────────────────────────────────
@@ -398,7 +396,7 @@ def main():
     log("═══ 日志链路回归测试 ═══")
     log("测试ID: %s", TEST_ID)
     for label, path in (("fuse_daemon", DAEMON), ("log_monitor", LOG_MON),
-                        ("log_ctl", LOG_CTL), ("basic_rules", RULES_SO)):
+                        ("log_ctl", LOG_CTL)):
         if not os.path.exists(path):
             log("❌ 缺少 %s: %s", label, path)
             log("   先执行 ninja -C build_gnu（或用环境变量指定产物路径）")

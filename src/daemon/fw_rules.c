@@ -1,11 +1,22 @@
 #define _GNU_SOURCE
-#include "br_rules.h"
-#include "nsp_module.h" /* LOG_*、g_log_shutdown、g_real_root、STORAGE_BASE 等 */
-#include "nsp_constants.h"
-#include "path_vars.h"
-#include "uid_map.h"
-#include "fast_pid.h"
-#include "sys_pkg.h"
+/*
+ * fw_rules.c — 框架内建规则引擎（见 fw_rules.h）
+ *
+ * 由原 basic_rules 模块的 br_rules.c 原样搬入：规则匹配语义逐行未改，
+ * 只做两件事——① uid→包名改由框架统一解析（fw_pkg.c）而非模块自带
+ * uid.map/proc 双份实现；② 配置索引由 fw_config 构建，本文件只在重载时
+ * 作废自有指针缓存。
+ *
+ * 内部符号沿用 `br_` 前缀（basic_rules 时代的命名）——它们是本文件私有的
+ * static 量与私有结构，不跨文件、不跨 ABI，故不做批量改名以免噪音。
+ */
+#include "fw_rules.h"      /* NspQueryCtx/NspPathDecision + nsp_module.h（LOG 宏） */
+#include "fw_pkg.h"        /* fw_pkg_resolve：包名解析归框架 */
+#include "config_parser.h" /* AppConfig / find_*_cfg_locked / config_read_* */
+#include "path_vars.h"     /* pkg_resolvable / has_path_var / expand_path_vars */
+#include "sys_pkg.h"       /* sys_pkg_is_system（SYSTEM_APPS 类别判定） */
+#include "common.h"        /* LOG 宏 / common_default_real_path / common_sandbox_path */
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +27,7 @@
 #include <pthread.h>
 #include <dirent.h>
 
-/* ============ 模块内部状态（从 vfs_core.c 适配，不再依赖 fuse_context） ============ */
+/* ============ 引擎内部状态（从 vfs_core.c 适配，不再依赖 fuse_context） ============ */
 
 static char g_br_rules_path[PATH_MAX] = {0};
 static bool g_br_disable_sandbox = false;
@@ -29,7 +40,7 @@ static bool g_br_disable_sandbox = false;
      读者零原子写，多线程并发读不产生缓存行颠簸（原 rwlock 读路径每次
      rdlock/unlock 均原子改写同一缓存行，高并发下成瓶颈）；
    - 写者（缓存填充/重载失效）取 wlock 互斥 + seq 奇数/偶数翻转。
-   所有调用方（br_resolve/br_probe）均持 config_lock_read，
+   所有调用方（fw_rules_resolve/fw_rules_probe）均持 config_lock_read，
    cfg 指针不会被重载并发释放；seqlock 仅需防止并发填充互相撕裂。 */
 typedef struct {
     pthread_mutex_t wlock; /* 写者互斥（填充/失效），读侧无锁 */
@@ -38,25 +49,19 @@ typedef struct {
     AppConfig* cfg;
     AppConfig* cat; /* 命中的类别段（USER_APPS/SYSTEM_APPS，可 NULL；
                                      与 cfg 同代际、同样仅作废不保留） */
-    uint64_t gen;   /* 填充时的配置代际（g_br_cfg_gen）：
-                                     重载后过期 → 走 pkg 复用路径（见下） */
-    char pkg[128];  /* pkg 为进程事实，不随规则重载变化：
-                                     重载仅作废 cfg（置 NULL + gen=0），
-                                     保留 uid/pkg，下次命中免 /proc 重解析 */
+    uint64_t gen;   /* 填充时的配置代际（g_br_cfg_gen）：重载后即过期 */
 } UidCacheSlot;
 static UidCacheSlot g_uid_cache[UID_CACHE_SIZE];
-static UidMapEntry* g_uid_maps = NULL;
-static int g_uid_map_count = 0;
 
 /* ============ readdir 目录级 probe 缓存 ============
-   br_probe 是 readdir 逐条目过滤的热路径：同一父目录的连续条目共享一次
+   fw_rules_probe 是 readdir 逐条目过滤的热路径：同一父目录的连续条目共享一次
    「根→父目录」trie 下降与 uid→cfg 解析，命中后仅按最后一段查子节点，
    避免每条目重复全路径 trie 遍历与 uid 缓存锁（大目录 O(n) 锁风暴）。
    线程私有（FUSE 多线程各自独立，readdir 循环在单线程内顺序执行）；
    配置重载（g_br_cfg_gen 递增，写锁内）后失效，杜绝 trie/cfg 悬垂。 */
 typedef struct {
     bool valid;
-    uint64_t gen; /* 配置代际（br_rules_apply_config 递增） */
+    uint64_t gen; /* 配置代际（fw_rules_on_reload 递增） */
     uid_t uid;
     pid_t pid;
     char dir[PATH_MAX]; /* 父目录 sub_path（"/" 或 "/a/b"） */
@@ -75,39 +80,6 @@ static _Thread_local BrProbeDirCache g_probe_dir_cache;
 static _Atomic(uint64_t) g_br_cfg_gen = 0; /* 配置代际：重载（写锁内）递增，
                                                 probe 缓存命中无锁路径据此校验 */
 
-static void load_uid_map(void) {
-    /* S1 COW：构建新映射到临时数组，发布时整体换入，旧数组延迟释放
-       （无锁读者可能正读 g_uid_maps，就地 free 会 UAF） */
-    int cap = UID_MAP_INIT_CAPACITY;
-    UidMapEntry* new_maps = malloc((size_t)cap * sizeof(UidMapEntry));
-    if (!new_maps) {
-        LOG_ERR("load_uid_map: malloc(%d) 失败", cap);
-        return;
-    }
-    int new_count = uid_map_load(new_maps, cap);
-    while (new_count > 0 && new_count == cap) {
-        cap *= 2;
-        UidMapEntry* nm = realloc(new_maps, (size_t)cap * sizeof(UidMapEntry));
-        if (!nm) {
-            LOG_ERR("load_uid_map: realloc(%d) 失败", cap);
-            free(new_maps);
-            return;
-        }
-        new_maps = nm;
-        new_count = uid_map_load(new_maps, cap);
-    }
-    uint64_t old_gen = config_publish_begin();
-    /* P1 修复：先排空旧代际读者再交换指针/count（否则 uid_map_lookup
-       可能对新数组 + 旧 count 做二分 → 越界读） */
-    config_drain_readers(old_gen);
-    UidMapEntry* old_maps = g_uid_maps;
-    g_uid_maps = new_maps;
-    g_uid_map_count = new_count;
-    config_publish_end(old_gen);
-    free(old_maps); /* 旧代际读者已归零 */
-    LOG_DBG("uid.map 已加载: %d 条映射 (容量 %d)", new_count, cap);
-}
-
 static void clear_uid_cache(void) {
     for (int i = 0; i < UID_CACHE_SIZE; i++) {
         UidCacheSlot* s = &g_uid_cache[i];
@@ -115,9 +87,8 @@ static void clear_uid_cache(void) {
         /* 写者进入：seq → 奇数（读者重试） */
         atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
                               memory_order_release);
-        /* 仅作废 cfg（重载后旧 AppConfig 已释放，指针悬垂）+ gen=0 标记过期；
-           保留 uid/pkg——pkg 为进程事实不随规则重载变化，下次同 uid 命中
-           可复用 pkg 免 /proc 重解析（热重载后不再全量 uid /proc 风暴） */
+        /* 作废 cfg/cat（重载后旧 AppConfig 已被 COW 发布释放，留着即悬垂）
+           + gen=0 标记过期。包名不在此缓存：它归 fw_pkg.c，自带跨重载缓存 */
         s->cfg = nullptr;
         s->cat = nullptr; /* 类别指针同代际，同样作废（防悬垂） */
         s->gen = 0;
@@ -127,56 +98,36 @@ static void clear_uid_cache(void) {
     }
 }
 
-/* 应用框架下发的配置视图：重建索引 + 失效缓存。
-   由 basic_rules.c 的 config_update 监听器在框架推送时调用（init 期间一次，
-   之后每次热重载一次）。框架已完成文件读取与词法/段头识别，本函数只做
-   "行 → 规则对象 → trie" 的索引构建，语义与原自读实现完全一致。 */
-void br_rules_apply_config(const NspModuleConfig* cfg) {
-    if (!cfg) return;
+/* 框架换入新配置索引后调用（fw_config 的 reload_once 内，紧接
+   config_build_from_view 之后）：只作废本引擎的 uid→AppConfig 指针缓存。
+   索引构建、uid.map 重读、sys_pkgs.cache 刷新都已由 fw_config 完成。 */
+void fw_rules_on_reload(void) {
     config_lock_write();
-    /* S1：先失效 uid 缓存与目录级 probe 缓存（g_br_cfg_gen++），再重建配置——
-       config_build_from_view 的 COW 发布会释放旧 AppConfig，必须在此之前让
-       缓存作废，否则无锁读者可能命中悬垂指针 */
     atomic_fetch_add_explicit(&g_br_cfg_gen, 1, memory_order_release);
     clear_uid_cache();
-    config_build_from_view(cfg->recs, cfg->count);
-    load_uid_map();
-    sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     config_unlock_write();
-    LOG_DBG("已应用框架下发的配置 (代际 %llu, %d 条记录)，全局监控状态: %s",
-            (unsigned long long)cfg->generation, cfg->count,
-            g_global_cfg.monitor ? "开启" : "关闭");
 }
 
-int br_rules_init(const char* rules_path, bool disable_sandbox) {
+int fw_rules_init(const char* rules_path, bool disable_sandbox) {
     strncpy(g_br_rules_path, rules_path ? rules_path : "", sizeof(g_br_rules_path) - 1);
     g_br_disable_sandbox = disable_sandbox;
-    /* 只读消费系统应用表（injector 落盘的 sys_pkgs.cache）：本进程永不
-       popen pm（binder 挂起风险），无表时回退 uid<10000 */
-    sys_pkg_init(false);
-    config_init_lock();
     for (int i = 0; i < UID_CACHE_SIZE; i++) {
         pthread_mutex_init(&g_uid_cache[i].wlock, nullptr);
         atomic_store_explicit(&g_uid_cache[i].seq, 0, memory_order_relaxed);
         g_uid_cache[i].uid = 0;
         g_uid_cache[i].cfg = nullptr;
+        g_uid_cache[i].cat = nullptr;
         g_uid_cache[i].gen = 0;
-        g_uid_cache[i].pkg[0] = '\0';
     }
-    /* 配置不在此读取：框架在 init 返回后经 config_update 监听器下发首份视图
-       （见 basic_rules.c 的 subscribe + set_config_listener） */
-    LOG("basic_rules: 规则引擎已就绪 (rules=%s, sandbox=%s)，等待框架下发配置",
+    /* 配置不在此读取：fw_config 在 init 之后（同一次启动流程内）构建索引并
+       调 fw_rules_on_reload。sys_pkg/config lock 的初始化也归 fw_config。 */
+    LOG("规则引擎已就绪 (rules=%s, sandbox=%s)",
         g_br_rules_path[0] ? g_br_rules_path : "(none)", disable_sandbox ? "off" : "on");
     return 0;
 }
 
-void br_rules_exit(void) {
-    /* 无自有线程（配置监听已收归框架），直接销毁锁与释放内存 */
-    config_destroy_lock();
-    sys_pkg_cleanup();
-    free(g_uid_maps);
-    g_uid_maps = NULL;
-    g_uid_map_count = 0;
+void fw_rules_exit(void) {
+    /* 无自有线程、无自有索引：索引与锁归 fw_config，配置内存由它释放 */
 }
 
 /* ============ uid → AppConfig 解析（适配 vfs_get_app_cfg） ============ */
@@ -197,25 +148,30 @@ static AppConfig* br_pick_category(uid_t uid, int user_id, const char* base_pkg)
     return find_category_cfg_locked(false, user_id);
 }
 
+/* uid → (应用段, 类别段)。包名由框架统一解析（fw_pkg.c：uid.map → /proc 回退，
+   与模块时代同源同序），本函数只做段匹配 + 指针缓存：
+   命中路径（含负面结果）缓存 uid→(cfg,cat)，避免每请求线性扫 g_app_cfgs。 */
 static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, AppConfig** cat_out) {
     if (cat_out) *cat_out = nullptr;
+    char pkg[128];
+    bool lookup_ok = fw_pkg_resolve(uid, tid, pkg, sizeof pkg);
+    strncpy(current_pkg_out, pkg, 127);
+    current_pkg_out[127] = '\0';
+
     if (uid < NSP_SYSTEM_APP_UID_MIN) {
-        strncpy(current_pkg_out, "system", 127);
-        current_pkg_out[127] = '\0';
-        /* 系统伪包同样参与类别层：SYSTEM_APPS 对 uid<10000 生效 */
+        /* 系统伪包（uid<10000，fw_pkg 已给出 "system"）：只参与 SYSTEM_APPS 类别层 */
         if (cat_out)
-            *cat_out = br_pick_category(uid, (int)(uid / NSP_PER_USER_UID_STRIDE), "system");
+            *cat_out = br_pick_category(uid, (int)(uid / NSP_PER_USER_UID_STRIDE), pkg);
         return nullptr;
     }
+
     int slot = uid % UID_CACHE_SIZE;
     UidCacheSlot* s = &g_uid_cache[slot];
     uint64_t cur_gen = atomic_load_explicit(&g_br_cfg_gen, memory_order_acquire);
 
     /* seqlock 无锁读：seq 偶数且两次读相等 = 稳定快照（读者零原子写，
-       多线程并发读无缓存行颠簸）。命中（含 negative：scfg 可为 NULL）
-       直接返回；代际过期则保留缓存 pkg 走下方复用路径（免 /proc） */
-    char reuse_pkg[128] = {0};
-    bool reuse_ok = false;
+       多线程并发读无缓存行颠簸）。命中（含负面：scfg 可为 NULL）直接返回；
+       代际过期则落到下方重算（重载后旧 AppConfig 已释放，不可复用指针）。 */
     for (;;) {
         uint64_t s1 = atomic_load_explicit(&s->seq, memory_order_acquire);
         if (s1 & 1) continue; /* 写者进行中：重试 */
@@ -223,80 +179,26 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, Ap
         AppConfig* scfg = s->cfg;
         AppConfig* scat = s->cat;
         uint64_t sgen = s->gen;
-        memcpy(reuse_pkg, s->pkg, sizeof reuse_pkg);
         uint64_t s2 = atomic_load_explicit(&s->seq, memory_order_acquire);
         if (s1 != s2) continue; /* 快照不一致：重试 */
-        if (suid == uid) {
-            if (sgen == cur_gen) {
-                strncpy(current_pkg_out, reuse_pkg, 127);
-                current_pkg_out[127] = '\0';
-                if (cat_out) *cat_out = scat;
-                return scfg;
-            }
-            /* 代际过期（热重载后）：pkg 为进程事实仍有效，可复用免 /proc */
-            reuse_ok = (reuse_pkg[0] != '\0');
+        if (suid == uid && sgen == cur_gen) {
+            if (cat_out) *cat_out = scat;
+            return scfg;
         }
         break;
     }
 
-    int user_id = uid / NSP_PER_USER_UID_STRIDE;
-    char final_pkg[256] = {0};
-    pid_t main_pid = tid;
-    const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
-    if (mapped) strncpy(final_pkg, mapped, 255);
-    /* 热重载后复用缓存 pkg（不随规则变化），免全量 uid /proc 解析风暴 */
-    if (final_pkg[0] == '\0' && reuse_ok) strncpy(final_pkg, reuse_pkg, 255);
-    if (final_pkg[0] == '\0') {
-        char status_path[64];
-        snprintf(status_path, sizeof(status_path), "/proc/%d/status", tid);
-        FILE* fp = fopen(status_path, "r");
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strncmp(line, "Tgid:", 5) == 0) {
-                    main_pid = atoi(line + 5);
-                    break;
-                }
-            }
-            fclose(fp);
-        }
-        proc_get_cmdline(main_pid, final_pkg, sizeof(final_pkg));
+    int user_id = (int)(uid / NSP_PER_USER_UID_STRIDE);
+    AppConfig* matched = nullptr;
+    AppConfig* cat = nullptr;
+    if (lookup_ok) {
+        /* 包名不可解析（过短/zygote/<pre-）时 lookup_ok=false，类别层与
+           应用段都不参与，仅 [GLOBAL] 生效——与旧实现同一 fail-safe 口径 */
+        matched = find_app_cfg_locked(pkg, user_id);
+        if (pkg_resolvable(pkg)) cat = br_pick_category(uid, user_id, pkg);
     }
-    char base_pkg[256];
-    strncpy(base_pkg, final_pkg, sizeof(base_pkg) - 1);
-    base_pkg[sizeof(base_pkg) - 1] = '\0';
-    char* colon = strchr(base_pkg, ':');
-    if (colon) *colon = 0;
-    strncpy(current_pkg_out, base_pkg, 127);
-    current_pkg_out[127] = '\0';
-
-    if (strlen(base_pkg) < 3 || strstr(base_pkg, "zygote") != nullptr ||
-        strstr(base_pkg, "<pre-") != nullptr) {
-        if (base_pkg[0] == '\0') {
-            strncpy(base_pkg, "unknown", sizeof(base_pkg) - 1);
-            base_pkg[sizeof(base_pkg) - 1] = '\0';
-        }
-        strncpy(current_pkg_out, base_pkg, 127);
-        current_pkg_out[127] = '\0';
-        /* 写缓存：wlock 互斥 + seq 奇数/偶数翻转（读者重试/恢复） */
-        pthread_mutex_lock(&s->wlock);
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release);
-        s->uid = uid;
-        s->cfg = nullptr;
-        s->cat = nullptr; /* 不可解析包名：类别层不同时生效（仅 GLOBAL） */
-        s->gen = cur_gen;
-        strncpy(s->pkg, base_pkg, 127);
-        s->pkg[127] = '\0';
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release);
-        pthread_mutex_unlock(&s->wlock);
-        return nullptr;
-    }
-
-    AppConfig* matched = find_app_cfg_locked(final_pkg, user_id);
-    AppConfig* cat = br_pick_category(uid, user_id, base_pkg);
     if (cat_out) *cat_out = cat;
+
     pthread_mutex_lock(&s->wlock);
     atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
                           memory_order_release);
@@ -304,8 +206,6 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, Ap
     s->cfg = matched;
     s->cat = cat;
     s->gen = cur_gen;
-    strncpy(s->pkg, current_pkg_out, 127);
-    s->pkg[127] = '\0';
     atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
                           memory_order_release);
     pthread_mutex_unlock(&s->wlock);
@@ -338,7 +238,7 @@ static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg) {
     return false;
 }
 
-static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path, TrieMatch* out) {
+static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path, FwRulesTrieMatch* out) {
     if (!out) return;
     out->valid = true;
     out->hidden = false;
@@ -417,9 +317,9 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
    注意：跨应用隔离（br_is_other_app_pkg）不在本函数判定——resolve
    （getattr/open）不得隐藏其他应用的 /Android/data 路径，否则列表可见
    但打开报 ENOENT（MT 管理器访问 /Android/data/<他包>/ 场景）；该隔离
-   只由 br_probe（readdir 条目过滤）显式追加，实现"限制列举、不限制打开"。 */
+   只由 fw_rules_probe（readdir 条目过滤）显式追加，实现"限制列举、不限制打开"。 */
 static bool br_hidden_static_part(const char* sub_path, const char* current_pkg,
-                                  const TrieMatch* tm, bool* is_skel_out) {
+                                  const FwRulesTrieMatch* tm, bool* is_skel_out) {
     if (is_skel_out) *is_skel_out = false;
     if (strncmp(sub_path, CONFIG_DIR, strlen(CONFIG_DIR)) == 0) return true;
     if (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0 ||
@@ -457,7 +357,7 @@ static bool br_cat_hide_linear(AppConfig* cat, const char* sub_path, const char*
 }
 
 static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const char* sub_path,
-                                       const char* current_pkg, const TrieMatch* tm) {
+                                       const char* current_pkg, const FwRulesTrieMatch* tm) {
     bool is_skel = false;
     if (br_hidden_static_part(sub_path, current_pkg, tm, &is_skel)) return true;
     if (is_skel) return false; /* 骨架目录恒不隐藏（原逻辑提前返回，不扫 hide） */
@@ -562,7 +462,7 @@ static int br_strip_and_sanitize(const char* path, int* path_user_id_out, char* 
 static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const char* path,
                                         int* path_user_id_out, char* sub_path_out,
                                         size_t sub_path_size, const char* current_pkg, uid_t uid,
-                                        TrieMatch* tm_out) {
+                                        FwRulesTrieMatch* tm_out) {
     (void)uid;
     if (br_strip_and_sanitize(path, path_user_id_out, sub_path_out, sub_path_size) != 0)
         return -ENOENT;
@@ -691,7 +591,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
 
 static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf,
                            size_t size, int user_id, bool* is_redir_out, const char* current_pkg,
-                           const TrieMatch* tm, uid_t uid) {
+                           const FwRulesTrieMatch* tm, uid_t uid) {
     char temp[PATH_MAX] = {0};
     bool redir = false;
 
@@ -799,7 +699,7 @@ static bool br_cat_ro_linear(AppConfig* cat, const char* sub_path, const char* c
 }
 
 static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
-                          const char* current_pkg, const TrieMatch* tm) {
+                          const char* current_pkg, const FwRulesTrieMatch* tm) {
     if (tm && tm->valid) {
         if (tm->ro) return true;
     } else {
@@ -1043,22 +943,30 @@ static bool br_is_redirect_target(AppConfig* cfg, AppConfig* cat, const char* su
 /* ============ 核心决策入口 ============ */
 
 /* 字符串仅需首字节清零；成功路径负责覆盖，隐藏路径保留空串。 */
-static inline void br_result_init(BrResult* out) {
+static inline void br_result_init(NspPathDecision* out) {
     out->valid = false;
     out->appear_missing = false;
     out->read_only = false;
-    out->attr_override = 0;
-    out->mode = 0;
-    out->uid = 0;
-    out->gid = 0;
     out->real_path[0] = '\0';
     out->is_redirect = false;
     out->virtual_kind = NSP_VK_NONE;
     out->is_ftp = false;
 }
 
-void br_resolve(const BrQuery* q, BrResult* out) {
-    if (!q || !out) return;
+/* 路径是否含 <uid>/ 用户层（如 /0/foo、/10/、或 /0 本身）：挂载点根（/、/obb
+   等非 uid 顶层）不进行任何规则合成，仅 <uid>/ 之后的路径才参与规则——从框架
+   源头规避挂载点根下出现额外虚拟目录（如 FTP 前缀条目被合到根下）。 */
+bool fw_rules_path_has_uid_layer(const char* path) {
+    if (!path || path[0] != '/' || path[1] < '0' || path[1] > '9') return false;
+    const char* d = path + 1;
+    while (*d >= '0' && *d <= '9') d++;
+    return (*d == '\0' || *d == '/');
+}
+
+void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
+    if (!out) return;
+    br_result_init(out);
+    if (!q || !fw_rules_path_has_uid_layer(q->path)) return; /* 直通：不参与规则 */
     /* S1 无锁快照读：替代 rwlock 读锁。config_read_begin 持槽期间旧配置
        不会被发布者释放；config_read_end 返回 false（读期间发生发布）则
        整体重试——热重载极低频，重试代价可忽略 */
@@ -1071,7 +979,7 @@ void br_resolve(const BrQuery* q, BrResult* out) {
 
         int path_user_id = -1;
         char sub_path[PATH_MAX];
-        TrieMatch tm;
+        FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0) {
             out->valid = true;
@@ -1121,8 +1029,11 @@ void br_resolve(const BrQuery* q, BrResult* out) {
 
 /* 轻量探测：readdir 逐条目过滤用。只做 sanitize + hidden/redirect_target/
    虚拟目录判断，不构建真实路径、不触发 sandbox 目录创建（性能敏感） */
-void br_probe(const BrQuery* q, BrProbeResult* out) {
-    if (!q || !out) return;
+void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->valid = false;
+    if (!q || !fw_rules_path_has_uid_layer(q->path)) return; /* 直通：不过滤 */
     /* S1 无锁快照读：替代 rwlock 读锁。config_read_begin 持槽期间旧配置
        不会被发布者释放；config_read_end 返回 false（读期间发生发布）则
        整体重试（probe 是 readdir 条目级热路径，重载极低频可忽略） */
@@ -1184,7 +1095,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
                               !(cat && (cat->dyn_redir || cat->dyn_hide || cat->dyn_ro)) &&
                               !pc->app_dir_node && !pc->cat_dir_node && !pc->g_dir_node;
             if (all_static) {
-                TrieMatch tm;
+                FwRulesTrieMatch tm;
                 tm.valid = true;
                 tm.hidden = pc->app_dir_hidden || pc->cat_dir_hidden || pc->g_dir_hidden;
                 bool is_skel = false;
@@ -1206,7 +1117,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
             if (ca && ca->is_hidden) trie_hidden = true;
             if (cc && cc->is_hidden) trie_hidden = true;
             if (cg && cg->is_hidden) trie_hidden = true;
-            TrieMatch tm;
+            FwRulesTrieMatch tm;
             tm.valid = true;
             tm.hidden = trie_hidden;
             /* 完整隐藏判定（CONFIG_DIR/Android 骨架/跨应用/hide 规则），
@@ -1243,7 +1154,7 @@ void br_probe(const BrQuery* q, BrProbeResult* out) {
         /* 未命中：完整路径解析（原逻辑）+ 填充目录缓存 */
         AppConfig* cat = nullptr;
         cfg = br_get_app_cfg(q->uid, q->pid, current_pkg, &cat);
-        TrieMatch tm;
+        FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
             br_is_other_app_pkg(sub_path, current_pkg)) {
@@ -1356,10 +1267,10 @@ static int br_process_cfg_dirs(AppConfig* c, const char* sub_path, int user_id, 
     return n;
 }
 
-int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id, const char* pkg,
+int fw_rules_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_id, const char* pkg,
                      bool is_root, NspDirEntry* out, int max) {
     if (!q || !out || max <= 0 || !sub_path) return 0;
-    /* S1 无锁快照读：替代 rwlock 读锁（与 br_resolve 一致，发布发生则重试） */
+    /* S1 无锁快照读：替代 rwlock 读锁（与 fw_rules_resolve 一致，发布发生则重试） */
     for (;;) {
         uint64_t cfg_gen = config_read_begin();
         char pkg_buf[128];

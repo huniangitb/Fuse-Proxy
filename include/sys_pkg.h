@@ -8,7 +8,7 @@
  * inject_target.c 内联实现一致，本文件为其跨进程共享抽取）。
  * 跨进程约束：fuse_daemon 受限环境 popen("pm ...") 可能经 binder 挂起
  * （见 br_rules_init 注释），故 pm 查询只允许 injector 做并落盘到
- * CONFIG_DIR/sys_pkgs.cache；fuse_daemon（经 basic_rules 模块）只读
+ * CONFIG_DIR/sys_pkgs.cache；fuse_daemon（内建引擎与后端模块）只读
  * 文件、永不 popen。无表时行为 = pm 查询失败（uid<10000 回退）。
  * 查询侧统一归一 `:process` 后缀与 pm 行内冒号，调用方直接传原始包名；
  * NULL/空串返回 false。 */

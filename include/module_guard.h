@@ -20,54 +20,14 @@
 #include <stddef.h>
 #include "nsp_module.h"
 
-/* ================= 输出守卫（canary） =================
- * NspPathDecision：调用方（FUSE 回调栈）用本守卫包裹，
- * 前后 canary 被模块整块越界写破坏时 loader 逐模块调用后检测——
- * 破坏精确归因到"刚调用完的模块"。canary 值取黄金比例常量，
- * 与正常数据碰撞概率可忽略。 */
-#define NSP_GUARD_CANARY 0x9E3779B97F4A7C15ULL
-typedef struct {
-    uint64_t front;
-    NspPathDecision r;
-    uint64_t back;
-} NspDecisionGuard;
-
-/* 标量与字符串首字节必须在每次分派、直通回退前重置；回调也会在无命中时
-   读取 read_only/is_ftp/虚拟目录性质，不能只重置 valid。 */
-static inline void nsp_decision_init(NspPathDecision* r) {
-    r->valid = false;
-    r->appear_missing = false;
-    r->read_only = false;
-    r->attr_override = 0;
-    r->mode = 0;
-    r->uid = 0;
-    r->gid = 0;
-    r->virtual_kind = NSP_VK_NONE;
-    r->real_path[0] = '\0';
-    r->is_redirect = false;
-    r->is_ftp = false;
-}
-
-static inline void nsp_guard_decision_init(NspDecisionGuard* g) {
-    g->front = NSP_GUARD_CANARY;
-    g->back = NSP_GUARD_CANARY;
-    nsp_decision_init(&g->r);
-}
-/* canary 完整性检查（loader 每次模块调用后调用） */
-static inline bool nsp_guard_decision_ok(const NspDecisionGuard* g) {
-    return g->front == NSP_GUARD_CANARY && g->back == NSP_GUARD_CANARY;
-}
+/* ================= 输出/入参校验 =================
+   规则决策不再跨 ABI（引擎已内建，见 src/daemon/fw_rules.h），故决策结构的
+   canary 守卫与值域校验随之删除；跨 ABI 的字符串只剩后端 readdir 的条目名。 */
 
 /* ================= 输出/入参校验 ================= */
 /* 字符串 NUL 终止检查：s 前 len 字节内存在 NUL = 合法 */
 bool nsp_guard_str_ok(const char* s, size_t len);
-/* 路径入参检查：非 NULL 且长度 < PATH_MAX */
-bool nsp_guard_path_ok(const char* p);
-/* decision 输出校验：字符串字段 NUL 终止 + virtual_kind 值域 +
-   attr_override 未知位与置位字段值域。返回 0 通过；非 0 = 失败字段编号
-   （detail 经 out 输出，可 NULL） */
-int nsp_guard_validate_decision(const NspPathDecision* r, char* detail, size_t dsz);
-/* readdir_extra 单条目校验：name NUL 终止 */
+/* 后端 readdir 单条目校验：name NUL 终止 */
 bool nsp_guard_dir_entry_ok(const NspDirEntry* e);
 
 /* ================= 错误上报 / 熔断 ================= */

@@ -114,10 +114,10 @@ void config_publish_end(uint64_t old_gen);
 bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_out, size_t sz);
 void scan_active_users();
 /* 应用规则目录创建权限开关：仅 injector 应开启（true）；fuse_daemon（经
-   basic_rules 模块）、log_ctl 等只读加载方保持默认 false，加载配置时
+   内建规则引擎）、log_ctl 等只读加载方保持默认 false，加载配置时
    不得 mkdir App-rules / App-rules-<uid>（防止伪用户目录固化） */
 void config_set_allow_app_rules_mkdir(bool allow);
-/* 活跃用户 pm 探测开关：fuse_daemon（经 basic_rules 模块）、log_ctl 等只读
+/* 活跃用户 pm 探测开关：fuse_daemon（内建引擎）、log_ctl 等只读
    加载方置 true——scan_active_users 跳过 popen("pm list users")（该命令需
    binder 通信 system_server，受限环境会挂起阻塞配置加载），改由 /data/media
    与已存在的 App-rules-<uid> 目录推导用户列表 */

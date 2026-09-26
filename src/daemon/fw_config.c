@@ -9,6 +9,7 @@
 #include "config_parser.h"
 #include "common.h"
 #include "fw_pkg.h"        /* 框架自算 uid→包名（MONITOR 三层合并的输入） */
+#include "fw_rules.h"      /* 内建规则引擎（索引换入后通知它作废缓存） */
 #include "nsp_constants.h" /* NSP_SYSTEM_APP_UID_MIN / NSP_PER_USER_UID_STRIDE */
 #include "module_loader.h" /* MAX_MODULES */
 #include "path_vars.h"     /* pkg_resolvable（类别段判据，与模块同源） */
@@ -197,6 +198,8 @@ static void reload_once(void) {
     config_build_from_view(new_recs, new_count);
     sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     config_unlock_write();
+    /* 内建规则引擎的 uid→AppConfig 指针缓存随之作废（旧索引已被 COW 释放） */
+    fw_rules_on_reload();
 
     pthread_mutex_lock(&g_lock);
     NspCfgRec* old_recs = g_recs;

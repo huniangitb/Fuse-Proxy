@@ -30,7 +30,7 @@ int g_active_users[MAX_USERS];
 int g_active_user_count = 0;
 /* 应用规则目录创建权限：默认只读（false）——只有 injector 能创建
    App-rules / App-rules-<uid>（经 config_set_allow_app_rules_mkdir 开启）；
-   fuse_daemon（经 basic_rules 模块）、log_ctl 等进程加载配置时只读，
+   fuse_daemon（内建规则引擎）、log_ctl 等进程加载配置时只读，
    避免将 scan_active_users 误判出的伪用户固化为目录 */
 static bool g_allow_app_rules_mkdir = false;
 /* pm 探测开关：scan_active_users 默认经 popen("pm list users") 枚举活跃
@@ -710,7 +710,7 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
 }
 /* 由磁盘上已存在的 App-rules-<uid> 目录补齐活跃用户列表。
 
-   跳过 pm 探测的只读加载方（fuse_daemon 经 basic_rules、log_ctl）若某用户的
+   跳过 pm 探测的只读加载方（fuse_daemon 内建引擎、log_ctl）若某用户的
    /data/media/<uid> 不可读，该用户不会出现在 pm / /data/media 两轮扫描里，
    load_config_rules 后续的 App-rules-<uid>/*.conf 扫描就整段跳过——injector
    仍把这些应用当注入目标，而真正执行 HIDE/RO/REDIRECT 的进程却没有对应规则，
@@ -814,14 +814,14 @@ void scan_active_users() {
 }
 
 /* 应用规则目录创建权限开关：仅 injector 应开启（true）——App-rules 目录的
-   创建权归属 injector 单一进程；fuse_daemon（basic_rules 模块）、log_ctl 等
+   创建权归属 injector 单一进程；fuse_daemon（内建引擎）、log_ctl 等
    只读加载方保持默认 false，加载配置时不得 mkdir（防止伪用户目录固化） */
 void config_set_allow_app_rules_mkdir(bool allow) {
     g_allow_app_rules_mkdir = allow;
     LOG_DBG("应用规则目录创建权限: %s", allow ? "允许(仅injector)" : "只读");
 }
 
-/* pm 探测开关：只读加载方（fuse_daemon 经 basic_rules 模块、log_ctl）置
+/* pm 探测开关：只读加载方（fuse_daemon 内建引擎、log_ctl）置
    true——scan_active_users 跳过 popen("pm list users")，改由 /data/media 与
    已存在的 App-rules-<uid> 目录推导用户列表。
    pm 需 binder 通信 system_server，在 fuse_daemon 受限环境（SELinux/

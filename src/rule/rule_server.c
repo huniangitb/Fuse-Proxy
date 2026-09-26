@@ -60,7 +60,7 @@ static time_t g_start_wall = 0;      /* 启动时刻（墙钟，started_at 展�
 /* ==================== 规则类型（动态注册表） ====================
    类型来源两类：
    1. 内置类型（rule_types_init 填充）：HIDE/RO/REDIRECT/ALLOW/MONITOR/
-      SANDBOX/GLOBAL_INJECT，与 basic_rules 模块能力对应；
+      SANDBOX/GLOBAL_INJECT，与框架内建规则引擎对应；
    2. 模块类型（rule_types_refresh 扫描）：加载模块目录下 <模块名>.rules
       声明的类型（如 ftp_module 的 FTP），实现「支持的规则随加载模块动态追加」。
    值格式决定 ADD 时如何解析 value、写入文件时如何拼行：
@@ -129,7 +129,7 @@ static void rule_fmt_default_argc(RuleFmt fmt, int* minp, int* maxp) {
     }
 }
 
-/* 内置类型初始化（与 basic_rules 能力一一对应） */
+/* 内置类型初始化（与内建规则引擎一一对应；模块自带 .rules 只补充新增类型） */
 static void rule_types_add_ex(const char* name, RuleFmt fmt, bool builtin, bool global_only,
                               const char* module, int argc_min, int argc_max,
                               const DescEntry* descs, int desc_count) {

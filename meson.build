@@ -264,10 +264,9 @@ else
 endif
 
 # ================= 源码集合 =================
-# 契约：common_sources 被多个二进制逐源重编译（Meson 正常行为，非错误）；
-# basic_rules.so 故意独立重编 config_parser/path_vars/trie（模块须 dlopen
-# 自包含，不依赖主程序符号除导出表外）——规则语义双活，修改 trie/变量静态性
-# 时须同步验证 tests/test_rules.py 与 tests/test_path_vars.py，防行为分叉。
+# 契约：common_sources 被多个二进制逐源重编译（Meson 正常行为，非错误）。
+# 规则引擎已内建（fw_rules.c 随 fuse_daemon 编译，唯一的规则语义实现）——
+# 修改 trie/变量静态性时跑 tests/test_rules.py 与 tests/test_path_vars.py。
 common_sources = [
     'src/core/common.c',
     'src/core/build_info.c',
@@ -279,7 +278,7 @@ common_sources = [
     'src/core/sys_pkg.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/daemon/fw_rules.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
   # 配置**读取**在框架侧完成（文件 I/O + inotify + 词法/段头识别，产出扁平视图
   # 经 fw_config 下发给模块），模块不再自行读文件。框架另建一份 AppConfig 索引
   # （config_build_from_view），但只用于回答 MONITOR 的三层合并——它是配置开关，
@@ -430,36 +429,8 @@ executable('rule_server',
 )
 
 # ================= 热插拔模块 =================
-# basic_rules：基础规则模块（REDIRECT/SANDBOX/HIDE/ALLOW/RO），
-# 由 fuse_daemon 启动后 dlopen 热加载。决策引擎自包含，
-# 日志等公共符号经主程序导出表解析（fuse_daemon 需 -Wl,--export-dynamic）。
-basic_rules_sources = [
-    'src/modules/basic_rules/basic_rules.c',
-    'src/modules/basic_rules/br_rules.c',
-    'src/config/config_parser.c',
-    'src/config/path_vars.c',
-    'src/core/path_trie.c',
-    'src/core/uid_map.c',
-    'src/core/fast_pid.c',
-    'src/core/sys_pkg.c',
-    'src/core/sha256.c',
-    'src/modules/nsp_self_hash.c',
-]
-
-shared_library('basic_rules',
-  basic_rules_sources,
-  include_directories: all_inc_dirs,
-  dependencies: [dependency('threads'), cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep],
-  c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
-  name_prefix: '',  # 生成 basic_rules.so（加载器按 <模块名>.so 扫描，与目录名一致）
-  install: true,
-  install_dir: install_bin_dir + '/modules/basic_rules'
-)
-
-# 模块规则类型注册文件：rule_server 扫描合并动态规则类型（格式见 nsp_module.h）
-install_data('src/modules/basic_rules/basic_rules.rules',
-  install_dir: install_bin_dir + '/modules/basic_rules'
-)
+# V4 起模块只剩「后端存储提供者」形态：规则决策引擎已编入 fuse_daemon
+# （src/daemon/fw_rules.c），故不再有 basic_rules.so。
 
 # ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库，无 FUSE 实现）。
 # 使用 libcurl（8.21.0+）处理所有 FTP 协议操作，模块仅负责转发。
