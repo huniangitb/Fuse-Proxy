@@ -7,11 +7,14 @@
  * 真实设备才有的 uid（>=10000）——FUSE 端到端测试的请求者是本机 uid（<10000），
  * 永远走不到 [USER_APPS:*] 分支，故这一层只能在此处用合成 uid 锁定。
  *
- * 用法：monitor_layers_driver <rules.conf> <uid>|<uid>@self> [...]
+ * 用法：monitor_layers_driver <rules.conf> (<uid>|<uid>@self>|resolve:<uid>:<path>) [...]
  *   `<uid>`        tid=0（只查 uid.map，不走 /proc）
  *   `<uid>@self`   以本进程 pid 作 tid，覆盖 uid.map 未收录时的 /proc 回退分支
  * 输出：每行 "uid=<u> pkg=<pkg> monitor=<0|1>"，交给 Python 侧断言
  *       （pkg 列用于失败时定位是「包名没解析出来」还是「合并算错」）。
+ *       `resolve <path>` 参数额外打印该 uid 下该原始路径的规则解析结果：
+ *       "resolve=<0|1> real=<最终真实路径> ro=<0|1>"——用于锁定沙盒/ALLOW 契约
+ *       （沙盒把共享目录也重定向进本应用沙盒；ALLOW 则落回真实路径）。
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -21,6 +24,7 @@
 
 #include "fw_config.h"
 #include "fw_pkg.h"
+#include "fw_rules.h"
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -31,8 +35,23 @@ int main(int argc, char** argv) {
         fprintf(stderr, "fw_config_init 失败\n");
         return 2;
     }
+    fw_rules_init(argv[1], false); /* 沙盒/ALLOW 解析断言需要引擎（配置索引由 fw_config 建好） */
     for (int i = 2; i < argc; i++) {
         char* arg = argv[i];
+        if (strncmp(arg, "resolve:", 8) == 0) {
+            /* resolve:<uid>:<path>：打印规则解析结果（沙盒/ALLOW 契约用） */
+            char* uid_s = arg + 8;
+            char* path = strchr(uid_s, ':');
+            if (!path) continue;
+            *path++ = '\0';
+            uid_t ruid = (uid_t)strtoul(uid_s, NULL, 10);
+            NspQueryCtx q = {.uid = ruid, .pid = 0, .gid = 0, .path = path};
+            NspPathDecision d;
+            fw_rules_resolve(&q, &d);
+            printf("resolve uid=%u path=%s valid=%d real=%s ro=%d\n", (unsigned)ruid, path,
+                   (int)d.valid, d.real_path, (int)d.read_only);
+            continue;
+        }
         size_t alen = strlen(arg);
         pid_t tid = 0;
         if (alen > 5 && strcmp(arg + alen - 5, "@self") == 0) {
