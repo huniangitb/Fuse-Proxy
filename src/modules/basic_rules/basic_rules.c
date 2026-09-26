@@ -122,15 +122,11 @@ static int br_module_readdir_extra(const NspQueryCtx* q, const char* sub_path, i
     return br_readdir_extra(&bq, sub_path, user_id, pkg, is_root, out, max);
 }
 
-static int br_module_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {
-    return br_get_pkg(uid, tid, pkg_out, pkg_size);
-}
 
 static const NspModuleOps g_br_ops = {
     .resolve = br_module_resolve,
     .probe = br_module_probe,
     .readdir_extra = br_module_readdir_extra,
-    .get_pkg = br_module_get_pkg,
 };
 
 /* 模块静态信息：框架 dlopen 后 dlsym(NSP_MODULE_INFO_SYMBOL) 读取 */

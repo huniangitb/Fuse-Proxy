@@ -90,7 +90,4 @@ void br_probe(const BrQuery* q, BrProbeResult* out);
 int br_readdir_extra(const BrQuery* q, const char* sub_path, int user_id, const char* pkg,
                      bool is_root, NspDirEntry* out, int max);
 
-/* uid → 包名解析（框架日志用） */
-int br_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
-
 #endif /* BR_RULES_H */

@@ -39,9 +39,6 @@ int module_dispatch_probe(const NspQueryCtx* q, NspProbeResult* out);
 int module_dispatch_readdir(const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max);
 
-/* uid → 包名解析（框架日志用）：遍历声明 get_pkg 的模块，第一个成功返回 0 */
-int module_dispatch_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
-
 /* 已加载模块快照（供 IPC LIST_MODULES）：填充 names，返回数量 */
 int module_snapshot(char names[][64], int max);
 

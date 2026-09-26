@@ -29,7 +29,7 @@ static bool g_br_disable_sandbox = false;
      读者零原子写，多线程并发读不产生缓存行颠簸（原 rwlock 读路径每次
      rdlock/unlock 均原子改写同一缓存行，高并发下成瓶颈）；
    - 写者（缓存填充/重载失效）取 wlock 互斥 + seq 奇数/偶数翻转。
-   所有调用方（br_resolve/br_get_pkg/br_probe）均持 config_lock_read，
+   所有调用方（br_resolve/br_probe）均持 config_lock_read，
    cfg 指针不会被重载并发释放；seqlock 仅需防止并发填充互相撕裂。 */
 typedef struct {
     pthread_mutex_t wlock; /* 写者互斥（填充/失效），读侧无锁 */
@@ -1129,22 +1129,6 @@ void br_resolve(const BrQuery* q, BrResult* out) {
         out->monitor_on = br_effective_monitor(cfg, cat);
         if (config_read_end(cfg_gen)) return;
         /* 读期间发生发布：整体重试 */
-    }
-}
-
-/* uid → 包名解析（框架日志用），语义与 br_get_app_cfg 的 pkg 输出一致 */
-int br_get_pkg(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size) {
-    if (!pkg_out || pkg_size == 0) return -1;
-    for (;;) {
-        uint64_t cfg_gen = config_read_begin();
-        char pkg[128];
-        br_get_app_cfg(uid, tid, pkg, NULL); /* 仅需包名，类别层不需要 */
-        if (config_read_end(cfg_gen)) {
-            strncpy(pkg_out, pkg, pkg_size - 1);
-            pkg_out[pkg_size - 1] = '\0';
-            return 0;
-        }
-        /* 读期间发生发布：重试 */
     }
 }
 

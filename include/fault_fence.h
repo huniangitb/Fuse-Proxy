@@ -109,8 +109,6 @@ int nsp_fence_readdir_extra(int slot, const char* op_name,
                                       NspDirEntry*, int),
                             const NspQueryCtx* q, const char* sub_path, int user_id,
                             const char* pkg, bool is_root, NspDirEntry* out, int max);
-int nsp_fence_get_pkg(int slot, const char* op_name, int (*fn)(uid_t, pid_t, char*, size_t),
-                      uid_t uid, pid_t tid, char* out, size_t sz);
 
 /* ---- 后端能力（NspModuleOps 一一对应） ---- */
 int nsp_fence_backend_match(int slot, const char* op_name, int (*fn)(const char*),

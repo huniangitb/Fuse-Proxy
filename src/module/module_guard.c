@@ -12,8 +12,7 @@
  *
  * 死锁约束（重要）：module_guard_error/fault 会经 module_fault_poison
  * 取 g_module_lock 写锁——调用方不得持有 g_module_lock（任何锁）时
- * 调用本文件函数。loader 的 readdir_extra/get_pkg 路径在释放读锁后
- * 才上报。
+ * 调用本文件函数。loader 的 readdir_extra 路径在释放读锁后才上报。
  */
 #include "module_guard.h"
 #include "module_loader.h"
