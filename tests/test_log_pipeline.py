@@ -19,7 +19,7 @@
 3. **端到端可达**：fuse_daemon 产生的 IO 日志能经 sock 查询到，
    而不只是躺在落盘文件里（子用例 1 同时覆盖本条）。
 
-前置：GNU 产物 `build_gnu/{fuse_daemon,log_monitor,log_ctl,basic_rules.so}`、
+前置：GNU 产物 `build_gnu/{fuse_daemon,log_monitor,log_ctl}`、
       `fusermount3`、`/dev/fuse`。非默认产物路径用环境变量覆盖：
       `FUSE_DAEMON`、`LOG_MONITOR`、`LOG_CTL`。
 
