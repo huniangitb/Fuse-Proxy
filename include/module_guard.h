@@ -43,11 +43,9 @@ static inline void nsp_decision_init(NspPathDecision* r) {
     r->uid = 0;
     r->gid = 0;
     r->virtual_kind = NSP_VK_NONE;
-    r->pkg[0] = '\0';
     r->real_path[0] = '\0';
     r->is_redirect = false;
     r->is_ftp = false;
-    r->monitor_on = false;
 }
 
 static inline void nsp_guard_decision_init(NspDecisionGuard* g) {

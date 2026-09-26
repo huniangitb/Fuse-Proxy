@@ -1040,13 +1040,6 @@ static bool br_is_redirect_target(AppConfig* cfg, AppConfig* cat, const char* su
     return res;
 }
 
-/* MONITOR 三层合并：应用显式 > 类别显式 > 全局 */
-static bool br_effective_monitor(AppConfig* cfg, AppConfig* cat) {
-    if (cfg && cfg->monitor_explicit) return cfg->monitor;
-    if (cat && cat->monitor_explicit) return cat->monitor;
-    return g_global_cfg.monitor;
-}
-
 /* ============ 核心决策入口 ============ */
 
 /* 字符串仅需首字节清零；成功路径负责覆盖，隐藏路径保留空串。 */
@@ -1058,12 +1051,10 @@ static inline void br_result_init(BrResult* out) {
     out->mode = 0;
     out->uid = 0;
     out->gid = 0;
-    out->pkg[0] = '\0';
     out->real_path[0] = '\0';
     out->is_redirect = false;
     out->virtual_kind = NSP_VK_NONE;
     out->is_ftp = false;
-    out->monitor_on = false;
 }
 
 void br_resolve(const BrQuery* q, BrResult* out) {
@@ -1085,8 +1076,6 @@ void br_resolve(const BrQuery* q, BrResult* out) {
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0) {
             out->valid = true;
             out->appear_missing = true;
-            strcpy(out->pkg, current_pkg); /* 源为 128B 栈缓冲，NUL 结尾 */
-            out->monitor_on = br_effective_monitor(cfg, cat);
             if (config_read_end(cfg_gen)) return;
             continue;
         }
@@ -1099,7 +1088,6 @@ void br_resolve(const BrQuery* q, BrResult* out) {
             continue;
         }
         out->valid = true;
-        strcpy(out->pkg, current_pkg); /* 源为 128B 栈缓冲，NUL 结尾 */
         out->read_only = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
         out->is_redirect = is_redir;
         strcpy(out->real_path, p); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
@@ -1126,7 +1114,6 @@ void br_resolve(const BrQuery* q, BrResult* out) {
        下降一次取得（替代 config_ftp_match 每请求 O(N) 线性扫描）；
        命中后由框架分派给 FTP 后端模块 */
         out->is_ftp = tm.ftp_app[0] || tm.ftp_cat[0] || tm.ftp_global[0];
-        out->monitor_on = br_effective_monitor(cfg, cat);
         if (config_read_end(cfg_gen)) return;
         /* 读期间发生发布：整体重试 */
     }

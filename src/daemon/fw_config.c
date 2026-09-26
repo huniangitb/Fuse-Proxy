@@ -60,7 +60,8 @@ typedef struct {
 static FwMonSlot g_mon_slots[FW_MON_CACHE_SIZE];
 static pthread_mutex_t g_mon_fill_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* 三层合并：应用显式 > 类别显式 > 全局（与模块 br_effective_monitor 同序）。
+/* 三层合并：应用显式 > 类别显式 > 全局（模块侧 config_parser 的 print_active_rules
+   用同一套优先级，改这里须同步核对）。
    包名不可解析时模块侧只认 GLOBAL，此处同口径：lookup_ok=false 时不做
    应用段/类别段匹配（uid<10000 例外——system 伪包仍参与 SYSTEM_APPS）。 */
 static bool monitor_uncached(uid_t uid, pid_t tid) {

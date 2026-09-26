@@ -39,7 +39,6 @@ static int ovr_resolve(const NspQueryCtx* q, NspPathDecision* out) {
 
     /* sub 是 "/gone/..." 形式（已剥掉 "ovr" 段），真实路径需带回来 */
     snprintf(out->real_path, sizeof out->real_path, "%s/0/ovr%s", ovr_storage(), sub);
-    snprintf(out->pkg, sizeof out->pkg, "ovrtest");
     out->valid = true;
 
     if (strncmp(sub, "/gone", 5) == 0) {

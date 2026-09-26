@@ -37,8 +37,7 @@ uint64_t fw_config_generation(void);
 const NspModuleConfig* fw_config_view_for(const char* module_name);
 
 /* IO 监控开关（框架权威）：按 uid→包名做三层合并——应用段显式 > 类别段显式
-   （USER_APPS[:uid] / SYSTEM_APPS）> `[GLOBAL]`，与模块 br_effective_monitor
-   同语义。**不依赖任何模块**：模块未加载/被 ban、路径无 <uid>/ 用户层、模块
+   （USER_APPS[:uid] / SYSTEM_APPS）> `[GLOBAL]`。**不依赖任何模块**：模块未加载/被 ban、路径无 <uid>/ 用户层、模块
    未命中规则时同样给出正确值。结果按 uid 缓存，重载时随代际失效。
 
    uid<10000 或包名不可解析（system/unknown/过短/zygote）时只认 SYSTEM_APPS 与

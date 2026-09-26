@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""模块 V2 契约回归：固定栈填充值、直通默认值、稀疏输出与 V1 拒绝加载。"""
+"""模块 ABI 契约回归：固定栈填充值、直通默认值、稀疏输出、V1/V2/V3 拒绝加载。"""
 import os
 from pathlib import Path
 import shlex
@@ -17,15 +17,15 @@ HARNESS = r'''
 
 static void check_defaults(const NspPathDecision* r) {
     assert(!r->valid && !r->appear_missing && !r->read_only);
-    assert(!r->is_redirect && !r->is_ftp && !r->monitor_on);
+    assert(!r->is_redirect && !r->is_ftp);
     assert(r->virtual_kind == NSP_VK_NONE);
     /* 属性覆盖默认全关：模块 memset 零初始化即"不改任何属性" */
     assert(r->attr_override == 0);
-    assert(!r->real_path[0] && !r->pkg[0]);
+    assert(!r->real_path[0]);
 }
 int main(int argc, char** argv) {
     assert(argc == 2);
-    _Static_assert(NSP_MODULE_ABI_VERSION == 3u, "更新 ABI 契约测试");
+    _Static_assert(NSP_MODULE_ABI_VERSION == 4u, "更新 ABI 契约测试");
     _Static_assert(NSP_FRAMEWORK_API_VERSION == 4u, "更新框架 API 版本契约测试");
     _Static_assert(NSP_OV_ALL == 7u, "属性覆盖位图契约");
     NspPathDecision r;
@@ -65,23 +65,24 @@ int main(int argc, char** argv) {
     fault_fence_init();
     module_guard_init();
     assert(module_system_init(NULL, argv[1], 0) == 0);
-    /* V1（信息头布局不同）与 V2（abi_version=2，决策结构不兼容）都必须
-       被加载器拒绝：只剩 sparse 一个模块 */
+    /* V1（信息头布局不同）/V2/V3（决策结构与 ops 表不兼容）都必须被加载器
+       拒绝：只剩 sparse 一个模块。V4 删了 pkg/monitor_on/get_pkg，放行旧版本
+       会让模块按旧布局写、框架按新布局读，静默错乱 */
     char names[MAX_MODULES][64];
     assert(module_snapshot(names, MAX_MODULES) == 1);
     assert(strcmp(names[0], "sparse") == 0);
     memset(&r, 0xa5, sizeof r);
     assert(module_dispatch_resolve(&q, &r) == NSP_DISPATCH_OK);
     assert(r.valid && r.appear_missing);
-    assert(!r.read_only && !r.is_redirect && !r.is_ftp && !r.monitor_on);
+    assert(!r.read_only && !r.is_redirect && !r.is_ftp);
     assert(r.virtual_kind == NSP_VK_NONE && r.attr_override == 0);
-    assert(!r.pkg[0] && !r.real_path[0]);
+    assert(!r.real_path[0]);
     q.path = "/";
     memset(&r, 0xa5, sizeof r);
     assert(module_dispatch_resolve(&q, &r) == NSP_DISPATCH_NONE);
     check_defaults(&r);
-    puts("模块 V3 契约检查通过：默认值、空查询、根路径、canary、稀疏输出、"
-         "输出校验、V1/V2 拒绝");
+    puts("模块 V4 契约检查通过：默认值、空查询、根路径、canary、稀疏输出、"
+         "输出校验、V1/V2/V3 拒绝");
     return 0;
 }
 '''
@@ -120,17 +121,18 @@ const NspModuleInfo nsp_module_info = {
 };
 '''
 
-V2_MOD = r'''
+OLD_MOD = r'''
 #include "nsp_module.h"
-/* V2 模块：NspModuleInfo 布局与 V3 相同，只有 abi_version 不同。加载器必须
-   在 dlopen 之后、init/ops 之前按版本拒绝——V3 改了 resolve 的决策结构，
-   放行会让模块按旧布局写 8KB 而框架按新布局读，静默错乱。 */
-static int forbidden_init(const NspFrameworkApi* api) { (void)api; abort(); }
-const NspModuleInfo nsp_module_info = {
-    .magic = NSP_MODULE_MAGIC, .abi_version = 2u,
+/* 旧版本模块：NspModuleInfo 布局与新版相同，只有 abi_version 不同。加载器必须
+   在 dlopen 之后、init/ops 之前按版本拒绝——V3 改了决策结构、V4 又删了
+   pkg/monitor_on 与 ops.get_pkg，放行会让模块按旧布局写而框架按新布局读，
+   静默错乱。此处按 {ver} 生成 V2/V3 两个样本。 */
+static int forbidden_init(const NspFrameworkApi* api) {{ (void)api; abort(); }}
+const NspModuleInfo nsp_module_info = {{
+    .magic = NSP_MODULE_MAGIC, .abi_version = {ver}u,
     .type = NSP_MODULE_TYPE_RULES, .caps = NSP_CAP_HIDE,
-    .name = "v2old", .version = "2", .init = forbidden_init, .ops = (const void*)1
-};
+    .name = "{name}", .version = "{ver}", .init = forbidden_init, .ops = (const void*)1
+}};
 '''
 
 
@@ -139,7 +141,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="nsp-abi-test-") as tmp:
         tmp = Path(tmp)
         modules = tmp / "modules"
-        for name, text in (("legacy", LEGACY), ("v2old", V2_MOD), ("sparse", SPARSE)):
+        old_mods = (("v2old", OLD_MOD.format(ver=2, name="v2old")),
+                    ("v3old", OLD_MOD.format(ver=3, name="v3old")))
+        for name, text in (("legacy", LEGACY), *old_mods, ("sparse", SPARSE)):
             folder = modules / name
             folder.mkdir(parents=True)
             source = tmp / f"{name}.c"
