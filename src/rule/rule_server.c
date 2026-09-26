@@ -59,8 +59,10 @@ static time_t g_start_wall = 0;      /* 启动时刻（墙钟，started_at 展�
 
 /* ==================== 规则类型（动态注册表） ====================
    类型来源两类：
-   1. 内置类型（rule_types_init 填充）：HIDE/RO/REDIRECT/ALLOW/MONITOR/
-      SANDBOX/GLOBAL_INJECT，与框架内建规则引擎对应；
+   1. 内建类型：**随二进制内嵌**（BUILTIN_RULE_TYPES，即原 basic_rules.rules
+      的内容）——规则引擎已内建进框架（fw_rules.c），其类型元数据也必须随
+      框架走：模块目录里不再有 basic_rules.rules，若改成在 C 里裸注册类型名，
+      desc/argc 这些展示与校验元数据会永久丢失；
    2. 模块类型（rule_types_refresh 扫描）：加载模块目录下 <模块名>.rules
       声明的类型（如 ftp_module 的 FTP），实现「支持的规则随加载模块动态追加」。
    值格式决定 ADD 时如何解析 value、写入文件时如何拼行：
@@ -129,7 +131,8 @@ static void rule_fmt_default_argc(RuleFmt fmt, int* minp, int* maxp) {
     }
 }
 
-/* 内置类型初始化（与内建规则引擎一一对应；模块自带 .rules 只补充新增类型） */
+/* 注册一个类型（新类型）：argc 未显式声明（-1）时取格式默认约束；
+   descs 为多语言描述槽（默认 zh 在前），多余截断 */
 static void rule_types_add_ex(const char* name, RuleFmt fmt, bool builtin, bool global_only,
                               const char* module, int argc_min, int argc_max,
                               const DescEntry* descs, int desc_count) {
@@ -156,23 +159,72 @@ static void rule_types_add_ex(const char* name, RuleFmt fmt, bool builtin, bool 
     g_rule_type_count++;
 }
 
-/* 兼容旧签名：argc/desc 取默认 */
-static void rule_types_add(const char* name, RuleFmt fmt, bool builtin, bool global_only,
-                           const char* module) {
-    rule_types_add_ex(name, fmt, builtin, global_only, module, -1, -1, nullptr, 0);
-}
+/* 内建规则类型声明 —— 原 basic_rules.rules 的内容，规则引擎内建后随二进制分发。
+   刻意用与模块 .rules **同一个解析器**（多语言 desc / argc 约束 / global-only
+   全部支持），而不是在 C 里裸注册类型名：后者会让内建类型的 desc 全空（前端
+   按 desc 渲染类型说明），argc/global-only 也只能靠格式默认值兜着。
+   改这里即改前端可见的类型说明；新增内建规则类型须与 fw_rules.c 的解析同步。 */
+static const char BUILTIN_RULE_TYPES[] =
+    "# 段格式：[类型名] 段 + key=value 属性行\n"
+    "#   format       — path（单值路径）/ pair（src|dst）/ switch（ON/OFF）/ tokens（多 token）\n"
+    "#   argc=N / argc=N:M — 参数个数约束（M 用 * 或不写表示不限上界）\n"
+    "#   global-only  — true/false：仅全局作用域可用\n"
+    "#   desc / desc.xx — 类型描述（默认中文；desc.en 等为指定语言）\n"
+    "\n"
+    "[HIDE]\n"
+    "format = path\n"
+    "argc = 1\n"
+    "desc = 隐藏路径\n"
+    "desc.en = Hide path\n"
+    "\n"
+    "[RO]\n"
+    "format = path\n"
+    "argc = 1\n"
+    "desc = 只读路径\n"
+    "desc.en = Read-only path\n"
+    "\n"
+    "[REDIRECT]\n"
+    "format = pair\n"
+    "argc = 2\n"
+    "desc = 路径重定向\n"
+    "desc.en = Path redirect\n"
+    "\n"
+    "[ALLOW]\n"
+    "format = path\n"
+    "argc = 1\n"
+    "desc = 放行路径\n"
+    "desc.en = Allow path\n"
+    "\n"
+    "[MONITOR]\n"
+    "format = switch\n"
+    "desc = 监控\n"
+    "desc.en = Monitor switch\n"
+    "\n"
+    "[SANDBOX]\n"
+    "format = switch\n"
+    "desc = 沙盒\n"
+    "desc.en = Sandbox switch\n"
+    "\n"
+    "[GLOBAL_INJECT]\n"
+    "format = switch\n"
+    "global-only = true\n"
+    "desc = 全局注入\n"
+    "desc.en = Global injection switch\n"
+    "\n"
+    "[SKIP_SYSTEM_APPS]\n"
+    "format = switch\n"
+    "global-only = true\n"
+    "desc = 跳过系统应用\n"
+    "desc.en = Skip system apps switch\n";
 
+/* 解析内嵌声明文本（定义见 conf 解析段）：前向声明供 rule_types_init 使用，
+   与模块 .rules 文件走同一套行解析与合并语义 */
+static void rule_types_parse_text(const char* text, const char* module, bool builtin);
+
+/* 内建类型初始化（与内建规则引擎一一对应；模块自带 .rules 只补充新增类型） */
 static void rule_types_init(void) {
     g_rule_type_count = 0;
-    rule_types_add("HIDE", RFT_PATH, true, false, "builtin");
-    rule_types_add("RO", RFT_PATH, true, false, "builtin");
-    rule_types_add("REDIRECT", RFT_PAIR, true, false, "builtin");
-    rule_types_add("ALLOW", RFT_PATH, true, false, "builtin");
-    rule_types_add("MONITOR", RFT_SWITCH, true, false, "builtin");
-    rule_types_add("SANDBOX", RFT_SWITCH, true, false, "builtin");
-    /* 全局专属：仅 [GLOBAL] 段可用，应用配置中不允许出现 */
-    rule_types_add("GLOBAL_INJECT", RFT_SWITCH, true, true, "builtin");
-    rule_types_add("SKIP_SYSTEM_APPS", RFT_SWITCH, true, true, "builtin");
+    rule_types_parse_text(BUILTIN_RULE_TYPES, "builtin", true);
 }
 
 /* 按名查找类型（大小写不敏感），返回索引；未找到返回 RT_UNKNOWN */
@@ -223,8 +275,9 @@ static RuleType classify_line(const char* line) {
 }
 
 /* 解析一行 .rules 声明："<TYPE> <FORMAT>"，追加进类型表（去重）。
-   FORMAT: path|pair|switch|tokens，缺省为 path */
-static void rule_types_parse_line(char* line, const char* module) {
+   FORMAT: path|pair|switch|tokens，缺省为 path。
+   builtin：声明来源是否内建（内嵌声明为 true，模块 .rules 为 false） */
+static void rule_types_parse_line(char* line, const char* module, bool builtin) {
     char* p = line;
     while (isspace((unsigned char)*p)) p++;
     if (!*p || *p == '#') return;
@@ -347,14 +400,14 @@ static void rule_types_parse_line(char* line, const char* module) {
         /* 未知属性：跳过该 token，保持向前兼容 */
         while (*p && !isspace((unsigned char)*p)) p++;
     }
-    /* 已注册（内置或他模块）的同名类型：合并补充属性（多语言 desc 等），
-       不覆盖类型名与 module 来源；否则作为新模块类型注册 */
+    /* 已注册（内建或他模块）的同名类型：合并补充属性（多语言 desc 等），
+       不覆盖类型名与 module 来源；否则按声明来源注册为新类型 */
     RuleType existing = rule_type_of(type);
     if (existing != RT_UNKNOWN) {
         rule_types_merge(existing, fmt, true, argc_min, argc_max, (argc_min >= 0), global_only,
                          global_only, descs, desc_count);
     } else {
-        rule_types_add_ex(type, fmt, false, global_only, module, argc_min, argc_max, descs,
+        rule_types_add_ex(type, fmt, builtin, global_only, module, argc_min, argc_max, descs,
                           desc_count);
     }
 }
@@ -433,12 +486,12 @@ static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set, int argc_m
     }
 }
 
-/* 段结束时把收集的属性注册进类型表（同名内置类型改为合并补充） */
-static void conf_section_flush(ConfSection* cs, const char* module) {
+/* 段结束时把收集的属性注册进类型表（同名内建类型改为合并补充） */
+static void conf_section_flush(ConfSection* cs, const char* module, bool builtin) {
     if (cs->active && cs->type[0]) {
         RuleType existing = rule_type_of(cs->type);
         if (existing == RT_UNKNOWN) {
-            rule_types_add_ex(cs->type, cs->fmt, false, cs->global_only, module, cs->argc_min,
+            rule_types_add_ex(cs->type, cs->fmt, builtin, cs->global_only, module, cs->argc_min,
                               cs->argc_max, cs->descs, cs->desc_count);
         } else {
             rule_types_merge(existing, cs->fmt, cs->fmt_set, cs->argc_min, cs->argc_max,
@@ -530,45 +583,72 @@ static void conf_section_apply_key(ConfSection* cs, const char* key, const char*
     /* 未知键：忽略（向前兼容） */
 }
 
+/* 处理一行 .rules 声明（段头 / 段内 key=value / 旧行格式），就地修改 line。
+   文件与内嵌文本两个入口共用，避免两套行语义漂移。 */
+static void rule_types_parse_one_line(char* line, ConfSection* cs, const char* module,
+                                      bool builtin) {
+    char* p = line;
+    while (isspace((unsigned char)*p)) p++;
+    if (!*p || *p == '#') return; /* 空行/注释 */
+    if (*p == '[') {              /* 段头：[TYPE] */
+        conf_section_flush(cs, module, builtin);
+        p++;
+        size_t ti = 0;
+        while (*p && *p != ']' && ti < sizeof(cs->type) - 1) cs->type[ti++] = *p++;
+        cs->type[ti] = '\0';
+        cs->active = (ti > 0);
+        return;
+    }
+    char* eq = strchr(p, '=');
+    if (cs->active && eq) { /* 段内 key=value */
+        *eq = '\0';
+        char* key = p;
+        while (key < eq && isspace((unsigned char)key[0])) key++;
+        char* kend = eq - 1;
+        while (kend >= key && isspace((unsigned char)*kend)) {
+            *kend = '\0';
+            kend--;
+        }
+        char* val = eq + 1;
+        while (isspace((unsigned char)*val)) val++;
+        conf_section_apply_key(cs, key, val);
+        return;
+    }
+    /* 旧行格式（兼容）：FTP pair argc=2 ... */
+    rule_types_parse_line(line, module, builtin);
+}
+
 /* 解析整个 .rules 文件（conf 段 + 旧行格式混合） */
-static void rule_types_parse_conf(FILE* fp, const char* module) {
+static void rule_types_parse_conf(FILE* fp, const char* module, bool builtin) {
     char line[256];
     ConfSection cs;
     conf_section_reset(&cs);
     while (fgets(line, sizeof(line), fp)) {
         char* nl = strchr(line, '\n');
         if (nl) *nl = '\0';
-        char* p = line;
-        while (isspace((unsigned char)*p)) p++;
-        if (!*p || *p == '#') continue; /* 空行/注释 */
-        if (*p == '[') {                /* 段头：[TYPE] */
-            conf_section_flush(&cs, module);
-            p++;
-            size_t ti = 0;
-            while (*p && *p != ']' && ti < sizeof(cs.type) - 1) cs.type[ti++] = *p++;
-            cs.type[ti] = '\0';
-            cs.active = (ti > 0);
-            continue;
-        }
-        char* eq = strchr(p, '=');
-        if (cs.active && eq) { /* 段内 key=value */
-            *eq = '\0';
-            char* key = p;
-            while (key < eq && isspace((unsigned char)key[0])) key++;
-            char* kend = eq - 1;
-            while (kend >= key && isspace((unsigned char)*kend)) {
-                *kend = '\0';
-                kend--;
-            }
-            char* val = eq + 1;
-            while (isspace((unsigned char)*val)) val++;
-            conf_section_apply_key(&cs, key, val);
-            continue;
-        }
-        /* 旧行格式（兼容）：FTP pair argc=2 ... */
-        rule_types_parse_line(line, module);
+        rule_types_parse_one_line(line, &cs, module, builtin);
     }
-    conf_section_flush(&cs, module); /* 文件尾刷新未结束段 */
+    conf_section_flush(&cs, module, builtin); /* 文件尾刷新未结束段 */
+}
+
+/* 解析内嵌声明文本（同 conf 解析器，含多语言 desc 与 argc 约束）：
+   rule_types_init 用它加载 BUILTIN_RULE_TYPES，不引入临时文件/流依赖 */
+static void rule_types_parse_text(const char* text, const char* module, bool builtin) {
+    char line[256];
+    ConfSection cs;
+    conf_section_reset(&cs);
+    const char* p = text;
+    while (*p) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        rule_types_parse_one_line(line, &cs, module, builtin);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    conf_section_flush(&cs, module, builtin); /* 文本尾刷新未结束段 */
 }
 
 /* ==================== 模块规则类型缓存（避免每次命令全量扫描） ====================
@@ -652,7 +732,7 @@ static void rule_types_refresh(void) {
         FILE* fp = fopen(rules_path, "r");
         if (!fp) continue;
         /* 支持 conf 段格式（[TYPE] + key=value）与旧行格式（TYPE FORMAT ...）混合 */
-        rule_types_parse_conf(fp, mname);
+        rule_types_parse_conf(fp, mname, false);
         fclose(fp);
     }
     closedir(d);

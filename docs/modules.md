@@ -42,8 +42,8 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 - 旧行格式 `<TYPE> <FORMAT> [属性...]` 仍兼容，两种格式可在同一文件混用；畸形声明（如 `argc=abc`）被跳过。
 - rule_server 带目录/文件 mtime 缓存，未变化时零扫描复用类型表；`.rules` 增删改即热更新，无需重启。
 - `argc_min/argc_max` 用于 ADD 参数校验，`global_only` 限制作用域，`desc` 按请求 `lang` 回传（默认中文，未知语言回退 zh）并附 `desc_map` 全语言映射。
-- 内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT/SKIP_SYSTEM_APPS）始终存在；未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE。无 `.rules` 的模块正常加载，仅跳过类型注册。
-- **`log_ctl` 与 `rule_server` 的类型集合刻意不同**：`rule_server` 是权威控制面，读取 `.rules` 合并模块动态类型；`log_ctl` 的 `set-rule`/`remove-rule` 只认内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT，不含 SKIP_SYSTEM_APPS），不扫描模块目录。两者对同一内置类型的编辑语义一致（行级实现共享，见 §6.1）。
+- **内置类型随 rule_server 二进制内嵌**（`rule_server.c` 的 `BUILTIN_RULE_TYPES`，即原 `basic_rules.rules` 的内容）：HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT/SKIP_SYSTEM_APPS 的 format/argc/global-only/多语言 desc 都在那里声明，走**与模块 `.rules` 完全相同的解析器**——规则引擎已内建进框架，模块目录里不再有 `basic_rules.rules`，若改成在 C 里裸注册类型名，内建类型的 `desc` 会全空（前端按 desc 渲染类型说明）。改内建类型说明即改该处。未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE；无 `.rules` 的模块正常加载，仅跳过类型注册。
+- **`log_ctl` 与 `rule_server` 的类型集合刻意不同**：`rule_server` 是权威控制面，内置类型内嵌 + 读取 `.rules` 合并模块动态类型；`log_ctl` 的 `set-rule`/`remove-rule` 只认内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT，不含 SKIP_SYSTEM_APPS），不扫描模块目录。两者对同一内置类型的编辑语义一致（行级实现共享，见 §6.1）。
 
 ## 3. 模块 ABI（`include/nsp_module.h`）
 
