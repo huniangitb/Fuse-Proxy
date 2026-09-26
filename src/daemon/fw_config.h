@@ -4,11 +4,14 @@
  * fw_config.h — 框架侧配置持有者（读取 + 热重载 + 按订阅下发）
  *
  * 职责边界：**读取**完全在框架（文件 I/O + inotify + 行级词法/段头识别，
- * 见 config_read_view），模块不再读文件、不再跑 inotify；**建索引**仍在模块
- * （各模块由扁平视图重建自己的规则索引）。
+ * 见 config_read_view），模块不再读文件、不再跑 inotify；**规则索引**仍由各
+ * 模块按需从扁平视图重建。
  *
- * 框架自身不建 AppConfig：它只持有扁平视图并按模块订阅过滤后下发，故不需要
- * 规则对象/trie（那是模块的索引表示）。
+ * 但框架**自己也需要一份索引**：`MONITOR` 是配置开关而非路径决策，它的作用域
+ * 合并（应用显式 > 类别显式 > 全局）必须与模块是否加载无关地生效——否则模块
+ * 未加载/被 ban 时 `[USER_APPS:0] MONITOR OFF` 的否决会静默失效。故框架在重载
+ * 时用 config_build_from_view 自建 AppConfig（与模块同一份实现），仅用于回答
+ * 这一个问题；路径决策（REDIRECT/HIDE/RO）仍归模块。
  *
  * 线程模型：inotify 监听线程在配置变更后读出新视图，然后经 reload 钩子
  * （loader 注册）在**同一线程**内同步推送给各活跃模块——推送期间旧视图仍有效，
@@ -16,6 +19,7 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 #include "nsp_cfg_view.h"
 
 /* 初始化：读取 rules_path 并启动监听线程。rules_path 为 --rules= 值。
@@ -32,16 +36,14 @@ uint64_t fw_config_generation(void);
    返回 NULL。订阅为空 = 不过滤（申请全部）。 */
 const NspModuleConfig* fw_config_view_for(const char* module_name);
 
-/* 框架侧兜底用的**全局** MONITOR 开关：取主视图中 `[GLOBAL]` 段内最后一条
-   MONITOR 记录（ON/1 为开），无记录为关。
- *
-   语义边界（勿扩大使用）：只用于「规则模块未参与本次决策」时的监控开关兜底
-   ——规则模块未加载/被 ban、路径无 <uid>/ 用户层、模块返回未命中这三种情形
-   下模块根本没机会说话，而 MONITOR 是**配置开关而非路径决策**，绑在决策有效性
-   上会让文件读写照常正常、只有 IO 监控日志静默消失。模块命中时一律以模块自己的
-   三层合并（应用 > 类别 > 全局）为准；此处**不重复实现**那套作用域语义——
-   类别/应用段的否决需要 uid→包名映射，那是模块的索引职责。 */
-bool fw_config_global_monitor(void);
+/* IO 监控开关（框架权威）：按 uid→包名做三层合并——应用段显式 > 类别段显式
+   （USER_APPS[:uid] / SYSTEM_APPS）> `[GLOBAL]`，与模块 br_effective_monitor
+   同语义。**不依赖任何模块**：模块未加载/被 ban、路径无 <uid>/ 用户层、模块
+   未命中规则时同样给出正确值。结果按 uid 缓存，重载时随代际失效。
+
+   uid<10000 或包名不可解析（system/unknown/过短/zygote）时只认 SYSTEM_APPS 与
+   `[GLOBAL]`——与模块侧同一口径（类别判定复用 sys_pkgs.cache / uid<10000）。 */
+bool fw_config_monitor_for(uid_t uid, pid_t tid);
 
 /* 订阅与监听注册（loader 在模块 init 期间以其名转发；名称须与目录名一致）。
    订阅仅在首次注册时生效（重复注册忽略），监听可覆盖。 */

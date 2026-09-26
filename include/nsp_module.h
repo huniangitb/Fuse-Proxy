@@ -173,9 +173,10 @@ typedef struct NspPathDecision {
     int32_t gid;            /* NSP_OV_GID 置位时生效 */
     uint8_t virtual_kind; /* NspVirtualKind：合成目录判定 */
     char pkg[128];        /* uid 解析出的包名（日志/沙箱用）。
-                             留在结果内是因为它随 resolve 一次返回；移到框架侧
-                             需要每个请求额外一次 get_pkg 模块调用（围栏+校验
-                             开销），得不偿失 */
+                             ⚠ 框架已不读取：包名是**配置语义的输入**（段匹配键 +
+                             日志标签），改由框架自算（`fw_pkg.c`：uid.map → /proc
+                             回退），以便模块缺席时仍可用。字段保留仅为 ABI 布局
+                             稳定，下次升版删除。 */
     /* 最终真实路径（模块负责把以上决策落实为最终可操作路径；
        未命中任何规则时为默认存储路径 STORAGE_BASE/<uid><sub>） */
     char real_path[PATH_MAX];
@@ -185,7 +186,10 @@ typedef struct NspPathDecision {
        命中后框架将该路径操作分派给对应 FTP 后端模块。
        ⚠ 过渡字段：FTP 归属迁移到 ftp_module 后删除（见 docs/modules.md）。 */
     bool is_ftp;
-    bool monitor_on; /* 模块配置的 MONITOR 状态（框架 I/O 日志开关） */
+    bool monitor_on; /* 模块侧的三层合并 MONITOR 值。
+                        ⚠ 框架已不读取：MONITOR 是配置开关，由框架统一自算
+                        （`fw_config_monitor_for`，应用 > 类别 > 全局），以免模块
+                        缺席时开关静默失效。字段保留仅为 ABI 布局稳定，下次升版删除。 */
 } NspPathDecision;
 
 
@@ -247,7 +251,10 @@ typedef struct NspModuleOps {
     int (*backend_truncate)(const char* path, off_t size);
 
     /* ---- 通用 ---- */
-    /* uid → 包名解析（框架日志等场景使用；返回 0 成功，pkg 最多 127 字节） */
+    /* uid → 包名解析（返回 0 成功，pkg 最多 127 字节）。
+       ⚠ 框架已不再调用：包名由框架自算（`fw_pkg.c`：uid.map → /proc 回退），
+       框架侧已无此能力的分派入口。字段保留仅为 ABI 布局稳定，下次升版删除；
+       模块实现它不再有任何效果。 */
     int (*get_pkg)(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
 } NspModuleOps;
 

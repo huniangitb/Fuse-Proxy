@@ -73,7 +73,7 @@ flowchart TB
 
 - **规则决策**经 `module_dispatch_resolve` 分派给 dlopen 的 `basic_rules.so`，无规则模块时直通回退。
 - **后端分派**（`NSP_CAP_BACKEND_IO`）：resolve 命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。
-- **uid→包名解析**（模块内 `br_get_pkg`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`。解析出 `<pre-`/`zygote`/长度<3 的视为不可解析，缓存为 nullptr。
+- **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。模块侧 `br_get_app_cfg` 仍保留同一套解析（它需要 pkg 做 `$package` 变量展开与沙箱隔离），两侧算法同源、结果一致。
 
 模块架构详见 `modules.md`。
 
@@ -81,7 +81,8 @@ flowchart TB
 
 - **log_monitor**：常驻收集服务，经 AF_UNIX `SOCK_STREAM`（抽象地址 `nsp_log_socket`）接收各进程 `log_internal`，并提供 `search`/`stream`/`clear`/`count` 查询。io/sys 自动落盘 `LOG_DIR/io.log`、`sys.log`（`push_log` 单漏斗暂存 64KB，stage 满 / 500ms tick 脏超 1s / 退出时刷盘；单文件超 2MB 轮转 `.1` 单备份，logcat 不落盘）。**刷盘任何失败路径都不清空 stage**——暂存区是该批日志的唯一副本，退避期只跳过 `open` 重试，真正写出的数据才移除；stage 耗尽时按行拒收并计入 `dropped`。启动时把 `io.log.1` + `io.log` 载入只读快照，按**紧凑存储**（`DiskEntry` 的 `t`/`level` + 指向字符串池的指针，按实际行长排布）全量容纳，`DISK_READ_MAX`(8MB) 是防异常大文件的硬上界，查询按"磁盘在前、内存在后"拼接——故 `count`/`search` 不受条数截断。
 - **丢弃可观测**：接收环（`entries`）满、合并队列（`batch_q`）满、落盘拒收这三处是仅有的静默吃日志点，各自累加原子计数，由 500ms tick 驱动的 `report_drops_once()` **限频（10s 至多一条）**写入 sys 缓冲，`search-sys` / `sys.log` 可查，稳态计数不变则零噪音。异步接收线程结束时置 `_Atomic disconnected`（release），回收方（epoll 通知路径与超时 tick 路径）**先 `drain_async` 抢救环内残留再 `free`**，否则线程末尾入环、notify 与置位错峰的日志会随回收永久丢失。
-- **监控开关单点（`fw_route`）**：`monitor_on` 是**配置开关而非路径决策**，不能绑在 `nsp_ok`（模块是否给出有效决策）上。`fw_route` 出口保证 `rr->monitor_on` 已定值：规则模块命中取模块的三层合并值（应用 > 类别 > 全局）；模块未参与决策（规则模块未加载/被 ban、路径无 `<uid>/` 用户层、模块返回未命中）时取 `fw_config_global_monitor()`——框架主视图 `[GLOBAL]` 段最后一条 MONITOR 记录的快照（视图换入时重算，热路径只做一次原子 load）。框架**不重复实现**模块的三层合并语义：类别/应用段的否决需要 uid→包名映射，那是模块的索引职责。开关词法唯一出处为 `nsp_switch_on()`（`ON`/`1` 为开），模块侧 `parse_switch_rule` 与框架侧兜底共用。
+- **监控开关单点（`fw_route` + `fw_config_monitor_for`）**：`monitor_on` 是**配置开关而非路径决策**，不能绑在 `nsp_ok`（模块是否给出有效决策）上。`fw_route` 在最后一步把 `rr->monitor_on` 定为框架自算值（`module_dispatch_resolve` 入口会经 `nsp_decision_init` 复位该字段，故必须先分派后写入），值由 `fw_config_monitor_for(uid, tid)` 给出：按 uid→包名做**三层合并**（应用段显式 > 类别段显式 `[USER_APPS[:uid]]`/`[SYSTEM_APPS]` > `[GLOBAL]`），与模块 `br_effective_monitor` 同序同口径，结果按 uid 缓存（重载时随代际失效，热路径只读一次原子快照）。**框架为此自建一份 AppConfig 索引**（`config_build_from_view`，与模块同一实现），因此模块未加载/被 ban、路径无 `<uid>/` 用户层、模块未命中规则时开关照样正确——这正是历史缺陷「文件读写一切正常、IO 监控日志静默归零」的根因所在。开关词法唯一出处为 `nsp_switch_on()`（`ON`/`1` 为开），模块侧 `parse_switch_rule` 与框架侧合并共用。
+- **模块侧 `monitor_on`/`pkg` 字段的现状**：`NspPathDecision` 仍保留这两个字段（ABI 布局不变），但框架不再读取——包名由 `fw_pkg.c` 自算，开关由上述三层合并自算。二者在"模块缺席"这一关键场景下本就无从提供，且框架与模块读同一份配置，故不构成语义分叉。下次 ABI 升版时连同删除。
 - **丢弃与容量的两项评估结论（勿反复重议）**：① 生产者侧 LOG 环维持 `nsp_comm.c` 的 `kCap=2048` **不扩**——满环覆盖旧数据已由 `nsp_log_report` 限频 5s 上报（"comm: LOG 通道拥塞，覆盖旧数据 N 条"），症结是可观测性而非容量，扩容只抬高内存上界（单槽上限 16KB，理论 32MB→128MB）；② **不恢复** `persist_io_log` 的"无条件落盘"——它写的是独立文件 `persistent_io.log`（非 log_monitor 的 `io.log`）、仅 `NSP_ENABLE_IO_LOG`（debug）编译、且当前无任何查询出口，落了盘也无人可读；真要做兜底须连查询路径一起补，否则只是多一份磁盘 I/O（详见 `common.c` 注释）。
 - **log_ctl**：CLI 客户端——查询日志、流式输出、规则编辑（`set-rule`/`remove-rule`/`validate-rules`）、拉取配置广播（`get-config`/`stream-config`）。规则编辑与 `rule_server` 共用 `nsp_rule_file` 行级实现（原子 tmp+rename 落盘）；`--config-dir` 可覆盖配置根（与 `rule_server` 同名选项一致），使其可在临时目录下测试。
 - **LOG_BATCH 协议**：应用还原等"一条日志对应整个挂载周期"的场景，周期内中间日志由 `log_batch_begin/end` 在 `log_internal` 层累积，`log_batch_end` 合并为**单条**（`LOG_KIND_MERGED`）发送。合并日志为单行 `[injector] <条目1>\t<条目2>...`（制表符连接，避免前端按行拆分导致 UTF-8 截断），级别固定 `LOG_DEBUG`。
@@ -109,6 +110,8 @@ src/
 │   └── path_vars.c       # 路径变量展开、真实目标分类
 ├── daemon/
 │   ├── fuse_daemon.c     # FUSE 回调 + main（框架，含后端分派）
+│   ├── fw_config.c       # 配置持有者（读取/热重载/下发 + 框架自建索引与 MONITOR 三层合并）
+│   ├── fw_pkg.c          # uid→包名解析（框架权威：uid.map → /proc 回退 + 缓存）
 │   └── fuse_thread_naming.c  # 线程语义命名（pthread_create 截持）
 ├── module/               # 模块框架
 │   ├── loader.c          # dlopen 加载/卸载、能力登记、分派、inotify 热插拔

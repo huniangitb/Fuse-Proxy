@@ -38,7 +38,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 | 改动 | 测试 |
 |---|---|
-| `basic_rules` / `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀/沙盒/热重载）、`test_config_snapshot.py`（解析快照 + STATIC 输出） |
+| `basic_rules` / `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，ALLOW/REDIRECT/HIDE/RO/通配符/最长前缀/沙盒/热重载）、`test_config_snapshot.py`（解析快照 + STATIC 输出）、`test_monitor_layers.py`（框架侧 MONITOR 三层合并，见下） |
 | `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（14，需 vsftpd）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd）、`test_ftp_parallel.py`（11，控制面并发/连接复用/延迟收敛/热重载竞态/断连熔断自愈，需 vsftpd；自起延迟中继，占用 127.0.0.1:2121） |
 | `src/modules/ftp/ftp_mux.c`（epoll + curl_multi 控制面复用器）或 `backend_rc_is_business`（业务 errno 豁免） | `test_ftp_parallel.py`（连接复用与延迟收敛）、`test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
 | `src/config/path_vars.c` | `test_path_vars.py` |
@@ -48,7 +48,8 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | 决策结构 / 框架单点强制（`NspPathDecision`、`fw_route` 的 appear_missing·read_only、`vfs_apply_attr_override`） | `test_module_overrides.py`（42，逐回调 errno 矩阵：appear_missing 统一 ENOENT、read_only 统一 EROFS、属性覆盖与类型位保持） |
 | `log_ctl` / `rule_server` 规则编辑（`nsp_rule_file`） | `test_log_ctl_rules.py`（30）、`test_rule_server.py` |
 | `subprojects/libfuse`（fork 追加接口）或框架缓存失效 | `test_libfuse_inval.py`（需 `-Dlibfuse_source=subproject` 的产物，缺失自动跳过） |
-| 日志链路（`src/log/`、`nsp_comm.*`、`common.c` 的 `vfs_log_io` / `monitor_on` / `persist_stage` / `drain_async`） | `test_log_pipeline.py`（16，框架闸门矩阵：规则模块未注册 / 路径无 `<uid>/` 层 / `MONITOR OFF` 三态 + 磁盘历史全量可查（`count`/`search`/历史转储三条路径）+ sock 查询端到端；**会重启 log_monitor 并备份还原 `io.log{,.1}`**） |
+| 日志链路（`src/log/`、`nsp_comm.*`、`common.c` 的 `vfs_log_io` / `monitor_on` / `persist_stage` / `drain_async`） | `test_log_pipeline.py`（24，框架闸门矩阵：规则模块未注册 / 路径无 `<uid>/` 层 / `MONITOR OFF` / 类别段 `[SYSTEM_APPS]` 否决与开启五态 + 磁盘历史全量可查（`count`/`search`/历史转储三条路径）+ sock 查询端到端；**会重启 log_monitor 并备份还原 `io.log{,.1}`**） |
+| 框架侧 uid→包名（`fw_pkg.c`）与 MONITOR 三层合并（`fw_config.c` 的 `fw_config_monitor_for`） | `test_monitor_layers.py`（11，应用 > 类别 > 全局两个方向、`[USER_APPS:0]`/`[USER_APPS:2]` 用户隔离、uid.map 未收录时 /proc 回退、包名不可解析 fail-safe；本机 uid<10000 走不到 USER_APPS 分支，故自编译实际源码 + 合成 uid，不经 Meson） |
 | 通用回归 | `test_functional.py`（34，IO/SQLite/并发）、`test_crash_log.py` |
 | 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
 

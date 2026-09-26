@@ -5,11 +5,15 @@
 
 锁定三类行为，均来自「框架运行期间监控日志凭空消失、只有历史遗留记录」的现场：
 
-1. **框架闸门不得静默关闭监控**（`fw_route` 单点给出 `monitor_on`）
+1. **框架闸门不得静默关闭监控**（`fw_route` 单点给出 `monitor_on`，且由框架自算）
    - 规则模块未加载/被拒载（`g_active_rules_count == 0`）时，`[GLOBAL] MONITOR ON`
      仍须记录 IO：修复前该情形文件读写一切正常、监控日志却是 0；
    - 路径无 `<uid>/` 用户层（挂载点根）时同样须记录（修复前为 0）；
-   - `MONITOR OFF` 必须**仍然**不记录——兜底不能退化成无条件开。
+   - `MONITOR OFF` 必须**仍然**不记录——兜底不能退化成无条件开；
+   - 类别段（`[SYSTEM_APPS]`）在模块缺席时同样生效：全局 OFF + 类别 ON 要记录、
+     全局 ON + 类别 OFF 要不记录（三层合并在框架侧完成，不依赖模块）。
+     `[USER_APPS:<uid>]` 分支需要 uid>=10000 的请求者，端到端测不到——那一层由
+     `test_monitor_layers.py` 用合成 uid 直接验证框架合并函数。
 2. **磁盘历史可查**：`io.log.1` + `io.log` 全量进入启动快照，
    `log-count` / `search-io` 不再被 2048 条固定上限截断。
 3. **端到端可达**：fuse_daemon 产生的 IO 日志能经 sock 查询到，
@@ -312,6 +316,11 @@ def run_gate_case(name, conf_text, with_module, ops, expect_log, search_key=None
 
 MON_ON = "[GLOBAL]\nMONITOR ON\n"
 MON_OFF = "[GLOBAL]\nMONITOR OFF\n"
+# 类别段（[USER_APPS:<uid>] / [SYSTEM_APPS]）：本测试的请求者是本机 uid（<10000），
+# 恒走 system 分支——USER_APPS 正常不参与匹配，类别层只由 SYSTEM_APPS 命中。
+CAT_SYS_OFF = "[GLOBAL]\nMONITOR ON\n[SYSTEM_APPS] ON\nMONITOR OFF\n"
+CAT_SYS_ON = "[GLOBAL]\nMONITOR OFF\n[SYSTEM_APPS] ON\nMONITOR ON\n"
+CAT_UA_OFF = "[GLOBAL]\nMONITOR ON\n[USER_APPS:0] ON\nMONITOR OFF\n"
 
 
 def test_gate_matrix():
@@ -322,6 +331,17 @@ def test_gate_matrix():
     run_gate_case("1.3 路径无 uid 层", MON_ON, True, ops_root, expect_log=True,
                   search_key="READDIR")
     run_gate_case("1.4 MONITOR OFF", MON_OFF, True, ops_uid, expect_log=False)
+    # 类别层：MONITOR 的三层合并归框架，模块缺席时也必须算得对
+    if os.getuid() >= 10000:
+        log("⚠ 本进程 uid=%d 属用户应用，类别段用例（1.5/1.6）语义不同，跳过",
+            os.getuid())
+    else:
+        run_gate_case("1.5 类别段不越界(USER_APPS vs system)", CAT_UA_OFF, False, ops_uid,
+                      expect_log=True)
+        run_gate_case("1.6 类别段可开启(全局 OFF + SYSTEM_APPS ON)", CAT_SYS_ON, False,
+                      ops_uid, expect_log=True)
+    run_gate_case("1.7 类别段否决(全局 ON + SYSTEM_APPS OFF, 模块在场)", CAT_SYS_OFF, True,
+                  ops_uid, expect_log=False)
 
 
 # ───────────────────────────────────────────────────────────
