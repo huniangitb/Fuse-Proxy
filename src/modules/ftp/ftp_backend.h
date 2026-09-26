@@ -3,7 +3,7 @@
 /*
  * ftp_backend.h — FTP 存储后端操作方法（纯方法，无 FUSE 实现）
  *
- * 供 ftp_module.so（NSP_MODULE_TYPE_BACKEND + NSP_CAP_BACKEND_IO）使用：
+ * 供 ftp_module.so（唯一形态：后端存储提供者，见 nsp_module.h）使用：
  * 只提供"目标功能（FTP）的操作方法"，由 fuse_daemon 框架在路径命中
  * （backend_match）时调用，最终执行（FUSE 回调）仍由框架实现。
  *

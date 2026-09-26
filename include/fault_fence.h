@@ -22,7 +22,7 @@
  *   - 跨模块调用不得持有任何框架锁：longjmp 跳过解锁路径会死锁。
  *     现有 S2 无锁分派（槽位原子快照 + 在途引用）已满足——引用计数
  *     的 release 由围栏返回路径显式补做（见 module_guard）；
- *     module_dispatch_readdir/get_pkg 原持 g_module_lock 读锁，
+ *     后端分派原持 g_module_lock 读锁，
  *     接入围栏时把锁的语义改为"仅用于枚举槽位快照，ops 调用不持锁"。
  *   - sigsetjmp/siglongjmp 只影响肇事线程（TLS），其余 FUSE worker
  *     线程不受影响。
@@ -99,17 +99,6 @@ void fault_fence_attribution(int* slot_out, const char** op_out, const char** na
  * 函数指针 NULL 时返回 NSP_FENCE_BADFN（不置窗口）。 */
 
 /* ---- 规则能力 ---- */
-int nsp_fence_resolve(int slot, const char* op_name,
-                      int (*fn)(const NspQueryCtx*, NspPathDecision*), const NspQueryCtx* q,
-                      NspPathDecision* out);
-int nsp_fence_probe(int slot, const char* op_name, int (*fn)(const NspQueryCtx*, NspProbeResult*),
-                    const NspQueryCtx* q, NspProbeResult* out);
-int nsp_fence_readdir_extra(int slot, const char* op_name,
-                            int (*fn)(const NspQueryCtx*, const char*, int, const char*, bool,
-                                      NspDirEntry*, int),
-                            const NspQueryCtx* q, const char* sub_path, int user_id,
-                            const char* pkg, bool is_root, NspDirEntry* out, int max);
-
 /* ---- 后端能力（NspModuleOps 一一对应） ---- */
 int nsp_fence_backend_match(int slot, const char* op_name, int (*fn)(const char*),
                             const char* path);

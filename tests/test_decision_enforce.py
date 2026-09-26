@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""V3 声明式决策回归：模块只声明，框架单点强制（appear_missing / read_only /
-属性覆盖），逐回调验证 errno 与属性结果。
+"""决策强制单点回归：规则只声明"路径该怎么表现"，errno 映射由框架统一施加
+（`fw_route` 的 appear_missing → ENOENT、read_only → EROFS），逐回调验证 errno。
 
-被测量（tests/override_rules.c，第三方模块视角仅依赖 nsp_module.h）：
-  /0/ovr/gone/**  → appear_missing：**所有**回调统一 ENOENT（V2 时代写类是 EACCES）
-  /0/ovr/ro/**    → read_only：变更操作统一 EROFS；读路径与 access(F_OK) 放行
-  /0/ovr/attrs/** → attr_override：mode 0700 + uid/gid 被采用，而文件类型位
-                    仍取自真实属性（模块故意声明 S_IFDIR，必须仍是普通文件）
+规则来源是**配置**（V4 起规则引擎内建，见 `src/daemon/fw_rules.c`）：
+  HIDE /ovr/gone → appear_missing：**所有**回调统一 ENOENT（V2 时代写类是 EACCES）
+  RO   /ovr/ro   → read_only：变更操作统一 EROFS；读路径与 access(F_OK) 放行
 
-前置：build_gnu/ 产物、/dev/fuse、fusermount3、gcc。
+原属本套件的 attr_override（模块声明 mode/uid/gid 覆盖 + 类型位保持）已随 V4 删除：
+规则语法从未支持它、引擎恒不置位，属无生产者的能力（见 docs/modules.md §3）。
+
+前置：build_gnu/ 产物、/dev/fuse、fusermount3。
 """
 import ctypes
 import errno
@@ -27,7 +28,6 @@ MODDIR = Path("/tmp/fuse_overrides_test/modules")
 CONF = Path("/tmp/Namespace-Proxy/injector.conf")
 DLOG = Path("/tmp/fo.log")
 DAEMON = os.environ.get("FUSE_DAEMON") or str(ROOT / "build_gnu" / "fuse_daemon")
-MODULE = "override_rules"
 OVR_UID, OVR_GID = 4242, 4343
 
 PASS = 0
@@ -80,43 +80,26 @@ def access_errno(path, mode):
     return 0 if rc == 0 else ctypes.get_errno()
 
 
-def build_module():
-    if not Path(DAEMON).exists():
-        print(f"!! 缺少 {DAEMON}，请先 ninja -C build_gnu")
-        sys.exit(2)
-    out = ROOT / "build_gnu" / f"{MODULE}.so"
-    r = subprocess.run(["gcc", "-shared", "-fPIC", "-O1", "-DNSP_MODULE_BUILD",
-                        f"-I{ROOT}/include", "-o", str(out), str(HERE / f"{MODULE}.c")],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"!! 测试模块编译失败:\n{r.stderr}")
-        sys.exit(2)
-
-
 def setup():
     subprocess.run(["fusermount3", "-u", str(MNT)], capture_output=True)
     shutil.rmtree("/tmp/fuse_overrides_test", ignore_errors=True)
     # 真实底层：gone 目录**真实存在**（否则 appear_missing 断言会平凡通过）
     (STORAGE / "0" / "ovr" / "gone").mkdir(parents=True)
     (STORAGE / "0" / "ovr" / "ro").mkdir(parents=True)
-    (STORAGE / "0" / "ovr" / "attrs").mkdir(parents=True)
     (STORAGE / "0" / "normal").mkdir(parents=True)
     (STORAGE / "0" / "ovr" / "gone" / "f.txt").write_text("hidden")
     (STORAGE / "0" / "ovr" / "ro" / "f.txt").write_text("readonly")
-    (STORAGE / "0" / "ovr" / "attrs" / "f.txt").write_text("attrs")
     (STORAGE / "0" / "normal" / "n.txt").write_text("normal")
-    os.chmod(STORAGE / "0" / "ovr" / "attrs" / "f.txt", 0o644)
     MNT.mkdir(parents=True)
-    d = MODDIR / MODULE
-    d.mkdir(parents=True)
-    shutil.copy(ROOT / "build_gnu" / f"{MODULE}.so", d / f"{MODULE}.so")
+    MODDIR.mkdir(parents=True, exist_ok=True)
     CONF.parent.mkdir(parents=True, exist_ok=True)
-    CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\n")
-    time.sleep(0.6)  # 模块加载稳定性窗口
+    # 规则由框架内建引擎解释：HIDE → appear_missing、RO → read_only
+    CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\n"
+                    "HIDE /ovr/gone\nRO /ovr/ro\n")
 
 
 def start():
-    env = dict(os.environ, NSP_OVR_STORAGE=str(STORAGE))
+    env = dict(os.environ)
     p = subprocess.Popen([DAEMON, f"--root={STORAGE}", f"--rules={CONF}",
                           f"--modules-dir={MODDIR}", "-f", str(MNT)],
                          stdout=open(DLOG, "w"), stderr=subprocess.STDOUT, env=env)
@@ -145,7 +128,6 @@ def stop(p):
 
 def main():
     global FAIL
-    build_module()  # 先产出 build_gnu/*.so，setup 再放置到模块目录
     setup()
     p = start()
     if not p:
@@ -154,21 +136,19 @@ def main():
     try:
         gone = MNT / "0" / "ovr" / "gone"
         ro = MNT / "0" / "ovr" / "ro"
-        attrs = MNT / "0" / "ovr" / "attrs"
         normal = MNT / "0" / "normal"
 
-        # 前置：底层真实存在（证明后面的 ENOENT 来自模块声明而非文件缺失）
+        # 前置：底层真实存在（证明后面的 ENOENT 来自规则声明而非文件缺失）
         if (STORAGE / "0" / "ovr" / "gone" / "f.txt").exists():
             ok("前置：/ovr/gone/f.txt 在底层真实存在")
         else:
             fail("前置", "底层文件缺失，appear_missing 断言将平凡通过")
-        # 模块生效判据：attrs 的属主被改成 4242
+        # 规则生效判据：HIDE 命中后 /ovr/gone 立即不可见（等价旧"模块已加载"前置）
         for _ in range(20):
             try:
-                if os.stat(attrs / "f.txt").st_uid == OVR_UID:
-                    break
+                os.stat(gone / "f.txt")
             except OSError:
-                pass
+                break
             time.sleep(0.3)
 
         print("\n── A. appear_missing：所有回调统一 ENOENT（含写类）──")
@@ -226,23 +206,7 @@ def main():
         expect_errno("rename → EROFS", errno.EROFS,
                      lambda: os.rename(ro / "f.txt", normal / "moved.txt"))
 
-        print("\n── C. 属性覆盖：权限位/属主可改，类型位取自真实属性 ──")
-        st = os.stat(attrs / "f.txt")
-        if st.st_mode & 0o7777 == 0o700:
-            ok("mode 覆盖为 0700（真实底层为 0644）")
-        else:
-            fail("mode 覆盖", f"实际 {oct(st.st_mode & 0o7777)}")
-        if os.path.isfile(attrs / "f.txt") and not os.path.isdir(attrs / "f.txt"):
-            ok("类型位仍为普通文件（模块声明了 S_IFDIR 也不生效）")
-        else:
-            fail("类型位", f"st_mode={oct(st.st_mode)}")
-        if st.st_uid == OVR_UID and st.st_gid == OVR_GID:
-            ok(f"uid/gid 覆盖为 {OVR_UID}/{OVR_GID}")
-        else:
-            fail("uid/gid 覆盖", f"实际 {st.st_uid}/{st.st_gid}")
-        expect_ok("覆盖后仍可读", lambda: os.close(os.open(attrs / "f.txt", os.O_RDONLY)))
-
-        print("\n── D. 未声明覆盖的路径：框架默认策略不变 ──")
+        print("\n── C. 未被规则命中的路径：框架默认策略不变（真实属主/权限）──")
         nst = os.stat(normal / "n.txt")
         real = os.lstat(STORAGE / "0" / "normal" / "n.txt")
         if nst.st_uid == real.st_uid and nst.st_gid == real.st_gid:
@@ -256,7 +220,7 @@ def main():
         expect_ok("直通路径可写（未误判 read_only）",
                   lambda: os.close(os.open(normal / "n.txt", os.O_WRONLY)))
 
-        print("\n── E. 读路径不受 read_only 影响（readdir 子项可见）──")
+        print("\n── D. 读路径不受 read_only 影响（readdir 子项可见）──")
         if "f.txt" in os.listdir(ro):
             ok("read_only 目录仍可列目录")
         else:
@@ -273,7 +237,7 @@ def main():
             print("\n".join(DLOG.read_text(errors="replace").splitlines()[-20:]))
 
     print("\n═══════════════════════════════════════")
-    print(f"V3 声明式决策回归 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS + FAIL}")
+    print(f"决策强制单点回归 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS + FAIL}")
     if ERRS:
         for d, detail in ERRS:
             print(f"   ✗ {d}: {detail}")

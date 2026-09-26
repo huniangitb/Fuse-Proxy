@@ -39,6 +39,8 @@ DRIVER = os.path.join(ROOT, "tests", "fixtures", "monitor_layers_driver.c")
 SOURCES = [
     "src/daemon/fw_config.c",
     "src/daemon/fw_pkg.c",
+    # fw_config 重载时会通知内建规则引擎作废缓存 → 链接 fw_rules.c（及 sys_pkg 等依赖）
+    "src/daemon/fw_rules.c",
     "src/config/config_parser.c",
     "src/config/path_vars.c",
     "src/core/path_trie.c",

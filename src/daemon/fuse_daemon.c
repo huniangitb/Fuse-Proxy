@@ -37,6 +37,7 @@
 #include "common.h"
 #include "fw_config.h"
 #include "fw_pkg.h"
+#include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
 #include "nsp_comm.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
@@ -203,8 +204,8 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
             .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = sub_path};
         NspProbeResult r0;
         memset(&r0, 0, sizeof r0);
-        if (module_dispatch_probe(&q0, &r0) == NSP_DISPATCH_OK && r0.valid &&
-            r0.virtual_kind == NSP_VK_ANCESTOR)
+        fw_rules_probe(&q0, &r0);
+        if (r0.valid && r0.virtual_kind == NSP_VK_ANCESTOR)
             return false;
     }
     struct stat st;
@@ -238,9 +239,10 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
                 .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_sub_path};
             NspProbeResult ir;
             memset(&ir, 0, sizeof ir);
-            if (module_dispatch_probe(&iq, &ir) == NSP_DISPATCH_OK && ir.valid) {
-                if (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)) continue;
-            }
+            fw_rules_probe(&iq, &ir);
+            if (ir.valid &&
+                (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)))
+                continue;
         }
         if (hide_others &&
             (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
@@ -266,11 +268,11 @@ static bool is_android_skel_dir(const char* sub_path) {
 /* ================= 三层数据路径（Phase 2 重构） =================
  *   FUSE 节点（内核）→ FUSE 守护进程：
  *     ① 路由层   fw_route()：FUSE 上下文 + 原始路径 → 路由决策
- *                （user_id 剥离 / 模块分派 / 直通回退 / 决策强制：appear_missing
- *                 → ENOENT、read_only → EROFS）
- *     ② 模块层   module_dispatch_resolve / module_backend_*（loader）：
- *                原子槽位快照 + 在途引用（S2 无锁分派）+ 调用围栏
- *                （崩溃→longjmp 恢复）+ 输出校验 + 熔断（错误→卸载）
+ *                （user_id 剥离 / fw_rules_resolve 规则决策 / 直通回退 /
+ *                 决策强制：appear_missing → ENOENT、read_only → EROFS）
+ *     ② 模块层   module_backend_*（loader）：原子槽位快照 + 在途引用
+ *                （无锁分派）+ 调用围栏（崩溃→longjmp 恢复）+ 输出校验 +
+ *                熔断（错误→卸载）。规则决策不在此层：引擎已内建（fw_rules）
  *     ③ FUSE 输出层  各 vfs_* 回调体：消费路由决策，执行真实系统操作
  *                （lstat/open/read/filler...）并返回 FUSE 语义
  * VFS_SETUP_CORE 是①③之间的薄胶水：声明回调体使用的局部变量并调用
@@ -278,8 +280,8 @@ static bool is_android_skel_dir(const char* sub_path) {
  * 线程安全：三层全部无全局可变状态依赖（路由层纯函数 + 模块层原子
  * 快照），FUSE 多线程（fuse_session_loop_mt）下任意 worker 并发进入。 */
 /* ================= 决策强制（框架单点） =================
- * V3 起模块只声明"这个路径该怎么表现"（NspPathDecision），errno 映射与权限
- * 策略集中在此，不再散落在各回调里各判一遍：
+ * 规则引擎只声明"这个路径该怎么表现"（NspPathDecision，见 fw_rules.h），errno
+ * 映射与权限策略集中在此，不再散落在各回调里各判一遍：
  *   - appear_missing → 所有回调统一 ENOENT。V2 时代读类回调 ENOENT、写类回调
  *     EACCES，同一声明两种结果；统一后与"存在变不存在"的语义一致。
  *   - read_only → 变更操作统一 EROFS，root 豁免由框架持有（模块无需关心）。
@@ -293,17 +295,6 @@ typedef enum {
 /* 只读检查：0 放行，-EROFS 拒绝。root 豁免是框架策略，模块无需关心。 */
 static inline int vfs_check_read_only(const NspPathDecision* d, uid_t uid) {
     return (uid != 0 && d->read_only) ? -EROFS : 0;
-}
-
-/* 属性覆盖落实（getattr 用）：在框架既有属性来源**之后**应用，故模块的显式
-   声明优先于框架默认（底层真实属性、虚拟目录继承上级、FTP 继承用户存储根等）。
-   只改权限位，文件类型位始终取自真实属性——不允许模块把一个文件声明成目录
-   （那属于 appear_missing/重定向该解决的问题）。 */
-static inline void vfs_apply_attr_override(const NspPathDecision* d, struct stat* st) {
-    if (!d->valid) return;
-    if (d->attr_override & NSP_OV_MODE) st->st_mode = (st->st_mode & S_IFMT) | (d->mode & 07777);
-    if (d->attr_override & NSP_OV_UID) st->st_uid = (uid_t)d->uid;
-    if (d->attr_override & NSP_OV_GID) st->st_gid = (gid_t)d->gid;
 }
 
 static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
@@ -333,13 +324,12 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
        由本函数经 monitor_out 单独给出。 */
     *monitor_out = fw_config_monitor_for(ctx->uid, ctx->pid);
     fw_pkg_resolve(ctx->uid, ctx->pid, current_pkg, 128);
-    /* module_dispatch_resolve 统一经 nsp_decision_init 初始化默认输出
-       （valid/appear_missing/read_only/mode/uid/gid 等全部有定义值），无论
-       是否命中模块都无需调用方预置；返回 NSP_DISPATCH_NONE 时 `*nsp_ok`
-       短路，调用方不读其余决策字段 */
+    /* fw_rules_resolve 内建：无 <uid>/ 用户层的路径（挂载点根）由引擎自己置
+       valid=false，机构与「模块未命中」一致——调用方只看 rr->valid。决策结构
+       由引擎整体初始化，调用方无需预置。 */
     NspQueryCtx nsp_q = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val};
-    int disp = module_dispatch_resolve(&nsp_q, rr);
-    if (disp == NSP_DISPATCH_OK && rr->valid) {
+    fw_rules_resolve(&nsp_q, rr);
+    if (rr->valid) {
         *nsp_ok = true;
         strcpy(real_path, rr->real_path);
         *is_redir = rr->is_redirect;
@@ -562,7 +552,6 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                     st->st_gid = pst.st_gid;
                 }
             }
-            vfs_apply_attr_override(&rr, st);
             VFS_RETURN(0);
         }
     }
@@ -594,7 +583,6 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                    不伪造为访问者属主 */
                 st->st_mode |= 0755;
             }
-            vfs_apply_attr_override(&rr, st);
             VFS_RETURN(0);
         }
         log_fuse_err("GETATTR", path, err);
@@ -611,7 +599,6 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
        挂载未开 default_permissions，内核本就不做 DAC 判定（fuse_permission
        对 open/read/write 直接放行，仅 access(2) 才下发 FUSE_ACCESS），模块
        也不具备 POSIX DAC——伪造属主拦不住任何访问，纯属误导读取方。 */
-    vfs_apply_attr_override(&rr, st);
     VFS_RETURN(0);
 }
 
@@ -743,6 +730,15 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
     filler(buf, ".", &dirst, 0, 0);
     filler(buf, "..", &dirst, 0, 0);
     for (int i = 0; i < n; i++) {
+        /* 条目名跨 ABI 由模块填写：未终止的名字会被 filler 当野指针读，故逐条
+           校验。旧实现该校验在规则 readdir_extra 的分派里；规则引擎内建后，
+           唯一跨 ABI 的条目来源就是后端 readdir，校验随之搬到这里 */
+        if (!nsp_guard_dir_entry_ok(&entries[i])) {
+            module_guard_error(bslot, "backend_readdir", 0, sub_path, "条目名未终止(越界写)");
+            free(entries);
+            *rc_out = -EIO;
+            return true;
+        }
         struct stat st;
         memset(&st, 0, sizeof st);
         st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
@@ -826,9 +822,9 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         probe_q.path = item_sub_path;
         NspProbeResult ir;
         memset(&ir, 0, sizeof ir);
-        if (module_dispatch_probe(&probe_q, &ir) == NSP_DISPATCH_OK && ir.valid) {
-            if (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)) continue;
-        }
+        fw_rules_probe(&probe_q, &ir);
+        if (ir.valid && (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)))
+            continue;
         if (d->is_root && strcmp(de->d_name, "Android") == 0) d->has_android = true;
         if (d->is_android_dir) {
             if (strcmp(de->d_name, "data") == 0)
@@ -890,7 +886,7 @@ static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
     NspDirEntry virt[MAX_MODULES * 8];
     NspQueryCtx vq = {
         .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = d->sub_path};
-    int vn = module_dispatch_readdir(&vq, d->sub_path, path_user_id, d->current_pkg, d->is_root,
+    int vn = fw_rules_readdir_extra(&vq, d->sub_path, path_user_id, d->current_pkg, d->is_root,
                                      virt, MAX_MODULES * 8);
     /* 纵深防御：dispatch 已钳制，但仍钳制 vn 防栈越界读 */
     if (vn < 0) vn = 0;
@@ -2374,9 +2370,10 @@ int main(int argc, char* argv[]) {
     /* 模块守卫（校验+熔断+MOD_ERR 日志限流）：须在模块系统初始化前
        就绪——模块加载/init 调用可能立即触发错误上报 */
     module_guard_init();
-    /* 热插拔模块系统：扫描模块目录并启动监控线程（规则模块能力在此注册） */
-    uint32_t mod_flags = g_disable_sandbox ? NSP_FLAG_DISABLE_SANDBOX : 0;
-    module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL, mod_flags);
+    /* 内建规则引擎先就绪：fw_config 在初始化与每次热重载时会调 fw_rules_on_reload */
+    fw_rules_init(rules_path, g_disable_sandbox);
+    /* 热插拔模块系统：扫描模块目录并启动监控线程（只剩后端模块形态） */
+    module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL);
 
     if (g_disable_sandbox) {
         LOG("沙盒特性已强制禁用");
@@ -2472,5 +2469,12 @@ int main(int argc, char* argv[]) {
     free(fopts.mountpoint);
     fuse_opt_free_args(&fa);
     if (fmain_rc && fmain_rc != 8) LOG_ERR("FUSE 会话退出: rc=%d", fmain_rc);
+    /* 退出前卸载模块（并停配置监听线程、释放引擎缓存）：
+       ① 模块的 exit 应在进程退出前正常调用；
+       ② 更要紧的是**别把模块留在映射里**——`exit()` → `_dl_fini` 会遍历所有仍
+       映射的 .so 并调用其析构器（.fini_array），若该 .so 曾被就地覆盖（映射页
+       因 truncate 失效、重定位丢失）就会跳到未重定位地址而崩在退出瞬间。
+       module_system_shutdown 内部对失效镜像走"不调 exit、直接 dlclose"。 */
+    module_system_shutdown();
     return fmain_rc;
 }

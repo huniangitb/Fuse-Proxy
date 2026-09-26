@@ -15,9 +15,9 @@
 #include <sys/inotify.h>
 
 /*
- * ftp_module.so — FTP 存储后端模块（NSP_MODULE_TYPE_BACKEND，由 fuse_daemon dlopen 加载）
+ * ftp_module.so — FTP 存储后端模块（由 fuse_daemon dlopen 加载）
  *
- * 与 basic_rules.so 同构，但**不实现 FUSE**：框架（fuse_daemon）已实现 FUSE，
+ * **不实现 FUSE**：框架（fuse_daemon）已实现 FUSE，
  * 本模块只提供"目标功能（FTP）的操作方法"（backend_*），框架在路径命中
  * （backend_match）时调用，最终执行仍由框架的 FUSE 回调驱动。
  *
@@ -159,8 +159,6 @@ static const NspModuleOps ftp_module_ops = {
 const NspModuleInfo nsp_module_info = {
     .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type = NSP_MODULE_TYPE_BACKEND,
-    .caps = NSP_CAP_BACKEND_IO,
     .name = "ftp_module",
     .version = "2.0-test",
     .init = ftp_module_init,

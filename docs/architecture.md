@@ -33,8 +33,8 @@ flowchart TB
 
     subgraph fd["fuse_daemon — FUSE 框架"]
         vfs["vfs 回调 + 模块调度<br/>约 27 个 FUSE 回调"]
-        br["basic_rules.so<br/>规则决策（dlopen）"]
-        ftp["ftp_module.so<br/>FTP 后端（dlopen）"]
+        br["fw_rules / fw_pkg / fw_config<br/>规则决策·包名·配置（内建）"]
+        ftp["ftp_module.so<br/>FTP 后端（dlopen，内存副本加载）"]
     end
 
     zy -->|"REPORT pkg/pid/uid"| ipc
@@ -69,10 +69,10 @@ flowchart TB
 
 ### 2.2 fuse_daemon — FUSE 守护
 
-由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动，实现约 27 个 `fuse_operations` 回调。框架**零规则功能**：
+由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动，实现约 27 个 `fuse_operations` 回调。框架**自带规则能力**（V4 起规则引擎内建，模块只剩后端）：
 
-- **规则决策**经 `module_dispatch_resolve` 分派给 dlopen 的 `basic_rules.so`，无规则模块时直通回退。
-- **后端分派**（`NSP_CAP_BACKEND_IO`）：resolve 命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。
+- **规则决策**（`fw_rules.c`）：本进程内解析 REDIRECT/SANDBOX/HIDE/ALLOW/RO 与 FTP 前缀归属，输出声明式 `NspPathDecision`（见 `src/daemon/fw_rules.h`）；无 `<uid>/` 用户层的路径（挂载点根）不参与规则，直通处理。
+- **后端分派**：决策命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。后端模块**从内存副本加载**（memfd），磁盘文件被原子替换或就地覆盖都不会破坏运行中的映像。
 - **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。模块侧 `br_get_app_cfg` 仍保留同一套解析（它需要 pkg 做 `$package` 变量展开与沙箱隔离），两侧算法同源、结果一致。
 
 模块架构详见 `modules.md`。
@@ -117,8 +117,7 @@ src/
 │   ├── loader.c          # dlopen 加载/卸载、能力登记、分派、inotify 热插拔
 │   ├── fault_fence.c     # 调用围栏（sigsetjmp 崩溃恢复）
 │   └── module_guard.c    # 输出校验 + 熔断器
-├── modules/              # 热插拔模块（.so）
-│   ├── basic_rules/      # 规则引擎：REDIRECT/SANDBOX/HIDE/ALLOW/RO
+├── modules/              # 热插拔模块（.so）——V4 起只有后端形态
 │   └── ftp/              # FTP 存储后端（纯方法模块，无 FUSE 实现）
 │       ├── ftp_mux.c     #   控制面 epoll + curl_multi 复用器（连接复用/并发）
 │       └── ftp_backend_libcurl.c  #   路径映射 + 读写（数据面每文件独立句柄）
@@ -136,7 +135,7 @@ src/
 
 ## 4. 规则系统
 
-由 `config_parser.c`（解析与存储，编译进各进程）+ `basic_rules.so`（匹配与应用，dlopen 进 fuse_daemon）组成。规则语法与作用域见 `config.md`。
+由 `config_parser.c`（解析/索引，编译进各进程）+ `src/daemon/fw_rules.c`（匹配与应用，内建进 fuse_daemon）组成。规则语法与作用域见 `config.md`。
 
 ### 4.1 双通道存储：Trie + 线性数组
 
@@ -193,7 +192,7 @@ FUSE 回调（如 getattr）
 2. 经 zygote 子进程检测（`fast_pid` + `/proc` 扫描，timerfd 驱动）发现新启动应用。
 3. `inject_target` 判定是否为目标（含 `SKIP_SYSTEM_APPS` 过滤、隔离进程过滤）。
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
-5. 此后该应用对 `/sdcard` 的访问经 FUSE → basic_rules 匹配。
+5. 此后该应用对 `/sdcard` 的访问经 FUSE → 内建引擎（`fw_rules`）匹配。
 
 #### 注入方法（`--inject-method=v1|v2|v3`）
 
@@ -228,7 +227,7 @@ injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫�
 ### 5.2 配置热重载
 
 - injector 用 inotify 监听 `injector.conf` 与 `App-rules*/*.conf`。
-- fuse_daemon 框架侧（`src/daemon/fw_config.c`）**唯一负责**读取与解析规则配置：单个 `config_monitor_thread` 监听规则目录，变更后经 `config_read_view()` 重新解析为扁平视图、原子换入并递增代际，再**按各模块在 `init` 内的订阅**（`api->subscribe_rules`）过滤后回调其监听器（`api->set_config_listener`）。模块不再各自读文件、各自跑 inotify——同一份配置在进程内只有一份实例（`basic_rules` 用下发的视图经 `config_build_from_view()` 重建自己的 AppConfig/Trie/uid 缓存）。
+- fuse_daemon 框架侧（`src/daemon/fw_config.c`）**唯一负责**读取与解析规则配置：单个 `config_monitor_thread` 监听规则目录，变更后经 `config_read_view()` 重新解析为扁平视图、原子换入并递增代际，再**按各模块在 `init` 内的订阅**（`api->subscribe_rules`）过滤后回调其监听器（`api->set_config_listener`）。模块不再各自读文件、各自跑 inotify。框架**自己也用同一份视图建索引**（`config_build_from_view()`）：内建规则引擎（`fw_rules.c` 的 AppConfig/Trie/uid 缓存）与 MONITOR 三层合并都建立在它之上，故模块缺席时规则与监控照样成立。
 - injector 经 `config_publisher` 向订阅者广播；`global_inject` 切换则广播全量变更（`changed_count=-1`）触发全应用重挂，否则仅通知受影响包。
 
 ### 5.3 路径缓存失效（内核侧）
@@ -238,7 +237,7 @@ injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫�
 - **inode 级** `fuse_invalidate_path()`：丢属性/数据缓存，对已打开的文件立即生效（句柄直接持 inode，不再经名字查找）。
 - **entry 级** `fuse_invalidate_path_entry()`：丢内核 dentry，使「名字 → inode」重新 lookup。远端增删/改名后**只有它**能让旧映射立即失效——inode 级不触碰名字映射，旧 dentry 会一直命中到 `entry_timeout` 到期。
 
-entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导出版本节点 `FUSE_3.19`），上游/系统/预构建库都没有，故框架侧**弱引用**：符号缺失时自动退化为仅 inode 级。负缓存另由框架把 `negative_timeout` 保持为 libfuse 默认的 `0.0` 关闭（早期版本曾抬到 0.5，导致 FTP「上传后立即 open」命中陈旧 ENOENT）。行为回归见 `tests/test_libfuse_inval.py`。
+entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导出版本节点 `FUSE_3.19`），上游/系统/预构建库都没有，故框架侧**弱引用**：符号缺失时自动退化为仅 inode 级。负缓存另由框架把 `negative_timeout` 保持为 libfuse 默认的 `0.0` 关闭（早期版本曾抬到 0.5，导致 FTP「上传后立即 open」命中陈旧 ENOENT）。
 
 ### 5.4 UDS 一览
 
@@ -253,12 +252,13 @@ entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导
 | 全局 | 归属 | 保护 |
 |------|------|------|
 | `g_global_cfg` / `g_app_cfgs` | config_parser | S1 无锁快照（代际 + per-thread 读者计数）；冷路径查询与写者仍走 `g_rules_lock` rwlock |
-| `g_uid_maps` / `g_uid_map_count` | basic_rules | 同一 S1 代际协议（COW + `config_publish_begin/drain_readers/publish_end` 后换指针），二分查询 |
-| `g_uid_cache[2048]` | basic_rules | seqlock（写者 wlock+seq 翻转，读者无锁），slot = `uid % 2048`，带配置代际校验 |
+| `g_uid_maps` / `g_uid_map_count` | fuse_daemon `fw_pkg` | 重载时整体换入（`fw_pkg_reload`）+ 代际递增；查询二分 |
+| `g_uid_cache[2048]` / `g_mon_slots` | fuse_daemon `fw_pkg` / `fw_config` | seqlock（写者 wlock+seq 翻转，读者无锁），slot = `uid % 2048`，带配置代际校验 |
+| `g_uid_cache[2048]`（引擎内·uid→AppConfig 指针） | fuse_daemon `fw_rules` | 同上 seqlock；`fw_rules_on_reload` 随配置换入作废（旧 AppConfig 已被 COW 释放） |
 | `g_recs` / `g_subs` / `g_gen` | fuse_daemon `fw_config` | 单一 `g_lock` 互斥 + 原子代际；发布路径「读锁内换视图 + 递增两槽引用计数 → 锁外回调模块」，故模块卸载的 drain 会等回调结束 |
 | `g_global_fuse` / `g_media_fuse` | injector | 各自字段（pid/mnt_path/disabled/crash_count） |
 
-FUSE 回调多线程并发执行。热路径（`br_resolve`/`br_probe`）**不取 rwlock**：`config_read_begin()` 持槽返回稳定代际，`config_read_end(gen)` 返回 false（读期间发生发布）则整个 resolve 重试；持槽期间旧配置不会被释放。写者 `config_publish_begin()` 置奇数封锁新读者 → `config_drain_readers()` 等旧代际归零 → 非原子交换 → `config_publish_end()` 放行并再等旧槽归零，之后才释放旧配置。读者计数按代际奇偶分槽、每线程独占 64B 缓存行，并发读不产生缓存行颠簸。**冷路径**（`config_publisher`/`log_ctl` 查询）仍走 `config_lock_read()` rwlock；框架层不再统一加读锁，`VFS_RETURN` 只是普通返回。
+FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_probe`）**不取 rwlock**：`config_read_begin()` 持槽返回稳定代际，`config_read_end(gen)` 返回 false（读期间发生发布）则整个 resolve 重试；持槽期间旧配置不会被释放。写者 `config_publish_begin()` 置奇数封锁新读者 → `config_drain_readers()` 等旧代际归零 → 非原子交换 → `config_publish_end()` 放行并再等旧槽归零，之后才释放旧配置。读者计数按代际奇偶分槽、每线程独占 64B 缓存行，并发读不产生缓存行颠簸。**冷路径**（`config_publisher`/`log_ctl` 查询）仍走 `config_lock_read()` rwlock；框架层不再统一加读锁，`VFS_RETURN` 只是普通返回。
 
 ## 7. 维护规范
 

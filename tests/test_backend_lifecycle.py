@@ -12,9 +12,11 @@
   原实现按指针去重只 put 一次（成功分支与 -EXDEV 分支均泄漏 1）。
 
 断言策略（避免“只看规则是否生效”的伪证据）：
-  - 卸载判定用内核证据：轮询 /proc/<pid>/maps，断言模块 .so 映射消失。
+  - 卸载判定用内核证据：轮询 /proc/<pid>/maps，断言该模块的映射项消失。
+    V4 起模块从**内存副本**（memfd）加载，maps 里呈现为 "memfd:nsp_module_<名>"，
+    不再出现磁盘 .so 路径——按该名断言即可（同时证明是内存副本加载）。
     引用泄漏会让卸载回滚、映射保留 → 测试失败。这是本用例的核心判别。
-  - 反向排除：断言规则模块仍在 maps、daemon 存活、挂载仍可列目录，
+  - 反向排除：daemon 存活、挂载仍可列目录（V4 规则内建，无规则模块可作对照），
     证明“后端不再被分派”不是“规则整体失效”造成的。
   - 分派证据：后端 backend_match / backend_rename 落 marker 文件，
     断言其后端确被调用（否则可能是规则没置 is_ftp，测试会平凡通过）。
@@ -51,7 +53,6 @@ CC = os.environ.get("CC", "cc")
 # —— 临时 fixture 路径：由 main() 用 mkdtemp 建立（import 无副作用）——
 TMP = MNT = STORAGE = MODDIR = BUILT = SRCDIR = CONF = MARKER = DLOG = None
 
-RULES_MOD = "lifecycle_rules"
 BACKEND_MOD = "lifecycle_backend"           # 含 backend_rename（成功分支）
 BACKEND_NORENAME_MOD = "lifecycle_backend_norename"  # rename NULL（EXDEV 分支）
 
@@ -78,57 +79,6 @@ def fail(d, dt=""):
 
 
 # ================= 测试模块源码（临时写盘后 cc 编译） =================
-
-RULES_SRC = r'''
-/* 测试规则模块：为 /blife* 置 is_ftp 并把 real_path 指向测试 storage，
-   使框架进入后端分派分支（backend_*）。无 /<uid>/ 用户层的路径不解析，
-   交框架直通回退（与 basic_rules 的 path_has_uid_layer 约定一致）。 */
-#include "nsp_module.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#ifndef NSP_TEST_STORAGE
-#error "编译需 -DNSP_TEST_STORAGE=\"/path\""
-#endif
-
-static int lr_resolve(const NspQueryCtx* q, NspPathDecision* out) {
-    if (!q || !q->path || !out) return -22; /* -EINVAL */
-    const char* p = q->path;
-    int user_id = -1;
-    const char* sub = p;
-    if (p[0] == '/' && p[1] >= '0' && p[1] <= '9') {
-        const char* d = p + 1;
-        while (*d >= '0' && *d <= '9') d++;
-        if (*d == '\0' || *d == '/') {
-            user_id = atoi(p + 1);
-            const char* slash = strchr(p + 1, '/');
-            sub = slash ? slash : "/";
-        }
-    }
-    if (user_id < 0) return 0; /* 无用户层：valid 保持 false，框架直通 */
-    /* V3：user_id/sub_path 由框架自算，模块只回传 real_path/is_ftp 等
-       真正由规则决定的字段 */
-    out->valid = true;
-    snprintf(out->real_path, sizeof out->real_path, "%s/%d%s", NSP_TEST_STORAGE, user_id, sub);
-    out->is_ftp = (strncmp(sub, "/blife", 6) == 0);
-    return 0;
-}
-
-static const NspModuleOps lr_ops = {.resolve = lr_resolve};
-
-const NspModuleInfo nsp_module_info = {
-    .magic = NSP_MODULE_MAGIC,
-    .abi_version = NSP_MODULE_ABI_VERSION,
-    .type = NSP_MODULE_TYPE_RULES,
-    .caps = NSP_CAP_REDIRECT,
-    .name = "__NAME__",
-    .version = "1",
-    .init = NULL,
-    .exit = NULL,
-    .ops = &lr_ops,
-};
-'''
 
 BACKEND_SRC = r'''
 /* 测试后端模块：仅 backend_match（可选 backend_rename），其余回调留 NULL，
@@ -174,8 +124,6 @@ __RENAME_FIELD__
 const NspModuleInfo nsp_module_info = {
     .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type = NSP_MODULE_TYPE_BACKEND,
-    .caps = NSP_CAP_BACKEND_IO,
     .name = "__NAME__",
     .version = "1",
     .init = NULL,
@@ -207,7 +155,6 @@ def build_modules():
     defs = [f'-DNSP_TEST_STORAGE="{STORAGE}"', f'-DNSP_TEST_MARKER="{MARKER}"']
 
     specs = [
-        (RULES_MOD, RULES_SRC.replace("__NAME__", RULES_MOD)),
         (BACKEND_MOD,
          BACKEND_SRC.replace("__NAME__", BACKEND_MOD)
                     .replace("__RENAME_FN__", RENAME_FN)
@@ -233,7 +180,9 @@ def build_modules():
 def stage(name):
     d = MODDIR / name
     d.mkdir(parents=True, exist_ok=True)
-    shutil.copy(BUILT / f"{name}.so", d / f"{name}.so")
+    tmp = d / f"{name}.so.tmp"
+    shutil.copy(BUILT / f"{name}.so", tmp)
+    os.replace(tmp, d / f"{name}.so")
 
 
 def unstage(name):
@@ -322,43 +271,32 @@ def run_case(label, backend_name, body):
     print(f"\n── {label} ──")
     reset_storage()
     clear_marker()
-    unstage(RULES_MOD)
     unstage(backend_name)
-    stage(RULES_MOD)
     stage(backend_name)
     p = start()
     if not p:
         fail("启动失败", f"见 {DLOG}")
-        unstage(RULES_MOD)
         unstage(backend_name)
         return
     try:
-        if not wait_maps(p.pid, f"{RULES_MOD}.so", True, LOAD_TIMEOUT):
-            fail("规则模块未加载", f"{RULES_MOD}.so 未出现在 maps")
+        if not wait_maps(p.pid, f"memfd:nsp_module_{backend_name}", True, LOAD_TIMEOUT):
+            fail("后端模块未加载", f"memfd:nsp_module_{backend_name} 未出现在 maps")
             return
-        if not wait_maps(p.pid, f"{backend_name}.so", True, LOAD_TIMEOUT):
-            fail("后端模块未加载", f"{backend_name}.so 未出现在 maps")
-            return
-        ok("规则+后端模块均已加载（maps 可见）")
+        ok("后端模块已加载（maps 可见）")
         body(p, backend_name)
     finally:
         stop(p)
-        unstage(RULES_MOD)
         unstage(backend_name)
 
 
 def assert_unloaded(p, backend_name, label):
     """核心断言：移除后 .so 必须从 maps 消失；并排除“规则整体失效”伪因。"""
-    if wait_maps(p.pid, f"{backend_name}.so", False, UNLOAD_TIMEOUT):
-        ok(f"{label}：后端 .so 已从 /proc/{p.pid}/maps 消失（真卸载，引用已归零）")
+    if wait_maps(p.pid, f"memfd:nsp_module_{backend_name}", False, UNLOAD_TIMEOUT):
+        ok(f"{label}：模块映射已从 /proc/{p.pid}/maps 消失（真卸载，引用已归零）")
     else:
-        fail(f"{label}：后端 .so 仍在 maps",
+        fail(f"{label}：模块映射仍在 maps",
              "卸载被回滚——backend_refs/槽位在途引用未归零（引用泄漏）")
-    # 反向排除：不是“规则不生效”或 daemon 已死
-    if maps_has(p.pid, f"{RULES_MOD}.so"):
-        ok(f"{label}：规则模块仍在 maps（排除“规则整体失效”伪因）")
-    else:
-        fail(f"{label}：规则模块也消失了", "无法排除规则整体失效")
+    # 反向排除：daemon 未死、挂载仍可服务（V4 规则已内建，不再有规则模块可作对照）
     if p.poll() is None:
         ok(f"{label}：daemon 存活")
     else:
@@ -530,7 +468,8 @@ def main():
 
     print(f"临时目录: {TMP}")
     MNT.mkdir(parents=True, exist_ok=True)
-    CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\n")
+    # FTP 规则使内建引擎为该前缀置 is_ftp，框架才会进入后端分派分支
+    CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\nFTP /blife seg1\n")
     try:
         build_modules()
     except SystemExit as e:

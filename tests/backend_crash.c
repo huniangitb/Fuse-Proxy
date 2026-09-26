@@ -9,7 +9,7 @@
  *   - 其余路径 → 返回 0（不认领，直通本地）
  *
  * 触发前置：injector.conf 需有 `FTP /bcrash seg1` / `FTP /bmatch seg1` /
- * `FTP /biznoent seg1` 使 basic_rules 置 rr.is_ftp，框架才走 backend_scan_match。
+ * `FTP /biznoent seg1`：FTP 规则使引擎置 is_ftp，框架才会走后端查找。
  *
  * 编译：gcc -shared -fPIC -O1 -g -DNSP_MODULE_BUILD -Iinclude backend_crash.c -o backend_crash.so
  */
@@ -58,8 +58,6 @@ static const NspModuleOps bc_ops = {
 const NspModuleInfo nsp_module_info = {
     .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .type = NSP_MODULE_TYPE_BACKEND,
-    .caps = NSP_CAP_BACKEND_IO,
     .name = "backend_crash",
     .version = "1.0",
     .init = NULL,

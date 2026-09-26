@@ -1,13 +1,14 @@
 # 热插拔模块架构与开发
 
-`fuse_daemon` 只是框架——FUSE 回调骨架 + 路径清洗 + 模块调度 + 本地存储原语，**不内置任何规则语义**。规则能力（REDIRECT/SANDBOX/HIDE/ALLOW/RO）与存储后端（如 FTP）均由 dlopen 的热插拔模块提供。第三方模块**只以 `include/nsp_module.h` 为唯一入口**（该头代含 `nsp_log.h` / `nsp_constants.h` / `nsp_cfg_view.h`，见 §6.1），可在独立仓库独立编译。
+`fuse_daemon` 是框架：FUSE 回调骨架 + 路径清洗 + **规则决策（内建 `fw_rules.c`）** + 后端分派 + 本地存储原语。**V4 起模块只有一种形态——后端存储提供者**（如 FTP）：规则决策、uid→包名、MONITOR 开关都是框架能力（放进模块会让"模块缺席 ⇒ 规则与监控一起失效"）。第三方模块**只以 `include/nsp_module.h` 为唯一入口**（该头代含 `nsp_log.h` / `nsp_constants.h` / `nsp_cfg_view.h`，见 §6.1），可在独立仓库独立编译。
 
 ## 1. 设计要点
 
-- **框架零功能**：无规则模块时框架直通回退（`g_active_rules_count == 0` 快速路径，零函数指针调用）。
-- **能力自述**：模块经 32 位能力位图声明支持哪些规则类型，框架只调用声明过的接口。
+- **规则内建**：REDIRECT/SANDBOX/HIDE/ALLOW/RO 与 FTP 前缀归属由框架解释（`fw_rules_resolve`），与模块无关；无后端模块时框架直接操作本地文件系统（`module_backend_active()` 快速路径，零函数指针调用）。
+- **只有后端形态**：模块声明 `backend_match` 即被认作后端；不再有能力位图/模块类型需要与实现保持一致的冗余声明。
 - **热插拔**：`.so` 放入模块目录即加载，删除即卸载，覆盖即重载，不中断已挂载的 FUSE。
-- **后端不实现 FUSE**：BACKEND 模块只提供 `backend_*` 操作方法，FUSE 由框架统一实现。
+- **内存副本加载**：模块经 `memfd_create` + `/proc/self/fd/N` dlopen，映像只属于本进程（`/proc/<pid>/maps` 显示为 `memfd:nsp_module_<名>`）。因此磁盘上那份 `.so` 无论**原子替换**（tmp+rename）还是**就地覆盖**（truncate + 重写）都不会破坏运行中的模块——后者曾是崩溃源：ELF 按文件 mmap，truncate 会连已重定位的私有页一起丢弃，再次缺页读到的是未重定位的链接期值（函数指针变垃圾），连 `dlclose`/进程退出的析构调用都会野指针跳转。检测到文件变化后按新内容重载（旧映像 `dlclose`）。
+- **后端不实现 FUSE**：模块只提供 `backend_*` 操作方法，FUSE 由框架统一实现。
 
 ## 2. 模块目录约定
 
@@ -97,7 +98,7 @@ typedef struct NspFrameworkApi {
 } NspFrameworkApi;
 ```
 
-- `api_version` 是模块 `init` 的第一道自检（`basic_rules` 在 `api->api_version < NSP_FRAMEWORK_API_VERSION` 时拒绝初始化）。
+- `api_version` 是模块 `init` 的第一道自检（如 `ftp_module` 在 `api->api_version < NSP_FRAMEWORK_API_VERSION` 时拒绝初始化）。
 - 日志**不再经服务表**：`nsp_module.h` 代含 `nsp_log.h`，模块直接调用 `log_internal(LogLevel, ...)` / `LOG`/`LOG_WRN`/`LOG_ERR`/`LOG_DBG` 宏，与框架同一套 `LogLevel`（0=DEBUG 1=INFO 2=WARN 3=ERROR）。真实存储根不再经服务表暴露——路径合成用导出表里的 `common_default_real_path` / `common_sandbox_path`（见 §6.1）。
 
 ### 3.3 接口表 `NspModuleOps`（模块 → 框架）
@@ -160,18 +161,18 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 ## 4. 加载与热插拔
 
-1. `module_system_init(rules_path, modules_dir, flags)`：mkdir 模块目录 → 全量扫描 → 启动 inotify 监控线程。
-2. 每个 `<name>/<name>.so`：0.5s 文件稳定性校验（防加载半写入的 .so）→ `dlopen(RTLD_NOW|RTLD_LOCAL)` → `dlsym(nsp_module_info)` → 校验魔数/ABI 版本/名字一致/自哈希 → `init(api)`（经围栏）→ 按能力位登记注册表。顺序见 §3：ABI 校验在 `dlopen` 之后、`init`/`ops` 之前。
+1. `module_system_init(rules_path, modules_dir)`：mkdir 模块目录 → 全量扫描 → 启动 inotify 监控线程。
+2. 每个 `<name>/<name>.so`：0.5s 文件稳定性校验（防加载半写入的 .so）→ **读入内存副本**（`memfd_create` + 写入）→ 再校验文件未在读取期间变化 → `dlopen("/proc/self/fd/<fd>", RTLD_NOW|RTLD_LOCAL)` → `dlsym(nsp_module_info)` → 校验魔数/ABI 版本/名字一致/自哈希 → `init(api)`（经围栏）→ 登记注册表（**该 memfd 保持打开到模块卸载**：模块自哈希经 `dladdr` 取到的是 `/proc/self/fd/<fd>`，提前关闭会让它读不到自身而误判"哈希不一致"）。顺序见 §3：ABI 校验在 `dlopen` 之后、`init`/`ops` 之前。
 3. inotify 监听模块目录：新增加载、删除卸载、`.so` 覆盖（mtime 变化）重载。**watch 不递归子目录**，故 monitor 线程每 5s poll 超时做兜底全量扫描。
 4. 模块变更**不再经 IPC 上报 injector**：`fuse_daemon` 的规则/后端分派走槽位原子快照，热插拔即时生效，无需 injector 重挂。`LIST_MODULES` 仍可查询当前模块列表（由 injector 扫描模块目录应答，与 fuse_daemon 的加载约定一致）。
 
 ## 5. 故障隔离（框架层防护）
 
-框架对全部模块调用（`resolve`/`probe`/`readdir_extra`/`backend_*`/`init`/`exit`）做三层防护，**模块错误不会带崩 fuse_daemon**：
+框架对全部模块调用（`backend_*`/`init`/`exit`）做三层防护，**模块错误不会带崩 fuse_daemon**：
 
 1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 TLS `sigsetjmp` 围栏；`sigaltstack` 是 **per-thread** 的——`fault_fence_init` 设置的全局 altstack 只覆盖主线程，每个首次调用围栏的线程还会为自己设置独立 TLS altstack（worker 不继承主线程的 altstack）。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
 2. **输出校验**（`src/module/module_guard.c`）：`NspPathDecision` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `virtual_kind` 值域与 `attr_override` 未知位检查 + readdir 条目名校验。
-3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（哈希不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。规则模块不同：`resolve`/`probe` 走决策字段（`appear_missing` 等）回传业务结果，返回非 0 仍判契约违规。
+3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（哈希不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。V4 起规则引擎内建，`resolve`/`probe` 已不在 ABI 中——熔断只对后端模块生效。
 
 **ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|SHA256|原因|时间戳`）。扫描线程见哈希与 ban 记录一致即跳过加载；哈希变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
 
@@ -270,14 +271,14 @@ ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 
 
 | 模块 | 源码 | 说明 |
 |------|------|------|
-| `basic_rules.so` | `src/modules/basic_rules/` | 规则引擎（原 `vfs_core` 迁移，匹配语义逐行等价）：`basic_rules.c` 模块入口（订阅规则类型 + 注册配置监听器）、`br_rules.c` 决策引擎（uid 缓存 / uid.map / Trie + 线性通道 / sandbox / 虚拟目录）；配置热重载由**框架**驱动（见 §6.1.1） |
+| 规则引擎（**非模块**） | `src/daemon/fw_rules.c` | V4 起规则决策内建进 fuse_daemon：Trie + 线性通道 / sandbox / 虚拟目录 / uid→AppConfig 缓存；配置由 `fw_config` 换入后经 `fw_rules_on_reload` 通知作废缓存（见 §6.1.1）。**它不是可插拔模块**——规则语义属于框架 |
 | `ftp_module.so` | `src/modules/ftp/` | FTP 后端（libcurl，**不依赖 libfuse3**）：`ftp_mux.c` 是控制面「epoll + curl_multi」复用器（见下），`ftp_backend_libcurl.c` 是路径映射与读写实现（含 `backend_flush` 两阶段收尾与弱网重试）；写路径为本地临时文件缓存 + 流式 STOR/APPE 上传 |
 
 **FTP 控制面并发模型（`src/modules/ftp/ftp_mux.c`）**：`getattr`/`readdir`/`DELE`/`MKD`/`RMD`/`RNFR`/空文件 `STOR`/`TRUNCATE` 等控制操作交给每后端一个 `CURLM` 句柄，由**一个 epoll 事件线程**驱动（`curl_multi_socket_action` + `CURLMOPT_SOCKET/TIMERFUNCTION` 接入 epoll；提交线程只入队 + eventfd 唤醒，绝不触碰 multi——libcurl 多接口非线程安全）。收益：控制连接在 multi 的连接缓存里长期复用（免重复 USER/PASS 登录），多个 FUSE 线程的控制操作并行在飞（同服务器并发控制连接上限 `CURLMOPT_MAX_HOST_CONNECTIONS`，默认 4），且**业务失败不再重建连接**——旧实现在任何失败（含 550 不存在）都 `curl_easy_cleanup` 重建共享句柄，让下一次操作白付一次 TCP + 登录往返。数据面（读下载线程 / 写流式上传）仍用每文件独立句柄 + 阻塞 `curl_easy_perform`：它们本就互不竞争，且背压模型是「缓冲满即中止传输」（`write_cb` 返回 0 → `CURLE_WRITE_ERROR`），与事件循环驱动不兼容。回归用例 `test_ftp_parallel.py`（并发正确性 / 连接数 / 延迟收敛 / 热重载竞态）。
 
-FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。命中后 `resolve` 回传 `is_ftp`，框架据此把该路径分派给 FTP 后端模块（不再有 `FTP_<段名>` 变量注册机制）。
+FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。规则由内建引擎解释并置 `is_ftp`，框架据此把该路径分派给 FTP 后端模块（不再有 `FTP_<段名>` 变量注册机制）。
 
-basic_rules 的关键语义（修改时必须保持）：appear_missing/read_only 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`br_resolve`/`br_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不再持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
+内建引擎的关键语义（修改时必须保持）：appear_missing/read_only 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`fw_rules_resolve`/`fw_rules_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
 
 ## 8. 相关文档
 
