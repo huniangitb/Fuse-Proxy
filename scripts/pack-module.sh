@@ -98,13 +98,12 @@ echo "== 输出:     $OUT_ZIP"
 # 主二进制（rule_server/injector/fuse_daemon/log_*）与模块 so 一并同步，
 # 与第 5 步"关键二进制齐全"验证清单保持一致，避免骨架残留旧产物
 echo "== 同步 Android 产物到 bin/ ..."
-for bin in rule_server injector fuse_daemon log_monitor log_ctl basic_rules.so ftp_module.so; do
+for bin in rule_server injector fuse_daemon log_monitor log_ctl ftp_module.so; do
     src="$BUILD_DIR/$bin"
     if [[ -f "$src" ]]; then
         case "$bin" in
-            basic_rules.so) dst="$MODULE_DIR/bin/modules/basic_rules/basic_rules.so" ;;
-            ftp_module.so)  dst="$MODULE_DIR/bin/modules/ftp_module/ftp_module.so" ;;
-            *)              dst="$MODULE_DIR/bin/$bin" ;;
+            ftp_module.so) dst="$MODULE_DIR/bin/modules/ftp_module/ftp_module.so" ;;
+            *)             dst="$MODULE_DIR/bin/$bin" ;;
         esac
         cp -f "$src" "$dst"
         echo "   - $bin"
@@ -116,8 +115,8 @@ done
 # ============================ 2. 同步 .rules 与 conf ============================
 echo "== 同步 .rules 规则类型注册文件 ..."
 # 源目录名与模块目录名可能不同（ftp_module.rules 位于 src/modules/ftp/）
-# 格式：<源目录>|<模块目录>
-for pair in "basic_rules|basic_rules" "ftp|ftp_module"; do
+# 格式：<源目录>|<模块目录>。规则能力已内建（V4），只剩后端模块自带 .rules
+for pair in "ftp|ftp_module"; do
     src_mod="${pair%%|*}"
     dst_mod="${pair##*|}"
     src="$RULES_DIR/$src_mod/$dst_mod.rules"
@@ -222,7 +221,7 @@ if git -C "$REPO_DIR" diff --quiet 2>/dev/null; then GIT_DIRTY="clean"; else GIT
             echo "  $bin sha256=$(sha256sum "$BUILD_DIR/$bin" | cut -d' ' -f1) size=$(stat -c%s "$BUILD_DIR/$bin")"
         fi
     done
-    for mod in basic_rules/basic_rules.so ftp_module/ftp_module.so; do
+    for mod in ftp_module/ftp_module.so; do
         name="${mod%%/*}"; so="${mod##*/}"
         if [[ -f "$BUILD_DIR/$so" ]]; then
             echo "  modules/$mod sha256=$(sha256sum "$BUILD_DIR/$so" | cut -d' ' -f1) size=$(stat -c%s "$BUILD_DIR/$so")"
@@ -283,7 +282,6 @@ check("service.sh 存在", "service.sh" in names)
 check("rule_server 存在", any("bin/rule_server" in n for n in names))
 check("injector 存在", any("bin/injector" in n for n in names))
 check("fuse_daemon 存在", any("bin/fuse_daemon" in n for n in names))
-check("basic_rules.rules 存在", any(n.endswith("basic_rules/basic_rules.rules") for n in names))
 check("ftp_module.rules 存在", any(n.endswith("ftp_module/ftp_module.rules") for n in names))
 check("zygisk 存在", any(n.startswith("zygisk/") and n.endswith(".so") for n in names))
 check("zygisk arm64-v8a 存在", "zygisk/arm64-v8a.so" in names)
@@ -325,7 +323,7 @@ else
     SYM_ZIP="${OUT_ZIP%.zip}-symbols.zip"
     [[ "$SYM_ZIP" == "$OUT_ZIP" ]] && SYM_ZIP="$OUT_ZIP-symbols.zip"
     SYM_FILES=()
-    for bin in rule_server injector fuse_daemon log_monitor log_ctl basic_rules.so ftp_module.so; do
+    for bin in rule_server injector fuse_daemon log_monitor log_ctl ftp_module.so; do
         [[ -f "$SYMBOLS_DIR/$bin" ]] && SYM_FILES+=("$bin")
     done
     if [[ ${#SYM_FILES[@]} -eq 0 ]]; then

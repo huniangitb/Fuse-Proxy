@@ -39,7 +39,7 @@ ninja -C "${BUILD_DIR}"
 
 echo
 echo "==> 构建完成：${BUILD_DIR}/"
-echo "    产物：fuse_daemon / log_monitor / log_ctl / rule_server / basic_rules.so / ftp_module.so / global_replace_ctl"
+echo "    产物：fuse_daemon（含内建规则引擎 fw_rules）/ log_monitor / log_ctl / rule_server / ftp_module.so / global_replace_ctl"
 if [ -f "${BUILD_DIR}/meson-info/intro-projectinfo.json" ] && grep -q '"libfuse"' "${BUILD_DIR}/meson-info/intro-projectinfo.json" 2>/dev/null; then
   echo "    libfuse3 来源：项目内子模块 subprojects/libfuse"
 else

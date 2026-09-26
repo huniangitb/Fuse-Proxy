@@ -60,7 +60,6 @@ TERM→KILL 升级、宿主 mountinfo 前后比对、按 cmdline 标记甄别残
     ``INJECTOR``        injector 路径（默认 ``build_gnu/injector``；必须位于
                         仓库内——沙箱按原路径绑定，且其旁须有 ``fuse_daemon``，
                         injector 经 ``get_self_dir()`` 定位它）
-    ``BASIC_RULES_SO``  basic_rules 模块（默认 ``build_gnu/basic_rules.so``）
 
 前置：GNU 产物、``/dev/fuse``、可用的 unshare(1)；userns 不可用时自动跳过。
 失败诊断：``<workdir>/inner.log``（沙箱控制台）与 ``<workdir>/chan/log/``
@@ -83,7 +82,6 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INJECTOR = os.environ.get("INJECTOR") or os.path.join(REPO, "build_gnu", "injector")
-BASIC_RULES = os.environ.get("BASIC_RULES_SO") or os.path.join(REPO, "build_gnu", "basic_rules.so")
 LOG_MONITOR = os.path.join(os.path.dirname(INJECTOR), "log_monitor")
 ROOTBASE = "/tmp/fuse_proxy_test/mnt_env"
 METHODS = ("v1", "v2", "v3")
@@ -689,11 +687,7 @@ def build_topology():
     # 日志落 chan/log（宿主可直接取证）
     if os.path.isdir("/chan/log"):
         mount("/chan/log", "/var/fuse-proxy/log", None, MS_BIND)
-    # 规则模块（缺失不致命：本测试不断言规则求值）
-    if os.path.exists(BASIC_RULES):
-        os.makedirs("/var/fuse-proxy/modules/basic_rules", exist_ok=True)
-        shutil.copyfile(BASIC_RULES, "/var/fuse-proxy/modules/basic_rules/basic_rules.so")
-
+    # 规则引擎已内建（fw_rules）：无需装载模块，本测试也不断言规则求值
     # 基线断言 + 记录关键 dev
     sys_dev = dev_at("/mnt/user/0/emulated")
     REP.check("族根 /mnt/user/0/emulated = 系统视图 (nsp_sysview)",
@@ -708,8 +702,6 @@ def build_topology():
     REP.check("fuse 就绪门 /data/media/0 已建立", os.path.isdir("/data/media/0"), "")
     REP.check("injector.conf 已写入 (GLOBAL_INJECT OFF + 目标/非目标段)",
               "[com.test.target] ON" in (read_text(CONFIG_PATH) or ""), "")
-    if os.path.exists(BASIC_RULES):
-        REP.check("basic_rules 模块就位", os.path.exists("/var/fuse-proxy/modules/basic_rules/basic_rules.so"), "")
     return sys_dev
 
 

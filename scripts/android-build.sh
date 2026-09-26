@@ -74,5 +74,5 @@ ninja -C "${BUILD_DIR}"
 
 echo
 echo "==> 构建完成：${BUILD_DIR}/"
-echo "    产物：fuse_daemon / injector / log_monitor / log_ctl / rule_server / basic_rules.so / ftp_module.so"
+echo "    产物：fuse_daemon（含内建规则引擎 fw_rules）/ injector / log_monitor / log_ctl / rule_server / ftp_module.so"
 echo "    依赖：libfuse/json-c/libcurl 均随主项目编译（静态链接），详见 meson 配置日志"
