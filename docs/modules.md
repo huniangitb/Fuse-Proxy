@@ -63,7 +63,7 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 
 **V3 的行为变更（有意）**：`appear_missing` 在**所有**回调统一返回 `ENOENT`。V2 时代读类回调是 `ENOENT`、写类回调是 `EACCES`，同一声明产生两种结果；统一后与「存在变不存在」的语义一致。若前端曾依赖写类路径的 `EACCES`，需按 `ENOENT` 调整。
 
-**V4 是 `NspFrameworkApi` 的尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故 V4 本身不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3 一律拒载（见下方加载校验顺序、§6.5）。
+**注意两个版本号是不同的命名空间**：`NSP_MODULE_ABI_VERSION`（本次 3→4，破坏性，须重编译）与 `NSP_FRAMEWORK_API_VERSION`（`NspFrameworkApi` 的版本，尾部兼容演进，自身不要求重编译）互不相干，当前恰好都是 4。**框架 API V4 是尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故框架 API 这一侧不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3 一律拒载（见下方加载校验顺序、§6.5）。
 
 加载校验顺序（`module_prepare`）：`dlopen` → `dlsym(nsp_module_info)` → 魔数/ABI 版本 → 名字一致 → 自哈希 → `init`。**ABI 校验发生在 `dlopen` 之后**：`RTLD_NOW` 会立即解析模块的全部符号，V1 模块引用已删除的导出符号时可能在 ABI 检查之前就解析失败；模块的构造器也已在 `dlopen` 期间运行。因此"拒绝旧 ABI"是加载失败，不是加载前拦截。
 
