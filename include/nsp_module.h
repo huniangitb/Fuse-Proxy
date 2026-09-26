@@ -61,11 +61,13 @@
 
 /* ================= ABI 版本与魔数 ================= */
 
-/* V3：决策结果改为声明式 NspPathDecision（取代 NspResolveResult），
-   删除 hidden/ro/is_virtual_ancestor/is_redirect_target/user_id/sub_path，
-   新增 appear_missing/read_only/mode/uid/gid/virtual_kind。属不兼容变更，
-   加载器拒绝 V2 模块——**V2 模块须重编译**。 */
-#define NSP_MODULE_ABI_VERSION 3u
+/* V4：删掉已归框架的三个成员——`NspPathDecision` 的 `pkg`/`monitor_on` 与
+   `NspModuleOps.get_pkg`。包名（`fw_pkg.c`）与 MONITOR 三层合并
+   （`fw_config_monitor_for`）都是**配置语义的输入**，模块缺席时也必须成立，
+   故 V4 起由框架自算，模块无从提供也不得提供。属不兼容变更，加载器拒绝
+   V1/V2/V3 模块——**旧模块须按 V4 头重编译**（多数只需删掉对这两个字段的赋值）。
+   MONITOR 开关已不由决策结构承载（见 `docs/architecture.md` §2.3）。 */
+#define NSP_MODULE_ABI_VERSION 4u
 #define NSP_MODULE_MAGIC       0x4E53504Du /* "NSPM" */
 
 /* ================= 模块类型 ================= */
@@ -157,7 +159,7 @@ typedef enum {
      剥离逻辑逐行等价，故无需跨 ABI 传递。
 
    多模块合并：appear_missing / read_only 取并集；real_path 取首次重定向；
-   pkg / is_ftp / monitor_on / virtual_kind 由首个 valid 模块独占。 */
+   is_ftp / virtual_kind 由首个 valid 模块独占。 */
 typedef struct NspPathDecision {
     bool valid;          /* false = 模块无法解析该路径，框架回退默认行为 */
     bool appear_missing; /* 视为不存在 → 框架在**所有**回调统一返回 ENOENT */
@@ -172,11 +174,6 @@ typedef struct NspPathDecision {
     int32_t uid;            /* NSP_OV_UID 置位时生效 */
     int32_t gid;            /* NSP_OV_GID 置位时生效 */
     uint8_t virtual_kind; /* NspVirtualKind：合成目录判定 */
-    char pkg[128];        /* uid 解析出的包名（日志/沙箱用）。
-                             ⚠ 框架已不读取：包名是**配置语义的输入**（段匹配键 +
-                             日志标签），改由框架自算（`fw_pkg.c`：uid.map → /proc
-                             回退），以便模块缺席时仍可用。字段保留仅为 ABI 布局
-                             稳定，下次升版删除。 */
     /* 最终真实路径（模块负责把以上决策落实为最终可操作路径；
        未命中任何规则时为默认存储路径 STORAGE_BASE/<uid><sub>） */
     char real_path[PATH_MAX];
@@ -186,10 +183,6 @@ typedef struct NspPathDecision {
        命中后框架将该路径操作分派给对应 FTP 后端模块。
        ⚠ 过渡字段：FTP 归属迁移到 ftp_module 后删除（见 docs/modules.md）。 */
     bool is_ftp;
-    bool monitor_on; /* 模块侧的三层合并 MONITOR 值。
-                        ⚠ 框架已不读取：MONITOR 是配置开关，由框架统一自算
-                        （`fw_config_monitor_for`，应用 > 类别 > 全局），以免模块
-                        缺席时开关静默失效。字段保留仅为 ABI 布局稳定，下次升版删除。 */
 } NspPathDecision;
 
 
@@ -249,13 +242,6 @@ typedef struct NspModuleOps {
     int (*backend_rmdir)(const char* path);
     int (*backend_rename)(const char* from, const char* to);
     int (*backend_truncate)(const char* path, off_t size);
-
-    /* ---- 通用 ---- */
-    /* uid → 包名解析（返回 0 成功，pkg 最多 127 字节）。
-       ⚠ 框架已不再调用：包名由框架自算（`fw_pkg.c`：uid.map → /proc 回退），
-       框架侧已无此能力的分派入口。字段保留仅为 ABI 布局稳定，下次升版删除；
-       模块实现它不再有任何效果。 */
-    int (*get_pkg)(uid_t uid, pid_t tid, char* pkg_out, size_t pkg_size);
 } NspModuleOps;
 
 /* ================= 模块信息（静态导出） ================= */

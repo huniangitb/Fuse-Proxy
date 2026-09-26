@@ -29,7 +29,6 @@ static int crash_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (strncmp(vp, "virt/", 5) == 0 || strcmp(vp, "virt") == 0) {
         const char* rest = (vp[4] == '/') ? vp + 5 : "";
         snprintf(out->real_path, sizeof out->real_path, "%s/0/real_dir/%s", test_storage(), rest);
-        snprintf(out->pkg, sizeof out->pkg, "test");
         out->valid = true;
         out->is_redirect = true;
         return 0;

@@ -80,14 +80,11 @@ static int br_module_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     out->mode = r.mode;
     out->uid = r.uid;
     out->gid = r.gid;
-    strncpy(out->pkg, r.pkg, sizeof out->pkg - 1);
-    out->pkg[sizeof out->pkg - 1] = '\0';
     strncpy(out->real_path, r.real_path, sizeof out->real_path - 1);
     out->real_path[sizeof out->real_path - 1] = '\0';
     out->virtual_kind = r.virtual_kind;
     out->is_redirect = r.is_redirect;
     out->is_ftp = r.is_ftp;
-    out->monitor_on = r.monitor_on; /* 漏拷贝会导致全局 MONITOR ON 时 IO 监控失效 */
     return 0;
 }
 

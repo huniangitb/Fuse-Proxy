@@ -46,7 +46,7 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 
 ## 3. 模块 ABI（`include/nsp_module.h`）
 
-当前 `NSP_MODULE_ABI_VERSION = 3`、`NSP_FRAMEWORK_API_VERSION = 4`。
+当前 `NSP_MODULE_ABI_VERSION = 4`、`NSP_FRAMEWORK_API_VERSION = 4`。
 
 **V3 是决策结果的不兼容重构**：`NspResolveResult` 被声明式的 `NspPathDecision` 取代，模块只声明「这个路径该怎么表现」，errno 映射与权限策略全部收归框架单点（`fw_route` 强制 appear_missing/read_only，`vfs_apply_attr_override` 落实属性覆盖，只读判定统一走 `vfs_check_read_only`）。字段变化：
 
@@ -59,11 +59,11 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 | `user_id` / `sub_path` | —（框架自算） | 框架的 `fw_parse_path` 与模块侧剥离逻辑逐行等价，无需跨 ABI 传递；结果结构由 8336 降到约 4.2KB |
 | — | `attr_override` + `mode`/`uid`/`gid` | 模块可覆盖权限位与属主（见 §3.3） |
 
-`pkg` 与 `monitor_on` **已退出框架消费**（字段保留仅为 ABI 布局稳定，下次升版删除）：两者都是配置语义的输入，模块缺席时必须仍有正确值，故归框架——包名由 `fw_pkg.c` 自算（`uid.map` → `/proc` 回退），`MONITOR` 由框架自算三层合并（应用 > 类别 > 全局）。模块照常填充即可，不要指望框架读取。
+**V4 删除了 `pkg` / `monitor_on` / `get_pkg`**：包名与 `MONITOR` 都是配置语义的输入，模块缺席时必须仍有正确值，故早已归框架——包名由 `fw_pkg.c` 自算（`uid.map` → `/proc` 回退），`MONITOR` 由 `fw_config_monitor_for` 自算三层合并（应用 > 类别 > 全局）。`monitor_on` 也不再由决策结构承载（`fw_route` 经出参单独给出，它本就不是路径决策）。
 
 **V3 的行为变更（有意）**：`appear_missing` 在**所有**回调统一返回 `ENOENT`。V2 时代读类回调是 `ENOENT`、写类回调是 `EACCES`，同一声明产生两种结果；统一后与「存在变不存在」的语义一致。若前端曾依赖写类路径的 `EACCES`，需按 `ENOENT` 调整。
 
-**V4 是 `NspFrameworkApi` 的尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故 V4 本身不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）——**V1 与 V2 模块都必须按 V3 头重编译**，否则加载被拒（见下方加载校验顺序、§6.5）。
+**V4 是 `NspFrameworkApi` 的尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故 V4 本身不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3 一律拒载（见下方加载校验顺序、§6.5）。
 
 加载校验顺序（`module_prepare`）：`dlopen` → `dlsym(nsp_module_info)` → 魔数/ABI 版本 → 名字一致 → 自哈希 → `init`。**ABI 校验发生在 `dlopen` 之后**：`RTLD_NOW` 会立即解析模块的全部符号，V1 模块引用已删除的导出符号时可能在 ABI 检查之前就解析失败；模块的构造器也已在 `dlopen` 期间运行。因此"拒绝旧 ABI"是加载失败，不是加载前拦截。
 
@@ -111,16 +111,9 @@ int (*resolve)(const NspQueryCtx* q, NspPathDecision* out);  /* 路径决策，�
 int (*probe)(const NspQueryCtx* q, NspProbeResult* out);      /* readdir 逐条目轻量过滤 */
 int (*readdir_extra)(const NspQueryCtx*, const char* sub_path, int user_id,
                      const char* pkg, bool is_root, NspDirEntry* out, int max);
-int (*get_pkg)(uid_t uid, pid_t tid, char* out, size_t size); /* ⚠ 框架已不调用（包名归框架自算），
-                                                                 实现它不再有效果，下次升版删除 */
 ```
 
-`resolve` 输入 FUSE 原始路径 + uid/pid/gid，输出**声明式决策**：`valid` / `appear_missing` / `read_only` / `attr_override`+`mode`/`uid`/`gid` / `virtual_kind` / `pkg` / `real_path` / `is_redirect` / `is_ftp` / `monitor_on`——**一次调用返回全部决策**，保住「一次查询多路复用」的性能语义。ALLOW 与 SANDBOX 不单独回传：模块已把它们落实进 `real_path`。`probe` 只判 `valid`/`appear_missing`/`virtual_kind`/`is_other_app_pkg`，不构建真实路径、不触发 sandbox 目录创建。
-
-> `pkg` 与 `monitor_on` **框架已不读取**（保留字段仅为 ABI 布局稳定，下次升版删除）：
-> 包名由框架自算（`fw_pkg.c`），`MONITOR` 由框架自算三层合并——两者都是配置语义的
-> 输入，模块缺席时必须仍有正确值。模块侧仍照常填充（`br_get_app_cfg` 的结果本就要
-> 用于 `$package` 展开与沙箱隔离），但不要依赖框架消费它们。
+`resolve` 输入 FUSE 原始路径 + uid/pid/gid，输出**声明式决策**：`valid` / `appear_missing` / `read_only` / `attr_override`+`mode`/`uid`/`gid` / `virtual_kind` / `real_path` / `is_redirect` / `is_ftp`——**一次调用返回全部决策**，保住「一次查询多路复用」的性能语义。ALLOW 与 SANDBOX 不单独回传：模块已把它们落实进 `real_path`。`probe` 只判 `valid`/`appear_missing`/`virtual_kind`/`is_other_app_pkg`，不构建真实路径、不触发 sandbox 目录创建。
 
 **强制由框架单点完成**（`src/daemon/fuse_daemon.c` 的 `fw_route`），模块不参与 errno 决策：
 
@@ -271,7 +264,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 | 新能力 / 新模块类型 | `caps` 位图扩展（32 位预留），框架按位判断 |
 | 模块自身版本 | `NspModuleInfo.version` 字符串（不影响加载兼容性） |
 
-ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。
+ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。
 
 ## 7. 参考实现
 

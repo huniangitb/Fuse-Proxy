@@ -81,11 +81,8 @@ bool nsp_guard_path_ok(const char* p) {
 
 int nsp_guard_validate_decision(const NspPathDecision* r, char* detail, size_t dsz) {
     if (!r) return 8;
-    /* 字符串字段 NUL 终止检查（模块写坏终止符 = 野指针/越界写指纹） */
-    if (!nsp_guard_str_ok(r->pkg, 128)) {
-        if (detail) snprintf(detail, dsz, "pkg 未终止");
-        return 2;
-    }
+    /* 字符串字段 NUL 终止检查（模块写坏终止符 = 野指针/越界写指纹）。
+       V4 起 pkg 已不在决策结构里（归框架自算），只剩 real_path。 */
     if (!nsp_guard_str_ok(r->real_path, PATH_MAX)) {
         if (detail) snprintf(detail, dsz, "real_path 未终止");
         return 5;

@@ -62,13 +62,11 @@ typedef struct {
     uint32_t mode;
     int32_t uid;
     int32_t gid;
-    char pkg[128]; /* uid 解析出的包名 */
     char real_path[PATH_MAX];
     bool is_redirect;
     uint8_t virtual_kind; /* NspVirtualKind */
     bool is_ftp; /* FTP <虚拟前缀> <段名> 规则命中（作用域由段决定）。
                     ⚠ 过渡字段：FTP 归属迁移到 ftp_module 后删除 */
-    bool monitor_on;
 } BrResult;
 
 typedef struct {
