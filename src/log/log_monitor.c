@@ -29,6 +29,7 @@
 #include "common.h"
 #include "nsp_comm.h"
 #include "nsp_util.h"
+#include "nsp_log.h"
 #define MAX_MSG_LEN NSP_LOG_MSG_MAX /* 单条日志上限，与 common.c 组帧同源（nsp_constants.h） */
 /* 滑动日志缓冲：按字节上限控制（超出丢弃最旧日志）。
    IO 日志最大 128MB，普通日志（sys/logcat）各 16MB。
@@ -266,7 +267,8 @@ static int stream_emit(void* ctx, const void* data, size_t len) {
     const char* line = (const char*)(p + 14);
     size_t llen = len - 15;
     char nl = '\n';
-    char level_pref[4]; /* "0|", "1|", "2|", "3|" */
+    const char* level_name = nsp_log_level_name(level);
+    size_t level_name_len = strlen(level_name);
     char ts_buf[32] = {0};
     if (t > 0) {
         struct tm tm_buf;
@@ -277,7 +279,7 @@ static int stream_emit(void* ctx, const void* data, size_t len) {
     while (c) {
         if (c->fd > 0 && (c->type == 0 || c->type == type)) {
             if (level >= c->min_level) {
-                struct iovec iov[5];
+                struct iovec iov[6];
                 int iovlen = 0;
                 if (c->with_ts && ts_buf[0]) {
                     iov[iovlen].iov_base = ts_buf;
@@ -287,11 +289,12 @@ static int stream_emit(void* ctx, const void* data, size_t len) {
                     iov[iovlen].iov_len = 1;
                     iovlen++;
                 }
-                if (type == 2 && c->level_tag) { /* SYS + api: 前插等级标签 */
-                    level_pref[0] = '0' + (level % 10);
-                    level_pref[1] = '|';
-                    iov[iovlen].iov_base = level_pref;
-                    iov[iovlen].iov_len = 2;
+                if (type == 2 && c->level_tag) { /* SYS + api: 前插等级名 */
+                    iov[iovlen].iov_base = (void*)level_name;
+                    iov[iovlen].iov_len = level_name_len;
+                    iovlen++;
+                    iov[iovlen].iov_base = (void*)"|";
+                    iov[iovlen].iov_len = 1;
                     iovlen++;
                 }
                 iov[iovlen].iov_base = (void*)line;
@@ -424,7 +427,7 @@ static void persist_stage(PersistWriter* w, const char* msg, int level, time_t t
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
     char line[MAX_MSG_LEN + 128];
-    int len = snprintf(line, sizeof(line), "%s|%d|%s\n", ts, level, msg);
+    int len = snprintf(line, sizeof(line), "%s|%s|%s\n", ts, nsp_log_level_name(level), msg);
     if (len <= 0) return;
     /* 截断时强制尾部换行，避免与下一行拼接成无换行超长行 */
     if ((size_t)len >= sizeof(line)) {
@@ -452,7 +455,8 @@ static void persist_lazy_tick(void) {
 /* ===== 启动时加载落盘快照（只读独立缓冲） =====
    io.log.1 → io.log（先旧后新）解析为线性数组（oldest→newest）。与内存环无
    重叠（内存启动时为空），客户端获取时拼接：磁盘在前、内存在后。
-   行格式 ts|level|msg（与落盘格式一致），解析失败跳过。
+   行格式 ts|LEVEL|msg（LEVEL 为 DEBUG/INFO/WARN/ERROR 名称，见 nsp_log.h；
+   2026-09 之前的旧文件为纯数字等级，仍可解析），解析失败跳过。
 
    磁盘历史可查性：旧实现按固定条数上限 DISK_LOAD_MAX=2048 截断，且每条固定
    占 MAX_MSG_LEN(4096) 字节——2×2MB 落盘里只有最新 2048 条能被 count/search
@@ -491,7 +495,10 @@ static time_t parse_log_ts(const char* ts) {
     return t < 0 ? (time_t)0 : t;
 }
 
-/* 解析一行落盘记录 "ts|level|msg"：成功填充并返回 true。
+/* 解析一行落盘记录 "ts|LEVEL|msg"：成功填充并返回 true。
+   等级字段自 2026-09 起渲染为名称（DEBUG/INFO/WARN/ERROR），旧文件仍是
+   纯数字——两者都接受；**未知等级一律判为无效行跳过**，不能退化成 atoi
+   （"INFO" 会被静默当成 0=DEBUG，等级过滤与展示一起失真）。
    **不改写 line**——同一份缓冲要先后被「统计」「填充」两遍扫描，
    就地切断分隔符会让第二遍再也找不到原始分段。 */
 static bool disk_parse_line(const char* line, size_t len, time_t* out_t, int* out_level,
@@ -511,11 +518,18 @@ static bool disk_parse_line(const char* line, size_t len, time_t* out_t, int* ou
     ts[tlen] = '\0';
     time_t t = parse_log_ts(ts);
     if (t == 0) return false;
+    char lvl_buf[16];
+    size_t lvlen = (size_t)(p2 - lvl);
+    if (lvlen == 0 || lvlen >= sizeof(lvl_buf)) return false;
+    memcpy(lvl_buf, lvl, lvlen);
+    lvl_buf[lvlen] = '\0';
+    int level = nsp_log_level_parse(lvl_buf);
+    if (level < 0) return false;
     const char* msg = p2 + 1;
     size_t mlen = len - (size_t)(msg - line);
     if (mlen == 0) return false;
     *out_t = t;
-    *out_level = atoi(lvl);
+    *out_level = level;
     *out_msg = msg;
     *out_msg_len = mlen;
     return true;
@@ -1068,9 +1082,9 @@ static void search_emit_line(int fd, time_t t, int level, const char* msg, const
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
     int len;
     if (log_type && strcmp(log_type, "sys") == 0) {
-        /* SYS 查询行附带等级（与落盘行/STREAM_SYS_API 格式一致）：
+        /* SYS 查询行附带等级名（与落盘行/STREAM_SYS_API 格式一致）：
            客户端据此执行等级阈值过滤 */
-        len = snprintf(line, sizeof(line), "%s|%d|%s\n", time_buf, level % 10, msg);
+        len = snprintf(line, sizeof(line), "%s|%s|%s\n", time_buf, nsp_log_level_name(level), msg);
     } else {
         len = snprintf(line, sizeof(line), "%s|%s\n", time_buf, msg);
     }
@@ -1164,7 +1178,10 @@ static bool dump_one_entry(int fd, time_t t, int level, const char* msg, int typ
         off = snprintf(line_buf, sizeof(line_buf), "%s|", time_buf);
     }
     if (with_level && type == 2) {
-        line_buf[off++] = (char)('0' + (level % 10));
+        const char* lvl_name = nsp_log_level_name(level);
+        size_t lvl_len = strlen(lvl_name);
+        memcpy(line_buf + off, lvl_name, lvl_len);
+        off += (int)lvl_len;
         line_buf[off++] = '|';
     }
     memcpy(line_buf + off, msg, msg_len);
@@ -1175,8 +1192,9 @@ static bool dump_one_entry(int fd, time_t t, int level, const char* msg, int typ
 }
 
 /* 历史转储：落盘快照（oldest→newest）在前、内存环在后拼接。
- * with_level 时为 SYS 条目附加 "<level>|" 等级前缀（与 STREAM_SYS_API
- * 实时推送行格式一致：ts|<lvl>|msg），客户端据此做等级阈值过滤 */
+ * with_level 时为 SYS 条目附加 "<LEVEL>|" 等级名前缀（与 STREAM_SYS_API
+ * 实时推送行格式一致：ts|LEVEL|msg，LEVEL ∈ DEBUG/INFO/WARN/ERROR），
+ * 客户端据此做等级阈值过滤 */
 static void dump_buf_to_client(int fd, LogBuffer* buf, const DiskLogBuf* disk, int type,
                                int min_level, bool with_ts, bool with_level) {
     if (disk) {

@@ -16,7 +16,11 @@
      `test_monitor_layers.py` 用合成 uid 直接验证框架合并函数。
 2. **磁盘历史可查**：`io.log.1` + `io.log` 全量进入启动快照，
    `log-count` / `search-io` 不再被 2048 条固定上限截断。
-3. **端到端可达**：fuse_daemon 产生的 IO 日志能经 sock 查询到，
+3. **等级字段可读且不丢语义**：落盘行/查询行/历史转储统一渲染为
+   `时间|LEVEL|msg`（LEVEL = DEBUG/INFO/WARN/ERROR 名称，可直接 grep）；
+   旧文件的纯数字等级仍能解析，**非法等级字段判为无效行跳过**
+   （不得退化成 `atoi`，否则 `INFO` 会被静默当成 0=DEBUG）。
+4. **端到端可达**：fuse_daemon 产生的 IO 日志能经 sock 查询到，
    而不只是躺在落盘文件里（子用例 1 同时覆盖本条）。
 
 前置：GNU 产物 `build_gnu/{fuse_daemon,log_monitor,log_ctl}`、
@@ -24,7 +28,8 @@
       `FUSE_DAEMON`、`LOG_MONITOR`、`LOG_CTL`。
 
 副作用：抽象套接字 `nsp_log_socket` 全局唯一，本测试会**重启 log_monitor**
-        （记录并还原被停掉的实例），并备份/还原 `<LOG_DIR>/io.log{,.1}`。
+        （记录并还原被停掉的实例），并备份/还原 `<LOG_DIR>/io.log{,.1}` 与
+        `sys.log{,.1}`。
 """
 import os
 import re
@@ -46,7 +51,12 @@ LOG_CTL = os.environ.get("LOG_CTL") or os.path.join(BUILD, "log_ctl")
 LOG_DIR = os.environ.get("NSP_LOG_DIR") or "/var/fuse-proxy/log"
 IO_LOG = os.path.join(LOG_DIR, "io.log")
 IO_ROT = IO_LOG + ".1"
+SYS_LOG = os.path.join(LOG_DIR, "sys.log")
+SYS_ROT = SYS_LOG + ".1"
 LOG_SOCKET_NAME = "nsp_log_socket"  # 抽象地址，权威在 include/common.h
+
+# 落盘/查询/流式三处统一的行格式：时间|LEVEL|msg（LEVEL 为名称，见 nsp_log.h）
+LEVEL_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(DEBUG|INFO|WARN|ERROR)\|")
 
 BASE = "/tmp/fuse_proxy_test"
 MNT = BASE + "/mnt"
@@ -194,6 +204,35 @@ def stream_io_dump(key, timeout=6.0):
     s.settimeout(timeout)
     s.connect(b"\0" + LOG_SOCKET_NAME.encode())
     s.sendall(b"STREAM_IO:0\n")
+    buf = b""
+    want = key.encode()
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if want in buf:
+                break
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return buf.decode("utf-8", "replace")
+
+
+def stream_sys_api_dump(key, timeout=6.0):
+    """直连 log_monitor 发 `STREAM_SYS_API:0:1`（带时间戳 + 等级名），取历史转储。
+
+    覆盖 `dump_buf_to_client` → `dump_one_entry` 的 with_level 渲染路径（与
+    `search-sys`、落盘是三条独立代码路径）。该命令是持续流（没有 DONE 行），
+    故读到 key 即断开。"""
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(b"\0" + LOG_SOCKET_NAME.encode())
+    s.sendall(b"STREAM_SYS_API:0:1\n")
     buf = b""
     want = key.encode()
     deadline = time.time() + timeout
@@ -389,6 +428,75 @@ def test_disk_history():
 
 
 # ───────────────────────────────────────────────────────────
+# 用例 3：等级字段可读（名称）与旧数字行兼容
+# ───────────────────────────────────────────────────────────
+def test_level_format():
+    log("\n━━━ 用例组3: 等级字段渲染为名称（旧数字行仍可解析） ━━━")
+    stop_logmon()
+    # 合成历史：新格式名称 + 旧格式数字（2=WARN）+ 两种非法等级字段
+    synth = [
+        "ERROR|[hist] lvl-err-%s" % TEST_ID,
+        "2|[hist] lvl-warn-%s" % TEST_ID,
+        "INFO|[hist] lvl-info-%s" % TEST_ID,
+        "9|[hist] lvl-bad-%s" % TEST_ID,        # 越界数字 → 无效行
+        "garbage|[hist] lvl-junk-%s" % TEST_ID,  # 非等级 → 无效行
+    ]
+    try:
+        with open(SYS_LOG, "w") as f:
+            for body in synth:
+                f.write("%s|%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), body))
+    except OSError as e:
+        log("⚠ 无法写入 %s（%s），跳过本组", SYS_LOG, e)
+        return
+
+    if not start_logmon():
+        fail("log_monitor 启动失败", "见 /tmp/log_pipeline_monitor.out")
+        return
+    proc = None
+    try:
+        err = ctl("search-sys", "lvl-err-" + TEST_ID)
+        check("3.1 查询行渲染为名称等级", "|ERROR|" in err, err[:200].replace("\n", " "))
+        # 旧文件（纯数字等级）必须仍然解析得出正确级别，而不是跳过或当 0
+        warn = ctl("search-sys", "lvl-warn-" + TEST_ID)
+        check("3.2 旧数字等级行仍可解析为 WARN", "|WARN|" in warn,
+              warn[:200].replace("\n", " "))
+        lv2 = ctl("search-sys", "--level", "2", "lvl-")
+        check("3.3 --level 过滤按语义生效（2=WARN 及以上）",
+              "lvl-warn-" in lv2 and "lvl-err-" in lv2 and "lvl-info-" not in lv2,
+              lv2[:200].replace("\n", " "))
+        # 非法等级（越界数字/非等级文本）不得被当成合法级别放行
+        bad = ctl("search-sys", "lvl-bad-" + TEST_ID) + ctl("search-sys", "lvl-junk-" + TEST_ID)
+        check("3.4 非法等级字段的行被跳过（不得静默当 DEBUG）",
+              "lvl-bad-" not in bad and "lvl-junk-" not in bad,
+              bad[:200].replace("\n", " "))
+        # 历史转储（dump_one_entry 的 with_level 路径）同样带名称等级
+        dump = stream_sys_api_dump("lvl-err-" + TEST_ID)
+        check("3.5 历史转储行带名称等级", "|ERROR|" in dump, dump[:200].replace("\n", " "))
+        # 运行期真实落盘行：起一次 daemon 让 log_monitor 写新行
+        fresh_env(MON_ON)
+        proc = start_fuse()
+        if not proc:
+            fail("3.6 fuse_daemon 未能挂载")
+        else:
+            ops_uid()
+            time.sleep(1.5)  # 等 comm 环 + 500ms 刷盘 tick
+    finally:
+        stop_fuse(proc)
+        stop_logmon()  # SIGTERM → 退出刷盘
+
+    try:
+        with open(SYS_LOG) as f:
+            lines = [x for x in f.read().splitlines() if x]
+    except OSError as e:
+        fail("3.6 读取 sys.log 失败", str(e))
+        return
+    live = lines[len(synth):]
+    bad_lines = [x for x in live if not LEVEL_LINE_RE.match(x)]
+    check("3.6 运行期落盘行带名称等级（新增 %d 行）" % len(live),
+          len(live) > 0 and not bad_lines, (bad_lines[:2] or ["无新增行"])[0])
+
+
+# ───────────────────────────────────────────────────────────
 # 主流程
 # ───────────────────────────────────────────────────────────
 def main():
@@ -405,9 +513,9 @@ def main():
         log("❌ /dev/fuse 不可用，跳过全部")
         return 1
 
-    # 备份磁盘历史：本测试会改写 io.log/.1，收尾原样还原
+    # 备份磁盘历史：本测试会改写 io.log/.1 与 sys.log/.1，收尾原样还原
     backup = {}
-    for p in (IO_LOG, IO_ROT):
+    for p in (IO_LOG, IO_ROT, SYS_LOG, SYS_ROT):
         if os.path.exists(p):
             try:
                 shutil.copy2(p, p + ".test_bak")
@@ -428,6 +536,7 @@ def main():
         else:
             test_gate_matrix()
             test_disk_history()
+            test_level_format()
     finally:
         stop_fuse(None)
         stop_logmon()
