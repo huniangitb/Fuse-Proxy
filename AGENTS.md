@@ -44,7 +44,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | `src/config/path_vars.c` | `test_path_vars.py` |
 | injector 目标判定 / 注入方法（`inject_target.c`、`--inject-method=v1\|v2\|v3`） | `test_inject_method.py`（31，v1/v2/v3 判定矩阵：v3 忽略 `GLOBAL_INJECT`/`SKIP_SYSTEM_APPS` 而段头 `OFF` 仍生效、派生标志、非法值拒绝）、`test_global_replace.py`（需 root，v2 替换/还原/审查生命周期，无权限自动跳过） |
 | injector 挂载/清理序列（`ns_utils.c` 跨 ns bind 与 preserve 路径、`ns_global_replace.c` 替换/备份/还原、`cleanup_app_mounts`） | `test_inject_mount_env.py`（38/42/41，rootless unshare 沙箱仿真安卓拓扑内 v1/v2/v3 全生命周期：注入→REQ→SIGTERM 清理→退出后宿主 mountinfo 前后比对零污染，缺产物/userns 不可用自动跳过） |
-| `src/module/`（加载器/内存副本加载/围栏/熔断/ABI） | `test_modules.py`（11，热插拔 + 规则不依赖模块）、`test_module_circuit.py`（46，故障隔离：后端载体）、`test_module_abi.py`（V4 布局契约/旧版本 V1/V2/V3 拒载/最小后端模块）、`test_backend_lifecycle.py`（23，后端引用配对/真卸载） |
+| `src/module/`（加载器/内存副本加载/围栏/熔断/ABI） | `test_modules.py`（19，热插拔 + 规则不依赖模块 + **残留旧 ABI 模块：加载前拒绝/按哈希落 ban/不泄漏 memfd fd/不挡真更新**）、`test_module_circuit.py`（46，故障隔离：后端载体）、`test_module_abi.py`（V4 布局契约/旧版本 V1/V2/V3 拒载/最小后端模块）、`test_backend_lifecycle.py`（23，后端引用配对/真卸载） |
 | 决策强制单点（`fw_route` 的 appear_missing→ENOENT、read_only→EROFS） | `test_decision_enforce.py`（38，逐回调 errno 矩阵，规则来自配置 HIDE/RO） |
 | `log_ctl` / `rule_server` 规则编辑（`nsp_rule_file`） | `test_log_ctl_rules.py`（30）、`test_rule_server.py` |
 | 日志链路（`src/log/`、`nsp_comm.*`、`nsp_log.h` / `nsp_util.c` 的 `nsp_log_level_*`、`common.c` 的 `vfs_log_io` / `monitor_on` / `persist_stage` / `drain_async`） | `test_log_pipeline.py`（30，框架闸门矩阵：无规则记录 / 路径无 `<uid>/` 层 / `MONITOR OFF` / 类别段 `[SYSTEM_APPS]` 否决与开启五态 + 磁盘历史全量可查（`count`/`search`/历史转储三条路径）+ 等级字段渲染为名称且旧数字行仍可解析、非法等级行跳过 + sock 查询端到端；**会重启 log_monitor 并备份还原 `io.log{,.1}` 与 `sys.log{,.1}`**） |

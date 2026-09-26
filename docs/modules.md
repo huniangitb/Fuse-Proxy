@@ -174,7 +174,11 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 2. **输出校验**（`src/module/module_guard.c`）：`NspPathDecision` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `virtual_kind` 值域与 `attr_override` 未知位检查 + readdir 条目名校验。
 3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（哈希不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。V4 起规则引擎内建，`resolve`/`probe` 已不在 ABI 中——熔断只对后端模块生效。
 
-**ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|SHA256|原因|时间戳`）。扫描线程见哈希与 ban 记录一致即跳过加载；哈希变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
+**ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|SHA256|原因|时间戳`）。扫描线程或热重载前先按文件哈希查 ban（`module_ban_blocks`）：一致即跳过（加载与重载都不做），哈希变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
+
+**加载前就被拒的情形同样落 ban**（`module_prepare` 内）：`abi_version` 不匹配、内部 `name` 与目录名不一致、自哈希与文件哈希不一致——这三种都发生在 `dlopen` 之后、`commit` 之前，槽位从未建立，若只报错不落 ban，扫描线程每 5s 一轮就重试一轮（0.5s 稳定性等待 + 全量 SHA-256 + 整份 `.so` 复制进新 memfd），并**每次泄漏一个内存副本 fd**（实测残留旧 ABI 模块时 1 个/5s，累积到 nofile 上限后 socket/open 全面 EMFILE）。现落 ban 后只报一次（`检测到新模块` + 具体原因 ERROR + 一次 `ban 名单命中` WARN），之后静默跳过；日志按 `(模块名, 文件哈希)` 去重，哈希一变重新提示一次（`sys.log` 里 DEBUG 不受最小级别过滤，靠降级日志级别解决不了刷屏）。`module_prepare` 的所有失败路径经 `module_prepare_reject()` 统一回收 memfd。
+
+**旧模块残留**：框架内建规则引擎后 `basic_rules` 已退役，而 `CONFIG_DIR/modules/` 不在 Magisk 模块目录内，卸载/更新都不会清它，安装脚本此前只 `cp` 不删 → 旧 `.so` 会永久留在设备上（症状就是启动后反复出现 `模块 basic_rules ABI 不匹配`）。现两条一起处理：安装脚本（`customize.sh`）按 `RETIRED_MODULES` 清理**已知退役**的模块目录（不做白名单全清，避免误删用户自己放的模块），框架侧按上面的 ban 机制兜底（用户手动放的坏模块同理）。回归用例见 `test_modules.py` §5。
 
 **排障入口**：`log_ctl search-sys --level 2 MOD_ERR <模块名>` 按模块过滤结构化错误行（`module=/op=/rc=/path=/detail=`）。窗口内前 5 条明细全打、之后每 100 条打 1 条汇总，坏模块不会淹没日志环；熔断与崩溃恢复两类高危事件无条件追加到 `<LOG_DIR>/module_errors.log`；崩溃转储附 `Crash attribution: module=<名> slot=<N> op=<op>` 归因行。`module_health_snapshot()` 输出每模块 `err_count`/`err_total`/`banned`/`ban_reason`/`last_err_time` 供前端展示。
 

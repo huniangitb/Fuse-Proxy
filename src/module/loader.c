@@ -175,9 +175,21 @@ static int find_slot(const char* name) {
 
 /* ================= 加载 / 卸载 ================= */
 
+/* 加载前拒绝的统一收口：释放映像 + 回收内存副本 fd。
+   mfd 一旦创建就必须在**每条**失败路径经此回收——否则每 5s 一轮的模块扫描
+   会无界泄漏 memfd（实测：模块目录残留旧 ABI 的 .so 时 1 个/5s，累积到
+   nofile 上限后 socket/open 全面 EMFILE）。h 传 NULL 表示保留 .so 映射
+   （模块可能还有自有线程，见 init 崩溃路径）。 */
+static int module_prepare_reject(void* h, int mfd, int rc) {
+    if (h) dlclose(h);
+    if (mfd >= 0) close(mfd);
+    return rc;
+}
+
 /* 加载并校验新模块（不注册）：0.5s 稳定性校验 + 框架文件哈希 + dlopen +
    ABI/自哈希校验 + init。全部通过才返回（h_out/info_out/hash_out 有效，
-   调用方负责 dlclose 或 module_commit）；任一失败返回负值（已 dlclose）。
+   调用方负责 dlclose 或 module_commit）；任一失败返回负值（映像与 memfd
+   均已回收，见 module_prepare_reject）。
    设计：热重载"先验后换"——先加载校验新模块，通过才卸载旧模块并登记，
    校验失败保留内存中的旧模块。 */
 static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_out,
@@ -270,25 +282,28 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         close(mfd);
         return -1;
     }
-    *mfd_out = mfd;
-    /* fd 不关闭：mfd_out 交给 commit 记入 ModuleEntry，直到模块卸载才 close
-       （模块自哈希经 dladdr → /proc/self/fd/N 读自身，见 ModuleEntry.mfd） */
+    /* mfd 的所有权：**只在最终成功时**交给调用方（commit 记入 ModuleEntry，
+       直到模块卸载才 close——模块自哈希经 dladdr → /proc/self/fd/N 读自身）。
+       dlopen 之后到成功之前的每条失败路径都必须 module_prepare_reject()，
+       否则每 5s 一轮的扫描会无界泄漏 memfd。 */
     NspModuleInfo* info = (NspModuleInfo*)dlsym(h, NSP_MODULE_INFO_SYMBOL);
     if (!info) {
         LOG_ERR("模块 %s 未导出 %s 符号", name, NSP_MODULE_INFO_SYMBOL);
-        dlclose(h);
-        return -2;
+        return module_prepare_reject(h, mfd, -2);
     }
     if (info->magic != NSP_MODULE_MAGIC || info->abi_version != NSP_MODULE_ABI_VERSION) {
         LOG_ERR("模块 %s ABI 不匹配 (magic=0x%x abi=%u，期望 0x%x/%u)", name, info->magic,
                 info->abi_version, NSP_MODULE_MAGIC, NSP_MODULE_ABI_VERSION);
-        dlclose(h);
-        return -3;
+        /* 落 ban：本文件按哈希记住，扫描不再反复尝试（否则每 5s 一条 ERROR +
+           一次 0.5s 稳定性等待 + 全量哈希 + 整份 .so 复制进新 memfd）；
+           哈希一变（真更新）即放行，不挡正常升级 */
+        module_ban_record(name, hash_out, "ABI mismatch");
+        return module_prepare_reject(h, mfd, -3);
     }
     if (!info->name || strcmp(info->name, name) != 0) {
         LOG_ERR("模块 %s 内部 name=%s 与目录名不一致", name, info->name ? info->name : "(null)");
-        dlclose(h);
-        return -4;
+        module_ban_record(name, hash_out, "name mismatch");
+        return module_prepare_reject(h, mfd, -4);
     }
     /* 模块加载兼容性 API（可选）：框架计算的文件哈希 vs 模块上报的自哈希——
        不一致（加载窗口内文件被写入/替换/篡改）→ 拒绝加载；模块未导出该
@@ -299,8 +314,8 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
             const char* mh = self_hash();
             if (!mh || strcmp(mh, hash_out) != 0) {
                 LOG_ERR("模块 %s 自哈希与文件哈希不一致（文件被修改/替换？），拒绝加载", name);
-                dlclose(h);
-                return -7;
+                module_ban_record(name, hash_out, "self-hash mismatch");
+                return module_prepare_reject(h, mfd, -7);
             }
         }
     }
@@ -334,14 +349,13 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
                 if (erc == NSP_FENCE_FAULT) can_unload = false;
             }
             fault_fence_unregister_slot(tent_slot);
-            if (can_unload) {
-                dlclose(h);
-            } else {
+            if (!can_unload) {
                 LOG_ERR("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
                         "detail=无法确认模块线程已停,保持 .so 映射不 dlclose",
                         name);
             }
-            return -5;
+            /* 保留映射时 h 传 NULL：fd 仍须回收（映射不依赖它） */
+            return module_prepare_reject(can_unload ? h : NULL, mfd, -5);
         }
         if (irc != 0) {
             /* init 返回非 0：模块自认初始化失败，清理责任在模块侧（约定不为
@@ -349,8 +363,7 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
                造成重复清理。 */
             LOG_ERR("模块 %s init 失败 (rc=%d)", name, irc);
             fault_fence_unregister_slot(tent_slot);
-            dlclose(h);
-            return -5;
+            return module_prepare_reject(h, mfd, -5);
         }
         /* 首份配置推送：模块在 init 内 subscribe_rules + set_config_listener，
            框架此时立即下发一次过滤视图（模块据此建索引）。推送崩溃=模块建不了
@@ -361,13 +374,13 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
                     name);
             module_ban_record(name, hash_out, "config_update crash");
             fault_fence_unregister_slot(tent_slot);
-            dlclose(h);
-            return -5;
+            return module_prepare_reject(h, mfd, -5);
         }
         fault_fence_unregister_slot(tent_slot); /* commit 时按正式槽位再注册 */
     }
     *h_out = h;
     *info_out = *info;
+    *mfd_out = mfd; /* 成功：fd 所有权交给调用方（commit 记入 ModuleEntry） */
     return 0;
 }
 
@@ -700,6 +713,49 @@ static void module_ban_record(const char* name, const char* hash, const char* re
     fclose(fp);
 }
 
+/* ============ 加载/热重载前的 ban 判定（扫描与热重载共用） ============
+   命中（同名且文件哈希与 ban 记录一致）→ 调用方跳过，不加载也不重载。
+   日志按 (name, 文件哈希) 去重：扫描每 5s 一轮，不去重就是每 5s 一条刷屏
+   ——残留旧 ABI 模块、崩溃后没修好的模块都会长期命中，而 sys.log 里 DEBUG
+   都不受最小级别过滤，降级日志级别解决不了噪音。哈希变化（真更新）后重新
+   提示一次。调用上下文：仅 monitor 线程（与 module_scan_diff 同线程），
+   故无需加锁。 */
+#define MAX_BAN_QUIET 16
+static struct {
+    char name[64];
+    char hash[65];
+} g_ban_quiet[MAX_BAN_QUIET];
+static int g_ban_quiet_count = 0;
+
+/* 首次见到该 (name,hash) 返回 true（应当记录），之后返回 false（静默跳过） */
+static bool ban_quiet_first(const char* name, const char* hash) {
+    for (int i = 0; i < g_ban_quiet_count; i++) {
+        if (strcmp(g_ban_quiet[i].name, name) == 0 && strcmp(g_ban_quiet[i].hash, hash) == 0)
+            return false;
+    }
+    if (g_ban_quiet_count < MAX_BAN_QUIET) {
+        strncpy(g_ban_quiet[g_ban_quiet_count].name, name, sizeof g_ban_quiet[0].name - 1);
+        strncpy(g_ban_quiet[g_ban_quiet_count].hash, hash, sizeof g_ban_quiet[0].hash - 1);
+        g_ban_quiet_count++;
+    }
+    return true;
+}
+
+static bool module_ban_blocks(const char* name, const char* so_path) {
+    char dhash[65] = {0};
+    if (sha256_file_hex(so_path, dhash) != 0) {
+        /* 哈希失败（I/O 错误/文件正写入）：延迟到下次扫描，不绕过 ban 直接加载 */
+        LOG_WRN("模块 %s 哈希计算失败，延迟加载（等下次扫描）", name);
+        return true;
+    }
+    char br[96] = {0};
+    if (!module_ban_lookup(name, dhash, br)) return false;
+    if (ban_quiet_first(name, dhash))
+        LOG_WRN("[MOD_ERR] module=%s op=scan reason=%s detail=ban 名单命中(哈希一致),跳过加载",
+                name, br[0] ? br : "unknown");
+    return true;
+}
+
 /* ================= 模块置毒（崩溃恢复/熔断触发的强制卸载） ================= */
 /*
  * 与 module_unload_one 的语义差异（崩溃不可回滚）：
@@ -879,25 +935,12 @@ static void module_scan_diff(void) {
     for (int p = 0; p < pcount; p++) {
         int slot = find_slot(present[p]);
         if (slot < 0) {
-            /* ban 检查：崩溃/熔断被卸载的模块，.so 哈希与 ban 记录一致时
-               不重载（防崩溃-重载震荡）；哈希变化（版本更新）放行 */
+            /* ban 检查：崩溃/熔断被卸载的模块，以及 ABI/name/自哈希不匹配被
+               拒的模块（module_prepare 内落 ban），哈希一致时不重载；哈希变化
+               （版本更新）放行。日志按 (name,hash) 去重，避免每 5s 刷屏 */
             char so[PATH_MAX];
             snprintf(so, sizeof so, "%s/%s/%s.so", g_modules_dir, present[p], present[p]);
-            char dhash[65] = {0};
-            if (sha256_file_hex(so, dhash) != 0) {
-                /* 哈希失败（I/O 错误/文件正写入）：延迟到下次扫描，不绕过 ban 直接加载 */
-                LOG_WRN("模块 %s 哈希计算失败，延迟加载（等下次扫描）", present[p]);
-                continue;
-            }
-            {
-                char br[96] = {0};
-                if (module_ban_lookup(present[p], dhash, br)) {
-                    LOG_WRN(
-                        "[MOD_ERR] module=%s op=scan reason=%s detail=ban 名单命中(哈希一致),跳过加载",
-                        present[p], br[0] ? br : "unknown");
-                    continue;
-                }
-            }
+            if (module_ban_blocks(present[p], so)) continue;
             LOG("检测到新模块: %s", present[p]);
             module_load_one(present[p]);
         } else {
@@ -911,6 +954,11 @@ static void module_scan_diff(void) {
                     LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟热重载", present[p]);
                     continue;
                 }
+                /* ban 检查（热重载路径同样适用）：磁盘上这份新文件若已被判为
+                   坏文件（ABI 不匹配等），不必再走一遍 0.5s 稳定性等待 + 全量
+                   哈希 + dlopen，直接静默保留内存中的旧模块——否则每 5s 一条
+                   "校验未通过" ERROR，且 .banned 会被重复追加同一行 */
+                if (module_ban_blocks(present[p], so)) continue;
                 /* 文件已被替换即重载：**不能**用"内容哈希相同"做跳过判据。
                    就地覆盖（truncate + 重写，非 tmp+rename）会让已映射页失效——
                    MAP_PRIVATE 映射下页在文件被截断时被丢弃，再次访问从"正在写入"
