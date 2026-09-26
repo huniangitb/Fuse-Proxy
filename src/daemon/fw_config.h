@@ -32,6 +32,17 @@ uint64_t fw_config_generation(void);
    返回 NULL。订阅为空 = 不过滤（申请全部）。 */
 const NspModuleConfig* fw_config_view_for(const char* module_name);
 
+/* 框架侧兜底用的**全局** MONITOR 开关：取主视图中 `[GLOBAL]` 段内最后一条
+   MONITOR 记录（ON/1 为开），无记录为关。
+ *
+   语义边界（勿扩大使用）：只用于「规则模块未参与本次决策」时的监控开关兜底
+   ——规则模块未加载/被 ban、路径无 <uid>/ 用户层、模块返回未命中这三种情形
+   下模块根本没机会说话，而 MONITOR 是**配置开关而非路径决策**，绑在决策有效性
+   上会让文件读写照常正常、只有 IO 监控日志静默消失。模块命中时一律以模块自己的
+   三层合并（应用 > 类别 > 全局）为准；此处**不重复实现**那套作用域语义——
+   类别/应用段的否决需要 uid→包名映射，那是模块的索引职责。 */
+bool fw_config_global_monitor(void);
+
 /* 订阅与监听注册（loader 在模块 init 期间以其名转发；名称须与目录名一致）。
    订阅仅在首次注册时生效（重复注册忽略），监听可覆盖。 */
 void fw_config_set_subscription(const char* module_name, const char* const* types, int count);

@@ -35,6 +35,7 @@
 #include <sys/syscall.h>
 #include <ctype.h>
 #include "common.h"
+#include "fw_config.h"
 #include "nsp_comm.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
@@ -321,7 +322,8 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
     /* module_dispatch_resolve 统一经 nsp_decision_init 初始化默认输出
        （valid/appear_missing/read_only/mode/uid/gid 等全部有定义值），无论
        是否命中模块都无需调用方预置；返回 NSP_DISPATCH_NONE 时 `*nsp_ok`
-       短路，调用方不读 rr 决策字段 */
+       短路，调用方只读 rr->monitor_on（本函数出口保证已定值：命中取模块值，
+       未命中取框架 [GLOBAL] 兜底），不读其余决策字段 */
     NspQueryCtx nsp_q = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val};
     if (module_dispatch_resolve(&nsp_q, rr) == NSP_DISPATCH_OK && rr->valid) {
         *nsp_ok = true;
@@ -344,7 +346,13 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
         }
         return 0;
     }
-    /* 框架直通回退（无规则模块 / 模块未命中） */
+    /* 框架直通回退（无规则模块 / 模块未命中）：路径决策退回默认真实路径，
+       但**监控开关不能跟着丢**——MONITOR 是配置开关而非路径决策，绑在
+       `nsp_ok`（模块是否给出有效决策）上会让「规则模块未加载/被 ban、路径无
+       <uid>/ 用户层、模块返回未命中」三种情形把 IO 监控静默关掉：文件读写走
+       直通回退一切正常，只有监控日志凭空消失，且无任何提示。此处用框架主视图
+       的 [GLOBAL] 开关兜底（模块命中时已在上面取模块的三层合并值，不覆盖）。 */
+    rr->monitor_on = fw_config_global_monitor();
     fw_default_real_path(*user_id, sub_path, real_path, PATH_MAX);
     return 0;
 }
@@ -387,12 +395,16 @@ static inline bool backend_rc_is_business(int rc) {
 
 /* 框架版 I/O 监控日志：由框架记录目标应用操作的【原始路径】；
    target_path 为模块 resolve 可选返回的【目标路径】（REDIRECT 命中时
-   非空，否则 NULL），附加到日志尾部。monitor 开关来自模块配置。 */
+   非空，否则 NULL），附加到日志尾部。monitor 开关由 fw_route 单点给出：
+   模块命中取模块的三层合并值，模块未参与决策时取框架 [GLOBAL] 兜底。 */
 static void vfs_log_io(const char* pkg, uid_t uid, const char* op, const char* orig_path,
                        const char* target_path, bool monitor_on) {
     /* 热路径提前过滤：MONITOR 关闭且非 DEBUG 级别时零开销返回。
        LOG_IO 为通道标记（0x81）恒 > g_min_log_level，log_internal 不会过滤
-       它，故格式化仅在 monitor_on 或 DEBUG MAP 分支才真正需要 */
+       它，故格式化仅在 monitor_on 或 DEBUG MAP 分支才真正需要。
+       monitor_on 由 fw_route 单点给出（模块命中取模块三层合并值，否则取框架
+       [GLOBAL] 兜底），调用方不得再用 nsp_ok 门控——那正是历史上「模块未命中
+       即静默停记」的来源。 */
     if (!monitor_on && g_min_log_level != LOG_DEBUG) return;
     if (monitor_on) {
         if (target_path && target_path[0]) {
@@ -903,7 +915,7 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     (void)fi;
     VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "READDIR", sub_path,
-               (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
+               (nsp_ok && is_redir) ? rr.real_path : NULL, rr.monitor_on);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
 
     /* 后端分派：readdir 由模块方法返回条目，框架负责 filler */
@@ -973,7 +985,7 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
     vfs_flush_pending_closes();
     VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "OPEN", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
-               nsp_ok ? rr.monitor_on : false);
+               rr.monitor_on);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
     /* open 归类 VFS_OP_READ（O_RDONLY 打开 RO 路径必须放行），只在 flags 表明
        要写时走框架只读策略；策略本身仍在 vfs_check_read_only 单点 */
@@ -1054,7 +1066,7 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
 static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "CREATE", sub_path,
-               (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
+               (nsp_ok && is_redir) ? rr.real_path : NULL, rr.monitor_on);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
     /* 后端分派：create 由模块方法创建，fi->fh 存后端句柄（含模块槽位） */
     int bslot = -1;
@@ -1119,7 +1131,7 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
 static int vfs_mkdir(const char* path, mode_t mode) {
     VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "MKDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
-               nsp_ok ? rr.monitor_on : false);
+               rr.monitor_on);
     /* 后端分派：mkdir 由模块方法创建（rr.is_ftp 短路，避免非 FTP 路径付出
        无条件 rwlock + backend_match 扫描） */
     const NspModuleOps* bops = NULL;
@@ -1163,7 +1175,7 @@ static int vfs_mkdir(const char* path, mode_t mode) {
 static int vfs_unlink(const char* path) {
     VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "UNLINK", sub_path,
-               (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
+               (nsp_ok && is_redir) ? rr.real_path : NULL, rr.monitor_on);
     /* 后端分派：unlink 由模块方法删除 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
@@ -1199,7 +1211,7 @@ static int vfs_unlink(const char* path) {
 static int vfs_rmdir(const char* path) {
     VFS_SETUP_CORE(path, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "RMDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
-               nsp_ok ? rr.monitor_on : false);
+               rr.monitor_on);
     if (rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET) {
         if (!fw_virtual_dir_empty(sub_path, p, current_pkg, path_user_id, ctx->uid)) {
             log_fuse_err("RMDIR_NOT_EMPTY", path, ENOTEMPTY);
@@ -1444,7 +1456,7 @@ static int vfs_flush(const char* path, struct fuse_file_info* fi) {
 static int vfs_readlink(const char* path, char* buf, size_t size) {
     VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "READLINK", sub_path,
-               (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
+               (nsp_ok && is_redir) ? rr.real_path : NULL, rr.monitor_on);
     ssize_t res = readlink(p, buf, size - 1);
     if (res == -1) {
         log_fuse_err("READLINK", path, errno);
@@ -1457,7 +1469,7 @@ static int vfs_readlink(const char* path, char* buf, size_t size) {
 static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
     VFS_SETUP_CORE(path, VFS_OP_READ);
     vfs_log_io(current_pkg, ctx->uid, "OPENDIR", sub_path,
-               (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
+               (nsp_ok && is_redir) ? rr.real_path : NULL, rr.monitor_on);
     /* 后端分派：目录由后端模块管理时直接放行（readdir 条目由模块方法提供，
        本地 real_path 不存在，不可 opendir） */
     const NspModuleOps* bops = NULL;
@@ -1484,7 +1496,7 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
 static int vfs_symlink(const char* target, const char* linkpath) {
     VFS_SETUP_CORE(linkpath, VFS_OP_MUTATE);
     vfs_log_io(current_pkg, ctx->uid, "SYMLINK", sub_path,
-               (nsp_ok && is_redir) ? rr.real_path : NULL, nsp_ok ? rr.monitor_on : false);
+               (nsp_ok && is_redir) ? rr.real_path : NULL, rr.monitor_on);
     if (symlink(target, p) == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *p_dir = dirname(p_dup);
@@ -1666,9 +1678,9 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, VFS_OP_MUTATE);
     if (rrc != 0) return rrc;
     vfs_log_io(pkg_from, ctx->uid, "RENAME_FROM", sub_from,
-               (ok1 && redir_from) ? r1.real_path : NULL, ok1 ? r1.monitor_on : false);
+               (ok1 && redir_from) ? r1.real_path : NULL, r1.monitor_on);
     vfs_log_io(pkg_to, ctx->uid, "RENAME_TO", sub_to, (ok2 && redir_to) ? r2.real_path : NULL,
-               ok2 ? r2.monitor_on : false);
+               r2.monitor_on);
     /* 后端分派：from/to 命中后端时由模块方法重命名（两端须同一后端模块） */
     const NspModuleOps* bf_ops = NULL;
     const NspModuleOps* bt_ops = NULL;

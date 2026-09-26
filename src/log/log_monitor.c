@@ -24,6 +24,7 @@
 #include <fnmatch.h>
 #include <sys/uio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/eventfd.h>
 #include "common.h"
 #include "nsp_comm.h"
@@ -46,7 +47,11 @@ typedef struct AsyncCtx {
     int fd;
     int type; /* 0=undef, 1=IO, 2=SYS, 3=LOGCAT */
     pthread_t tid;
-    volatile bool disconnected;
+    /* 断开标记用原子而非 volatile：async 线程在**最后一批 entries/batch_q 写入之后**
+       才置位，主循环回收前置 acquire 读取——release/acquire 配对让那些 volatile
+       写对接收方可见。用 volatile 只保证不被优化掉，不保证跨线程可见性，线程
+       末尾刚入环的日志会在回收方读 head 之前就被 free 掉而永久丢失。 */
+    _Atomic bool disconnected;
     struct {
         char msg[512];
         int level;
@@ -336,10 +341,16 @@ typedef struct {
     size_t staged;
     uint64_t last_flush_ms;
     uint64_t fail_until_ms; /* 磁盘失败退避：到期前跳过 open 尝试 */
-    uint64_t dropped;       /* 磁盘不可写时丢弃批次数 */
+    uint64_t dropped;       /* stage 满且刷盘不可用时被拒收的日志行数 */
 } PersistWriter;
 static PersistWriter g_persist_io;
 static PersistWriter g_persist_sys;
+
+/* 链路丢弃累计（跨连接/跨 async 线程）：这些是**唯一**会静默吃掉日志的点，
+   不计数就等于"日志凭空消失且无从查起"。由 report_drops_once() 限频上报到
+   sys 缓冲（search-sys / sys.log 可见），稳态计数不变则零噪音。 */
+static _Atomic uint64_t g_drop_entries = 0; /* 接收环（entries）满丢弃的行数 */
+static _Atomic uint64_t g_drop_batch = 0;   /* 合并队列（batch_q）满丢弃的包数 */
 
 static uint64_t persist_now_ms(void) {
     struct timespec ts;
@@ -357,21 +368,18 @@ static void persist_init_writer(PersistWriter* w, const char* name) {
     w->dropped = 0;
 }
 
-/* 刷盘：open → fstat 校准 → 超限轮转 → 全量写出 → close。失败退避，下轮
-   重试；磁盘不可写时丢弃本批（内存链路不受影响，dropped 计数）。 */
+/* 刷盘：open → fstat 校准 → 超限轮转 → 全量写出 → close。失败进入退避后重试。
+   **任何失败路径都不清空 stage**：暂存区是这批日志的唯一副本，清掉等于把
+   退避期（默认 5s，磁盘故障期间更久）内累积的最多 64KB 无声丢弃；只有真正
+   写出的数据才从 stage 移除（部分写出时保留未写出的尾部）。容量耗尽由
+   persist_stage 收口——它在 flush 后仍放不下时按行拒收并计数（dropped）。 */
 static void persist_flush(PersistWriter* w) {
     if (!w->stage || w->staged == 0) return;
     uint64_t now = persist_now_ms();
-    if (now < w->fail_until_ms) {
-        w->staged = 0;
-        w->dropped++;
-        return;
-    }
+    if (now < w->fail_until_ms) return;
     int fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) {
         w->fail_until_ms = now + PERSIST_FAIL_BACKOFF_MS;
-        w->staged = 0;
-        w->dropped++;
         return;
     }
     struct stat st;
@@ -383,8 +391,6 @@ static void persist_flush(PersistWriter* w) {
         fd = open(w->path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
         if (fd < 0) {
             w->fail_until_ms = now + PERSIST_FAIL_BACKOFF_MS;
-            w->staged = 0;
-            w->dropped++;
             return;
         }
     }
@@ -399,8 +405,13 @@ static void persist_flush(PersistWriter* w) {
     }
     close(fd);
     if (off < w->staged) {
+        /* 部分写出：移除已落盘的前缀，未写出的尾部留到退避结束后重试 */
+        if (off > 0) {
+            memmove(w->stage, w->stage + off, w->staged - off);
+            w->staged -= off;
+        }
         w->fail_until_ms = now + PERSIST_FAIL_BACKOFF_MS;
-        w->dropped++;
+        return;
     }
     w->staged = 0;
     w->last_flush_ms = now;
@@ -439,13 +450,25 @@ static void persist_lazy_tick(void) {
 }
 
 /* ===== 启动时加载落盘快照（只读独立缓冲） =====
-   io.log.1 → io.log（先旧后新）解析为线性数组（oldest→newest），上限
-   DISK_LOAD_MAX 条/类（滑动保留最新，超限丢弃最旧）。与内存环无重叠
-   （内存启动时为空），客户端获取时拼接：磁盘在前、内存在后。
-   行格式 ts|level|msg（与落盘格式一致），解析失败跳过。 */
-#define DISK_LOAD_MAX 2048
+   io.log.1 → io.log（先旧后新）解析为线性数组（oldest→newest）。与内存环无
+   重叠（内存启动时为空），客户端获取时拼接：磁盘在前、内存在后。
+   行格式 ts|level|msg（与落盘格式一致），解析失败跳过。
+
+   磁盘历史可查性：旧实现按固定条数上限 DISK_LOAD_MAX=2048 截断，且每条固定
+   占 MAX_MSG_LEN(4096) 字节——2×2MB 落盘里只有最新 2048 条能被 count/search
+   翻到，更早的记录明明躺在文件里却"查不到"（重启即只剩两千余条）。现改为
+   **紧凑存储**：条目只存 t/level + 指向字符串池的指针，字符串按实际行长排布，
+   同样的内存量级即可全量载入（2×2MB ≈ 5MB）。DISK_READ_MAX 是防异常大文件的
+   硬上界：超出时只取末尾并跳过残缺首行（轮转本身把文件约束在 2MB 内）。 */
+#define DISK_READ_MAX (8u * 1024u * 1024u)
 typedef struct {
-    LogEntry* data; /* oldest→newest 线性数组，启动后只读 */
+    time_t t;
+    int level;
+    const char* msg; /* 指向 strings 池（NUL 结尾），池释放前有效 */
+} DiskEntry;
+typedef struct {
+    DiskEntry* data; /* oldest→newest 线性数组，启动后只读 */
+    char* strings;   /* 全部条目字符串的单块池 */
     int count;
 } DiskLogBuf;
 static DiskLogBuf g_io_disk = {0};
@@ -468,50 +491,174 @@ static time_t parse_log_ts(const char* ts) {
     return t < 0 ? (time_t)0 : t;
 }
 
-static void disk_load_file(LogEntry* ring, int* total, const char* path) {
-    FILE* fp = fopen(path, "r");
-    if (!fp) return;
-    char line[MAX_MSG_LEN + 128];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        if (len == 0) continue;
-        char* p1 = strchr(line, '|');
-        if (!p1) continue;
-        char* p2 = strchr(p1 + 1, '|');
-        if (!p2) continue;
-        *p1 = '\0'; /* ts 段 */
-        int level = atoi(p1 + 1);
-        const char* msg = p2 + 1;
-        time_t t = parse_log_ts(line);
-        if (t == 0 || !msg[0]) continue;
-        LogEntry* e = &ring[(*total) % DISK_LOAD_MAX];
-        e->t = t;
-        e->level = level;
-        strncpy(e->msg, msg, MAX_MSG_LEN - 1);
-        e->msg[MAX_MSG_LEN - 1] = '\0';
-        (*total)++;
+/* 解析一行落盘记录 "ts|level|msg"：成功填充并返回 true。
+   **不改写 line**——同一份缓冲要先后被「统计」「填充」两遍扫描，
+   就地切断分隔符会让第二遍再也找不到原始分段。 */
+static bool disk_parse_line(const char* line, size_t len, time_t* out_t, int* out_level,
+                            const char** out_msg, size_t* out_msg_len) {
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) len--;
+    if (len == 0) return false;
+    const char* p1 = memchr(line, '|', len);
+    if (!p1) return false;
+    const char* lvl = p1 + 1;
+    size_t lvl_len = len - (size_t)(lvl - line);
+    const char* p2 = memchr(lvl, '|', lvl_len);
+    if (!p2) return false;
+    char ts[32];
+    size_t tlen = (size_t)(p1 - line);
+    if (tlen >= sizeof(ts)) return false;
+    memcpy(ts, line, tlen);
+    ts[tlen] = '\0';
+    time_t t = parse_log_ts(ts);
+    if (t == 0) return false;
+    const char* msg = p2 + 1;
+    size_t mlen = len - (size_t)(msg - line);
+    if (mlen == 0) return false;
+    *out_t = t;
+    *out_level = atoi(lvl);
+    *out_msg = msg;
+    *out_msg_len = mlen;
+    return true;
+}
+
+/* 读文件末尾至多 DISK_READ_MAX 字节。*out_partial=true 表示从中间截断
+ （首行残缺，统计/填充两遍都要跳过首行）。返回 NUL 结尾的 malloc 缓冲，失败 NULL。 */
+static char* disk_read_tail(const char* path, size_t* out_len, bool* out_partial) {
+    *out_len = 0;
+    *out_partial = false;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return nullptr;
     }
-    fclose(fp);
+    size_t size = (size_t)st.st_size;
+    size_t off = 0;
+    if (size > DISK_READ_MAX) {
+        off = size - DISK_READ_MAX;
+        *out_partial = true;
+    }
+    size_t len = size - off;
+    char* buf = (char*)malloc(len + 1);
+    if (!buf) {
+        close(fd);
+        return nullptr;
+    }
+    if (off > 0 && lseek(fd, (off_t)off, SEEK_SET) < 0) {
+        free(buf);
+        close(fd);
+        return nullptr;
+    }
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = read(fd, buf + got, len - got);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    buf[got] = '\0';
+    *out_len = got;
+    return buf;
+}
+
+/* 第一遍：只累计有效条数与字符串总字节数（用于一次性分配，避免反复 realloc） */
+static void disk_count_lines(const char* text, size_t len, bool skip_first, int* cnt,
+                             size_t* bytes) {
+    size_t pos = 0;
+    bool first = skip_first;
+    while (pos < len) {
+        const char* nl = memchr(text + pos, '\n', len - pos);
+        size_t line_len = nl ? (size_t)(nl - (text + pos)) : len - pos;
+        if (!first) {
+            time_t t;
+            int level;
+            const char* msg;
+            size_t mlen;
+            if (disk_parse_line(text + pos, line_len, &t, &level, &msg, &mlen)) {
+                (*cnt)++;
+                *bytes += mlen + 1;
+            }
+        }
+        first = false;
+        pos += line_len + (nl ? 1 : 0);
+    }
+}
+
+/* 第二遍：写入预分配好的条目数组与字符串池（游标由调用方跨文件累计，
+   保证 .1 → io.log 的旧新顺序） */
+static void disk_fill_lines(const char* text, size_t len, bool skip_first, DiskEntry* entries,
+                            char* strings, int* cursor, size_t* str_off) {
+    size_t pos = 0;
+    bool first = skip_first;
+    while (pos < len) {
+        const char* nl = memchr(text + pos, '\n', len - pos);
+        size_t line_len = nl ? (size_t)(nl - (text + pos)) : len - pos;
+        if (!first) {
+            time_t t;
+            int level;
+            const char* msg;
+            size_t mlen;
+            if (disk_parse_line(text + pos, line_len, &t, &level, &msg, &mlen)) {
+                DiskEntry* e = &entries[*cursor];
+                e->t = t;
+                e->level = level;
+                e->msg = strings + *str_off;
+                memcpy(strings + *str_off, msg, mlen);
+                strings[*str_off + mlen] = '\0';
+                *str_off += mlen + 1;
+                (*cursor)++;
+            }
+        }
+        first = false;
+        pos += line_len + (nl ? 1 : 0);
+    }
+}
+
+static void disk_free(DiskLogBuf* d) {
+    if (!d) return;
+    free(d->data);
+    free(d->strings);
+    d->data = nullptr;
+    d->strings = nullptr;
+    d->count = 0;
 }
 
 static void disk_load(DiskLogBuf* d, const char* rot_path, const char* cur_path) {
-    LogEntry* ring = calloc(DISK_LOAD_MAX, sizeof(LogEntry));
-    if (!ring) return;
-    int total = 0;
-    disk_load_file(ring, &total, rot_path); /* 先旧（.1） */
-    disk_load_file(ring, &total, cur_path); /* 后新 */
-    int n = total < DISK_LOAD_MAX ? total : DISK_LOAD_MAX;
-    d->data = malloc((size_t)n * sizeof(LogEntry));
-    if (!d->data) {
-        free(ring);
+    size_t len1 = 0, len2 = 0;
+    bool part1 = false, part2 = false;
+    char* text1 = disk_read_tail(rot_path, &len1, &part1);
+    char* text2 = disk_read_tail(cur_path, &len2, &part2);
+    int cnt = 0;
+    size_t bytes = 0;
+    if (text1) disk_count_lines(text1, len1, part1, &cnt, &bytes);
+    if (text2) disk_count_lines(text2, len2, part2, &cnt, &bytes);
+    DiskEntry* entries = cnt > 0 ? (DiskEntry*)malloc((size_t)cnt * sizeof(DiskEntry)) : nullptr;
+    char* strings = bytes > 0 ? (char*)malloc(bytes) : nullptr;
+    if (cnt > 0 && (!entries || !strings)) {
+        free(entries);
+        free(strings);
+        free(text1);
+        free(text2);
+        d->data = nullptr;
+        d->strings = nullptr;
         d->count = 0;
+        LOG_ERR("磁盘历史快照分配失败: %d 条 / %zu 字节", cnt, bytes);
         return;
     }
-    int start = total < DISK_LOAD_MAX ? 0 : total % DISK_LOAD_MAX;
-    for (int i = 0; i < n; i++) d->data[i] = ring[(start + i) % DISK_LOAD_MAX];
-    d->count = n;
-    free(ring);
+    int cursor = 0;
+    size_t str_off = 0;
+    if (text1) disk_fill_lines(text1, len1, part1, entries, strings, &cursor, &str_off);
+    if (text2) disk_fill_lines(text2, len2, part2, entries, strings, &cursor, &str_off);
+    free(text1);
+    free(text2);
+    d->data = entries;
+    d->strings = strings;
+    d->count = cursor;
 }
 
 static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
@@ -558,6 +705,31 @@ static void drain_async(AsyncCtx* ctx) {
         }
         ctx->tail = (ctx->tail + 1) & (RING_CAP - 1);
     }
+}
+
+/* 丢弃告警：计数有变化时至多每 DROP_REPORT_INTERVAL_MS 上报一行到 sys 缓冲。
+   由 500ms 定时 tick 驱动，不占用任何查询协议（不动 COUNT 响应格式）。 */
+#define DROP_REPORT_INTERVAL_MS 10000
+static uint64_t g_drop_reported = 0;
+static uint64_t g_drop_report_ms = 0;
+
+static void report_drops_once(void) {
+    uint64_t ring_drop = atomic_load_explicit(&g_drop_entries, memory_order_relaxed);
+    uint64_t batch_drop = atomic_load_explicit(&g_drop_batch, memory_order_relaxed);
+    uint64_t drops = ring_drop + batch_drop + g_persist_io.dropped + g_persist_sys.dropped;
+    if (drops == g_drop_reported) return;
+    uint64_t now = persist_now_ms();
+    if (g_drop_report_ms != 0 && now - g_drop_report_ms < DROP_REPORT_INTERVAL_MS) return;
+    g_drop_reported = drops;
+    g_drop_report_ms = now;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "日志链路丢弃累计: 接收环满 %llu 条, 合并队列满 %llu 包, "
+             "落盘拒收 IO %llu / SYS %llu 行（限频告警，每 %d s 至多一次）",
+             (unsigned long long)ring_drop, (unsigned long long)batch_drop,
+             (unsigned long long)g_persist_io.dropped, (unsigned long long)g_persist_sys.dropped,
+             (unsigned)(DROP_REPORT_INTERVAL_MS / 1000));
+    push_log(&g_sys_buf, msg, 2, LOG_WARN);
 }
 static void cleanup_async(AsyncCtx* ctx) {
     AsyncCtx** pp = &g_async_clients;
@@ -607,8 +779,10 @@ static void* async_log_thread(void* arg) {
                             ctx->batch_q_head++;
                             uint64_t val = 1;
                             write(ctx->notify_fd, &val, sizeof(val));
+                        } else {
+                            /* 合并队列满：丢弃本包并计数（见 report_drops_once） */
+                            atomic_fetch_add_explicit(&g_drop_batch, 1, memory_order_relaxed);
                         }
-                        /* batch_q 满：丢弃本合并包（overflow 机制已移除） */
                     }
                     pos = 0;
                     continue;
@@ -656,8 +830,11 @@ static void* async_log_thread(void* arg) {
                     ctx->head = next;
                     uint64_t val = 1;
                     write(ctx->notify_fd, &val, sizeof(val));
+                } else {
+                    /* 接收环满：丢弃本条并计数（overflow 应急落盘已移除），
+                       计数由 report_drops_once 限频上报，不再是无痕丢失 */
+                    atomic_fetch_add_explicit(&g_drop_entries, 1, memory_order_relaxed);
                 }
-                /* entries 环满：丢弃本条（overflow 机制已移除） */
             }
             pos = 0;
         } else if (pos < (int)sizeof(line) - 1) {
@@ -691,8 +868,10 @@ static void* async_log_thread(void* arg) {
                                 ctx->batch_q_head++;
                                 uint64_t val = 1;
                                 write(ctx->notify_fd, &val, sizeof(val));
+                            } else {
+                                /* 合并队列满：丢弃本包并计数（见 report_drops_once） */
+                                atomic_fetch_add_explicit(&g_drop_batch, 1, memory_order_relaxed);
                             }
-                            /* batch_q 满：丢弃本合并包（overflow 机制已移除） */
                         }
                         pos = 0;
                         continue;
@@ -743,8 +922,10 @@ static void* async_log_thread(void* arg) {
                         ctx->head = next;
                         uint64_t val = 1;
                         write(ctx->notify_fd, &val, sizeof(val));
+                    } else {
+                        /* 接收环满：丢弃本条并计数（见 report_drops_once） */
+                        atomic_fetch_add_explicit(&g_drop_entries, 1, memory_order_relaxed);
                     }
-                    /* entries 环满：丢弃本条（overflow 机制已移除） */
                 }
                 pos = 0;
             } else if (pos < (int)sizeof(line) - 1) {
@@ -1160,9 +1341,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         g_io_buf.head = g_io_buf.tail = 0;
         g_io_buf.full = false;
         /* 同步清启动快照、暂存与落盘文件（暂存不清会与 tick 刷盘竞态复活文件） */
-        free(g_io_disk.data);
-        g_io_disk.data = nullptr;
-        g_io_disk.count = 0;
+        disk_free(&g_io_disk);
         g_persist_io.staged = 0;
         unlink(g_persist_io.path);
         unlink(g_persist_io.rot);
@@ -1171,9 +1350,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
     } else if (strcmp(line, "CLEAR_SYS") == 0) {
         g_sys_buf.head = g_sys_buf.tail = 0;
         g_sys_buf.full = false;
-        free(g_sys_disk.data);
-        g_sys_disk.data = nullptr;
-        g_sys_disk.count = 0;
+        disk_free(&g_sys_disk);
         g_persist_sys.staged = 0;
         unlink(g_persist_sys.path);
         unlink(g_persist_sys.rot);
@@ -1290,6 +1467,7 @@ static void handle_client_timeout_tick(int timer_fd) {
     ssize_t r = read(timer_fd, &expirations, sizeof(expirations));
     (void)r;
     persist_lazy_tick(); /* 落盘懒刷盘（500ms tick 驱动） */
+    report_drops_once(); /* 链路丢弃限频告警（500ms tick 限频到 10s 一条） */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     ClientCtx* curr_chk = g_active_clients;
@@ -1313,6 +1491,11 @@ static void handle_client_timeout_tick(int timer_fd) {
     while (*app) {
         AsyncCtx* a = *app;
         if (a->disconnected) {
+            /* async 线程已结束（acquire 读取，见 AsyncCtx::disconnected 注释）：
+               先把环内尚未移交的条目/合并包入库再回收。漏掉这一步，线程末尾
+               写入、但 notify 事件与置位错峰未再触发 epoll 的那批日志会随
+               free 一起静默消失——生产者侧日志"只发不收"的第二个丢失点。 */
+            drain_async(a);
             *app = a->next;
             epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, a->notify_fd, nullptr);
             if (a->fd >= 0) close(a->fd);
@@ -1508,6 +1691,7 @@ int main(int argc, char* argv[]) {
     while (a_curr) {
         AsyncCtx* a_next = a_curr->next;
         a_curr->disconnected = true;
+        drain_async(a_curr); /* 退出前抢救环内残留（与超时回收同源） */
         if (a_curr->fd >= 0) close(a_curr->fd);
         if (a_curr->notify_fd >= 0) close(a_curr->notify_fd);
         free(a_curr);
@@ -1521,12 +1705,8 @@ int main(int argc, char* argv[]) {
     g_persist_io.stage = nullptr;
     free(g_persist_sys.stage);
     g_persist_sys.stage = nullptr;
-    free(g_io_disk.data);
-    g_io_disk.data = nullptr;
-    g_io_disk.count = 0;
-    free(g_sys_disk.data);
-    g_sys_disk.data = nullptr;
-    g_sys_disk.count = 0;
+    disk_free(&g_io_disk);
+    disk_free(&g_sys_disk);
     destroy_buf(&g_io_buf);
     destroy_buf(&g_sys_buf);
     destroy_buf(&g_logcat_buf);

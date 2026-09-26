@@ -45,7 +45,9 @@
 | `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON** |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节） |
 
-`MONITOR` / `SANDBOX` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记），不存在"继承全局后再覆盖"的中间态。
+`MONITOR` / `SANDBOX` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记），不存在"继承全局后再覆盖"的中间态。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
+
+`MONITOR` 另有一条**框架兜底**：规则模块未参与本次决策时（模块未加载/被 ban、路径无 `<uid>/` 用户层、模块返回未命中），`MONITOR` 作为**配置开关**由框架直接读主视图 `[GLOBAL]` 段最后一条 `MONITOR` 记录。若把它绑在"模块是否给出有效决策"上，这些情形下文件读写一切正常、IO 监控日志却静默消失且无任何提示。模块命中时仍以模块的三层合并（应用 > 类别 > 全局）为准——`[GLOBAL]` 只是兜底，不是第二套作用域语义。
 
 注入方法为 `v3` 时（`injector --inject-method=v3`，见 `architecture.md` §5.1），`GLOBAL_INJECT` / `SKIP_SYSTEM_APPS` **不参与目标判定**——含系统应用在内一律经项目 FUSE；应用段与类别段头的 `OFF` 仍然生效。
 
