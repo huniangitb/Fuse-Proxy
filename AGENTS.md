@@ -30,7 +30,9 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 ## 测试流程（纯 Python，无 C 测试目标）
 
-前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`BASIC_RULES_SO`、`GLOBAL_REPLACE_CTL`、`LOG_CTL`。
+**一条命令**：`python3 tests/run.py` —— 自动按「本次改动的文件 + 改动行里的符号」匹配下表，依次执行选中的套件并汇总退出码。`--list` 只看会跑哪些、`--all` 忽略映射跑全量、`--base <ref>` 换对比基线（默认 `HEAD`，即暂存+未暂存+未跟踪）、尾部直接给脚本名则跳过自动匹配。下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`，**两边须同步维护**；各脚本仍可单独直接跑。
+
+前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`BASIC_RULES_SO`、`GLOBAL_REPLACE_CTL`、`LOG_CTL`、`LOG_MONITOR`。
 
 按改动跑映射（全绿方可提交）：
 
@@ -46,6 +48,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | 决策结构 / 框架单点强制（`NspPathDecision`、`fw_route` 的 appear_missing·read_only、`vfs_apply_attr_override`） | `test_module_overrides.py`（42，逐回调 errno 矩阵：appear_missing 统一 ENOENT、read_only 统一 EROFS、属性覆盖与类型位保持） |
 | `log_ctl` / `rule_server` 规则编辑（`nsp_rule_file`） | `test_log_ctl_rules.py`（30）、`test_rule_server.py` |
 | `subprojects/libfuse`（fork 追加接口）或框架缓存失效 | `test_libfuse_inval.py`（需 `-Dlibfuse_source=subproject` 的产物，缺失自动跳过） |
+| 日志链路（`src/log/`、`nsp_comm.*`、`common.c` 的 `vfs_log_io` / `monitor_on` / `persist_stage` / `drain_async`） | `test_log_pipeline.py`（16，框架闸门矩阵：规则模块未注册 / 路径无 `<uid>/` 层 / `MONITOR OFF` 三态 + 磁盘历史全量可查（`count`/`search`/历史转储三条路径）+ sock 查询端到端；**会重启 log_monitor 并备份还原 `io.log{,.1}`**） |
 | 通用回归 | `test_functional.py`（34，IO/SQLite/并发）、`test_crash_log.py` |
 | 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
 
