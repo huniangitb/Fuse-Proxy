@@ -48,7 +48,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | 决策强制单点（`fw_route` 的 appear_missing→ENOENT、read_only→EROFS） | `test_decision_enforce.py`（38，逐回调 errno 矩阵，规则来自配置 HIDE/RO） |
 | `log_ctl` / `rule_server` 规则编辑（`nsp_rule_file`） | `test_log_ctl_rules.py`（30）、`test_rule_server.py` |
 | 日志链路（`src/log/`、`nsp_comm.*`、`common.c` 的 `vfs_log_io` / `monitor_on` / `persist_stage` / `drain_async`） | `test_log_pipeline.py`（24，框架闸门矩阵：无规则记录 / 路径无 `<uid>/` 层 / `MONITOR OFF` / 类别段 `[SYSTEM_APPS]` 否决与开启五态 + 磁盘历史全量可查（`count`/`search`/历史转储三条路径）+ sock 查询端到端；**会重启 log_monitor 并备份还原 `io.log{,.1}`**） |
-| 框架侧 uid→包名（`fw_pkg.c`）与 MONITOR 三层合并（`fw_config.c` 的 `fw_config_monitor_for`） | `test_monitor_layers.py`（11，应用 > 类别 > 全局两个方向、`[USER_APPS:0]`/`[USER_APPS:2]` 用户隔离、uid.map 未收录时 /proc 回退、包名不可解析 fail-safe；本机 uid<10000 走不到 USER_APPS 分支，故自编译实际源码 + 合成 uid，不经 Meson） |
+| 框架侧规则解析：uid→包名（`fw_pkg.c`）、MONITOR 三层合并（`fw_config_monitor_for`）、沙盒/ALLOW 解析（`fw_rules.c`） | `test_monitor_layers.py`（20：uid→包名与 MONITOR 合并 11 项；**沙盒解析契约 9 项**——`SANDBOX ON` 时 Download/Pictures/Documents 等共享目录一并重定向进本应用沙盒、自己的 data/obb 与 `/Android` 下非 data/obb 不重定向、`ALLOW` 落回真实路径。本机 uid<10000 恒走 system 分支测不到这些，故自编译实际源码 + 合成 uid，不经 Meson） |
 | 通用回归 | `test_functional.py`（34，IO/SQLite/并发）、`test_crash_log.py` |
 | 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
 

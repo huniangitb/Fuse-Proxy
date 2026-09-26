@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""监控开关三层合并（框架权威）与 uid→包名解析的 GNU 单元测试。
+"""框架规则解析的 GNU 单元测试：uid→包名、MONITOR 三层合并、沙盒/ALLOW 解析契约。
 
 背景：`MONITOR` 是**配置开关**而非路径决策。它的值此前只由规则模块给出
 （`br_effective_monitor` 的应用 > 类别 > 全局合并），框架仅在模块缺席时用
@@ -20,6 +20,11 @@
      两个方向都要生效——全局 ON 时的类别否决、全局 OFF 时的类别开启。
   3. 用户隔离：`[USER_APPS:0]` 不作用于 user 2；`[USER_APPS:2]` 独立生效。
   4. fail-safe：包名不可解析（unknown/过短/zygote）时只认 `[GLOBAL]`。
+  5. **沙盒解析契约**（合成 uid 才测得到，端到端 uid<10000 走 system 分支）：
+     `SANDBOX ON` 时**共享目录也被重定向**进本应用沙盒
+     （`<storage>/<uid>/Android/data/<pkg>/sandbox/<原路径>`）——Download/Pictures/
+     Documents 这类位置同样隔离；应用**自己**的 `/Android/data/<pkg>` 与 `/Android`
+     下非 data/obb 不重定向；`ALLOW <前缀>` 落回真实路径。
 
 前置：本机 cc、pthread。退出码：全部通过 0，任一失败 1。
 """
@@ -57,6 +62,27 @@ CONFIG_DIR_PAT = re.compile(
 
 # (配置, uid 参数, 期望包名或 None=不校验, 期望 monitor)
 # uid 参数带 "@self" 表示以驱动自身 pid 作 tid，覆盖 uid.map 未收录时的 /proc 回退
+# (配置, 原始路径, 期望 real 中的片段, 期望不在 real 中的片段) —— 沙盒/ALLOW 契约
+RESOLVE_CASES = [
+    # 应用显式 SANDBOX ON：共享目录也进沙盒（用户反馈的"Download/Pictures 该隔离"）
+    ("sandbox.conf", 10123, "/0/Download/q.txt", "Android/data/com.demo.app/sandbox/Download/q.txt", None),
+    ("sandbox.conf", 10123, "/0/Pictures/p.jpg", "Android/data/com.demo.app/sandbox/Pictures/p.jpg", None),
+    ("sandbox.conf", 10123, "/0/Documents/d.docx", "Android/data/com.demo.app/sandbox/Documents/d.docx", None),
+    # 自己的 data/obb 不重定向（沙盒是隔离"别的应用的数据"，不是自己的）
+    ("sandbox.conf", 10123, "/0/Android/data/com.demo.app/own.txt", "/0/Android/data/com.demo.app/own.txt", None),
+    # /Android 下非 data/obb（如 media）不重定向
+    ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin", "/0/Android/media/com.other.app/m.bin", None),
+    # 别的应用的 data 进自己的沙盒
+    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", "sandbox/Android/data/com.other.app/f", None),
+    # ALLOW 豁免：显式放行 → 落回真实路径，不进沙盒
+    ("sandbox.conf", 10500, "/0/Download/keep/k.txt", None, "sandbox"),
+    # 该应用其它共享目录仍进沙盒
+    ("sandbox.conf", 10500, "/0/Download/q.txt", "Android/data/com.plain.app/sandbox/Download/q.txt", None),
+    # 全局 SANDBOX OFF + 应用未显式开：不重定向（cat_off.conf 里 [GLOBAL] 只有 MONITOR）
+    ("cat_off.conf", 10123, "/0/Download/q.txt", "/0/Download/q.txt", None),
+]
+
+
 CASES = [
     # 全局 ON：类别/应用显式 OFF 必须否决
     ("cat_off.conf", "10123", "com.demo.app", False),   # [USER_APPS:0] MONITOR OFF
@@ -131,6 +157,17 @@ def parse(out):
     return got
 
 
+def parse_resolve(out):
+    """'resolve uid=10123 path=/0/Download/q.txt valid=1 real=... ro=0' → [(uid, path, real)]"""
+    got = []
+    for line in out.splitlines():
+        m = re.match(r"resolve uid=(\d+) path=(\S+) valid=(\d+) real=(\S*) ro=(\d+)$",
+                     line.strip())
+        if m:
+            got.append((int(m.group(1)), m.group(2), m.group(4)))
+    return got
+
+
 def run_case(exe, tmpdir, conf, uid_args):
     r = subprocess.run([exe, os.path.join(tmpdir, "config", conf)] + list(uid_args),
                        capture_output=True, text=True)
@@ -154,6 +191,34 @@ def main():
         if exe is None:
             return 1
 
+        passed = failed = 0
+        # 沙盒/ALLOW 解析契约（同一批配置，用 resolve: 参数逐路径解析）
+        resolve_results = {}
+        for conf in sorted({c[0] for c in RESOLVE_CASES}):
+            args = [f"resolve:{c[1]}:{c[2]}" for c in RESOLVE_CASES if c[0] == conf]
+            r = subprocess.run([exe, os.path.join(tmpdir, "config", conf)] + args,
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"驱动退出码 {r.returncode}: {r.stderr}", file=sys.stderr)
+                return 1
+            for uid, path, real in parse_resolve(r.stdout):
+                resolve_results[(conf, uid, path)] = real
+
+        for conf, uid, path, want_in, want_not in RESOLVE_CASES:
+            real = resolve_results.get((conf, uid, path))
+            name = f"{conf} uid={uid} {path}"
+            if real is None:
+                print(f"FAIL {name}: 无解析输出")
+                failed += 1
+                continue
+            okp = (want_in is None or want_in in real) and (want_not is None or want_not not in real)
+            if not okp:
+                print(f"FAIL {name}: real={real}（期望含 {want_in!r} / 不含 {want_not!r}）")
+                failed += 1
+            else:
+                print(f"PASS {name}: real={real}")
+                passed += 1
+
         results = {}
         for conf in sorted({c[0] for c in CASES}):
             # 每个配置一次进程内批量查询：一次 init 即可覆盖全部 uid（驱动按参数逐个算）
@@ -162,7 +227,6 @@ def main():
         if any(v is None for v in results.values()):
             return 1
 
-        passed = failed = 0
         for conf, uid_arg, want_pkg, want_mon in CASES:
             got = results[conf].get(int(uid_arg.split("@")[0]))
             name = f"{conf} uid={uid_arg}"
