@@ -153,9 +153,11 @@ def main():
                    "src/module/fault_fence.c", "src/core/common.c", "src/core/nsp_util.c",
                    "src/core/nsp_comm.c", "src/core/sha256.c", "src/core/sha256_hw.c",
                    # 框架侧配置持有者及其读取依赖（loader → fw_config → config_read_view）
-                   "src/daemon/fw_config.c", "src/config/config_parser.c",
+                   # fw_pkg.c 是 fw_config 自建索引/ MONITOR 合并的 uid→包名输入
+                   "src/daemon/fw_config.c", "src/daemon/fw_pkg.c",
+                   "src/config/config_parser.c",
                    "src/config/path_vars.c", "src/core/path_trie.c", "src/core/uid_map.c",
-                   "src/core/sys_pkg.c", "src/core/fast_search.c"]
+                   "src/core/sys_pkg.c", "src/core/fast_search.c", "src/core/fast_pid.c"]
         binary = tmp / "contract"
         subprocess.run(cc + ["-std=c23", "-O2", "-D_GNU_SOURCE", "-DTARGET_GNU=1",
                              "-ftrivial-auto-var-init=pattern", "-I" + str(ROOT / "include"),

@@ -36,6 +36,7 @@
 #include <ctype.h>
 #include "common.h"
 #include "fw_config.h"
+#include "fw_pkg.h"
 #include "nsp_comm.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
@@ -147,7 +148,9 @@ static void log_fuse_err(const char* op, const char* path, int err_code) {
         char current_pkg[128] = "unknown";
         struct fuse_context* ctx = fuse_get_context();
         if (ctx) {
-            module_dispatch_get_pkg(ctx->uid, ctx->pid, current_pkg, sizeof(current_pkg));
+            /* 包名由框架自算（fw_pkg.c）：错误日志路径不该再经模块围栏调用
+               get_pkg——模块缺席时正是最需要看清"是哪个应用报的错"的时刻 */
+            fw_pkg_resolve(ctx->uid, ctx->pid, current_pkg, sizeof(current_pkg));
         }
         fprintf(stderr,
                 "[FUSE_ERR] 应用: %s (PID: %d, UID: %d) | 操作: %s | 路径: %s | 错误码: %d (%s)\n",
@@ -319,18 +322,26 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
        （br_strip_and_sanitize）逐行等价，故 V3 起不经 ABI 回传——
        模块只回传它真正能决定的字段 */
     if (fw_parse_path(path_val, user_id, sub_path, PATH_MAX) != 0) return -ENOENT;
+    /* uid→包名与 MONITOR 开关都由框架自算，不取模块返回值：
+       - 包名是配置语义的输入（段匹配键、日志标签），模块缺失时也必须有值；
+       - MONITOR 是**配置开关**而非路径决策，若跟着「模块是否给出有效决策」一起
+         丢，就会出现「文件读写一切正常、IO 监控日志静默归零」——历史上正是把
+         开关绑在 nsp_ok 上的后果。三层合并（应用显式 > 类别显式 > 全局，含
+         [USER_APPS:<uid>]/[SYSTEM_APPS]）在 fw_config_monitor_for 内完成，
+         与模块同语义但不依赖模块。
+       定值必须在本函数出口处最后一次写入：module_dispatch_resolve 入口会经
+       nsp_decision_init 重置整个决策结构（含 monitor_on），先写会被清零。 */
+    bool mon = fw_config_monitor_for(ctx->uid, ctx->pid);
+    fw_pkg_resolve(ctx->uid, ctx->pid, current_pkg, 128);
     /* module_dispatch_resolve 统一经 nsp_decision_init 初始化默认输出
        （valid/appear_missing/read_only/mode/uid/gid 等全部有定义值），无论
        是否命中模块都无需调用方预置；返回 NSP_DISPATCH_NONE 时 `*nsp_ok`
-       短路，调用方只读 rr->monitor_on（本函数出口保证已定值：命中取模块值，
-       未命中取框架 [GLOBAL] 兜底），不读其余决策字段 */
+       短路，调用方不读其余决策字段 */
     NspQueryCtx nsp_q = {.uid = ctx->uid, .pid = ctx->pid, .gid = ctx->gid, .path = path_val};
-    if (module_dispatch_resolve(&nsp_q, rr) == NSP_DISPATCH_OK && rr->valid) {
+    int disp = module_dispatch_resolve(&nsp_q, rr);
+    rr->monitor_on = mon;
+    if (disp == NSP_DISPATCH_OK && rr->valid) {
         *nsp_ok = true;
-        if (rr->pkg[0]) {
-            strncpy(current_pkg, rr->pkg, 128 - 1);
-            current_pkg[128 - 1] = '\0';
-        }
         strcpy(real_path, rr->real_path);
         *is_redir = rr->is_redirect;
         /* ---- 决策强制（单点）---- */
@@ -346,13 +357,9 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
         }
         return 0;
     }
-    /* 框架直通回退（无规则模块 / 模块未命中）：路径决策退回默认真实路径，
-       但**监控开关不能跟着丢**——MONITOR 是配置开关而非路径决策，绑在
-       `nsp_ok`（模块是否给出有效决策）上会让「规则模块未加载/被 ban、路径无
-       <uid>/ 用户层、模块返回未命中」三种情形把 IO 监控静默关掉：文件读写走
-       直通回退一切正常，只有监控日志凭空消失，且无任何提示。此处用框架主视图
-       的 [GLOBAL] 开关兜底（模块命中时已在上面取模块的三层合并值，不覆盖）。 */
-    rr->monitor_on = fw_config_global_monitor();
+    /* 框架直通回退（无规则模块 / 模块未命中）：路径决策退回默认真实路径。
+       监控开关已在入口由框架定值，此处无需也不得再改写——改写即等于把开关
+       重新绑回「模块是否给出有效决策」上。 */
     fw_default_real_path(*user_id, sub_path, real_path, PATH_MAX);
     return 0;
 }
@@ -395,16 +402,16 @@ static inline bool backend_rc_is_business(int rc) {
 
 /* 框架版 I/O 监控日志：由框架记录目标应用操作的【原始路径】；
    target_path 为模块 resolve 可选返回的【目标路径】（REDIRECT 命中时
-   非空，否则 NULL），附加到日志尾部。monitor 开关由 fw_route 单点给出：
-   模块命中取模块的三层合并值，模块未参与决策时取框架 [GLOBAL] 兜底。 */
+   非空，否则 NULL），附加到日志尾部。monitor 开关由 fw_route 单点给出，
+   且由框架自算（fw_config_monitor_for 的三层合并），与规则模块是否加载无关。 */
 static void vfs_log_io(const char* pkg, uid_t uid, const char* op, const char* orig_path,
                        const char* target_path, bool monitor_on) {
     /* 热路径提前过滤：MONITOR 关闭且非 DEBUG 级别时零开销返回。
        LOG_IO 为通道标记（0x81）恒 > g_min_log_level，log_internal 不会过滤
        它，故格式化仅在 monitor_on 或 DEBUG MAP 分支才真正需要。
-       monitor_on 由 fw_route 单点给出（模块命中取模块三层合并值，否则取框架
-       [GLOBAL] 兜底），调用方不得再用 nsp_ok 门控——那正是历史上「模块未命中
-       即静默停记」的来源。 */
+       monitor_on 由 fw_route 单点给出（框架按 uid→包名做三层合并，不取模块
+       返回值），调用方不得再用 nsp_ok 门控——那正是历史上「模块未命中即静默
+       停记」的来源。 */
     if (!monitor_on && g_min_log_level != LOG_DEBUG) return;
     if (monitor_on) {
         if (target_path && target_path[0]) {

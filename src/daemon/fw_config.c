@@ -8,11 +8,13 @@
 #include "fw_config.h"
 #include "config_parser.h"
 #include "common.h"
+#include "fw_pkg.h"        /* 框架自算 uid→包名（MONITOR 三层合并的输入） */
+#include "nsp_constants.h" /* NSP_SYSTEM_APP_UID_MIN / NSP_PER_USER_UID_STRIDE */
 #include "module_loader.h" /* MAX_MODULES */
-#include "nsp_util.h"      /* nsp_switch_on */
+#include "path_vars.h"     /* pkg_resolvable（类别段判据，与模块同源） */
+#include "sys_pkg.h"       /* sys_pkg_is_system（SYSTEM_APPS 类别判定） */
 
 #include <errno.h>
-#include <ctype.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -44,32 +46,75 @@ static _Atomic uint64_t g_gen = 0;
 static char g_rules_path[PATH_MAX] = {0};
 static void (*g_reload_hook)(void) = nullptr;
 
-/* 全局 MONITOR 快照（fw_config_global_monitor 读取）：reload_once 内随视图
-   换入重算，读者只做原子 load——兜底值若每次 FUSE 请求都持 g_lock 扫视图，
-   会在「规则模块缺失」这种本就异常的场景里把锁竞争引入热路径。 */
-static _Atomic bool g_global_monitor = false;
+/* IO 监控开关缓存：按 uid 存三层合并结果。热路径（每次 FUSE 请求）只做一次
+   原子 load + 定长比较，避免每请求解析 uid→包名并线性扫 g_app_cfgs。
+   重载时 g_gen 递增即整体失效（不需遍历清理），与配置索引同代际。 */
+#define FW_MON_CACHE_SIZE 2048
+typedef struct {
+    _Atomic uint64_t seq; /* 奇数 = 写者进行中 */
+    uint64_t gen;
+    uid_t uid;
+    bool monitor;
+} FwMonSlot;
 
-/* 从扁平视图算出 `[GLOBAL]` 段内最后一条 MONITOR 记录的开关值（无记录 = 关）。
-   仅认 GLOBAL 段：类别/应用段的否决需要 uid→包名映射，那是模块的索引职责，
-   框架不在这里重复实现三层合并（见 fw_config.h 语义边界）。 */
-static bool scan_global_monitor(const NspCfgRec* recs, int count) {
-    bool in_global = false;
-    bool on = false;
-    for (int i = 0; i < count; i++) {
-        const NspCfgRec* r = &recs[i];
-        if (r->kind == NSP_CFG_REC_SECTION) {
-            in_global = r->text && strcmp(r->text, "GLOBAL") == 0;
-            continue;
+static FwMonSlot g_mon_slots[FW_MON_CACHE_SIZE];
+static pthread_mutex_t g_mon_fill_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 三层合并：应用显式 > 类别显式 > 全局（与模块 br_effective_monitor 同序）。
+   包名不可解析时模块侧只认 GLOBAL，此处同口径：lookup_ok=false 时不做
+   应用段/类别段匹配（uid<10000 例外——system 伪包仍参与 SYSTEM_APPS）。 */
+static bool monitor_uncached(uid_t uid, pid_t tid) {
+    char pkg[128];
+    bool lookup_ok = fw_pkg_resolve(uid, tid, pkg, sizeof pkg);
+    int user_id = (int)(uid / NSP_PER_USER_UID_STRIDE);
+    bool is_sys = (uid < NSP_SYSTEM_APP_UID_MIN);
+    for (;;) {
+        uint64_t gen = config_read_begin();
+        AppConfig* cfg = nullptr;
+        AppConfig* cat = nullptr;
+        if (is_sys) {
+            cat = find_category_cfg_locked(true, user_id);
+        } else if (lookup_ok) {
+            cfg = find_app_cfg_locked(pkg, user_id);
+            /* 类别层另需 pkg_resolvable：system/unknown 这类伪包不参与类别匹配
+               （否则"解析不出包名"会误命中 [USER_APPS:*]）——与模块
+               br_pick_category 的判据逐字一致 */
+            if (pkg_resolvable(pkg)) {
+                cat = sys_pkg_is_system(pkg) ? find_category_cfg_locked(true, user_id)
+                                             : find_category_cfg_locked(false, user_id);
+            }
         }
-        if (!in_global || r->kind != NSP_CFG_REC_RULE || !r->type || !r->text) continue;
-        if (strcmp(r->type, "MONITOR") != 0) continue;
-        /* r->text 是去注释/首尾空白的整行（"MONITOR ON"）：跳过首 token 取开关值 */
-        const char* p = r->text;
-        while (*p && !isspace((unsigned char)*p)) p++;
-        while (*p && isspace((unsigned char)*p)) p++;
-        char val[8] = {0};
-        on = (sscanf(p, "%7s", val) == 1) && nsp_switch_on(val);
+        bool on = (cfg && cfg->monitor_explicit) ? cfg->monitor
+                  : (cat && cat->monitor_explicit) ? cat->monitor
+                                                   : g_global_cfg.monitor;
+        if (config_read_end(gen)) return on; /* 读期间发生发布：整体重试 */
     }
+}
+
+bool fw_config_monitor_for(uid_t uid, pid_t tid) {
+    FwMonSlot* s = &g_mon_slots[uid % FW_MON_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    for (;;) {
+        uint64_t s1 = atomic_load_explicit(&s->seq, memory_order_acquire);
+        if (s1 & 1) continue; /* 填充进行中：重试 */
+        uid_t suid = s->uid;
+        uint64_t sgen = s->gen;
+        bool smon = s->monitor;
+        uint64_t s2 = atomic_load_explicit(&s->seq, memory_order_acquire);
+        if (s1 != s2) continue; /* 快照撕裂：重试 */
+        if (suid == uid && sgen == gen) return smon;
+        break;
+    }
+
+    bool on = monitor_uncached(uid, tid);
+    pthread_mutex_lock(&g_mon_fill_lock);
+    uint64_t seq = atomic_load_explicit(&s->seq, memory_order_relaxed);
+    atomic_store_explicit(&s->seq, seq + 1, memory_order_release);
+    s->uid = uid;
+    s->gen = gen;
+    s->monitor = on;
+    atomic_store_explicit(&s->seq, seq + 2, memory_order_release);
+    pthread_mutex_unlock(&g_mon_fill_lock);
     return on;
 }
 
@@ -141,6 +186,17 @@ static void reload_once(void) {
     int new_count = 0;
     config_read_view(g_rules_path, &new_recs, &new_count);
 
+    /* 先递增代际使框架侧派生缓存（monitor 决策）失效，再换入新索引：
+       config_build_from_view 的 COW 发布会释放旧 AppConfig，缓存若仍以旧代际
+       命中就会读到悬垂段指针（与模块 br_rules_apply_config 同序）。
+       uid.map 随应用启动增长、无独立监听，搭本次重载顺带重读。 */
+    atomic_fetch_add_explicit(&g_gen, 1, memory_order_release);
+    fw_pkg_reload();
+    config_lock_write();
+    config_build_from_view(new_recs, new_count);
+    sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
+    config_unlock_write();
+
     pthread_mutex_lock(&g_lock);
     NspCfgRec* old_recs = g_recs;
     int old_count = g_rec_count;
@@ -155,11 +211,6 @@ static void reload_once(void) {
     }
     g_recs = new_recs;
     g_rec_count = new_count;
-    /* 全局 MONITOR 快照随视图一起换入：热路径只做一次原子 load，
-       不为兜底开关在每个 FUSE 请求上抢 g_lock */
-    atomic_store_explicit(&g_global_monitor, scan_global_monitor(new_recs, new_count),
-                          memory_order_release);
-    atomic_fetch_add_explicit(&g_gen, 1, memory_order_release);
     for (int i = 0; i < MAX_MODULES; i++) {
         if (g_subs[i].used) rebuild_filter(&g_subs[i]);
     }
@@ -252,6 +303,13 @@ int fw_config_init(const char* rules_path) {
        FUSE 会话启动前同步执行 → 会话永不启动；热重载同理会卡死） */
     config_set_allow_app_rules_mkdir(false);
     config_set_scan_users_skip_pm(true);
+    /* 框架自建索引所需的两项初始化（与模块 br_rules_init 同一套）：
+       - sys_pkg_init(false)：SYSTEM_APPS 类别判定只读 sys_pkgs.cache，永不 popen；
+       - config_init_lock()：自建索引走 config_lock_write 与冷路径读者互斥；
+       - fw_pkg_reload()：装载 uid.map，供 uid→包名与 require 的 MONITOR 合并。 */
+    sys_pkg_init(false);
+    config_init_lock();
+    fw_pkg_reload();
     if (g_rules_path[0] == '\0') {
         LOG_WRN("未提供 --rules= 路径，框架配置视图为空（模块将收不到任何规则）");
         return 0;
@@ -288,9 +346,9 @@ void fw_config_shutdown(void) {
     int count = g_rec_count;
     g_recs = nullptr;
     g_rec_count = 0;
-    atomic_store_explicit(&g_global_monitor, false, memory_order_release);
     pthread_mutex_unlock(&g_lock);
     config_free_view(recs, count);
+    fw_pkg_shutdown();
 }
 
 const NspCfgRec* fw_config_recs(int* count_out) {
@@ -300,10 +358,6 @@ const NspCfgRec* fw_config_recs(int* count_out) {
 
 uint64_t fw_config_generation(void) {
     return atomic_load_explicit(&g_gen, memory_order_acquire);
-}
-
-bool fw_config_global_monitor(void) {
-    return atomic_load_explicit(&g_global_monitor, memory_order_acquire);
 }
 
 const NspModuleConfig* fw_config_view_for(const char* module_name) {

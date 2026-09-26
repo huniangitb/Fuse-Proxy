@@ -279,10 +279,12 @@ common_sources = [
     'src/core/sys_pkg.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
   # 配置**读取**在框架侧完成（文件 I/O + inotify + 词法/段头识别，产出扁平视图
-  # 经 fw_config 下发给模块），模块不再自行读文件。框架不建 AppConfig（规则
-  # 对象/trie 是模块的索引表示），故这些源在框架侧只用到读取与词法部分。
+  # 经 fw_config 下发给模块），模块不再自行读文件。框架另建一份 AppConfig 索引
+  # （config_build_from_view），但只用于回答 MONITOR 的三层合并——它是配置开关，
+  # 不得随规则模块的可用性一起失效（fw_pkg.c 提供其 uid→包名输入）；路径决策
+  # （REDIRECT/HIDE/RO）仍由模块自己的索引决定。
   'src/config/config_parser.c', 'src/config/path_vars.c', 'src/core/path_trie.c',
   'src/core/fast_search.c', 'src/core/uid_map.c', 'src/core/sys_pkg.c',
   # pthread_create 截持：libfuse worker 默认命名 fuse_worker（见文件头），

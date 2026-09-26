@@ -32,7 +32,7 @@ SUITE_MAP = [
      "通用回归基线"),
 
     # ── AGENTS.md 映射表 ──
-    (("test_rules.py", "test_config_snapshot.py"),
+    (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py"),
      ("src/modules/basic_rules/", "src/config/config_parser.c", "src/daemon/fuse_daemon.c"),
      ("br_rules", "config_build_from_view", "parse_config_line"),
      "basic_rules / fuse_daemon.c / config_parser.c"),
@@ -81,8 +81,14 @@ SUITE_MAP = [
      ("src/log/", "src/core/nsp_comm.c", "include/nsp_comm.h", "include/nsp_log.h",
       "src/core/common.c"),
      ("vfs_log_io", "monitor_on", "persist_stage", "drain_async", "log_internal",
-      "fw_config_global_monitor"),
+      "fw_config_monitor_for"),
      "日志链路（生产 → 通讯 → log_monitor → 查询）"),
+
+    (("test_monitor_layers.py",),
+     ("src/daemon/fw_config.c", "src/daemon/fw_config.h", "src/daemon/fw_pkg.c",
+      "src/daemon/fw_pkg.h"),
+     ("fw_config_monitor_for", "fw_pkg_resolve"),
+     "监控开关三层合并 / uid→包名（框架权威）"),
 ]
 
 

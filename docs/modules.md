@@ -59,7 +59,7 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 | `user_id` / `sub_path` | —（框架自算） | 框架的 `fw_parse_path` 与模块侧剥离逻辑逐行等价，无需跨 ABI 传递；结果结构由 8336 降到约 4.2KB |
 | — | `attr_override` + `mode`/`uid`/`gid` | 模块可覆盖权限位与属主（见 §3.3） |
 
-`pkg` 保留在结果内：它随 `resolve` 一次返回；若移到框架侧需每请求额外一次 `get_pkg` 模块调用（围栏+校验开销），得不偿失。
+`pkg` 与 `monitor_on` **已退出框架消费**（字段保留仅为 ABI 布局稳定，下次升版删除）：两者都是配置语义的输入，模块缺席时必须仍有正确值，故归框架——包名由 `fw_pkg.c` 自算（`uid.map` → `/proc` 回退），`MONITOR` 由框架自算三层合并（应用 > 类别 > 全局）。模块照常填充即可，不要指望框架读取。
 
 **V3 的行为变更（有意）**：`appear_missing` 在**所有**回调统一返回 `ENOENT`。V2 时代读类回调是 `ENOENT`、写类回调是 `EACCES`，同一声明产生两种结果；统一后与「存在变不存在」的语义一致。若前端曾依赖写类路径的 `EACCES`，需按 `ENOENT` 调整。
 
@@ -111,10 +111,16 @@ int (*resolve)(const NspQueryCtx* q, NspPathDecision* out);  /* 路径决策，�
 int (*probe)(const NspQueryCtx* q, NspProbeResult* out);      /* readdir 逐条目轻量过滤 */
 int (*readdir_extra)(const NspQueryCtx*, const char* sub_path, int user_id,
                      const char* pkg, bool is_root, NspDirEntry* out, int max);
-int (*get_pkg)(uid_t uid, pid_t tid, char* out, size_t size); /* uid→包名（框架日志用） */
+int (*get_pkg)(uid_t uid, pid_t tid, char* out, size_t size); /* ⚠ 框架已不调用（包名归框架自算），
+                                                                 实现它不再有效果，下次升版删除 */
 ```
 
 `resolve` 输入 FUSE 原始路径 + uid/pid/gid，输出**声明式决策**：`valid` / `appear_missing` / `read_only` / `attr_override`+`mode`/`uid`/`gid` / `virtual_kind` / `pkg` / `real_path` / `is_redirect` / `is_ftp` / `monitor_on`——**一次调用返回全部决策**，保住「一次查询多路复用」的性能语义。ALLOW 与 SANDBOX 不单独回传：模块已把它们落实进 `real_path`。`probe` 只判 `valid`/`appear_missing`/`virtual_kind`/`is_other_app_pkg`，不构建真实路径、不触发 sandbox 目录创建。
+
+> `pkg` 与 `monitor_on` **框架已不读取**（保留字段仅为 ABI 布局稳定，下次升版删除）：
+> 包名由框架自算（`fw_pkg.c`），`MONITOR` 由框架自算三层合并——两者都是配置语义的
+> 输入，模块缺席时必须仍有正确值。模块侧仍照常填充（`br_get_app_cfg` 的结果本就要
+> 用于 `$package` 展开与沙箱隔离），但不要依赖框架消费它们。
 
 **强制由框架单点完成**（`src/daemon/fuse_daemon.c` 的 `fw_route`），模块不参与 errno 决策：
 
@@ -168,7 +174,7 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 ## 5. 故障隔离（框架层防护）
 
-框架对全部模块调用（`resolve`/`probe`/`readdir_extra`/`get_pkg`/`backend_*`/`init`/`exit`）做三层防护，**模块错误不会带崩 fuse_daemon**：
+框架对全部模块调用（`resolve`/`probe`/`readdir_extra`/`backend_*`/`init`/`exit`）做三层防护，**模块错误不会带崩 fuse_daemon**：
 
 1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 TLS `sigsetjmp` 围栏；`sigaltstack` 是 **per-thread** 的——`fault_fence_init` 设置的全局 altstack 只覆盖主线程，每个首次调用围栏的线程还会为自己设置独立 TLS altstack（worker 不继承主线程的 altstack）。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
 2. **输出校验**（`src/module/module_guard.c`）：`NspPathDecision` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `virtual_kind` 值域与 `attr_override` 未知位检查 + readdir 条目名校验。
@@ -207,8 +213,10 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 `NspModuleConfig.generation` 在每次重载递增，模块可据此跳过无变化的重建。
 段头与 App-rules 归属记录**恒下发**（规则要靠它们解释作用域），过滤只作用于规则行。
 
-> 注意：`uid.map`（uid→包名）与 `sys_pkgs.cache`（系统应用表）目前仍由模块自行读取
-> （它们不是规则配置而是数据表），后续版本可能一并收归框架下发。
+> 注意：`uid.map`（uid→包名）与 `sys_pkgs.cache`（系统应用表）**框架与模块各自读取**
+> （它们不是规则配置而是数据表，故不经视图下发）：框架侧用于日志标签与 `MONITOR`
+> 的三层合并（`fw_pkg.c`），模块侧用于 `$package` 变量展开与沙箱隔离。两侧都只读
+> 文件、都不写，故无冲突。
 
 ### 6.2 最小骨架
 

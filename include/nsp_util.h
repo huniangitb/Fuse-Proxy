@@ -60,7 +60,7 @@ bool nsp_is_app_rules_dirname(const char* name);
 
 /* 配置开关取值：**ON/1 为开，其余（含 NULL、缺省、OFF）一律为关**。
  * 这是 MONITOR / SANDBOX / GLOBAL_INJECT 等开关类规则词法的唯一出处——
- * 模块侧 parse_switch_rule 与框架侧 fw_config_global_monitor 兜底共用，
+ * 模块侧 parse_switch_rule 与框架侧 fw_config_monitor_for 的三层合并共用，
  * 防止 "ON"/"1" 字面量在各处漂移（漏写 "1" 会让 `MONITOR 1` 静默失效）。 */
 bool nsp_switch_on(const char* val);
 
