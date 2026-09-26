@@ -942,8 +942,14 @@ static int do_combined_mount(void* raw_args) {
                         pkg, user, mp);
                     continue;
                 }
-                char src[256];
-                snprintf(src, sizeof src, "%s/%s", sys_src, rel_full);
+                char src[PATH_MAX];
+                int slen = snprintf(src, sizeof src, "%s/%s", sys_src, rel_full);
+                if (slen < 0 || (size_t)slen >= sizeof src) {
+                    log_ns_error(
+                        "[ns_error] [%s] Combined mount preserve skip: composed source path truncated (%s/%s)\n",
+                        pkg, sys_src, rel_full);
+                    continue;
+                }
                 mkdir_recursive(mp);
                 if (mount(src, mp, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
                     int err = errno;
