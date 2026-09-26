@@ -138,9 +138,16 @@ void persist_log_to_disk(const char* log_type, const char* message, bool append_
     pthread_mutex_unlock(&g_persist_mutex);
 }
 
-/* 监控日志落盘（无条件，不依赖 g_persist_all_logs）：MONITOR ON 时保证
-   应用操作路径始终可查（LOG_DIR/persistent_io.log），即使 log_ctl/UDS
-   链路不可用也能从日志文件查看 */
+/* 监控日志落盘（不看 g_persist_all_logs）：写 **LOG_DIR/persistent_io.log**，
+   与 log_monitor 的 io.log 是两个文件。
+
+   可用性边界（排查时勿误判）：仅在 `NSP_ENABLE_IO_LOG` 下编译（meson 只给
+   debug 加该宏，发布构建不写），且当前**没有任何查询出口**——log_ctl 只读
+   io.log/sys.log 与内存环，不读本文件。故它不是"UDS 不可用时的兜底可查
+   历史"：真要兜底须同时补查询路径，否则落了盘也无人可读（YAGNI，不做）。
+   主链路的丢失可观测性由两处负责：生产者侧 nsp_log_report（comm 拥塞覆盖
+   旧数据，限频 5s）与 log_monitor 侧 report_drops_once（环满/合并队列满/
+   落盘拒收，限频 10s）。 */
 void persist_io_log(const char* message) {
     if (!message) return;
     mkdir_recursive(LOG_DIR);

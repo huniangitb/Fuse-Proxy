@@ -498,10 +498,11 @@ static bool parse_variable_rule(AppConfig* cur, const char* line, int line_num,
     return true;
 }
 
-/* MONITOR / SANDBOX：取 ON/1 为开，其余（含缺省）为关；写一次即标记 explicit */
+/* MONITOR / SANDBOX：取 ON/1 为开（词法唯一出处 nsp_switch_on），其余（含缺省）
+   为关；写一次即标记 explicit */
 static void parse_switch_rule(bool* field, bool* explicit_flag, char* p_ptr) {
     char* val = get_next_token(&p_ptr);
-    *field = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+    *field = nsp_switch_on(val);
     *explicit_flag = true;
 }
 
@@ -513,7 +514,7 @@ static void parse_global_switch_rule(AppConfig* cur, bool* field, const char* na
         LOG_WRN("%s 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", name, line_num, file_path);
         return;
     }
-    *field = (val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0));
+    *field = nsp_switch_on(val);
 }
 
 /* FUSE_EXTRA_ARGS：仅 [GLOBAL] 段有效；取行尾原样内容（不分词，上限 512 字节） */

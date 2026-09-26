@@ -149,6 +149,8 @@ void nsp_app_rule_path(const char* config_dir, int uid, const char* pkg, char* o
         snprintf(out, sz, "%s/%s-%d/%s.conf", config_dir, NSP_APP_RULES_DIRNAME, uid, pkg);
 }
 
+bool nsp_switch_on(const char* val) { return val && (strcmp(val, "ON") == 0 || strcmp(val, "1") == 0); }
+
 bool nsp_is_app_rules_dirname(const char* name) {
     /* "-" 后缀形态长度 = "App-rules-" 字面量长度（sizeof-1 = 10） */
     return name &&
