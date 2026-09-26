@@ -44,7 +44,9 @@ void usage(const char* prog) {
     printf("\n日志查询命令:\n");
     printf("  search-io|search-sys [--level level] [key] [limit] [offset] [-u] [api]\n");
     printf("    --level level: 日志级别过滤（仅 search-sys 有效）\n");
-    printf("           0=DEBUG 1=INFO 2=WARN 3=ERROR (-1=全部，默认-1)\n");
+    printf("           0=DEBUG 1=INFO 2=WARN 3=ERROR (-1=全部，默认-1)，也接受名字\n");
+    printf("    search-sys 输出行: 时间|LEVEL|msg（LEVEL=DEBUG/INFO/WARN/ERROR，\n");
+    printf("           与 sys.log 落盘行同格式，可直接 grep）\n");
     printf("  clear-io|clear-sys\n");
     printf("\n日志统计命令:\n");
     printf("  log-count [api]            获取当前日志缓冲区总计条数（JSON）\n");

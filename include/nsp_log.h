@@ -19,6 +19,15 @@ typedef enum {
 extern LogLevel g_min_log_level;
 void log_internal(LogLevel level, const char* format, ...);
 
+/* 级别 ↔ 名称（DEBUG/INFO/WARN/ERROR）——唯一出处：落盘 sys.log/io.log 行、
+   `search-sys` 查询输出与流式推送统一渲染为名称，排查时可直接 grep/肉眼定位，
+   不必记 `|0|..|3|` 的映射。实现见 src/core/nsp_util.c（纯 libc，模块可链接）。
+   越界值（通道标记 LOG_IO 等）一律回退 "INFO"。 */
+const char* nsp_log_level_name(int level);
+/* 名称 → 级别；无法识别返回 -1。兼容旧落盘行的纯数字等级，**不得**退化成
+   atoi——名字会被静默当 0=DEBUG，与 log_ctl 的 --level 词法属同一类坑。 */
+int nsp_log_level_parse(const char* name);
+
 #define LOG_DBG(format, ...) log_internal(LOG_DEBUG, format "\n" __VA_OPT__(, ) __VA_ARGS__)
 #define LOG_DBG_PERF(format, ...)                                            \
     do {                                                                     \

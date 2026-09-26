@@ -3,6 +3,7 @@
 #endif
 #include "nsp_util.h"
 #include "nsp_constants.h"
+#include "nsp_log.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -157,3 +158,41 @@ bool nsp_is_app_rules_dirname(const char* name) {
            (strcmp(name, NSP_APP_RULES_DIRNAME) == 0 ||
             strncmp(name, NSP_APP_RULES_DIRNAME "-", sizeof(NSP_APP_RULES_DIRNAME "-") - 1) == 0);
 }
+
+/* ==================== 日志级别词法 ==================== */
+/* 声明在 nsp_log.h（级别词汇的唯一出处），实现放这里——纯查表、无全局依赖，
+   log_monitor/log_ctl 与不链接 common.c 的模块都能直接链接复用。log_monitor
+   的落盘 / 查询 / 流式三处渲染共用，避免各写一份名称表。 */
+
+const char* nsp_log_level_name(int level) {
+    switch (level) {
+        case LOG_DEBUG: return "DEBUG";
+        case LOG_INFO: return "INFO";
+        case LOG_WARN: return "WARN";
+        case LOG_ERROR: return "ERROR";
+        /* 通道标记（LOG_IO/LOG_LOGCAT）不经此渲染；越界值按 INFO 兜底，
+           与 log_internal 对级别的宽容一致 */
+        default: return "INFO";
+    }
+}
+
+int nsp_log_level_parse(const char* name) {
+    if (!name || !*name) return -1;
+    const char* p = name;
+    while (*p >= '0' && *p <= '9') p++;
+    int level = -1;
+    if (p != name && *p == '\0') {
+        level = atoi(name); /* 旧落盘行：纯数字等级 */
+    } else {
+        for (int i = LOG_DEBUG; i <= LOG_ERROR; i++) {
+            if (strcmp(name, nsp_log_level_name(i)) == 0) {
+                level = i;
+                break;
+            }
+        }
+    }
+    /* 越界（未知名称 / 损坏的数字字段）一律判为无效：若原样放行，`9` 会通过
+       任何 `--level` 过滤、又被 nsp_log_level_name 渲染成 INFO，等级面全失真 */
+    return (level >= LOG_DEBUG && level <= LOG_ERROR) ? level : -1;
+}
+
