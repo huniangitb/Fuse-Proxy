@@ -503,13 +503,30 @@ static void vfs_hash_free(DirHashTable* ht) {
     ht->names = NULL;
 }
 
-/* 为合成目录 stat 生成非零 inode（原 vfs_core.h static inline） */
+/* 为合成目录 stat 生成非零 inode（原 vfs_core.h static inline）。
+   正常路径哈希恒为奇数（h | 1），故 NULL 哨兵取偶数 2——既非 0（use_ino=1
+   下 0 会原样进内核），也不与根节点号 1（FUSE_ROOT_ID）混淆，且永不与
+   正常哈希碰撞 */
 static inline ino_t synthetic_inode(const char* path) {
-    if (!path) return 1;
+    if (!path) return 2;
     unsigned long h = 5381;
     int c;
     while ((c = (unsigned char)*path++)) h = ((h << 5) + h) + c;
     return (ino_t)(h | 1);
+}
+
+/* 合成条目 d_ino 派生（框架侧唯一出口）：按「父 sub_path + 名字」拼出子项
+   全路径再哈希，与 vfs_getattr 的 synthetic_inode(sub_path) 同一套算法。
+   d_ino 与后续 lookup 的 attr ino 不一致时内核反复重查；裸名哈希（如
+   synthetic_inode("data")）与全路径哈希（synthetic_inode("/Android/data")）
+   是两个值，故此处禁止裸名入哈希 */
+static ino_t vfs_readdir_child_ino(const char* parent_sub, const char* name) {
+    char child[PATH_MAX];
+    if (!parent_sub || parent_sub[0] == '\0' || strcmp(parent_sub, "/") == 0)
+        snprintf(child, sizeof child, "/%s", name);
+    else
+        snprintf(child, sizeof child, "%s/%s", parent_sub, name);
+    return synthetic_inode(child);
 }
 
 static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
@@ -666,6 +683,8 @@ static void readdir_join(char* dst, size_t cap, const char* base, const char* na
  * 任一 filler 返回非 0（内核缓冲已满）即短路结束本次 readdir（返回 0）。 */
 typedef struct {
     struct fuse_context* ctx;
+    const char* fuse_path; /* 未剥离 <uid>/ 的 FUSE 层路径（readdir 条目 ino 与
+                              getattr 同源解析用，见 vfs_readdir_entry_ino） */
     const char* sub_path;  /* 剥离 <uid>/ 后的虚拟路径 */
     const char* real_path; /* 本地真实目录（opendir/lstat 用） */
     const char* current_pkg;
@@ -732,12 +751,14 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
     }
     /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致）。
        filler 只消费 st_ino 与 st_mode 的类型位（fuse_add_direntry 不读 uid/gid），
-       此处仅用于给出 d_type，属主由 getattr 决定 */
-    struct stat dirst;
-    memset(&dirst, 0, sizeof dirst);
-    dirst.st_mode = S_IFDIR | 0755;
-    filler(buf, ".", &dirst, 0, 0);
-    filler(buf, "..", &dirst, 0, 0);
+       此处仅用于给出 d_type，属主由 getattr 决定。
+       点条目传 nullptr：libfuse fill_dir 遇空 stat 即填 FUSE_UNKNOWN_INO，
+       内核视其为未知、后续按名 lookup 取 getattr 的真实 ino。此处若传
+       memset 全 0 的 stat（含 st_ino=0），0 会随 use_ino=1 原样进内核，
+       与后端 getattr 侧的 synthetic 兜底语义矛盾（见 vfs_readdir_fill_dots
+       同一写法） */
+    filler(buf, ".", nullptr, 0, 0);
+    filler(buf, "..", nullptr, 0, 0);
     for (int i = 0; i < n; i++) {
         /* 条目名跨 ABI 由模块填写：未终止的名字会被 filler 当野指针读，故逐条
            校验。旧实现该校验在规则 readdir_extra 的分派里；规则引擎内建后，
@@ -752,13 +773,8 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
         memset(&st, 0, sizeof st);
         st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
         /* d_ino 必须非 0（use_ino=1 下直接进内核）且与该路径 getattr 一致：
-           按「父 sub_path + 名字」派生，与 getattr 的 synthetic_inode(sub_path) 同源 */
-        char entry_sub[PATH_MAX];
-        if (strcmp(sub_path, "/") == 0)
-            snprintf(entry_sub, sizeof entry_sub, "/%s", entries[i].name);
-        else
-            snprintf(entry_sub, sizeof entry_sub, "%s/%s", sub_path, entries[i].name);
-        st.st_ino = synthetic_inode(entry_sub);
+           经 vfs_readdir_child_ino 派生，与 getattr 的 synthetic_inode 同源 */
+        st.st_ino = vfs_readdir_child_ino(sub_path, entries[i].name);
         if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
     }
     free(entries);
@@ -766,10 +782,11 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
     return true;
 }
 
-static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, const char* sub_path,
-                                 const char* real_path, const char* current_pkg, int path_user_id,
-                                 void* buf, fuse_fill_dir_t filler) {
+static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, const char* fuse_path,
+                                 const char* sub_path, const char* real_path, const char* current_pkg,
+                                 int path_user_id, void* buf, fuse_fill_dir_t filler) {
     d->ctx = ctx;
+    d->fuse_path = fuse_path;
     d->sub_path = sub_path;
     d->real_path = real_path;
     d->current_pkg = current_pkg;
@@ -786,13 +803,59 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     d->has_data = d->has_obb = d->has_android = d->has_pkg = false;
 }
 
+/* 合成/虚拟条目 d_ino 与 getattr 同源解析（f7169be 不变量：目录项 d_ino
+   == getattr st_ino）。vfs_readdir_child_ino 的纯 synthetic 只在「真实路径
+   不存在」时与 getattr 一致；重定向虚拟目录（如 /网盘 → /Download）的
+   getattr 直接 lstat 解析后的真实目标并报告真实 ino，故此处逐条目镜像
+   getattr 的本地分派：fw_route 解析子项 → lstat 真实路径，命中即真实 ino；
+   失败（虚拟目录无底层文件）才落 synthetic 全路径哈希（与 getattr 虚拟
+   分支的 synthetic_inode(sub_path) 同源）。后端路径（FTP 前缀等）不逐条
+   发起网络查询：FTP 的 backend_getattr 只填 mode/size/mtime（ino=0 →
+   框架 synthetic 兜底），直接 synthetic 即与 getattr 一致；模块未提供
+   backend_getattr 时同 getattr 一样落到本地 lstat。 */
+static ino_t vfs_readdir_entry_ino(VfsReaddirCtx* d, const char* name) {
+    char child_sub[PATH_MAX], child_fuse[PATH_MAX];
+    /* 子项 sub_path 拼接走 readdir_join（文件内唯一出口），根（"" 或 "/"）
+       传空 base 得 "/name"——与 scan_local 的 is_root 分支同语义 */
+    const char* sub_base = (!d->sub_path || d->sub_path[0] == '\0' ||
+                            strcmp(d->sub_path, "/") == 0) ? "" : d->sub_path;
+    readdir_join(child_sub, sizeof child_sub, sub_base, name);
+    /* FUSE 层子路径：挂载点根 "/" 传空 base，其余拼父路径 */
+    const char* fuse_base = (!d->fuse_path || d->fuse_path[0] == '\0' ||
+                             strcmp(d->fuse_path, "/") == 0) ? "" : d->fuse_path;
+    readdir_join(child_fuse, sizeof child_fuse, fuse_base, name);
+    NspPathDecision rr;
+    bool nsp_ok = false, is_redir = false, monitor_on = false;
+    char current_pkg[128], sub[PATH_MAX], p[PATH_MAX];
+    int path_user_id = -1;
+    if (fw_route(d->ctx, child_fuse, &rr, &nsp_ok, current_pkg, &path_user_id, sub, p,
+                 &is_redir, &monitor_on, VFS_OP_READ) == 0) {
+        if (rr.is_ftp) {
+            const NspModuleOps* bops = NULL;
+            if (module_backend_lookup(sub, &bops) == 0) {
+                bool has_getattr = (bops->backend_getattr != NULL);
+                module_backend_put(bops);
+                /* 后端接管 getattr 且它普遍回 ino=0（框架 synthetic 兜底）：
+                   与 vfs_getattr 第 570 行同一算法，用规范 sub 同源 */
+                if (has_getattr) return synthetic_inode(sub);
+            }
+        }
+        struct stat st;
+        if (lstat(p, &st) == 0 && st.st_ino != 0) return st.st_ino;
+        /* lstat 失败：同 getattr 虚拟分支（合成/祖先/目标目录），用 fw_route
+           归一后的规范 sub_path 入哈希 */
+        return synthetic_inode(sub);
+    }
+    return synthetic_inode(child_sub);
+}
+
 /* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束。
    只给 st_ino + 类型位：fuse_add_direntry 不读 uid/gid（属主看 getattr） */
 static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
     if (!vfs_hash_insert(&d->ht, name)) return true; /* 已存在：跳过 */
     struct stat st;
     memset(&st, 0, sizeof(st));
-    st.st_ino = synthetic_inode(name);
+    st.st_ino = vfs_readdir_entry_ino(d, name);
     st.st_mode = S_IFDIR | 0755;
     return d->filler(d->buf, name, &st, 0, 0) == 0;
 }
@@ -802,7 +865,7 @@ static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
 static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
     struct stat st;
     memset(&st, 0, sizeof(st));
-    st.st_ino = synthetic_inode(name);
+    st.st_ino = vfs_readdir_entry_ino(d, name);
     st.st_mode = S_IFDIR | 0755;
     return d->filler(d->buf, name, &st, 0, 0) == 0;
 }
@@ -913,7 +976,7 @@ static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
         if (!vfs_hash_insert(&d->ht, virt[vi].name)) continue;
         struct stat st_dir;
         memset(&st_dir, 0, sizeof(st_dir));
-        st_dir.st_ino = synthetic_inode(virt[vi].name);
+        st_dir.st_ino = vfs_readdir_entry_ino(d, virt[vi].name);
         st_dir.st_mode = S_IFDIR; /* filler 只取类型位给出 d_type */
         if (d->filler(d->buf, virt[vi].name, &st_dir, 0, 0) != 0) return false;
     }
@@ -943,7 +1006,7 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     if (vfs_readdir_backend(ctx, sub_path, rr.is_ftp, buf, filler, &brc)) VFS_RETURN(brc);
 
     VfsReaddirCtx d;
-    vfs_readdir_ctx_init(&d, ctx, sub_path, p, current_pkg, path_user_id, buf, filler);
+    vfs_readdir_ctx_init(&d, ctx, path, sub_path, p, current_pkg, path_user_id, buf, filler);
     DIR* dp = opendir(p);
     if (!dp) {
         int err = errno;

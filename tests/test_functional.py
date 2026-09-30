@@ -2,7 +2,7 @@
 """
 fuse_daemon 完整测试套件
 =======================
-测试场景: 基础文件操作 / SQLite 数据库 / 并发压力
+测试场景: 基础文件操作 / SQLite 数据库 / 并发压力 / inode 非零一致性
 """
 import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json, sqlite3
 from pathlib import Path
@@ -163,6 +163,34 @@ def test_basic_operations():
         items = sorted(os.listdir(m / vdir))
         missing = [e for e in expect if e not in items]
         ok(f"{vdir}/ 列表含预期文件") if not missing else fail(f"{vdir}/ 列表", f"missing={missing} items={items}")
+
+# ═══════════════════════════════════════════════════════
+# 模块 1.5：inode 非零一致性（use_ino=1 下 0 会原样进内核）
+# 回归：后端/合成路径曾回 st_ino=0（libfuse 报 node 0 not found 后 SIGABRT，
+# 见 f7169be）；合成条目 d_ino 曾用裸名哈希，与 getattr 全路径哈希不一致。
+# ═══════════════════════════════════════════════════════
+def test_inode_nonzero():
+    log("\n━━━ 模块1.5: inode 非零一致性 ━━━")
+    m = Path(MNT)
+    # scandir 的 inode() 取自 getdents 的 d_ino（readdir 路径），
+    # stat().st_ino 走 getattr/lookup 路径——两者须同时非零且相等
+    with os.scandir(m / "0") as it:
+        dents = [(e.name, e.inode()) for e in it if e.name not in (".", "..")]
+    if not dents:
+        fail("readdir 条目非空", "empty"); return
+    ok(f"readdir 取到 {len(dents)} 条目")
+    for name, d_ino in dents:
+        ok(f"d_ino 非零 '{name}'") if d_ino != 0 else fail(f"d_ino 非零 '{name}'", f"ino={d_ino}")
+        try:
+            s_ino = (m / "0" / name).stat().st_ino
+        except OSError as e:
+            fail(f"stat '{name}'", str(e)); continue
+        ok(f"st_ino 非零 '{name}'") if s_ino != 0 else fail(f"st_ino 非零 '{name}'", f"ino={s_ino}")
+        # 虚拟条目（REDIRECT 祖先/目标，无底层真实文件）：d_ino 必须与
+        # getattr 的 st_ino 同源（vfs_readdir_child_ino ↔ synthetic_inode），
+        # 否则内核每次按名重查；本地真实条目两者本来就一致，一并断言
+        ok(f"ino 一致 '{name}'") if d_ino == s_ino else fail(f"ino 一致 '{name}'",
+                                                            f"d_ino={d_ino} st_ino={s_ino}")
 
 # ═══════════════════════════════════════════════════════
 # 模块 2：SQLite 数据库测试
@@ -436,6 +464,7 @@ def main():
 
     try:
         test_basic_operations()
+        test_inode_nonzero()
         test_sqlite()
         test_concurrent()
     finally:
