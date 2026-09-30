@@ -8,6 +8,7 @@
     python3 tests/run.py --all           # 忽略映射，跑全部套件
     python3 tests/run.py --base <ref>    # 与指定提交对比（默认 HEAD，即未提交改动）
     python3 tests/run.py test_rules.py …  # 显式指定套件（同时跳过自动匹配）
+    python3 tests/run.py --jobs 4        # Tier 0 白名单套件并行，其余仍串行
 
 改动来源：`git diff --name-only <base>` + 未跟踪文件（新文件按整体内容匹配符号）。
 映射规则：每个条目给出 **文件路径子串**（任一命中即选中）与 **符号**（该符号出现在
@@ -17,6 +18,7 @@
 对应 AGENTS.md「测试流程」映射表；两边需同步维护。
 """
 import argparse
+import concurrent.futures
 import os
 import subprocess
 import sys
@@ -176,17 +178,66 @@ def all_suites():
     return sorted(out)
 
 
-def run_suite(name):
+# Tier 0 并行白名单：逐个核对过无共享状态的套件（判据：无 FUSE 挂载，或
+# 挂载点/CONF 全由 mkdtemp 派生自管；无固定端口；无全局 pkill；不碰系统
+# log_monitor 与真实日志文件）。命中 --jobs 时仅这些进线程池并行，其余
+# 按选中顺序串行。新套件默认串行，要加入须先核对判据。
+PARALLEL_SAFE = frozenset({
+    "test_config_snapshot.py",    # cc 编译夹具直跑，临时 config_dir
+    "test_module_abi.py",         # cc 编译 ABI 夹具，无 daemon
+    "test_path_vars.py",          # cc 编译直跑
+    "test_monitor_layers.py",     # cc 编译实际源码 + 合成 uid，无挂载
+    "test_log_ctl_rules.py",      # 全走 mkdtemp
+    "test_inject_method.py",      # conf 全走 mkdtemp + global_replace_ctl 驱动
+    "test_crash_log.py",          # --crash-test 挂载前退出，日志只写临时文件
+    "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon
+})
+# 注意：test_rule_server.py 虽用临时 conf_dir，但 SERVICE 用例会 pkill -9 全局
+# log_monitor 并拉起系统实例，与 test_log_pipeline.py 互斥，故不进白名单。
+
+
+def run_suite(name, capture=False):
+    """跑单个套件，返回 (rc, dt, output)。
+
+    capture=False（串行默认）：子进程输出直接透传终端，行为与旧版一致。
+    capture=True（并行用）：输出截获后由调用方在任务完成时统一打印，
+    避免多套件刷屏交错；退出码原样回传（不用管道吞退出码）。
+    """
     path = os.path.join(TESTS, name)
     if not os.path.exists(path):
         print(f"⚠ 缺少 {name}，跳过")
-        return None, 0.0
+        return None, 0.0, ""
     t0 = time.time()
+    if capture:
+        r = subprocess.run([sys.executable, path], cwd=ROOT,
+                           capture_output=True, text=True)
+        dt = time.time() - t0
+        return r.returncode, dt, r.stdout + r.stderr
     print(f"\n{'━' * 60}\n▶ {name}\n{'━' * 60}", flush=True)
     # 不用管道承接子进程输出：退出码须原样回传（AGENTS 失败处理要求）
     rc = subprocess.run([sys.executable, path], cwd=ROOT).returncode
     dt = time.time() - t0
-    return rc, dt
+    return rc, dt, ""
+
+
+def run_parallel(safe, jobs):
+    """Tier 0 套件并行：输出截获、按完成顺序打印，返回 {套件名: (rc, dt)}。"""
+    done = {}
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(jobs, len(safe))) as pool:
+        futs = {pool.submit(run_suite, s, True): s for s in safe}
+        for fut in concurrent.futures.as_completed(futs):
+            s = futs[fut]
+            rc, dt, out = fut.result()
+            if rc is None:
+                continue
+            print(f"\n{'━' * 60}\n▶ {s}（并行，{dt:.1f}s）\n{'━' * 60}",
+                  flush=True)
+            print(out, end="", flush=True)
+            if rc != 0:
+                print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
+            done[s] = (rc, dt)
+    return done
 
 
 def main():
@@ -196,6 +247,8 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出将要执行的套件")
     ap.add_argument("--base", default="HEAD",
                     help="与该提交对比以确定改动（默认 HEAD = 暂存+未暂存+未跟踪）")
+    ap.add_argument("--jobs", "-j", type=int, default=1,
+                    help="Tier 0 套件（PARALLEL_SAFE 白名单）并行worker数，默认1即全串行")
     args = ap.parse_args()
 
     if args.suites:
@@ -215,15 +268,28 @@ def main():
         suites, rows = select_suites(syms_text, paths)
 
     print("\n选中套件：")
+    safe = [s for s in suites if s in PARALLEL_SAFE]
+    excl = [s for s in suites if s not in PARALLEL_SAFE]
     for s in suites:
-        print(f"  {s}")
+        tag = "并行" if s in PARALLEL_SAFE else "串行"
+        print(f"  [{tag}] {s}")
     print("命中条目：" + ("、".join(rows) if rows else "无"))
     if args.list:
         return 0
 
     results = []
+    if args.jobs > 1 and safe:
+        # 先并行 Tier 0，再串行其余：挂载类/独占类之间仍保持原有顺序语义，
+        # 且独占类（log_monitor/vsftpd/userns）不受并行任务干扰
+        para = run_parallel(safe, args.jobs)
+        by_name = dict(para)
+        for s in suites:
+            if s in by_name:
+                rc, dt = by_name[s]
+                results.append((s, rc, dt))
+        suites = excl
     for s in suites:
-        rc, dt = run_suite(s)
+        rc, dt, _ = run_suite(s)
         if rc is None:
             continue
         results.append((s, rc, dt))
