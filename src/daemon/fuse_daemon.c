@@ -195,6 +195,10 @@ static void fw_default_real_path(int user_id, const char* sub_path, char* out, s
     common_default_real_path(user_id, sub_path, out, sz);
 }
 
+/* 前向声明：readdir 路径合成唯一出口（定义在后，probe/ino 派生先用） */
+static void readdir_base_normalize(char* dst, size_t cap, const char* src);
+static void readdir_join(char* dst, size_t cap, const char* base, const char* name);
+
 /* 虚拟目录判空（原 vfs_is_virtual_dir_empty 的分派器版）：
    - 虚拟祖先 → 视为非空（拒绝删除）
    - 否则扫描真实目录，跳过规则隐藏/重定向子项（与 readdir 过滤一致） */
@@ -217,17 +221,18 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
     bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
                         strcmp(current_pkg, "unknown") != 0);
-    bool is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
     struct dirent* de;
     bool empty = true;
+    /* probe 路径归一（readdir_base_normalize）：根传空 base 得 "/name"，与
+       readdir/scan_local 同一合成语义，免 "/a//name" 双斜杠哈希漂移 */
+    char norm_base[2048];
+    readdir_base_normalize(norm_base, sizeof norm_base, sub_path);
     while ((de = readdir(dp)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         if (path_contains_invalid_chars(de->d_name)) continue;
         char item_sub_path[2048];
-        if (is_root)
-            snprintf(item_sub_path, 2047, "/%s", de->d_name);
-        else
-            snprintf(item_sub_path, 2047, "%s/%s", sub_path, de->d_name);
+        int w = snprintf(item_sub_path, sizeof item_sub_path, "%s/%s", norm_base, de->d_name);
+        if (w < 0 || (size_t)w >= sizeof item_sub_path) continue; /* 超长 fail-closed：跳过该条目 */
         if (uid != 0) {
             /* 轻量探测；user_id 目录条目豁免 redirect_target（与 readdir 一致） */
             bool uid_dir = false;
@@ -396,6 +401,20 @@ static inline bool backend_rc_is_business(int rc) {
    target_path 为模块 resolve 可选返回的【目标路径】（REDIRECT 命中时
    非空，否则 NULL），附加到日志尾部。monitor 开关由 fw_route 单点给出，
    且由框架自算（fw_config_monitor_for 的三层合并），与规则模块是否加载无关。 */
+/* 监控日志目标路径展示归一：仅剥 STORAGE_BASE（/data/media）存储根前缀，
+   其余保持绝对路径（g_real_root 测试根、FTP 目标等非存储根路径原样返回）。
+   /data/media/0/x → /0/x：user_id 层即展示起点，与 orig_path（sub_path）
+   的相对口径对齐。边界：恰好等于存储根时回 "/"；非完整前缀（如
+   /data/mediafoo）不剥 */
+static const char* log_strip_storage_base(const char* path) {
+    if (!path) return path;
+    size_t bl = sizeof(STORAGE_BASE) - 1;
+    if (strncmp(path, STORAGE_BASE, bl) != 0) return path;
+    if (path[bl] == '/') return path + bl;
+    if (path[bl] == '\0') return "/";
+    return path;
+}
+
 static void vfs_log_io(const char* pkg, uid_t uid, const char* op, const char* orig_path,
                        const char* target_path, bool monitor_on) {
     /* 热路径提前过滤：MONITOR 关闭且非 DEBUG 级别时零开销返回。
@@ -405,15 +424,16 @@ static void vfs_log_io(const char* pkg, uid_t uid, const char* op, const char* o
        返回值），调用方不得再用 nsp_ok 门控——那正是历史上「模块未命中即静默
        停记」的来源。 */
     if (!monitor_on && g_min_log_level != LOG_DEBUG) return;
+    const char* t = log_strip_storage_base(target_path);
     if (monitor_on) {
-        if (target_path && target_path[0]) {
-            log_internal(LOG_IO, "[%s(%u)] [%s] %s -> %s", pkg, uid, op, orig_path, target_path);
+        if (t && t[0]) {
+            log_internal(LOG_IO, "[%s(%u)] [%s] %s -> %s", pkg, uid, op, orig_path, t);
         } else {
             log_internal(LOG_IO, "[%s(%u)] [%s] %s", pkg, uid, op, orig_path);
         }
     }
-    if (target_path && target_path[0] && g_min_log_level == LOG_DEBUG) {
-        log_internal(LOG_DEBUG, "[MAP] %s: '%s' -> '%s'", op, orig_path, target_path);
+    if (t && t[0] && g_min_log_level == LOG_DEBUG) {
+        log_internal(LOG_DEBUG, "[MAP] %s: '%s' -> '%s'", op, orig_path, t);
     }
 }
 
@@ -526,8 +546,14 @@ static ino_t vfs_readdir_child_ino(const char* parent_sub, const char* name) {
     char child[PATH_MAX];
     if (!parent_sub || parent_sub[0] == '\0' || strcmp(parent_sub, "/") == 0)
         snprintf(child, sizeof child, "/%s", name);
-    else
-        snprintf(child, sizeof child, "%s/%s", parent_sub, name);
+    else {
+        /* 父路径归一复用 readdir_base_normalize（与 readdir probe/合成同一出口），
+           否则 "/a//name" 双斜杠哈希与 getattr 规范形式不一致，d_ino != st_ino
+           复发 lookup 风暴 */
+        char base[PATH_MAX];
+        readdir_base_normalize(base, sizeof base, parent_sub);
+        snprintf(child, sizeof child, "%s/%s", base, name);
+    }
     return synthetic_inode(child);
 }
 
@@ -667,6 +693,22 @@ static int vfs_access(const char* path, int mask) {
 /* readdir 条目路径拼接：结果可容纳时 memcpy 组装，免每条目 snprintf 格式化
    开销（大目录每条目省 ~200-400ns）；超长边界回退 snprintf 保持与原名一致
    的截断语义。base 传 "" 表示根（生成 "/name"）。 */
+
+/* readdir d_ino 派生的 base 归一化：NULL/空串/"/" 归一为 ""（readdir_join
+   根语义），其余剥掉尾部 '/'（长度>1 才剥）——与 getattr 侧 fw_parse_path
+   的规范化对齐，避免 "/a/" + name 拼出 "/a//name" 双斜杠哈希漂移 */
+static void readdir_base_normalize(char* dst, size_t cap, const char* src) {
+    if (!src || src[0] == '\0' || strcmp(src, "/") == 0) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t bl = strlen(src);
+    if (bl >= cap) bl = cap - 1;
+    memcpy(dst, src, bl);
+    dst[bl] = '\0';
+    while (bl > 1 && dst[bl - 1] == '/') dst[--bl] = '\0';
+}
+
 static void readdir_join(char* dst, size_t cap, const char* base, const char* name) {
     size_t bl = strlen(base);
     size_t nl = strlen(name);
@@ -733,6 +775,7 @@ static int vfs_emit_raw(void* buf, fuse_fill_dir_t filler, uint64_t* next, uint6
 #define VFS_READDIR_MAX_TOTAL 65536
 static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, bool is_ftp,
                                 void* buf, fuse_fill_dir_t filler, uint64_t skip, int* rc_out) {
+    (void)ctx; /* 上下文经 VfsReaddirCtx/探测路径自取，保留形参以统一分派签名 */
     if (!is_ftp) return false;
     const NspModuleOps* bops = NULL;
     if (module_backend_lookup(sub_path, &bops) != 0) return false;
@@ -810,8 +853,10 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
         }
         total += (size_t)n;
         if (n < VFS_READDIR_PAGE) break; /* 短页 = 末尾 */
-        if (total >= VFS_READDIR_MAX_TOTAL) {
+        if (total > VFS_READDIR_MAX_TOTAL) {
             /* 后端持续满页（正常应在短页/0 页收尾）：疑似无限产条目，熔断收尾。
+               用 > 而非 >=：恰好 64K 条是合法目录（下一页短页/0 页自然收尾）；
+               与 FTP 侧 FTP_LIST_CACHE_MAX=65537 的 +1 哨兵对齐（>64K 才熔断）。
                属框架侧防御（非常规业务失败），计错误后 loud 报错 */
             module_guard_error(bslot, "backend_readdir", 0, sub_path, "条目数超限(疑似无限产出)");
             rc = -E2BIG;
@@ -860,13 +905,13 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
 static ino_t vfs_readdir_entry_ino(VfsReaddirCtx* d, const char* name) {
     char child_sub[PATH_MAX], child_fuse[PATH_MAX];
     /* 子项 sub_path 拼接走 readdir_join（文件内唯一出口），根（"" 或 "/"）
-       传空 base 得 "/name"——与 scan_local 的 is_root 分支同语义 */
-    const char* sub_base = (!d->sub_path || d->sub_path[0] == '\0' ||
-                            strcmp(d->sub_path, "/") == 0) ? "" : d->sub_path;
+       传空 base 得 "/name"——与 scan_local 的 is_root 分支同语义。
+       base 先剥尾部 '/'（长度>1）：非规范 sub_path（如 "/Android/data/"）
+       会拼出 "//name"，与 getattr 规范形式的哈希不一致 */
+    char sub_base[PATH_MAX], fuse_base[PATH_MAX];
+    readdir_base_normalize(sub_base, sizeof sub_base, d->sub_path);
+    readdir_base_normalize(fuse_base, sizeof fuse_base, d->fuse_path);
     readdir_join(child_sub, sizeof child_sub, sub_base, name);
-    /* FUSE 层子路径：挂载点根 "/" 传空 base，其余拼父路径 */
-    const char* fuse_base = (!d->fuse_path || d->fuse_path[0] == '\0' ||
-                             strcmp(d->fuse_path, "/") == 0) ? "" : d->fuse_path;
     readdir_join(child_fuse, sizeof child_fuse, fuse_base, name);
     NspPathDecision rr;
     bool nsp_ok = false, is_redir = false, monitor_on = false;
@@ -925,10 +970,11 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
     struct dirent* de;
     while ((de = readdir(dp)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (d->is_root)
-            readdir_join(item_sub_path, 2047, "", de->d_name);
-        else
-            readdir_join(item_sub_path, 2047, d->sub_path, de->d_name);
+        /* probe 路径归一：base 先剥尾部 '/'（复用 readdir_base_normalize，与
+           fw_virtual_dir_empty/vfs_readdir_child_ino 同一合成语义） */
+        char norm_base[2048];
+        readdir_base_normalize(norm_base, sizeof norm_base, d->sub_path);
+        readdir_join(item_sub_path, sizeof item_sub_path, norm_base, de->d_name);
         if (path_contains_invalid_chars(de->d_name)) continue;
         /* 子项轻量探测（probe）：只判 hidden/redirect_target，不构建真实路径、
            不触发 sandbox 目录创建（无模块时直通不过滤）。
@@ -2367,7 +2413,8 @@ static int vfs_bpf_setup(const char* path, struct fuse_entry_param* e) {
             return -ENOENT;
     }
 
-    snprintf(real, sizeof(real), "%s%s", g_real_root, path);
+    int bw = snprintf(real, sizeof(real), "%s%s", g_real_root, path);
+    if (bw < 0 || (size_t)bw >= sizeof(real)) return -ENAMETOOLONG; /* 超长 fail-closed */
     if (!S_ISDIR(e->attr.st_mode)) return -ENOTDIR;
 
     int bfd = open(real, O_CLOEXEC | O_DIRECTORY | O_RDONLY);

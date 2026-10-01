@@ -44,6 +44,10 @@ REDIRECT /音乐/ /Download/Music/
 
 # 包含子目录的重定向
 REDIRECT /应用数据/com.example.app/ /Download/AppData/
+
+# inode 一致性专用：目标目录无底层文件——readdir 条目须走合成 inode 回退
+# （lstat 失败 → synthetic_inode(sub)），与 getattr 虚拟分支同源
+REDIRECT /空盘/ /Download/notexist_target/
 """
 
 def setup_env():
@@ -191,6 +195,36 @@ def test_inode_nonzero():
         # 否则内核每次按名重查；本地真实条目两者本来就一致，一并断言
         ok(f"ino 一致 '{name}'") if d_ino == s_ino else fail(f"ino 一致 '{name}'",
                                                             f"d_ino={d_ino} st_ino={s_ino}")
+
+    # 合成 inode 回退分支（lstat 失败 → synthetic_inode(sub_path)）：
+    # 「空盘」是 REDIRECT 目标 /Download/notexist_target/，无底层目录——
+    # getattr 走虚拟分支 synthetic_inode，readdir d_ino 必须同源一致
+    try:
+        s_ino = (m / "0/空盘").stat().st_ino
+        with os.scandir(m / "0") as it:
+            d_ino = next(e.inode() for e in it if e.name == "空盘")
+        ok(f"合成回退 d_ino 非零 '空盘'") if d_ino != 0 else fail("合成回退 d_ino 非零", f"ino={d_ino}")
+        ok(f"合成回退 ino 一致 '空盘'") if d_ino == s_ino else fail("合成回退 ino 一致 '空盘'",
+                                                                  f"d_ino={d_ino} st_ino={s_ino}")
+    except OSError as e:
+        fail("合成回退条目 '空盘'", str(e))
+
+    # REDIRECT 祖先目录（虚拟祖先无底层文件）：其下条目的 d_ino 亦须与
+    # getattr 同源（readdir_join 拼全路径哈希 ↔ getattr synthetic_inode）
+    try:
+        with os.scandir(m / "0/应用数据") as it:
+            dents = [(e.name, e.inode()) for e in it if e.name not in (".", "..")]
+        if not dents:
+            fail("祖先目录条目非空", "empty")
+        for name, d_ino in dents:
+            try:
+                s_ino = (m / "0/应用数据" / name).stat().st_ino
+            except OSError as e:
+                fail(f"祖先 stat '{name}'", str(e)); continue
+            ok(f"祖先 ino 一致 '{name}'") if d_ino == s_ino and d_ino != 0 else \
+                fail(f"祖先 ino 一致 '{name}'", f"d_ino={d_ino} st_ino={s_ino}")
+    except OSError as e:
+        fail("祖先目录 /0/应用数据", str(e))
 
 # ═══════════════════════════════════════════════════════
 # 模块 2：SQLite 数据库测试

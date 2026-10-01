@@ -418,8 +418,8 @@ static void rule_types_parse_line(char* line, const char* module, bool builtin) 
      format = pair
      argc = 2
      global-only = false
-     desc = FTP 存储映射：<虚拟前缀>|<段名>
-     desc.en = FTP storage mapping: <virtual prefix>|<section>
+     desc = 存储映射：<虚拟前缀>|<段名>
+     desc.en = Storage mapping: <virtual prefix>|<section>
    旧行格式（兼容）：FTP pair argc=2 desc="..." desc.en="..."
    解析器为状态机：遇到 [TYPE] 段头进入段模式收集 key=value 属性，
    段内无 '=' 的行或段外行按旧行格式处理；文件尾刷新未结束的段。 */
