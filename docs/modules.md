@@ -277,7 +277,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 
 ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。V5 同理（`backend_readdir` 加 `offset` 分页 + 超长名跳过语义），递增到 5 并拒绝 V1/V2/V3/V4——V4 模块无分页，大目录静默丢尾。
 
-**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。
+**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。`ftp.conf` 失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
 
 ## 7. 参考实现
 

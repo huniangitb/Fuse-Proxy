@@ -847,6 +847,8 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
        否则 remote_dir（如 /upload）映射后父路径会算错 */
     char url[2048];
     build_url(bk, path, url, sizeof url);
+    if (url[0] == '\0') return -1; /* build_url 已失败闭合（超长置空）：不拿截断串继续 */
+    if (strlen(url) < strlen("ftp://") + 1) return -1;
     char* pathpart = strchr(url + strlen("ftp://"), '/');
     if (!pathpart) return -1;
     /* 去尾斜杠（FTP 目录 URL 常以 / 结尾） */
@@ -862,12 +864,18 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
     char target[PATH_MAX];
     char* dec = curl_easy_unescape(NULL, enc_target, 0, NULL);
     if (dec) {
-        strncpy(target, dec, sizeof(target) - 1);
-        target[sizeof(target) - 1] = '\0';
+        size_t dl = strlen(dec);
+        /* 超长名无法精确匹配：失败闭合（不截断后模糊匹配错目录） */
+        if (dl == 0 || dl >= sizeof(target)) {
+            curl_free(dec);
+            return -1;
+        }
+        memcpy(target, dec, dl + 1);
         curl_free(dec);
     } else {
-        strncpy(target, enc_target, sizeof(target) - 1);
-        target[sizeof(target) - 1] = '\0';
+        size_t el = strlen(enc_target);
+        if (el == 0 || el >= sizeof(target)) return -1;
+        memcpy(target, enc_target, el + 1);
     }
     /* 父路径 = 去掉最后一段；根时父为空 → LIST "/" */
     char parent[2048];
@@ -880,9 +888,13 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
         strcpy(parent, "/");
     }
     /* 拼接父路径 FTP URL（同一 bk 的 host/port/remote_dir 已含在 pathpart 计算中，
-       这里直接基于原 url 前缀重建） */
+       这里直接基于原 url 前缀重建）。失败闭合：nsp_snprintf_dyn 放不下
+       （堆溢出）即返回 -1，绝不拿截断 URL 去 LIST 错目录。 */
     size_t urllen = strlen(url);
     char list_url[2048];
+    char* list_heap = NULL;
+    const char* list_use = list_url;
+    int lr = -1;
     if (strcmp(parent, "/") == 0) {
         /* 父为 FTP 根：remote_dir 的父级 = remote_dir 去掉最后一段或空 */
         const char* rd = bk->cfg.remote_dir;
@@ -893,15 +905,23 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
             if (rd[i] == '/') rdslash = rd + i;
         if (rdslash && rdslash > rd) {
             size_t plen2 = (size_t)(rdslash - rd);
-            snprintf(list_url, sizeof list_url, "ftp://%s:%d%.*s/", bk->cfg.host, bk->cfg.port,
-                     (int)plen2, rd);
+            lr = nsp_snprintf_dyn(list_url, sizeof list_url, &list_heap, 65536,
+                                  "ftp://%s:%d%.*s/", bk->cfg.host, bk->cfg.port,
+                                  (int)plen2, rd);
         } else {
-            snprintf(list_url, sizeof list_url, "ftp://%s:%d/", bk->cfg.host, bk->cfg.port);
+            lr = nsp_snprintf_dyn(list_url, sizeof list_url, &list_heap, 65536,
+                                  "ftp://%s:%d/", bk->cfg.host, bk->cfg.port);
         }
     } else {
         /* 父路径在 remote_dir 之下：url 前缀（host:port）+ parent */
-        snprintf(list_url, sizeof list_url, "%.*s%s/", (int)(urllen - pplen), url, parent);
+        lr = nsp_snprintf_dyn(list_url, sizeof list_url, &list_heap, 65536, "%.*s%s/",
+                              (int)(urllen - pplen), url, parent);
     }
+    if (lr < 0 || list_heap) {
+        free(list_heap);
+        return -1;
+    }
+    list_use = list_url;
 
     struct WriteBuf wb = {0};
     /* 只需匹配目标目录行：限制 LIST 缓冲容量（256KB 固定、不自动扩容），
@@ -915,7 +935,7 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
         free(wb.buf);
         return -1;
     }
-    curl_easy_setopt(c, CURLOPT_URL, list_url);
+    curl_easy_setopt(c, CURLOPT_URL, list_use);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &wb);
     CURLcode res = backend_perform(bk, c);
@@ -953,12 +973,14 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
         if (nlen == strlen(target) && memcmp(nm, target, nlen) == 0) {
             if (ftp_parse_list_time(line, nl, out) == 0) {
                 rc = 0;
-                /* 写入 TTL 缓存：后续 getattr 直接命中，免父目录 LIST */
+                /* 写入 TTL 缓存：后续 getattr 直接命中，免父目录 LIST。
+                   键超长不缓存（不写截断键，防键碰撞污染），本次结果照常返回。 */
                 pthread_mutex_lock(&bk->lock);
-                strncpy(bk->mtime_cache_path, path, sizeof(bk->mtime_cache_path) - 1);
-                bk->mtime_cache_path[sizeof(bk->mtime_cache_path) - 1] = '\0';
-                bk->mtime_cache_val = *out;
-                bk->mtime_cache_ts = time(NULL);
+                if (strlen(path) < sizeof(bk->mtime_cache_path)) {
+                    memcpy(bk->mtime_cache_path, path, strlen(path) + 1);
+                    bk->mtime_cache_val = *out;
+                    bk->mtime_cache_ts = time(NULL);
+                }
                 pthread_mutex_unlock(&bk->lock);
             }
             break;
