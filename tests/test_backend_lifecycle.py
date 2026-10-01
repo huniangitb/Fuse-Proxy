@@ -56,7 +56,7 @@ TMP = MNT = STORAGE = MODDIR = BUILT = SRCDIR = CONF = MARKER = DLOG = None
 BACKEND_MOD = "lifecycle_backend"           # 含 backend_rename（成功分支）
 BACKEND_NORENAME_MOD = "lifecycle_backend_norename"  # rename NULL（EXDEV 分支）
 
-# 用例等待上限（秒）：模块热插拔扫描周期 5s + 卸载 drain 等待 2s + 余量
+# 用例等待上限（秒）：事件触发扫描（1s 归并窗口 + 0.5s 稳定性校验）+ 卸载 drain 等待 2s + 余量
 LOAD_TIMEOUT = 25.0
 UNLOAD_TIMEOUT = 35.0
 
