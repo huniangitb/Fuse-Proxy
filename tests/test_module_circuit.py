@@ -17,12 +17,12 @@ V4 起规则引擎已内建（`src/daemon/fw_rules.c`），模块只剩「后端
   3. 回调缺失（BADFN）：模块未实现 backend_open/read 时框架静默跳过，
      不得误毒化（模块仍在册、无 ban 记录）
   4. .banned 重写完整性：stale 条目移除不破坏其他模块的 ban 记录
-  5. ban 持久化：重启 daemon 后同哈希坏 .so 不重载（防崩溃-重载震荡）
+  5. ban 持久化：重启 daemon 后同 mtime 坏 .so 不重载（防崩溃-重载震荡）
   6. backend_readdir 崩溃围栏 → 恢复 + 置毒
   7. backend_readdir 谎报条数（>max）→ 整批丢弃 + 计错误，ls 无垃圾条目
   8. 同进程连续两次崩溃（两个模块各一次）daemon 均存活（in_handler 复位）
   9. backend_match 崩溃围栏 + 业务 errno 不计熔断（连续多次 -ENOENT 不得置毒）
-  10. ban 自愈 + 槽位复用：坏模块熔断后换同名修复版 .so（哈希变化）→ 重载恢复
+  10. ban 自愈 + 槽位复用：坏模块熔断后换同名修复版 .so（mtime 变化）→ 重载恢复
 
 测试模块（gcc 现场编译，第三方视角仅依赖 nsp_module.h，见 docs/modules.md）：
   backend_crash.so — backend_match: bcrash→SIGSEGV / bmatch→认领 / biznoent→业务 -ENOENT
@@ -58,7 +58,7 @@ def build_modules():
         print(f"!! 缺少 {DAEMON}，请先 ninja -C build_gnu"); sys.exit(2)
     for name, extra, cflags in (("backend_crash", "-O1 -g", []),
                                 ("backend_bad", "-O1 -g", []),
-                                # 同名修复版：模块名仍是 backend_bad，只有哈希不同
+                                # 同名修复版：模块名仍是 backend_bad，只有 mtime 不同
                                 ("backend_bad_fixed", "-O1 -DFIXED", [])):
         out = ROOT / "build_gnu" / f"{name}.so"
         r = subprocess.run(["gcc", "-shared", "-fPIC", *extra.split(), "-DNSP_MODULE_BUILD",
@@ -226,7 +226,7 @@ def main():
 
     # ── 3. BADFN 不触发毒化：模块未实现某后端回调时静默跳过 ──
     print("\n── 3. BADFN 不触发毒化：未实现的后端回调不得误 ban ──")
-    # backend_crash 在本用例上一轮（用例 2）已因崩溃被 ban，同哈希会加载不上；
+    # backend_crash 在本用例上一轮（用例 2）已因崩溃被 ban，同 mtime 会加载不上；
     # 本用例要验的是"回调缺失不毒化"，故先清掉 ban 记录（ban 机制本身由 4/5 覆盖）
     if BANFILE.exists(): BANFILE.unlink()
     wconf("bmatch")
@@ -254,7 +254,7 @@ def main():
         stop(p)
         unstage_module("backend_crash")
 
-    # ── 4. .banned 文件重写完整性：stale 哈希重写不破坏其他条目 ──
+    # ── 4. .banned 文件重写完整性：stale 条目移除不破坏其他条目 ──
     print("\n── 4. .banned 重写完整性：stale 条目移除后其他条目保留 ──")
     BANFILE.parent.mkdir(parents=True, exist_ok=True)
     BANFILE.write_text("other_mod|abc123fakehash|test_reason|1700000000\n")
@@ -277,13 +277,13 @@ def main():
         fail("backend_bad ban 记录", f".banned: {ban_content!r}")
     if ("other_mod" in ban_content and "abc123fakehash" in ban_content
             and "test_reason" in ban_content and "1700000000" in ban_content):
-        ok("other_mod ban 记录完整保留（hash+reason+timestamp）")
+        ok("other_mod ban 记录完整保留（未被查找的名字不受重写影响）")
     else:
         fail("other_mod ban 记录被破坏", f".banned: {ban_content!r}")
     if BANFILE.exists(): BANFILE.unlink()
 
-    # ── 5. ban 持久化：重启 daemon 后同哈希 .so 不重载 ──
-    print("\n── 5. ban 持久化：重启不重载同哈希坏模块 ──")
+    # ── 5. ban 持久化：重启 daemon 后同 mtime .so 不重载 ──
+    print("\n── 5. ban 持久化：重启不重载同 mtime 坏模块 ──")
     wconf("berr", "bhealth")
     stage_module("backend_bad")
     p = start()
@@ -294,12 +294,12 @@ def main():
         ok("首次熔断并落盘 ban") if "backend_bad" in banned_text() else fail("ban 未落盘", banned_text()[:120])
     finally:
         stop(p)
-    # 同哈希 .so 仍在目录：重启后必须被 ban 拦截，不重载
+    # 同 mtime .so 仍在目录：重启后必须被 ban 拦截，不重载
     p = start()
     if not p: fail("重启失败"); return
     try:
         time.sleep(1.5)
-        ok("重启后同哈希坏模块未重载") if not alive("bhealth", timeout=3) else fail("ban 失效", "重启后坏模块又被加载")
+        ok("重启后同 mtime 坏模块未重载") if not alive("bhealth", timeout=3) else fail("ban 失效", "重启后坏模块又被加载")
         ok("重启后普通路径正常") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "重启后 n.txt 不可见")
     finally:
         stop(p)
@@ -398,8 +398,8 @@ def main():
         unstage_module("backend_crash")
     if BANFILE.exists(): BANFILE.unlink()
 
-    # ── 10. ban 自愈 + 槽位复用：换同名修复版 .so（哈希变化）→ 重载恢复 ──
-    print("\n── 10. ban 自愈：同哈希被 ban → 换修复版 .so → 重载恢复 ──")
+    # ── 10. ban 自愈 + 槽位复用：换同名修复版 .so（mtime 变化）→ 重载恢复 ──
+    print("\n── 10. ban 自愈：同 mtime 被 ban → 换修复版 .so → 重载恢复 ──")
     wconf("berr", "bhealth")
     stage_module("backend_bad")
     p = start()
@@ -415,15 +415,15 @@ def main():
     finally:
         stop(p)
 
-    # 同目录换入同名修复版（.so 内容不同 → 哈希变化 → 允许重载）
-    # 注意 .banned 需保留：正是"哈希不同才放行"的验证点
+    # 同目录换入同名修复版（.so 内容不同 → mtime 变化 → 允许重载）
+    # 注意 .banned 需保留：正是"mtime 不同才放行"的验证点
     unstage_module("backend_bad")
     stage_module("backend_bad_fixed", as_name="backend_bad")
     p = start()
     if not p: fail("重启失败（修复版）"); return
     try:
-        ok("换修复版后重载恢复（哈希变化绕过 ban）") if alive("bhealth") else fail(
-            "修复版未恢复", "bhealth 仍不可用（ban 未按哈希放行）")
+        ok("换修复版后重载恢复（mtime 变化绕过 ban）") if alive("bhealth") else fail(
+            "修复版未恢复", "bhealth 仍不可用（ban 未按 mtime 放行）")
         ok("普通路径正常") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "n.txt 不可见")
     finally:
         stop(p)

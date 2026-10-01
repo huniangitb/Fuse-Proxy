@@ -33,7 +33,7 @@
 
 /* ================= 配置 ================= */
 
-#define FTP_BACKEND_MAX     16
+#define FTP_BACKEND_MAX     16 /* 初容（动态翻倍起点），不再是硬上限 */
 #define FTP_HANDLE_MAX      256
 #define FTP_STREAM_BUF_SIZE (64 * 1024)       /* 流式读缓冲 64KB */
 #define FTP_RBUF_MIN        (64 * 1024)       /* 预取缓冲最小容量（随机读/初始） */
@@ -96,7 +96,30 @@ typedef struct FtpBackend {
     bool mutex_inited;         /* 每后端互斥锁是否已初始化（槽位复用：clear
                                     不再 destroy，add 仅首次 init，杜绝在途
                                     操作使用已销毁锁 → SIGSEGV） */
+    bool in_use;               /* 注册表槽位占用（clear 后复用，不 free——在途
+                                    操作可能仍持 bk 指针，内存 immortal） */
+    /* ---- V5 分页 LIST 缓存（单条目：最近列过的目录全量条目） ----
+       框架顺序翻页（offset 0→N）时后续页零网络；并发交错列多目录时颠簸重取
+       （正确，仅多一次 LIST）。bk->lock 保护（复用连接锁，短临界区）；
+       变更操作成功后失效（与 stat 缓存同策略，见各 ftp_stat_cache_clear 点）。
+       常驻内存上限 ≈ FTP_LIST_CACHE_MAX 条名字（仅巨型目录可达，典型 KB 级）。 */
+    char* list_path;           /* 目录虚拟路径（malloc） */
+    struct FtpListEntry* list_entries; /* 全量条目数组（malloc） */
+    size_t list_count;
+    bool list_truncated;       /* 解析超上限，尾部未知（见 FTP_LIST_CACHE_MAX） */
 } FtpBackend;
+
+/* V5 分页缓存上限 = 框架页循环总数上限(VFS_READDIR_MAX_TOTAL=65536)+1 哨兵：
+   解析到此数后仍有行即 truncated，服务到缓存末尾时报 E2BIG（fail-closed，
+   与框架侧总数上限对齐，>64K 条的 FTP 目录 loud 报错而非静默丢尾）。 */
+#define FTP_LIST_CACHE_MAX 65537u
+
+typedef struct FtpListEntry {
+    char name[256]; /* 单名 ≤255（ABI 约束），超长名解析时整条跳过 */
+    bool is_dir;
+    off_t size;   /* LIST 第 5 列（stat 预取用） */
+    time_t mtime; /* 整行时间解析（失败 0） */
+} FtpListEntry;
 
 /* 目录 mtime 缓存 TTL：目录时间变化不频繁，30s 内复用缓存足够 */
 #define FTP_MTIME_CACHE_TTL 30
@@ -225,10 +248,16 @@ static bool silent_fast_fail(FtpBackend* bk) {
     return false;
 }
 
-static FtpBackend g_backends[FTP_BACKEND_MAX];
-static int g_backend_count = 0;
+/* 后端注册表：指针数组动态翻倍（初容 FTP_BACKEND_MAX），条目 immortal——
+   find 返回的 bk 指针在 glock 解锁后仍被在途操作使用，故条目内存永不 free
+   （clear 只关停 mux/标记空闲，add 复用空闲槽）。数组本身的 realloc 只在
+   glock 内发生，逃逸的 bk 指针不受影响。 */
+static FtpBackend** g_backends = NULL;
+static int g_backend_count = 0; /* 活跃条目数（in_use；ftp_backend_count 上报值） */
+static int g_backend_slots = 0; /* 已分配槽位数（含 clear 后的空闲槽，复用不 free） */
+static int g_backend_cap = 0;   /* 指针数组容量 */
 /* 后端数组全局锁 + 热重载标志：
-   - g_backend_glock：保护 g_backend_count 与 g_backends 数组的增删扫描
+   - g_backend_glock：保护 g_backend_count/cap 与 g_backends 数组的增删扫描
      （find/add/clear/retry_all），杜绝热重载清表与在途查找的数组撕裂
    - g_backend_clearing：ftp.conf 热重载（ftp_backend_clear）期间置位，
      find 立即拒绝新调用，保证 clear 之后不会有新操作触碰已清理的后端 */
@@ -395,19 +424,68 @@ static size_t read_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
 
 /* ================= 后端管理 ================= */
 
+/* LIST 缓存释放（调用方须持 bk->lock；clear/替换/模块清表路径用） */
+static void ftp_list_cache_free_locked(FtpBackend* bk) {
+    free(bk->list_path);
+    free(bk->list_entries);
+    bk->list_path = NULL;
+    bk->list_entries = NULL;
+    bk->list_count = 0;
+    bk->list_truncated = false;
+}
+
+/* 变更操作成功后失效 LIST 缓存（与 ftp_stat_cache_clear 同点调用，
+   同策略：写低频，全清成本可忽略）。bk->lock 内执行。 */
+static void ftp_list_cache_clear(FtpBackend* bk) {
+    pthread_mutex_lock(&bk->lock);
+    ftp_list_cache_free_locked(bk);
+    pthread_mutex_unlock(&bk->lock);
+}
+
 int ftp_backend_add(const FtpServerCfg* cfg) {
     if (!cfg || !cfg->name[0]) return -1;
     pthread_mutex_lock(&g_backend_glock);
-    if (g_backend_count >= FTP_BACKEND_MAX) {
-        pthread_mutex_unlock(&g_backend_glock);
-        return -1;
+    /* 空闲槽复用优先（clear 后条目内存 immortal，锁原位保留） */
+    FtpBackend* bk = NULL;
+    for (int i = 0; i < g_backend_slots; i++) {
+        if (g_backends[i] && !g_backends[i]->in_use) {
+            bk = g_backends[i];
+            break;
+        }
     }
-    FtpBackend* bk = &g_backends[g_backend_count];
+    if (!bk) {
+        /* 无空闲槽：指针数组翻倍（初容 FTP_BACKEND_MAX），条目 immortal malloc。
+           数组 realloc 只在 glock 内发生；已逃逸的 bk 指针指向条目内存，
+           不受数组搬移影响。 */
+        if (g_backend_slots >= g_backend_cap) {
+            int ncap = g_backend_cap > 0 ? g_backend_cap * 2 : FTP_BACKEND_MAX;
+            FtpBackend** grown = realloc(g_backends, (size_t)ncap * sizeof *grown);
+            if (!grown) {
+                pthread_mutex_unlock(&g_backend_glock);
+                return -1;
+            }
+            for (int i = g_backend_cap; i < ncap; i++) grown[i] = NULL;
+            g_backends = grown;
+            g_backend_cap = ncap;
+        }
+        bk = calloc(1, sizeof *bk);
+        if (!bk) {
+            pthread_mutex_unlock(&g_backend_glock);
+            return -1;
+        }
+        g_backends[g_backend_slots++] = bk;
+    }
+    /* 复用槽的锁不得重 init（UB）：先保 mutex_inited 再清零。
+       在途操作理论上仍可能持旧 bk 指针（热重载与 serving 并发）——此前静态
+       数组同行为（memset 原位槽），语义未变；真正的安全由 clear 的 mux 摘除
+       + 调用失败码保障，条目内存本身永不释放。 */
+    bool was_inited = bk->mutex_inited;
     memset(bk, 0, sizeof *bk);
+    bk->mutex_inited = was_inited;
+    bk->in_use = true;
     bk->cfg = *cfg;
     snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
-    /* 互斥锁仅首次初始化：clear 不再 destroy，槽位复用不重复 init
-       （对已初始化 mutex 重复 pthread_mutex_init 属未定义行为） */
+    /* 互斥锁仅首次初始化（此前 memset 清标志导致每次重 init，属 UB，现修正） */
     if (!bk->mutex_inited) {
         pthread_mutex_init(&bk->lock, NULL);
         pthread_mutex_init(&bk->pool_lock, NULL);
@@ -433,14 +511,16 @@ int ftp_backend_add(const FtpServerCfg* cfg) {
 void ftp_backend_clear(void) {
     atomic_store_explicit(&g_backend_clearing, true, memory_order_release);
     pthread_mutex_lock(&g_backend_glock);
-    for (int i = 0; i < g_backend_count; i++) {
-        FtpBackend* bk = &g_backends[i];
+    for (int i = 0; i < g_backend_slots; i++) {
+        FtpBackend* bk = g_backends[i];
+        if (!bk || !bk->in_use) continue;
         /* 先摘指针再关停：摘指针与 backend_mux_ref 的取引用互斥（同锁），
            摘除后新操作拿不到旧 mux；关停会把在途任务归位（提交者拿到
            失败码而非悬挂），并等其全部离开后才销毁 multi */
         pthread_mutex_lock(&bk->lock);
         FtpMux* mux = bk->mux;
         bk->mux = NULL;
+        ftp_list_cache_free_locked(bk); /* LIST 缓存同清（锁内） */
         pthread_mutex_unlock(&bk->lock);
         if (mux) {
             ftp_mux_shutdown(mux);
@@ -454,7 +534,9 @@ void ftp_backend_clear(void) {
         bk->read_pool_count = 0;
         pthread_mutex_unlock(&bk->pool_lock);
         /* 不再 pthread_mutex_destroy：槽位复用，互斥锁生命周期与模块一致，
-           杜绝在途操作 pthread_mutex_lock 已销毁锁 → UB/SIGSEGV */
+           杜绝在途操作 pthread_mutex_lock 已销毁锁 → UB/SIGSEGV。
+           条目内存 immortal（不 free）：在途操作仍可能持 bk 指针。 */
+        bk->in_use = false;
     }
     g_backend_count = 0;
     pthread_mutex_unlock(&g_backend_glock);
@@ -465,16 +547,19 @@ int ftp_backend_count(void) {
     return g_backend_count;
 }
 
-/* 找 path 命中的后端 */
+/* 找 path 命中的后端（仅活跃条目；返回指针在 glock 外仍有效，
+   条目内存 immortal） */
 static FtpBackend* ftp_backend_find(const char* path) {
     if (atomic_load_explicit(&g_backend_clearing, memory_order_acquire)) return NULL;
     pthread_mutex_lock(&g_backend_glock);
     FtpBackend* r = NULL;
-    for (int i = 0; i < g_backend_count; i++) {
-        size_t plen = strlen(g_backends[i].prefix);
-        if (strncmp(g_backends[i].prefix, path, plen) == 0 &&
+    for (int i = 0; i < g_backend_slots; i++) {
+        FtpBackend* bk = g_backends[i];
+        if (!bk || !bk->in_use) continue;
+        size_t plen = strlen(bk->prefix);
+        if (strncmp(bk->prefix, path, plen) == 0 &&
             (path[plen] == '\0' || path[plen] == '/')) {
-            r = &g_backends[i];
+            r = bk;
             break;
         }
     }
@@ -482,18 +567,32 @@ static FtpBackend* ftp_backend_find(const char* path) {
     return r;
 }
 
-/* 构建 FTP URL（不编码 /，FTP 协议路径直接使用） */
+/* 构建 FTP URL（不编码 /，FTP 协议路径直接使用）。
+   失败闭合：保持 void 签名（9 处调用方不动），任何一步放不下都写空串——
+   调用方 curl 以空 URL 失败（EIO），永不读写截断出的错误远端文件。
+   动态扩充：rel 经 nsp_snprintf_dyn 堆溢出（URL 编码可膨胀 3 倍，固定 1024
+   栈缓冲在深路径 + 中文名下必截断）；终 URL 同理。常见短路径零 malloc。 */
 static void build_url(const FtpBackend* bk, const char* path, char* url, size_t sz) {
-    char rel[1024];
+    if (!url || sz == 0) return;
+    url[0] = '\0'; /* 先置空：任何失败路径都不外流截断串 */
     const char* p = path + strlen(bk->prefix);
     while (*p == '/') p++;
-    if (p[0] == '\0') {
-        snprintf(rel, sizeof rel, "%s", bk->cfg.remote_dir);
-    } else {
-        snprintf(rel, sizeof rel, "%s/%s", bk->cfg.remote_dir, p);
+    char rel_fixed[1024];
+    char* rel_heap = NULL;
+    int rn = (p[0] == '\0')
+                 ? nsp_snprintf_dyn(rel_fixed, sizeof rel_fixed, &rel_heap, 65536, "%s",
+                                    bk->cfg.remote_dir)
+                 : nsp_snprintf_dyn(rel_fixed, sizeof rel_fixed, &rel_heap, 65536, "%s/%s",
+                                    bk->cfg.remote_dir, p);
+    if (rn < 0) {
+        free(rel_heap);
+        return;
     }
+    const char* rel = rel_heap ? rel_heap : rel_fixed;
     // 对路径中的特殊字符（空格等）编码，但保留 /
     char* enc = curl_easy_escape(NULL, rel, 0);
+    char* url_heap = NULL;
+    int un;
     if (enc) {
         // 将 %2F 还原为 /（FTP 路径中的 / 是目录分隔符，不应编码）
         char* s = enc;
@@ -507,10 +606,18 @@ static void build_url(const FtpBackend* bk, const char* path, char* url, size_t 
             }
         }
         *d = '\0';
-        snprintf(url, sz, "ftp://%s:%d%s", bk->cfg.host, bk->cfg.port, enc);
+        un = nsp_snprintf_dyn(url, sz, &url_heap, 65536, "ftp://%s:%d%s", bk->cfg.host,
+                              bk->cfg.port, enc);
         curl_free(enc);
     } else {
-        snprintf(url, sz, "ftp://%s:%d%s", bk->cfg.host, bk->cfg.port, rel);
+        un = nsp_snprintf_dyn(url, sz, &url_heap, 65536, "ftp://%s:%d%s", bk->cfg.host,
+                              bk->cfg.port, rel);
+    }
+    free(rel_heap);
+    if (un < 0 || url_heap) {
+        /* 终 URL 放不进调用方缓冲（或超限）：置空失败 */
+        free(url_heap);
+        url[0] = '\0';
     }
 }
 
@@ -990,7 +1097,43 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     return -EIO;
 }
 
-int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
+/* 从已缓存数组服务一页（纯函数，无锁，调用方持 bk->lock）：
+   返回填充数；页尾恰为缓存末尾但远端还有未知条目（truncated）→ -E2BIG
+   fail-closed（框架中止并 loud 报错，不静默丢尾）；offset 越界时同理，
+   否则（确到末尾）返回 0。 */
+static int ftp_list_serve_page(const FtpListEntry* arr, size_t count, bool truncated,
+                               NspDirEntry* out, int max, uint64_t offset) {
+    if (max <= 0) return 0;
+    if (offset >= (uint64_t)count) return truncated ? -E2BIG : 0;
+    size_t avail = count - (size_t)offset;
+    size_t n = avail < (size_t)max ? avail : (size_t)max;
+    for (size_t i = 0; i < n; i++) {
+        memcpy(out[i].name, arr[(size_t)offset + i].name, sizeof out[i].name);
+        out[i].is_dir = arr[(size_t)offset + i].is_dir;
+    }
+    if ((uint64_t)offset + n == (uint64_t)count && truncated) return -E2BIG;
+    return (int)n;
+}
+
+/* 已服务页的子项 stat 预取（优化 3：readdir 后 getattr 子项零网络）。
+   调用方持 bk->lock；key 为虚拟路径（path + "/" + name），与 getattr 一致。 */
+static void ftp_list_prefetch(FtpBackend* bk, const char* path, const FtpListEntry* arr,
+                              size_t base, int n) {
+    size_t plen = strlen(path);
+    if (plen == 0) return;
+    for (int i = 0; i < n; i++) {
+        const FtpListEntry* e = &arr[base + (size_t)i];
+        size_t nlen = strlen(e->name);
+        if (plen + 1 + nlen >= FTP_STAT_PATH_MAX) continue; /* 超长不缓存 */
+        char child[FTP_STAT_PATH_MAX];
+        memcpy(child, path, plen);
+        child[plen] = '/';
+        memcpy(child + plen + 1, e->name, nlen + 1);
+        ftp_stat_cache_fill(bk, child, 0, e->is_dir, e->size, e->mtime);
+    }
+}
+
+int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_t offset) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk) return -ENOENT;
     if (!entries || max <= 0) return 0;
@@ -1000,9 +1143,26 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
 
     if (backend_ready(bk) != 0) return -EIO;
 
+    /* 缓存命中：同目录后续页零网络（框架顺序翻页，命中率 100%）。
+       空目录也缓存（entries NULL + count 0）：到末尾直接回 0，免重复 LIST。 */
+    pthread_mutex_lock(&bk->lock);
+    if (bk->list_path && strcmp(bk->list_path, path) == 0) {
+        int n = ftp_list_serve_page(bk->list_entries, bk->list_count, bk->list_truncated,
+                                    entries, max, offset);
+        if (n > 0)
+            ftp_list_prefetch(bk, path, bk->list_entries, (size_t)offset, n);
+        pthread_mutex_unlock(&bk->lock);
+        return n;
+    }
+    pthread_mutex_unlock(&bk->lock);
+
+    /* 未命中：一次 LIST 全量拉取（wb auto_grow，大小不限——解析侧按
+       FTP_LIST_CACHE_MAX 封顶，网络侧全收保证解析完整） */
     char url[2048], dir_url[2048];
     build_url(bk, path, url, sizeof url);
+    if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
     size_t ulen = strlen(url);
+    if (ulen + 2 > sizeof dir_url) return -ENAMETOOLONG;
     if (ulen > 0 && url[ulen - 1] != '/')
         snprintf(dir_url, sizeof dir_url, "%s/", url);
     else
@@ -1029,20 +1189,26 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
         return res_is_not_found(res, resp) ? -ENOENT : -EIO;
     }
 
-    // 解析 LIST 输出
-    int out_n = 0;
+    // 解析 LIST 输出 → 新缓存数组（动态翻倍，上限 FTP_LIST_CACHE_MAX）
+    FtpListEntry* arr = NULL;
+    size_t count = 0, arr_cap = 0;
+    bool truncated = false;
+    size_t skipped_long = 0;
     char* line = wb.buf;
     char* end = wb.buf + wb.len;
-    while (line < end && out_n < max) {
+    while (line < end) {
         // 跳过空行
         while (line < end && (*line == '\n' || *line == '\r')) line++;
         if (line >= end) break;
-        char* nl = memchr(line, '\n', end - line);
+        if (count >= FTP_LIST_CACHE_MAX) {
+            truncated = true; /* 尾部未知：服务到末尾时 E2BIG（fail-closed） */
+            break;
+        }
+        char* nl = memchr(line, '\n', (size_t)(end - line));
         if (!nl) nl = end;
         // 简单解析：跳过日期/权限字段，取最后一列作为文件名；
-        // 同时捕获第 5 列（size）用于子项 stat 缓存预取
-        //（优化 3：readdir 后 getattr 子项零网络；时间列由
-        //  ftp_parse_list_time 对整行解析，此处不重复捕获）
+        // 同时捕获第 5 列（size）与时间列用于子项 stat 缓存预取
+        //（优化 3：readdir 后 getattr 子项零网络）
         char* name = NULL;
         char* p = line;
         char size_str[32] = {0};
@@ -1071,37 +1237,78 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max) {
             // 去掉末尾的 \r
             char* e = nl;
             if (e > name && *(e - 1) == '\r') e--;
-            size_t nlen = e - name;
+            size_t nlen = (size_t)(e - name);
             if (nlen > 0 && name[0] != '.') {
-                /* 拷贝文件名并显式补 NUL：strncpy 在 nlen < 容量时不补 NUL，
-                   会残留栈垃圾字节导致条目名拼接/乱码（根目录短名最明显） */
-                size_t cap = sizeof(entries[out_n].name) - 1;
-                size_t cp = nlen < cap ? nlen : cap;
-                memcpy(entries[out_n].name, name, cp);
-                entries[out_n].name[cp] = '\0';
-                entries[out_n].is_dir = (line[0] == 'd');
-                /* 优化 3：预取填充子项 stat 缓存（getattr 命中免 SIZE+MDTM→LIST
-                   网络往返）。key 为虚拟路径（path + "/" + name），与
-                   getattr 查询一致；mtime 由整行解析，失败兜底 0 */
-                size_t plen = strlen(path);
-                if (plen > 0 && plen + 1 + cp < FTP_STAT_PATH_MAX) {
-                    char child[FTP_STAT_PATH_MAX];
-                    memcpy(child, path, plen);
-                    child[plen] = '/';
-                    memcpy(child + plen + 1, entries[out_n].name, cp + 1);
-                    time_t mt = 0;
-                    if (ftp_parse_list_time(line, nl, &mt) != 0) mt = 0;
-                    ftp_stat_cache_fill(bk, child, 0, entries[out_n].is_dir,
-                                        size_str[0] ? (off_t)atoll(size_str) : 0, mt);
+                /* V5：超长名整条跳过（ABI 约束：禁止截断安装，同前缀长名
+                   截断后会互相覆盖；且内核 NAME_MAX=255 本就装不下）。
+                   点条目（./..）沿旧行为跳过。 */
+                if (nlen >= sizeof arr[0].name) {
+                    skipped_long++;
+                } else {
+                    if (count >= arr_cap) {
+                        size_t ncap = arr_cap > 0 ? arr_cap * 2 : 256;
+                        if (ncap > FTP_LIST_CACHE_MAX) ncap = FTP_LIST_CACHE_MAX;
+                        FtpListEntry* grown = realloc(arr, ncap * sizeof *grown);
+                        if (!grown) {
+                            /* OOM：已有条目照常服务，但尾部未知 → 置 truncated，
+                               服务到末尾时 E2BIG（fail-closed，不谎报“到末尾”） */
+                            truncated = true;
+                            break;
+                        }
+                        arr = grown;
+                        arr_cap = ncap;
+                    }
+                    if (count < arr_cap) {
+                        memcpy(arr[count].name, name, nlen);
+                        arr[count].name[nlen] = '\0';
+                        arr[count].is_dir = (line[0] == 'd');
+                        arr[count].size = size_str[0] ? (off_t)atoll(size_str) : 0;
+                        arr[count].mtime = 0;
+                        if (ftp_parse_list_time(line, nl, &arr[count].mtime) != 0)
+                            arr[count].mtime = 0;
+                        count++;
+                    }
                 }
-                out_n++;
             }
         }
         line = nl + 1;
     }
     free(wb.buf);
+
+    /* 安装：锁内复核（并发另一线程可能已装好同目录——复用已装，丢本次） */
+    pthread_mutex_lock(&bk->lock);
+    int n;
+    const FtpListEntry* use_arr;
+    size_t use_count;
+    bool use_trunc;
+    if (bk->list_path && strcmp(bk->list_path, path) == 0) {
+        free(arr);
+        use_arr = bk->list_entries;
+        use_count = bk->list_count;
+        use_trunc = bk->list_truncated;
+    } else {
+        char* np = strdup(path);
+        if (!np) {
+            pthread_mutex_unlock(&bk->lock);
+            free(arr);
+            return -ENOMEM;
+        }
+        ftp_list_cache_free_locked(bk);
+        bk->list_path = np;
+        bk->list_entries = arr;
+        bk->list_count = count;
+        bk->list_truncated = truncated;
+        use_arr = arr;
+        use_count = count;
+        use_trunc = truncated;
+    }
+    n = ftp_list_serve_page(use_arr, use_count, use_trunc, entries, max, offset);
+    if (n > 0) ftp_list_prefetch(bk, path, use_arr, (size_t)offset, n);
+    pthread_mutex_unlock(&bk->lock);
+    if (skipped_long > 0)
+        LOG_WRN("ftp_module: 目录 %s 有 %zu 个超长文件名（≥255 字节）已跳过", path, skipped_long);
     mark_success(bk); /* 操作成功：清零熔断计数 */
-    return out_n;
+    return n;
 }
 
 /* S3 读句柄池：获取读模式句柄——优先复用池中空闲句柄（libcurl 句柄保留
@@ -1298,6 +1505,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
         return -EIO;
     }
     ftp_stat_cache_clear(bk); /* 空文件已创建：整表失效 */
+    ftp_list_cache_clear(bk); /* 新条目出现：LIST 缓存失效 */
     return ftp_backend_open(path, O_WRONLY | O_CREAT | O_TRUNC, h);
 }
 
@@ -1739,6 +1947,7 @@ static int ftp_backend_upload(FtpBackendFile* f) {
         f->uploaded = true;
         mark_success(f->bk);         /* 上传成功：清零熔断计数（网络恢复退出静默） */
         ftp_stat_cache_clear(f->bk); /* STOR 完成：整表失效，杜绝写后旧 stat */
+        ftp_list_cache_clear(f->bk); /* 新条目出现：LIST 缓存失效 */
     }
     return rc;
 }
@@ -1770,6 +1979,7 @@ int ftp_backend_flush(uint64_t h) {
     f->uploaded = true;
     mark_success(f->bk);
     ftp_stat_cache_clear(f->bk); /* 流式 STOR/APPE 完成：整表失效 */
+    ftp_list_cache_clear(f->bk); /* 新条目出现：LIST 缓存失效 */
     return 0;
 }
 
@@ -1901,6 +2111,7 @@ static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int 
         return ok_code ? -ok_code : -EPERM;
     }
     ftp_stat_cache_clear(bk); /* DELE/MKD/RMD 成功：整表失效 */
+    ftp_list_cache_clear(bk); /* 条目增删：LIST 缓存失效 */
     return 0;
 }
 
@@ -1955,6 +2166,7 @@ int ftp_backend_rename(const char* from, const char* to) {
         return -EIO;
     }
     ftp_stat_cache_clear(bk); /* RNFR/RNTO 成功：整表失效（from/to 均可能被缓存） */
+    ftp_list_cache_clear(bk); /* 条目改名：LIST 缓存失效 */
     return 0;
 }
 

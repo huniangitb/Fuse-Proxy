@@ -30,7 +30,7 @@
  * ftp.conf 位置：与 --rules= 参数同目录（Android 为 /data/Namespace-Proxy/ftp.conf）
  */
 
-#define FTP_MAX_BACKENDS FTP_CONF_MAX_SERVERS
+/* 后端数量无上限（ftp_backend 指针数组 + 加载器注册表均动态扩充） */
 
 static char g_ftp_conf_path[PATH_MAX] = CONFIG_DIR "/ftp.conf";
 
@@ -46,12 +46,15 @@ static void reload_ftp_conf(void) {
         return;
     }
     ftp_backend_clear();
-    for (int i = 0; i < list.count && i < FTP_MAX_BACKENDS; i++) {
+    /* 后端表已动态化（加载器注册表 + FTP 后端指针数组均无 16 上限），
+       有多少 server 注册多少；单段 add 失败（OOM）仅跳过该段 */
+    for (int i = 0; i < list.count; i++) {
         if (ftp_backend_add(&list.servers[i]) != 0) continue;
         LOG("ftp_module: 注册后端 /%s → FTP %s:%d%s (server=%s)", list.servers[i].name,
             list.servers[i].host, list.servers[i].port, list.servers[i].remote_dir,
             list.servers[i].name);
     }
+    ftp_conf_free(&list);
     if (ftp_backend_count() == 0)
         LOG_WRN("ftp_module: 无可用 server，请检查 ftp.conf");
     else

@@ -28,7 +28,10 @@ void ftp_backend_retry_all(void);
 /* ---- NspModuleOps.backend_* 实现（由框架调用） ---- */
 int ftp_backend_match(const char* path);
 int ftp_backend_getattr(const char* path, struct stat* st);
-int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max);
+/* V5 分页：跳过前 offset 条，填 ≤max 条；0=到末尾，<0 errno（E2BIG=缓存外
+   还有未知条目，fail-closed）。同目录翻页走单条目 LIST 缓存（零额外 LIST）；
+   变更成功后缓存失效。 */
+int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_t offset);
 int ftp_backend_open(const char* path, int flags, uint64_t* h);
 int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
 int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);

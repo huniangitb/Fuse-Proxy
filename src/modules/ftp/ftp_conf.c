@@ -19,16 +19,43 @@ static void set_str(char* dst, size_t sz, const char* v) {
     dst[sz - 1] = '\0';
 }
 
+#define FTP_CONF_LINE_MAX 1024
+
+/* 新段槽位：动态翻倍（初容 FTP_CONF_MAX_SERVERS），OOM 返回 NULL
+   （调用方将后续键值静默丢弃——整段失效但不断解析；OOM 极罕见）。 */
+static FtpServerCfg* ftp_conf_new_server(FtpServerList* out) {
+    if (out->count >= out->cap) {
+        int ncap = out->cap > 0 ? out->cap * 2 : FTP_CONF_MAX_SERVERS;
+        FtpServerCfg* grown = realloc(out->servers, (size_t)ncap * sizeof *grown);
+        if (!grown) return NULL;
+        out->servers = grown;
+        out->cap = ncap;
+    }
+    FtpServerCfg* cur = &out->servers[out->count];
+    memset(cur, 0, sizeof *cur);
+    cur->port = 21;
+    set_str(cur->remote_dir, sizeof cur->remote_dir, "/");
+    set_str(cur->user, sizeof cur->user, "anonymous");
+    out->count++;
+    return cur;
+}
+
 int ftp_conf_load(const char* path, FtpServerList* out) {
     memset(out, 0, sizeof *out);
     FILE* fp = fopen(path, "r");
     if (!fp) return -1;
 
-    char line[1024];
+    char* line = nullptr;
+    size_t line_cap = 0;
     char cur_section[128] = {0};
     FtpServerCfg* cur = NULL;
 
-    while (fgets(line, sizeof line, fp)) {
+    /* 有界动态行读取：超长行整行丢弃（长行永不裂成“段头碎片 + 键值碎片”） */
+    for (;;) {
+        int r = nsp_getline_capped(fp, &line, &line_cap, FTP_CONF_LINE_MAX, NULL);
+        if (r == 0) break;
+        if (r == -2) continue; /* 超长整行跳过（段声明亦不生效） */
+        if (r < 0) break;
         strip_comment(line);
         char* s = nsp_str_trim(line);
         if (!s[0]) continue;
@@ -42,17 +69,8 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
                 cur = NULL;
                 continue;
             }
-            if (out->count < FTP_CONF_MAX_SERVERS) {
-                cur = &out->servers[out->count];
-                memset(cur, 0, sizeof *cur);
-                cur->port = 21;
-                set_str(cur->remote_dir, sizeof cur->remote_dir, "/");
-                set_str(cur->user, sizeof cur->user, "anonymous");
-                set_str(cur->name, sizeof cur->name, cur_section); /* 段名 = 服务器名 */
-                out->count++;
-            } else {
-                cur = NULL;
-            }
+            cur = ftp_conf_new_server(out);
+            if (cur) set_str(cur->name, sizeof cur->name, cur_section); /* 段名 = 服务器名 */
             continue;
         }
 
@@ -81,6 +99,7 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
         }
         /* 其他键忽略（passive/encoding 等预留） */
     }
+    free(line);
     fclose(fp);
 
     /* 清理无 host 的 server 段（未配置 host= 的段无效） */
@@ -93,6 +112,14 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
     }
     out->count = n;
     return out->count > 0 ? 0 : -1;
+}
+
+void ftp_conf_free(FtpServerList* list) {
+    if (!list) return;
+    free(list->servers);
+    list->servers = NULL;
+    list->count = 0;
+    list->cap = 0;
 }
 
 FtpServerCfg* ftp_conf_find(FtpServerList* list, const char* name) {

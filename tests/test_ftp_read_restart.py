@@ -60,8 +60,10 @@ def main():
             "-I", str(ROOT / "src" / "modules" / "ftp"),
             str(DRIVER),
             # 后端源码由 FTP_BACKEND_SRC 直接编入驱动；ftp_mux.c 是独立编译单元
-            # （控制面 epoll 复用器，本用例不驱动它，但引用符号须可解析）
+            # （控制面 epoll 复用器，本用例不驱动它，但引用符号须可解析）；
+            # nsp_util.c 提供后端引用的真实通用原语（nsp_snprintf_dyn，纯 libc）
             str(ROOT / "src" / "modules" / "ftp" / "ftp_mux.c"),
+            str(ROOT / "src" / "core" / "nsp_util.c"),
             "-o", str(exe),
             "-pthread", "-lcurl", "-lm",
         ]

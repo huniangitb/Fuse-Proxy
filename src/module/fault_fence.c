@@ -18,7 +18,7 @@
  */
 #include "fault_fence.h"
 #include "common.h"
-#include "module_loader.h" /* MAX_MODULES：与 NSP_FENCE_UNBOUND_SLOT 对齐断言 */
+#include "module_loader.h" /* MODULE_HARD_MAX：与 NSP_FENCE_UNBOUND_SLOT 对齐断言 */
 #include <setjmp.h>
 #include <signal.h>
 #include <string.h>
@@ -68,7 +68,7 @@ static FenceTls* ensure_fence(void) {
 
 /* ================= 静态槽位注册表（信号安全） ================= */
 
-_Static_assert(NSP_FENCE_UNBOUND_SLOT == MAX_MODULES, "未绑定槽位须紧随模块槽位之后");
+_Static_assert(NSP_FENCE_UNBOUND_SLOT == MODULE_HARD_MAX, "未绑定槽位须紧随模块槽位之后");
 
 typedef struct {
     char name[64];
@@ -256,10 +256,10 @@ int nsp_fence_backend_getattr(int slot, const char* op_name, int (*fn)(const cha
     NSP_FENCE_WRAP(slot, op_name, fn(path, st));
 }
 int nsp_fence_backend_readdir(int slot, const char* op_name,
-                              int (*fn)(const char*, NspDirEntry*, int), const char* path,
-                              NspDirEntry* entries, int max) {
+                              int (*fn)(const char*, NspDirEntry*, int, uint64_t),
+                              const char* path, NspDirEntry* entries, int max, uint64_t offset) {
     if (!fn) return NSP_FENCE_BADFN;
-    NSP_FENCE_WRAP(slot, op_name, fn(path, entries, max));
+    NSP_FENCE_WRAP(slot, op_name, fn(path, entries, max, offset));
 }
 int nsp_fence_backend_open(int slot, const char* op_name, int (*fn)(const char*, int, uint64_t*),
                            const char* path, int flags, uint64_t* h) {

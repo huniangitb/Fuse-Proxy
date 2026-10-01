@@ -903,17 +903,29 @@ static bool view_parse_section(char* p, char** name_out, int* uid_out, bool* ena
     return true;
 }
 
-/* 主文件：段头 → SECTION，其余行 → RULE */
+/* 主文件：段头 → SECTION，其余行 → RULE。
+   行读取经 nsp_getline_capped 有界动态拼装：超长行整行丢弃并告警
+   （与 docs/config.md「单行 ≤2048 字节，超长行不参与匹配」对齐）。
+   旧 fgets 固定缓冲会把长行切成多段、首段仍当规则生效 + 余段污染日志。 */
 static void view_scan_main_file(ViewAcc* va, const char* path) {
     FILE* fp = fopen(path, "r");
     if (!fp) {
         LOG_ERR("无法打开主规则文件: %s (%s)", path, strerror(errno));
         return;
     }
-    char line[NSP_CONFIG_LINE_MAX];
+    char* line = nullptr;
+    size_t line_cap = 0;
     int line_num = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    for (;;) {
+        int r = nsp_getline_capped(fp, &line, &line_cap, NSP_CONFIG_LINE_MAX, NULL);
+        if (r == 0) break;
         line_num++;
+        if (r == -2) {
+            LOG_WRN("规则文件 %s 第 %d 行超长（>%d 字节），整行跳过", path, line_num,
+                    NSP_CONFIG_LINE_MAX);
+            continue;
+        }
+        if (r < 0) break;
         char* p = clean_path_string(line);
         if (!p || p[0] == '#' || p[0] == 0) continue;
         char* sec = nullptr;
@@ -927,6 +939,7 @@ static void view_scan_main_file(ViewAcc* va, const char* path) {
         view_first_token(p, type, sizeof type);
         view_push(va, NSP_CFG_REC_RULE, 0, -1, line_num, path, type, p);
     }
+    free(line);
     fclose(fp);
 }
 
@@ -955,10 +968,20 @@ static void view_scan_app_rules(ViewAcc* va) {
                 view_push(va, NSP_CFG_REC_APP_FILE, 0, uid, 0, app_conf_path, nullptr, pkg);
                 FILE* afp = fopen(app_conf_path, "r");
                 if (afp) {
-                    char line[NSP_CONFIG_LINE_MAX];
+                    char* line = nullptr;
+                    size_t line_cap = 0;
                     int app_line_num = 0;
-                    while (fgets(line, sizeof(line), afp)) {
+                    for (;;) {
+                        int r =
+                            nsp_getline_capped(afp, &line, &line_cap, NSP_CONFIG_LINE_MAX, NULL);
+                        if (r == 0) break;
                         app_line_num++;
+                        if (r == -2) {
+                            LOG_WRN("规则文件 %s 第 %d 行超长（>%d 字节），整行跳过",
+                                    app_conf_path, app_line_num, NSP_CONFIG_LINE_MAX);
+                            continue;
+                        }
+                        if (r < 0) break;
                         char* p = clean_path_string(line);
                         if (!p || p[0] == '#' || p[0] == 0) continue;
                         char* sec = nullptr;
@@ -974,6 +997,7 @@ static void view_scan_app_rules(ViewAcc* va) {
                         view_push(va, NSP_CFG_REC_RULE, 0, uid, app_line_num, app_conf_path, type,
                                   p);
                     }
+                    free(line);
                     fclose(afp);
                 }
             } else if (ext && strcmp(ext, ".disabled") == 0) {
@@ -1075,7 +1099,13 @@ void config_build_from_view(const NspCfgRec* recs, int count) {
         case NSP_CFG_REC_RULE: {
             if (!r->text) break;
             /* 复制后再解析：parse_config_line 及其下 parse_*_rule 会就地切分入参，
-               视图须保持只读（模块可能持有框架下发的视图） */
+               视图须保持只读（模块可能持有框架下发的视图）。
+               扫描侧已以 NSP_CONFIG_LINE_MAX 限长，此处仅防御性复核：
+               超限（外来视图）即跳过，永不截断生效。 */
+            if (strlen(r->text) >= (size_t)NSP_CONFIG_LINE_MAX) {
+                LOG_WRN("规则文本超长（%s:%d），跳过", r->file ? r->file : "?", r->line_no);
+                break;
+            }
             char line[NSP_CONFIG_LINE_MAX];
             snprintf(line, sizeof(line), "%s", r->text);
             if (cur) parse_config_line(cur, line, current_user_id, r->line_no, r->file);

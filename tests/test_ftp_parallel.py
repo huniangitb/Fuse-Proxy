@@ -29,6 +29,7 @@
 """
 import errno
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -293,13 +294,28 @@ def stat_ok(name, size=100):
 
 
 def listdir_n(base):
-    """一次目录列举（每次都是真实网络 LIST）；返回 None=成功。"""
+    """一次目录列举；返回 None=成功。
+    注意：同目录重复列举命中模块侧 LIST 缓存（V5 单条目，零网络）——
+    延迟测量须列不同目录（见阶段 B），此处只保证正确性。"""
     try:
         if not os.listdir(base):
             return "readdir 返回空目录"
     except OSError as e:
         return f"readdir 失败 {e!r}"
     return None
+
+
+def make_dirs(names):
+    for n in names:
+        d = Path(FTP_UPLOAD) / n
+        d.mkdir(exist_ok=True)
+        (d / "f").write_bytes(b"x")
+        os.chmod(d / "f", 0o666)
+
+
+def rm_dirs(names):
+    for n in names:
+        shutil.rmtree(Path(FTP_UPLOAD) / n, ignore_errors=True)
 
 
 # ================= 阶段 A：并发正确性 =================
@@ -353,8 +369,9 @@ def phase_a():
 #
 # 测量对象是 **readdir**（LIST）而非 stat：stat 对未解析路径要先做一次
 # lookup（内核 VFS 对同一父目录的并发 lookup 会排队），那样测到的瓶颈是
-# 内核路径解析而不是本模块的控制面并发；readdir 无此confound——每次
-# os.listdir 都实打实落到 backend_readdir 发一次 LIST（模块侧不缓存目录）。
+# 内核路径解析而不是本模块的控制面并发；readdir 无此confound——每个不同
+# 目录的首次 os.listdir 都实打实落到 backend_readdir 发一次 LIST（同目录
+# 重复列举命中模块侧 V5 LIST 缓存，零网络，故基线/并发须列不同目录）。
 
 def phase_b(relay, restart_fuse):
     print("── B. 连接复用与延迟收敛（延迟中继放大控制往返）──")
@@ -372,6 +389,12 @@ def phase_b(relay, restart_fuse):
     base = Path(MNT) / "0" / SERVER
     relay.reset()
 
+    # 12 个不同目录：每个基线/并发 listdir 都是缓存未命中的真实 LIST
+    #（同目录重复列举命中 V5 LIST 缓存，测不出网络延迟）。
+    dirs = [f"{PREFIX}bd{i}" for i in range(12)]
+    make_dirs(dirs)
+    vdirs = [base / d for d in dirs]
+
     # 预热：并发 readdir 触发多连接建立（首轮并发会开新连接并留在 multi 的
     # 连接缓存里，后续轮次直接复用——连接数只能在首次并发时观察到）
     for _ in range(3):
@@ -379,19 +402,20 @@ def phase_b(relay, restart_fuse):
         if bad:
             fail("预热并发 readdir", "; ".join(bad[:2]))
             rm_files(warm)
+            rm_dirs(dirs)
             return
 
-    # 串行基线
+    # 串行基线（12 个不同目录 × 真实 LIST）
     t0 = time.monotonic()
-    for _ in range(12):
-        err = listdir_n(base)
+    for vd in vdirs:
+        err = listdir_n(vd)
         if err:
             fail("串行基线 readdir", err)
             break
     t_seq = time.monotonic() - t0
-    # 并发
+    # 并发（12 线程 × 12 个不同目录，12 路真实 LIST 并发在飞）
     t0 = time.monotonic()
-    bad = [b for b in run_threads(listdir_n, [(base,)] * 12) if b]
+    bad = [b for b in run_threads(listdir_n, [(vd,) for vd in vdirs]) if b]
     t_par = time.monotonic() - t0
     new_conns, max_conns = relay.stats()
 
@@ -417,6 +441,7 @@ def phase_b(relay, restart_fuse):
         else:
             fail("并发耗时 < 串行 0.6×", f"{ratio:.2f}×（串行 {t_seq:.3f}s，并发 {t_par:.3f}s）")
     rm_files(warm)
+    rm_dirs(dirs)
 
 
 # ================= 阶段 C：热重载竞态 =================

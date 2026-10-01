@@ -22,37 +22,69 @@
 #include "config_parser.h"
 #include "ns_utils.h"
 
-/* LIST_MODULES 应答：扫描模块目录，列出含 <name>.so 的模块（与 fuse_daemon 加载约定一致） */
+/* LIST_MODULES 应答：扫描模块目录，列出含 <name>.so 的模块（与 fuse_daemon 加载约定一致）。
+   应答动态翻倍（初容 4KB）：模块数无上限后固定 4KB 会在约 15 个模块处截断
+   列表（且截断时连 END 尾标记都发不出，客户端误以为全量）。 */
 static void handle_list_modules(int client_fd) {
-    char reply[4096];
-    int offset = 0;
+    size_t cap = 4096;
+    char* reply = malloc(cap);
+    if (!reply) return;
+    size_t offset = 0;
+    bool truncated = false;
     DIR* d = opendir(MODULES_DIR);
     if (d) {
         struct dirent* de;
-        while ((de = readdir(d)) && offset < (int)sizeof(reply) - 64) {
+        while ((de = readdir(d))) {
             if (de->d_name[0] == '.') continue;
             char so[PATH_MAX];
             snprintf(so, sizeof so, "%s/%s/%s.so", MODULES_DIR, de->d_name, de->d_name);
-            if (access(so, F_OK) == 0) {
-                /* 先算整行长度，放得下才追加，防止 offset 越过缓冲区
-                   （snprintf 返回应写长度，255 字符模块名单行最长 263 字节） */
-                int n = snprintf(nullptr, 0, "MODULE|%s\n", de->d_name);
-                if (n <= 0 || n >= (int)sizeof(reply) - offset) break;
-                int w = snprintf(reply + offset, (size_t)((int)sizeof(reply) - offset),
-                                 "MODULE|%s\n", de->d_name);
-                if (w > 0) offset += w;
+            if (access(so, F_OK) != 0) continue;
+            /* 先算整行长度，放不下则翻倍（OOM 即截断收尾，见下） */
+            int n = snprintf(nullptr, 0, "MODULE|%s\n", de->d_name);
+            if (n <= 0) continue;
+            while (offset + (size_t)n + 5 > cap) {
+                size_t ncap = cap * 2;
+                if (ncap > 1u << 20) {
+                    truncated = true; /* 1MB 仍不够：loud 截断（absurd） */
+                    break;
+                }
+                char* grown = realloc(reply, ncap);
+                if (!grown) {
+                    truncated = true;
+                    break;
+                }
+                reply = grown;
+                cap = ncap;
             }
+            if (truncated) break;
+            int w = snprintf(reply + offset, cap - offset, "MODULE|%s\n", de->d_name);
+            if (w > 0) offset += (size_t)w;
         }
         closedir(d);
     }
-    if (offset < (int)sizeof(reply) - 4) {
-        int n = snprintf(reply + offset, sizeof(reply) - (size_t)offset, "END\n");
-        if (n > 0) offset += n;
+    if (truncated) {
+        /* 截断标记行（客户端可辨“非全量”，不静默缺模块） */
+        const char* mark = "TRUNCATED\nEND\n";
+        size_t ml = strlen(mark);
+        if (offset + ml > cap) {
+            char* grown = realloc(reply, offset + ml + 1);
+            if (grown) {
+                reply = grown;
+                cap = offset + ml + 1;
+            } else {
+                send(client_fd, reply, offset, MSG_NOSIGNAL);
+                free(reply);
+                return;
+            }
+        }
+        memcpy(reply + offset, mark, ml + 1);
+        offset += ml;
     } else {
-        offset = (int)sizeof(reply) - 1; /* 钳制，杜绝 size 回绕越界写 */
-        reply[offset] = '\0';
+        memcpy(reply + offset, "END\n", 5);
+        offset += 4;
     }
     send(client_fd, reply, offset, MSG_NOSIGNAL);
+    free(reply);
 }
 
 /* IPC 线程挂载参数 */

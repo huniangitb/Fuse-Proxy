@@ -13,7 +13,16 @@
 #include <stdint.h>
 #include "nsp_module.h"
 
-#define MAX_MODULES 16
+/* 注册表容量：初容 16（写锁内动态翻倍），硬上限 1024（fh 槽位 10 位编码，
+   见 fuse_daemon.c NSP_FH_BACKEND_SLOT_MASK）。
+   静态快照数组（槽位原子快照/围栏/guard/占位名）按硬上限分配（约 100KB
+   .bss，无每模块成本）；注册表本体按需翻倍，无 16 上限静默拒载。
+   超硬上限 loud 拒绝（practically unreachable：每模块一 inotify watch +
+   memfd，先触 fd 上限）。MAX_MODULES 保留为硬上限别名（静态数组维度与
+   断言用），新代码用 MODULE_* 语义名。 */
+#define MODULE_INIT_CAP 16
+#define MODULE_HARD_MAX 1024
+#define MAX_MODULES     MODULE_HARD_MAX
 
 /* 初始化：mkdir 模块目录 + 全量扫描 + 启动热插拔监控线程。
    rules_path 为框架规则配置路径（--rules=），modules_dir 为模块目录
@@ -48,7 +57,7 @@ bool module_any_loaded(void);
 const char* module_slot_name(int slot);
 
 /* 模块置毒（崩溃恢复/熔断触发的强制卸载）：槽位快照置空（规则立即失效）
-   → 等在途引用归零 → dlclose → 落盘 ban 记录（同哈希 .so 不再重载）。
+   → 等在途引用归零 → dlclose → 落盘 ban 记录（同 mtime .so 不再重载）。
    幂等；由 module_guard 在确认故障后调用。0 成功，-1 槽位无效。 */
 int module_fault_poison(int slot, const char* reason);
 

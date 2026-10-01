@@ -578,17 +578,20 @@ bool is_media_provider(const char* pkg) {
 /* 存储路径合成统一出口：fuse_daemon fw_default_real_path、br_rules 回退分支、
  * path_vars build_real_base 尾部分支原各写一份 STORAGE_BASE snprintf，现收敛至此。
  * 语义与原手写逻辑逐分支一致（g_real_root 非空则用测试/注入指定的真实根）。
- * 截断可观测：保持 void 签名（不断模块 ABI）。P3：每展开点独立计数、前 3 次
- * 带调用点告警（不同场景不再被一次性标志屏蔽），之后每 1024 次补一行抑制计数。
+ * 失败闭合：保持 void 签名（不断模块 ABI，见 nsp_module.h），放不下时写空串
+ * 而非截断串——调用方以截断路径 open 会读写**错误的文件**，空串则以 ENOENT
+ * 失败（fail-closed）。P3：每展开点独立计数、前 3 次带调用点告警（不同场景
+ * 不再被一次性标志屏蔽），之后每 1024 次补一行抑制计数。
  * 输入恒受 MAX_PATH_LEN/PATH_MAX 约束，实际不可达；一旦出现即排查。 */
 #define PATH_SNPRINTF(out, sz, ...)                                                                \
     do {                                                                                           \
         int _pn = snprintf(out, sz, __VA_ARGS__);                                                  \
         if (_pn < 0 || (size_t)_pn >= (sz)) {                                                      \
+            (out)[0] = '\0'; /* 失败闭合：截断串永不外流 */                                        \
             static _Atomic unsigned _pwarn_n = 0;                                                  \
             unsigned _n0 = atomic_fetch_add(&_pwarn_n, 1);                                         \
             if (_n0 < 3)                                                                           \
-                LOG_WRN("路径合成截断[%s:%d]（需 %d/限 %zu），请排查超长输入", __func__, __LINE__, \
+                LOG_WRN("路径合成截断[%s:%d]（需 %d/限 %zu），已置空失败", __func__, __LINE__,     \
                         _pn, (size_t)(sz));                                                        \
             else if (_n0 % 1024 == 0)                                                              \
                 LOG_WRN("路径合成截断[%s:%d]已累计 %u 次（抑制中）", __func__, __LINE__, _n0);     \

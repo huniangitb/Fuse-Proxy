@@ -42,10 +42,11 @@ static int bc_getattr(const char* path, struct stat* st) {
     return 0;
 }
 
-static int bc_readdir(const char* path, NspDirEntry* entries, int max) {
+static int bc_readdir(const char* path, NspDirEntry* entries, int max, uint64_t offset) {
     (void)path;
     (void)entries;
     (void)max;
+    (void)offset;
     return 0; /* 空目录 */
 }
 

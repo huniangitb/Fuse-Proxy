@@ -43,6 +43,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include "nsp_module.h"
+#include "module_loader.h" /* MODULE_HARD_MAX（围栏槽位表容量上源） */
 
 /* 围栏调用返回值（仅围栏自身产生，与模块返回码空间严格区分）。
    ⚠ 哨兵值必须远离模块的合法返回值域：backend_match 成功返回 1，
@@ -69,14 +70,15 @@ void fault_fence_rearm(void);
 typedef void (*NspOrigCrashHandler)(int sig, siginfo_t* info, void* uctx);
 void fault_fence_set_orig_handler(NspOrigCrashHandler h);
 
-/* 围栏槽位表容量：MAX_MODULES 个模块槽位（索引 0..MAX_MODULES-1，与 loader
-   槽位一一对应）+ 1 个未绑定槽位（见下）。 */
-#define NSP_FENCE_MAX_SLOTS 17
+/* 围栏槽位表容量：MODULE_HARD_MAX 个模块槽位（索引与 loader 槽位一一对应）
+   + 1 个未绑定槽位（见下）。信号处理器内读取，故静态数组（1025×72B≈74KB
+   .bss），不随注册表动态分配。 */
+#define NSP_FENCE_MAX_SLOTS (MODULE_HARD_MAX + 1)
 /* 未绑定槽位索引：供"尚无正式模块槽位"的过渡期调用归因——init 试探期与
    commit 失败（注册表满）时的 exit。与任何模块槽位不重叠，故不会覆盖在册
    模块的归因信息；过渡期调用串行（仅 monitor 线程），单槽位足够。
-   fault_fence.c 以 _Static_assert 与 MAX_MODULES 对齐。 */
-#define NSP_FENCE_UNBOUND_SLOT 16
+   fault_fence.c 以 _Static_assert 与 MODULE_HARD_MAX 对齐。 */
+#define NSP_FENCE_UNBOUND_SLOT MODULE_HARD_MAX
 
 /* 模块加载/卸载时更新静态注册表（信号安全），供崩溃恢复日志与
    归因查询输出模块名。dl_handle 保留供映射段判定扩展。 */
@@ -105,8 +107,8 @@ int nsp_fence_backend_match(int slot, const char* op_name, int (*fn)(const char*
 int nsp_fence_backend_getattr(int slot, const char* op_name, int (*fn)(const char*, struct stat*),
                               const char* path, struct stat* st);
 int nsp_fence_backend_readdir(int slot, const char* op_name,
-                              int (*fn)(const char*, NspDirEntry*, int), const char* path,
-                              NspDirEntry* entries, int max);
+                              int (*fn)(const char*, NspDirEntry*, int, uint64_t),
+                              const char* path, NspDirEntry* entries, int max, uint64_t offset);
 int nsp_fence_backend_open(int slot, const char* op_name, int (*fn)(const char*, int, uint64_t*),
                            const char* path, int flags, uint64_t* h);
 int nsp_fence_backend_read(int slot, const char* op_name,

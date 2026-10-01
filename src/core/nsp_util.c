@@ -6,6 +6,9 @@
 #include "nsp_log.h"
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <pthread.h>
@@ -194,5 +197,206 @@ int nsp_log_level_parse(const char* name) {
     /* 越界（未知名称 / 损坏的数字字段）一律判为无效：若原样放行，`9` 会通过
        任何 `--level` 过滤、又被 nsp_log_level_name 渲染成 INFO，等级面全失真 */
     return (level >= LOG_DEBUG && level <= LOG_ERROR) ? level : -1;
+}
+
+/* ==================== 通用动态扩充（低内存快道 + 堆溢出） ==================== */
+
+static size_t nsp_dyn_limit(size_t max) {
+    size_t lim = NSP_DYN_FORMAT_MAX;
+    if (max > 0 && max < lim) lim = max;
+    return lim;
+}
+
+char* nsp_vformat_dynamic(size_t max, const char* fmt, va_list ap) {
+    if (!fmt) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t lim = nsp_dyn_limit(max);
+    va_list aq;
+    va_copy(aq, ap);
+    int need = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (need < 0) return NULL;
+    if ((size_t)need >= lim) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    char* out = malloc((size_t)need + 1);
+    if (!out) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    va_copy(aq, ap);
+    int n2 = vsnprintf(out, (size_t)need + 1, fmt, aq);
+    va_end(aq);
+    if (n2 < 0 || n2 != need) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+char* nsp_format_dynamic(size_t max, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char* r = nsp_vformat_dynamic(max, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int nsp_snprintf_dyn(char* fixed, size_t fixed_sz, char** heap_out, size_t max,
+                     const char* fmt, ...) {
+    if (heap_out) *heap_out = NULL;
+    if (!fmt) return -1;
+    /* 纯堆路径（无栈缓冲）：算长 → 一次 malloc → 落定 */
+    if (!fixed || fixed_sz == 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        va_list aq;
+        va_copy(aq, ap);
+        int need = vsnprintf(NULL, 0, fmt, aq);
+        va_end(aq);
+        if (need < 0) {
+            va_end(ap);
+            return -1;
+        }
+        if ((size_t)need >= nsp_dyn_limit(max)) {
+            va_end(ap);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (!heap_out) {
+            va_end(ap);
+            return need;
+        }
+        char* h = malloc((size_t)need + 1);
+        if (!h) {
+            va_end(ap);
+            errno = ENOMEM;
+            return -1;
+        }
+        int n2 = vsnprintf(h, (size_t)need + 1, fmt, ap);
+        va_end(ap);
+        if (n2 < 0 || n2 != need) {
+            free(h);
+            return -1;
+        }
+        *heap_out = h;
+        return need;
+    }
+    /* 栈快道：一次 vsnprintf 试写；返回值 need 本就是“需要多大”，
+       放不下才 malloc 精确大小（常见短输入零堆分配）。 */
+    va_list ap, aq;
+    va_start(ap, fmt);
+    va_copy(aq, ap);
+    int need = vsnprintf(fixed, fixed_sz, fmt, ap);
+    va_end(ap);
+    if (need < 0) {
+        va_end(aq);
+        return -1;
+    }
+    if ((size_t)need < fixed_sz) {
+        va_end(aq);
+        return need;
+    }
+    if ((size_t)need >= nsp_dyn_limit(max)) {
+        va_end(aq);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (!heap_out) {
+        va_end(aq);
+        return need;
+    }
+    char* h = malloc((size_t)need + 1);
+    if (!h) {
+        va_end(aq);
+        errno = ENOMEM;
+        return -1;
+    }
+    int n2 = vsnprintf(h, (size_t)need + 1, fmt, aq);
+    va_end(aq);
+    if (n2 < 0 || n2 != need) {
+        free(h);
+        return -1;
+    }
+    *heap_out = h;
+    return need;
+}
+
+int nsp_getline_capped(FILE* fp, char** buf, size_t* cap, size_t max, size_t* out_len) {
+    if (!fp || !buf || !cap) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (*buf == NULL || *cap < 256) {
+        char* nb = realloc(*buf, 256);
+        if (!nb) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *buf = nb;
+        *cap = 256;
+    }
+    size_t len = 0;
+    (*buf)[0] = '\0';
+    for (;;) {
+        if (!fgets(*buf + len, *cap - len, fp)) {
+            /* 读失败但已有内容 = 末行无换行：仍算一行 */
+            if (len > 0) {
+                if (max > 0 && len > max) return -2;
+                if (out_len) *out_len = len;
+                return 1;
+            }
+            return feof(fp) ? 0 : -1;
+        }
+        len += strlen(*buf + len);
+        if (len > 0 && (*buf)[len - 1] == '\n') {
+            (*buf)[--len] = '\0';
+            if (len > 0 && (*buf)[len - 1] == '\r') (*buf)[--len] = '\0';
+            /* 超长但不大（整行已在缓冲内）：按调用方约定整行跳过。
+               空行（len==0）是有效行，返回 1 而非 0（0 只表 EOF）。 */
+            if (max > 0 && len > max) return -2;
+            if (out_len) *out_len = len;
+            return 1;
+        }
+        if (feof(fp)) {
+            if (max > 0 && len > max) return -2;
+            if (out_len) *out_len = len;
+            return 1;
+        }
+        /* 缓冲满而行未完：超长则只消费不存，峰值 ≤ max+512 */
+        if (max > 0 && len >= max) {
+            char discard[512];
+            for (;;) {
+                if (!fgets(discard, sizeof discard, fp)) break;
+                if (strchr(discard, '\n') || feof(fp)) break;
+            }
+            return ferror(fp) ? -1 : -2;
+        }
+        size_t ncap = *cap * 2;
+        if (max > 0 && ncap > max + 2) ncap = max + 2;
+        if (max == 0 && ncap > NSP_DYN_FORMAT_MAX) {
+            errno = EFBIG;
+            return -1;
+        }
+        if (ncap <= *cap) {
+            /* max 极小（<256）导致无法扩容：转丢弃 */
+            char discard[512];
+            for (;;) {
+                if (!fgets(discard, sizeof discard, fp)) break;
+                if (strchr(discard, '\n') || feof(fp)) break;
+            }
+            return ferror(fp) ? -1 : -2;
+        }
+        char* nb = realloc(*buf, ncap);
+        if (!nb) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *buf = nb;
+        *cap = ncap;
+    }
 }
 

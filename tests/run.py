@@ -77,9 +77,10 @@ SUITE_MAP = [
 
     (("test_log_pipeline.py",),
      ("src/log/", "src/core/nsp_comm.c", "include/nsp_comm.h", "include/nsp_log.h",
-      "src/core/common.c", "src/core/nsp_util.c"),
+      "src/core/common.c", "src/core/nsp_util.c", "include/nsp_util.h"),
      ("vfs_log_io", "monitor_on", "persist_stage", "drain_async", "log_internal",
-      "fw_config_monitor_for", "nsp_log_level_name", "nsp_log_level_parse"),
+      "fw_config_monitor_for", "nsp_log_level_name", "nsp_log_level_parse",
+      "nsp_getline_capped", "nsp_snprintf_dyn", "nsp_format_dynamic"),
      "日志链路（生产 → 通讯 → log_monitor → 查询）"),
 
     (("test_monitor_layers.py",),
