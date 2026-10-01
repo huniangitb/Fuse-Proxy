@@ -8,6 +8,7 @@
 
 覆盖：列目录 / 读现有文件 / 创建写入 / 读回 / mkdir / rename / unlink / rmdir，
 并直接核对 vsftpd 匿名根（/home/bdy/ftp）验证 FTP 服务器实际变化。
+V5 分页回归：700 文件大目录一次列全（旧 512 整批上限会静默丢尾）。
 """
 import subprocess, os, sys, time, shutil
 from pathlib import Path
@@ -241,6 +242,22 @@ def main():
                 got == "ftp-original-content" else fail("熔断误杀", f"got='{got}'")
         except Exception as e:
             fail("缺失路径不入内部熔断（防误杀）", str(e))
+
+        # 12. V5 分页：700 文件大目录一次列全（3 页 × 256；旧 512 整批
+        #     上限会静默丢尾）。文件直写 FTP 根（免 700 次 STOR），只测读链路。
+        try:
+            bigd = "nsp_bigdir"
+            (Path(FTP_UPLOAD)/bigd).mkdir(exist_ok=True)
+            want = {f"f{i:04d}" for i in range(700)}
+            for n in want:
+                (Path(FTP_UPLOAD)/bigd/n).write_bytes(b"x")
+            items = set(os.listdir(m/"0"/SERVER/bigd))
+            ok("大目录 700 文件一次列全（V5 分页）") if items == want else fail(
+                "大目录分页", f" 列出 {len(items)}/700（丢尾则为旧 512 上限复发）")
+        except Exception as e:
+            fail("大目录分页", str(e))
+        finally:
+            shutil.rmtree(Path(FTP_UPLOAD)/"nsp_bigdir", ignore_errors=True)
 
     finally:
         stop_fuse(p)   # fuse_daemon 退出 → 模块 exit 清理后端

@@ -7,6 +7,7 @@ V4 起模块只有后端形态、规则引擎内建，故本套件覆盖：
   3. 运行中移除 .so：后端不再服务该路径，落回本地直通（热拔）
   4. 损坏 .so：加载失败但 daemon 存活、其它路径正常
   5. 热拔后规则仍在（引擎不受模块存亡影响）
+  6. 旧哈希格式 ban 自愈（内容哈希校验弃用后的迁移）
 """
 import subprocess, os, sys, time, shutil
 from pathlib import Path
@@ -40,7 +41,7 @@ def build_abi_variants():
     """同一份 backend_abi.c 编两份：合法 ABI 与旧 ABI（-DNSP_TEST_ABI=1）。
 
     旧 ABI 那份模拟设备上残留的旧 basic_rules.so：模块目录里这类 .so 不随包
-    更新消失，而加载器每 5s 扫描一次就重试一次。"""
+    更新消失，而每次事件扫描都会重试一次。"""
     for tag, extra in (("", []), ("_stale", ["-DNSP_TEST_ABI=1"])):
         out = ROOT / "build_gnu" / f"backend_abi{tag}.so"
         r = subprocess.run(["gcc", "-shared", "-fPIC", "-O1", "-DNSP_MODULE_BUILD",
@@ -101,7 +102,7 @@ def memfd_count(proc, name=None):
         return -1
 
 def ban_lines(name):
-    """<modules_dir>/.banned 里该模块的记录（name|hash|reason|ts）。"""
+    """<modules_dir>/.banned 里该模块的记录（name|mtime|reason|ts）。"""
     p = Path(MODDIR) / ".banned"
     if not p.exists(): return []
     return [l for l in p.read_text().splitlines() if l.startswith(name + "|")]
@@ -218,15 +219,15 @@ def main():
     run_case("4. 损坏 .so 容错", case4)
 
     def case5(p, m):
-        """残留的旧 ABI 模块：加载前拒绝 + 按哈希落 ban + 不泄漏内存副本 fd
+        """残留的旧 ABI 模块：加载前拒绝 + 按 mtime 落 ban + 不泄漏内存副本 fd
 
         设备现场：规则引擎内建进框架后删掉了 basic_rules，但 CONFIG_DIR/modules
         不在 Magisk 模块目录内，卸载/更新都不会动它，安装脚本也只 cp 不删 →
-        旧 .so 永久残留。加载器每 5s 扫描一次就重试一次：修复前每次留一条
-        ERROR 并泄漏一个 memfd（1 个/5s，累积到 nofile 上限即 EMFILE），
-        修复后只报一次、之后按文件哈希静默跳过。"""
+        旧 .so 永久残留。每次事件扫描都会重试一次：修复前每次留一条
+        ERROR 并泄漏一个 memfd（累积到 nofile 上限即 EMFILE），
+        修复后只报一次、之后按文件 mtime 静默跳过。"""
         put_so(ROOT / "build_gnu" / "backend_abi_stale.so", "backend_abi")
-        # 首次扫描：拒绝 + 落 ban（扫描周期 5s，留足两轮）
+        # 首次事件扫描：拒绝 + 落 ban（留足 20s 等 inotify 事件 + 稳定性窗口）
         deadline = time.time() + 20
         while time.time() < deadline and not ban_lines("backend_abi"):
             time.sleep(0.5)
@@ -239,27 +240,50 @@ def main():
         ok("旧 ABI 模块未加载") if memfd_count(p, "backend_abi") == 0 else fail(
             "旧 ABI 模块被加载了", f"maps 含 {memfd_count(p,'backend_abi')} 个 memfd")
 
-        # 跨两个扫描周期：fd 不得增长（修复前每轮泄漏一个 memfd）
+        # 落 ban 后无事件即无扫描：fd 不得增长（修复前每次扫描泄漏一个 memfd）
         fd0 = fd_count(p)
         time.sleep(12)
         fd1 = fd_count(p)
-        ok("拒绝后 fd 不增长（跨 2 个扫描周期）") if fd0 == fd1 else fail(
-            "fd 泄漏", f"{fd0} → {fd1}（每 5s 一轮扫描各泄漏一个 memfd）")
+        ok("拒绝后 fd 不增长（静默 12s）") if fd0 == fd1 else fail(
+            "fd 泄漏", f"{fd0} → {fd1}（每次扫描各泄漏一个 memfd）")
         ok("拒绝后无残留内存副本") if memfd_count(p, "backend_abi") == 0 else fail(
             "内存副本泄漏", f"maps 含 {memfd_count(p,'backend_abi')} 个 memfd")
 
-        # ban 按文件哈希：同名文件换了内容（真更新）必须放行，不能挡升级
+        # ban 按文件 mtime：同名文件换了内容（真更新）必须放行，不能挡升级
         put_so(ROOT / "build_gnu" / "backend_abi.so", "backend_abi")
         deadline = time.time() + 20
         while time.time() < deadline and memfd_count(p, "backend_abi") == 0:
             time.sleep(0.5)
-        ok("哈希变化后放行（旧 ban 不挡真更新）") if memfd_count(p, "backend_abi") > 0 else fail(
+        ok("mtime 变化后放行（旧 ban 不挡真更新）") if memfd_count(p, "backend_abi") > 0 else fail(
             "更新被 ban 挡住", "换成合法 ABI 的同名模块后仍未加载")
         ok("放行后陈旧 ban 记录被清除") if not ban_lines("backend_abi") else fail(
             "陈旧 ban 未清除", str(ban_lines("backend_abi")))
         ok("旧 ABI 期间规则/普通路径不受影响") if (m/"0/normal/n.txt").exists() else fail(
             "普通路径", "旧 ABI 模块在场时 /0/normal/n.txt 不可见")
     run_case("5. 残留旧 ABI 模块（拒绝/落 ban/不泄漏 fd/不挡更新）", case5)
+
+    def case6(p, m):
+        """旧哈希格式 ban 自愈：.banned 里残留的 name|SHA256|reason|ts 行
+        （内容哈希校验已弃用，含 bionic 误杀的 self-hash mismatch 行）命中时
+        按 stale 清除并放行"""
+        # 先清上一个 case 残留的同名模块，等卸载落定（memfd 从 maps 消失）
+        shutil.rmtree(f"{MODDIR}/backend_abi", ignore_errors=True)
+        deadline = time.time() + 20
+        while time.time() < deadline and memfd_count(p, "backend_abi") != 0:
+            time.sleep(0.5)
+        so = ROOT / "build_gnu" / "backend_abi.so"
+        # 线上真实残留行（ftp self-hash 误杀现场）：第二字段 64 位哈希即旧格式
+        with open(Path(MODDIR) / ".banned", "w") as f:
+            f.write("backend_abi|1e2513d1f86358166e8fb88304153610e6fcccfcf2d6238726ea8ac0caaa2958|self-hash mismatch|1790780214\n")
+        put_so(so, "backend_abi")
+        deadline = time.time() + 20
+        while time.time() < deadline and memfd_count(p, "backend_abi") == 0:
+            time.sleep(0.5)
+        ok("陈旧哈希格式 ban 不挡加载") if memfd_count(p, "backend_abi") > 0 else fail(
+            "旧格式 ban 未自愈", "残留哈希格式记录阻挡了正常模块")
+        ok("旧格式 ban 记录被清除") if not ban_lines("backend_abi") else fail(
+            "旧格式 ban 未清除", str(ban_lines("backend_abi")))
+    run_case("6. 旧哈希格式 ban 自愈", case6)
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")

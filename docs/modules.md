@@ -47,7 +47,7 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 
 ## 3. 模块 ABI（`include/nsp_module.h`）
 
-当前 `NSP_MODULE_ABI_VERSION = 4`、`NSP_FRAMEWORK_API_VERSION = 4`。
+当前 `NSP_MODULE_ABI_VERSION = 5`、`NSP_FRAMEWORK_API_VERSION = 4`。
 
 **V3 是决策结果的不兼容重构**：`NspResolveResult` 被声明式的 `NspPathDecision` 取代，模块只声明「这个路径该怎么表现」，errno 映射与权限策略全部收归框架单点（`fw_route` 强制 appear_missing/read_only，`vfs_apply_attr_override` 落实属性覆盖，只读判定统一走 `vfs_check_read_only`）。字段变化：
 
@@ -64,9 +64,9 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 
 **V3 的行为变更（有意）**：`appear_missing` 在**所有**回调统一返回 `ENOENT`。V2 时代读类回调是 `ENOENT`、写类回调是 `EACCES`，同一声明产生两种结果；统一后与「存在变不存在」的语义一致。若前端曾依赖写类路径的 `EACCES`，需按 `ENOENT` 调整。
 
-**注意两个版本号是不同的命名空间**：`NSP_MODULE_ABI_VERSION`（本次 3→4，破坏性，须重编译）与 `NSP_FRAMEWORK_API_VERSION`（`NspFrameworkApi` 的版本，尾部兼容演进，自身不要求重编译）互不相干，当前恰好都是 4。**框架 API V4 是尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故框架 API 这一侧不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3 一律拒载（见下方加载校验顺序、§6.5）。
+**注意两个版本号是不同的命名空间**：`NSP_MODULE_ABI_VERSION`（本次 4→5，破坏性，须重编译）与 `NSP_FRAMEWORK_API_VERSION`（`NspFrameworkApi` 的版本，尾部兼容演进，自身不要求重编译）互不相干。**框架 API V4 是尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故框架 API 这一侧不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3/V4 一律拒载（见下方加载校验顺序、§6.5）。
 
-加载校验顺序（`module_prepare`）：`dlopen` → `dlsym(nsp_module_info)` → 魔数/ABI 版本 → 名字一致 → 自哈希 → `init`。**ABI 校验发生在 `dlopen` 之后**：`RTLD_NOW` 会立即解析模块的全部符号，V1 模块引用已删除的导出符号时可能在 ABI 检查之前就解析失败；模块的构造器也已在 `dlopen` 期间运行。因此"拒绝旧 ABI"是加载失败，不是加载前拦截。
+加载校验顺序（`module_prepare`）：稳定性校验 → 读入内存副本 → `dlopen` → `dlsym(nsp_module_info)` → 魔数/ABI 版本 → 名字一致 → `init`。框架只校验"模块是否可用"，不做内容哈希。**ABI 校验发生在 `dlopen` 之后**：`RTLD_NOW` 会立即解析模块的全部符号，V1 模块引用已删除的导出符号时可能在 ABI 检查之前就解析失败；模块的构造器也已在 `dlopen` 期间运行。因此"拒绝旧 ABI"是加载失败，不是加载前拦截。
 
 ### 3.1 类型与能力位
 
@@ -133,7 +133,9 @@ int (*readdir_extra)(const NspQueryCtx*, const char* sub_path, int user_id,
 ```c
 int (*backend_match)(const char* path);        /* 1=管理该路径（前缀匹配） 0=否 */
 int (*backend_getattr)(const char* path, struct stat* st);
-int (*backend_readdir)(const char* path, NspDirEntry* entries, int max);
+/* V5 分页：跳过前 offset 条，填 ≤max 条；0=到末尾，<0 errno。
+   超长名（≥256）整条跳过，禁止截断安装。 */
+int (*backend_readdir)(const char* path, NspDirEntry* entries, int max, uint64_t offset);
 int (*backend_open)(const char* path, int flags, uint64_t* h);
 int (*backend_create)(const char* path, mode_t mode, uint64_t* h);
 int (*backend_read)(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
@@ -145,6 +147,10 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 `backend_flush` 与 `backend_release` 的分工是易错点：FLUSH 可因 dup/fork **多次调用**，只能收尾数据（如上传完成），销毁必须等 RELEASE。
 
+**列目录分页（V5）**：框架按 256 条/页、`offset` 累加逐页拉取，直到短页/0 页或 filler 满——FTP 大目录无条数上限（V4 的 512 整批上限会静默丢尾）。FTP 后端以单条目 LIST 缓存服务后续页（同目录翻页零额外 LIST；变更成功后失效）；`VFS_READDIR_MAX_TOTAL=65536` 是恶意后端无限产条目的 DoS 熔断（超限 `E2BIG` loud 报错，正常走不到）。
+
+**内核断点续扫**：单目录一次列不完时内核带 `offset`（上次收到的条目 `off`）再次调用；所有发射经 `vfs_emit` 单点编号（`off` 从 1 起），`offset>0` 时跳过去重后的前 `offset` 个条目（后端路径含点条目，后端分页起点同步对齐，免空翻页）。旧实现忽略 `offset` 且 `filler off` 全 0，大目录尾部丢失/重复。
+
 ### 3.4 后端分派与句柄编码
 
 框架 vfs 回调解析出 real_path 后，若规则模块 resolve 命中 FTP 规则（`rr.is_ftp`）且 `backend_match(path)==1`，则改调模块方法；否则本地文件系统直通（`module_backend_active()` 保证零开销）。路径参数为框架解析后的真实路径（如 `/mnt/nsp_ftp/云盘/xxx`），模块自行剥离前缀。
@@ -154,16 +160,16 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 | 位段 | 含义 |
 |------|------|
 | `bit40` | 后端句柄标志 `NSP_FH_BACKEND_FLAG`（与本地 fd 区分） |
-| `bit41-47` | 模块槽位（`MAX_MODULES=16`） |
+| `bit41-50` | 模块槽位（V5 注册表动态化，硬上限 1024，10 位） |
 | `bit0-39` | 后端句柄 ID（`NSP_FH_HANDLE_MASK` 还原） |
 
-**模块侧须保证句柄 ID 落在 bit0-39 内**——Android tagged-pointer 对 top byte 会 SIGABRT，高位一律保留给框架。
+**模块侧须保证句柄 ID 落在 bit0-39 内**——Android tagged-pointer 对 top byte 会 SIGABRT，高位一律保留给框架。bit51-55 空闲。
 
 ## 4. 加载与热插拔
 
 1. `module_system_init(rules_path, modules_dir)`：mkdir 模块目录 → 全量扫描 → 启动 inotify 监控线程。
-2. 每个 `<name>/<name>.so`：0.5s 文件稳定性校验（防加载半写入的 .so）→ **读入内存副本**（`memfd_create` + 写入）→ 再校验文件未在读取期间变化 → `dlopen("/proc/self/fd/<fd>", RTLD_NOW|RTLD_LOCAL)` → `dlsym(nsp_module_info)` → 校验魔数/ABI 版本/名字一致/自哈希 → `init(api)`（经围栏）→ 登记注册表（**该 memfd 保持打开到模块卸载**：模块自哈希经 `dladdr` 取到的是 `/proc/self/fd/<fd>`，提前关闭会让它读不到自身而误判"哈希不一致"）。顺序见 §3：ABI 校验在 `dlopen` 之后、`init`/`ops` 之前。
-3. inotify 监听模块目录：新增加载、删除卸载、`.so` 覆盖（mtime 变化）重载。**watch 不递归子目录**，故 monitor 线程每 5s poll 超时做兜底全量扫描。
+2. 每个 `<name>/<name>.so`：0.5s 文件稳定性校验（防加载半写入的 .so）→ **读入内存副本**（`memfd_create` + 写入）→ 再校验文件未在读取期间变化 → `dlopen("/proc/self/fd/<fd>", RTLD_NOW|RTLD_LOCAL)` → `dlsym(nsp_module_info)` → 校验魔数/ABI 版本/名字一致 → `init(api)`（经围栏）→ 登记注册表（**该 memfd 保持打开到模块卸载**：它是模块唯一可执行映像的 `memfd:nsp_module_<名>` 可观测证据）。顺序见 §3：ABI 校验在 `dlopen` 之后、`init`/`ops` 之前。内容哈希校验（含旧"模块自哈希"与框架侧 memfd 复验）已整体弃用：相对热加载收益是无效工作，版本区分由 ban 记录的 mtime 承担；`.banned` 里残留的旧哈希格式行会在命中时视为 stale 自动清除。
+3. 两层 inotify 监听：顶层管子目录增删（+ `.banned` 等顶层文件），每个合法模块子目录各一个 watch 管各自 `.so` 变更（inotify 不递归，子目录 watch 补上这一层）。任何变更必有事件，扫描只由事件触发（1s 归并窗口合并一次拷贝的多个事件），**稳态零唤醒、无周期扫描**；仅当上次扫描留下延迟工作（quiescence 推迟的卸载/重载、拷贝中途的瞬时失败）或 watch 建不全时，才按 5s 间隔定时重试回到稳态。
 4. 模块变更**不再经 IPC 上报 injector**：`fuse_daemon` 的规则/后端分派走槽位原子快照，热插拔即时生效，无需 injector 重挂。`LIST_MODULES` 仍可查询当前模块列表（由 injector 扫描模块目录应答，与 fuse_daemon 的加载约定一致）。
 
 ## 5. 故障隔离（框架层防护）
@@ -172,11 +178,11 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 TLS `sigsetjmp` 围栏；`sigaltstack` 是 **per-thread** 的——`fault_fence_init` 设置的全局 altstack 只覆盖主线程，每个首次调用围栏的线程还会为自己设置独立 TLS altstack（worker 不继承主线程的 altstack）。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
 2. **输出校验**（`src/module/module_guard.c`）：`NspPathDecision` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `virtual_kind` 值域与 `attr_override` 未知位检查 + readdir 条目名校验。
-3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（哈希不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。V4 起规则引擎内建，`resolve`/`probe` 已不在 ABI 中——熔断只对后端模块生效。
+3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（文件不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。V4 起规则引擎内建，`resolve`/`probe` 已不在 ABI 中——熔断只对后端模块生效。
 
-**ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|SHA256|原因|时间戳`）。扫描线程或热重载前先按文件哈希查 ban（`module_ban_blocks`）：一致即跳过（加载与重载都不做），哈希变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
+**ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|mtime|原因|时间戳`）。扫描线程或热重载前先按文件 mtime 查 ban（`module_ban_blocks`）：一致即跳过（加载与重载都不做），mtime 变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
 
-**加载前就被拒的情形同样落 ban**（`module_prepare` 内）：`abi_version` 不匹配、内部 `name` 与目录名不一致、自哈希与文件哈希不一致——这三种都发生在 `dlopen` 之后、`commit` 之前，槽位从未建立，若只报错不落 ban，扫描线程每 5s 一轮就重试一轮（0.5s 稳定性等待 + 全量 SHA-256 + 整份 `.so` 复制进新 memfd），并**每次泄漏一个内存副本 fd**（实测残留旧 ABI 模块时 1 个/5s，累积到 nofile 上限后 socket/open 全面 EMFILE）。现落 ban 后只报一次（`检测到新模块` + 具体原因 ERROR + 一次 `ban 名单命中` WARN），之后静默跳过；日志按 `(模块名, 文件哈希)` 去重，哈希一变重新提示一次（`sys.log` 里 DEBUG 不受最小级别过滤，靠降级日志级别解决不了刷屏）。`module_prepare` 的所有失败路径经 `module_prepare_reject()` 统一回收 memfd。
+**加载前就被拒的情形同样落 ban**（`module_prepare` 内）：`abi_version` 不匹配、内部 `name` 与目录名不一致——这两种都发生在 `dlopen` 之后、`commit` 之前，槽位从未建立，若只报错不落 ban，每次事件扫描就重试一轮（0.5s 稳定性等待 + 整份 `.so` 复制进新 memfd），并**每次泄漏一个内存副本 fd**（实测残留旧 ABI 模块时每次扫描漏 1 个，累积到 nofile 上限后 socket/open 全面 EMFILE）。现落 ban 后只报一次（`检测到新模块` + 具体原因 ERROR + 一次 `ban 名单命中` WARN），之后静默跳过；日志按 `(模块名, 文件 mtime)` 去重，文件一变重新提示一次（`sys.log` 里 DEBUG 不受最小级别过滤，靠降级日志级别解决不了刷屏）。`module_prepare` 的所有失败路径经 `module_prepare_reject()` 统一回收 memfd。
 
 **旧模块残留**：框架内建规则引擎后 `basic_rules` 已退役，而 `CONFIG_DIR/modules/` 不在 Magisk 模块目录内，卸载/更新都不会清它，安装脚本此前只 `cp` 不删 → 旧 `.so` 会永久留在设备上（症状就是启动后反复出现 `模块 basic_rules ABI 不匹配`）。现两条一起处理：安装脚本（`customize.sh`）按 `RETIRED_MODULES` 清理**已知退役**的模块目录（不做白名单全清，避免误删用户自己放的模块），框架侧按上面的 ban 机制兜底（用户手动放的坏模块同理）。回归用例见 `test_modules.py` §5。
 
@@ -269,7 +275,9 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 | 新能力 / 新模块类型 | `caps` 位图扩展（32 位预留），框架按位判断 |
 | 模块自身版本 | `NspModuleInfo.version` 字符串（不影响加载兼容性） |
 
-ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。
+ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。V5 同理（`backend_readdir` 加 `offset` 分页 + 超长名跳过语义），递增到 5 并拒绝 V1/V2/V3/V4——V4 模块无分页，大目录静默丢尾。
+
+**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。
 
 ## 7. 参考实现
 

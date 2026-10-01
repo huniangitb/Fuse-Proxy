@@ -33,14 +33,12 @@
 #define FTP_BACKEND_SRC "ftp_backend_libcurl.c"
 #endif
 
-/* ================= 框架运行时桩（本驱动不链接 common.c / nsp_util.c） ================= */
+/* ================= 框架运行时桩（本驱动不链接 common.c；nsp_util.c 参与
+   编译提供真实通用原语，仅 log_internal 仍桩化） ================= */
 LogLevel g_min_log_level = LOG_ERROR;
 void log_internal(LogLevel level, const char* format, ...) {
     (void)level;
     (void)format;
-}
-void nsp_set_thread_name(const char* name) {
-    (void)name;
 }
 
 /* ================= curl mock ================= */

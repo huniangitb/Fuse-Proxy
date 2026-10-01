@@ -45,10 +45,11 @@ static int bb_getattr(const char* path, struct stat* st) {
     return 0;
 }
 
-static int bb_readdir(const char* path, NspDirEntry* entries, int max) {
+static int bb_readdir(const char* path, NspDirEntry* entries, int max, uint64_t offset) {
     (void)path;
     (void)entries;
     (void)max;
+    (void)offset;
 #ifndef FIXED
     if (path && strstr(path, "bovf")) {
         /* 谎报条数：调用方必须按 max 钳制/整批丢弃，绝不能按 n 循环填充 */

@@ -67,8 +67,14 @@
        不再是 ABI——它们随引擎住进 `src/daemon/fw_rules.h`。跨 ABI 只剩
        `NspDirEntry`（后端 readdir 回传条目用）。
    加载器按 `abi_version` 精确匹配，**V1/V2/V3 模块一律拒载**，须按本头重编译。
-   本次未发布过旧 V4 头，故版本号仍为 4（详见 docs/modules.md §3/§6.5）。 */
-#define NSP_MODULE_ABI_VERSION 4u
+   本次未发布过旧 V4 头，故版本号仍为 4（详见 docs/modules.md §3/§6.5）。
+   V5 是**截断收敛**的不兼容变更（开发阶段，旧版本无存量负担）：
+     - `backend_readdir` 追加 `offset` 分页参数：框架按页拉取，大目录不再
+       顶满 512 即静默丢尾（V4 的整批上限）；V4 模块（无 offset）一律拒载；
+     - `NspDirEntry.name` 保持 256（内核 NAME_MAX=255 的硬约束，不是框架
+       截断）：超长名后端必须整条跳过，禁止截断安装（截断会制造重名混淆）。
+   详见 docs/modules.md §3/§6.5。 */
+#define NSP_MODULE_ABI_VERSION 5u
 #define NSP_MODULE_MAGIC       0x4E53504Du /* "NSPM" */
 
 /* ================= 模块形态 =================
@@ -104,7 +110,10 @@ typedef struct NspFrameworkApi {
 #define NSP_FRAMEWORK_API_VERSION 4u
 
 /* ================= readdir 虚拟目录补充 =================
-   模块填充条目数组，框架负责 filler 与去重（不依赖 fuse 类型，便于解耦）。 */
+   模块填充条目数组，框架负责 filler 与去重（不依赖 fuse 类型，便于解耦）。
+   name 上限 256（含 NUL，即最多 255 字节名——内核 NAME_MAX 的硬约束）：
+   超长名后端必须整条跳过，禁止截断安装（同前缀长名截断后会互相覆盖，
+   且与 getattr 的 stat 缓存 key 错位）。 */
 
 typedef struct NspDirEntry {
     char name[256];
@@ -122,7 +131,12 @@ typedef struct NspModuleOps {
        声明了 backend_match 即视为后端模块——V4 起没有别的模块形态。 */
     int (*backend_match)(const char* path); /* 1=管理该路径 0=否 */
     int (*backend_getattr)(const char* path, struct stat* st);
-    int (*backend_readdir)(const char* path, NspDirEntry* entries, int max);
+    /* 分页列目录：跳过前 offset 条，填充至多 max 条；返回本次填充数，
+       0 表到末尾，负值 errno 风格。框架按 offset 累加逐页拉取直到短页/0 页，
+       故大目录无条数上限（V4 的 512 整批上限已删除）；offset 超出末尾返回 0。
+       max<=0 时返回 0（框架恒传正数页大小）。后端应对 offset 做钳制，
+       不得因超大 offset 崩溃（返回 0 即可）。 */
+    int (*backend_readdir)(const char* path, NspDirEntry* entries, int max, uint64_t offset);
     int (*backend_open)(const char* path, int flags, uint64_t* h);
     int (*backend_read)(uint64_t h, char* buf, size_t size, off_t off, size_t* got);
     int (*backend_write)(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote);

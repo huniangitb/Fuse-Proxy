@@ -72,6 +72,10 @@ def run(conf,checks,label=""):
                     # exp=="" 表示期望目录为空
                     passed = (items == []) if exp == "" else (exp in items)
                     ok(name) if passed else fail(name,f"entries={items}")
+                elif want=="LIST_ALL":
+                    # exp=期望全集（set）：断点续扫回归——必须一字不差
+                    items=set(os.listdir(fp)); exp=set(c[3])
+                    ok(name) if items==exp else fail(name,f"列出{len(items)}/{len(exp)} 缺={sorted(exp-items)[:5]} 多={sorted(items-exp)[:5]}")
                 else:
                     got=fp.read_text().strip()
                     ok(name) if got==want else fail(name,f"got='{got}'")
@@ -166,6 +170,19 @@ REDIRECT /秘密/ /Download/Pics/
 HIDE /秘密/""", [
         ("HIDE>R","0/秘密/1.jpg","NOT_EXISTS"),
     ],"9.HIDE覆盖REDIRECT")
+
+    # ── 断点续扫：300 文件本地目录一次列全 ──
+    # 内核单次 readdir 回复装不下时带 offset（上次条目 off）再次调用；
+    # 旧实现忽略 offset 恒从头发（且 filler off 全 0），大目录尾部丢失/重复。
+    big = Path(STORAGE)/"0/Download/bigoff"
+    big.mkdir(exist_ok=True)
+    want = {f"e{i:04d}" for i in range(300)}
+    for n in want:
+        (big/n).write_bytes(b"y")
+    run("""[GLOBAL] MONITOR OFF""", [
+        ("OFFSET:300文件","0/Download/bigoff","LIST_ALL",{f"e{i:04d}" for i in range(300)}),
+    ],"9b.断点续扫")
+    shutil.rmtree(big, ignore_errors=True)
 
     # ── 沙盒 ON + REDIRECT ──
     run("""[GLOBAL] MONITOR OFF

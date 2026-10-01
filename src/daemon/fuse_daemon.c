@@ -10,11 +10,13 @@
 #define NSP_FH_BACKEND_FLAG (1ULL << 40)
 /* 后端句柄 fh 布局（open 时绑定，read/write 免路径解析直接定位模块 ops）：
    - bit40：后端句柄标志（沿用）
-   - bit41-47：模块槽位（MAX_MODULES=16 < 128，7 位足够）
+   - bit41-50：模块槽位（V5 注册表动态化，上限 1024，10 位）
    - bit0-39：后端句柄 ID（模块分配的小整数）
-   低 40 位掩码用于提取句柄 ID（不含标志与槽位） */
+   低 40 位掩码用于提取句柄 ID（不含标志与槽位）。
+   bit51-55 空闲；bit56-63 禁用（Android tagged-pointer 检测，见上）。 */
 #define NSP_FH_BACKEND_SLOT_SHIFT 41
-#define NSP_FH_BACKEND_SLOT_MASK  (0x7FULL << NSP_FH_BACKEND_SLOT_SHIFT)
+#define NSP_FH_BACKEND_SLOT_MASK  (0x3FFULL << NSP_FH_BACKEND_SLOT_SHIFT)
+#define NSP_FH_BACKEND_SLOT_MAX   1024
 #define NSP_FH_HANDLE_MASK        ((1ULL << 40) - 1)
 #include <fuse3/fuse.h>
 #include <fuse3/fuse_lowlevel.h>
@@ -680,7 +682,11 @@ static void readdir_join(char* dst, size_t cap, const char* base, const char* na
 /* ================= readdir 分阶段实现 =================
  * vfs_readdir 拆为：后端分派 → 本地目录扫描（probe 过滤/去重/filler）
  * → 骨架与虚拟目录合成 → . / .. 收尾。各阶段共享 VfsReaddirCtx，
- * 任一 filler 返回非 0（内核缓冲已满）即短路结束本次 readdir（返回 0）。 */
+ * 任一 filler 返回非 0（内核缓冲已满）即短路结束本次 readdir（返回 0）。
+ * 断点续扫：单目录一次列不完时内核带 offset（上次收到的条目 off）再次调用；
+ * 所有发射经 vfs_emit 单点编号（off 从 1 起），offset>0 时跳过去重后的前
+ * offset 个条目。去重（ht）在编号之前，故跨调用序列稳定（同目录无并发
+ * 修改时；并发增删下的重复/遗漏是 offset cookie 的固有语义）。 */
 typedef struct {
     struct fuse_context* ctx;
     const char* fuse_path; /* 未剥离 <uid>/ 的 FUSE 层路径（readdir 条目 ino 与
@@ -691,17 +697,42 @@ typedef struct {
     void* buf;
     fuse_fill_dir_t filler;
     DirHashTable ht; /* 条目去重表 */
+    uint64_t emit_next; /* 下一条目的 off（从 1 起） */
+    uint64_t emit_skip; /* 仍需跳过的已发条目数（= 入参 offset） */
     bool is_root;    /* sub_path 为挂载点根 */
     bool is_android_dir;
     bool hide_others; /* 跨应用隔离生效（沙盒开启 + 非 root/未知访问者） */
     bool has_data, has_obb, has_android, has_pkg;
 } VfsReaddirCtx;
 
+/* 本地路径发射 choke 点：编号 → 跳过（断点续扫）→ filler。
+   返回 false = 内核缓冲已满，调用方短路结束。 */
+static bool vfs_emit(VfsReaddirCtx* d, const char* name, const struct stat* st) {
+    uint64_t off = d->emit_next++;
+    if (off <= d->emit_skip) return true;
+    return d->filler(d->buf, name, st, (off_t)off, 0) == 0;
+}
+
+/* 后端路径发射（VfsReaddirCtx 外的轻量版：同编号/跳过语义）。
+   返回 1=跳过（已发过），0=已发射，-1=内核缓冲已满。 */
+static int vfs_emit_raw(void* buf, fuse_fill_dir_t filler, uint64_t* next, uint64_t skip,
+                        const char* name, const struct stat* st) {
+    uint64_t off = (*next)++;
+    if (off <= skip) return 1;
+    return filler(buf, name, st, (off_t)off, 0) != 0 ? -1 : 0;
+}
+
 /* readdir 后端分派：rr.is_ftp 且路径命中 BACKEND 模块时由模块方法返回条目，
    框架负责 . / .. 与 filler 输出。返回 true = 已处理（*rc_out 为 FUSE 返回码）；
-   false = 未命中后端，交回本地目录路径。 */
+   false = 未命中后端，交回本地目录路径。
+   V5 分页：按 VFS_READDIR_PAGE 逐页拉取（offset 累加），直到短页/0 页/filler
+   满——大目录无条数上限（V4 的 512 整批上限已删除）。VFS_READDIR_MAX_TOTAL
+   是恶意后端无限产条目的 DoS 熔断（超限 E2BIG loud 报错）；正常后端
+   （含 FTP 单 LIST 缓存）在短页处自然收尾，走不到该分支。 */
+#define VFS_READDIR_PAGE      256
+#define VFS_READDIR_MAX_TOTAL 65536
 static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, bool is_ftp,
-                                void* buf, fuse_fill_dir_t filler, int* rc_out) {
+                                void* buf, fuse_fill_dir_t filler, uint64_t skip, int* rc_out) {
     if (!is_ftp) return false;
     const NspModuleOps* bops = NULL;
     if (module_backend_lookup(sub_path, &bops) != 0) return false;
@@ -710,75 +741,88 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
         module_backend_put(bops);
         return false;
     }
-    /* 512×NspDirEntry ≈ 135KB：必须堆分配——FUSE 线程栈（Android 常为
-       1MB）上放 135KB 栈数组仍有风险。calloc 同时提供清零防御
-       （防后端未填充字段残留垃圾）。原 1024×270KB：readdir 缓冲
-       每请求一次性分配，FTP 目录条目数通常远小于 512（超限时
-       FUSE 分页续读），减半降低每请求堆分配开销 */
-    NspDirEntry* entries = calloc(512, sizeof(NspDirEntry));
+    /* 页缓冲堆分配（FUSE 线程栈在 Android 常为 1MB，栈上放数组有风险）。
+       calloc 清零防御后端未填充字段残留垃圾。 */
+    NspDirEntry* entries = calloc(VFS_READDIR_PAGE, sizeof(NspDirEntry));
     if (!entries) {
         module_backend_put(bops); /* calloc 失败：释放引用再报错 */
         *rc_out = -ENOMEM;
         return true;
     }
     int bslot = module_ops_slot(bops);
-    int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir, sub_path,
-                                      entries, 512);
-    module_backend_put(bops);
-    if (n == NSP_FENCE_FAULT) {
-        module_guard_fault(bslot, "backend_readdir", sub_path);
-        free(entries);
-        *rc_out = -EIO;
-        return true;
-    }
-    if (n == NSP_FENCE_BADFN) {
-        free(entries);
-        *rc_out = -EIO;
-        return true;
-    }
-    if (n < 0) {
-        if (!backend_rc_is_business(n))
-            module_guard_error(bslot, "backend_readdir", n, sub_path, "readdir 返回异常");
-        free(entries);
-        *rc_out = n;
-        return true;
-    }
-    if (n > 512) {
-        module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
-        free(entries);
-        *rc_out = -EIO;
-        return true;
-    }
     /* POSIX readdir 恒含 . / ..（与本地文件系统 readdir 路径一致）。
-       filler 只消费 st_ino 与 st_mode 的类型位（fuse_add_direntry 不读 uid/gid），
-       此处仅用于给出 d_type，属主由 getattr 决定。
        点条目传 nullptr：libfuse fill_dir 遇空 stat 即填 FUSE_UNKNOWN_INO，
        内核视其为未知、后续按名 lookup 取 getattr 的真实 ino。此处若传
        memset 全 0 的 stat（含 st_ino=0），0 会随 use_ino=1 原样进内核，
        与后端 getattr 侧的 synthetic 兜底语义矛盾（见 vfs_readdir_fill_dots
-       同一写法） */
-    filler(buf, ".", nullptr, 0, 0);
-    filler(buf, "..", nullptr, 0, 0);
-    for (int i = 0; i < n; i++) {
-        /* 条目名跨 ABI 由模块填写：未终止的名字会被 filler 当野指针读，故逐条
-           校验。旧实现该校验在规则 readdir_extra 的分派里；规则引擎内建后，
-           唯一跨 ABI 的条目来源就是后端 readdir，校验随之搬到这里 */
-        if (!nsp_guard_dir_entry_ok(&entries[i])) {
-            module_guard_error(bslot, "backend_readdir", 0, sub_path, "条目名未终止(越界写)");
-            free(entries);
-            *rc_out = -EIO;
-            return true;
+       同一写法）。编号 1/2（断点续扫 skip 覆盖点条目）。 */
+    uint64_t next = 1;
+    if (vfs_emit_raw(buf, filler, &next, skip, ".", nullptr) < 0) goto done;
+    if (vfs_emit_raw(buf, filler, &next, skip, "..", nullptr) < 0) goto done;
+    /* 后端分页起点对齐 skip（点条目占 off 1/2，后端条目从 off 3 起）：
+       大 offset 续扫时免空翻前面页——编号连续性由 next += offset 保持
+       （跳过的条目仍占号，跨调用序列稳定）。 */
+    uint64_t offset = (skip > 2) ? skip - 2 : 0;
+    next += offset;
+    size_t total = 0;
+    int rc = 0;
+    for (;;) {
+        int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir,
+                                          sub_path, entries, VFS_READDIR_PAGE, offset);
+        if (n == NSP_FENCE_FAULT) {
+            module_guard_fault(bslot, "backend_readdir", sub_path);
+            rc = -EIO;
+            break;
         }
-        struct stat st;
-        memset(&st, 0, sizeof st);
-        st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-        /* d_ino 必须非 0（use_ino=1 下直接进内核）且与该路径 getattr 一致：
-           经 vfs_readdir_child_ino 派生，与 getattr 的 synthetic_inode 同源 */
-        st.st_ino = vfs_readdir_child_ino(sub_path, entries[i].name);
-        if (filler(buf, entries[i].name, &st, 0, 0) != 0) break;
+        if (n == NSP_FENCE_BADFN) {
+            rc = -EIO;
+            break;
+        }
+        if (n < 0) {
+            if (!backend_rc_is_business(n))
+                module_guard_error(bslot, "backend_readdir", n, sub_path, "readdir 返回异常");
+            rc = n;
+            break;
+        }
+        if (n == 0) break; /* 到末尾 */
+        if (n > VFS_READDIR_PAGE) {
+            module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
+            rc = -EIO;
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            /* 条目名跨 ABI 由模块填写：未终止的名字会被 filler 当野指针读，
+               故逐条校验（超长名由后端整条跳过，框架侧只防未终止） */
+            if (!nsp_guard_dir_entry_ok(&entries[i])) {
+                module_guard_error(bslot, "backend_readdir", 0, sub_path,
+                                   "条目名未终止(越界写)");
+                rc = -EIO;
+                goto done;
+            }
+            struct stat st;
+            memset(&st, 0, sizeof st);
+            st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+            /* d_ino 必须非 0（use_ino=1 下直接进内核）且与该路径 getattr 一致：
+               经 vfs_readdir_child_ino 派生，与 getattr 的 synthetic_inode 同源 */
+            st.st_ino = vfs_readdir_child_ino(sub_path, entries[i].name);
+            int er = vfs_emit_raw(buf, filler, &next, skip, entries[i].name, &st);
+            if (er < 0) goto done; /* 内核缓冲满 */
+        }
+        total += (size_t)n;
+        if (n < VFS_READDIR_PAGE) break; /* 短页 = 末尾 */
+        if (total >= VFS_READDIR_MAX_TOTAL) {
+            /* 后端持续满页（正常应在短页/0 页收尾）：疑似无限产条目，熔断收尾。
+               属框架侧防御（非常规业务失败），计错误后 loud 报错 */
+            module_guard_error(bslot, "backend_readdir", 0, sub_path, "条目数超限(疑似无限产出)");
+            rc = -E2BIG;
+            break;
+        }
+        offset += (uint64_t)n;
     }
+done:
+    module_backend_put(bops);
     free(entries);
-    *rc_out = 0;
+    *rc_out = rc;
     return true;
 }
 
@@ -857,7 +901,7 @@ static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
     memset(&st, 0, sizeof(st));
     st.st_ino = vfs_readdir_entry_ino(d, name);
     st.st_mode = S_IFDIR | 0755;
-    return d->filler(d->buf, name, &st, 0, 0) == 0;
+    return vfs_emit(d, name, &st);
 }
 
 /* 合成目录条目输出（不经 ht 去重）：data/obb 骨架沿用原语义——物理扫描未
@@ -867,7 +911,7 @@ static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
     memset(&st, 0, sizeof(st));
     st.st_ino = vfs_readdir_entry_ino(d, name);
     st.st_mode = S_IFDIR | 0755;
-    return d->filler(d->buf, name, &st, 0, 0) == 0;
+    return vfs_emit(d, name, &st);
 }
 
 /* 本地目录扫描：probe 条目级过滤（hidden/redirect_target）+ ht 去重 +
@@ -924,9 +968,9 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
             memset(&st, 0, sizeof(st));
             readdir_join(item_real_path, 2047, d->real_path, de->d_name);
             if (lstat(item_real_path, &st) == 0) {
-                if (d->filler(d->buf, de->d_name, &st, 0, 0) != 0) return false;
+                if (!vfs_emit(d, de->d_name, &st)) return false;
             } else {
-                if (d->filler(d->buf, de->d_name, nullptr, 0, 0) != 0) return false;
+                if (!vfs_emit(d, de->d_name, nullptr)) return false;
             }
         }
     }
@@ -961,16 +1005,41 @@ static bool vfs_readdir_fill_own_pkg(VfsReaddirCtx* d) {
 
 /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler。
    条目只给 st_ino 与目录类型位——fuse_add_direntry 不读 uid/gid 与权限位，
-   属主/权限由 getattr 决定（虚拟路径无底层文件，getattr 侧继承用户存储根） */
+   属主/权限由 getattr 决定（虚拟路径无底层文件，getattr 侧继承用户存储根）。
+   缓冲动态翻倍（初容 128，上限 VIRT_MAX）：虚拟前缀数随模块数增长，
+   V4 的栈上 MAX_MODULES*8=128 固定上限会静默丢虚拟条目。堆分配亦避开
+   FUSE 线程栈压力。超上限（8192 同目录虚拟前缀， absurd）则 loud 告警
+   后截断——真实文件条目不受影响（本函数只产虚拟合成条目）。 */
+#define VIRT_INIT_CAP 128
+#define VIRT_MAX      8192
 static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
-    NspDirEntry virt[MAX_MODULES * 8];
-    NspQueryCtx vq = {
-        .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = d->sub_path};
-    int vn = fw_rules_readdir_extra(&vq, d->sub_path, path_user_id, d->current_pkg, d->is_root,
-                                     virt, MAX_MODULES * 8);
-    /* 纵深防御：dispatch 已钳制，但仍钳制 vn 防栈越界读 */
+    size_t cap = VIRT_INIT_CAP;
+    NspDirEntry* virt = malloc(cap * sizeof *virt);
+    if (!virt) return true; /* OOM：跳过虚拟补充（目录仍可用，不报错） */
+    int vn = 0;
+    for (;;) {
+        NspQueryCtx vq = {.uid = d->ctx->uid,
+                          .pid = d->ctx->pid,
+                          .gid = d->ctx->gid,
+                          .path = d->sub_path};
+        vn = fw_rules_readdir_extra(&vq, d->sub_path, path_user_id, d->current_pkg, d->is_root,
+                                    virt, (int)cap);
+        if (vn < 0) vn = 0;
+        /* 满容 = 可能还有：翻倍重取（readdir_extra 为纯内存计算，重调廉价） */
+        if ((size_t)vn < cap || cap >= VIRT_MAX) break;
+        size_t ncap = cap * 2;
+        if (ncap > VIRT_MAX) ncap = VIRT_MAX;
+        NspDirEntry* grown = realloc(virt, ncap * sizeof *grown);
+        if (!grown) break; /* OOM：用已有容量结果（短页收尾，不静默丢已取） */
+        virt = grown;
+        cap = ncap;
+    }
+    if ((size_t)vn >= cap && cap >= VIRT_MAX)
+        LOG_WRN("虚拟目录条目超上限(%d)，超出部分跳过", VIRT_MAX);
+    /* 纵深防御：钳制 vn 防越界读 */
     if (vn < 0) vn = 0;
-    if (vn > MAX_MODULES * 8) vn = MAX_MODULES * 8;
+    if ((size_t)vn > cap) vn = (int)cap;
+    bool ok = true;
     for (int vi = 0; vi < vn; vi++) {
         if (virt[vi].name[0] == '\0') continue;
         if (!vfs_hash_insert(&d->ht, virt[vi].name)) continue;
@@ -978,22 +1047,25 @@ static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
         memset(&st_dir, 0, sizeof(st_dir));
         st_dir.st_ino = vfs_readdir_entry_ino(d, virt[vi].name);
         st_dir.st_mode = S_IFDIR; /* filler 只取类型位给出 d_type */
-        if (d->filler(d->buf, virt[vi].name, &st_dir, 0, 0) != 0) return false;
+        if (!vfs_emit(d, virt[vi].name, &st_dir)) {
+            ok = false; /* 内核缓冲满：短路后继阶段（与旧语义一致） */
+            break;
+        }
     }
-    return true;
+    free(virt);
+    return ok;
 }
 
 /* POSIX readdir 收尾：恒含 . / ..（与本地文件系统 readdir 路径一致） */
 static bool vfs_readdir_fill_dots(VfsReaddirCtx* d) {
-    if (d->filler(d->buf, ".", nullptr, 0, 0) != 0) return false;
-    if (d->filler(d->buf, "..", nullptr, 0, 0) != 0) return false;
+    if (!vfs_emit(d, ".", nullptr)) return false;
+    if (!vfs_emit(d, "..", nullptr)) return false;
     return true;
 }
 
 static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset,
                        struct fuse_file_info* fi, enum fuse_readdir_flags flags) {
     vfs_flush_pending_closes();
-    (void)offset;
     (void)flags;
     (void)fi;
     VFS_SETUP_CORE(path, VFS_OP_READ);
@@ -1001,12 +1073,18 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
                (nsp_ok && is_redir) ? rr.real_path : NULL, monitor_on);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
 
+    /* 断点续扫：内核 offset = 上次收到的条目 off（vfs_emit 编号），本轮跳过
+       已发条目后继续。offset<=0 视为从头（内核首扫传 0）。 */
+    uint64_t skip = (offset > 0) ? (uint64_t)offset : 0;
+
     /* 后端分派：readdir 由模块方法返回条目，框架负责 filler */
     int brc = 0;
-    if (vfs_readdir_backend(ctx, sub_path, rr.is_ftp, buf, filler, &brc)) VFS_RETURN(brc);
+    if (vfs_readdir_backend(ctx, sub_path, rr.is_ftp, buf, filler, skip, &brc)) VFS_RETURN(brc);
 
     VfsReaddirCtx d;
     vfs_readdir_ctx_init(&d, ctx, path, sub_path, p, current_pkg, path_user_id, buf, filler);
+    d.emit_next = 1;
+    d.emit_skip = skip;
     DIR* dp = opendir(p);
     if (!dp) {
         int err = errno;
@@ -1113,7 +1191,7 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
                module_backend_acquire_slot 无锁快速分派，免每 IO 路径解析
                与线性扫描（模块卸载时快照置空→快速失败，不悬垂） */
             fi->fh =
-                h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
+                h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & (NSP_FH_BACKEND_SLOT_MAX - 1)) << NSP_FH_BACKEND_SLOT_SHIFT);
             fi->direct_io = 1;
             FTP_DBG("vfs_open: 后端命中 sub=%s fh=%llu slot=%d flags=%o direct_io=1\n", sub_path,
                     (unsigned long long)fi->fh, bslot, fi->flags);
@@ -1173,7 +1251,7 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
                 VFS_RETURN(brc < 0 ? brc : -EIO);
             }
             fi->fh =
-                h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & 0x7F) << NSP_FH_BACKEND_SLOT_SHIFT);
+                h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & (NSP_FH_BACKEND_SLOT_MAX - 1)) << NSP_FH_BACKEND_SLOT_SHIFT);
             VFS_RETURN(0);
         }
     }

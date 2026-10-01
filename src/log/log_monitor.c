@@ -54,7 +54,11 @@ typedef struct AsyncCtx {
        末尾刚入环的日志会在回收方读 head 之前就被 free 掉而永久丢失。 */
     _Atomic bool disconnected;
     struct {
+        /* 短消息内联（512，常见路径零 malloc）；超长经 big 堆溢出
+           （malloc 精确大小，上限行缓冲 4224）——此前一律截断到 511，
+           长路径 IO 行的路径尾部在内存与 io.log 里永久丢失。 */
         char msg[512];
+        char* big;
         int level;
         int type;
     } entries[RING_CAP];
@@ -66,8 +70,8 @@ typedef struct AsyncCtx {
        在 process_line 内、pthread_create 之前填充，避免线程先跑读空 */
     char pending[4096];
     int pending_len;
-    /* 合并日志多槽队列：LOG_BATCH 合并内容可超过 entries.msg 的 512 上限，
-       且连续多个合并周期（背靠背 LOG_BATCH 帧）不能互相覆盖。
+    /* 合并日志多槽队列：LOG_BATCH 整块内容经此入 g_sys_buf，
+       背靠背 LOG_BATCH 帧互不覆盖。
        head 仅 async_log_thread 写、tail 仅主循环 drain_async 读（无锁环形）。
        drain_async 将每槽 push 入 g_sys_buf（MAX_MSG_LEN=4096），
        避免 UTF-8 截断乱码 */
@@ -354,6 +358,38 @@ static PersistWriter g_persist_sys;
    sys 缓冲（search-sys / sys.log 可见），稳态计数不变则零噪音。 */
 static _Atomic uint64_t g_drop_entries = 0; /* 接收环（entries）满丢弃的行数 */
 static _Atomic uint64_t g_drop_batch = 0;   /* 合并队列（batch_q）满丢弃的包数 */
+
+/* 接收槽存储（含堆溢出）：短消息内联，超长 malloc 精确大小。
+   低内存：常见短日志零堆分配；堆路径上限行缓冲（约 4KB），随槽释放即 free。
+   OOM 回退截断内联并计入 g_drop_entries（可观测，不静默）。 */
+static void async_slot_store(AsyncCtx* ctx, int idx, const char* msg) {
+    size_t len = strlen(msg);
+    if (len < sizeof(ctx->entries[idx].msg)) {
+        memcpy(ctx->entries[idx].msg, msg, len + 1);
+        ctx->entries[idx].big = NULL;
+    } else {
+        char* h = malloc(len + 1);
+        if (!h) {
+            memcpy(ctx->entries[idx].msg, msg, sizeof(ctx->entries[idx].msg) - 1);
+            ctx->entries[idx].msg[sizeof(ctx->entries[idx].msg) - 1] = '\0';
+            ctx->entries[idx].big = NULL;
+            atomic_fetch_add_explicit(&g_drop_entries, 1, memory_order_relaxed);
+        } else {
+            memcpy(h, msg, len + 1);
+            ctx->entries[idx].msg[0] = '\0';
+            ctx->entries[idx].big = h;
+        }
+    }
+}
+
+static char* async_slot_msg(AsyncCtx* ctx, int idx) {
+    return ctx->entries[idx].big ? ctx->entries[idx].big : ctx->entries[idx].msg;
+}
+
+static void async_slot_release(AsyncCtx* ctx, int idx) {
+    free(ctx->entries[idx].big);
+    ctx->entries[idx].big = NULL;
+}
 
 static uint64_t persist_now_ms(void) {
     struct timespec ts;
@@ -707,7 +743,7 @@ static void drain_async(AsyncCtx* ctx) {
         ctx->batch_q_tail++;
     }
     while (ctx->tail != ctx->head) {
-        char* msg = ctx->entries[ctx->tail].msg;
+        char* msg = async_slot_msg(ctx, ctx->tail);
         int level = ctx->entries[ctx->tail].level;
         int entry_type = ctx->entries[ctx->tail].type;
         if (entry_type == 1) {
@@ -717,6 +753,7 @@ static void drain_async(AsyncCtx* ctx) {
         } else if (entry_type == 3) {
             push_log(&g_logcat_buf, msg, 3, LOG_INFO);
         }
+        async_slot_release(ctx, ctx->tail);
         ctx->tail = (ctx->tail + 1) & (RING_CAP - 1);
     }
 }
@@ -754,6 +791,11 @@ static void cleanup_async(AsyncCtx* ctx) {
         }
         pp = &(*pp)->next;
     }
+    /* 释放环内未消费的堆溢出消息（断开时在途条目） */
+    while (ctx->tail != ctx->head) {
+        async_slot_release(ctx, ctx->tail);
+        ctx->tail = (ctx->tail + 1) & (RING_CAP - 1);
+    }
     if (ctx->fd >= 0) close(ctx->fd);
     if (ctx->notify_fd >= 0) close(ctx->notify_fd);
     free(ctx);
@@ -780,8 +822,8 @@ static void* async_log_thread(void* arg) {
                 if (batch_collect && strncmp(msg, "LOG_BATCH_END", 13) == 0) {
                     batch_collect = 0;
                     if (batch_len > 0) {
-                        /* 合并日志入多槽队列（可超过 entries.msg 的 512 上限），
-                           背靠背帧互不覆盖，由主循环 drain_async 逐槽 push 入 g_sys_buf */
+                        /* 合并日志入多槽队列（整块入库，背靠背帧互不覆盖，
+                           由主循环 drain_async 逐槽 push 入 g_sys_buf） */
                         int slot = ctx->batch_q_head % BATCH_Q_CAP;
                         if ((ctx->batch_q_head - ctx->batch_q_tail) < BATCH_Q_CAP) {
                             size_t copy = (batch_len < (int)sizeof(ctx->batch_q[slot].msg))
@@ -837,8 +879,7 @@ static void* async_log_thread(void* arg) {
                 }
                 int next = (ctx->head + 1) & (RING_CAP - 1);
                 if (next != ctx->tail) {
-                    strncpy(ctx->entries[ctx->head].msg, msg, 511);
-                    ctx->entries[ctx->head].msg[511] = '\0';
+                    async_slot_store(ctx, ctx->head, msg);
                     ctx->entries[ctx->head].level = level;
                     ctx->entries[ctx->head].type = ctx->type;
                     ctx->head = next;
@@ -929,8 +970,7 @@ static void* async_log_thread(void* arg) {
                     }
                     int next = (ctx->head + 1) & (RING_CAP - 1);
                     if (next != ctx->tail) {
-                        strncpy(ctx->entries[ctx->head].msg, msg, 511);
-                        ctx->entries[ctx->head].msg[511] = '\0';
+                        async_slot_store(ctx, ctx->head, msg);
                         ctx->entries[ctx->head].level = level;
                         ctx->entries[ctx->head].type = ctx->type;
                         ctx->head = next;
@@ -1252,8 +1292,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
             msg += 11;
         }
         actx->type = entry_type;
-        strncpy(actx->entries[0].msg, msg, 511);
-        actx->entries[0].msg[511] = '\0';
+        async_slot_store(actx, 0, msg);
         actx->entries[0].level = level;
         actx->entries[0].type = entry_type;
         actx->head = 1;

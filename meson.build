@@ -278,7 +278,7 @@ common_sources = [
     'src/core/sys_pkg.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/daemon/fw_rules.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c', 'src/core/sha256.c',
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/daemon/fw_rules.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c',
   # 配置**读取**在框架侧完成（文件 I/O + inotify + 词法/段头识别，产出扁平视图
   # 经 fw_config 下发给模块），模块不再自行读文件。框架另建一份 AppConfig 索引
   # （config_build_from_view），但只用于回答 MONITOR 的三层合并——它是配置开关，
@@ -296,23 +296,6 @@ install_bin_dir = 'bin'
 
 # fuse_daemon：纯框架（回调骨架 + 模块调度 + 存储原语），不链接规则引擎源，
 # 规则能力来自 dlopen 的热插拔模块（basic_rules.so 等）；common.c 为公共工具（日志/路径）。
-# SHA-256 硬件加速静态库：按目标平台启用对应 ISA 扩展
-# （Android aarch64: armv8-a+sha2 启用 sha256h；GNU x86_64: -msha 启用 SHA-NI）。
-# 运行时能力检测 + 已知向量自校验（sha256_hw.c 内部），不可用/校验失败
-# 自动回退纯软件实现——ISA 标志仅作用于本文件，不影响其他目标。
-if target_os == 'android'
-  sha_hw_args = ['-march=armv8-a+sha2']
-else
-  # SHA-NI 需 SSSE3（字节交换）+ SSE4.1（_mm_blend_epi16 状态重排）
-  sha_hw_args = ['-msha', '-mssse3', '-msse4.1']
-endif
-sha256_hw_lib = static_library('sha256_hw',
-  'src/core/sha256_hw.c',
-  include_directories: all_inc_dirs,
-  c_args: sha_hw_args,
-)
-sha256_hw_dep = declare_dependency(link_with: sha256_hw_lib,
-                                   include_directories: all_inc_dirs)
 
 # nsp_util 轻量公共库（纯 libc，无项目全局依赖）：收敛 UDS 抽象地址填充、send_all
 # 全量发送、str_trim、mkdir_p、daemonize、cgroup 逃逸，供各二进制与热插拔模块
@@ -358,7 +341,7 @@ executable('fuse_daemon',
   include_directories: all_inc_dirs,
   # libdl：fuse_thread_naming 经 dlsym(RTLD_NEXT) 取真实 pthread_create
   #（bionic 自带，GNU 经此显式链接；required=false 兼容无独立 libdl 的工具链）
-  dependencies: project_deps + [sha256_hw_dep, nsp_util_dep, nsp_comm_dep,
+  dependencies: project_deps + [nsp_util_dep, nsp_comm_dep,
                                 cc.find_library('dl', required: false)],
   c_args: ['-DFUSE_USE_VERSION=317'],
   link_args: ['-Wl,--export-dynamic'],  # 导出公共符号，供 dlopen 的热插拔模块解析
@@ -439,8 +422,6 @@ ftp_module_sources = [
     'src/modules/ftp/ftp_conf.c',
     'src/modules/ftp/ftp_mux.c',
     'src/modules/ftp/ftp_backend_libcurl.c',
-    'src/core/sha256.c',
-    'src/modules/nsp_self_hash.c',
 ]
 
 # ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库，无 FUSE 实现）。
@@ -517,7 +498,7 @@ endif
 shared_library('ftp_module',
   ftp_module_sources,
   include_directories: [all_inc_dirs, ftp_curl_inc],
-  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), sha256_hw_dep, nsp_util_dep],
+  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), nsp_util_dep],
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,
