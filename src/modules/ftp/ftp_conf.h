@@ -28,6 +28,7 @@ typedef struct FtpServerCfg {
     char user[64];
     char pass[128];
     char remote_dir[512]; /* 远程根目录（默认 "/"） */
+    bool bad; /* 解析期标记：任一字段超长被截断即整段作废（见 ftp_conf.c），不参与连接 */
 } FtpServerCfg;
 
 /* 服务器表：动态数组（初容 16，按需翻倍），不再有 16 段硬上限。
