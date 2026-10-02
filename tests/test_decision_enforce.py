@@ -243,6 +243,9 @@ def main():
             print(f"   ✗ {d}: {detail}")
     print("注：read_only 的 root 豁免需以 uid 0 访问，本测试以普通用户运行，"
           "该分支未覆盖（与 test_global_replace.py 同样受权限限制）。")
+    print("注2：本套件只用 [GLOBAL] 段——包作用域（[包名]/[包名:userid]）的合并语义"
+          "端到端测不到（本机 uid<10000 恒走 system 分支），由 "
+          "test_monitor_layers.py 用合成 uid 直接验证框架合并函数。")
     return 1 if FAIL else 0
 
 

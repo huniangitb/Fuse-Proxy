@@ -73,9 +73,9 @@ def run(conf,checks,label=""):
                     passed = (items == []) if exp == "" else (exp in items)
                     ok(name) if passed else fail(name,f"entries={items}")
                 elif want=="LIST_ALL":
-                    # exp=期望全集（set）：断点续扫回归——必须一字不差
-                    items=set(os.listdir(fp)); exp=set(c[3])
-                    ok(name) if items==exp else fail(name,f"列出{len(items)}/{len(exp)} 缺={sorted(exp-items)[:5]} 多={sorted(items-exp)[:5]}")
+                    # exp=期望全集（set）：断点续扫回归——必须一字不差（含裸条目数）
+                    raw=os.listdir(fp); items=set(raw); exp=set(c[3])
+                    ok(name) if items==exp and len(raw)==len(exp) else fail(name,f"列出{len(items)}/{len(exp)} 缺={sorted(exp-items)[:5]} 多={sorted(items-exp)[:5]}")
                 else:
                     got=fp.read_text().strip()
                     ok(name) if got==want else fail(name,f"got='{got}'")
@@ -137,17 +137,13 @@ HIDE /Download/*.mp3""", [
         ("通配:其他可见","0/Download/hi.txt","hello"),
     ],"5.HIDE通配")
 
-    # ── RO 只读 ──
+    # ── RO 只读（可读性冒烟；写入拒绝的逐回调 errno 矩阵见
+    # test_decision_enforce.py B 组——此处 run() 返回时已卸载，
+    # 卸载后写 MNT 测的是宿主空目录而非 RO 规则，属无效断言故不保留）──
     run("""[GLOBAL] MONITOR OFF
 RO /Download/Pics/""", [
         ("RO:可读","0/Download/Pics/1.jpg","img1"),
     ],"6.RO只读")
-    # RO写拒
-    try:
-        (Path(MNT)/"0/Download/Pics/n.txt").write_bytes(b"x")
-        fail("RO写拒","文件被写入")
-        (Path(MNT)/"0/Download/Pics/n.txt").unlink(missing_ok=True)
-    except: ok("6b.RO:写入被拒")
 
     # ── RO + REDIRECT ──
     run("""[GLOBAL] MONITOR OFF
