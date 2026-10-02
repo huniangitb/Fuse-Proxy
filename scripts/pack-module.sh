@@ -179,18 +179,10 @@ for abi in arm64-v8a armeabi-v7a; do
     fi
 done
 
-# ============================ 2.5 同步许可证（分发二进制的法定义务） =====================
-# GPL-3.0 要求随二进制附许可证；libfuse 为静态链接的 LGPL-2.1 组件，
-# 其告知义务同样在分发时履行（见 THIRD-PARTY-NOTICES.md）。
-echo "== 同步许可证文件 ..."
-for f in LICENSE LICENSE.module-exception THIRD-PARTY-NOTICES.md; do
-    if [[ -f "$REPO_DIR/$f" ]]; then
-        cp -f "$REPO_DIR/$f" "$MODULE_DIR/$f"
-        echo "   - $f"
-    else
-        echo "   - $f (缺失，跳过)" >&2
-    fi
-done
+# ============================ 2.5 许可证 =====================
+# 许可证与附加声明（LICENSE / module-exception / THIRD-PARTY-NOTICES）均不再入包，
+# 义务履行改由源码仓库/发布页承担。
+echo "== 跳过许可证同步（已移除） =="
 
 # ============================ 3. 权限 ============================
 echo "== 设置可执行权限 (0755) ..."
@@ -225,36 +217,6 @@ else
         echo "== name 已追加 -Test（非发布模式）"
     fi
 fi
-
-# ============================ 3.6 构建水印文件 ============================
-# bin/build-info.txt 随模块上机：用户执行 `cat` 即可上报版本，
-# 与 sys.log 首批 [*/build] 行、crash 日志 Build: 行三方互证。
-echo "== 生成 bin/build-info.txt ..."
-GIT_FULL="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-GIT_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if git -C "$REPO_DIR" diff --quiet 2>/dev/null; then GIT_DIRTY="clean"; else GIT_DIRTY="dirty"; fi
-{
-    echo "version=$MODULE_VERSION"
-    echo "versionCode=$VERCODE"
-    echo "git=$GIT_FULL"
-    echo "git_short=$GIT_SHORT"
-    echo "git_status=$GIT_DIRTY"
-    echo "target=android-aarch64"
-    echo "built=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    echo "files:"
-    for bin in rule_server injector fuse_daemon log_monitor log_ctl; do
-        if [[ -f "$BUILD_DIR/$bin" ]]; then
-            echo "  $bin sha256=$(sha256sum "$BUILD_DIR/$bin" | cut -d' ' -f1) size=$(stat -c%s "$BUILD_DIR/$bin")"
-        fi
-    done
-    for mod in ftp_module/ftp_module.so; do
-        name="${mod%%/*}"; so="${mod##*/}"
-        if [[ -f "$BUILD_DIR/$so" ]]; then
-            echo "  modules/$mod sha256=$(sha256sum "$BUILD_DIR/$so" | cut -d' ' -f1) size=$(stat -c%s "$BUILD_DIR/$so")"
-        fi
-    done
-} > "$MODULE_DIR/bin/build-info.txt"
-echo "   - bin/build-info.txt (git=$GIT_SHORT $GIT_DIRTY)"
 
 # ============================ 4. 打包 ============================
 echo "== 打包 zip ..."
@@ -317,11 +279,12 @@ check("bin/modules 下只有当前模块 (%s)" % (",".join(mod_dirs) or "空"), 
 check("zygisk 存在", any(n.startswith("zygisk/") and n.endswith(".so") for n in names))
 check("zygisk arm64-v8a 存在", "zygisk/arm64-v8a.so" in names)
 check("zygisk armeabi-v7a 存在", "zygisk/armeabi-v7a.so" in names)
-check("webroot 存在", any(n.startswith("webroot/") for n in names))
+check("webroot 已移除", not any(n.startswith("webroot/") for n in names))
 check("reload_rules 无残留", not any("reload_rules" in n for n in names))
-check("LICENSE 存在", "LICENSE" in names)
-check("模块 ABI 例外条款存在", "LICENSE.module-exception" in names)
-check("第三方组件声明存在", "THIRD-PARTY-NOTICES.md" in names)
+check("LICENSE 已移除", "LICENSE" not in names and not any(n.startswith("LICENSE") for n in names))
+check("模块 ABI 例外条款已移除", "LICENSE.module-exception" not in names)
+check("第三方组件声明已移除", "THIRD-PARTY-NOTICES.md" not in names)
+check("build-info 已移除", not any(n.endswith("build-info.txt") for n in names))
 check("可执行文件权限 0755",
       all((z.getinfo(n).external_attr >> 16 & 0o777) == 0o755
           for n in names if n.endswith((".so", ".sh")) or "bin/rule_server" in n))
@@ -375,7 +338,6 @@ else
                 fi
             done
         fi
-        cp -f "$MODULE_DIR/bin/build-info.txt" "$SYMBOLS_DIR/build-info.txt"
         python3 - "$SYMBOLS_DIR" "$SYM_ZIP" "${SYM_FILES[*]}" <<'PYEOF'
 import os, sys, zipfile
 sym_dir, out_zip, files = sys.argv[1], sys.argv[2], sys.argv[3].split()
@@ -388,15 +350,10 @@ with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr(zi, f.read())
     hint = ("addr2line 用法（NDK llvm-addr2line）：\n"
             "  llvm-addr2line -e symbols/fuse_daemon -f -C <offset>\n"
-            "offset 取 fuse_crash.log 中 '-> offset +0x...'（如 +0x30c1c）。\n"
-            "归因前先核对本包 build-info.txt 的 git 与崩溃日志 Build: 行一致。\n")
+            "offset 取 fuse_crash.log 中 '-> offset +0x...'（如 +0x30c1c）。\n")
     zi = zipfile.ZipInfo("symbols/README", (1980, 1, 1, 0, 0, 0))
     zi.external_attr = (0o644 & 0xFFFF) << 16
     z.writestr(zi, hint)
-    zi = zipfile.ZipInfo("symbols/build-info.txt", (1980, 1, 1, 0, 0, 0))
-    zi.external_attr = (0o644 & 0xFFFF) << 16
-    with open(os.path.join(sym_dir, "build-info.txt"), "rb") as f:
-        z.writestr(zi, f.read())
 print(f"符号包完成: {out_zip} ({os.path.getsize(out_zip)} bytes)")
 PYEOF
         echo "   sha256: $(sha256sum "$SYM_ZIP" | cut -d' ' -f1)"
