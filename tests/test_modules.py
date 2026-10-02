@@ -157,6 +157,8 @@ def run_case(label, body):
     print(f"\n── {label} ──")
     wconf("""
 [GLOBAL]
+MONITOR OFF
+SANDBOX OFF
 REDIRECT /云盘 real_dir
 FTP /bhealth seg1
 """)
