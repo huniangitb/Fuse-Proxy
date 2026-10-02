@@ -533,15 +533,17 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
             size_t tlen = strlen(real_base);
             bool t_slash = (tlen > 0 && real_base[tlen - 1] == '/');
             bool s_slash = (suffix[0] == '/');
+            int w;
             if (t_slash && s_slash)
-                snprintf(temp, temp_size, "%s%s", real_base, suffix + 1);
+                w = snprintf(temp, temp_size, "%s%s", real_base, suffix + 1);
             else if (!t_slash && !s_slash) {
                 if (suffix[0] == '\0')
-                    snprintf(temp, temp_size, "%s", real_base);
+                    w = snprintf(temp, temp_size, "%s", real_base);
                 else
-                    snprintf(temp, temp_size, "%s/%s", real_base, suffix);
+                    w = snprintf(temp, temp_size, "%s/%s", real_base, suffix);
             } else
-                snprintf(temp, temp_size, "%s%s", real_base, suffix);
+                w = snprintf(temp, temp_size, "%s%s", real_base, suffix);
+            if (w < 0 || (size_t)w >= temp_size) continue; /* 超截断 fail-closed：不用错路径 */
             matched = true;
             break;
         }
@@ -583,7 +585,8 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
             return false;
         }
         if (access(sandbox_target, F_OK) != 0) mkdir_recursive_p(sandbox_target, 0775);
-        snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
+        int sw = snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
+        if (sw < 0 || (size_t)sw >= temp_size) return false; /* 超截断 fail-closed */
         return true;
     }
     return false;
