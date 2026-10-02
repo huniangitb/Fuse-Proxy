@@ -90,7 +90,7 @@ int nsp_snprintf_dyn(char* fixed, size_t fixed_sz, char** heap_out, size_t max,
  * 0=EOF（无更多行）；-1=I/O 或 OOM 错误；-2=超长整行已丢弃
  * （已消费至行尾/文件尾，调用方告警后跳过——与“超长行不参与匹配”对齐）。
  * *buf 按需 realloc 扩容（初值 NULL 且 *cap=0），峰值内存 ≤ max+块大小；
- * max=0 表不限制（仅用于必须保真的编辑器回写路径，慎用）。 */
+ * max=0 表不限制（仅用于必须保真的编辑器回写路径，慎用），但 1MB 处仍以 EFBIG 熔断（NSP_DYN_FORMAT_MAX）。 */
 int nsp_getline_capped(FILE* fp, char** buf, size_t* cap, size_t max, size_t* out_len);
 
 /* 配置开关取值：**ON/1 为开，其余（含 NULL、缺省、OFF）一律为关**。

@@ -13,7 +13,7 @@
  * injector 的 inotify 监听读到半截配置。
  */
 #include "nsp_rule_file.h"
-#include "nsp_constants.h"
+#include "nsp_util.h" /* nsp_getline_capped（编辑器回写路径的有界行读取） */
 
 #include <ctype.h>
 #include <errno.h>
@@ -39,42 +39,49 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
 
     char** lines = NULL;
     int count = 0, cap = 0;
-    char buf[NSP_CONFIG_LINE_MAX];
-    while (fgets(buf, sizeof buf, fp)) {
+    /* 有界动态行读取（1MB 熔断，NSP_DYN_FORMAT_MAX）：超长整行丢弃，长行永不
+       裂成多条“碎片规则”——旧 fgets 固定缓冲（2048B）会把超长行切成多段，
+       下次编辑回写时碎片间被插入换行复活为多条畸形规则。 */
+    char* line = NULL;
+    size_t line_cap = 0;
+    for (;;) {
+        int r = nsp_getline_capped(fp, &line, &line_cap, NSP_DYN_FORMAT_MAX, NULL);
+        if (r == 0) break;
+        if (r == -2) continue; /* 超长整行丢弃，不参与匹配（与配置语义对齐） */
+        if (r < 0) break;
         if (count >= cap) {
             int ncap = cap == 0 ? NSP_RULE_LINES_INIT_CAP : cap * 2;
             char** grown = realloc(lines, (size_t)ncap * sizeof(char*));
             if (!grown) {
                 nsp_rule_file_free(lines, count);
+                free(line);
                 fclose(fp);
                 return NULL;
             }
             lines = grown;
             cap = ncap;
         }
-        /* 行尾换行归一：末行无换行（文件不以 \n 结尾）时，任何"插到该行之后"
-           的写入会与之粘连成同一行（如 "[USER_APPS:0]REDIRECT ..."），产出畸形
-           配置且后续匹配全线失配。统一在此补齐，使写入路径面对的行数组恒满足
-           "行尾带 \n"（写入本就会重写整个文件，补一个缺失的收尾换行无副作用）。 */
-        size_t blen = strlen(buf);
-        if (blen > 0 && buf[blen - 1] != '\n') {
-            char* fixed = malloc(blen + 2);
-            if (fixed) {
-                memcpy(fixed, buf, blen);
-                fixed[blen] = '\n';
-                fixed[blen + 1] = '\0';
-            }
-            lines[count] = fixed;
-        } else {
-            lines[count] = strdup(buf);
+        /* 行尾换行归一：getline 已剥换行（含末行无换行与 \r\n），此处统一补齐，
+           使写入路径面对的行数组恒满足"行尾带 \n"——任何"插到该行之后"的写入
+           都不会与之粘连成同一行（如 "[USER_APPS:0]REDIRECT ..." 畸形配置）。
+           写入本就会重写整个文件，补一个缺失的收尾换行无副作用。 */
+        size_t llen = strlen(line);
+        char* dup = malloc(llen + 2);
+        if (dup) {
+            memcpy(dup, line, llen);
+            dup[llen] = '\n';
+            dup[llen + 1] = '\0';
         }
+        lines[count] = dup;
         if (!lines[count]) {
             nsp_rule_file_free(lines, count);
+            free(line);
             fclose(fp);
             return NULL;
         }
         count++;
     }
+    free(line);
     fclose(fp);
     if (out_count) *out_count = count;
     if (out_cap) *out_cap = cap;

@@ -226,22 +226,19 @@ def test_remove_index_semantics():
     check("按类型筛选：RO 不受影响", "RO /r0" in ls, True)
     check("其它 HIDE 保留", "HIDE /c" in ls, True)
     c.close()
+    # 同机制覆盖 REDIRECT（pair 类型同样按类型筛选计索引）
+    c = Cfg("[GLOBAL]\nREDIRECT /a /b\nREDIRECT /c /d\n")
+    c.run("remove-rule", "GLOBAL", "REDIRECT", "1")
+    ls = lines_of(c.main_text())
+    check("删除第 2 条 REDIRECT", "REDIRECT /c /d" in ls, False)
+    check("第 1 条 REDIRECT 保留", "REDIRECT /a /b" in ls, True)
+    c.close()
     # 越界索引：报错且不改动
     c = Cfg("[GLOBAL]\nHIDE /only\n")
     before = c.main_text()
     _, out = c.run("remove-rule", "GLOBAL", "HIDE", "9")
     check("越界索引提示未找到", "未找到" in out, True)
     check("越界索引不改动文件", c.main_text(), before)
-    c.close()
-
-
-def test_redirect_remove_by_index():
-    print("── remove-rule 对 REDIRECT 的索引 ──")
-    c = Cfg("[GLOBAL]\nREDIRECT /a /b\nREDIRECT /c /d\n")
-    c.run("remove-rule", "GLOBAL", "REDIRECT", "1")
-    ls = lines_of(c.main_text())
-    check("删除第 2 条 REDIRECT", "REDIRECT /c /d" in ls, False)
-    check("第 1 条 REDIRECT 保留", "REDIRECT /a /b" in ls, True)
     c.close()
 
 
@@ -258,7 +255,6 @@ def main():
     test_category_header_variants()
     test_unknown_type()
     test_remove_index_semantics()
-    test_redirect_remove_by_index()
     print()
     print("═" * 39)
     print(f"log_ctl 规则编辑测试 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS + FAIL}")
