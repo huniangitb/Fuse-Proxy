@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "ftp_conf.h"
+#include "nsp_module.h" /* LOG_WRN（模块 ABI，经主程序导出表解析，与同目录后端一致） */
 #include "nsp_util.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,12 +59,21 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
     char cur_section[128] = {0};
     bool cur_section_bad = false; /* 段名超长：整段跳过（不建 server，不消费键） */
     FtpServerCfg* cur = NULL;
+    int lineno = 0;
 
     /* 有界动态行读取：超长行整行丢弃（长行永不裂成“段头碎片 + 键值碎片”） */
     for (;;) {
         int r = nsp_getline_capped(fp, &line, &line_cap, FTP_CONF_LINE_MAX, NULL);
         if (r == 0) break;
-        if (r == -2) continue; /* 超长整行跳过（段声明亦不生效） */
+        lineno++;
+        if (r == -2) {
+            LOG_WRN("ftp.conf %s 第 %d 行超长（>%d 字节），整行跳过", path, lineno,
+                    FTP_CONF_LINE_MAX);
+            /* 超长值行被整行丢弃：字段会静默回默认（fail-open 缝隙），故整段作废
+               fail-closed。长注释行亦毒化段落——可接受，配合本日志可查。 */
+            if (cur) cur->bad = true;
+            continue; /* 超长整行跳过（段声明亦不生效） */
+        }
         if (r < 0) break;
         strip_comment(line);
         char* s = nsp_str_trim(line);
@@ -135,7 +145,10 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
        绝不带着截断的 host/remote_dir 去连接或映射错地方 */
     int n = 0;
     for (int i = 0; i < out->count; i++) {
-        if (out->servers[i].bad) continue;
+        if (out->servers[i].bad) {
+            LOG_WRN("ftp.conf [%s] 字段超长，整段作废", out->servers[i].name);
+            continue;
+        }
         if (out->servers[i].host[0]) {
             if (n != i) out->servers[n] = out->servers[i];
             n++;

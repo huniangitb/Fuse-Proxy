@@ -251,8 +251,9 @@ def main():
             want = {f"f{i:04d}" for i in range(700)}
             for n in want:
                 (Path(FTP_UPLOAD)/bigd/n).write_bytes(b"x")
-            items = set(os.listdir(m/"0"/SERVER/bigd))
-            ok("大目录 700 文件一次列全（V5 分页）") if items == want else fail(
+            raw = os.listdir(m/"0"/SERVER/bigd)
+            items = set(raw)
+            ok("大目录 700 文件一次列全（V5 分页）") if items == want and len(raw) == 700 else fail(
                 "大目录分页", f" 列出 {len(items)}/700（丢尾则为旧 512 上限复发）")
         except Exception as e:
             fail("大目录分页", str(e))
