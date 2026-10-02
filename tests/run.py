@@ -36,7 +36,8 @@ SUITE_MAP = [
     # ── AGENTS.md 映射表 ──
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py"),
-     ("src/daemon/fw_rules.c", "src/config/config_parser.c", "src/daemon/fuse_daemon.c"),
+     ("src/daemon/fw_rules.c", "src/daemon/fw_rules.h", "src/config/config_parser.c",
+      "src/daemon/fuse_daemon.c"),
      ("fw_rules_resolve", "config_build_from_view", "parse_config_line"),
      "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
 
@@ -179,22 +180,65 @@ def all_suites():
     return sorted(out)
 
 
-# Tier 0 并行白名单：逐个核对过无共享状态的套件（判据：无 FUSE 挂载，或
-# 挂载点/CONF 全由 mkdtemp 派生自管；无固定端口；无全局 pkill；不碰系统
-# log_monitor 与真实日志文件）。命中 --jobs 时仅这些进线程池并行，其余
-# 按选中顺序串行。新套件默认串行，要加入须先核对判据。
+# ── 共享状态冲突矩阵（逐个审计 tests/test_*.py 得出，2026-10）──
+# 资源 R1 固定 CONF=/tmp/Namespace-Proxy/injector.conf：
+#   test_functional / test_rules / test_ftp / test_ftp_parallel /
+#   test_modules / test_module_circuit / test_decision_enforce /
+#   test_log_pipeline（各写各的规则内容，串行才安全）
+# 资源 R2 /tmp/fuse_proxy_test 基目录复用：
+#   test_functional(mnt/modules/storage) 与 test_log_pipeline(BASE 同名) 直接重合；
+#   test_inject_mount_env(ROOTBASE=…/mnt_env) 同前缀（但跑在 unshare 沙箱内）
+# 资源 R3 全局 pkill：test_functional / test_rules(pkill -f fuse_daemon 会杀掉
+#   别人刚起的 daemon)；test_log_pipeline / test_rule_server(SERVICE 段)
+#   pkill -9 -x log_monitor（会杀掉别人的 monitor）
+# 资源 R4 vsftpd 127.0.0.1:21 + 服务端目录 /home/bdy/ftp/upload（服务端文件互见）：
+#   test_ftp / test_ftp_parallel / test_ftp_stress 三者互斥
+# 资源 R5 固定中继端口 127.0.0.1:2121：test_ftp_parallel 独占绑定
+# 资源 R6 全局 log_monitor（抽象套接字 nsp_log_socket 单例 + 系统 LOG_DIR）：
+#   test_log_pipeline（重启系统实例 + 备份还原 /var/fuse-proxy/log 下 io/sys.log）
+#   与 test_rule_server（SERVICE 启停拉起系统 log_monitor）互斥，
+#   且二者与 test_inject_mount_env（沙箱内自起 log_monitor -p）互斥
+# 资源 R7 系统配置 /var/fuse-proxy/injector.conf：test_inject_mount_env 直接改写
+# 结论：挂载类恒串行；R6 两套件另划独占 Tier（最后跑，收尾把系统 monitor 还原）。
+#
+# Tier 0 并行白名单：逐个核对过无共享状态的套件（判据：CONF/挂载点全由 mkdtemp
+# 派生自管或根本不挂载；无固定端口；无全局 pkill；不碰系统 log_monitor 与
+# 真实日志文件）。命中 --jobs 时仅这些进线程池并行，其余按 Tier 串行。
+# 新套件默认串行，要加入须先核对判据。
 PARALLEL_SAFE = frozenset({
-    "test_config_snapshot.py",    # cc 编译夹具直跑，临时 config_dir
-    "test_module_abi.py",         # cc 编译 ABI 夹具，无 daemon
-    "test_path_vars.py",          # cc 编译直跑
-    "test_monitor_layers.py",     # cc 编译实际源码 + 合成 uid，无挂载
-    "test_log_ctl_rules.py",      # 全走 mkdtemp
-    "test_inject_method.py",      # conf 全走 mkdtemp + global_replace_ctl 驱动
-    "test_crash_log.py",          # --crash-test 挂载前退出，日志只写临时文件
-    "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon
+    "test_config_snapshot.py",    # cc 编译夹具直跑，TemporaryDirectory
+    "test_module_abi.py",         # cc 编译 ABI 夹具，无 daemon（TemporaryDirectory）
+    "test_path_vars.py",          # cc 编译直跑（mkdtemp）
+    "test_monitor_layers.py",     # cc 编译实际源码 + 合成 uid，无挂载（TemporaryDirectory）
+    "test_log_ctl_rules.py",      # 全走 mkdtemp（--config-dir 指向临时目录）
+    "test_inject_method.py",      # conf 全走 mkdtemp + global_replace_ctl 驱动，无 daemon
+    "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
+    "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
+    "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
 })
-# 注意：test_rule_server.py 虽用临时 conf_dir，但 SERVICE 用例会 pkill -9 全局
-# log_monitor 并拉起系统实例，与 test_log_pipeline.py 互斥，故不进白名单。
+# Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
+# 系统 monitor 已还原，不干扰其他套件。
+TIER_EXCLUSIVE = frozenset({
+    "test_log_pipeline.py",
+    "test_rule_server.py",
+})
+# 注意：test_rule_server.py 主体已隔离（临时 conf_dir + PID 后缀 socket），但
+# SERVICE 用例会 pkill -9 全局 log_monitor 并拉起系统实例，故仍归 Tier 2。
+
+
+# Tier 0 默认 worker 数：cc 编译型小套件为主，4 足够吃满；上限 8 防 fork 炸弹。
+# Tier 1/2（挂载/独占类）恒串行，不受 --jobs 影响。
+DEFAULT_JOBS = min(4, os.cpu_count() or 1)
+MAX_JOBS = 8
+
+
+def tier_of(name):
+    """套件分 Tier：0=并行白名单，2=独占（全局 log_monitor），其余 1=挂载类串行。"""
+    if name in PARALLEL_SAFE:
+        return 0
+    if name in TIER_EXCLUSIVE:
+        return 2
+    return 1
 
 
 def run_suite(name, capture=False):
@@ -248,9 +292,16 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出将要执行的套件")
     ap.add_argument("--base", default="HEAD",
                     help="与该提交对比以确定改动（默认 HEAD = 暂存+未暂存+未跟踪）")
-    ap.add_argument("--jobs", "-j", type=int, default=1,
-                    help="Tier 0 套件（PARALLEL_SAFE 白名单）并行worker数，默认1即全串行")
+    ap.add_argument("--jobs", "-j", type=int, default=DEFAULT_JOBS,
+                    help=f"Tier 0 套件（PARALLEL_SAFE 白名单）并行worker数，"
+                         f"默认{DEFAULT_JOBS}（上限{MAX_JOBS}）；"
+                         "Tier 1/2（挂载/独占类）恒串行")
     args = ap.parse_args()
+    if args.jobs > MAX_JOBS:
+        print(f"⚠ --jobs {args.jobs} 超过上限 {MAX_JOBS}，钳制为 {MAX_JOBS}")
+        args.jobs = MAX_JOBS
+    if args.jobs < 1:
+        args.jobs = 1
 
     if args.suites:
         suites = [s if s.endswith(".py") else s + ".py" for s in args.suites]
@@ -269,27 +320,28 @@ def main():
         suites, rows = select_suites(syms_text, paths)
 
     print("\n选中套件：")
-    safe = [s for s in suites if s in PARALLEL_SAFE]
-    excl = [s for s in suites if s not in PARALLEL_SAFE]
+    t0 = [s for s in suites if tier_of(s) == 0]
+    t1 = [s for s in suites if tier_of(s) == 1]
+    t2 = [s for s in suites if tier_of(s) == 2]
     for s in suites:
-        tag = "并行" if s in PARALLEL_SAFE else "串行"
+        tag = {0: "Tier0并行", 1: "Tier1串行", 2: "Tier2独占"}[tier_of(s)]
         print(f"  [{tag}] {s}")
     print("命中条目：" + ("、".join(rows) if rows else "无"))
     if args.list:
         return 0
 
     results = []
-    if args.jobs > 1 and safe:
-        # 先并行 Tier 0，再串行其余：挂载类/独占类之间仍保持原有顺序语义，
-        # 且独占类（log_monitor/vsftpd/userns）不受并行任务干扰
-        para = run_parallel(safe, args.jobs)
+    if args.jobs > 1 and t0:
+        # 先并行 Tier 0，再串行 Tier 1，最后独占 Tier 2：挂载类/独占类之间
+        # 仍保持选中顺序语义，且独占类（log_monitor/vsftpd/userns）不受
+        # 并行任务干扰，收尾时系统 log_monitor 已还原
+        para = run_parallel(t0, args.jobs)
         by_name = dict(para)
         for s in suites:
             if s in by_name:
                 rc, dt = by_name[s]
                 results.append((s, rc, dt))
-        suites = excl
-    for s in suites:
+    for s in t1 + t2:
         rc, dt, _ = run_suite(s)
         if rc is None:
             continue
