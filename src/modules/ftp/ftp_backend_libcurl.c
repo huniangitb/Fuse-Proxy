@@ -1019,6 +1019,7 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
 
     char url[2048];
     build_url(bk, path, url, sizeof url);
+    if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
 
     // 先尝试作为文件（SIZE + MDTM）
     struct WriteBuf wb = {0};
@@ -1133,6 +1134,8 @@ static int ftp_list_serve_page(const FtpListEntry* arr, size_t count, bool trunc
         memcpy(out[i].name, arr[(size_t)offset + i].name, sizeof out[i].name);
         out[i].is_dir = arr[(size_t)offset + i].is_dir;
     }
+    /* 页尾恰达缓存末尾但远端还有未知条目：宁可报错不给残页（fail-closed，
+       框架中止并 loud 报错，不静默丢尾） */
     if ((uint64_t)offset + n == (uint64_t)count && truncated) return -E2BIG;
     return (int)n;
 }
@@ -1378,6 +1381,11 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     f->tmp_fd = -1;
     pthread_mutex_init(&f->f_lock, NULL); /* 保护读缓冲状态 */
     build_url(bk, path, f->ftp_path, sizeof f->ftp_path);
+    if (f->ftp_path[0] == '\0') { /* 路径过长组不出 URL（业务 errno，不熔断），不进 curl */
+        pthread_mutex_destroy(&f->f_lock);
+        free(f);
+        return -ENAMETOOLONG;
+    }
 
     int accmode = flags & O_ACCMODE;
     bool writing = (accmode != O_RDONLY || (flags & O_CREAT) || (flags & O_TRUNC));
@@ -1505,6 +1513,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
 
     char url[2048];
     build_url(bk, path, url, sizeof url);
+    if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
 
     // STOR 上传空文件
     struct ReadBuf rb = {"", 0, 0};
@@ -2103,6 +2112,7 @@ static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int 
     if (backend_ready(bk) != 0) return -EIO;
     char url[2048], parent[2048], cmd[4096];
     build_url(bk, path, url, sizeof url);
+    if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
     ftp_parent_url(url, parent, sizeof parent);
     snprintf(cmd, sizeof cmd, fmt, ftp_filename(url));
     struct curl_slist* slist = curl_slist_append(NULL, cmd);
@@ -2158,6 +2168,8 @@ int ftp_backend_rename(const char* from, const char* to) {
         cmd2[4096];
     build_url(bk, from, from_url, sizeof from_url);
     build_url(bk, to, to_url, sizeof to_url);
+    if (from_url[0] == '\0' || to_url[0] == '\0')
+        return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
     /* RNFR/RNTO 用完整远程路径（跨目录 rename 时目标目录才正确），
        不能只用 basename——RNTO 会在源 CWD 内改名导致文件放错目录 */
     ftp_remote_path(from_url, from_path, sizeof from_path);
@@ -2205,6 +2217,7 @@ int ftp_backend_truncate(const char* path, off_t size) {
 
         char url[2048];
         build_url(bk, path, url, sizeof url);
+        if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
 
         struct ReadBuf rb = {"", 0, 0};
         CURL* c = ftp_easy_new(&bk->cfg);
