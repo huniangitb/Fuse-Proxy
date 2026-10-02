@@ -28,8 +28,8 @@
 [FTP]
 format = pair
 argc = 2
-desc = FTP 存储映射：<虚拟前缀>|<段名>
-desc.en = FTP storage mapping: <virtual prefix>|<section>
+desc = 存储映射：<虚拟前缀>|<段名>
+desc.en = Storage mapping: <virtual prefix>|<section>
 ```
 
 | 键 | 说明 |
@@ -58,17 +58,19 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 | `is_virtual_ancestor` + `is_redirect_target` | `virtual_kind`（`NSP_VK_NONE/ANCESTOR/TARGET`） | 两个并列 bool 合并为单枚举，合并策略明确（ANCESTOR 优先） |
 | `is_redir` | `is_redirect` | 仅改名 |
 | `user_id` / `sub_path` | —（框架自算） | 框架的 `fw_parse_path` 与模块侧剥离逻辑逐行等价，无需跨 ABI 传递；结果结构由 8336 降到约 4.2KB |
-| — | `attr_override` + `mode`/`uid`/`gid` | 模块可覆盖权限位与属主（见 §3.3） |
+| — | `attr_override` + `mode`/`uid`/`gid`（V4 已删，见 `src/daemon/fw_rules.h:42-47`） | 模块可覆盖权限位与属主（见 §3.3 历史记录） |
 
 **V4 删除了 `pkg` / `monitor_on` / `get_pkg`**：包名与 `MONITOR` 都是配置语义的输入，模块缺席时必须仍有正确值，故早已归框架——包名由 `fw_pkg.c` 自算（`uid.map` → `/proc` 回退），`MONITOR` 由 `fw_config_monitor_for` 自算三层合并（应用 > 类别 > 全局）。`monitor_on` 也不再由决策结构承载（`fw_route` 经出参单独给出，它本就不是路径决策）。
 
 **V3 的行为变更（有意）**：`appear_missing` 在**所有**回调统一返回 `ENOENT`。V2 时代读类回调是 `ENOENT`、写类回调是 `EACCES`，同一声明产生两种结果；统一后与「存在变不存在」的语义一致。若前端曾依赖写类路径的 `EACCES`，需按 `ENOENT` 调整。
 
-**注意两个版本号是不同的命名空间**：`NSP_MODULE_ABI_VERSION`（本次 4→5，破坏性，须重编译）与 `NSP_FRAMEWORK_API_VERSION`（`NspFrameworkApi` 的版本，尾部兼容演进，自身不要求重编译）互不相干。**框架 API V4 是尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故框架 API 这一侧不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `get_flags`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3/V4 一律拒载（见下方加载校验顺序、§6.5）。
+**注意两个版本号是不同的命名空间**：`NSP_MODULE_ABI_VERSION`（本次 4→5，破坏性，须重编译）与 `NSP_FRAMEWORK_API_VERSION`（`NspFrameworkApi` 的版本，尾部兼容演进，自身不要求重编译）互不相干。**框架 API V4 是尾部兼容新增**（`subscribe_rules` / `set_config_listener`），故框架 API 这一侧不要求重编译。`NspFrameworkApi` 只保留框架真正消费的字段（`api_version` / `get_rules_path` / `subscribe_rules` / `set_config_listener`）；日志由 `nsp_log.h` 的 `log_internal(LogLevel)` 统一提供。V2 删除了中间字段（`log` / `get_real_root`、`NspResolveResult` 的 `allow`/`has_redir`/`redir_target`/`has_sandbox`/`sandbox_target`/`is_other_app_pkg`/`ftp_backend`、`ops` 的 `get_vars`/`reload` 等）。**按新版头重编译是硬要求**：加载器按 `abi_version` 精确匹配，V1/V2/V3/V4 一律拒载（见下方加载校验顺序、§6.5）。
 
 加载校验顺序（`module_prepare`）：稳定性校验 → 读入内存副本 → `dlopen` → `dlsym(nsp_module_info)` → 魔数/ABI 版本 → 名字一致 → `init`。框架只校验"模块是否可用"，不做内容哈希。**ABI 校验发生在 `dlopen` 之后**：`RTLD_NOW` 会立即解析模块的全部符号，V1 模块引用已删除的导出符号时可能在 ABI 检查之前就解析失败；模块的构造器也已在 `dlopen` 期间运行。因此"拒绝旧 ABI"是加载失败，不是加载前拦截。
 
-### 3.1 类型与能力位
+### 3.1 类型与能力位（V4 已删，历史保留）
+
+> V4 起 `NspModuleInfo` 已无 `type`/`caps` 字段：现行模块形态只由 `ops` 决定（声明了 `backend_match` 即后端模块），见 `include/nsp_module.h:61-84`。下表仅为 V3 及以前的历史记录，重编译须删掉这两处赋值。
 
 | 类型 | 说明 |
 |------|------|
@@ -91,12 +93,13 @@ desc.en = FTP storage mapping: <virtual prefix>|<section>
 typedef struct NspFrameworkApi {
     uint32_t api_version;                       /* NSP_FRAMEWORK_API_VERSION */
     const char* (*get_rules_path)(void);        /* 规则配置路径（--rules） */
-    uint32_t (*get_flags)(void);                /* NSP_FLAG_DISABLE_SANDBOX 等 */
     /* ---- API V4 追加（尾部新增，旧模块按 api_version 决定是否使用）---- */
     void (*subscribe_rules)(const char* const* types, int count);   /* 声明申请的规则类型 */
     void (*set_config_listener)(void (*cb)(const NspModuleConfig*)); /* 配置下发回调 */
 } NspFrameworkApi;
 ```
+
+现行字段仅 `get_rules_path` / `subscribe_rules` / `set_config_listener`（对照 `include/nsp_module.h:90-108`）：`get_flags` 随 V4 与规则模块一起删除（唯一消费者是规则决策，框架不再提供）。
 
 - `api_version` 是模块 `init` 的第一道自检（如 `ftp_module` 在 `api->api_version < NSP_FRAMEWORK_API_VERSION` 时拒绝初始化）。
 - 日志**不再经服务表**：`nsp_module.h` 代含 `nsp_log.h`，模块直接调用 `log_internal(LogLevel, ...)` / `LOG`/`LOG_WRN`/`LOG_ERR`/`LOG_DBG` 宏，与框架同一套 `LogLevel`（0=DEBUG 1=INFO 2=WARN 3=ERROR）。真实存储根不再经服务表暴露——路径合成用导出表里的 `common_default_real_path` / `common_sandbox_path`（见 §6.1）。
@@ -105,7 +108,9 @@ typedef struct NspFrameworkApi {
 
 所有字段可选，未实现置 NULL。返回 `0` 成功 / **负值 errno** 失败。
 
-规则模块：
+> V4 起只剩 `backend_*`（历史记录）：`resolve` / `probe` / `readdir_extra` 随规则引擎内建一起删除，决策结构 `NspQueryCtx` / `NspPathDecision` / `NspProbeResult` 已搬进 `src/daemon/fw_rules.h:42-47`，不再是 ABI。以下 `resolve` / `probe` / `attr_override` 段落仅为 V3 及以前的历史语义，现行模块不要实现它们。
+
+规则模块（V4 已删，历史保留）：
 
 ```c
 int (*resolve)(const NspQueryCtx* q, NspPathDecision* out);  /* 路径决策，一次调用返回全部声明式决策 */
@@ -222,29 +227,32 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 > 的三层合并（`fw_pkg.c`），模块侧用于 `$package` 变量展开与沙箱隔离。两侧都只读
 > 文件、都不写，故无冲突。
 
-### 6.2 最小骨架
+### 6.2 最小骨架（V5 后端形态，照抄编译通过为准）
 
 ```c
-#include "nsp_module.h"   /* NSP_MODULE_BUILD 已定义 */
+#include "nsp_module.h"   /* 编译须带 -DNSP_MODULE_BUILD */
+
+static int my_match(const char* path) { (void)path; return 0; }  /* 1=管理该路径 */
+static const NspModuleOps g_my_ops = { .backend_match = my_match };
 
 static int my_init(const NspFrameworkApi* api) {
-    g_api = api;                    /* 保存框架参数表（get_rules_path / get_flags） */
-    return 0;                       /* 非 0 拒绝加载 */
+    (void)api;                    /* 按需取用 get_rules_path / subscribe_rules / set_config_listener */
+    return 0;                     /* 非 0 拒绝加载 */
 }
 static void my_exit(void) { /* 清理（可为 NULL） */ }
 
 const NspModuleInfo nsp_module_info = {
     .magic       = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,    /* 必须匹配，否则拒绝加载 */
-    .type        = NSP_MODULE_TYPE_RULES,     /* 或 BACKEND */
-    .caps        = NSP_CAP_REDIRECT,          /* 能力位图，须与 ops 一致 */
     .name        = "my_module",               /* 须与 .so 文件名/目录名一致 */
     .version     = "1.0.0",
     .init        = my_init,
     .exit        = my_exit,
-    .ops         = &g_my_ops,
+    .ops         = &g_my_ops,                 /* 声明 backend_match 即后端模块，无 type/caps */
 };
 ```
+
+> V4 起 `NspModuleInfo` 已无 `.type` / `.caps`（见 `include/nsp_module.h:61-84`）：旧骨架照抄必编译失败，以本节为准。
 
 ### 6.3 编译与安装
 
@@ -277,7 +285,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 
 ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。V5 同理（`backend_readdir` 加 `offset` 分页 + 超长名跳过语义），递增到 5 并拒绝 V1/V2/V3/V4——V4 模块无分页，大目录静默丢尾。
 
-**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。`ftp.conf` 失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
+**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。模块版本区分按 `.so` 文件 mtime 秒粒度（`st.st_mtime`）：同秒内替换不放行 ban、不触发重载，需 `touch` 续秒或等下次变化。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。`ftp.conf` 失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
 
 ## 7. 参考实现
 
