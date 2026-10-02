@@ -420,7 +420,8 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
    exit 必须调且必须过围栏（用未绑定槽位归因——正式槽位尚未分配，不能占用
    在册模块的槽位）。exit 崩溃则无法确认线程已停，保持 .so 映射不 dlclose。
    调用时须已释放 g_module_lock。 */
-static void commit_reject_unload(const char* name, void* h, const NspModuleInfo* info) {
+static void commit_reject_unload(const char* name, void* h, const NspModuleInfo* info,
+                                   int mfd) {
     bool can_unload = true;
     if (info->exit) {
         fault_fence_register_slot(NSP_FENCE_UNBOUND_SLOT, name, h);
@@ -435,6 +436,8 @@ static void commit_reject_unload(const char* name, void* h, const NspModuleInfo*
                 "detail=注册表满且无法确认模块线程已停,保持 .so 映射不 dlclose",
                 name);
     }
+    /* mfd 所有权随拒绝一并回收：commit 失败即定时重试，不 close 则每次漏 1fd */
+    if (mfd >= 0) close(mfd);
 }
 
 /* 登记已校验模块到槽位（写锁内发布原子快照/链） */
@@ -487,7 +490,9 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, i
             }
             if (!grown_ok) {
                 pthread_rwlock_unlock(&g_module_lock);
-                commit_reject_unload(name, h, info);
+                /* 注册表满/OOM 拒绝亦落 ban（mtime 版）：防定时重试每次漏 1fd + 反复全量加载 */
+                module_ban_record(name, so_mtime(so_path), "registry full");
+                commit_reject_unload(name, h, info, mfd);
                 return -6;
             }
         }
@@ -1549,16 +1554,18 @@ int module_ops_slot(const NspModuleOps* ops) {
     return -1;
 }
 
+/* slot 占位名表（"slotN"，无锁读）：pthread_once 初始化，消并发首调写入竞态 */
+static char g_slot_names[MAX_MODULES][16];
+static void slot_names_init_once(void) {
+    for (int i = 0; i < MAX_MODULES; i++)
+        snprintf(g_slot_names[i], sizeof g_slot_names[i], "slot%d", i);
+}
+static pthread_once_t g_slot_names_once = PTHREAD_ONCE_INIT;
+
 const char* module_slot_name(int slot) {
     /* "slotN" 占位静态表（无锁安全）：1024×16B=16KB .bss */
-    static char slot_names[MAX_MODULES][16];
     if (slot < 0 || slot >= MAX_MODULES) return "unknown";
-    static _Atomic(bool) names_ready = false;
-    if (!atomic_load_explicit(&names_ready, memory_order_relaxed)) {
-        for (int i = 0; i < MAX_MODULES; i++)
-            snprintf(slot_names[i], sizeof slot_names[i], "slot%d", i);
-        atomic_store_explicit(&names_ready, true, memory_order_relaxed);
-    }
+    pthread_once(&g_slot_names_once, slot_names_init_once);
     /* TLS 拷贝后返回：旧实现解锁后返回条目内部指针（UAF——unload 可复用/
        改写该槽）。本函数仅日志路径调用，TLS 开销可忽略。 */
     static _Thread_local char name_copy[64];
@@ -1570,5 +1577,5 @@ const char* module_slot_name(int slot) {
         return name_copy;
     }
     pthread_rwlock_unlock(&g_module_lock);
-    return slot_names[slot];
+    return g_slot_names[slot];
 }
