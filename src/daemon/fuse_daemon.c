@@ -592,6 +592,14 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                readdir 条目同一套算法，保证「目录项 d_ino == 该路径 getattr
                的 st_ino」，避免内核反复重查。 */
             if (st->st_ino == 0) st->st_ino = synthetic_inode(sub_path);
+            /* 类型位契约：后端必须给出 S_IFMT（文件/目录），缺失时内核按无类型
+               处理——目录在文件管理器中显示为文件且无法点击，子路径却仍可进入。
+               fail-closed：判契约违规（EIO + 熔断计数），不把错类型送进内核。 */
+            if ((st->st_mode & S_IFMT) == 0) {
+                module_guard_error(bslot, "backend_getattr", EIO, sub_path,
+                                   "getattr 未给出文件类型位");
+                VFS_RETURN(-EIO);
+            }
             if (st->st_uid == 0 && st->st_gid == 0) {
                 int root_uid = (path_user_id >= 0) ? path_user_id : 0;
                 char root_path[PATH_MAX];
