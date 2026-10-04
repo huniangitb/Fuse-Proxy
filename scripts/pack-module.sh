@@ -156,7 +156,7 @@ for d in "$MODULE_DIR"/bin/modules/*/; do
 done
 
 echo "== 同步 conf 配置 ..."
-for f in injector.conf ftp.conf monitor_ignore.conf; do
+for f in injector.conf ftp.conf; do
     if [[ -f "$CONF_DIR_SRC/$f" ]]; then
         cp -f "$CONF_DIR_SRC/$f" "$MODULE_DIR/conf/$f"
         echo "   - $f"
