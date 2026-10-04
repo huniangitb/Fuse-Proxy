@@ -396,6 +396,9 @@ static void inject_global_fuse() {
         int ai = 0;
         args[ai++] = "fuse_daemon";
         args[ai++] = g_global_fuse.mnt_path;
+        /* --root= 必须显式传递：vfs_bpf_setup 直接拼接 g_real_root（无 common
+           回退），缺省会导致 backing 路径成虚拟路径、open 恒 ENOENT */
+        args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
         if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
@@ -509,6 +512,8 @@ static void inject_media_fuse() {
         int ai = 0;
         args[ai++] = "fuse_daemon";
         args[ai++] = g_media_fuse.mnt_path;
+        /* --root= 必须显式传递（同全局实例，见上） */
+        args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
         if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
