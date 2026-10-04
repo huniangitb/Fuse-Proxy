@@ -2619,11 +2619,12 @@ int main(int argc, char* argv[]) {
         }
     }
     fuse_argv[fuse_argc] = nullptr;
-    /* 负缓存熔断单点：见 strip_negative_timeout_opt（nodeid=0 上送崩溃防御） */
-    fuse_argc = strip_negative_timeout_opt(fuse_argv, fuse_argc);
-    fuse_argv[fuse_argc] = nullptr;
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
+    /* 负缓存熔断单点（nodeid=0 上送崩溃防御）：须在 log_init 之后，
+       剥离告警（LOG_WRN）走日志系统，未初始化会被丢弃 */
+    fuse_argc = strip_negative_timeout_opt(fuse_argv, fuse_argc);
+    fuse_argv[fuse_argc] = nullptr;
     /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
     /* 崩溃处理器安装顺序（关键）：先装 crash_handler（内层/dump+re-raise），
        再装 fault_fence 处理器（外层/活动处理器）——后安装者生效。fence 在
