@@ -130,6 +130,9 @@ typedef struct NspModuleOps {
        透传。返回 0 成功，负值 errno 风格（业务失败不触发熔断，见 modules.md §5）。
        声明了 backend_match 即视为后端模块——V4 起没有别的模块形态。 */
     int (*backend_match)(const char* path); /* 1=管理该路径 0=否 */
+    /* 成功时 st 必须含有效类型位（S_IFDIR/S_IFREG 等 S_IFMT 成员）：缺失时框架
+       判契约违规（EIO + 熔断计数），不把无类型 stat 送进内核（目录会被识别成
+       文件）。ino 为 0 时框架按路径派生兜底；uid/gid 全 0 时继承存储根属主。 */
     int (*backend_getattr)(const char* path, struct stat* st);
     /* 分页列目录：跳过前 offset 条，填充至多 max 条；返回本次填充数，
        0 表到末尾，负值 errno 风格。框架按 offset 累加逐页拉取直到短页/0 页，
