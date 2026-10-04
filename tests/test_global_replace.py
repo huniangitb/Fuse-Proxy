@@ -16,8 +16,9 @@ build_gnu/global_replace_ctl 验证新方法的完整生命周期：
   排除项：/mnt/pass_through/0/emulated（直通视图，不得被替换）
   项目 FUSE 源：/mnt/nsp_global
 
-运行要求：root（mount 权限）。全程在私有挂载命名空间内进行，
-测试进程退出即自动销毁，不污染宿主环境。无权限时跳过。
+运行要求：免 root——经 `unshare --user --map-root-user --mount`
+进 rootless 沙箱（映射根用户后即具挂载权限），先 `mount --make-rprivate /`
+切断传播，全程不污染宿主；userns 不可用时跳过。
 """
 import os, sys, time, subprocess, shutil, ctypes
 
@@ -114,6 +115,8 @@ def ctl_status(pid):
 
 def setup_view():
     """在私有命名空间中构造模拟安卓视图。"""
+    # 先切断挂载传播：测试挂载绝不回流宿主（沙箱退出后内核自动回收）
+    sh("mount", "--make-rprivate", "/")
     os.makedirs(BACKUP_ROOT, exist_ok=True)
     mount_tmpfs(FUSE_SRC)  # 项目 FUSE 源（模拟 fuse_daemon 挂载）
     for fam in FAMILIES:
@@ -361,20 +364,16 @@ def run_tests():
         fail("恢复后 status", f"期望 normal 实际 {st}")
 
 
-def main():
-    if os.geteuid() != 0:
-        log("跳过：需要 root 权限（mount/unshare）")
-        return
-    if not os.path.exists(CTL):
-        log(f"跳过：找不到测试驱动 {CTL}（请先构建 build_gnu）")
-        return
-    # 进入私有挂载命名空间，隔离测试挂载，避免污染宿主
-    if LIB_C.unshare(CLONE_NEWNS) != 0:
-        log("跳过：unshare(CLONE_NEWNS) 失败（需要 CAP_SYS_ADMIN）")
-        return
-    # 关键：/mnt 等宿主挂载多为 shared 传播挂载，unshare 后挂载仍会双向传播
-    # （测试挂载污染宿主 / 宿主残留回流测试视图），必须把整棵树改为私有切断传播
-    subprocess.run(["mount", "--make-rprivate", "/"], capture_output=True)
+def mountinfo_snapshot():
+    try:
+        with open("/proc/self/mountinfo") as fh:
+            return sorted(fh.read().splitlines())
+    except OSError:
+        return []
+
+
+def inner_main():
+    """rootless 沙箱内执行体：隔离挂载 + 全场景不断言遗漏。"""
     try:
         setup_view()
         run_tests()
@@ -384,8 +383,51 @@ def main():
     if ERRORS:
         for d, det in ERRORS:
             print(f"  ❌ {d}: {det}")
-        sys.exit(1)
+        return 1
+    return 0
+
+
+def userns_available():
+    if shutil.which("unshare") is None:
+        return False
+    r = subprocess.run(["unshare", "--user", "--map-root-user", "--mount", "true"],
+                       capture_output=True, timeout=15)
+    return r.returncode == 0
+
+
+def main():
+    if not os.path.exists(CTL):
+        log(f"跳过：找不到测试驱动 {CTL}（请先构建 build_gnu）")
+        return 0
+    if not userns_available():
+        log("跳过：user/mount ns 不可用（需要 unshare 与 userns 权限）")
+        return 0
+    host_before = mountinfo_snapshot()
+    # rootless 沙箱：映射根用户后具挂载权限；测试挂载 confined 于私有命名空间，
+    # 进程退出即随命名空间销毁，宿主零残留（另有前后 mountinfo 比对兜底）
+    cmd = ["unshare", "--user", "--map-root-user", "--mount",
+           sys.executable, os.path.abspath(__file__), "--inner"]
+    try:
+        r = subprocess.run(cmd, timeout=180)
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        log("失败：沙箱内测试超时(180s)")
+        rc = 1
+    host_after = mountinfo_snapshot()
+    if host_before != host_after:
+        diff = [l for l in host_after if l not in host_before][:6]
+        log(f"  ❌ 宿主 mountinfo 被污染: {'; '.join(diff)}")
+        rc = 1
+    else:
+        log("  ✅ 宿主 mountinfo 零变化")
+    # /tmp 下测试目录仅为占位（挂载已随命名空间销毁），尽力清理
+    shutil.rmtree(os.path.dirname(BACKUP_ROOT), ignore_errors=True)
+    if rc != 0:
+        sys.exit(rc)
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--inner":
+        sys.exit(inner_main())
+    sys.exit(main())
