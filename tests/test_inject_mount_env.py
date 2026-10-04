@@ -106,7 +106,7 @@ PROJ_MARK_PHYS = "/var/fuse-proxy/storage/0/proj_marker"
 BACKUP_TOP = "/var/fuse-proxy/backup/global_emulated/user_0/emulated"
 
 # 残留进程甄别标记（沙箱进程一旦漏杀，必然带其一；宿主自身不带）
-HOST_MARKERS = ("--inject-method=", "--global-root-fd=", "--workdir",
+HOST_MARKERS = ("--inject-method=", "--ready-fd=", "--workdir",
                 TARGET_PKG, NONTARGET_PKG)
 
 # 配置：GLOBAL_INJECT OFF → v1 不拉媒体 FUSE；目标段带实质规则（否则 v1
@@ -1046,9 +1046,9 @@ def inner_main(argv):
         REP.check("injector 收到 SIGTERM 后优雅退出", exited,
                   "" if exited else f"pid {daemon_pid} 25s 未退出")
 
-        # fuse_daemon 随退出终结
+        # fuse_daemon 随退出终结（--ready-fd= 是 injector 启动 daemon 的稳定标记）
         def fuse_gone():
-            pids = find_procs("--global-root-fd=")
+            pids = find_procs("--ready-fd=")
             return not pids, f"仍存活: {pids}" if pids else "已终结"
         wait_check("fuse_daemon 已随 injector 退出终结", fuse_gone, timeout=8)
 
