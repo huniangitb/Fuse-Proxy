@@ -1066,6 +1066,9 @@ static void injector_start_fuses(bool start_passive) {
     g_config_pub_fd = config_publisher_init();
     strcpy(g_real_root, STORAGE_BASE);
     mkdir_recursive(BACKUP_DIR);
+    /* 备份根收敛：v2/v3 全局替换备份树（GLOBAL_BACKUP_ROOT）与 v1 占位同处
+       BACKUP_DIR 下，生命周期内此处预建一次，各 ns 操作内不再逐次建目录 */
+    mkdir_recursive(GLOBAL_BACKUP_ROOT);
     /* 应用规则目录创建权归属 injector 单一进程：显式开启后，后续所有
        load_config_rules 调用（启动 + 热重载 reload_config_rules_diff）均
        允许 mkdir App-rules / App-rules-<uid>；fuse_daemon/log_ctl 等

@@ -200,7 +200,13 @@ int ns_backup_point_state(int pid, const char* path) {
 struct GlobalReplaceArgs {
     const char* fuse_src;
     const char* backup_root;
+    bool skip_backup;
 };
+
+/* 程序生命周期内节点备份一次标志（父进程侧）：首次替换成功后置位，
+   后续替换跳过已有备份节点的备份 bind，只补充新增用户；成功 restore 后
+   清零（备份树已卸载消费，下一次替换需重新备份）。 */
+static bool g_global_backup_done = false;
 
 struct AppRestoreArgs {
     char fuse_src[PATH_MAX];
@@ -213,6 +219,7 @@ static int do_global_replace(void* raw) {
     struct GlobalReplaceArgs* args = (struct GlobalReplaceArgs*)raw;
     const char* fuse_src = args->fuse_src;
     const char* backup_root = args->backup_root;
+    bool skip_backup = args->skip_backup;
     /* NsMountEntry 单条约 8.3KB，栈上声明大数组会叠加超 8MB 栈上限导致 SIGSEGV，
        全部改为堆分配 */
     NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
@@ -303,7 +310,8 @@ static int do_global_replace(void* raw) {
     static const char* const fam_names[] = {"installer", "androidwritable", "user"};
     LOG("全局替换: 备份族=%s, 共 %d 个族根", fam_names[backup_family], root_count);
 
-    /* 3. 备份：对备份族每个用户，逐节点 bind 到 backup_root/user_<id>/emulated */
+    /* 3. 备份：对备份族每个用户，逐节点 bind 到 backup_root/user_<id>/emulated。
+       生命周期一次：skip_backup 置位后已有备份点直接跳过，仅新增用户走补充备份 */
     for (int i = 0; i < root_count; i++) {
         int uid = 0;
         if (ns_parse_family_root(roots[i].mount_point, &uid) != backup_family) continue;
@@ -329,9 +337,14 @@ static int do_global_replace(void* raw) {
             return -1;
         }
         if (st == 1) {
-            LOG("全局替换: 备份点 %s 已有有效备份，跳过（避免叠 bind）", backup_top);
+            if (skip_backup)
+                LOG_DBG("全局替换: 备份点 %s 生命周期内已备份，跳过", backup_top);
+            else
+                LOG("全局替换: 备份点 %s 已有有效备份，跳过（避免叠 bind）", backup_top);
             continue;
         }
+        if (skip_backup)
+            LOG("全局替换: 生命周期内已备份，发现新增用户 %d，补充备份 %s", uid, backup_top);
         /* 收集该族根全部挂载点（含自身与 fuse 子挂载） */
         int sn = ns_gather_mounts_under(all, n, root, true, true, sub, 128);
         if (sn >= 128) {
@@ -434,11 +447,19 @@ static int do_global_replace(void* raw) {
 
 int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* backup_root) {
     if (!fuse_src || !backup_root) return -1;
-    struct GlobalReplaceArgs args = {fuse_src, backup_root};
+    /* 生命周期一次：已备份且当前全量已替换时不再进 ns 操作，直接返回 */
+    if (g_global_backup_done &&
+        ns_global_status(mnt_ns_pid, fuse_src) == NSP_GLOBAL_STATUS_REPLACED) {
+        LOG_DBG("全局替换: 生命周期内已备份且状态为已替换，跳过");
+        return 0;
+    }
+    struct GlobalReplaceArgs args = {fuse_src, backup_root, g_global_backup_done};
     int child_err = 0;
     int ret = run_in_mnt_ns_timeout(mnt_ns_pid, do_global_replace, &args, &child_err, 15000);
     if (ret != 0) {
         LOG_ERR("全局替换失败 (ret=%d, err=%d)", ret, child_err);
+    } else {
+        g_global_backup_done = true;
     }
     return ret;
 }
@@ -569,7 +590,12 @@ int ns_global_restore_system(int mnt_ns_pid, const char* backup_root) {
     int child_err = 0;
     int ret =
         run_in_mnt_ns_timeout(mnt_ns_pid, do_global_restore, (void*)backup_root, &child_err, 15000);
-    if (ret != 0) LOG_ERR("全局恢复失败 (ret=%d, err=%d)", ret, child_err);
+    if (ret != 0) {
+        LOG_ERR("全局恢复失败 (ret=%d, err=%d)", ret, child_err);
+    } else {
+        /* 备份树已卸载消费：清零一次标志，下一次替换需重新备份 */
+        g_global_backup_done = false;
+    }
     return ret;
 }
 
