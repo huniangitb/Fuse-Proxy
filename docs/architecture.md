@@ -69,7 +69,7 @@ flowchart TB
 
 ### 2.2 fuse_daemon — FUSE 守护
 
-由 injector 以 `--mode=redirect --root=/data/media --rules=<injector.conf>` 启动，实现约 27 个 `fuse_operations` 回调。框架**自带规则能力**（V4 起规则引擎内建，模块只剩后端）：
+由 injector 以 `<mnt> --rules=<injector.conf> --ready-fd=<fd> [-f -o ...]` 启动（`--mode`/`--root`/`--global-root-fd` 已删：mode 从未被读取、root 缺省即 `STORAGE_BASE`、root-fd 在 daemon 侧从未使用；日志级别默认 INFO，不占参数位），实现约 27 个 `fuse_operations` 回调。框架**自带规则能力**（V4 起规则引擎内建，模块只剩后端）：
 
 - **规则决策**（`fw_rules.c`）：本进程内解析 REDIRECT/SANDBOX/HIDE/ALLOW/RO 与 FTP 前缀归属，输出声明式 `NspPathDecision`（见 `src/daemon/fw_rules.h`）；无 `<uid>/` 用户层的路径（挂载点根）不参与规则，直通处理。
 - **后端分派**：决策命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。后端模块**从内存副本加载**（memfd），磁盘文件被原子替换或就地覆盖都不会破坏运行中的映像。

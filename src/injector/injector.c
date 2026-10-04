@@ -384,14 +384,8 @@ static void inject_global_fuse() {
         char arg_ready[64];
         snprintf(arg_ready, sizeof(arg_ready), "--ready-fd=%d", ready_pipe[1]);
         fcntl(ready_pipe[1], F_SETFD, 0);
-        char arg_global[64];
-        if (g_global_root_fd >= 0) {
-            fcntl(g_global_root_fd, F_SETFD, 0);
-            snprintf(arg_global, sizeof(arg_global), "--global-root-fd=%d", g_global_root_fd);
-        } else {
-            strcpy(arg_global, "--global-root-fd=-1");
-        }
-        const char* log_lvl = "info";
+        /* 日志级别透传：daemon 侧默认即 INFO（g_min_log_level），默认级别不占参数位 */
+        const char* log_lvl = NULL;
         if (g_min_log_level == LOG_DEBUG)
             log_lvl = "debug";
         else if (g_min_log_level == LOG_ERROR)
@@ -402,15 +396,12 @@ static void inject_global_fuse() {
         int ai = 0;
         args[ai++] = "fuse_daemon";
         args[ai++] = g_global_fuse.mnt_path;
-        args[ai++] = "--mode=redirect";
-        args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
         if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
-        args[ai++] = arg_global;
-        args[ai++] = (char*)log_lvl;
+        if (log_lvl) args[ai++] = (char*)log_lvl;
         if (g_global_cfg.fuse_extra_args[0]) {
             char extra_copy[512];
             strncpy(extra_copy, g_global_cfg.fuse_extra_args, sizeof(extra_copy) - 1);
@@ -506,14 +497,8 @@ static void inject_media_fuse() {
         char arg_ready[64];
         snprintf(arg_ready, sizeof(arg_ready), "--ready-fd=%d", ready_pipe[1]);
         fcntl(ready_pipe[1], F_SETFD, 0);
-        char arg_global[64];
-        if (g_global_root_fd >= 0) {
-            fcntl(g_global_root_fd, F_SETFD, 0);
-            snprintf(arg_global, sizeof(arg_global), "--global-root-fd=%d", g_global_root_fd);
-        } else {
-            strcpy(arg_global, "--global-root-fd=-1");
-        }
-        const char* log_lvl = "info";
+        /* 日志级别透传：daemon 侧默认即 INFO，默认级别不占参数位 */
+        const char* log_lvl = NULL;
         if (g_min_log_level == LOG_DEBUG)
             log_lvl = "debug";
         else if (g_min_log_level == LOG_ERROR)
@@ -524,15 +509,12 @@ static void inject_media_fuse() {
         int ai = 0;
         args[ai++] = "fuse_daemon";
         args[ai++] = g_media_fuse.mnt_path;
-        args[ai++] = "--mode=redirect";
-        args[ai++] = "--root=" STORAGE_BASE;
         args[ai++] = "--rules=" INJECTOR_CONFIG_PATH;
         if (g_strip_o_direct) args[ai++] = "--strip-o-direct";
         if (g_no_passthrough_fallback) args[ai++] = "--no-passthrough";
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
-        args[ai++] = arg_global;
-        args[ai++] = (char*)log_lvl;
+        if (log_lvl) args[ai++] = (char*)log_lvl;
         args[ai++] = "--no-passthrough";
         args[ai++] = "--media-fuse";
 

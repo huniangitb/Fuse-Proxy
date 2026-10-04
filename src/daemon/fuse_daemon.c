@@ -61,7 +61,6 @@ bool g_passthrough_enabled = false;
 bool g_disable_sandbox = false; /* 新增：禁用沙盒功能标志 */
 
 static int g_ready_fd = -1;
-static int g_global_root_fd = -1;
 /* 崩溃触发测试：--crash-test[=segv|abrt|bus]，验证崩溃日志捕获链路 */
 static int g_crash_test = 0; /* 0=无 1=SIGSEGV 2=SIGABRT 3=SIGBUS */
 #ifdef TARGET_ANDROID
@@ -135,9 +134,6 @@ static void vfs_flush_pending_closes(void) {
     } while (consumed < ready);
     atomic_store_explicit(&g_pc_consumed, consumed, memory_order_release);
 }
-
-typedef enum { MODE_REDIRECT, MODE_OVERLAY } DaemonMode;
-static DaemonMode g_mode = MODE_REDIRECT;
 
 static char g_lower_dir[PATH_MAX] = {0};
 static char g_upper_dir[PATH_MAX] = {0};
@@ -2113,7 +2109,6 @@ static void vfs_destroy(void* private_data) {
     char msg[256];
     snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid());
     nsp_comm_post(NSP_CH_IPC, msg, strlen(msg) + 1);
-    if (g_global_root_fd >= 0) close(g_global_root_fd);
 #ifdef TARGET_ANDROID
     if (g_bpf_fd >= 0) close(g_bpf_fd);
 #endif
@@ -2542,11 +2537,11 @@ int main(int argc, char* argv[]) {
     int fuse_argc = 0;
     if (argc > 0) fuse_argv[fuse_argc++] = argv[0];
     for (int i = 1; i < argc; i++) {
+        /* --mode= 已删除：g_mode 从未被读取（redirect 是唯一形态），
+           injector 不再传递，误传的旧参数在此显式拒绝而非静默吞掉 */
         if (strncmp(argv[i], "--mode=", 7) == 0) {
-            if (strcmp(argv[i] + 7, "overlay") == 0)
-                g_mode = MODE_OVERLAY;
-            else
-                g_mode = MODE_REDIRECT;
+            fprintf(stderr, "fuse_daemon: 不支持的参数 %s（--mode 已删除）\n", argv[i]);
+            return 1;
         } else if (strncmp(argv[i], "--root=", 7) == 0) {
             strncpy(g_real_root, argv[i] + 7, PATH_MAX - 1);
         } else if (strncmp(argv[i], "--rules=", 8) == 0) {
@@ -2558,7 +2553,11 @@ int main(int argc, char* argv[]) {
         } else if (strncmp(argv[i], "--ready-fd=", 11) == 0) {
             g_ready_fd = atoi(argv[i] + 11);
         } else if (strncmp(argv[i], "--global-root-fd=", 17) == 0) {
-            g_global_root_fd = atoi(argv[i] + 17);
+            /* --global-root-fd 已删除：daemon 侧从未使用该 fd，injector 不再传递；
+               误传的旧参数显式拒绝 */
+            fprintf(stderr, "fuse_daemon: 不支持的参数 %s（--global-root-fd 已删除）\n",
+                    argv[i]);
+            return 1;
         } else if (strcmp(argv[i], "--strip-o-direct") == 0) {
             g_strip_o_direct = true;
 #ifdef TARGET_ANDROID
