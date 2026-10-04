@@ -43,7 +43,7 @@
 | `SANDBOX` | 应用段 | 启用独立沙箱（隔离 `/Android/data`、`/Android/obb`） |
 | `GLOBAL_INJECT` | 全局段 | 全局注入开关 |
 | `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON** |
-| `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节） |
+| `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节）；其中 `-o negative_timeout[=N]` 会被单点剥离（恒为 libfuse 默认 0.0，非 0 负缓存以 ino=0 回包会触发内核 nodeid=0 崩溃） |
 
 `MONITOR` / `SANDBOX` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记），不存在"继承全局后再覆盖"的中间态。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
 

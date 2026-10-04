@@ -35,7 +35,7 @@ SUITE_MAP = [
 
     # ── AGENTS.md 映射表 ──
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
-      "test_decision_enforce.py"),
+      "test_decision_enforce.py", "test_negative_timeout.py"),
      ("src/daemon/fw_rules.c", "src/daemon/fw_rules.h", "src/config/config_parser.c",
       "src/daemon/fuse_daemon.c"),
      ("fw_rules_resolve", "config_build_from_view", "parse_config_line"),
