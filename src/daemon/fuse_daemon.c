@@ -2416,8 +2416,12 @@ static int vfs_bpf_setup(const char* path, struct fuse_entry_param* e) {
             return -ENOENT;
     }
 
-    int bw = snprintf(real, sizeof(real), "%s%s", g_real_root, path);
-    if (bw < 0 || (size_t)bw >= sizeof(real)) return -ENAMETOOLONG; /* 超长 fail-closed */
+    /* backing 路径经 common 唯一出口合成：g_real_root 为空（injector 已不再
+       传 --root=）时回退 STORAGE_BASE，与 common_default_real_path 同口径；
+       此前裸拼在空 root 下产出虚拟路径（/0/...），open 恒 ENOENT，BPF  backing
+       静默丢失（线上实例）。user_id=-1 保留 <uid>/ 层原样。 */
+    common_default_real_path(-1, path, real, sizeof(real));
+    if (real[0] == '\0') return -ENAMETOOLONG; /* 超长 fail-closed */
     if (!S_ISDIR(e->attr.st_mode)) return -ENOTDIR;
 
     int bfd = open(real, O_CLOEXEC | O_DIRECTORY | O_RDONLY);
