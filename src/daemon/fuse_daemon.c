@@ -999,6 +999,35 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         fw_rules_probe(&probe_q, &ir);
         if (ir.valid && (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)))
             continue;
+        if (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
+                               strcmp(d->sub_path, "/Android/data/") == 0 ||
+                               strcmp(d->sub_path, "/Android/obb") == 0 ||
+                               strcmp(d->sub_path, "/Android/obb/") == 0)) {
+            if (strcmp(de->d_name, d->current_pkg) != 0) continue;
+        }
+        /* 骨架名判定（与后继 fill_* 合成条件同源）：lstat 失败时不上架 NULL 条目、
+           也不置 has_* 标记，交由 fill 阶段合成标准目录条目（S_IFDIR|0755 + 同源
+           ino）。否则 DT_UNKNOWN 条目会让管理器显示为文件且无法点击，而按名
+           stat（getattr 虚拟分支）又是目录——线上实例：lower 层 EACCES 致 lstat
+           失败时 has_* 已预置，fill 合成被跳过，列表里只剩无类型条目。 */
+        bool skel = (d->is_root && d->hide_others && strcmp(de->d_name, "Android") == 0) ||
+                    (d->is_android_dir && (strcmp(de->d_name, "data") == 0 ||
+                                           strcmp(de->d_name, "obb") == 0)) ||
+                    (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
+                                        strcmp(d->sub_path, "/Android/data/") == 0 ||
+                                        strcmp(d->sub_path, "/Android/obb") == 0 ||
+                                        strcmp(d->sub_path, "/Android/obb/") == 0) &&
+                     strcmp(de->d_name, d->current_pkg) == 0);
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        readdir_join(item_real_path, 2047, d->real_path, de->d_name);
+        if (lstat(item_real_path, &st) != 0) {
+            if (skel) continue; /* 回退 fill 合成（has_* 保持 false，不占 ht 名额） */
+            if (vfs_hash_insert(&d->ht, de->d_name)) {
+                if (!vfs_emit(d, de->d_name, nullptr)) return false;
+            }
+            continue;
+        }
         if (d->is_root && strcmp(de->d_name, "Android") == 0) d->has_android = true;
         if (d->is_android_dir) {
             if (strcmp(de->d_name, "data") == 0)
@@ -1009,19 +1038,11 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         if (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
                                strcmp(d->sub_path, "/Android/data/") == 0 ||
                                strcmp(d->sub_path, "/Android/obb") == 0 ||
-                               strcmp(d->sub_path, "/Android/obb/") == 0)) {
-            if (strcmp(de->d_name, d->current_pkg) != 0) continue;
+                               strcmp(d->sub_path, "/Android/obb/") == 0) &&
+            strcmp(de->d_name, d->current_pkg) == 0)
             d->has_pkg = true;
-        }
         if (vfs_hash_insert(&d->ht, de->d_name)) {
-            struct stat st;
-            memset(&st, 0, sizeof(st));
-            readdir_join(item_real_path, 2047, d->real_path, de->d_name);
-            if (lstat(item_real_path, &st) == 0) {
-                if (!vfs_emit(d, de->d_name, &st)) return false;
-            } else {
-                if (!vfs_emit(d, de->d_name, nullptr)) return false;
-            }
+            if (!vfs_emit(d, de->d_name, &st)) return false;
         }
     }
     return true;
