@@ -2549,11 +2549,15 @@ int main(int argc, char* argv[]) {
     int fuse_argc = 0;
     if (argc > 0) fuse_argv[fuse_argc++] = argv[0];
     for (int i = 1; i < argc; i++) {
-        /* --mode= 已删除：g_mode 从未被读取（redirect 是唯一形态），
-           injector 不再传递，误传的旧参数在此显式拒绝而非静默吞掉 */
+        /* --mode= 已删除（g_mode 从未被读取，redirect 是唯一形态）：
+           旧版对任何取值实际都跑 redirect，故忽略与旧行为完全一致；
+           曾改为显式拒绝，但线上出现新旧混装（旧 injector + 新 daemon）
+           导致 daemon 连续拒启（log(7) 3 秒内 15 次），改回警告忽略。
+           解析尚在 log_init 之前，日志走 stderr（injector 重定向至
+           fuse_crash.log，可查）。 */
         if (strncmp(argv[i], "--mode=", 7) == 0) {
-            fprintf(stderr, "fuse_daemon: 不支持的参数 %s（--mode 已删除）\n", argv[i]);
-            return 1;
+            fprintf(stderr, "fuse_daemon: 忽略已删除的参数 %s（恒为 redirect 语义）\n", argv[i]);
+            continue;
         } else if (strncmp(argv[i], "--root=", 7) == 0) {
             strncpy(g_real_root, argv[i] + 7, PATH_MAX - 1);
         } else if (strncmp(argv[i], "--rules=", 8) == 0) {
@@ -2565,11 +2569,10 @@ int main(int argc, char* argv[]) {
         } else if (strncmp(argv[i], "--ready-fd=", 11) == 0) {
             g_ready_fd = atoi(argv[i] + 11);
         } else if (strncmp(argv[i], "--global-root-fd=", 17) == 0) {
-            /* --global-root-fd 已删除：daemon 侧从未使用该 fd，injector 不再传递；
-               误传的旧参数显式拒绝 */
-            fprintf(stderr, "fuse_daemon: 不支持的参数 %s（--global-root-fd 已删除）\n",
-                    argv[i]);
-            return 1;
+            /* --global-root-fd 已删除（daemon 侧从未使用该 fd）：同 --mode，
+               混装下拒绝会致连续拒启，改警告忽略（stderr 可查）。 */
+            fprintf(stderr, "fuse_daemon: 忽略已删除的参数 %s\n", argv[i]);
+            continue;
         } else if (strcmp(argv[i], "--strip-o-direct") == 0) {
             g_strip_o_direct = true;
 #ifdef TARGET_ANDROID
