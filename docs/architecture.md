@@ -236,7 +236,7 @@ injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫�
 - **inode 级** `fuse_invalidate_path()`：丢属性/数据缓存，对已打开的文件立即生效（句柄直接持 inode，不再经名字查找）。
 - **entry 级** `fuse_invalidate_path_entry()`：丢内核 dentry，使「名字 → inode」重新 lookup。远端增删/改名后**只有它**能让旧映射立即失效——inode 级不触碰名字映射，旧 dentry 会一直命中到 `entry_timeout` 到期。
 
-entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导出版本节点 `FUSE_3.19`），上游/系统/预构建库都没有，故框架侧**弱引用**：符号缺失时自动退化为仅 inode 级。负缓存另由框架把 `negative_timeout` 保持为 libfuse 默认的 `0.0` 关闭（早期版本曾抬到 0.5，导致 FTP「上传后立即 open」命中陈旧 ENOENT）。
+entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导出版本节点 `FUSE_3.19`），上游/系统/预构建库都没有，故框架侧**弱引用**：符号缺失时自动退化为仅 inode 级。负缓存另由框架在 `fuse_daemon` 启动参数单点**强制剥离** `-o negative_timeout`（恒以 libfuse 默认 `0.0` 运行；早期版本曾抬到 0.5，导致 FTP「上传后立即 open」命中陈旧 ENOENT）。非 0 负缓存还会以 `e.ino=0` 成功回包，现代内核把 nodeid=0 原样入缓存，后续请求触发 `get_node(0)` abort → SIGABRT（线上实例），故此处是崩溃防御而不仅是语义修正。
 
 ### 5.4 UDS 一览
 

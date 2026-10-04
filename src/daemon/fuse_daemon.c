@@ -2287,7 +2287,7 @@ static void* vfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
        把它抬到 0.5，正是"上传成功后立即 open 命中陈旧负缓存报 ENOENT"的根因
        （FTP 后端只能靠 open 内 2×10ms 重试兜底）。保持默认 0 后该竞态消失；
        后端自有 stat 缓存（含负条目）吸收内核层未命中的重复查询，无吞吐回退。
-       需要负缓存时经 FUSE_EXTRA_ARGS 传 -o negative_timeout=N 即可生效。 */
+       需要负缓存时该 -o 子项会被 main() 单点剥离（nodeid=0 上送崩溃防御，见 strip_negative_timeout_opt）。 */
     signal(SIGPIPE, SIG_IGN);
     g_passthrough_enabled = false;
 
@@ -2469,6 +2469,73 @@ static struct fuse_operations vfs_ops = {
 #endif
 };
 
+/* -o negative_timeout 熔断（防御 nodeid=0 上送崩溃）：
+   libfuse 负缓存分支在 LOOKUP 未命中且 negative_timeout!=0 时以 e.ino=0
+   成功回包（fuse.c fuse_lib_lookup）；现代内核（proto>=4）把 nodeid=0 原样
+   入缓存，后续 FORGET(0) 触发 get_node(0) abort → SIGABRT（线上实例）。
+   本文件系统做实时重定向/规则热重载，负缓存语义本就错误，故在此单点剥离
+   该 -o 子项（同串其余子项保留；串空则整项丢弃），恒以 libfuse 默认 0.0
+   运行。覆盖 FUSE_EXTRA_ARGS 与手工启动两种形态：`-o a,negative_timeout=N,b`
+   与 `-o` + `a,negative_timeout=N,b`。 */
+static bool fuse_opt_item_match(const char* item, const char* name) {
+    size_t n = strlen(name);
+    return strncmp(item, name, n) == 0 && (item[n] == '\0' || item[n] == '=');
+}
+
+/* 原地过滤逗号串中的目标子项（只缩短不增长）；返回过滤后是否非空 */
+static bool filter_opt_list(char* opts, const char* name) {
+    char* w = opts;
+    bool first = true;
+    for (char* p = opts;;) {
+        char* comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        char save = p[len];
+        p[len] = '\0';
+        if (!fuse_opt_item_match(p, name)) {
+            if (!first) *w++ = ',';
+            memmove(w, p, len);
+            w += len;
+            first = false;
+        }
+        p[len] = save;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    *w = '\0';
+    return w != opts;
+}
+
+/* 剥离 fuse_argv 中的 -o negative_timeout 子项；返回整理后的 argc */
+static int strip_negative_timeout_opt(char** av, int ac) {
+    bool stripped = false;
+    int w = 0;
+    for (int r = 0; r < ac; r++) {
+        char* a = av[r];
+        char* opts = NULL;
+        bool separate = false;
+        if (strcmp(a, "-o") == 0 && r + 1 < ac) {
+            opts = av[r + 1];
+            separate = true;
+        } else if (strncmp(a, "-o", 2) == 0 && a[2] != '\0') {
+            opts = a + 2;
+        }
+        if (opts && strstr(opts, "negative_timeout") != NULL) {
+            size_t before = strlen(opts);
+            bool nonempty = filter_opt_list(opts, "negative_timeout");
+            if (strlen(opts) != before) stripped = true;
+            if (!nonempty) {
+                if (separate) r++; /* 连值 token 一并丢弃 */
+                continue;          /* 整项丢弃 */
+            }
+        }
+        av[w++] = a;
+    }
+    if (stripped)
+        LOG_WRN("FUSE: 已剥离 -o negative_timeout（负缓存以 ino=0 回包，内核缓存 "
+                "nodeid=0 后触发 abort），保持 libfuse 默认 0.0");
+    return w;
+}
+
 int main(int argc, char* argv[]) {
     char rules_path[PATH_MAX] = {0};
     char* fuse_argv[argc + 1];
@@ -2537,6 +2604,9 @@ int main(int argc, char* argv[]) {
             fuse_argv[fuse_argc++] = argv[i];
         }
     }
+    fuse_argv[fuse_argc] = nullptr;
+    /* 负缓存熔断单点：见 strip_negative_timeout_opt（nodeid=0 上送崩溃防御） */
+    fuse_argc = strip_negative_timeout_opt(fuse_argv, fuse_argc);
     fuse_argv[fuse_argc] = nullptr;
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
