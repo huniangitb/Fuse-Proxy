@@ -36,10 +36,11 @@ SUITE_MAP = [
     # ── AGENTS.md 映射表 ──
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py", "test_negative_timeout.py",
-      "test_readdir_skel_fallback.py"),
+      "test_readdir_skel_fallback.py", "test_backing_gate.py"),
      ("src/daemon/fw_rules.c", "src/daemon/fw_rules.h", "src/config/config_parser.c",
       "src/daemon/fuse_daemon.c"),
-     ("fw_rules_resolve", "config_build_from_view", "parse_config_line"),
+     ("fw_rules_resolve", "config_build_from_view", "parse_config_line",
+      "fw_data_mediation_required", "fw_backing_mediation_required_for"),
      "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
 
     (("test_ftp.py", "test_ftp_read_restart.py"),
