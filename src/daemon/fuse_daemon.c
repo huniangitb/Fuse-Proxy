@@ -64,7 +64,7 @@ static int g_ready_fd = -1;
 /* 崩溃触发测试：--crash-test[=segv|abrt|bus]，验证崩溃日志捕获链路 */
 static int g_crash_test = 0; /* 0=无 1=SIGSEGV 2=SIGABRT 3=SIGBUS */
 #ifdef TARGET_ANDROID
-static int g_bpf_fd = -1; /* BPF program fd, -1 = disabled */
+static bool g_bpf_disabled = false; /* --no-bpf：禁用 backing 直通挂接 */
 #endif
 static bool g_passthrough_disabled = false; /* --no-passthrough 显式禁用 */
 /* 透传方法：init 阶段一次探测确认，open 阶段直连对应 ioctl，避免每次 open 走回退链。
@@ -2138,9 +2138,6 @@ static void vfs_destroy(void* private_data) {
     char msg[256];
     snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid());
     nsp_comm_post(NSP_CH_IPC, msg, strlen(msg) + 1);
-#ifdef TARGET_ANDROID
-    if (g_bpf_fd >= 0) close(g_bpf_fd);
-#endif
     log_close();
 }
 
@@ -2395,46 +2392,43 @@ static bool is_fuse_bpf_supported(void) {
     return ok;
 }
 
-#ifndef __NR_bpf
-#if defined(__aarch64__)
-#define __NR_bpf 280
-#else
-#define __NR_bpf 321
-#endif
-#endif
-#include <linux/bpf.h>
-
-static int open_bpf_prog(void) {
-    static const char* bpf_paths[] = {"/sys/fs/bpf/prog_fuseMedia_fuse_media",
-                                      "/sys/fs/bpf/prog_fuse_media", NULL};
-    for (int i = 0; bpf_paths[i]; i++) {
-        union bpf_attr attr = {};
-        attr.pathname = (uint64_t)(uintptr_t)bpf_paths[i];
-        attr.bpf_fd = 0;
-        int fd = (int)syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr));
-        if (fd >= 0) {
-            LOG_DBG("FUSE BPF: 已获取程序 %s (fd=%d)", bpf_paths[i], fd);
-            return fd;
-        }
-        LOG_DBG("FUSE BPF: %s: %s", bpf_paths[i], strerror(errno));
-    }
-    LOG_WRN("FUSE BPF: 无法获取 BPF 程序, 将以标准 FUSE 模式运行");
-    return -1;
-}
 #endif
 
 #ifdef TARGET_ANDROID
-static int vfs_bpf_setup(const char* path, struct fuse_entry_param* e) {
-    if (g_bpf_fd < 0) return -ENOSYS;
+/* backing 直通挂接（内核 bpf_setup 上行回调）：只挂 backing fd，不挂系统 BPF
+   策略程序——后者按调用方独立裁决且 verdict 最终（daemon 零感知），线上实例：
+   空规则下 root 按名 stat 他包 data 目录被它以 ENOENT 拒绝（直接访问 backing
+   则正常），且 SANDBOX/REDIRECT/HIDE/RO 对该子树整体失效。故：
+   - 全局实例 data/obb：永不挂接（DAC per-caller：opendir 按调用方凭证，
+     fd 相对沿用 daemon root 凭证，直通即越权；与规则无关）；
+   - 其余路径（含全局非 data/obb 与全部媒体路径）：按路径门
+     fw_backing_mediation_required_for() 逐路径裁决——命中（自身/其下/
+     直接父）即 declined（-ENOENT，内核回退 daemon 全权 mediation），
+     未命中则 backing-only 挂接。远祖先（/、/0、/Android 等）不强制仲裁，
+     保留加速；SANDBOX ON 时整树要求仲裁（隐私模式）。
+   已挂接 dentry 对运行期新增规则不感知（与此前同约束，历史行为一致）。 */
+static int vfs_backing_setup(const char* path, struct fuse_entry_param* e) {
+    if (g_bpf_disabled) return -ENOSYS;
     if (!path || !e) return -EINVAL;
 
     char real[PATH_MAX];
 
     if (!g_is_media_fuse) {
-        const char* suffix;
-        if ((suffix = strstr(path, "/Android/data")) == NULL &&
-            (suffix = strstr(path, "/Android/obb")) == NULL)
+        if (strstr(path, "/Android/data") != NULL ||
+            strstr(path, "/Android/obb") != NULL) {
+            /* 全局实例 data/obb 永不挂接：见函数头 DAC 注释。 */
+            LOG_DBG("FUSE backing: 全局 data/obb 由 daemon 全权仲裁，不挂接 %s", path);
             return -ENOENT;
+        }
+        /* 全局非 data/obb：按路径门裁决（无关路径保留加速）。 */
+        if (fw_backing_mediation_required_for(path)) {
+            LOG_DBG("FUSE backing: 规则需仲裁，放弃挂接 %s", path);
+            return -ENOENT;
+        }
+    } else if (fw_backing_mediation_required_for(path)) {
+        /* 媒体实例：调用方单一，仅规则需仲裁此路径时 declined。 */
+        LOG_DBG("FUSE backing: 规则需仲裁，放弃挂接 %s", path);
+        return -ENOENT;
     }
 
     /* backing 路径经 common 唯一出口合成：g_real_root 为空（injector 已不再
@@ -2447,16 +2441,14 @@ static int vfs_bpf_setup(const char* path, struct fuse_entry_param* e) {
 
     int bfd = open(real, O_CLOEXEC | O_DIRECTORY | O_RDONLY);
     if (bfd < 0) {
-        LOG_DBG("FUSE BPF: open(%s) = %s", real, strerror(errno));
+        LOG_DBG("FUSE backing: open(%s) = %s", real, strerror(errno));
         return -errno;
     }
 
+    /* 只挂 backing，不挂系统策略程序（bpf_action 保持 KEEP=0）：见函数头注释 */
     e->backing_action = FUSE_ACTION_REPLACE;
     e->backing_fd = (uint64_t)bfd;
-    e->bpf_action = FUSE_ACTION_REPLACE;
-    e->bpf_fd = (uint64_t)g_bpf_fd;
-    LOG_DBG_PERF("FUSE BPF: backing %s (fd=%d, bpf=%d, media=%d)", real, bfd, g_bpf_fd,
-                 g_is_media_fuse);
+    LOG_DBG_PERF("FUSE backing: %s (fd=%d, media=%d)", real, bfd, g_is_media_fuse);
 
     vfs_defer_close(bfd);
     return 0;
@@ -2493,7 +2485,7 @@ static struct fuse_operations vfs_ops = {
     .setxattr = vfs_setxattr,
     .removexattr = vfs_removexattr,
 #ifdef TARGET_ANDROID
-    .bpf_setup = vfs_bpf_setup,
+    .bpf_setup = vfs_backing_setup,
 #endif
 };
 
@@ -2598,7 +2590,7 @@ int main(int argc, char* argv[]) {
             g_strip_o_direct = true;
 #ifdef TARGET_ANDROID
         } else if (strcmp(argv[i], "--no-bpf") == 0) {
-            g_bpf_fd = -2;
+            g_bpf_disabled = true;
 #endif
         } else if (strcmp(argv[i], "--no-passthrough") == 0) {
             g_passthrough_disabled = true;
@@ -2691,18 +2683,12 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef TARGET_ANDROID
-    if (g_bpf_fd != -2) {
-        g_bpf_fd = -1;
-        if (is_fuse_bpf_supported()) {
-            int fd = open_bpf_prog();
-            if (fd >= 0) {
-                g_bpf_fd = fd;
-                LOG("FUSE BPF: 已启用 (bpf_fd=%d)", g_bpf_fd);
-            }
-        }
+    if (g_bpf_disabled) {
+        LOG("FUSE backing: 已被 --no-bpf 参数禁用（标准 FUSE 全仲裁模式）");
+    } else if (is_fuse_bpf_supported()) {
+        LOG("FUSE backing: 直通就绪（仅 backing，无系统策略程序）");
     } else {
-        LOG("FUSE BPF: 已被 --no-bpf 参数禁用");
-        g_bpf_fd = -1;
+        LOG_WRN("FUSE backing: 内核不支持，直通挂接不可用，将以标准 FUSE 模式运行");
     }
 #endif
     /* Phase 3：显式 FUSE 会话，复刻 libfuse fuse_main_real_versioned

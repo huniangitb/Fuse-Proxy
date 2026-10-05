@@ -107,6 +107,28 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out);
 /* 轻量探测：readdir 逐条目过滤用 */
 void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out);
 
+/* backing 直通仲裁：Android/data|obb 子树是否需 daemon 仲裁。
+   背景：内核侧挂接 backing 后该子树 I/O 不再经过 daemon，且系统 BPF 策略
+   程序（如挂接）会按调用方独立裁决——线上实例：空规则下 root 按名 stat 他包
+   data 目录被系统程序以 ENOENT 拒绝（直接访问 backing 则正常），daemon 日志
+   零痕迹；挂接后 SANDBOX 过滤/REDIRECT/HIDE/RO 对该子树同样整体失效。
+   故挂接前须确认没有任何规则需要对此子树仲裁。判定保守（fail-closed）：
+   任一段 SANDBOX ON，或任一条 REDIRECT（ALLOW 除外，ALLOW 即直通）/HIDE/RO/
+   FTP 前缀的字面量或其变量展开值与 data/obb 相交（其下、其本身、其祖先、
+   或规则即 "/"），即要求仲裁。经 config_read_begin/end 快照协议读索引。 */
+bool fw_data_mediation_required(void);
+
+/* backing 按路径仲裁（细粒度门）：查询路径 fuse_path（可带 /<uid>/ 层，
+   内部归一为 sub_path）是否需 daemon 仲裁。语义 = 全局门
+   fw_data_mediation_required() 的按路径细化：仅当某条规则在该路径自身
+   （相等/其下）或其直接父目录（readdir 会列出受影响名，attr 可能来自
+   重定向目标）上产生 per-caller 差异时返回 true；远祖先（挂载根、/0、
+   /Android 等，只列出中间名）不强制要求仲裁，允许 backing 保留。
+   SANDBOX ON 除外：共享目录重定向 + 跨应用隔离影响整树，任一查询均 true
+   （隐私模式，正确优先）。REDIRECT 只看 virtual_prefix（ALLOW 跳过）；
+   HIDE/RO/FTP 看各自前缀；含 $变量时追查展开值。fail-closed。 */
+bool fw_backing_mediation_required_for(const char* fuse_path);
+
 /* readdir 虚拟目录补充：向 out 填充最多 max 个虚拟条目，返回条目数
    （框架负责 filler 与去重；sandbox/Android 骨架由框架自行合成）。 */
 int fw_rules_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_id,

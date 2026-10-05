@@ -1289,3 +1289,252 @@ int fw_rules_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_
         /* 读期间发生发布：重试 */
     }
 }
+
+/* ============ backing 直通仲裁（见 fw_rules.h 声明注释） ============ */
+/* 规则侧路径与 data/obb 是否相交：其下/其本身（字面量子串）、其祖先
+   （"/" 或 "/Android"，剥尾部 '/' 后以前缀判定，"/AndroidData" 类
+   相似名因 '/' 边界检查而排除）。 */
+static bool br_data_overlap(const char* s) {
+    if (!s || !*s) return false;
+    char t[PATH_MAX];
+    size_t n = strlen(s);
+    if (n >= sizeof t) n = sizeof t - 1;
+    memcpy(t, s, n);
+    t[n] = '\0';
+    while (n > 1 && t[n - 1] == '/') t[--n] = '\0';
+    if (strcmp(t, "/") == 0) return true; /* 覆盖一切 */
+    if (strstr(t, "Android/data") || strstr(t, "Android/obb")) return true;
+    /* 祖先："/Android/data" 以 t+"/" 开头 */
+    size_t tl = strlen(t);
+    if (strncmp("/Android/data", t, tl) == 0 && "/Android/data"[tl] == '/') return true;
+    if (strncmp("/Android/obb", t, tl) == 0 && "/Android/obb"[tl] == '/') return true;
+    return false;
+}
+
+/* 规则字面量含 $变量时追查其展开值（resolved 优先，回退原始值；变量名存储
+   不含 '$'，needle 须带 '$' 前缀，"${V}" 形式天然包含 "$V"）。$package 展开
+   为纯包名（无 '/'），不改变相交性，无须特殊处理。 */
+static bool br_rule_touches_data(const AppConfig* c, const char* rule) {
+    if (!rule || !*rule) return false;
+    if (br_data_overlap(rule)) return true;
+    if (!strchr(rule, '$') || !c) return false;
+    for (int i = 0; i < c->var_count; i++) {
+        const char* vn = (c->var_names && c->var_names[i]) ? c->var_names[i] : NULL;
+        if (!vn || !*vn) continue;
+        char needle[136];
+        needle[0] = '$';
+        strncpy(needle + 1, vn, sizeof needle - 2);
+        needle[sizeof needle - 1] = '\0';
+        if (!strstr(rule, needle)) continue;
+        const char* v = (c->var_resolved && c->var_resolved[i]) ? c->var_resolved[i]
+                        : (c->var_values ? c->var_values[i] : NULL);
+        if (!v || !*v) continue;
+        if (strlen(v) <= 1 || br_data_overlap(v)) return true; /* "/" 值展开后覆盖一切 */
+    }
+    return false;
+}
+
+static bool br_cfg_touches_data(const AppConfig* c) {
+    if (!c) return false;
+    /* 任一段 SANDBOX ON：共享目录重定向目标落进 data 沙盒，且跨应用隔离
+       过滤依赖 daemon，必须仲裁（--disable-sandbox 全局关闭时除外） */
+    if (c->sandbox && !g_br_disable_sandbox) return true;
+    for (int i = 0; i < c->hide_count; i++)
+        if (c->hide_rules && br_rule_touches_data(c, c->hide_rules[i])) return true;
+    for (int i = 0; i < c->ro_count; i++)
+        if (c->ro_rules && br_rule_touches_data(c, c->ro_rules[i])) return true;
+    for (int i = 0; i < c->redir_count; i++) {
+        if (!c->redir_rules || c->redir_rules[i].is_allow) continue; /* ALLOW 即直通 */
+        if (br_rule_touches_data(c, c->redir_rules[i].virtual_prefix) ||
+            br_rule_touches_data(c, c->redir_rules[i].real_target))
+            return true;
+    }
+    for (int i = 0; i < c->ftp_count; i++)
+        if (c->ftp_rules && br_rule_touches_data(c, c->ftp_rules[i].virtual_prefix)) return true;
+    return false;
+}
+
+bool fw_data_mediation_required(void) {
+    /* S1 无锁快照读（与 fw_rules_resolve 同协议，发布发生则重试） */
+    for (;;) {
+        uint64_t cfg_gen = config_read_begin();
+        bool need = br_cfg_touches_data(&g_global_cfg);
+        if (!need) {
+            for (int i = 0; i < g_app_cfg_count; i++) {
+                if (g_app_cfgs && br_cfg_touches_data(g_app_cfgs[i])) {
+                    need = true;
+                    break;
+                }
+            }
+        }
+        if (config_read_end(cfg_gen)) return need;
+    }
+}
+
+/* ============ backing 按路径仲裁（细粒度门） ============ */
+/* 查询归一：剥离 /<uid>/ 层（/0、/10/...，与 br_strip_and_sanitize 同口径），
+   去尾部 '/'（根保留 "/"），无前导 '/' 则补 '/'. */
+static void backing_norm_query(const char* p, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    const char* sub = (p && p[0]) ? p : "/";
+    if (sub[0] == '/' && sub[1] >= '0' && sub[1] <= '9') {
+        const char* d = sub + 1;
+        while (*d >= '0' && *d <= '9') d++;
+        if (*d == '\0' || *d == '/') {
+            const char* slash = strchr(sub + 1, '/');
+            sub = slash ? slash : "/";
+        }
+    }
+    size_t n = strlen(sub);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, sub, n);
+    out[n] = '\0';
+    while (n > 1 && out[n - 1] == '/') out[--n] = '\0';
+    if (out[0] != '/') {
+        /* 非绝对规则值：原样保留（调用方判定跳过），避免误判 */
+        out[0] = '\0';
+    }
+}
+
+/* query 是否在 rule 之下（含相等；rule=="/" 覆盖一切） */
+static bool backing_under_or_eq(const char* query, const char* rule) {
+    if (!query || !rule || !query[0] || !rule[0]) return false;
+    if (strcmp(rule, "/") == 0) return true;
+    size_t rl = strlen(rule);
+    if (strcmp(query, rule) == 0) return true;
+    return strncmp(query, rule, rl) == 0 && query[rl] == '/';
+}
+
+/* query 是否为 rule 的直接父目录（readdir 会列出受影响名） */
+static bool backing_is_parent(const char* query, const char* rule) {
+    if (!query || !rule || strcmp(rule, "/") == 0) return false;
+    const char* last = strrchr(rule, '/');
+    if (!last) return false;
+    if (last == rule) return strcmp(query, "/") == 0;
+    size_t pl = (size_t)(last - rule);
+    return strlen(query) == pl && strncmp(query, rule, pl) == 0;
+}
+
+/* 通配符静态前缀：截到首个 *?[( 为止，再回退到最后 '/'（至少保留 "/"）。
+   无通配符则去尾 '/' 后整体返回。 */
+static void backing_static_prefix(const char* rule, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    size_t n = strlen(rule);
+    size_t cut = n;
+    for (size_t i = 0; i < n; i++) {
+        if (rule[i] == '*' || rule[i] == '?' || rule[i] == '[') {
+            cut = i;
+            break;
+        }
+    }
+    if (cut >= cap) cut = cap - 1;
+    memcpy(out, rule, cut);
+    out[cut] = '\0';
+    if (cut == n) {
+        while (cut > 1 && out[cut - 1] == '/') out[--cut] = '\0';
+        return;
+    }
+    char* last = strrchr(out, '/');
+    if (!last) {
+        out[0] = '\0';
+        return;
+    }
+    if (last == out) {
+        out[1] = '\0';
+        return;
+    }
+    *last = '\0';
+}
+
+/* 字面量（含通配符）与查询是否相交：相等/其下必中；其上仅直接父中
+   （远祖先只列出中间名，无 per-caller 差异）；fnmatch 命中亦中。 */
+static bool backing_literal_hits(const char* rule, const char* query) {
+    if (!rule || !*rule || !query || !query[0]) return false;
+    if (fnmatch(rule, query, 0) == 0) return true;
+    char sp[PATH_MAX];
+    backing_static_prefix(rule, sp, sizeof sp);
+    if (!sp[0]) return false;
+    if (sp[0] != '/') return false;
+    if (strcmp(sp, query) == 0) return true;
+    if (backing_under_or_eq(query, sp)) return true;
+    if (backing_under_or_eq(sp, query)) return backing_is_parent(query, sp);
+    return false;
+}
+
+/* 规则中 $变量展开值与查询是否相交（$package 展开无 '/'，天然不中）。
+   只查被规则字面量实际引用的变量（needle 须带 '$' 前缀）。 */
+static bool backing_var_hits(const AppConfig* c, const char* rule, const char* query) {
+    if (!c || !rule || !strchr(rule, '$')) return false;
+    for (int i = 0; i < c->var_count; i++) {
+        const char* vn = (c->var_names && c->var_names[i]) ? c->var_names[i] : NULL;
+        if (!vn || !*vn) continue;
+        char needle[136];
+        needle[0] = '$';
+        strncpy(needle + 1, vn, sizeof needle - 2);
+        needle[sizeof needle - 1] = '\0';
+        if (!strstr(rule, needle)) continue;
+        const char* v = (c->var_resolved && c->var_resolved[i]) ? c->var_resolved[i]
+                        : (c->var_values ? c->var_values[i] : NULL);
+        if (!v || !*v || v[0] != '/') continue;
+        char t[PATH_MAX];
+        size_t n = strlen(v);
+        if (n >= sizeof t) n = sizeof t - 1;
+        memcpy(t, v, n);
+        t[n] = '\0';
+        while (n > 1 && t[n - 1] == '/') t[--n] = '\0';
+        if (strcmp(t, "/") == 0) return true;
+        if (strcmp(t, query) == 0) return true;
+        if (backing_under_or_eq(query, t)) return true;
+        if (backing_under_or_eq(t, query)) {
+            if (backing_is_parent(query, t)) return true;
+        }
+    }
+    return false;
+}
+
+static bool backing_rule_hits(const AppConfig* c, const char* rule, const char* query) {
+    return backing_literal_hits(rule, query) || backing_var_hits(c, rule, query);
+}
+
+/* 单段配置是否在该查询路径上产生 per-caller 差异 */
+static bool br_cfg_mediates_path(const AppConfig* c, const char* query) {
+    if (!c || !query || !query[0]) return false;
+    /* SANDBOX ON：共享目录重定向 + 跨应用隔离影响整树，任一查询均需仲裁 */
+    if (c->sandbox && !g_br_disable_sandbox) return true;
+    for (int i = 0; i < c->hide_count; i++) {
+        if (!c->hide_rules || !c->hide_rules[i]) continue;
+        if (backing_rule_hits(c, c->hide_rules[i], query)) return true;
+    }
+    for (int i = 0; i < c->ro_count; i++) {
+        if (!c->ro_rules || !c->ro_rules[i]) continue;
+        if (backing_rule_hits(c, c->ro_rules[i], query)) return true;
+    }
+    for (int i = 0; i < c->redir_count; i++) {
+        if (!c->redir_rules || c->redir_rules[i].is_allow) continue; /* ALLOW 即直通 */
+        if (backing_rule_hits(c, c->redir_rules[i].virtual_prefix, query)) return true;
+    }
+    for (int i = 0; i < c->ftp_count; i++) {
+        if (!c->ftp_rules || !c->ftp_rules[i].virtual_prefix) continue;
+        if (backing_rule_hits(c, c->ftp_rules[i].virtual_prefix, query)) return true;
+    }
+    return false;
+}
+
+bool fw_backing_mediation_required_for(const char* fuse_path) {
+    char query[PATH_MAX];
+    backing_norm_query(fuse_path, query, sizeof query);
+    if (!query[0]) return true; /* 归一失败 fail-closed */
+    for (;;) {
+        uint64_t cfg_gen = config_read_begin();
+        bool need = br_cfg_mediates_path(&g_global_cfg, query);
+        if (!need) {
+            for (int i = 0; i < g_app_cfg_count; i++) {
+                if (g_app_cfgs && br_cfg_mediates_path(g_app_cfgs[i], query)) {
+                    need = true;
+                    break;
+                }
+            }
+        }
+        if (config_read_end(cfg_gen)) return need;
+    }
+}
