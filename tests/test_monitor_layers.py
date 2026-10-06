@@ -22,7 +22,7 @@
   4. fail-safe：包名不可解析（unknown/过短/zygote）时只认 `[GLOBAL]`。
   5. **沙盒解析契约**（合成 uid 才测得到，端到端 uid<10000 走 system 分支）：
      `SANDBOX ON` 时**共享目录也被重定向**进本应用沙盒
-     （`<storage>/<uid>/Android/data/<pkg>/sandbox/<原路径>`）——Download/Pictures/
+     （`<storage>/<uid>/Android/data/<pkg>/cache/<原路径>`，即应用外部缓存目录）——Download/Pictures/
      Documents 这类位置同样隔离；应用**自己**的 `/Android/data/<pkg>` 与 `/Android`
      下非 data/obb 不重定向；`ALLOW <前缀>` 落回真实路径。
 
@@ -67,19 +67,19 @@ CONFIG_DIR_PAT = re.compile(
 # (配置, 原始路径, 期望 real 中的片段, 期望不在 real 中的片段) —— 沙盒/ALLOW 契约
 RESOLVE_CASES = [
     # 应用显式 SANDBOX ON：共享目录也进沙盒（用户反馈的"Download/Pictures 该隔离"）
-    ("sandbox.conf", 10123, "/0/Download/q.txt", "Android/data/com.demo.app/sandbox/Download/q.txt", None),
-    ("sandbox.conf", 10123, "/0/Pictures/p.jpg", "Android/data/com.demo.app/sandbox/Pictures/p.jpg", None),
-    ("sandbox.conf", 10123, "/0/Documents/d.docx", "Android/data/com.demo.app/sandbox/Documents/d.docx", None),
+    ("sandbox.conf", 10123, "/0/Download/q.txt", "Android/data/com.demo.app/cache/Download/q.txt", None),
+    ("sandbox.conf", 10123, "/0/Pictures/p.jpg", "Android/data/com.demo.app/cache/Pictures/p.jpg", None),
+    ("sandbox.conf", 10123, "/0/Documents/d.docx", "Android/data/com.demo.app/cache/Documents/d.docx", None),
     # 自己的 data/obb 不重定向（沙盒是隔离"别的应用的数据"，不是自己的）
     ("sandbox.conf", 10123, "/0/Android/data/com.demo.app/own.txt", "/0/Android/data/com.demo.app/own.txt", None),
     # /Android 下非 data/obb（如 media）不重定向
     ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin", "/0/Android/media/com.other.app/m.bin", None),
     # 别的应用的 data 进自己的沙盒
-    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", "sandbox/Android/data/com.other.app/f", None),
+    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", "cache/Android/data/com.other.app/f", None),
     # ALLOW 豁免：显式放行 → 落回真实路径，不进沙盒
-    ("sandbox.conf", 10500, "/0/Download/keep/k.txt", None, "sandbox"),
+    ("sandbox.conf", 10500, "/0/Download/keep/k.txt", "/0/Download/keep/k.txt", "/cache/"),
     # 该应用其它共享目录仍进沙盒
-    ("sandbox.conf", 10500, "/0/Download/q.txt", "Android/data/com.plain.app/sandbox/Download/q.txt", None),
+    ("sandbox.conf", 10500, "/0/Download/q.txt", "Android/data/com.plain.app/cache/Download/q.txt", None),
     # 全局 SANDBOX OFF + 应用未显式开：不重定向（cat_off.conf 里 [GLOBAL] 只有 MONITOR）
     ("cat_off.conf", 10123, "/0/Download/q.txt", "/0/Download/q.txt", None),
 ]
