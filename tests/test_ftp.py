@@ -291,6 +291,9 @@ def main():
         #      再截断（旧实现只清 stat、不清 LIST），随后再列——命中旧 LIST 会把
         #      截断前的 size 预填回 stat。最后等内核 attr 缓存（attr_timeout=1s）过期
         #      再 stat，确保读到的是模块侧的值。
+        #      注：本端到端用例是**一致性检查**——FUSE 侧另有内核 attr 缓存等层，
+        #      本机复现不出「旧 size 回灌」；判别该修复的确定性回归是
+        #      test_ftp_truncate_list.py（直编后端 + 桩 mux/curl）。
         try:
             tfile = "nsp_truncate_size.txt"
             (m/"0"/SERVER/tfile).write_text("0123456789")
