@@ -144,6 +144,23 @@ def gone(kw, timeout=12.0):
     except OSError:
         return True
 
+def maps_gone(pid, needle, timeout=8.0):
+    """轮询 /proc/<pid>/maps 直到 needle 消失：模块内存副本（memfd:nsp_module_<名>）
+    被 dlclose 的内核证据——置毒后若引用未归零会跳过 dlclose，映射永久保留。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if needle not in Path(f"/proc/{pid}/maps").read_text():
+                return True
+        except OSError:
+            return False
+        time.sleep(0.3)
+    try:
+        return needle not in Path(f"/proc/{pid}/maps").read_text()
+    except OSError:
+        return False
+
+
 def stop(p):
     if p:
         p.terminate()
@@ -323,6 +340,14 @@ def main():
             ok("module_errors.log 记录 op=backend_readdir")
         else:
             fail("errlog 缺 op", f"内容: {errlog_text()[:200]!r}")
+        # 置毒回收：readdir 崩溃时上报线程还攥着自己那份在途引用，若在持有期间
+        # 等引用归零必然 2s 超时 → 跳过 dlclose，模块映射与自有线程永不回收。
+        # 断言内核证据：memfd 映射从 maps 消失
+        needle = "memfd:nsp_module_backend_bad"
+        if maps_gone(p.pid, needle):
+            ok("置毒后模块映射已回收（引用先交还 → exit/dlclose）")
+        else:
+            fail("置毒后模块映射未回收", f"{needle} 仍在 /proc/{p.pid}/maps（引用自持必然超时）")
     finally:
         stop(p)
         unstage_module("backend_bad")

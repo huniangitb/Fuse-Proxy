@@ -731,6 +731,19 @@ static int vfs_emit_raw(void* buf, fuse_fill_dir_t filler, uint64_t* next, uint6
     return filler(buf, name, st, (off_t)off, 0) != 0 ? -1 : 0;
 }
 
+/* 上报后端错误/崩溃前先交还本次调用的在途引用：置毒（module_guard_fault 与
+   达阈值的 module_guard_error）要等该槽位在途引用归零才 dlclose，而当前线程
+   若仍攥着自己这份引用等待归零，必然 2s 超时 → 跳过 dlclose，模块映射与自有
+   线程永不回收。置空 *ops 后调用方随后的 module_backend_put 是空操作。
+   其余回调（getattr/open/create/mkdir/unlink/rmdir/read/write/release/flush/
+   rename/truncate）都在上报前先 put/release_slot，只有 readdir 因多分支早退
+   需要这个显式交还。 */
+static void backend_put_before_guard(const NspModuleOps** ops) {
+    if (!ops) return;
+    module_backend_put(*ops);
+    *ops = NULL;
+}
+
 /* readdir 后端分派：rr.is_ftp 且路径命中 BACKEND 模块时由模块方法返回条目，
    框架负责 . / .. 与 filler 输出。返回 true = 已处理（*rc_out 为 FUSE 返回码）；
    false = 未命中后端，交回本地目录路径。
@@ -780,6 +793,7 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
         int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir,
                                           sub_path, entries, VFS_READDIR_PAGE, offset);
         if (n == NSP_FENCE_FAULT) {
+            backend_put_before_guard(&bops);
             module_guard_fault(bslot, "backend_readdir", sub_path);
             rc = -EIO;
             break;
@@ -789,13 +803,16 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
             break;
         }
         if (n < 0) {
-            if (!backend_rc_is_business(n))
+            if (!backend_rc_is_business(n)) {
+                backend_put_before_guard(&bops);
                 module_guard_error(bslot, "backend_readdir", n, sub_path, "readdir 返回异常");
+            }
             rc = n;
             break;
         }
         if (n == 0) break; /* 到末尾 */
         if (n > VFS_READDIR_PAGE) {
+            backend_put_before_guard(&bops);
             module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
             rc = -EIO;
             break;
@@ -804,6 +821,7 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
             /* 条目名跨 ABI 由模块填写：未终止的名字会被 filler 当野指针读，
                故逐条校验（超长名由后端整条跳过，框架侧只防未终止） */
             if (!nsp_guard_dir_entry_ok(&entries[i])) {
+                backend_put_before_guard(&bops);
                 module_guard_error(bslot, "backend_readdir", 0, sub_path,
                                    "条目名未终止(越界写)");
                 rc = -EIO;
@@ -825,6 +843,7 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
                用 > 而非 >=：恰好 64K 条是合法目录（下一页短页/0 页自然收尾）；
                与 FTP 侧 FTP_LIST_CACHE_MAX=65537 的 +1 哨兵对齐（>64K 才熔断）。
                属框架侧防御（非常规业务失败），计错误后 loud 报错 */
+            backend_put_before_guard(&bops);
             module_guard_error(bslot, "backend_readdir", 0, sub_path, "条目数超限(疑似无限产出)");
             rc = -E2BIG;
             break;
@@ -2636,7 +2655,7 @@ int main(int argc, char* argv[]) {
     /* 模块守卫（校验+熔断+MOD_ERR 日志限流）：须在模块系统初始化前
        就绪——模块加载/init 调用可能立即触发错误上报 */
     module_guard_init();
-    /* 内建规则引擎先就绪：fw_config 在初始化与每次热重载时会调 fw_rules_on_reload */
+    /* 内建规则引擎先就绪：它把派生缓存作废注册进配置发布临界区（此后每次发布自动作废） */
     fw_rules_init(rules_path, g_disable_sandbox);
     /* 热插拔模块系统：扫描模块目录并启动监控线程（只剩后端模块形态） */
     module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL);
