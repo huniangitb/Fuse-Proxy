@@ -30,6 +30,7 @@ bool register_async_mount_pipe(int fd, void* ctx) {
     (void)ctx;
     return true;
 }
+void unregister_async_mount_pipe(int fd) { (void)fd; }
 void schedule_retry_mount(const char* pkg, int pid) {
     (void)pkg;
     (void)pid;

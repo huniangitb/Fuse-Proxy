@@ -104,12 +104,44 @@ void register_fuse_ready_pipe(int fd, void* ctx) {
     g_fuse_ready_ctx = ctx;
 }
 
+/* 异步挂载完成注册表：生产者是挂载工作线程（run_in_mnt_ns_async），消费者是主
+   epoll 线程（on_client_fd），两侧都必须持锁——无锁时两个工作线程读到同一 count
+   会覆盖同一槽位，被覆盖者注册的 status pipe 在主线程查不到归属，会被当普通 IPC
+   客户端读掉并 close：挂载结果永不被处理，该应用既不标注入也不重试。 */
+static pthread_mutex_t g_async_mount_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* 持锁前提下的摘表：命中则摘除并返回 ctx，否则返回 NULL */
+static void* async_mount_take_locked(int fd) {
+    for (int i = 0; i < g_async_mount_count; i++) {
+        if (g_async_mount_fds[i] != fd) continue;
+        void* ctx = g_async_mount_ctxs[i];
+        g_async_mount_fds[i] = g_async_mount_fds[g_async_mount_count - 1];
+        g_async_mount_ctxs[i] = g_async_mount_ctxs[g_async_mount_count - 1];
+        g_async_mount_count--;
+        return ctx;
+    }
+    return NULL;
+}
+
 bool register_async_mount_pipe(int fd, void* ctx) {
-    if (g_async_mount_count >= MAX_ASYNC_MOUNTS) return false;
-    g_async_mount_fds[g_async_mount_count] = fd;
-    g_async_mount_ctxs[g_async_mount_count] = ctx;
-    g_async_mount_count++;
-    return true;
+    bool ok = false;
+    pthread_mutex_lock(&g_async_mount_mutex);
+    if (g_async_mount_count < MAX_ASYNC_MOUNTS) {
+        g_async_mount_fds[g_async_mount_count] = fd;
+        g_async_mount_ctxs[g_async_mount_count] = ctx;
+        g_async_mount_count++;
+        ok = true;
+    }
+    pthread_mutex_unlock(&g_async_mount_mutex);
+    return ok;
+}
+
+/* 注册回滚（注册成功但 epoll_ctl 失败等路径）：不摘表就会留下已 close 的 fd 与
+   已 free 的 ctx，同号 fd 之后被复用时会被误当挂载完成事件、拿野指针当 ctx。 */
+void unregister_async_mount_pipe(int fd) {
+    pthread_mutex_lock(&g_async_mount_mutex);
+    (void)async_mount_take_locked(fd);
+    pthread_mutex_unlock(&g_async_mount_mutex);
 }
 
 void schedule_retry_mount(const char* pkg, int pid) {
@@ -588,13 +620,41 @@ static void remount_all_tracked() {
     LOG("FUSE 崩溃恢复重挂完成");
 }
 
+/* 受管子进程的收尸记录：fuse_daemon 退出后，check_and_recover_fuse 要靠
+   waitpid(pid) 的返回确认"确实退出了"并 dump 崩溃 backtrace。而 reap_zombies 用
+   waitpid(-1) 会抢先把它收走 —— 之后 waitpid(pid) 返回 ECHILD，恢复逻辑仍在
+   （kill(pid,0) 早已失败，照常重挂），但崩溃现场不再进日志环（sys.log / log_ctl
+   查不到）。waitpid(-1) 无法"跳过指定子进程"，故改为收尸时把受管子进程的退出状态
+   记下来，供恢复路径复核（语义等价：无论收尸先后，恢复路径都能拿到状态）。 */
+#define REAPED_MANAGED_SLOTS 4
+static struct {
+    pid_t pid;
+    int status;
+} g_reaped_managed[REAPED_MANAGED_SLOTS];
+
+/* 复核受管子进程是否已退出；退出状态若已被 reap_zombies 收走则从记录里取回 */
+static bool managed_child_exited(pid_t pid, int* status_out) {
+    if (pid <= 0) return false;
+    for (int i = 0; i < REAPED_MANAGED_SLOTS; i++) {
+        if (g_reaped_managed[i].pid != pid) continue;
+        if (status_out) *status_out = g_reaped_managed[i].status;
+        g_reaped_managed[i].pid = 0;
+        return true;
+    }
+    int st = 0;
+    if (waitpid(pid, &st, WNOHANG) == pid) {
+        if (status_out) *status_out = st;
+        return true;
+    }
+    return false;
+}
+
 static void check_and_recover_fuse() {
     if (g_global_fuse.disabled || g_global_fuse.pid <= 0) return;
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) != 0) {
         g_fuse_ready = 0;
         int status = 0;
-        if (waitpid(g_global_fuse.fuse_pid, &status, WNOHANG) == g_global_fuse.fuse_pid)
-            dump_crash_log_tail();
+        if (managed_child_exited(g_global_fuse.fuse_pid, &status)) dump_crash_log_tail();
         g_global_fuse.fuse_pid = 0;
         time_t now = time(nullptr);
         if (now - g_global_fuse.last_crash_time < 60)
@@ -634,8 +694,7 @@ static void check_and_recover_fuse() {
      * 只有当 com.android.providers.media.module 仍是注入目标时才拉起。
      */
     if (g_media_fuse.fuse_pid > 0 && kill(g_media_fuse.fuse_pid, 0) != 0) {
-        int status;
-        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+        (void)managed_child_exited(g_media_fuse.fuse_pid, nullptr);
         g_media_fuse.fuse_pid = 0;
         time_t now = time(nullptr);
         if (now - g_media_fuse.last_crash_time < 60)
@@ -669,8 +728,7 @@ static void check_and_recover_fuse() {
          */
         LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
         kill(g_media_fuse.fuse_pid, SIGTERM);
-        int status;
-        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+        (void)managed_child_exited(g_media_fuse.fuse_pid, nullptr);
         g_media_fuse.fuse_pid = 0;
         ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
     }
@@ -894,7 +952,19 @@ int scan_zygote_children() {
 
 void reap_zombies() {
     int status;
-    while (waitpid(-1, &status, WNOHANG) > 0);
+    pid_t reaped;
+    while ((reaped = waitpid(-1, &status, WNOHANG)) > 0) {
+        /* 受管子进程的退出状态留档，供恢复路径复核后 dump 崩溃 backtrace
+           （见 g_reaped_managed 注释）；其余子进程照常收割 */
+        if (reaped != g_global_fuse.fuse_pid && reaped != g_media_fuse.fuse_pid) continue;
+        for (int i = 0; i < REAPED_MANAGED_SLOTS; i++) {
+            if (g_reaped_managed[i].pid == 0 || g_reaped_managed[i].pid == reaped) {
+                g_reaped_managed[i].pid = reaped;
+                g_reaped_managed[i].status = status;
+                break;
+            }
+        }
+    }
 }
 
 static void do_cleanup() {
@@ -1240,20 +1310,15 @@ static void on_ipc_accept(int ipc_sock) {
 }
 
 static void on_client_fd(int fd) {
-    int mount_idx = -1;
-    for (int m = 0; m < g_async_mount_count; m++) {
-        if (g_async_mount_fds[m] == fd) {
-            mount_idx = m;
-            break;
-        }
-    }
-    if (mount_idx >= 0) {
-        handle_async_mount_event(g_async_mount_ctxs[mount_idx]);
-        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_async_mount_fds[mount_idx], nullptr);
-        close(g_async_mount_fds[mount_idx]);
-        g_async_mount_fds[mount_idx] = g_async_mount_fds[g_async_mount_count - 1];
-        g_async_mount_ctxs[mount_idx] = g_async_mount_ctxs[g_async_mount_count - 1];
-        g_async_mount_count--;
+    /* 先在锁内摘表取出 ctx（消费即摘）：命中说明这是异步挂载的 status pipe，
+       否则才是普通 IPC 客户端。事件处理放在锁外（可能耗时）。 */
+    pthread_mutex_lock(&g_async_mount_mutex);
+    void* mount_ctx = async_mount_take_locked(fd);
+    pthread_mutex_unlock(&g_async_mount_mutex);
+    if (mount_ctx) {
+        handle_async_mount_event(mount_ctx);
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
     } else {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
         handle_ipc_client_readable(fd);

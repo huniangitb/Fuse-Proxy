@@ -55,6 +55,8 @@ void notify_fuses(int sig);
 /* 核心暴露：非阻塞异步控制接口 */
 void register_fuse_ready_pipe(int fd, void* ctx);
 bool register_async_mount_pipe(int fd, void* ctx);
+/* 注册回滚：注册后若 epoll_ctl(ADD) 失败必须撤销，避免表里留下已关闭 fd/已释放 ctx */
+void unregister_async_mount_pipe(int fd);
 void handle_fuse_ready_event(void *ptr);
 void handle_async_mount_event(void *ptr);
 
