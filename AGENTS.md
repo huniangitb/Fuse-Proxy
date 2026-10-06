@@ -62,6 +62,8 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 失败处理：退出码 1 为失败（勿用管道吞退出码）；**跳过（77/78）不算通过**——验收用 `python3 tests/run.py --all --strict` 让 gap 计为失败，并逐条核对跳过原因；残留挂载点（`/tmp/fuse_proxy_test/mnt`、`/tmp/fuse_rules_test/mnt`、`/tmp/fuse_neg_test/mnt`）用 `fusermount3 -u` 清理后重跑；测试规则文件在 `/tmp/Namespace-Proxy/injector.conf`。
 
+**测试自清约定**（写**真实** FTP 树 `upload/`、`upload2/` 的套件适用，那是用户的投递目录，会无界累积）：清扫必须按**宽前缀 / 模式**（`nsp_`、`nsp_par_`、`conc_*.bin`…），**不得**用含 `os.getpid()` 的名字限定——否则只能清自己那份，异常退出（或修好前的历史运行）留下的 `nsp_par_<旧 pid>_*` 永久堆积。写盘位置与清扫位置要**成对**（如 `upload2/` 有写就得有扫）。判定是否残留**用 `find -name`，不要用 `ls | grep '^前缀'`**：本机 `ls` 是 eza、输出带图标前缀，锚定 grep 恒假阴性。判别性验证时探针要选套件**不碰**的名字，否则会伪装成套件缺陷（例：往真实树预置 `pat_1m.bin` 会让匿名 ftp 用户无权覆盖，用例报 EIO）。
+
 内存验收：`meson setup build_asan2 -Dtarget_os=gnu -Denable_debug=true -Db_sanitize=address,undefined`（等价 `-Dwith_asan=true -Dwith_ubsan=true`）。**sanitizer 标志必须同时进编译与链接**——只进 `link_flags` 会「链接了运行时但零插桩」，核对方式：`compile_commands.json` 里每条命令都含 `-fsanitize`（`-Dwith_asan/with_ubsan` 仅在 `enable_debug=true` 下生效，release 下给出 warning 并忽略）。
 
 内存验收实际范围与结果（2026-10-06 实测，**共 26 套全绿、0 条 sanitizer 报告**）：
