@@ -60,7 +60,9 @@ SUITE_MAP = [
       "test_ftp_upload_lock.py"),
      ("src/modules/ftp/",),
      ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read",
-      "ftp_backend_truncate", "ftp_list_cache_clear", "ftp_backend_upload"),
+      "ftp_backend_truncate", "ftp_list_cache_clear", "ftp_backend_upload",
+      # fsync 与 FLUSH 共用后端收尾（vfs_fsync 不再是空操作）→ 改这些行必须跑 ftp
+      "vfs_backend_finish_data", "vfs_fsync", "backend_flush"),
      "src/modules/ftp/ 或框架后端分派"),
 
     (("test_ftp_parallel.py",),

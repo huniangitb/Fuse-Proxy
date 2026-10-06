@@ -103,6 +103,8 @@ static char g_upper_dir[PATH_MAX] = {0};
 
 static int recursive_rmdir(const char* path);
 static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid);
+/* FSYNC 与 FLUSH 共用的后端数据收尾（定义在 vfs_inval_path 之后） */
+static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path);
 
 static void log_fuse_err(const char* op, const char* path, int err_code) {
     int err = err_code < 0 ? -err_code : err_code;
@@ -1481,12 +1483,11 @@ static int vfs_rmdir(const char* path) {
     int ret = rmdir(p);
     if (ret == -1) {
         int err = errno;
-        if (err == ENOTEMPTY) {
-            int r = recursive_rmdir(p);
-            if (r == 0) VFS_RETURN(0);
-            log_fuse_err("RMDIR", path, -r);
-            VFS_RETURN(r);
-        }
+        /* 非空目录一律返回 ENOTEMPTY（POSIX），与上面的虚拟路径分支语义一致。
+           此前对 ENOTEMPTY 递归删除整个子树，等于「rmdir 静默变成 rm -r」——
+           依赖 rmdir 失败的调用方（rmdir(1)、清理逻辑、探测空目录）会误以为
+           目录已空并连带丢失全部内容。真正的递归删除只应出现在显式要求它的
+           路径上（跨设备 rename 的 EXDEV 回退）。 */
         log_fuse_err("RMDIR", path, err);
         VFS_RETURN(-err);
     }
@@ -1604,14 +1605,12 @@ static int vfs_release(const char* path, struct fuse_file_info* fi) {
 }
 
 static int vfs_fsync(const char* path, int datasync, struct fuse_file_info* fi) {
+    /* 后端句柄：fsync 必须真正把数据交给后端（上传收尾），否则依赖 fsync 持久化
+       的调用方（SQLite synchronous=FULL、编辑器保存）会拿到「成功」而数据仍在模块
+       缓冲里。语义与 FLUSH 一致：调用 backend_flush 收尾数据、不销毁句柄。 */
     if (fi->fh & NSP_FH_BACKEND_FLAG) {
         int slot = (int)((fi->fh & NSP_FH_BACKEND_SLOT_MASK) >> NSP_FH_BACKEND_SLOT_SHIFT);
-        const NspModuleOps* bops = NULL;
-        if (module_backend_acquire_slot(slot, &bops) == 0) {
-            module_backend_release_slot(slot);
-            return 0; /* 后端文件：数据同步语义由模块 FLUSH/RELEASE 收尾负责 */
-        }
-        return 0;
+        return vfs_backend_finish_data(slot, fi->fh, path);
     }
     if (!fi || fi->fh <= 0) return 0;
     int ret = (datasync ? fdatasync(fi->fh) : fsync(fi->fh));
@@ -1643,6 +1642,30 @@ static void vfs_inval_path(struct fuse* f, const char* path) {
     if (fuse_invalidate_path_entry) fuse_invalidate_path_entry(f, path);
 }
 
+/* 后端句柄的「数据落盘」收尾：调用模块 backend_flush（数据收尾/上传，**不销毁
+   句柄**），成功则失效路径缓存（否则紧随的读取会命中旧属性/旧 dentry）。
+   FSYNC 与 FLUSH 共用——两者都要求「数据已落盘」，且 backend_flush 可重复调用
+   （FUSE 的 FLUSH 会因 dup/fork 对同一句柄多次触发）。返回 0 或负 errno。 */
+static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path) {
+    const NspModuleOps* bops = NULL;
+    if (module_backend_acquire_slot(slot, &bops) != 0) return 0;
+    int rc = 0;
+    if (bops->backend_flush)
+        rc = nsp_fence_backend_flush(slot, "backend_flush", bops->backend_flush,
+                                     fh & NSP_FH_HANDLE_MASK);
+    module_backend_release_slot(slot);
+    if (rc == NSP_FENCE_FAULT) {
+        module_guard_fault(slot, "backend_flush", path);
+        rc = -EIO;
+    } else if (rc != 0 && rc != NSP_FENCE_BADFN && !backend_rc_is_business(rc))
+        module_guard_error(slot, "backend_flush", rc, path, "flush 返回异常");
+    if (rc == 0) {
+        struct fuse_context* ctx = fuse_get_context();
+        if (ctx) vfs_inval_path(ctx->fuse, path);
+    }
+    return rc < 0 ? rc : 0;
+}
+
 static int vfs_flush(const char* path, struct fuse_file_info* fi) {
     /* close() 同步等待 FLUSH 返回——写模式 STOR 上传必须在此完成（FLUSH
        错误会传播给 close() → 应用读到 EIO）。backend_flush 只收尾数据、
@@ -1652,27 +1675,7 @@ static int vfs_flush(const char* path, struct fuse_file_info* fi) {
     /* 后端分派：flush 由模块方法收尾数据（不销毁句柄） */
     if (fi->fh & NSP_FH_BACKEND_FLAG) {
         int slot = (int)((fi->fh & NSP_FH_BACKEND_SLOT_MASK) >> NSP_FH_BACKEND_SLOT_SHIFT);
-        const NspModuleOps* bops = NULL;
-        if (module_backend_acquire_slot(slot, &bops) == 0) {
-            int rc = 0;
-            if (bops->backend_flush)
-                rc = nsp_fence_backend_flush(slot, "backend_flush", bops->backend_flush,
-                                             fi->fh & NSP_FH_HANDLE_MASK);
-            module_backend_release_slot(slot);
-            if (rc == NSP_FENCE_FAULT) {
-                module_guard_fault(slot, "backend_flush", path);
-                rc = -EIO;
-            } else if (rc != 0 && rc != NSP_FENCE_BADFN && !backend_rc_is_business(rc))
-                module_guard_error(slot, "backend_flush", rc, path, "flush 返回异常");
-            if (rc == 0) {
-                /* 数据已落盘（上传完成）：使路径缓存失效，否则立即读取
-                   会命中旧属性/旧 dentry */
-                struct fuse_context* ctx = fuse_get_context();
-                if (ctx) vfs_inval_path(ctx->fuse, path);
-            }
-            return rc < 0 ? rc : 0;
-        }
-        return 0;
+        return vfs_backend_finish_data(slot, fi->fh, path);
     }
     /* 非后端文件：仅写模式 open 才在 close 时同步落盘（只读 open 无需
        写回，避免每次 close 无条件 fsync 的热路径吞吐回归）；fsync 失败
