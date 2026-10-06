@@ -291,7 +291,7 @@ ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 
 
 | 模块 | 源码 | 说明 |
 |------|------|------|
-| 规则引擎（**非模块**） | `src/daemon/fw_rules.c` | V4 起规则决策内建进 fuse_daemon：Trie + 线性通道 / sandbox / 虚拟目录 / uid→AppConfig 缓存；配置由 `fw_config` 换入后经 `fw_rules_on_reload` 通知作废缓存（见 §6.1.1）。**它不是可插拔模块**——规则语义属于框架 |
+| 规则引擎（**非模块**） | `src/daemon/fw_rules.c` | V4 起规则决策内建进 fuse_daemon：Trie + 线性通道 / sandbox / 虚拟目录 / uid→AppConfig 缓存；配置由 `fw_config` 换入，引擎的派生缓存在发布临界区（旧读者排空、新读者封锁）内经 `config_set_publish_invalidate_hook` 作废（见 §6.1.1）。**它不是可插拔模块**——规则语义属于框架 |
 | `ftp_module.so` | `src/modules/ftp/` | FTP 后端（libcurl，**不依赖 libfuse3**）：`ftp_mux.c` 是控制面「epoll + curl_multi」复用器（见下），`ftp_backend_libcurl.c` 是路径映射与读写实现（含 `backend_flush` 两阶段收尾与弱网重试）；写路径为本地临时文件缓存 + 流式 STOR/APPE 上传 |
 
 **FTP 控制面并发模型（`src/modules/ftp/ftp_mux.c`）**：`getattr`/`readdir`/`DELE`/`MKD`/`RMD`/`RNFR`/空文件 `STOR`/`TRUNCATE` 等控制操作交给每后端一个 `CURLM` 句柄，由**一个 epoll 事件线程**驱动（`curl_multi_socket_action` + `CURLMOPT_SOCKET/TIMERFUNCTION` 接入 epoll；提交线程只入队 + eventfd 唤醒，绝不触碰 multi——libcurl 多接口非线程安全）。收益：控制连接在 multi 的连接缓存里长期复用（免重复 USER/PASS 登录），多个 FUSE 线程的控制操作并行在飞（同服务器并发控制连接上限 `CURLMOPT_MAX_HOST_CONNECTIONS`，默认 4），且**业务失败不再重建连接**——旧实现在任何失败（含 550 不存在）都 `curl_easy_cleanup` 重建共享句柄，让下一次操作白付一次 TCP + 登录往返。数据面（读下载线程 / 写流式上传）仍用每文件独立句柄 + 阻塞 `curl_easy_perform`：它们本就互不竞争，且背压模型是「缓冲满即中止传输」（`write_cb` 返回 0 → `CURLE_WRITE_ERROR`），与事件循环驱动不兼容。回归用例 `test_ftp_parallel.py`（并发正确性 / 连接数 / 延迟收敛 / 热重载竞态）。

@@ -44,7 +44,9 @@ DRIVER = os.path.join(ROOT, "tests", "fixtures", "monitor_layers_driver.c")
 SOURCES = [
     "src/daemon/fw_config.c",
     "src/daemon/fw_pkg.c",
-    # fw_config 重载时会通知内建规则引擎作废缓存 → 链接 fw_rules.c（及 sys_pkg 等依赖）
+    # fw_config 的监听线程用 cfg_watch 对账 App-rules* 子目录 watch
+    "src/daemon/cfg_watch.c",
+    # fw_rules.c：本驱动直接调 fw_rules_init/fw_rules_resolve/probe（及 sys_pkg 等依赖）
     "src/daemon/fw_rules.c",
     "src/config/config_parser.c",
     "src/config/path_vars.c",

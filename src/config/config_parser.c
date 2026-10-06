@@ -228,6 +228,14 @@ static void free_app_config_rules(AppConfig* cfg) {
     cfg->var_count = 0;
     cfg->var_capacity = 0;
 }
+/* 发布期派生缓存作废钩子（见 config_parser.h）：单一注册者，写者线程在
+   排空旧读者后、放行新读者前调用，此时无读者能重算并缓存旧配置指针 */
+static void (*g_publish_invalidate_hook)(void);
+
+void config_set_publish_invalidate_hook(void (*fn)(void)) {
+    g_publish_invalidate_hook = fn;
+}
+
 /* COW 发布：把暂存区构建的新配置整体换入 live（g_global_cfg/g_app_cfgs），
    旧配置在旧代际读者归零后延迟释放。调用方须持 config_lock_write。 */
 static void config_publish(void) {
@@ -237,6 +245,10 @@ static void config_publish(void) {
        或新 trie+旧规则的错误决策窗口）。config_publish_end 的排空仅用于
        延迟释放判定，无法撤销已发生的撕裂读 */
     config_drain_readers(old_gen);
+    /* 派生缓存作废的**唯一安全窗口**：旧读者已全部离开、新读者仍被封锁
+       （代际为奇数），此刻既不会有人把旧配置指针以新代际缓存下来，也没有
+       读者还持着旧指针——见 config_parser.h 的钩子契约 */
+    if (g_publish_invalidate_hook) g_publish_invalidate_hook();
     /* 快照旧 live（浅拷贝结构体，指针指向待释放内存） */
     AppConfig old_global = g_global_cfg;
     AppConfig** old_apps = g_app_cfgs;

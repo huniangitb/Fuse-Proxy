@@ -92,14 +92,17 @@ typedef struct {
 
 /* ================= 接口 ================= */
 
-/* 初始化（fuse_daemon 启动期、fw_config_init 之前）：只建内部缓存，
-   配置索引由 fw_config 在重载时构建并调 fw_rules_on_reload 通知本引擎。 */
+/* 初始化（fuse_daemon 启动期、fw_config_init 之前）：只建内部缓存，并把
+   「派生缓存作废」注册到配置发布临界区（config_set_publish_invalidate_hook），
+   此后每次发布都会在唯一安全窗口内自动作废，重载方无需（也不该）在发布后补调。 */
 int fw_rules_init(const char* rules_path, bool disable_sandbox);
 void fw_rules_exit(void);
 
-/* 框架换入新配置索引后调用：作废本引擎的 uid→AppConfig 指针缓存
-   （旧 AppConfig 已被 COW 发布释放，缓存不禁会造成悬垂）。 */
-void fw_rules_on_reload(void);
+/* 配置发布临界区内的作废钩子实现（由 config_publish 在「旧读者已排空、
+   新读者仍封锁」的窗口内调用）：作废 uid→AppConfig 指针缓存并递增代际
+   （旧 AppConfig 随即被 COW 释放，缓存不禁会造成悬垂）。
+   不得直接调用——它是 config_set_publish_invalidate_hook 的注册体。 */
+void fw_rules_invalidate_caches(void);
 
 /* 路径决策：一次返回全部决策。无 <uid>/ 用户层（挂载点根）时 uns 置 valid=false。 */
 void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out);
