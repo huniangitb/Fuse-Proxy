@@ -150,7 +150,7 @@ int (*backend_release)(uint64_t h);            /* 句柄销毁唯一入口 */
 int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 ```
 
-`backend_flush` 与 `backend_release` 的分工是易错点：FLUSH 可因 dup/fork **多次调用**，只能收尾数据（如上传完成），销毁必须等 RELEASE。
+`backend_flush` 与 `backend_release` 的分工是易错点：FLUSH 可因 dup/fork **多次调用**，只能收尾数据（如上传完成），销毁必须等 RELEASE。**FLUSH 之后句柄仍可写**——第一次 FLUSH 把当前数据同步到后端，之后从存活的 fd 继续写入的数据必须由后续 FLUSH/RELEASE 继续同步；把「已同步」写成一次性开关（置位后写路径或补传路径早退）会让后半段数据静默丢失（FTP 后端 `uploaded` 曾如此：`tests/test_ftp.py` 的 dup/close 用例守护）。
 
 **列目录分页（V5）**：框架按 256 条/页、`offset` 累加逐页拉取，直到短页/0 页或 filler 满——FTP 大目录无条数上限（V4 的 512 整批上限会静默丢尾）。FTP 后端以单条目 LIST 缓存服务后续页（同目录翻页零额外 LIST；变更成功后失效）；`VFS_READDIR_MAX_TOTAL=65536` 是恶意后端无限产条目的 DoS 熔断（超限 `E2BIG` loud 报错，正常走不到）。
 

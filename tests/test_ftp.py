@@ -164,6 +164,28 @@ def main():
             ok("内容正确") if wait_ftp_content(newf, "hello from fuse-ftp") else fail("写内容", "FTP 内容未同步")
         except Exception as e: fail("写文件", str(e))
 
+        # 3b. FLUSH 之后继续写（dup + close 触发 FLUSH）→ 后续数据必须落远端
+        #     FUSE 的 FLUSH 在每次 close(2) 触发（dup/fork 可多次），第一次 FLUSH
+        #     之后存活的 fd 仍可写，那些数据必须由后续 FLUSH/RELEASE 续传。旧实现
+        #     第二次 FLUSH 被 uploaded 早退挡掉，远端只留前半段（静默丢数据）
+        dupf = "nsp_test_flush_then_write.txt"
+        try:
+            fd = os.open(str(m/"0"/SERVER/dupf), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                os.write(fd, b"AAAA")
+                fd2 = os.dup(fd)
+                os.close(fd2)           # 触发 FLUSH：前半段落远端
+                os.write(fd, b"BBBB")   # FLUSH 之后继续写
+            finally:
+                os.close(fd)            # 触发 FLUSH + RELEASE：后半段必须补传
+            if wait_ftp_content(dupf, "AAAABBBB"):
+                ok("FLUSH 后续写（dup/close）：远端内容完整")
+            else:
+                p = Path(FTP_UPLOAD) / dupf
+                got = p.read_text(errors="replace") if p.exists() else "<文件不存在>"
+                fail("FLUSH 后续写", f"远端={got!r}（期望 'AAAABBBB'）")
+        except Exception as e: fail("FLUSH 后续写", str(e))
+
         # 4. 读回（经 fuse）
         try:
             got = (m/"0"/SERVER/newf).read_text().strip()
