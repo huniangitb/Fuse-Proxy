@@ -329,10 +329,21 @@ def main():
 
     finally:
         stop_fuse(p)   # fuse_daemon 退出 → 模块 exit 清理后端
-        # 清理测试残留
-        for f in [orig]:
-            fp = Path(FTP_UPLOAD)/f
-            if fp.exists(): fp.unlink()
+        # 清理测试残留：本套件的工件统一用 nsp_ 前缀，按前缀整体清扫。
+        # 此前只逐个手删（且只删了 orig），漏掉 nsp_ttl_probe /
+        # nsp_truncate_size.txt / nsp_test_flush_then_write.txt 等，于是在
+        # **真实** FTP 树上持续累积——upload/ 同时是用户的投递目录，不能留垃圾。
+        for n in os.listdir(FTP_UPLOAD):
+            if not n.startswith("nsp_"):
+                continue
+            fp = Path(FTP_UPLOAD) / n
+            if fp.is_dir():
+                shutil.rmtree(fp, ignore_errors=True)
+            else:
+                try:
+                    fp.unlink()
+                except OSError:
+                    pass
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")
