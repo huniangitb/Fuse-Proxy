@@ -265,6 +265,48 @@ def main():
         except Exception as e:
             fail("缺失路径不入内部熔断（防误杀）", str(e))
 
+        # 11b. LIST 缓存有界 TTL：**绕过代理**直接在 FTP 服务器上新增的文件，
+        #      空闲超过 TTL 后再列必须可见。旧实现按路径永久复用缓存 → 外部改动
+        #      永远看不到（同一目录反复列）。夹具必须先清目录：上传区跨次运行
+        #      不清理，残留文件会让首次列举就"包含"待验证的名字（用例退化为恒真）。
+        try:
+            extdir = "nsp_ttl_dir"
+            d = Path(FTP_UPLOAD)/extdir
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True)
+            (d/"before.txt").write_text("x")
+            first = sorted(os.listdir(m/"0"/SERVER/extdir))
+            _ = os.listdir(m/"0"/SERVER/extdir)  # TTL 内第二次：仍走缓存（滑动续期）
+            (d/"added_ext.txt").write_text("y")  # 外部新增（不经代理 → 不触发失效）
+            time.sleep(6)  # > FTP_LIST_CACHE_TTL(5s)
+            after = sorted(os.listdir(m/"0"/SERVER/extdir))
+            if first == ["before.txt"] and "added_ext.txt" in after:
+                ok("LIST 缓存有界 TTL：外部新增在空闲超时后可见")
+            else:
+                fail("LIST 缓存 TTL", f"first={first} after={after}")
+        except Exception as e:
+            fail("LIST 缓存 TTL", str(e))
+
+        # 11c. truncate 后 size 不得被旧 LIST 缓存回灌：先列一次父目录把缓存装上，
+        #      再截断（旧实现只清 stat、不清 LIST），随后再列——命中旧 LIST 会把
+        #      截断前的 size 预填回 stat。最后等内核 attr 缓存（attr_timeout=1s）过期
+        #      再 stat，确保读到的是模块侧的值。
+        try:
+            tfile = "nsp_truncate_size.txt"
+            (m/"0"/SERVER/tfile).write_text("0123456789")
+            _ = os.listdir(m/"0"/SERVER)
+            time.sleep(1.2)
+            os.truncate(m/"0"/SERVER/tfile, 0)
+            _ = os.listdir(m/"0"/SERVER)
+            time.sleep(1.2)
+            sz3 = os.stat(m/"0"/SERVER/tfile).st_size
+            if sz3 == 0:
+                ok("truncate 清 LIST：截断后 size 不被旧缓存回灌")
+            else:
+                fail("truncate 清 LIST", f"截断后 size={sz3}（期望 0；旧 LIST 缓存回灌了旧值）")
+        except Exception as e:
+            fail("truncate 清 LIST", str(e))
+
         # 12. V5 分页：700 文件大目录一次列全（3 页 × 256；旧 512 整批
         #     上限会静默丢尾）。文件直写 FTP 根（免 700 次 STOR），只测读链路。
         try:

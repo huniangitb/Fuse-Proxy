@@ -206,7 +206,7 @@ class DelayRelay:
 # ================= 挂载（--fuse-threads=-1：给足 FUSE worker，
 #   否则并发度被人为压到默认的 2，测不出 mux 的连接复用上限） =================
 
-def write_conf(port):
+def write_conf(port, remote_dir="/upload"):
     with open(CONF_FTP, "w") as fh:
         fh.write(f"""
 [{SERVER}]
@@ -214,8 +214,21 @@ host = 127.0.0.1
 port = {port}
 user = anonymous
 password =
-remote_dir = /upload
+remote_dir = {remote_dir}
 """.strip())
+
+
+def wait_in_listing(name, timeout=20.0):
+    """轮询 FTP 根列举直到出现指定名字（热重载后新配置生效的判据）"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if name in os.listdir(Path(MNT) / "0" / SERVER):
+                return True
+        except OSError:
+            pass
+        time.sleep(0.3)
+    return False
 
 
 def start_fuse(threads=-1):
@@ -511,6 +524,29 @@ def phase_c(relay, restart_fuse):
         fail("热重载后操作恢复", "; ".join(rec[:2]))
     else:
         ok("热重载后操作恢复正常")
+
+    # C2. 配置**内容**变更（远程目录换一个）：重载后必须由新配置服务，旧目录的
+    #     内容不得继续可见（后端对象按代际重建；旧对象只被在途/已打开操作继续
+    #     持有，不再改写它）。末尾改回 /upload 并等生效——后续阶段依赖它。
+    up2 = Path(FTP_UPLOAD).parent / "upload2"  # 与 FTP_UPLOAD 同底盘：anon chroot 根下
+    up2.mkdir(parents=True, exist_ok=True)
+    os.chmod(up2, 0o777)
+    m2 = f"{PREFIX}gen2.txt"
+    (up2 / m2).write_text("gen2")
+    write_conf(RELAY_PORT, "/upload2")
+    if wait_in_listing(m2):
+        ok("远程目录变更生效（列举来自新配置）")
+    else:
+        fail("远程目录变更生效", f"未在列举中见到 {m2}")
+    if names2 and not any(vpath(n).exists() for n in names2):
+        ok("旧目录内容不再可见（未跨代串用）")
+    else:
+        fail("旧目录内容不再可见", "改配置后仍能看见旧目录的文件")
+    write_conf(RELAY_PORT)
+    if wait_in_listing(names2[0]):
+        ok("配置还原生效（/upload）")
+    else:
+        fail("配置还原生效", "改回 /upload 后未见到既有文件")
     rm_files(names)
     rm_files(names2)
 
