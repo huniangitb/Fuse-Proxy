@@ -66,6 +66,12 @@ SUITE_MAP = [
      ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
 
+    (("test_reaped_managed.py",),
+     ("src/injector/reaped_managed.c", "src/injector/reaped_managed.h",
+      "src/injector/injector.c"),
+     ("reaped_managed_put", "reaped_managed_exited", "reap_zombies"),
+     "受管子进程收尸留档（崩溃现场入日志环）"),
+
     (("test_modules.py", "test_module_circuit.py", "test_module_abi.py",
       "test_backend_lifecycle.py"),
      ("src/module/",), ("memfd_create", "module_backend_", "module_fault_poison"),
@@ -239,6 +245,7 @@ PARALLEL_SAFE = frozenset({
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
     "test_rule_file_lock.py",     # cc 直编 nsp_rule_file + 子进程并发写，/tmp 工作目录
     "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权
+    "test_reaped_managed.py",     # cc 直编收尸留档 + 真实 fork 子进程，无共享状态
     "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时

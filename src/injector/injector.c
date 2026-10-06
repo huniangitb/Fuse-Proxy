@@ -8,6 +8,7 @@
 #include "ns_utils.h"
 #include "fast_pid.h"
 #include "inject_target.h"
+#include "reaped_managed.h"
 #include "mount_manager.h"
 #include "ipc_server.h"
 #include "config_publisher.h"
@@ -620,41 +621,16 @@ static void remount_all_tracked() {
     LOG("FUSE 崩溃恢复重挂完成");
 }
 
-/* 受管子进程的收尸记录：fuse_daemon 退出后，check_and_recover_fuse 要靠
-   waitpid(pid) 的返回确认"确实退出了"并 dump 崩溃 backtrace。而 reap_zombies 用
-   waitpid(-1) 会抢先把它收走 —— 之后 waitpid(pid) 返回 ECHILD，恢复逻辑仍在
-   （kill(pid,0) 早已失败，照常重挂），但崩溃现场不再进日志环（sys.log / log_ctl
-   查不到）。waitpid(-1) 无法"跳过指定子进程"，故改为收尸时把受管子进程的退出状态
-   记下来，供恢复路径复核（语义等价：无论收尸先后，恢复路径都能拿到状态）。 */
-#define REAPED_MANAGED_SLOTS 4
-static struct {
-    pid_t pid;
-    int status;
-} g_reaped_managed[REAPED_MANAGED_SLOTS];
-
-/* 复核受管子进程是否已退出；退出状态若已被 reap_zombies 收走则从记录里取回 */
-static bool managed_child_exited(pid_t pid, int* status_out) {
-    if (pid <= 0) return false;
-    for (int i = 0; i < REAPED_MANAGED_SLOTS; i++) {
-        if (g_reaped_managed[i].pid != pid) continue;
-        if (status_out) *status_out = g_reaped_managed[i].status;
-        g_reaped_managed[i].pid = 0;
-        return true;
-    }
-    int st = 0;
-    if (waitpid(pid, &st, WNOHANG) == pid) {
-        if (status_out) *status_out = st;
-        return true;
-    }
-    return false;
-}
+/* 受管子进程的退出状态留档与复核见 reaped_managed.{h,c}：通用收尸
+   （reap_zombies 的 waitpid(-1)）会抢先取走 fuse_daemon 的僵尸，恢复路径不能只
+   靠 waitpid(pid)——否则 ECHILD 会让崩溃现场不再进日志环 */
 
 static void check_and_recover_fuse() {
     if (g_global_fuse.disabled || g_global_fuse.pid <= 0) return;
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) != 0) {
         g_fuse_ready = 0;
         int status = 0;
-        if (managed_child_exited(g_global_fuse.fuse_pid, &status)) dump_crash_log_tail();
+        if (reaped_managed_exited(g_global_fuse.fuse_pid, &status)) dump_crash_log_tail();
         g_global_fuse.fuse_pid = 0;
         time_t now = time(nullptr);
         if (now - g_global_fuse.last_crash_time < 60)
@@ -694,7 +670,7 @@ static void check_and_recover_fuse() {
      * 只有当 com.android.providers.media.module 仍是注入目标时才拉起。
      */
     if (g_media_fuse.fuse_pid > 0 && kill(g_media_fuse.fuse_pid, 0) != 0) {
-        (void)managed_child_exited(g_media_fuse.fuse_pid, nullptr);
+        (void)reaped_managed_exited(g_media_fuse.fuse_pid, nullptr);
         g_media_fuse.fuse_pid = 0;
         time_t now = time(nullptr);
         if (now - g_media_fuse.last_crash_time < 60)
@@ -728,7 +704,7 @@ static void check_and_recover_fuse() {
          */
         LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
         kill(g_media_fuse.fuse_pid, SIGTERM);
-        (void)managed_child_exited(g_media_fuse.fuse_pid, nullptr);
+        (void)reaped_managed_exited(g_media_fuse.fuse_pid, nullptr);
         g_media_fuse.fuse_pid = 0;
         ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
     }
@@ -955,15 +931,9 @@ void reap_zombies() {
     pid_t reaped;
     while ((reaped = waitpid(-1, &status, WNOHANG)) > 0) {
         /* 受管子进程的退出状态留档，供恢复路径复核后 dump 崩溃 backtrace
-           （见 g_reaped_managed 注释）；其余子进程照常收割 */
+           （见 reaped_managed.h）；其余子进程照常收割 */
         if (reaped != g_global_fuse.fuse_pid && reaped != g_media_fuse.fuse_pid) continue;
-        for (int i = 0; i < REAPED_MANAGED_SLOTS; i++) {
-            if (g_reaped_managed[i].pid == 0 || g_reaped_managed[i].pid == reaped) {
-                g_reaped_managed[i].pid = reaped;
-                g_reaped_managed[i].status = status;
-                break;
-            }
-        }
+        reaped_managed_put(reaped, status);
     }
 }
 
