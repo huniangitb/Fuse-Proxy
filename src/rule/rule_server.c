@@ -780,25 +780,6 @@ static void main_conf_path(char* out, size_t sz) {
     snprintf(out, sz, "%s/injector.conf", g_config_dir);
 }
 
-/* 返回应用规则当前生效文件：.conf 存在（启用）→ .conf；否则 .conf.disabled 存在
-   （停用）→ .disabled；两者皆无 → .conf（新建时使用）。
-   保证停用状态下 ADD/SET/REMOVE/TOGGLE 继续操作 .disabled 文件，
-   不会新建残缺 .conf 导致规则丢失或注入状态异常开启。 */
-static void resolve_app_rule_active_path(const char* pkg, int uid, char* out, size_t sz) {
-    char path[PATH_MAX];
-    nsp_app_rule_path(g_config_dir, uid, pkg, path, sizeof(path));
-    if (access(path, F_OK) == 0) {
-        snprintf(out, sz, "%s", path);
-        return;
-    }
-    char dis[PATH_MAX];
-    snprintf(dis, sizeof(dis), "%s.disabled", path);
-    if (access(dis, F_OK) == 0)
-        snprintf(out, sz, "%s", dis);
-    else
-        snprintf(out, sz, "%s", path);
-}
-
 /* 应用规则状态：true=启用（.conf 存在），false=停用（仅 .conf.disabled） */
 static bool app_rule_is_enabled(const char* pkg, int uid) {
     char path[PATH_MAX];
@@ -950,7 +931,7 @@ static json_object* build_global_json(void) {
 
 static json_object* build_app_json(const char* pkg, int uid) {
     char read_path[PATH_MAX];
-    resolve_app_rule_active_path(pkg, uid, read_path, sizeof(read_path));
+    nsp_rule_file_app_active_path(g_config_dir, uid, pkg, read_path, sizeof(read_path));
     bool disabled = !app_rule_is_enabled(pkg, uid);
     json_object* app = json_object_new_object();
     json_object* switches = json_object_new_object();
@@ -1420,7 +1401,7 @@ static void handle_add(int fd, json_object* req) {
     }
     char dir[PATH_MAX], path[PATH_MAX];
     nsp_app_rule_dir(g_config_dir, uid, dir, sizeof(dir));
-    resolve_app_rule_active_path(pkg, uid, path, sizeof(path));
+    nsp_rule_file_app_active_path(g_config_dir, uid, pkg, path, sizeof(path));
     if (nsp_mkdir_p(dir, 0755) != 0) {
         reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
         return;
@@ -1451,7 +1432,7 @@ static void resolve_rule_path(const char* pkg, int uid, bool* is_global, char* o
         main_conf_path(out, sz);
     } else {
         *is_global = false;
-        resolve_app_rule_active_path(pkg, uid, out, sz);
+        nsp_rule_file_app_active_path(g_config_dir, uid, pkg, out, sz);
     }
 }
 

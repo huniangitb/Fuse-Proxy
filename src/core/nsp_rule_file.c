@@ -17,11 +17,14 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strncasecmp */
+#include <sys/file.h> /* flock：跨进程串行化读改写 */
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* 行数组初始容量与扩容因子（与合并前两份实现一致） */
@@ -88,10 +91,29 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
     return lines;
 }
 
+/* 目录 fsync（rename 的持久化点）：失败不致命，仅尽力而为 */
+static void rule_file_fsync_dir(const char* path) {
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof dir, "%s", path ? path : "");
+    if (n < 0 || (size_t)n >= sizeof dir) return;
+    char* slash = strrchr(dir, '/');
+    if (!slash) return;
+    if (slash == dir)
+        dir[1] = '\0';
+    else
+        *slash = '\0';
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return;
+    fsync(fd);
+    close(fd);
+}
+
 bool nsp_rule_file_write(const char* path, char** lines, int count) {
     if (!path || count < 0) return false;
+    /* 临时名带 pid：同一目录可能被多个进程（rule_server 与多个 log_ctl）同时编辑，
+       固定 <path>.tmp 会让两个写者互相 rename 掉对方尚未写完的临时文件 */
     char tmp[PATH_MAX];
-    int n = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
     if (n < 0 || (size_t)n >= sizeof tmp) {
         errno = ENAMETOOLONG;
         return false;
@@ -105,6 +127,13 @@ bool nsp_rule_file_write(const char* path, char** lines, int count) {
             return false;
         }
     }
+    /* 持久性：fclose 只把数据交给内核，掉电时可能"rename 已生效、内容还是旧的"。
+       先 fsync 文件内容，再 rename，最后 fsync 目录让 rename 本身持久化 */
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        unlink(tmp);
+        return false;
+    }
     if (fclose(fp) != 0) {
         unlink(tmp);
         return false;
@@ -113,7 +142,38 @@ bool nsp_rule_file_write(const char* path, char** lines, int count) {
         unlink(tmp);
         return false;
     }
+    rule_file_fsync_dir(path);
     return true;
+}
+
+/* 跨进程串行化「读-改-写」：flock 于规则文件所在目录（目录 fd 上 flock 合法，
+   也不必额外维护锁文件）。不取锁时两边仍各自原子落盘，但两个编辑者读到同一份
+   内容再各自写回，后写者会吃掉前者的修改。取锁失败按 fail-open 继续（绝不因
+   锁不可用而拒绝编辑）。 */
+static int rule_file_lock_dir(const char* path) {
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof dir, "%s", path ? path : "");
+    if (n < 0 || (size_t)n >= sizeof dir) return -1;
+    char* slash = strrchr(dir, '/');
+    if (!slash) return -1;
+    if (slash == dir)
+        dir[1] = '\0';
+    else
+        *slash = '\0';
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno == EINTR) continue;
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void rule_file_unlock_dir(int fd) {
+    if (fd < 0) return;
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 void nsp_rule_file_free(char** lines, int count) {
@@ -198,6 +258,24 @@ int nsp_rule_file_find_switch(char** lines, int count, int header_idx, const cha
     return NSP_RULE_FILE_ENOTFND;
 }
 
+void nsp_rule_file_app_active_path(const char* config_dir, int uid, const char* pkg, char* out,
+                                   size_t sz) {
+    if (!out || sz == 0) return;
+    char path[PATH_MAX];
+    nsp_app_rule_path(config_dir, uid, pkg, path, sizeof(path));
+    if (access(path, F_OK) == 0) {
+        snprintf(out, sz, "%s", path);
+        return;
+    }
+    char dis[PATH_MAX];
+    int dn = snprintf(dis, sizeof(dis), "%s.disabled", path);
+    if (dn > 0 && (size_t)dn < sizeof(dis) && access(dis, F_OK) == 0) {
+        snprintf(out, sz, "%s", dis);
+        return;
+    }
+    snprintf(out, sz, "%s", path); /* 两者皆无（或路径过长表达不出 .disabled）→ base */
+}
+
 bool nsp_rule_file_is_category_pkg(const char* pkg) {
     /* 大小写敏感，与 config_parser 及 GLOBAL 段一致：控制面不得把
        [user_apps:0] 当类别写入（parser 会将其按普通应用加载） */
@@ -242,7 +320,7 @@ int nsp_rule_file_find_nth(char** lines, int count, const char* type_name, int i
 
 /* ==================== 段式文件写入 ==================== */
 
-int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
+static int upsert_in_section_impl(const char* path, const char* sec_name,
                                     NspRuleSectionMatch sec_match, bool is_switch,
                                     const char* type_name, const char* line, bool* out_changed) {
     if (!path || !sec_name || !line) return NSP_RULE_FILE_EINVAL;
@@ -341,7 +419,7 @@ int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
 
 /* ==================== 无段文件写入 ==================== */
 
-int nsp_rule_file_upsert_line(const char* path, bool is_switch, const char* type_name,
+static int upsert_line_impl(const char* path, bool is_switch, const char* type_name,
                               const char* line, bool* out_changed) {
     if (!path || !line) return NSP_RULE_FILE_EINVAL;
     if (is_switch && !type_name) return NSP_RULE_FILE_EINVAL;
@@ -411,7 +489,7 @@ int nsp_rule_file_upsert_line(const char* path, bool is_switch, const char* type
 
 /* ==================== 按 (类型, 索引) 删除 ==================== */
 
-int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index, char* out_removed,
+static int remove_nth_impl(const char* path, const char* type_name, int index, char* out_removed,
                              size_t removed_sz) {
     if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
 
@@ -433,4 +511,34 @@ int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index,
     }
     nsp_rule_file_free(lines, count);
     return NSP_RULE_FILE_OK;
+}
+
+/* ==================== 加锁包装（读-改-写全程持目录 flock） ====================
+   三个入口都是「读全文件 → 改内存 → 覆盖写」，跨进程并发时必须串行，否则后写者
+   吃掉前者的修改。实现体不改，包装只负责取/放锁（fail-open）。 */
+
+int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
+                                    NspRuleSectionMatch sec_match, bool is_switch,
+                                    const char* type_name, const char* line, bool* out_changed) {
+    int lk = rule_file_lock_dir(path);
+    int rc = upsert_in_section_impl(path, sec_name, sec_match, is_switch, type_name, line,
+                                    out_changed);
+    rule_file_unlock_dir(lk);
+    return rc;
+}
+
+int nsp_rule_file_upsert_line(const char* path, bool is_switch, const char* type_name,
+                              const char* line, bool* out_changed) {
+    int lk = rule_file_lock_dir(path);
+    int rc = upsert_line_impl(path, is_switch, type_name, line, out_changed);
+    rule_file_unlock_dir(lk);
+    return rc;
+}
+
+int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index, char* out_removed,
+                             size_t removed_sz) {
+    int lk = rule_file_lock_dir(path);
+    int rc = remove_nth_impl(path, type_name, index, out_removed, removed_sz);
+    rule_file_unlock_dir(lk);
+    return rc;
 }

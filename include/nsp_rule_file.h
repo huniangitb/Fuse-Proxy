@@ -89,6 +89,15 @@ int nsp_rule_file_find_switch(char** lines, int count, int header_idx, const cha
 /* 类别段判定：[USER_APPS] / [SYSTEM_APPS]（大小写敏感，与 config_parser 一致） */
 bool nsp_rule_file_is_category_pkg(const char* pkg);
 
+/* 应用规则**当前生效文件**的路径合成（rule_server 与 log_ctl 共用的唯一实现）：
+ *   <pkg>.conf 存在（启用）→ 返回它；否则 <pkg>.conf.disabled 存在（停用）→
+ *   返回它；两者皆无 → 返回 base <pkg>.conf（新建时用）。
+ * 编辑（ADD/SET/REMOVE/TOGGLE）必须走这里：直接写 base <pkg>.conf 会在应用处于
+ * 停用状态时新建一个 .conf，按解析语义（存在 .conf 即启用）等于静默把注入重新
+ * 打开，同时 .disabled 里的规则被丢在一边。 */
+void nsp_rule_file_app_active_path(const char* config_dir, int uid, const char* pkg, char* out,
+                                   size_t sz);
+
 /* 类别段名（不含方括号）：USER_APPS 恒带显式 :uid（uid<0 视为 0），
  * SYSTEM_APPS 无参。写入方经 nsp_rule_file_upsert_in_section 使用时由后者
  * 补方括号。 */
