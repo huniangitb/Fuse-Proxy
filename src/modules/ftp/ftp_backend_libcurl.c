@@ -1913,25 +1913,28 @@ static void* ftp_up_thread(void* arg) {
    → 上传失败（写模式场景 f_lock 无其他竞争，read 只用于读模式）。
    返回 0 成功，负值 errno 风格。 */
 static int ftp_backend_upload(FtpBackendFile* f) {
+    /* 统一出口：f_lock 必须恰好释放一次。此前主路径（全量 STOR 成功/失败）
+       直接 return 而漏解锁 → 锁随句柄泄漏，存活 fd 的下一次 write（1762）
+       与 release（ftp_write_sync）永久阻塞（乱序改写→close→再写必现）。 */
+    char* data = NULL;
+    off_t sz = 0;
+    int rc = 0;
     pthread_mutex_lock(&f->f_lock);
     /* 是否需要上传由调用方（ftp_write_sync）判定，此处只挡「非写模式」与
        「本地缓存已被 RELEASE 回收」两态。用 uploaded 早退会让「FLUSH 置位后
        又写入」的补传被静默跳过——数据不落远端（dup/fork 下的数据丢失根因） */
-    if (!f->writing || f->tmp_fd < 0) {
-        pthread_mutex_unlock(&f->f_lock);
-        return 0;
-    }
-    off_t sz = lseek(f->tmp_fd, 0, SEEK_END);
+    if (!f->writing || f->tmp_fd < 0) goto out; /* rc=0：无需上传 */
+    sz = lseek(f->tmp_fd, 0, SEEK_END);
     if (sz < 0) {
-        pthread_mutex_unlock(&f->f_lock);
-        return -EIO;
+        rc = -EIO;
+        goto out;
     }
     lseek(f->tmp_fd, 0, SEEK_SET);
 
-    char* data = sz > 0 ? malloc((size_t)sz) : NULL;
+    data = sz > 0 ? malloc((size_t)sz) : NULL;
     if (sz > 0 && !data) {
-        pthread_mutex_unlock(&f->f_lock);
-        return -ENOMEM;
+        rc = -ENOMEM;
+        goto out;
     }
 
     size_t got = 0;
@@ -1949,7 +1952,6 @@ static int ftp_backend_upload(FtpBackendFile* f) {
        RELEASE 前仍可继续写。保留本地文件才能续写、续传与再次全量同步；
        tmp_fd 与临时文件由 RELEASE 统一回收 */
 
-    int rc = 0;
     /* 独立写句柄（持久选项同读句柄：用户名/密码/弱网超时）：不走控制面 mux，
        并发多文件 STOR 因此互不竞争（此前 res=43 的竞争窗口由此根除）；
        句柄缓存在文件上，同文件多次 FLUSH/补传复用连接池 */
@@ -1991,7 +1993,6 @@ static int ftp_backend_upload(FtpBackendFile* f) {
     } else {
         rc = -EIO;
     }
-    free(data);
     if (rc == 0) {
         /* 全量 STOR 覆盖成功：远端内容 == 本地内容，流式状态复位（此后增量
            走 APPE，乱序/出错标记清除，流式上传可恢复） */
@@ -2004,6 +2005,9 @@ static int ftp_backend_upload(FtpBackendFile* f) {
         ftp_stat_cache_clear(f->bk); /* STOR 完成：整表失效，杜绝写后旧 stat */
         ftp_list_cache_clear(f->bk); /* 新条目出现：LIST 缓存失效 */
     }
+out:
+    free(data);
+    pthread_mutex_unlock(&f->f_lock);
     return rc;
 }
 
