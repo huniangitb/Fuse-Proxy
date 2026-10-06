@@ -310,6 +310,14 @@ static int g_uid_map_cap = 0;
 static uid_t g_failed_uids[MAX_FAILED_UIDS];
 static int g_failed_uid_count = 0;
 
+/* g_uid_map / g_failed_uids 的互斥：update_uid_map 的调用方既有主线程
+   （ipc_server 的 IPC 客户端处理），也有每次 IPC 通知 detach 出来的挂载线程
+   （ipc_server.c 的 ipc_mount_thread 与 mount_manager），而它执行「线性查找 +
+   落盘 upsert + realloc + count++」整套读改写——无锁在开机多应用并发上报时
+   会 realloc 覆盖/悬垂或丢记录。初始化在 early_init 单线程完成，故
+   init_uid_map_cache 不取锁。 */
+static pthread_mutex_t g_uid_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static bool uid_has_failed(uid_t uid) {
     for (int i = 0; i < g_failed_uid_count; i++) {
         if (g_failed_uids[i] == uid) return true;
@@ -455,7 +463,8 @@ void get_target_storage_path(uid_t uid, char* path, size_t size) {
     snprintf(path, size, "%s", NSP_ANDROID_EMULATED_ROOT);
 }
 
-void update_uid_map(uid_t uid, const char* pkg) {
+/* 加锁实现（调用方须持 g_uid_map_mutex）：拆分只为让早退分支不必逐个解锁 */
+static void update_uid_map_locked(uid_t uid, const char* pkg) {
     if (uid < NSP_SYSTEM_APP_UID_MIN || is_isolated_uid(uid)) return;
     if (uid_has_failed(uid)) return;
     char clean_pkg[128];
@@ -514,6 +523,12 @@ void update_uid_map(uid_t uid, const char* pkg) {
         g_uid_map_count++;
         LOG_DBG("UID内存映射已更新 (新增记录): %u -> %s", uid, clean_pkg);
     }
+}
+
+void update_uid_map(uid_t uid, const char* pkg) {
+    pthread_mutex_lock(&g_uid_map_mutex);
+    update_uid_map_locked(uid, pkg);
+    pthread_mutex_unlock(&g_uid_map_mutex);
 }
 
 void cleanup_app_mounts(int pid, const char* target_path, const char* backup_path, uid_t uid) {
