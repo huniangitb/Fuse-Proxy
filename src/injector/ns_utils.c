@@ -260,16 +260,19 @@ int run_in_mnt_ns_async(int target_pid, const char* pkg, int (*func)(void*), voi
     strncpy(ctx->pkg_name, pkg, sizeof(ctx->pkg_name) - 1);
     ctx->pkg_name[sizeof(ctx->pkg_name) - 1] = '\0';
     ctx->mount_args = mount_args;
-    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.fd = status_pipe[0]};
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, status_pipe[0], &ev) < 0) {
+    /* 注册**先于** epoll_ctl(ADD)：反过来的话，事件可以在注册完成前就被主线程
+       收到，on_client_fd 在注册表里查不到该 fd，会把它当普通 IPC 客户端读掉并
+       close —— 挂载结果丢失且 ctx 泄漏（该应用既不标注入也不重试）。 */
+    if (!register_async_mount_pipe(status_pipe[0], ctx)) {
         close(status_pipe[0]);
         free(ctx);
         kill(child, SIGKILL);
         waitpid(child, nullptr, WNOHANG);
         return -1;
     }
-    if (!register_async_mount_pipe(status_pipe[0], ctx)) {
-        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, status_pipe[0], nullptr);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.fd = status_pipe[0]};
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, status_pipe[0], &ev) < 0) {
+        unregister_async_mount_pipe(status_pipe[0]); /* 撤销注册：别留下已关闭 fd/已释放 ctx */
         close(status_pipe[0]);
         free(ctx);
         kill(child, SIGKILL);
@@ -889,6 +892,27 @@ static int do_combined_mount(void* raw_args) {
             LOG_ERROR,
             "[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)",
             pkg, source, target, err, strerror(err));
+        /* 回滚：本函数前面已经卸载了 backup 与 target 下的子挂载以及 target 本身，
+           挂载再失败就把应用留在"裸"状态（连 /storage/emulated 都没有，直到进程
+           重启或重试成功）。用应用 ns 内始终存活的族根重新 bind 出原生视图——
+           与 cleanup_app_mounts 的还原同源（区别只是这里已在目标 ns 内，无需跨 ns）。
+           回滚失败则 loud 报错，交由重试队列按退避接管。 */
+        uid_t app_uid = get_app_uid(args->target_pid);
+        char fam_src[PATH_MAX];
+        if (ns_find_family_root(getpid(), app_uid, fam_src, sizeof fam_src) == 0 &&
+            mount(fam_src, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+            log_internal(LOG_WARN,
+                         "[ns_error] [%s] 合并挂载失败已回滚：%s 还原为族根视图 %s（uid=%u）", pkg,
+                         target, fam_src, (unsigned)app_uid);
+        } else {
+            log_ns_error(
+                "[ns_error] [%s] Combined mount rollback failed: target=%s 仍无挂载，应用存储不可用\n",
+                pkg, target);
+            log_internal(LOG_ERROR,
+                         "[ns_error] [%s] 合并挂载失败且回滚未成功（族根 %s 不可用或 bind 失败），"
+                         "target=%s 保持裸挂载态，交由重试队列",
+                         pkg, fam_src[0] ? fam_src : "(未找到)", target);
+        }
         return err;
     }
     if (preserve_count > 0) {
