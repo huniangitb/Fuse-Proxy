@@ -55,7 +55,7 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 |---|---|---|
 | `hidden` | `appear_missing` | 语义不变，但强制统一为 ENOENT（见下） |
 | `ro` | `read_only` | 语义不变，强制统一为 EROFS |
-| `is_virtual_ancestor` + `is_redirect_target` | `virtual_kind`（`NSP_VK_NONE/ANCESTOR/TARGET`） | 两个并列 bool 合并为单枚举，合并策略明确（ANCESTOR 优先） |
+| `is_virtual_ancestor` + `is_redirect_target` | `virtual_kind`（`NSP_VK_NONE/ANCESTOR/TARGET`） | 两个并列 bool 合并为单枚举，合并策略明确（ANCESTOR 优先）。命名沿用历史：`TARGET` 指该路径**本身是重定向的虚拟前缀**，与"重定向的真实目标"无关（见 `architecture.md` §4.6） |
 | `is_redir` | `is_redirect` | 仅改名 |
 | `user_id` / `sub_path` | —（框架自算） | 框架的 `fw_parse_path` 与模块侧剥离逻辑逐行等价，无需跨 ABI 传递；结果结构由 8336 降到约 4.2KB |
 | — | `attr_override` + `mode`/`uid`/`gid`（V4 已删，见 `src/daemon/fw_rules.h:42-47`） | 模块可覆盖权限位与属主（见 §3.3 历史记录） |

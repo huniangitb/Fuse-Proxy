@@ -270,6 +270,11 @@ bool trie_lookup(const TrieNode* root, const char* path, bool* out_hidden, bool*
     return (hidden || ro || redir_base != NULL);
 }
 
+/* 该路径是否**本身**是某条 REDIRECT 的虚拟前缀（即它会被重定向）。
+   函数名沿用历史（`trie_is_redirect_target`），与"重定向的真实目标"无关：
+   真实目标是普通路径，照常列举与访问。
+   注：树在根到该节点的下降途中只要某段不存在即返回 false（非祖先语义，
+   祖先判定见 trie_is_ancestor）。 */
 bool trie_is_redirect_target(const TrieNode* root, const char* path) {
     if (!root || !path) return false;
     const TrieNode* curr = root;
