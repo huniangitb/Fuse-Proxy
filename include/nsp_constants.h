@@ -34,6 +34,14 @@
  * （路径合成见 nsp_util.h 的 nsp_app_rule_dir/nsp_app_rule_path） */
 #define NSP_APP_RULES_DIRNAME "App-rules"
 
+/* ================= 沙盒目录名 =================
+ * `SANDBOX ON` 的数据落点：<STORAGE_BASE>/<uid>/Android/data/<pkg>/<NSP_SANDBOX_DIRNAME>
+ * （唯一合成出口 common_sandbox_path，模块经导出表调用）。
+ * 取应用**外部缓存目录**（`getExternalCacheDir()`）而非自定义子目录：沙盒数据随
+ * 应用缓存一起被正常的清理手段回收——用户「清除缓存」、系统存储清理、卸载都会
+ * 走到它，不必再引入一套只能靠 root 手工清的私有目录。 */
+#define NSP_SANDBOX_DIRNAME "cache"
+
 /* ================= 缓冲区上限 =================
  * NSP_CONFIG_LINE_MAX：配置/规则文件单行上限（docs/config.md「单行 ≤2048 字节」，
  *   超长行不参与段/键匹配）；NSP_LOG_MSG_MAX：单条日志消息上限（common.c 组帧

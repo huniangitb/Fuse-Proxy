@@ -626,15 +626,19 @@ void common_storage_root(int user_id, char* out, size_t sz) {
 int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz) {
     if (!pkg || !pkg[0] || !out || sz == 0) return -1;
     if (uid < 0) uid = 0;
+    /* 落点是应用的外部缓存目录（NSP_SANDBOX_DIRNAME，见 nsp_constants.h）：
+       随「清除缓存」/系统清理一起回收 */
     int need;
     if (g_real_root[0])
-        need = snprintf(nullptr, 0, "%s/%d/Android/data/%s/sandbox", g_real_root, uid, pkg);
+        need = snprintf(nullptr, 0, "%s/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, g_real_root, uid,
+                        pkg);
     else
-        need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/sandbox", uid, pkg);
+        need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, uid,
+                        pkg);
     if (need <= 0 || (size_t)need >= sz) return -1;
     if (g_real_root[0])
-        snprintf(out, sz, "%s/%d/Android/data/%s/sandbox", g_real_root, uid, pkg);
+        snprintf(out, sz, "%s/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, g_real_root, uid, pkg);
     else
-        snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/sandbox", uid, pkg);
+        snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, uid, pkg);
     return 0;
 }

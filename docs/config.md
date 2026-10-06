@@ -141,7 +141,7 @@ HIDE /secret   # 这不是注释，会被并入规则
 | 单行超 2048 字节 | 整行删除或缩短后重载 | 超长行整行跳过（告警），不参与匹配 |
 | 路径超 255 字符 | 缩短路径 | `MAX_PATH_LEN=256` |
 | 包名超 127 字符 | 校验包名长度 | 结构体上限 128 |
-| `SANDBOX_TARGET` / 自定义沙箱目录 | 仅用 `SANDBOX ON` | 未实现，路径固定 `/Android/data/<pkg>/sandbox` |
+| `SANDBOX_TARGET` / 自定义沙箱目录 | 仅用 `SANDBOX ON` | 未实现，路径固定为应用外部缓存目录 `/Android/data/<pkg>/cache`（可被「清除缓存」等正常手段回收） |
 | 应用段写 `MONITOR OFF` 期望继承全局 | 全局段写 `MONITOR OFF`，或应用段显式写所需值 | 应用段显式写即覆盖全局 |
 | `FUSE_EXTRA_ARGS` 写在应用段 | 仅写 `[GLOBAL]` 段 | 应用段无该字段 |
 | 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `strip_storage_prefix` 不处理 `/sdcard` |
