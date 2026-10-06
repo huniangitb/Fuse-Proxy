@@ -43,9 +43,10 @@ SUITE_MAP = [
       "fw_data_mediation_required", "fw_backing_mediation_required_for"),
      "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
 
-    (("test_ftp.py", "test_ftp_read_restart.py"),
+    (("test_ftp.py", "test_ftp_read_restart.py", "test_ftp_truncate_list.py"),
      ("src/modules/ftp/",),
-     ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read"),
+     ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read",
+      "ftp_backend_truncate", "ftp_list_cache_clear"),
      "src/modules/ftp/ 或框架后端分派"),
 
     (("test_ftp_parallel.py",),
@@ -60,9 +61,9 @@ SUITE_MAP = [
      ("inject-method",),
      "injector 目标判定 / 注入方法"),
 
-    (("test_inject_mount_env.py",),
+    (("test_inject_mount_env.py", "test_ns_combined_rollback.py"),
      ("src/injector/ns_utils.c", "src/injector/ns_global_replace.c"),
-     ("cleanup_app_mounts",),
+     ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
 
     (("test_modules.py", "test_module_circuit.py", "test_module_abi.py",
@@ -237,6 +238,8 @@ PARALLEL_SAFE = frozenset({
     "test_pending_close.py",      # cc 直编队列实现 + 驱动，TemporaryDirectory，无挂载
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
     "test_rule_file_lock.py",     # cc 直编 nsp_rule_file + 子进程并发写，/tmp 工作目录
+    "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权
+    "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
