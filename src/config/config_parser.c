@@ -1141,17 +1141,27 @@ void config_build_from_view(const NspCfgRec* recs, int count) {
         default: break;
         }
     }
-    qsort(g_global_cfg_stage.redir_rules, g_global_cfg_stage.redir_count, sizeof(RedirectRule),
-          cmp_redir);
-    qsort(g_global_cfg_stage.hide_rules, g_global_cfg_stage.hide_count, sizeof(char*), cmp_hide);
-    qsort(g_global_cfg_stage.ro_rules, g_global_cfg_stage.ro_count, sizeof(char*), cmp_hide);
-    for (int i = 0; i < g_app_cfg_count_stage; i++) {
-        qsort(g_app_cfgs_stage[i]->redir_rules, g_app_cfgs_stage[i]->redir_count,
+    /* qsort(NULL, 0, …) 是 UB：base 形参声明为 nonnull，规则为空时数组指针为
+       NULL，UBSan（-fsanitize=undefined）会在每次空配置加载时报
+       "null pointer passed as argument 1"。空表本就无需排序，按 uid_map.c
+       同一写法加 count 守卫。 */
+    if (g_global_cfg_stage.redir_count > 0)
+        qsort(g_global_cfg_stage.redir_rules, g_global_cfg_stage.redir_count,
               sizeof(RedirectRule), cmp_redir);
-        qsort(g_app_cfgs_stage[i]->hide_rules, g_app_cfgs_stage[i]->hide_count, sizeof(char*),
-              cmp_hide);
-        qsort(g_app_cfgs_stage[i]->ro_rules, g_app_cfgs_stage[i]->ro_count, sizeof(char*),
-              cmp_hide);
+    if (g_global_cfg_stage.hide_count > 0)
+        qsort(g_global_cfg_stage.hide_rules, g_global_cfg_stage.hide_count, sizeof(char*), cmp_hide);
+    if (g_global_cfg_stage.ro_count > 0)
+        qsort(g_global_cfg_stage.ro_rules, g_global_cfg_stage.ro_count, sizeof(char*), cmp_hide);
+    for (int i = 0; i < g_app_cfg_count_stage; i++) {
+        if (g_app_cfgs_stage[i]->redir_count > 0)
+            qsort(g_app_cfgs_stage[i]->redir_rules, g_app_cfgs_stage[i]->redir_count,
+                  sizeof(RedirectRule), cmp_redir);
+        if (g_app_cfgs_stage[i]->hide_count > 0)
+            qsort(g_app_cfgs_stage[i]->hide_rules, g_app_cfgs_stage[i]->hide_count, sizeof(char*),
+                  cmp_hide);
+        if (g_app_cfgs_stage[i]->ro_count > 0)
+            qsort(g_app_cfgs_stage[i]->ro_rules, g_app_cfgs_stage[i]->ro_count, sizeof(char*),
+                  cmp_hide);
     }
     analyze_var_staticness(&g_global_cfg_stage, NULL);
     for (int i = 0; i < g_app_cfg_count_stage; i++) {
