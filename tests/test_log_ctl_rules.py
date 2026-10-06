@@ -151,6 +151,35 @@ def test_app_scope():
     c.close()
 
 
+def test_app_disabled_scope():
+    """停用态（仅 <pkg>.conf.disabled）下的编辑：必须继续落在 .disabled 上，
+    且**不得**新建 .conf——解析语义是「存在 .conf 即启用该应用注入」，新建 =
+    静默把注入重新打开（旧实现直接拼 base .conf 就会这样）。"""
+    print("── 停用态应用段：编辑仍落 .disabled ──")
+    c = Cfg("[GLOBAL]\n")
+    sub = os.path.join(c.dir, "App-rules")
+    os.makedirs(sub, exist_ok=True)
+    dis = os.path.join(sub, "com.test.app.conf.disabled")
+    with open(dis, "w", encoding="utf-8") as fh:
+        fh.write("HIDE /disabled-rule\n")
+
+    rc, _ = c.run("set-rule", "com.test.app", "HIDE", "/added-while-disabled")
+    check("set-rule 返回 0", rc, 0)
+    check("未新建 .conf", os.path.exists(os.path.join(sub, "com.test.app.conf")), False)
+    with open(dis, encoding="utf-8") as fh:
+        dis_text = fh.read()
+    check("写入落到 .disabled", "/added-while-disabled" in dis_text, True)
+    check("原有停用规则仍在", "/disabled-rule" in dis_text, True)
+
+    rc, _ = c.run("remove-rule", "com.test.app", "HIDE", "0")
+    check("remove-rule 能命中 .disabled", rc, 0)
+    with open(dis, encoding="utf-8") as fh:
+        dis_text2 = fh.read()
+    check("删除生效", "/disabled-rule" in dis_text2, False)
+    check("删除后仍未新建 .conf", os.path.exists(os.path.join(sub, "com.test.app.conf")), False)
+    c.close()
+
+
 def test_category_scope():
     print("── 类别段落主文件精确段头 ──")
     c = Cfg("[GLOBAL]\n")
@@ -251,6 +280,7 @@ def main():
     test_global_rule_insert_and_dedupe()
     test_redirect_forms()
     test_app_scope()
+    test_app_disabled_scope()
     test_category_scope()
     test_category_header_variants()
     test_unknown_type()

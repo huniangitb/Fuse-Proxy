@@ -578,7 +578,9 @@ static void handle_set_rule(bool api_mode, const char* pkg, const char* type, co
     if (is_global || is_cat) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
-        nsp_app_rule_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
+        /* 走共享解析：应用处于停用态（仅有 .conf.disabled）时继续编辑那个文件，
+           否则会新建 .conf 把注入静默重新打开（见 nsp_rule_file_app_active_path） */
+        nsp_rule_file_app_active_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
     }
 
     char line[1024];
@@ -685,7 +687,8 @@ static void handle_remove_rule(bool api_mode, const char* pkg, const char* type,
     if (strcmp(pkg, "GLOBAL") == 0 || nsp_rule_file_is_category_pkg(pkg)) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
     } else {
-        nsp_app_rule_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
+        /* 同 set-rule：停用态继续操作 .disabled，保证删除也能命中 */
+        nsp_rule_file_app_active_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
     }
     /* 索引计入已停用行（与 rule_server / LIST 输出一致） */
     int rc = nsp_rule_file_remove_nth(rule_path, type, index, NULL, 0);
