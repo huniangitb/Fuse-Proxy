@@ -94,6 +94,28 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 4. 隔离证据：L2 套件宿主 `mountinfo` 前后零变化；挂载未消失前禁删 fixture。
 5. L2 通过 ≠ Android 运行时已验证——SELinux/Bionic/vold/Zygisk/多用户须 L3–L4 覆盖。
 
+### 隔离跑全量（宿主零污染）
+
+`scripts/test-isolated.sh [套件名…]`（不传套件名即 `--all`）。在
+`unshare --user --map-root-user --map-auto --mount --pid --fork --mount-proc --net`
+里跑，并把 **/tmp、/var、/home/bdy/ftp 全部私有化**，沙箱内自起一份 vsftpd。
+退出前对宿主三项不变量做前后比对：**mountinfo / `/var/fuse-proxy` / FTP 树**；
+任一变化即报错并保留现场（`$STAGE/diff.txt`）。退出码：0 全绿且零污染、1 有污染、
+2 测试失败、3 两者皆有。
+
+实测：**30 套全绿且宿主零变化**，跑完自动清理（含属主归还）。四个坑都已写进脚本注释，
+改动前务必先读：
+- 客户端必须 uid 1000 **且带 ambient CAP_SYS_ADMIN**：RO 用例要求非 root
+  （`vfs_check_read_only` 对 `uid==0` 有框架级豁免），但降权后 setuid 的 `fusermount3`
+  在本 userns 内提不了权（EPERM），故须显式给 cap；它不影响 RO 判定（那条只看 uid）。
+- 私有 `/var` 后 vsftpd 会因缺 `secure_chroot_dir` 而「端口在听、连上即挂」
+  （守护化后错误只进 syslog，stderr 恒空，极易误判成网络问题）→ 显式指定到 stage 下。
+- FTP 树**不能整树复制**（`/home/bdy/ftp` 有 4.7G）→ 用最小合成树
+  （根 0755 不可写、`upload/` 与 `upload2/` 0777），测试自建全部数据。
+- 内层 uid 1000 经 `--map-auto` 落到 subuid，与 ns-root 属主错配 → FTP 树与
+  `build_gnu/` 需 `chown` 给客户端，收尾再 `chown -R 0:0` 归还，否则仓库里会留下
+  宿主无法覆盖的 subuid 属主 .so。
+
 ## 设备操作（生产级隔离，血的教训）
 
 真机视为生产：一切设备命令经 `scripts/adb-sh.sh` 执行（会话强制 PATH 垫片 + source `adb-safe.sh` + `set -u` + 变更/生产路径文本预检），禁止裸 `adb shell` 做变更。隔离主体是 Linux 原生机制（内核强制，非约定）：测试 I/O 一律 `su shell` 降级执行——实测 uid=gid=groups=2000（1078 等危险组已脱）、CapEff=0，`assert_downgraded()` 每次先验，root 只建/卸挂载（/dev/fuse 0600，只能 root 开）且 `need_root()` 留痕；backing 只用 `SAFE_ROOT` 合成 fixture（生产 backing 永不进测试挂载，需真实下层行为时 cp -a 快照到沙盒）。纵深为 shell 层：设备侧脚本 source harness 即自动影子危险命令（rm/umount/mv/cp/dd/tee/chcon/chmod/chown/restorecon/setenforce/kill），绕过须 `command`/绝对路径（评审可见）；umount 循环卸直到消失、失败即 die 且错误禁止重定向吞掉；`set -u` 常开。SELinux 现状：测试树自动落 `shell_data_file`，root 段尚无专用受限域（ksu 域基本不受限，需 policy 新域——列为二期，不在这次范围内）。
