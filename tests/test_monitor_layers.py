@@ -68,21 +68,33 @@ CONFIG_DIR_PAT = re.compile(
 # (配置, 原始路径, 期望 real 中的片段, 期望不在 real 中的片段) —— 沙盒/ALLOW 契约
 RESOLVE_CASES = [
     # 应用显式 SANDBOX ON：共享目录也进沙盒（用户反馈的"Download/Pictures 该隔离"）
-    ("sandbox.conf", 10123, "/0/Download/q.txt", "Android/data/com.demo.app/cache/Download/q.txt", None),
-    ("sandbox.conf", 10123, "/0/Pictures/p.jpg", "Android/data/com.demo.app/cache/Pictures/p.jpg", None),
-    ("sandbox.conf", 10123, "/0/Documents/d.docx", "Android/data/com.demo.app/cache/Documents/d.docx", None),
+    ("sandbox.conf", 10123, "/0/Download/q.txt", "/0/Android/data/com.demo.app/sandbox/Download/q.txt", None),
+    ("sandbox.conf", 10123, "/0/Pictures/p.jpg", "/0/Android/data/com.demo.app/sandbox/Pictures/p.jpg", None),
+    ("sandbox.conf", 10123, "/0/Documents/d.docx", "/0/Android/data/com.demo.app/sandbox/Documents/d.docx", None),
     # 自己的 data/obb 不重定向（沙盒是隔离"别的应用的数据"，不是自己的）
     ("sandbox.conf", 10123, "/0/Android/data/com.demo.app/own.txt", "/0/Android/data/com.demo.app/own.txt", None),
     # /Android 下非 data/obb（如 media）不重定向
     ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin", "/0/Android/media/com.other.app/m.bin", None),
     # 别的应用的 data 进自己的沙盒
-    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", "cache/Android/data/com.other.app/f", None),
+    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", "com.demo.app/sandbox/Android/data/com.other.app/f", None),
     # ALLOW 豁免：显式放行 → 落回真实路径，不进沙盒
-    ("sandbox.conf", 10500, "/0/Download/keep/k.txt", "/0/Download/keep/k.txt", "/cache/"),
+    ("sandbox.conf", 10500, "/0/Download/keep/k.txt", "/0/Download/keep/k.txt", "/sandbox/"),
     # 该应用其它共享目录仍进沙盒
-    ("sandbox.conf", 10500, "/0/Download/q.txt", "Android/data/com.plain.app/cache/Download/q.txt", None),
+    ("sandbox.conf", 10500, "/0/Download/q.txt", "/0/Android/data/com.plain.app/sandbox/Download/q.txt", None),
     # 全局 SANDBOX OFF + 应用未显式开：不重定向（cat_off.conf 里 [GLOBAL] 只有 MONITOR）
     ("cat_off.conf", 10123, "/0/Download/q.txt", "/0/Download/q.txt", None),
+    # SANDBOX_DIR 覆盖目录名：[GLOBAL] 段 vault 生效（应用段写 SANDBOX_DIR 被忽略）
+    ("sandbox_dir.conf", 10123, "/0/Download/q.txt", "/0/Android/data/com.demo.app/vault/Download/q.txt", None),
+    # SANDBOX_DIR 不影响未开沙盒的路径（SANDBOX OFF → 落回真实路径）
+    ("sandbox_dir.conf", 10123, "/0/Android/data/com.demo.app/own.txt",
+     "/0/Android/data/com.demo.app/own.txt", None),
+    # SANDBOX_DIR cache：落点为应用外部缓存目录（随「清除缓存」回收）
+    ("sandbox_cache.conf", 10123, "/0/Download/q.txt",
+     "/0/Android/data/com.demo.app/cache/Download/q.txt", None),
+    ("sandbox_cache.conf", 10123, "/0/Android/data/com.demo.app/own.txt",
+     "/0/Android/data/com.demo.app/own.txt", None),
+    # 无 SANDBOX_DIR 的配置仍用默认目录名（与 sandbox.conf 交叉确认）
+    ("sandbox.conf", 10123, "/0/Download/q.txt", "/0/Android/data/com.demo.app/sandbox/Download/q.txt", None),
 ]
 
 

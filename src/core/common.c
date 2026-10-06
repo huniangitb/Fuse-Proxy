@@ -275,8 +275,10 @@ static void sync_attributes(const char* source_parent, const char* target_path) 
     if (ctx_len > 0) {
         lsetxattr(target_path, "security.selinux", context, (size_t)ctx_len, 0);
     } else if (strstr(target_path, STORAGE_BASE) == target_path) {
-        const char* default_ctx = "u:object_r:media_rw_data_file:s0";
-        lsetxattr(target_path, "security.selinux", default_ctx, strlen(default_ctx) + 1, 0);
+        /* 长度用 sizeof（含 NUL）：与 fuse_daemon 侧回填同一常量、同一算法，
+           消除「手写字节数」这一类越界读来源 */
+        lsetxattr(target_path, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
+                  sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
     }
 #endif
 }
@@ -623,22 +625,31 @@ void common_storage_root(int user_id, char* out, size_t sz) {
         PATH_SNPRINTF(out, sz, STORAGE_BASE "/%d", user_id);
 }
 
+/* 沙盒目录名：默认 NSP_SANDBOX_DIRNAME，配置发布时经 common_set_sandbox_dirname
+   单点覆盖（[GLOBAL] 段 SANDBOX_DIR，热重载生效）；common_sandbox_path 唯一消费 */
+static char g_sandbox_dirname[64] = NSP_SANDBOX_DIRNAME;
+
+void common_set_sandbox_dirname(const char* name) {
+    if (!name || !name[0] || strlen(name) >= sizeof(g_sandbox_dirname) || strchr(name, '/'))
+        return; /* 非法回退：保持现值（解析层已挡，此处兜底） */
+    strcpy(g_sandbox_dirname, name);
+}
+
 int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz) {
     if (!pkg || !pkg[0] || !out || sz == 0) return -1;
     if (uid < 0) uid = 0;
-    /* 落点是应用的外部缓存目录（NSP_SANDBOX_DIRNAME，见 nsp_constants.h）：
-       随「清除缓存」/系统清理一起回收 */
+    /* 落点是应用外部数据目录 <STORAGE_BASE>/<uid>/Android/data/<pkg>/<沙盒目录名>
+       （默认 "sandbox"，配置可覆盖） */
+    const char* dirname = g_sandbox_dirname;
     int need;
     if (g_real_root[0])
-        need = snprintf(nullptr, 0, "%s/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, g_real_root, uid,
-                        pkg);
+        need = snprintf(nullptr, 0, "%s/%d/Android/data/%s/%s", g_real_root, uid, pkg, dirname);
     else
-        need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, uid,
-                        pkg);
+        need = snprintf(nullptr, 0, STORAGE_BASE "/%d/Android/data/%s/%s", uid, pkg, dirname);
     if (need <= 0 || (size_t)need >= sz) return -1;
     if (g_real_root[0])
-        snprintf(out, sz, "%s/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, g_real_root, uid, pkg);
+        snprintf(out, sz, "%s/%d/Android/data/%s/%s", g_real_root, uid, pkg, dirname);
     else
-        snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/" NSP_SANDBOX_DIRNAME, uid, pkg);
+        snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/%s", uid, pkg, dirname);
     return 0;
 }

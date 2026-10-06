@@ -56,6 +56,9 @@ typedef struct {
     int    var_count;
     int    var_capacity;
     char fuse_extra_args[512];
+    /* [GLOBAL] 段 SANDBOX_DIR：沙盒目录名（覆盖 NSP_SANDBOX_DIRNAME 默认
+       "sandbox"）；仅 [GLOBAL] 段有效，空串 = 用默认 */
+    char sandbox_dir[64];
 } AppConfig;
 
 typedef struct {

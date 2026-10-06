@@ -13,7 +13,7 @@ Fuse-Proxy 运行在 **Android 13+（API 33~35）**，作为 root 模块的二�
 
 ## 2. 进程架构
 
-6 个可执行文件各自为独立进程，经 Unix Domain Socket 协作：
+5 个可执行文件各自为独立进程，经 Unix Domain Socket 协作（另有仅 GNU、不安装的测试驱动 `global_replace_ctl`，不参与运行时协作）：
 
 ```mermaid
 flowchart TB
@@ -32,7 +32,7 @@ flowchart TB
     end
 
     subgraph fd["fuse_daemon — FUSE 框架"]
-        vfs["vfs 回调 + 模块调度<br/>约 27 个 FUSE 回调"]
+        vfs["vfs 回调 + 模块调度<br/>28 个 FUSE 回调（Android 29，含 bpf_setup）"]
         br["fw_rules / fw_pkg / fw_config<br/>规则决策·包名·配置（内建）"]
         ftp["ftp_module.so<br/>FTP 后端（dlopen，内存副本加载）"]
     end
@@ -69,11 +69,12 @@ flowchart TB
 
 ### 2.2 fuse_daemon — FUSE 守护
 
-由 injector 以 `<mnt> --root=< STORAGE_BASE> --rules=<injector.conf> --ready-fd=<fd> [-f -o ...]` 启动（`--mode`/`--global-root-fd` 已删：前者从未被读取，后者在 daemon 侧从未使用；`--root` 必须显式传递，`vfs_bpf_setup` 直接拼接它；日志级别默认 INFO，不占参数位），实现约 27 个 `fuse_operations` 回调。框架**自带规则能力**（V4 起规则引擎内建，模块只剩后端）：
+由 injector 以 `<mnt> --root=< STORAGE_BASE> --rules=<injector.conf> --ready-fd=<fd> [-f -o ...]` 启动（`--mode`/`--global-root-fd` 已删：前者从未被读取，后者在 daemon 侧从未使用；`--root` 必须显式传递，`vfs_bpf_setup` 直接拼接它；日志级别默认 INFO，不占参数位），实现 **28 个** `fuse_operations` 回调（`vfs_ops` 初始化器的赋值成员数；Android 下另有 `.bpf_setup`，共 29 个）。
+框架**自带规则能力**（V4 起规则引擎内建，模块只剩后端）：
 
 - **规则决策**（`fw_rules.c`）：本进程内解析 REDIRECT/SANDBOX/HIDE/ALLOW/RO 与 FTP 前缀归属，输出声明式 `NspPathDecision`（见 `src/daemon/fw_rules.h`）；无 `<uid>/` 用户层的路径（挂载点根）不参与规则，直通处理。
 - **后端分派**：决策命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。后端模块**从内存副本加载**（memfd），磁盘文件被原子替换或就地覆盖都不会破坏运行中的映像。
-- **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。模块侧 `br_get_app_cfg` 仍保留同一套解析（它需要 pkg 做 `$package` 变量展开与沙箱隔离），两侧算法同源、结果一致。
+- **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。规则引擎内部另有一份同源解析（`fw_rules.c` 的 static `br_get_app_cfg`，它需要 pkg 做 `$package` 变量展开与沙箱隔离）：两者同在框架进程内、算法同源、结果一致。
 
 模块架构详见 `modules.md`。
 
@@ -82,9 +83,10 @@ flowchart TB
 - **log_monitor**：常驻收集服务，经 AF_UNIX `SOCK_STREAM`（抽象地址 `nsp_log_socket`）接收各进程 `log_internal`，并提供 `search`/`stream`/`clear`/`count` 查询。io/sys 自动落盘 `LOG_DIR/io.log`、`sys.log`（`push_log` 单漏斗暂存 64KB，stage 满 / 500ms tick 脏超 1s / 退出时刷盘；单文件超 2MB 轮转 `.1` 单备份，logcat 不落盘）。**落盘/查询/流式三处的行格式统一为 `时间|LEVEL|msg`**，`LEVEL` 是 `DEBUG`/`INFO`/`WARN`/`ERROR` **名称**（词法唯一出处 `nsp_log_level_name`/`nsp_log_level_parse`，见 `nsp_log.h`）——排查时可直接 `grep '|ERROR|'`，不必记 `|0|..|3|` 的映射；2026-09 之前的旧文件是纯数字等级，`nsp_log_level_parse` 仍接受，**未知等级字段判为无效行跳过**（不得退化成 `atoi`，否则 `INFO` 会被静默当成 0=DEBUG）。进程间**线协议不变**（`LOG_SYS:<数字>:`），故新旧二进制混跑仍可互通，改的只是渲染。**刷盘任何失败路径都不清空 stage**——暂存区是该批日志的唯一副本，退避期只跳过 `open` 重试，真正写出的数据才移除；stage 耗尽时按行拒收并计入 `dropped`。启动时把 `io.log.1` + `io.log` 载入只读快照，按**紧凑存储**（`DiskEntry` 的 `t`/`level` + 指向字符串池的指针，按实际行长排布）全量容纳，`DISK_READ_MAX`(8MB) 是防异常大文件的硬上界，查询按"磁盘在前、内存在后"拼接——故 `count`/`search` 不受条数截断。
 - **丢弃可观测**：接收环（`entries`）满、合并队列（`batch_q`）满、落盘拒收这三处是仅有的静默吃日志点，各自累加原子计数，由 500ms tick 驱动的 `report_drops_once()` **限频（10s 至多一条）**写入 sys 缓冲，`search-sys` / `sys.log` 可查，稳态计数不变则零噪音。异步接收线程结束时置 `_Atomic disconnected`（release），回收方（epoll 通知路径与超时 tick 路径）**先 `drain_async` 抢救环内残留再 `free`**，否则线程末尾入环、notify 与置位错峰的日志会随回收永久丢失。
 - **监控开关单点（`fw_route` + `fw_config_monitor_for`）**：`monitor_on` 是**配置开关而非路径决策**，不能绑在 `nsp_ok`（模块是否给出有效决策）上，也**不由决策结构承载**（V4 起 `NspPathDecision` 已无该字段，`fw_route` 经出参单独给出）。值由 `fw_config_monitor_for(uid, tid)` 给出：按 uid→包名做**三层合并**（应用段显式 > 类别段显式 `[USER_APPS[:uid]]`/`[SYSTEM_APPS]` > `[GLOBAL]`），与模块侧同一套作用域语义（模块内部仍算同一份值，只是不再跨 ABI 回传），结果按 uid 缓存（重载时随代际失效，热路径只读一次原子快照）。**框架为此自建一份 AppConfig 索引**（`config_build_from_view`，与模块同一实现），因此模块未加载/被 ban、路径无 `<uid>/` 用户层、模块未命中规则时开关照样正确——这正是历史缺陷「文件读写一切正常、IO 监控日志静默归零」的根因所在。开关词法唯一出处为 `nsp_switch_on()`（`ON`/`1` 为开），模块侧 `parse_switch_rule` 与框架侧合并共用。
-- **ABI V4 的删除项**：`NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg` 已从 ABI 移除（`NSP_MODULE_ABI_VERSION=4`，旧模块须重编译）。三者在"模块缺席"这一关键场景下本就无从提供，而框架与模块读同一份配置，故不存在语义分叉——模块侧 `br_rules.c` 仍保留自己的包名解析（用于 `$package` 展开与沙箱隔离）与三层合并计算（内部用），只是不再跨 ABI 回传。
+- **ABI V4 的删除项**：`NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg` 已从 ABI 移除（该次变更把 `NSP_MODULE_ABI_VERSION` 升到 4；**当前值以 `include/nsp_module.h` 为唯一出处**——已到 5，见 `docs/modules.md` §6.5；旧模块须按新头重编译）。三者在"模块缺席"这一关键场景下本就无从提供，而框架与模块读同一份配置，故不存在语义分叉——包名解析（`$package` 展开与沙箱隔离用）与三层合并计算此前在模块侧的 `br_rules.c` 内，V4 把该文件原样搬入框架成为 `src/daemon/fw_rules.c`（模块侧已无副本），只是不再跨 ABI 回传。
 - **丢弃与容量的两项评估结论（勿反复重议）**：① 生产者侧 LOG 环维持 `nsp_comm.c` 的 `kCap=2048` **不扩**——满环覆盖旧数据已由 `nsp_log_report` 限频 5s 上报（"comm: LOG 通道拥塞，覆盖旧数据 N 条"），症结是可观测性而非容量，扩容只抬高内存上界（单槽上限 16KB，理论 32MB→128MB）；② **不恢复** `persist_io_log` 的"无条件落盘"——它写的是独立文件 `persistent_io.log`（非 log_monitor 的 `io.log`）、仅 `NSP_ENABLE_IO_LOG`（debug）编译、且当前无任何查询出口，落了盘也无人可读；真要做兜底须连查询路径一起补，否则只是多一份磁盘 I/O（详见 `common.c` 注释）。
 - **log_ctl**：CLI 客户端——查询日志、流式输出、规则编辑（`set-rule`/`remove-rule`/`validate-rules`）、拉取配置广播（`get-config`/`stream-config`）。规则编辑与 `rule_server` 共用 `nsp_rule_file` 行级实现（原子 tmp+rename 落盘）；`--config-dir` 可覆盖配置根（与 `rule_server` 同名选项一致），使其可在临时目录下测试。
+- **控制面对端鉴权（B2）**：`rule_server` 与 injector 的 UDS 控制面在 dispatch 前取 `SO_PEERCRED`（`nsp_peer_cred`）核对调用者身份——仅靠 SELinux 域兜底不足（模块骨架的 sepolicy 已允许 `untrusted_app_all` 连 root 的 stream socket，任何本地进程都能发控制命令）。`rule_server` 的**高危命令**（STOP/QUIT/EXPORT_LOGS：停服、把全机访问日志导出到落点）仅 root 或 `NSP_TRUSTED_UIDS`（逗号分隔 uid，启动时读一次；生产由模块的 service.sh 设为管理器 App 的 uid，**未设置时只有 root**）可执行，其余查询/规则编辑命令保持开放；injector IPC 要求对端 uid 为 root 或**与自报 uid 相等**（合法发送方只有 zygisk companion(root) 与目标应用自身），否则拒绝——避免任意进程污染 uid→包名映射而使 HIDE/RO 整体失配。
 - **LOG_BATCH 协议**：应用还原等"一条日志对应整个挂载周期"的场景，周期内中间日志由 `log_batch_begin/end` 在 `log_internal` 层累积，`log_batch_end` 合并为**单条**（`LOG_KIND_MERGED`）发送。合并日志为单行 `[injector] <条目1>\t<条目2>...`（制表符连接，避免前端按行拆分导致 UTF-8 截断），级别固定 `LOG_DEBUG`。
 
 ## 3. 源码布局
@@ -109,8 +111,11 @@ src/
 │   └── path_vars.c       # 路径变量展开、真实目标分类
 ├── daemon/
 │   ├── fuse_daemon.c     # FUSE 回调 + main（框架，含后端分派）
+│   ├── fw_rules.c        # 内建规则引擎（REDIRECT/SANDBOX/HIDE/ALLOW/RO + FTP 归属 → NspPathDecision）
 │   ├── fw_config.c       # 配置持有者（读取/热重载/下发 + 框架自建索引与 MONITOR 三层合并）
 │   ├── fw_pkg.c          # uid→包名解析（框架权威：uid.map → /proc 回退 + 缓存）
+│   ├── fd_close_queue.c  # 延迟 close 环形队列（Android backing fd 回收，fdq_*）
+│   ├── cfg_watch.c       # 配置目录 watch 对账（App-rules 子目录热更新，cfg_*）
 │   └── fuse_thread_naming.c  # 线程语义命名（pthread_create 截持）
 ├── module/               # 模块框架
 │   ├── loader.c          # dlopen 加载/卸载、能力登记、分派、inotify 热插拔
@@ -118,10 +123,13 @@ src/
 │   └── module_guard.c    # 输出校验 + 熔断器
 ├── modules/              # 热插拔模块（.so）——V4 起只有后端形态
 │   └── ftp/              # FTP 存储后端（纯方法模块，无 FUSE 实现）
+│       ├── ftp_module.c  #   模块 ABI 入口（NspModuleInfo / init / ops）
+│       ├── ftp_conf.c    #   ftp.conf 解析（server 段、port 校验、# 注释边界）
 │       ├── ftp_mux.c     #   控制面 epoll + curl_multi 复用器（连接复用/并发）
 │       └── ftp_backend_libcurl.c  #   路径映射 + 读写（数据面每文件独立句柄）
-├── injector/             # 注入器（injector/inject_target/mount_manager/
-│   │                     #   ns_utils/ns_global_replace/ipc_server/config_publisher）
+├── injector/             # 注入器（injector/inject_target/mount_manager/ns_utils/
+│   │                     #   ns_global_replace/ns_mountinfo/ipc_server/
+│   │                     #   config_publisher/reaped_managed）
 │   └── global_replace_ctl.c  # 全局替换挂载测试驱动（仅 GNU）
 ├── zygisk/               # Zygisk 应用创建通知模块（仅 Android，双 ABI）
 │   ├── zygisk.hpp        # Zygisk ABI 头（ISC，取自 Magisk，原样收录）
@@ -147,7 +155,7 @@ src/
 
 ```
 FUSE 回调（如 getattr）
-  └─ VFS_SETUP_CORE 宏：经 module_dispatch_resolve 一次调用取回全部决策
+  └─ VFS_SETUP_CORE 宏：经 fw_rules_resolve 一次调用取回全部决策
        ① br_get_app_cfg(uid) ──────────── uid→AppConfig（2048 槽 seqlock 无锁读缓存，O(1)）
        ② br_sanitize_and_check_hidden ─── 路径消毒 + Trie 一次性解析（填 TrieMatch）+ 隐藏判定
        ③ br_to_real_path ──────────────── 复用 TrieMatch 的 redirect 结果 → 真实路径
@@ -163,7 +171,7 @@ FUSE 回调（如 getattr）
 1. **应用段**：先静态（Trie 命中，`TrieMatch.redir`/`redir_scope`），再线性（含通配/变量的 `redir_rules`）。
 2. **类别段**（`USER_APPS[:uid]` / `SYSTEM_APPS`）：同上。
 3. **`[GLOBAL]`**：同上。
-4. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到**应用自己的外部缓存目录** `/Android/data/<pkg>/cache`（`NSP_SANDBOX_DIRNAME`，即 `getExternalCacheDir()`；选缓存目录是为了让沙盒数据能被用户「清除缓存」/系统清理/卸载等正常手段回收，三层 OFF 否决语义见 §4.2）。
+4. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox/`（目录名默认 `sandbox`，可经 `[GLOBAL]` 段 `SANDBOX_DIR` 配置项覆盖，配置发布单点下发；三层 OFF 否决语义见 `config.md` §2/§3）。
 5. **fallback**：`STORAGE_BASE/<user_id><sub_path>`。
 
 > Trie 与线性通道是**同一作用域内的等价实现**——Trie 只是静态规则的加速索引，不是更高的优先级层：同层内静态命中先于该层线性规则，但**跨作用域不得互相压过**。旧实现先取「任一作用域的静态命中」再才看线性，于是 `[GLOBAL]` 的静态 REDIRECT 会压过应用/类别段的通配/变量规则（与 `config.md` §2 相反，`test_rules.py` §21 守护）。
@@ -178,8 +186,8 @@ FUSE 回调（如 getattr）
 模块只声明「路径该怎么表现」（`NspPathDecision`），**errno 映射与权限策略不由模块决定**，集中在框架：
 
 - `fw_route()`（`fuse_daemon.c`）是所有回调的唯一入口，按操作类别 `VFS_OP_READ` / `VFS_OP_MUTATE` 强制：`appear_missing` → `ENOENT`（**所有**回调统一，写类不再是 `EACCES`）、`read_only` → `EROFS`（root 豁免由框架持有）。`open`/`access` 是否算「写」取决于 `flags`/`mask`（`O_RDONLY` 打开只读路径必须放行），触发条件留在回调内，但判定统一走 `vfs_check_read_only()`。
-- `vfs_apply_attr_override()` 在框架既有属性来源**之后**落实 `attr_override`（`NSP_OV_MODE/UID/GID` 位图），故模块的显式声明优先于框架默认（底层真实属性、虚拟目录继承上级目录、FTP 条目继承用户存储根）；`mode` 只取 `07777`，类型位始终取自真实属性。
-- **属性一律原样上报底层真实值**：早期的「默认伪造模式」（属主改写为访问者、重定向目录强制 0777、skel 目录强制 0755）连同 `--preserve-perms` 开关已删除。理由：挂载只带 `allow_other` 而无 `default_permissions`，内核对 `open/read/write` 本就不做 DAC 判定（仅 `access(2)` 下发 `FUSE_ACCESS`，且由 root 守护进程执行的 `access()` 必然通过），模块也不具备 POSIX DAC——伪造属主拦不住任何访问，只会误导读取方。`readdir` 的 filler 只消费 `st_ino` 与类型位（`fuse_add_direntry` 不读 uid/gid），故条目侧的属主赋值同样是死代码。
+- **属性一律原样上报底层真实值**：`NspPathDecision` 只携带 `valid` / `appear_missing` / `read_only` / `virtual_kind` 与最终真实路径，**不含**任何属主/权限覆盖字段。V3 时代曾有的 `attr_override`（`NSP_OV_MODE/UID/GID` 位图）与框架侧落实它的 `vfs_apply_attr_override()` 已随 V4 连同 ABI 一起删除——规则语法从未支持该能力、引擎恒不置位，属「无生产者」的预留实现，违反 YAGNI。删除理由：挂载只带 `allow_other` 而无 `default_permissions`，内核对 `open/read/write` 本就不做 DAC 判定（仅 `access(2)` 下发 `FUSE_ACCESS`，且由 root 守护进程执行的 `access()` 必然通过），模块也不具备 POSIX DAC——伪造属主拦不住任何访问，只会误导读取方。`readdir` 的 filler 只消费 `st_ino` 与类型位（`fuse_add_direntry` 不读 uid/gid），故条目侧的属主赋值同样是死代码。（历史注记见 `fw_rules.h` 的 `NspPathDecision` 头注释。）
+- **早年的「默认伪造模式」（属主改写为访问者、重定向目录强制 0777、skel 目录强制 0755）连同 `--preserve-perms` 开关同样已删除**，与上一条同一理由。
 
 > 位图而非「特殊值哨兵」：若用 `mode == UNSET` 表示不改，模块惯用的 `memset(out,0,...)` 会静默变成「权限清 0 + 属主 root」。位图让零初始化等于「什么都不改」。
 
@@ -263,6 +271,7 @@ entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导
 | `nsp_ipc_socket` | 抽象 | injector 控制/查询（如 `list-injected`、`LIST_MODULES`） |
 | `nsp_config_broadcast` | DGRAM 抽象 | 配置广播（GET/STATIC/SUBSCRIBE） |
 | `nsp_log_socket` | SOCK_STREAM 抽象 | 各进程 `log_internal` → log_monitor；log_ctl 查询同走此路 |
+| `nsp_rule_socket` | SOCK_STREAM 抽象 | rule_server 的 JSON 行协议控制面（规则增删改查、SERVICE、EXPORT_LOGS；高危命令经 `SO_PEERCRED` 鉴权，见 §2.3） |
 
 ## 6. 全局状态与并发
 
@@ -281,13 +290,13 @@ FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_prob
 
 - **公共工具归属**：①纯 libc、无全局依赖 → `src/core/nsp_util.c`（UDS 地址填充、`nsp_send_all`、`nsp_str_trim`、`nsp_mkdir_p`、`nsp_daemonize`、`nsp_escape_cgroup`），各二进制与**树内** dlopen 模块均可链接，**禁止私刻副本**；②依赖项目全局（`g_real_root`、日志、SELinux）→ `src/core/common.c`（模块侧经 `nsp_module.h` 导出表解析）。注意：`nsp_util` 是树内共享实现，**不是模块 SDK 的公开 ABI**——第三方模块要保留 ABI 链接例外，只能依赖 `nsp_module.h`（及其代含的公开头），不得 include `nsp_util.h` 或编入项目源码。
 - **存储路径合成唯一出口**：禁止裸拼 `STORAGE_BASE "/%d…"`——默认真实路径走 `common_default_real_path()`、用户存储根走 `common_storage_root()`、沙盒目标走 `common_sandbox_path()`。`MAX_PATH_LEN` 放不下时返回 -1，调用方**放弃重定向而非截断**（sandbox 尤其注意：`current_pkg` 可能极长）。
-- **函数命名前缀**：`br_*`（基础规则）、`config_*`、`module_*`/`nsp_guard_*`/`nsp_fence_*`（模块框架）、`ftp_*`、`trie_*`/`uid_map_*`/`fast_pid_*`、`vfs_*`/`fw_*`（FUSE 回调）、`fdq_*`（延迟 close 环形队列）、`cfg_*`（配置目录 watch）、`ns_*`（mount namespace）、`reaped_managed_*`（受管子进程收尸留档）、`nsp_*`（轻量公共库）、`common_*`（路径合成）。新增跨文件函数必须带域前缀；`inject_target.c` 的 `is_*/add_*` 裸名是已知历史包袱。
+- **函数命名前缀**：`br_*`（基础规则）、`config_*`、`module_*`/`nsp_guard_*`/`nsp_fence_*`（模块框架）、`ftp_*`、`trie_*`/`uid_map_*`/`fast_pid_*`、`vfs_*`/`fw_*`（FUSE 回调）、`fdq_*`（延迟 close 环形队列）、`cfg_*`（配置目录 watch）、`ns_*`（mount namespace）、`reaped_managed_*`（受管子进程收尸留档）、`nsp_*`（轻量公共库）、`common_*`（路径合成）；近期补充：`rule_*`（规则文件与 rule_server 编辑）、`view_*`（配置视图快照，config_parser + fw_config）、`backend_*`（模块后端分派，fuse_daemon + loader + FTP 后端）、`persist_*`（规则文件持久化）、`injector_*`（注入器查询/命令）、`log_*`（日志链路）。新增跨文件函数必须带域前缀；`inject_target.c` 的 `is_*/add_*` 裸名是已知历史包袱。
 - **头文件职责**：`mkdir_recursive_p`、`is_media_provider` 的权威声明只在 `common.h`（`config_parser.h` 不得重复）；`_locked` 后缀函数不得进公共头。`LogLevel`/`log_internal` 与日志宏的权威只在 `nsp_log.h`（`common.h` 代含），跨进程/跨模块业务常量（`NSP_CONFIG_DIR`/`NSP_STORAGE_BASE`/uid 布局/行缓冲上限）的权威只在 `nsp_constants.h`——`common.h` 的 `CONFIG_DIR`/`STORAGE_BASE`/`LOG_DIR` 与 `nsp_module.h` 的同名别名均以它为唯一出处。`crash_dump.c` 的 `backtrace/backtrace_symbols*` 是**故意**的静态实现（满足 `libfuse3.a` 对 `execinfo.h` 的链接依赖），不得改名。
 - **初始化契约**：`log_init` 内部调用 `init_timezone`；仅 `log_monitor`（自身即日志服务端，不走 `log_init`）直接调，其余进程不得手动补调。
 - **统一通讯线程**：所有发后即忘 socket 发送经 `nsp_comm_post(ch, data, len)`（`nsp_comm.h`，全进程唯一入口），调用线程永不阻塞、永不碰 socket。`LOG`/`IPC` 后端常驻 `log_init`；`BCAST` 由 injector、log_monitor 各自注册。同步 query 类（`LIST/COUNT/QUERY`）与 `log_ctl` 短命 CLI 保持阻塞原样。背压：满环覆盖最旧 + `dropped` 计数；drain 优先级 `IPC > LOG > BCAST`。
 - **fd 归属铁律**：谁拥有集合，谁 `close`。comm 线程拥有的客户端 fd，主线程只允许 `shutdown` + 投递控制消息，**禁止直接 `close`**（不断号，杜绝复用竞态）；退出时先 `nsp_comm_fini()` 再集中关闭。
 - **规则文件编辑唯一实现**：`rule_server` 与 `log_ctl` 的规则行级读写统一走 `nsp_rule_file`（`src/core/nsp_rule_file.c`，纯 libc）——段式文件（`injector.conf`）与无段文件（`App-rules/<pkg>.conf`）的开关替换、规则去重、按 `(类型, 索引)` 删除均只有一份实现，落盘一律 tmp+rename 原子写（inotify 端不会读到半截文件）。索引语义以 `rule_server` 为准：**计入 `#` 停用的行**，与 LIST 输出一致。
-- **模块 resolve 输出逐字段初始化**：`module_dispatch_resolve` 对未命中/空查询/根路径也调用 `nsp_resolve_result_init`（loader 与 `NspResolveGuard` 共用同一实现），把 `valid`/`user_id`/`real_path`/`is_ftp`/虚拟目录标志等全部字段置为确定默认值。FUSE 回调在未命中时仍会读这些标志，"只置 `valid`"曾把不存在路径合成为目录，不得回退。
+- **决策输出逐字段初始化**：`fw_rules_resolve` 对未命中/空查询/根路径也把 `NspPathDecision` 全部字段置为确定默认值（`valid`/`real_path`/`is_ftp`/`virtual_kind`/`appear_missing`/`read_only`），不是"只置 `valid` 就返回"。FUSE 回调在未命中时仍会读这些标志，只置 `valid` 曾把不存在的路径合成为目录，不得回退。（V3 之前此事由模块侧 `NspResolveResult` + loader 的初始化函数承担，规则内建后收归 `fw_rules.c` 单点。）
 - **规则匹配语义等价**：修改 Trie 或线性通道时保持二者优先级一致——**重定向按作用域优先**（应用 > 类别 > GLOBAL；同层内静态 Trie 与线性规则等价，Trie 只作加速，跨层不得互相压过）；hidden/ro 取三层**并集**。
 - **Trie matched 语义**：`trie_lookup` 返回值表示"命中至少一条真实规则（含祖先继承）"，而非"途经了无规则的中间节点"——否则 `/Android/data/<未配置包>` 会误判。
 - **数据结构独立**：内聚、零业务依赖的数据结构（如 Trie）自成模块，可独立单测。`path_trie.c` 不引用 AppConfig 或任何配置全局。
