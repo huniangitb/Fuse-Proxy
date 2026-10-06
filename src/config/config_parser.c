@@ -255,6 +255,10 @@ static void config_publish(void) {
     int old_count = g_app_cfg_count;
     /* 换入新配置 */
     g_global_cfg = g_global_cfg_stage;
+    /* 沙盒目录名单点下发：common_sandbox_path 是唯一合成出口，
+       配置发布时同步覆盖其目录名（热重载生效） */
+    common_set_sandbox_dirname(g_global_cfg.sandbox_dir[0] ? g_global_cfg.sandbox_dir
+                                                           : NSP_SANDBOX_DIRNAME);
     g_app_cfgs = g_app_cfgs_stage;
     g_app_cfg_count = g_app_cfg_count_stage;
     g_app_cfg_capacity = g_app_cfg_capacity_stage;
@@ -549,6 +553,32 @@ static void parse_fuse_extra_args_rule(AppConfig* cur, char* p_ptr, int line_num
     cur->fuse_extra_args[copy_len] = '\0';
 }
 
+/* SANDBOX_DIR <目录名>：仅 [GLOBAL] 段有效；沙盒落点目录名（不含路径分隔符），
+   空值/超长/含分隔符告警忽略（保持默认 "sandbox"） */
+static void parse_sandbox_dir_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                   const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("SANDBOX_DIR 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                file_path);
+        return;
+    }
+    char* val = get_next_token(&p_ptr);
+    if (!val || !val[0]) {
+        LOG_WRN("SANDBOX_DIR 缺少目录名（行 %d, 文件 %s），已忽略", line_num, file_path);
+        return;
+    }
+    if (strchr(val, '/')) {
+        LOG_WRN("SANDBOX_DIR 只接受单级目录名，不允许路径分隔符（行 %d, 文件 %s），已忽略",
+                line_num, file_path);
+        return;
+    }
+    if (strlen(val) >= sizeof(cur->sandbox_dir)) {
+        LOG_WRN("SANDBOX_DIR 目录名过长（行 %d, 文件 %s），已忽略", line_num, file_path);
+        return;
+    }
+    strcpy(cur->sandbox_dir, val);
+}
+
 /* HIDE <path> / RO <path> */
 static void parse_path_rule(AppConfig* cur, char* p_ptr, bool is_hide, int line_num,
                             const char* file_path) {
@@ -643,6 +673,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_global_switch_rule(cur, &cur->skip_system_apps, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
         parse_fuse_extra_args_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "SANDBOX_DIR") == 0)
+        parse_sandbox_dir_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "HIDE") == 0)
         parse_path_rule(cur, p_ptr, true, line_num, file_path);
     else if (strcmp(tok, "RO") == 0)

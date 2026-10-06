@@ -1,6 +1,8 @@
 #ifndef COMMON_H
 #define COMMON_H
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "nsp_comm.h"
 #include "nsp_constants.h"
 #include <stdio.h>
@@ -93,12 +95,14 @@ void persist_log_to_disk(const char* log_type, const char* message, bool append_
  * common_storage_root：用户存储根（STORAGE_BASE/<uid>，vfs 权限继承用）；
  *   两者保持 void 签名（模块 ABI），放不下时写空串失败闭合（调用方以 ENOENT
  *   失败，永不读写截断出的错误路径）；
- * common_sandbox_path：沙盒目标（STORAGE_BASE/<uid>/Android/data/<pkg>/<NSP_SANDBOX_DIRNAME>，
- *   即应用外部缓存目录，随「清除缓存」一并回收），
+ * common_sandbox_path：沙盒目标（STORAGE_BASE/<uid>/Android/data/<pkg>/<沙盒目录名>，
+ *   目录名默认 NSP_SANDBOX_DIRNAME "sandbox"，经 common_set_sandbox_dirname
+ *   由配置发布单点覆盖），
  *   成功返回 0，输入非法或输出放不下返回 -1（调用方自行日志并放弃重定向）。 */
 void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz);
 void common_storage_root(int user_id, char* out, size_t sz);
 int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz);
+void common_set_sandbox_dirname(const char* name);
 /* 媒体 Provider 判定（common.c 实现；inject_target.h 亦有兼容声明） */
 bool is_media_provider(const char* pkg);
 /* comm 拥塞上报（common.c 实现）：供各进程 BCAST 等后端复用为 report 钩子 */
