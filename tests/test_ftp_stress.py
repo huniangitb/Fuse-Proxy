@@ -205,9 +205,16 @@ def main():
 
     finally:
         stop_fuse(p)
-        for f in ["pat_1m.bin", "big_32m.bin", "openloop.bin", "manyfd.bin"]:
-            fp = Path(FTP_UPLOAD) / f
-            if fp.exists(): fp.unlink()
+        # 按模式清扫本套件工件。此前是 4 个硬编码文件名，漏掉 conc_*.bin（并发写）
+        # 与 small_*.txt（50 个小文件）——这两类只在 happy path 的 inline unlink 里删，
+        # 中途异常就漏在**真实** FTP 树（upload/ 同时是用户的投递目录）里累积。
+        for pat in ("pat_1m.bin", "big_32m.bin", "openloop.bin", "manyfd.bin",
+                    "conc_*.bin", "small_*.txt"):
+            for fp in Path(FTP_UPLOAD).glob(pat):
+                try:
+                    fp.unlink()
+                except OSError:
+                    pass
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 压力测试完成 | 总耗时 {time.time()-t0:.0f}s | "

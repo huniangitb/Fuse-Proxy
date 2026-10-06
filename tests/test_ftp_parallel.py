@@ -49,6 +49,10 @@ DELAY_A_MS = 10            # 阶段 A：只需可用的往返放大，不必大
 DELAY_B_MS = 30            # 阶段 B：单次 LIST ≈ 2~3 往返 ≈ 120~180ms
 DELAY_C_MS = 300           # 阶段 C：拉大在飞窗口，保证重载时确有在途任务
 PREFIX = f"nsp_par_{os.getpid()}_"
+# 清扫用宽前缀：本套件全部工件都以 nsp_par_ 开头，按 pid 限定只能清掉自己那份，
+# 上一次异常退出（或修好前的历史运行）留下的 nsp_par_<旧 pid>_* 会永久堆积。
+# 挂载类套件恒串行（run.py 的 PARALLEL_SAFE 不含本套件），故不存在并发实例误删。
+CLEAN_PREFIX = "nsp_par_"
 
 PASS = 0
 FAIL = 0
@@ -275,10 +279,11 @@ def make_files(names, size=100):
         os.chmod(p, 0o666)
 
 
-def rm_files(names):
+def rm_files(names, base=None):
+    base = Path(base) if base else Path(FTP_UPLOAD)
     for n in names:
         try:
-            (Path(FTP_UPLOAD) / n).unlink()
+            (base / n).unlink()
         except OSError:
             pass
 
@@ -666,8 +671,13 @@ def main():
     finally:
         stop_fuse(cur[0])
         relay.stop()
-        leftovers = [n for n in os.listdir(FTP_UPLOAD) if n.startswith(PREFIX)]
-        rm_files(leftovers)
+        # 清扫本套件工件：phase_c 会写到 anon chroot 根下的 upload2/（**不在** upload/
+        # 之下），原先只扫 FTP_UPLOAD → upload2 里的 nsp_par_<pid>_gen2.txt 长期累积
+        # （实测积了 10 个历史文件，宿主用户得手动清）。两处都扫，且用宽前缀
+        # CLEAN_PREFIX（按 pid 限定只能清自己那份，历史/异常退出的永远留着）。
+        for d in (Path(FTP_UPLOAD), Path(FTP_UPLOAD).parent / "upload2"):
+            if d.is_dir():
+                rm_files([n for n in os.listdir(d) if n.startswith(CLEAN_PREFIX)], base=d)
 
     print("═══════════════════════════════════════")
     print(f"测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS + FAIL}")
