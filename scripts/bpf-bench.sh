@@ -26,8 +26,40 @@ set -u
 HERE=$(dirname "$0")
 . "$HERE/adb-safe.sh"
 
-BIN=${FUSE_DAEMON_BIN:-/data/adb/modules/Namespace-Proxy/bin/fuse_daemon}
-RULES=${FUSE_BENCH_RULES:-/data/Namespace-Proxy/injector.conf}
+# ── 二进制 ────────────────────────────────────────────────────────────
+# 默认**绝不**用已安装的生产二进制：/data/adb/modules/Namespace-Proxy/bin/
+# fuse_daemon 是设备正在用的模块核心，拿它跑 benchmark 等于在生产进程上做实验
+# （且它自带模块目录/日志路径等生产上下文）。默认只认 SAFE_ROOT 下的 scratch
+# 副本；确需用生产二进制时显式 USE_PROD_BIN=1 + FUSE_DAEMON_BIN=<路径>（留痕）。
+if [ "${USE_PROD_BIN:-0}" = 1 ]; then
+    [ -n "${FUSE_DAEMON_BIN:-}" ] || die "USE_PROD_BIN=1 必须显式给 FUSE_DAEMON_BIN（拒绝隐式落到生产路径）"
+    BIN=$FUSE_DAEMON_BIN
+    need_root "以生产二进制跑 benchmark（USE_PROD_BIN=1）：$BIN"
+else
+    BIN=${FUSE_DAEMON_BIN:-$SAFE_ROOT/bin/fuse_daemon}
+    _is_prod "$BIN" && die "拒绝：scratch 二进制不得位于生产路径 $BIN（确需请设 USE_PROD_BIN=1）"
+fi
+[ -x "$BIN" ] || die "缺少可执行 daemon：$BIN（scratch 场景请先把它放到 $SAFE_ROOT/bin/）"
+
+# ── 规则 ──────────────────────────────────────────────────────────────
+# 默认从生产 injector.conf **快照**到 scratch 再读（语义不变，但 daemon 的
+# --rules 不再指向生产路径，避免测试期间反复读生产配置）；也可用
+# FUSE_BENCH_RULES= 直接指定。两者都拿不到则明确失败，不静默换一套语义。
+PROD_RULES=/data/Namespace-Proxy/injector.conf
+if [ -n "${FUSE_BENCH_RULES:-}" ]; then
+    RULES=$FUSE_BENCH_RULES
+    _is_prod "$RULES" && log "警告：规则直接指向生产路径 $RULES（只读使用）"
+else
+    RULES=$SAFE_ROOT/bench_rules.conf
+    if [ ! -f "$RULES" ]; then
+        [ -r "$PROD_RULES" ] || die "无规则可用：$RULES 不存在且读不到 $PROD_RULES；请给 FUSE_BENCH_RULES=<路径>"
+        mkdir -p "$SAFE_ROOT" 2>/dev/null
+        cp "$PROD_RULES" "$RULES" || die "规则快照失败：$PROD_RULES → $RULES"
+        log "规则已快照到 scratch：$RULES（源 $PROD_RULES）"
+    fi
+fi
+[ -r "$RULES" ] || die "规则不可读：$RULES"
+
 MNT=$SAFE_ROOT/bench_mnt
 MODDIR=$SAFE_ROOT/bench_mod
 VMNT=$MNT/0/Android/data/.bpf_bench
@@ -161,7 +193,15 @@ run_mode() {
             log "prep（shell 身份）： $(as_shell prep)"
             ;;
     esac
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    # 全局 drop_caches 会把**整机**页缓存清掉（其他应用/系统服务同受其害），
+    # 默认不做。确需冷缓存基线时显式 ALLOW_DROP_CACHES=1——写入前记录，便于
+    # 事后把「谁在测试期间清了整机缓存」归因到本脚本。
+    if [ "${ALLOW_DROP_CACHES:-0}" = 1 ]; then
+        log "警告：全局 drop_caches（影响整机，已显式授权 ALLOW_DROP_CACHES=1）"
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || log "drop_caches 写入失败（忽略，结果为热缓存）"
+    else
+        log "跳过全局 drop_caches（默认关闭；需冷缓存基线设 ALLOW_DROP_CACHES=1）"
+    fi
     GATE_OUT=$(as_shell gate)
     log "门禁（shell 身份）： $GATE_OUT"
     case "$GATE_OUT" in GATE_OK*) ;; *) die "门禁失败，停止";; esac
@@ -188,6 +228,7 @@ main() {
     safe_rm "$SHELL_PHASE"
     safe_rm "$SAFE_ROOT/bench_inner.sh"
     safe_rm "$SAFE_ROOT/bench_mod"
+    safe_rm "$SAFE_ROOT/bench_rules.conf"
     safe_rm "$SAFE_ROOT/bench-bpf-on.log"
     safe_rm "$SAFE_ROOT/bench-bpf-off.log"
     safe_rm "$SAFE_ROOT/bench-bpf-on.pid"
