@@ -27,6 +27,10 @@
      （产物落真实 storage），同模块 rename 两次 lookup 配对释放。
   B. 后端仅实现 backend_match（rename 也 NULL）：rename 返回 -EXDEV，
      覆盖 EXDEV 分支的两次 lookup 配对释放。
+  C. 热重载放弃新实例（旧实例在途引用未归零）：新实例 init 已成功、已起自有
+     线程，框架必须在 dlclose 前经围栏调 exit 停线程。判别证据是 v2 独有的
+     exit 标记——旧实现直接 dlclose 会让残留线程执行已解除映射的代码，daemon
+     当场 SIGSEGV（本用例在旧实现下实测 rc=-11）。
 
 测试模块由本脚本临时写源码 + cc 现场编译（第三方模块视角，仅依赖
 include/nsp_module.h）。所有 fixture 位于 mkdtemp 临时目录；每个用例
@@ -42,6 +46,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -51,10 +56,14 @@ DAEMON = os.environ.get("FUSE_DAEMON") or str(ROOT / "build_gnu" / "fuse_daemon"
 CC = os.environ.get("CC", "cc")
 
 # —— 临时 fixture 路径：由 main() 用 mkdtemp 建立（import 无副作用）——
-TMP = MNT = STORAGE = MODDIR = BUILT = SRCDIR = CONF = MARKER = DLOG = None
+TMP = MNT = STORAGE = MODDIR = BUILT = SRCDIR = CONF = MARKER = DLOG = HOLD = None
 
 BACKEND_MOD = "lifecycle_backend"           # 含 backend_rename（成功分支）
 BACKEND_NORENAME_MOD = "lifecycle_backend_norename"  # rename NULL（EXDEV 分支）
+SWAP_MOD = "lifecycle_swap"                 # 热重载回滚用例（同名两版本）
+SWAP_V2_SO = SWAP_MOD + "_v2.so"            # v2 构建产物（v1 走通用 <name>.so）
+SWAP_EXIT_TAG = "swap-exit-v2"              # 仅 v2 的 exit 会落此标记
+SWAP_HOLD_MS = 6000                         # 阻塞 rename 时长：须明显超过 drain 的 ~2s
 
 # 用例等待上限（秒）：事件触发扫描（1s 归并窗口 + 0.5s 稳定性校验）+ 卸载 drain 等待 2s + 余量
 LOAD_TIMEOUT = 25.0
@@ -147,12 +156,132 @@ static int lb_rename(const char* from, const char* to) {
 '''
 RENAME_FIELD = "    .backend_rename = lb_rename,"
 
+# 热重载回滚用例模块：rename 在 hold 文件存在时阻塞，用于在 module_unload_one
+# 的 drain 窗口（~2s）内持续持有后端引用，稳定命中「旧实例在途引用未归零 →
+# 热重载放弃新实例」分支。v2 额外提供 init（起自有线程）/exit（停线程 + 落唯一
+# 标记），用于断言「被放弃的新实例仍经围栏调了 exit」——旧实现直接 dlclose，
+# 残留线程执行已解除映射的代码即带崩整个 daemon。
+SWAP_SRC = r'''
+#include "nsp_module.h"
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef NSP_TEST_STORAGE
+#error "编译需 -DNSP_TEST_STORAGE=\"/path\""
+#endif
+#ifndef NSP_TEST_MARKER
+#error "编译需 -DNSP_TEST_MARKER=\"/path\""
+#endif
+#ifndef NSP_TEST_HOLD
+#error "编译需 -DNSP_TEST_HOLD=\"/path\""
+#endif
+
+static void swap_mark(const char* what) {
+    FILE* f = fopen(NSP_TEST_MARKER, "a");
+    if (f) {
+        fprintf(f, "%s\n", what);
+        fclose(f);
+    }
+}
+
+static int swap_match(const char* path) {
+    return path && strncmp(path, "/blife", 6) == 0;
+}
+
+static int swap_rename(const char* from, const char* to) {
+    if (access(NSP_TEST_HOLD, F_OK) == 0) {
+        swap_mark("hold-begin");
+        struct timespec ts = {__HOLD_MS__ / 1000, (__HOLD_MS__ % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    char a[PATH_MAX], b[PATH_MAX];
+    if (snprintf(a, sizeof a, "%s/0%s", NSP_TEST_STORAGE, from) >= (int)sizeof a) return -36;
+    if (snprintf(b, sizeof b, "%s/0%s", NSP_TEST_STORAGE, to) >= (int)sizeof b) return -36;
+    if (rename(a, b) != 0) return -errno;
+    return 0;
+}
+
+__SWAP_INIT_EXIT__
+
+static const NspModuleOps swap_ops = {
+    .backend_match = swap_match,
+    .backend_rename = swap_rename,
+};
+
+const NspModuleInfo nsp_module_info = {
+    .magic = NSP_MODULE_MAGIC,
+    .abi_version = NSP_MODULE_ABI_VERSION,
+    .name = "__NAME__",
+    .version = "__VERSION__",
+    .init = __INIT__,
+    .exit = __EXIT__,
+    .ops = &swap_ops,
+};
+'''
+
+# v2 独有：自有线程 + exit 落标记（v1 的 init/exit 为 NULL）
+SWAP_V2_INIT_EXIT = r'''
+static pthread_t swap_tid;
+static volatile int swap_stop;
+
+static void* swap_thread(void* arg) {
+    (void)arg;
+    while (!swap_stop) {
+        struct timespec ts = {0, 10 * 1000 * 1000L};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static int swap_init(const NspFrameworkApi* api) {
+    (void)api;
+    swap_stop = 0;
+    if (pthread_create(&swap_tid, NULL, swap_thread, NULL) != 0) return -1;
+    return 0;
+}
+
+static void swap_exit(void) {
+    swap_stop = 1;
+    pthread_join(swap_tid, NULL);
+    /* 唯一标记：证明「init 已成功的新实例」被拒绝时确实调用了 exit */
+    swap_mark(NSP_SWAP_EXIT_TAG);
+}
+'''
+
+
+def swap_source(version):
+    init_exit = SWAP_V2_INIT_EXIT if version == "2" else ""
+    return (SWAP_SRC.replace("__SWAP_INIT_EXIT__", init_exit)
+                   .replace("__HOLD_MS__", str(SWAP_HOLD_MS))
+                   .replace("__VERSION__", version)
+                   .replace("__INIT__", "swap_init" if version == "2" else "NULL")
+                   .replace("__EXIT__", "swap_exit" if version == "2" else "NULL")
+                   .replace("__NAME__", SWAP_MOD))
+
 
 def build_modules():
-    """临时写 C 源码并现场编译三个测试模块到 BUILT/。"""
+    """临时写 C 源码并现场编译测试模块到 BUILT/（含同名两版本的热重载用例）。"""
     for d in (MODDIR, BUILT, SRCDIR):
         d.mkdir(parents=True, exist_ok=True)
-    defs = [f'-DNSP_TEST_STORAGE="{STORAGE}"', f'-DNSP_TEST_MARKER="{MARKER}"']
+    defs = [f'-DNSP_TEST_STORAGE="{STORAGE}"', f'-DNSP_TEST_MARKER="{MARKER}"',
+            f'-DNSP_TEST_HOLD="{HOLD}"']
+
+    def compile_so(so_name, src, extra=()):
+        cfile = SRCDIR / f"{so_name}.c"
+        cfile.write_text(src)
+        so = BUILT / f"{so_name}.so"
+        r = subprocess.run(
+            [CC, "-std=c23", "-shared", "-fPIC", "-O1", "-DNSP_MODULE_BUILD", "-pthread",
+             f"-I{ROOT / 'include'}", *defs, *extra, str(cfile), "-o", str(so)],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"!! 测试模块 {so_name} 编译失败:\n{r.stderr}")
+            sys.exit(2)
 
     specs = [
         (BACKEND_MOD,
@@ -163,26 +292,27 @@ def build_modules():
          BACKEND_SRC.replace("__NAME__", BACKEND_NORENAME_MOD)
                     .replace("__RENAME_FN__", "")
                     .replace("__RENAME_FIELD__", "")),
+        # 热重载回滚用例 v1：与 v2 同模块名、同 match/rename，但无 init/exit
+        (SWAP_MOD, swap_source("1")),
     ]
     for name, src in specs:
-        cfile = SRCDIR / f"{name}.c"
-        cfile.write_text(src)
-        so = BUILT / f"{name}.so"
-        r = subprocess.run(
-            [CC, "-std=c23", "-shared", "-fPIC", "-O1", "-DNSP_MODULE_BUILD",
-             f"-I{ROOT / 'include'}", *defs, str(cfile), "-o", str(so)],
-            capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"!! 测试模块 {name} 编译失败:\n{r.stderr}")
-            sys.exit(2)
+        compile_so(name, src)
+    # v2：同一模块名的第二版本（init 起线程 / exit 停线程并落唯一标记），
+    # 编译到独立 .so，测试中途原子替换到模块目录触发热重载
+    compile_so(SWAP_MOD + "_v2", swap_source("2"), [f'-DNSP_SWAP_EXIT_TAG="{SWAP_EXIT_TAG}"'])
 
 
-def stage(name):
+def stage_file(name, so_name):
+    """把 BUILT/<so_name> 原子替换到 MODDIR/<name>/<name>.so（触发热重载/首装）。"""
     d = MODDIR / name
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / f"{name}.so.tmp"
-    shutil.copy(BUILT / f"{name}.so", tmp)
+    shutil.copy(BUILT / so_name, tmp)
     os.replace(tmp, d / f"{name}.so")
+
+
+def stage(name):
+    stage_file(name, f"{name}.so")
 
 
 def unstage(name):
@@ -208,6 +338,16 @@ def marker_text():
         return MARKER.read_text()
     except OSError:
         return ""
+
+
+def wait_marker(text, timeout):
+    """轮询 marker 文件等待出现指定行（模块侧证据）。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        if text in marker_text():
+            return True
+        time.sleep(0.2)
+    return text in marker_text()
 
 
 # ================= daemon 生命周期 / 内核证据 =================
@@ -444,8 +584,56 @@ def case_rename_missing_exdev(p, backend_name):
     assert_unloaded(p, backend_name, "B")
 
 
+def case_hot_reload_rollback_calls_exit(p, name):
+    """C. 旧实例在途引用未归零 → 热重载放弃新实例。新实例 init 已成功（起了自有
+       线程），必须经围栏 exit 停线程后再 dlclose；直接 dlclose 会让残留线程执行
+       已解除映射的代码，把整个 daemon 带崩。
+       判别证据：v2 独有的 exit 标记必须出现（旧实现直接 dlclose，标记必然缺失）。"""
+    blife = MNT / "0" / "blife"
+    HOLD.write_text("hold")
+    errs = []
+
+    def do_rename():
+        try:
+            os.rename(blife / "seed.txt", blife / "seed2.txt")
+        except OSError as e:
+            errs.append(e)
+
+    th = threading.Thread(target=do_rename, daemon=True)
+    th.start()
+    if not wait_marker("hold-begin", LOAD_TIMEOUT):
+        fail("旧实例 rename 未进入阻塞", f"marker={marker_text()!r}")
+        HOLD.unlink(missing_ok=True)
+        return
+    ok(f"旧实例在途 rename 阻塞（drain 窗口内持续持引用，>{SWAP_HOLD_MS}ms）")
+
+    # .so 原子替换 → 热重载：prepare(v2) 成功（init 已起线程），unload(v1) 因
+    # 在途引用超时失败 → 放弃新实例——此分支必须调 v2 的 exit
+    stage_file(name, SWAP_V2_SO)
+    if wait_marker(SWAP_EXIT_TAG, UNLOAD_TIMEOUT):
+        ok("热重载放弃分支执行了新实例 exit（线程已停后再 dlclose）")
+    else:
+        fail("新实例 exit 未执行",
+             f"marker={marker_text()!r}（旧实现 dlclose 不带 exit，残留线程会带崩 daemon）")
+
+    th.join(timeout=SWAP_HOLD_MS / 1000.0 + 20)
+    HOLD.unlink(missing_ok=True)
+    if p.poll() is None:
+        ok("daemon 存活（无语义残留线程踩空）")
+    else:
+        fail("daemon 已退出", f"rc={p.poll()}")
+    try:
+        mounted = (MNT / "0").is_dir()
+    except OSError:
+        mounted = False
+    if mounted:
+        ok("挂载仍可服务")
+    else:
+        fail("挂载不可用", "/0 不可见")
+
+
 def main():
-    global TMP, MNT, STORAGE, MODDIR, BUILT, SRCDIR, CONF, MARKER, DLOG
+    global TMP, MNT, STORAGE, MODDIR, BUILT, SRCDIR, CONF, MARKER, DLOG, HOLD
     if not Path(DAEMON).exists():
         print(f"!! 缺少 {DAEMON}，请先构建 GNU 产物（scripts/build.sh）")
         return 2
@@ -464,6 +652,7 @@ def main():
     SRCDIR = TMP / "src"
     CONF = TMP / "injector.conf"
     MARKER = TMP / "backend_marker"
+    HOLD = TMP / "hold_flag"
     DLOG = TMP / "daemon.log"
 
     print(f"临时目录: {TMP}")
@@ -481,6 +670,8 @@ def main():
                  BACKEND_MOD, case_local_fallback_and_rename_success)
         run_case("B. rename 回调缺失 → EXDEV 分支配对",
                  BACKEND_NORENAME_MOD, case_rename_missing_exdev)
+        run_case("C. 热重载放弃新实例：新实例 exit 必须执行（自有线程已停）",
+                 SWAP_MOD, case_hot_reload_rollback_calls_exit)
     finally:
         # 精确清理自身挂载点与临时目录（daemon 已由各用例 finally 终止）
         subprocess.run(["fusermount3", "-u", str(MNT)], capture_output=True)

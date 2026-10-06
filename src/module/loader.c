@@ -237,6 +237,11 @@ static time_t so_mtime(const char* so_path) {
     return (stat(so_path, &st) == 0) ? st.st_mtime : (time_t)-1;
 }
 
+/* 见定义处：init 已成功的实例被拒绝时的统一善后（须经围栏调 exit 再决定
+   dlclose）。声明在前，因为 module_prepare 的配置下发崩溃路径就要用它。 */
+static void module_reject_after_init(const char* name, void* h, const NspModuleInfo* info,
+                                     int mfd, const char* why);
+
 /* 加载并校验新模块（不注册）：0.5s 稳定性校验 + 读入内存副本 +
    dlopen + ABI/名字校验 + init。框架只校验"模块是否可用"，不做内容哈希
    （全文件 SHA-256 的算力与 I/O 相对热加载收益是无效工作；版本区分由 ban
@@ -405,8 +410,11 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
                     "detail=拒绝加载并落盘 ban",
                     name);
             module_ban_record(name, so_mtime(so_path), "config_update crash");
+            /* 先注销初始化归因槽位，再交给统一拒绝出口（后者自行注册未绑定
+               槽位调 exit）：init 已成功、模块可能已起自有线程，dlclose 前必须停 */
             fault_fence_unregister_slot(tent_slot);
-            return module_prepare_reject(h, mfd, -5);
+            module_reject_after_init(name, h, info, mfd, "配置下发监听器崩溃");
+            return -5;
         }
         fault_fence_unregister_slot(tent_slot); /* commit 时按正式槽位再注册 */
     }
@@ -416,25 +424,28 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
     return 0;
 }
 
-/* commit 拒绝路径的模块善后：init 已成功执行，模块可能持有自有线程，
-   exit 必须调且必须过围栏（用未绑定槽位归因——正式槽位尚未分配，不能占用
-   在册模块的槽位）。exit 崩溃则无法确认线程已停，保持 .so 映射不 dlclose。
-   调用时须已释放 g_module_lock。 */
-static void commit_reject_unload(const char* name, void* h, const NspModuleInfo* info,
-                                   int mfd) {
+/* init 已成功的模块被拒绝时的统一善后：模块可能已持有自有线程（如
+   ftp_module 的 ftp.conf 监视线程），exit 必须调且必须过围栏（用未绑定槽位
+   归因——正式槽位尚未分配，不能占用在册模块的槽位）。**任何"init 过了但
+   最终没 commit"的路径都必须走这里**：直接 dlclose 会解除映射而留下仍在运行
+   的模块线程，执行失效代码即带崩整个 daemon（档头 §热加载注释与置毒路径
+   同一条铁律）。exit 崩溃则无法确认线程已停，保持 .so 映射不 dlclose。
+   调用时须已释放 g_module_lock；why 用于日志定位拒绝原因。 */
+static void module_reject_after_init(const char* name, void* h, const NspModuleInfo* info,
+                                     int mfd, const char* why) {
     bool can_unload = true;
-    if (info->exit) {
+    if (info && info->exit) {
         fault_fence_register_slot(NSP_FENCE_UNBOUND_SLOT, name, h);
         int erc = nsp_fence_exit_call(NSP_FENCE_UNBOUND_SLOT, "exit", info->exit);
         if (erc == NSP_FENCE_FAULT) can_unload = false;
         fault_fence_unregister_slot(NSP_FENCE_UNBOUND_SLOT);
     }
-    if (can_unload) {
+    if (can_unload && h) {
         dlclose(h);
-    } else {
+    } else if (!can_unload) {
         LOG_ERR("[MOD_ERR] module=%s op=exit reason=exit 崩溃被围栏恢复 "
-                "detail=注册表满且无法确认模块线程已停,保持 .so 映射不 dlclose",
-                name);
+                "detail=%s且无法确认模块线程已停,保持 .so 映射不 dlclose",
+                name, why ? why : "");
     }
     /* mfd 所有权随拒绝一并回收：commit 失败即定时重试，不 close 则每次漏 1fd */
     if (mfd >= 0) close(mfd);
@@ -470,7 +481,7 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, i
     if (slot < 0) {
         if (g_module_count >= g_module_cap) {
             /* 无复用槽：翻倍扩容（写锁内；g_modules 仅锁内访问，realloc 安全）。
-               OOM/硬上限即按旧语义拒绝（exit 仍须调，见 commit_reject_unload）。 */
+               OOM/硬上限即按旧语义拒绝（exit 仍须调，见 module_reject_after_init）。 */
             bool grown_ok = false;
             if (g_module_cap < MODULE_HARD_MAX) {
                 int ncap = g_module_cap > 0 ? g_module_cap * 2 : MODULE_INIT_CAP;
@@ -492,7 +503,7 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, i
                 pthread_rwlock_unlock(&g_module_lock);
                 /* 注册表满/OOM 拒绝亦落 ban（mtime 版）：防定时重试每次漏 1fd + 反复全量加载 */
                 module_ban_record(name, so_mtime(so_path), "registry full");
-                commit_reject_unload(name, h, info, mfd);
+                module_reject_after_init(name, h, info, mfd, "注册表满");
                 return -6;
             }
         }
@@ -572,8 +583,10 @@ static int module_unload_one(const char* name) {
         atomic_fetch_sub_explicit(&g_backend_active_count, 1, memory_order_release);
     /* 先置空槽位快照（写锁内）：后续 acquire 立即失败，不再获得新引用；
        在途 acquire（已取到 ops 且二次确认未变）持有 g_backend_slot_refs，
-       由下方等待循环保证归零后才 dlclose，杜绝函数指针悬垂 */
-    atomic_store_explicit(&g_backend_slot_ops[slot], NULL, memory_order_release);
+       由下方等待循环保证归零后才 dlclose，杜绝函数指针悬垂。
+       置空与下方归零读均用 seq_cst：须与 backend_scan_match/acquire_slot 的
+       「取引用 + 复查快照」构成全序（弱序机器上否则可被重排而漏判） */
+    atomic_store_explicit(&g_backend_slot_ops[slot], NULL, memory_order_seq_cst);
     int mfd = m->mfd;
     m->mfd = -1;
     m->active = false;
@@ -592,7 +605,7 @@ static int module_unload_one(const char* name) {
         pthread_rwlock_rdlock(&g_module_lock);
         busy = (m->backend_refs > 0);
         pthread_rwlock_unlock(&g_module_lock);
-        if (!busy && atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_acquire) == 0) {
+        if (!busy && atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_seq_cst) == 0) {
             drained = true;
             break;
         }
@@ -921,7 +934,9 @@ int module_fault_poison(int slot, const char* reason) {
     pthread_rwlock_wrlock(&g_module_lock);
     if (info.ops && info.ops->backend_match)
         atomic_fetch_sub_explicit(&g_backend_active_count, 1, memory_order_release);
-    atomic_store_explicit(&g_backend_slot_ops[slot], NULL, memory_order_release);
+    /* 置空与下方归零读同用 seq_cst：与 backend_scan_match/acquire_slot 的
+       「取引用 + 复查快照」构成全序（理由见 module_unload_one） */
+    atomic_store_explicit(&g_backend_slot_ops[slot], NULL, memory_order_seq_cst);
     int mfd = m->mfd;
     m->mfd = -1;
     m->active = false;
@@ -933,7 +948,7 @@ int module_fault_poison(int slot, const char* reason) {
        在途 backend 调用完成即释放）。超时不恢复（区别于 unload） */
     bool drained = false;
     for (int i = 0; i < 2000; i++) {
-        if (atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_acquire) == 0) {
+        if (atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_seq_cst) == 0) {
             drained = true;
             break;
         }
@@ -1105,9 +1120,12 @@ static bool module_scan_diff(void) {
                     continue;
                 }
                 if (module_unload_one(present[p]) != 0) {
-                    dlclose(nh); /* 旧模块在途引用未归零（回滚保留旧）→ 放弃新模块 */
-                    if (nmfd >= 0) close(nmfd);
+                    /* 旧实例在途引用未归零 → 放弃新实例（回滚保留旧模块）。
+                       新实例 init 已成功、可能已起自有线程，必须经围栏 exit/join
+                       后再 dlclose，否则残留线程执行已解除映射的代码即带崩 daemon */
                     LOG_WRN("模块 %s 旧实例仍有在途调用，热重载放弃（保留旧模块）", present[p]);
+                    module_reject_after_init(present[p], nh, &ninfo, nmfd,
+                                             "旧实例在途引用未归零,热重载放弃");
                     pending = true;
                     continue;
                 }
@@ -1398,10 +1416,21 @@ static int backend_scan_match(const char* path, int* slot_out, const NspModuleOp
     for (int i = 0; i < hwm; i++) {
         const NspModuleOps* ops =
             atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire);
-        if (!ops || !ops->backend_match) continue;
-        atomic_fetch_add_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_backend_slot_ops[i], memory_order_acquire) != ops) {
+        if (!ops) continue;
+        /* 先取引用再解引用模块内存：ops 字段的读取必须处于引用保护之下。unload
+           是「置空快照 → 等引用归零 → dlclose」，若在取引用前读 ops->backend_match，
+           该窗口内被 dlclose 后即读未映射内存——且这发生在围栏之前，围栏救不了。
+           两侧 seq_cst 配对（此处 + module_unload_one/module_guard_poison 的置空与
+           归零读）：否则 ARM 弱序下 store/load 可重排，仍会出现「生产者没看到置空
+           快照、卸载者没看到新引用」而 dlclose 在途模块。 */
+        atomic_fetch_add_explicit(&g_backend_slot_refs[i], 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&g_backend_slot_ops[i], memory_order_seq_cst) != ops) {
             /* 快照刚被 unload 置空：放弃引用，不调用 ops */
+            atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
+            continue;
+        }
+        if (!ops->backend_match) {
+            /* 槽位未提供 match：不参与分派，释放引用继续 */
             atomic_fetch_sub_explicit(&g_backend_slot_refs[i], 1, memory_order_acq_rel);
             continue;
         }
@@ -1442,8 +1471,10 @@ int module_backend_acquire_slot(int slot, const NspModuleOps** ops_out) {
     if (!ops_out || slot < 0 || slot >= MAX_MODULES) return -1;
     const NspModuleOps* ops = atomic_load_explicit(&g_backend_slot_ops[slot], memory_order_acquire);
     if (!ops) return -1;
-    atomic_fetch_add_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
-    if (atomic_load_explicit(&g_backend_slot_ops[slot], memory_order_acquire) != ops) {
+    /* seq_cst 与 backend_scan_match 同协议：须与 unload 的「置空 + 归零读」
+       构成全序，才能保证「要么引用被卸载者看见、要么本线程看见置空」 */
+    atomic_fetch_add_explicit(&g_backend_slot_refs[slot], 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_backend_slot_ops[slot], memory_order_seq_cst) != ops) {
         /* 快照刚被 unload 置空：放弃引用，不调用 ops */
         atomic_fetch_sub_explicit(&g_backend_slot_refs[slot], 1, memory_order_acq_rel);
         return -1;
