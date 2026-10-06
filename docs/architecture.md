@@ -158,13 +158,15 @@ FUSE 回调（如 getattr）
 
 ### 4.3 真实路径解析优先级
 
-`br_to_real_path` 按序解析：
+`br_to_real_path` 按**作用域优先**逐层取首命中（`config.md` §2 的 应用 > 类别 > GLOBAL）：
 
-1. **Trie 静态 redirect 命中**（复用 `TrieMatch`）：目标以 `?` 开头则转 `STORAGE_BASE/<user_id><后缀>`。
-2. **线性 redir_rules**：app 优先、global 兜底；目标经 `build_real_base_from_target` 分类（分类表见 `config.md` §4）。
-3. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `/Android/data/<pkg>/sandbox`。
-4. **fallback**：`STORAGE_BASE/<user_id><sub_path>`。
+1. **应用段**：先静态（Trie 命中，`TrieMatch.redir`/`redir_scope`），再线性（含通配/变量的 `redir_rules`）。
+2. **类别段**（`USER_APPS[:uid]` / `SYSTEM_APPS`）：同上。
+3. **`[GLOBAL]`**：同上。
+4. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `/Android/data/<pkg>/sandbox`（三层 OFF 否决语义见 §4.2）。
+5. **fallback**：`STORAGE_BASE/<user_id><sub_path>`。
 
+> Trie 与线性通道是**同一作用域内的等价实现**——Trie 只是静态规则的加速索引，不是更高的优先级层：同层内静态命中先于该层线性规则，但**跨作用域不得互相压过**。旧实现先取「任一作用域的静态命中」再才看线性，于是 `[GLOBAL]` 的静态 REDIRECT 会压过应用/类别段的通配/变量规则（与 `config.md` §2 相反，`test_rules.py` §21 守护）。
 > `?` 前缀是内部标记，由 parse 阶段对 ALLOW 和相对路径 REDIRECT 自动生成，表示"相对当前用户存储"。
 
 ### 4.4 跨应用隔离
@@ -270,7 +272,7 @@ FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_prob
 - **fd 归属铁律**：谁拥有集合，谁 `close`。comm 线程拥有的客户端 fd，主线程只允许 `shutdown` + 投递控制消息，**禁止直接 `close`**（不断号，杜绝复用竞态）；退出时先 `nsp_comm_fini()` 再集中关闭。
 - **规则文件编辑唯一实现**：`rule_server` 与 `log_ctl` 的规则行级读写统一走 `nsp_rule_file`（`src/core/nsp_rule_file.c`，纯 libc）——段式文件（`injector.conf`）与无段文件（`App-rules/<pkg>.conf`）的开关替换、规则去重、按 `(类型, 索引)` 删除均只有一份实现，落盘一律 tmp+rename 原子写（inotify 端不会读到半截文件）。索引语义以 `rule_server` 为准：**计入 `#` 停用的行**，与 LIST 输出一致。
 - **模块 resolve 输出逐字段初始化**：`module_dispatch_resolve` 对未命中/空查询/根路径也调用 `nsp_resolve_result_init`（loader 与 `NspResolveGuard` 共用同一实现），把 `valid`/`user_id`/`real_path`/`is_ftp`/虚拟目录标志等全部字段置为确定默认值。FUSE 回调在未命中时仍会读这些标志，"只置 `valid`"曾把不存在路径合成为目录，不得回退。
-- **规则匹配语义等价**：修改 Trie 或线性通道时保持二者优先级一致——app trie 优先于 global trie；redirect 取 app 优先、global 兜底；hidden/ro 取 app+global **并集**。
+- **规则匹配语义等价**：修改 Trie 或线性通道时保持二者优先级一致——**重定向按作用域优先**（应用 > 类别 > GLOBAL；同层内静态 Trie 与线性规则等价，Trie 只作加速，跨层不得互相压过）；hidden/ro 取三层**并集**。
 - **Trie matched 语义**：`trie_lookup` 返回值表示"命中至少一条真实规则（含祖先继承）"，而非"途经了无规则的中间节点"——否则 `/Android/data/<未配置包>` 会误判。
 - **数据结构独立**：内聚、零业务依赖的数据结构（如 Trie）自成模块，可独立单测。`path_trie.c` 不引用 AppConfig 或任何配置全局。
 - **YAGNI**：不保留无调用者的"预留"实现。

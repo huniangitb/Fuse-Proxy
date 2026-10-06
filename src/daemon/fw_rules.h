@@ -75,11 +75,26 @@ typedef struct NspProbeResult {
 /* ================= 引擎内部：单次操作的 trie 查询结果缓存 =================
    同一次 resolve 对同一 sub_path 会问 app/类别/global 三棵 trie：一次下降把
    命中信息全带上，避免各自再全路径遍历（热路径每操作最多省 4 次 trie 下降）。 */
+
+/* 规则作用域（数值即优先级：应用 > 类别 > [GLOBAL]，见 docs/config.md §2）。
+   Trie 与线性通道是同一作用域内的两种等价实现（Trie 只是静态规则的加速索引），
+   故跨作用域比较一律用本枚举，不得让「通道」压过「作用域」。 */
+typedef enum {
+    BR_SCOPE_NONE = 0,   /* 未命中 */
+    BR_SCOPE_GLOBAL = 1, /* [GLOBAL] */
+    BR_SCOPE_CAT = 2,    /* 类别段 [USER_APPS[:uid]] / [SYSTEM_APPS] */
+    BR_SCOPE_APP = 3,    /* 应用段 [<pkg>] / [<pkg>:<uid>] */
+} BrRuleScope;
+
 typedef struct {
     bool valid;     /* 是否已 resolve */
     bool hidden;    /* app_hidden || cat_hidden || global_hidden */
     bool ro;        /* app_ro || cat_ro || global_ro */
     bool has_redir; /* 命中 redirect（app > 类别 > global） */
+    BrRuleScope redir_scope; /* has_redir 时命中所在作用域：同层静态 vs 线性、
+                                跨层作用域优先的比较都靠它（旧实现只留合并后的
+                                目标、丢了作用域，导致 GLOBAL 静态压过应用/类别的
+                                动态规则） */
     char redir[PATH_MAX];
     /* FTP 最长前缀命中（trie 下降过程输出）：app > 类别 > global */
     char ftp_app[64];
