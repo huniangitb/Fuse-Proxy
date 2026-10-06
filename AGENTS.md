@@ -116,6 +116,30 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
   `build_gnu/` 需 `chown` 给客户端，收尾再 `chown -R 0:0` 归还，否则仓库里会留下
   宿主无法覆盖的 subuid 属主 .so。
 
+## 待裁决（不擅自定契约，需用户裁定）
+
+以下两处行为文档从未定义，代码里是既有实现。已取证但**未改动**，裁定后再动。
+
+1. **`vfs_rmdir` 对 ENOTEMPTY 递归删除**（`src/daemon/fuse_daemon.c`，引入提交 `51abd2c`，
+   提交说明「目录非空时自动调用 recursive_rmdir 兜底，避免应用反复重试」）。
+   本地真实路径上 `rmdir()` 返回 ENOTEMPTY 时会 `recursive_rmdir(p)` 并返回 0——
+   即**对非空目录调 `rmdir` 会静默删掉整个子树**，不符合 POSIX（应返回 ENOTEMPTY）。
+   注意同一函数的**虚拟路径分支**（`NSP_VK_ANCESTOR/TARGET`）是返回 ENOTEMPTY 的，
+   两条分支语义不一致。方向上是**放大破坏面**（本该失败的删除变成了递归删除），
+   而 `rm -rf` 这类正常递归删除路径并不依赖它。
+   倾向：本地分支改为返回 `-ENOTEMPTY`，与虚拟分支对齐；`recursive_rmdir` 保留给
+   `rename`（1971/1974/1978 行）的既有用途。
+
+2. **`vfs_fsync` 对后端句柄直接返回 0**（同上文件）。后端文件（`NSP_FH_BACKEND_FLAG`）
+   的 fsync 不做任何同步，注释称「同步交给模块 FLUSH/RELEASE」。风险面：依赖
+   `fsync()` 保证持久化的调用方（SQLite `synchronous=FULL`、编辑器保存）在 close 之前
+   调 fsync 会拿到「成功」而数据仍在本地 tmp / 网络缓冲里。FTP 后端本就不提供原子
+   持久化，且 FUSE 每次 close 都会触发 FLUSH——实际影响取决于是否存在「close 前依赖
+   fsync」的调用方（Android 侧未观测到，但无证据表明不存在）。
+   倾向：二选一并写进 `docs/architecture.md`——(a) 明确「后端不保证 fsync 语义」；
+    (b) 让 fsync 触发一次 FLUSH 收尾。前者零成本，后者语义更强但会给每次 fsync 加一次
+   网络往返。
+
 ## 设备操作（生产级隔离，血的教训）
 
 真机视为生产：一切设备命令经 `scripts/adb-sh.sh` 执行（会话强制 PATH 垫片 + source `adb-safe.sh` + `set -u` + 变更/生产路径文本预检），禁止裸 `adb shell` 做变更。隔离主体是 Linux 原生机制（内核强制，非约定）：测试 I/O 一律 `su shell` 降级执行——实测 uid=gid=groups=2000（1078 等危险组已脱）、CapEff=0，`assert_downgraded()` 每次先验，root 只建/卸挂载（/dev/fuse 0600，只能 root 开）且 `need_root()` 留痕；backing 只用 `SAFE_ROOT` 合成 fixture（生产 backing 永不进测试挂载，需真实下层行为时 cp -a 快照到沙盒）。纵深为 shell 层：设备侧脚本 source harness 即自动影子危险命令（rm/umount/mv/cp/dd/tee/chcon/chmod/chown/restorecon/setenforce/kill），绕过须 `command`/绝对路径（评审可见）；umount 循环卸直到消失、失败即 die 且错误禁止重定向吞掉；`set -u` 常开。SELinux 现状：测试树自动落 `shell_data_file`，root 段尚无专用受限域（ksu 域基本不受限，需 policy 新域——列为二期，不在这次范围内）。
