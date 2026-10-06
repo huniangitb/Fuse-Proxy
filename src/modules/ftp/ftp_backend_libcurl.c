@@ -93,9 +93,9 @@ typedef struct FtpBackend {
     CURL* read_pool[FTP_READ_POOL_MAX];
     int read_pool_count;
     pthread_mutex_t pool_lock; /* 读句柄池锁（仅 open/release/clear 触碰） */
-    bool mutex_inited;         /* 每后端互斥锁是否已初始化（槽位复用：clear
-                                    不再 destroy，add 仅首次 init，杜绝在途
-                                    操作使用已销毁锁 → SIGSEGV） */
+    bool mutex_inited;         /* 互斥锁已初始化（对象在 add 内一次性建好；clear
+                                    不 destroy——对象可能仍被在途操作持有，销毁
+                                    会让它们撞上已销毁锁 → SIGSEGV） */
     bool in_use;               /* 注册表槽位占用（clear 后复用，不 free——在途
                                     操作可能仍持 bk 指针，内存 immortal） */
     /* ---- V5 分页 LIST 缓存（单条目：最近列过的目录全量条目） ----
@@ -107,7 +107,16 @@ typedef struct FtpBackend {
     struct FtpListEntry* list_entries; /* 全量条目数组（malloc） */
     size_t list_count;
     bool list_truncated;       /* 解析超上限，尾部未知（见 FTP_LIST_CACHE_MAX） */
+    time_t list_ts;            /* 上次使用时间：跨**次**列举的缓存有界 TTL，
+                                  在用的（连续翻页）不失效——见 FTP_LIST_CACHE_TTL */
 } FtpBackend;
+
+/* 跨次列举的 LIST 缓存存活期（秒），**滑动**刷新：每次命中续期。
+   为什么滑动而不是绝对 TTL：框架翻页靠 offset，缓存若在翻页中途失效，条目序列
+   会平移——同一次 readdir 出现重复/漏项。滑动续期保证"正在被列举的目录"序列稳定；
+   空闲超过该时长后再列则重新 LIST，外部客户端在服务器上的增删因此有界可见
+   （此前永久复用：只改动的同一目录长期看不到变化）。 */
+#define FTP_LIST_CACHE_TTL 5
 
 /* V5 分页缓存上限 = 框架页循环总数上限(VFS_READDIR_MAX_TOTAL=65536)+1 哨兵：
    解析到此数后仍有行即 truncated，服务到缓存末尾时报 E2BIG（fail-closed，
@@ -254,7 +263,7 @@ static bool silent_fast_fail(FtpBackend* bk) {
    glock 内发生，逃逸的 bk 指针不受影响。 */
 static FtpBackend** g_backends = NULL;
 static int g_backend_count = 0; /* 活跃条目数（in_use；ftp_backend_count 上报值） */
-static int g_backend_slots = 0; /* 已分配槽位数（含 clear 后的空闲槽，复用不 free） */
+static int g_backend_slots = 0; /* 已分配槽位数（每次 add 一个新对象，只增不减） */
 static int g_backend_cap = 0;   /* 指针数组容量 */
 /* 后端数组全局锁 + 热重载标志：
    - g_backend_glock：保护 g_backend_count/cap 与 g_backends 数组的增删扫描
@@ -433,6 +442,7 @@ static void ftp_list_cache_free_locked(FtpBackend* bk) {
     bk->list_entries = NULL;
     bk->list_count = 0;
     bk->list_truncated = false;
+    bk->list_ts = 0;
 }
 
 /* 变更操作成功后失效 LIST 缓存（与 ftp_stat_cache_clear 同点调用，
@@ -446,53 +456,38 @@ static void ftp_list_cache_clear(FtpBackend* bk) {
 int ftp_backend_add(const FtpServerCfg* cfg) {
     if (!cfg || !cfg->name[0]) return -1;
     pthread_mutex_lock(&g_backend_glock);
-    /* 空闲槽复用优先（clear 后条目内存 immortal，锁原位保留） */
-    FtpBackend* bk = NULL;
-    for (int i = 0; i < g_backend_slots; i++) {
-        if (g_backends[i] && !g_backends[i]->in_use) {
-            bk = g_backends[i];
-            break;
-        }
-    }
-    if (!bk) {
-        /* 无空闲槽：指针数组翻倍（初容 FTP_BACKEND_MAX），条目 immortal malloc。
-           数组 realloc 只在 glock 内发生；已逃逸的 bk 指针指向条目内存，
-           不受数组搬移影响。 */
-        if (g_backend_slots >= g_backend_cap) {
-            int ncap = g_backend_cap > 0 ? g_backend_cap * 2 : FTP_BACKEND_MAX;
-            FtpBackend** grown = realloc(g_backends, (size_t)ncap * sizeof *grown);
-            if (!grown) {
-                pthread_mutex_unlock(&g_backend_glock);
-                return -1;
-            }
-            for (int i = g_backend_cap; i < ncap; i++) grown[i] = NULL;
-            g_backends = grown;
-            g_backend_cap = ncap;
-        }
-        bk = calloc(1, sizeof *bk);
-        if (!bk) {
+    /* **每次 add 都新建后端对象**，不复用已 clear 槽位的内存：旧对象可能仍被
+       在途操作或已打开文件持有（它们缓存了 bk 指针，文件句柄还靠 bk->cfg 拼
+       URL/取凭据），原位 memset 会把在用的 pthread mutex 一起清零（UB：持有者
+       与新进入者同时进临界区），并把 cfg 换成新服务器——热重载与 serving 并发
+       时的跨代串用正源于此。对象内存依旧 immortal（既有设计：条目永不 free），
+       只是从注册表摘除（in_use=false，find 不再命中），新对象接管。
+       指针数组翻倍：realloc 只在 glock 内发生；已逃逸的 bk 指针指向对象本身，
+       不受数组搬移影响。 */
+    if (g_backend_slots >= g_backend_cap) {
+        int ncap = g_backend_cap > 0 ? g_backend_cap * 2 : FTP_BACKEND_MAX;
+        FtpBackend** grown = realloc(g_backends, (size_t)ncap * sizeof *grown);
+        if (!grown) {
             pthread_mutex_unlock(&g_backend_glock);
             return -1;
         }
-        g_backends[g_backend_slots++] = bk;
+        for (int i = g_backend_cap; i < ncap; i++) grown[i] = NULL;
+        g_backends = grown;
+        g_backend_cap = ncap;
     }
-    /* 复用槽的锁不得重 init（UB）：先保 mutex_inited 再清零。
-       在途操作理论上仍可能持旧 bk 指针（热重载与 serving 并发）——此前静态
-       数组同行为（memset 原位槽），语义未变；真正的安全由 clear 的 mux 摘除
-       + 调用失败码保障，条目内存本身永不释放。 */
-    bool was_inited = bk->mutex_inited;
-    memset(bk, 0, sizeof *bk);
-    bk->mutex_inited = was_inited;
+    FtpBackend* bk = calloc(1, sizeof *bk);
+    if (!bk) {
+        pthread_mutex_unlock(&g_backend_glock);
+        return -1;
+    }
+    g_backends[g_backend_slots++] = bk;
+    pthread_mutex_init(&bk->lock, NULL);
+    pthread_mutex_init(&bk->pool_lock, NULL);
+    pthread_mutex_init(&bk->stat_lock, NULL);
+    bk->mutex_inited = true;
     bk->in_use = true;
     bk->cfg = *cfg;
     snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
-    /* 互斥锁仅首次初始化（此前 memset 清标志导致每次重 init，属 UB，现修正） */
-    if (!bk->mutex_inited) {
-        pthread_mutex_init(&bk->lock, NULL);
-        pthread_mutex_init(&bk->pool_lock, NULL);
-        pthread_mutex_init(&bk->stat_lock, NULL);
-        bk->mutex_inited = true;
-    }
     /* 控制面复用器（epoll 事件线程 + CURLM 连接缓存） */
     FtpMux* mux = ftp_mux_new();
     if (!mux) {
@@ -1172,7 +1167,9 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
     /* 缓存命中：同目录后续页零网络（框架顺序翻页，命中率 100%）。
        空目录也缓存（entries NULL + count 0）：到末尾直接回 0，免重复 LIST。 */
     pthread_mutex_lock(&bk->lock);
-    if (bk->list_path && strcmp(bk->list_path, path) == 0) {
+    if (bk->list_path && strcmp(bk->list_path, path) == 0 &&
+        time(nullptr) - bk->list_ts <= FTP_LIST_CACHE_TTL) {
+        bk->list_ts = time(nullptr); /* 滑动续期：连续翻页期间不失效（序列稳定） */
         int n = ftp_list_serve_page(bk->list_entries, bk->list_count, bk->list_truncated,
                                     entries, max, offset);
         if (n > 0)
@@ -1301,13 +1298,17 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
     }
     free(wb.buf);
 
-    /* 安装：锁内复核（并发另一线程可能已装好同目录——复用已装，丢本次） */
+    /* 安装：锁内复核。命中"TTL 内的同路径缓存"说明是并发另一线程刚装好同目录
+       （本次是重复拉取）→ 复用已装、丢本次结果。注意判据必须带 TTL：只比路径的话，
+       本次因**过期**而重取的数据也会被这里丢掉、旧缓存原样留着，于是每次列举都白拉
+       一遍且永远看不到外部改动（TTL 形同虚设）。 */
     pthread_mutex_lock(&bk->lock);
     int n;
     const FtpListEntry* use_arr;
     size_t use_count;
     bool use_trunc;
-    if (bk->list_path && strcmp(bk->list_path, path) == 0) {
+    if (bk->list_path && strcmp(bk->list_path, path) == 0 &&
+        time(nullptr) - bk->list_ts <= FTP_LIST_CACHE_TTL) {
         free(arr);
         use_arr = bk->list_entries;
         use_count = bk->list_count;
@@ -1324,6 +1325,7 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
         bk->list_entries = arr;
         bk->list_count = count;
         bk->list_truncated = truncated;
+        bk->list_ts = time(nullptr);
         use_arr = arr;
         use_count = count;
         use_trunc = truncated;
@@ -2262,6 +2264,8 @@ int ftp_backend_truncate(const char* path, off_t size) {
             return -EIO;
         }
         ftp_stat_cache_clear(bk); /* STOR 空文件截断成功：整表失效 */
+        ftp_list_cache_clear(bk); /* 目录条目大小随之变化：LIST 缓存一并失效，
+                                     否则后续列举会把旧 size 回灌进 stat 缓存 */
         return 0;
     }
     return -EIO; // 非零截断暂不支持
