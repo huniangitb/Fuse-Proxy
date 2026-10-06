@@ -224,9 +224,18 @@ disable_warnings = [
 ]
 
 if enable_debug
-    opt_flags = ['-O0', '-g3', '-ggdb3', '-fno-omit-frame-pointer', '-fstack-protector-all', '-DDEBUG=1', '-DNSP_ENABLE_IO_LOG'] + disable_warnings
-    link_flags = (with_asan ? ['-fsanitize=address'] : []) + (with_ubsan ? ['-fsanitize=undefined'] : [])
+    # sanitizer 必须同时进**编译**与**链接**：只进 link_flags 会「链接了运行时
+    # 但一个函数都没插桩」——内存验收会给出错误安全感（旧实现即此缺陷）。
+    # 推荐写法：-Db_sanitize=address,undefined（Meson 内建，自动双端生效）；
+    # 本项目的 with_asan/with_ubsan 与之等价，二选一即可（重复叠加无害）。
+    sanitize_flags = (with_asan ? ['-fsanitize=address'] : []) + \
+                     (with_ubsan ? ['-fsanitize=undefined'] : [])
+    opt_flags = ['-O0', '-g3', '-ggdb3', '-fno-omit-frame-pointer', '-fstack-protector-all', '-DDEBUG=1', '-DNSP_ENABLE_IO_LOG'] + sanitize_flags + disable_warnings
+    link_flags = sanitize_flags
 else
+    if with_asan or with_ubsan
+        warning('with_asan/with_ubsan 仅在 -Denable_debug=true 下生效（当前为 release，已忽略）')
+    endif
     opt_flags = ['-O3', '-flto', '-fstack-protector-strong', '-ffunction-sections', '-fdata-sections'] + disable_warnings
     # Clang 特有优化
     if is_clang
