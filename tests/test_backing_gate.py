@@ -14,14 +14,18 @@ stat 他包 data 目录被判 ENOENT（直接访问 backing 则正常），且 S
   （整树仲裁）。REDIRECT 只看 virtual_prefix（ALLOW 跳过）。
 
 本用例临时编译实际源码（fw_rules.c 等，不经 Meson）并断言 16 组配置。
-前置：本机 cc、json-c；缺失则跳过（rc=0，沿用仓库约定）。
+前置：本机 cc、json-c；缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
 """
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=环境不具备跳过(gap)
+SKIP_RC = 77
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DRIVER = os.path.join(ROOT, "tests", "fixtures", "backing_gate_driver.c")
@@ -111,12 +115,15 @@ def pkg_config(flag):
 
 
 def main():
-    if shutil.which(os.environ.get("CC", "cc")) is None:
+    # CC 须按 shlex 拆词取可执行名：CC 常带参数（如内存验收时
+    # CC="cc -fsanitize=address,undefined"），直接 which 整个串会误判「缺少编译器」
+    cc = shlex.split(os.environ.get("CC", "cc"))
+    if shutil.which(cc[0]) is None:
         log("跳过：缺少 C 编译器")
-        return 0
+        return SKIP_RC
     if not pkg_config("--libs"):
         log("跳过：缺少 json-c")
-        return 0
+        return SKIP_RC
     tmpdir = "/tmp/fuse_gate_test"
     shutil.rmtree(tmpdir, ignore_errors=True)
     os.makedirs(tmpdir)
@@ -141,9 +148,9 @@ def main():
             hits += n
     if hits == 0:
         log("跳过：未定位 GNU 配置根常量")
-        return 0
+        return SKIP_RC
     exe = os.path.join(tmpdir, "gate_test")
-    cmd = [os.environ.get("CC", "cc"), "-std=c23", "-DTARGET_GNU=1",
+    cmd = cc + ["-std=c23", "-DTARGET_GNU=1",
            "-D_GNU_SOURCE", "-Wall", "-Wno-unused-parameter",
            "-I", dst_inc, "-I", os.path.join(ROOT, "include"),
            "-I", os.path.join(ROOT, "src", "daemon"), DRIVER] + \

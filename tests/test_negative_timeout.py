@@ -17,7 +17,7 @@ libfuse 的负缓存分支在 LOOKUP 未命中且 negative_timeout != 0 时，�
      （剥离不得破坏其余参数解析）。
 
 前置：GNU 产物 build_gnu/fuse_daemon、fusermount3、/dev/fuse；
-缺失则跳过（rc=0，沿用仓库约定）。
+缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
 """
 import os
 import shutil
@@ -25,6 +25,9 @@ import subprocess
 import sys
 import time
 import uuid
+
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=环境不具备跳过(gap)
+SKIP_RC = 77
 
 BASE = "/tmp/fuse_neg_test"
 MNT = BASE + "/mnt"
@@ -168,13 +171,13 @@ def scenario_attached_form():
 def main():
     if not os.path.exists(DAEMON):
         log(f"跳过：找不到 fuse_daemon 产物 {DAEMON}")
-        return 0
+        return SKIP_RC
     if not os.path.exists("/dev/fuse"):
         log("跳过：缺少 /dev/fuse（内核未启用 FUSE）")
-        return 0
+        return SKIP_RC
     if shutil.which("fusermount3") is None:
         log("跳过：缺少 fusermount3")
-        return 0
+        return SKIP_RC
     scenario_separate_form()
     scenario_attached_form()
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)

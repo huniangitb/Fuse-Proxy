@@ -30,7 +30,9 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 ## 测试流程（纯 Python，无 C 测试目标）
 
-**一条命令**：`python3 tests/run.py` —— 自动按「本次改动的文件 + 改动行里的符号」匹配下表，依次执行选中的套件并汇总退出码。`--list` 只看会跑哪些、`--all` 忽略映射跑全量、`--base <ref>` 换对比基线（默认 `HEAD`，即暂存+未暂存+未跟踪）、尾部直接给脚本名则跳过自动匹配。`--jobs N` 并行加速：仅 `PARALLEL_SAFE` 白名单内的无共享状态套件进线程池（挂载类恒串行，`test_rule_server.py` 因全局 `pkill log_monitor` 副作用被排除），其余仍串行。下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`，**两边须同步维护**；各脚本仍可单独直接跑。
+**一条命令**：`python3 tests/run.py` —— 自动按「本次改动的文件 + 改动行里的符号」匹配下表，依次执行选中的套件并汇总退出码。`--list` 只看会跑哪些、`--all` 忽略映射跑全量、`--base <ref>` 换对比基线（默认 `HEAD`，即暂存+未暂存+未跟踪）、尾部直接给脚本名则跳过自动匹配、`--strict` 为验收模式（跳过项计为失败）。`--jobs N` 并行加速：仅 `PARALLEL_SAFE` 白名单内的无共享状态套件进线程池（挂载类恒串行，`test_rule_server.py` 因全局 `pkill log_monitor` 副作用被排除），其余仍串行；`--jobs 1` 亦会跑 Tier0（不再整组漏跑）。下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`，**两边须同步维护**；各脚本仍可单独直接跑。
+
+**套件退出码约定（防假绿）**：`0`=通过、`1`=失败、`77`=环境不具备**整套**跳过（gap）、`78`=**部分子组**跳过（gap，如 `test_log_pipeline` 的类别段组、`test_rule_server` 的 SERVICE 段）、`127`=套件文件不存在（**计为失败**——拼错名字不得静默通过）。`run.py` 汇总区分 PASS/FAIL/跳过(gap)，**跳过不计通过**；验收须用 `--strict` 让 gap 变成失败。
 
 前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`GLOBAL_REPLACE_CTL`、`LOG_CTL`、`LOG_MONITOR`。
 
@@ -39,7 +41,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | 改动 | 测试 |
 |---|---|
 | 内建规则引擎（`src/daemon/fw_rules.c`）/ `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，含本地大目录断点续扫）、`test_config_snapshot.py`、`test_monitor_layers.py`（MONITOR 三层合并）、`test_decision_enforce.py`（决策强制单点 errno 矩阵）、`test_negative_timeout.py`（-o negative_timeout 熔断：未命中后建文件立即可见）、`test_readdir_skel_fallback.py`（lstat 拒绝时骨架名回退合成目录条目）、`test_backing_gate.py`（backing 仲裁门 16 项：全局 8 + 按路径 8） |
-| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（15，需 vsftpd；含 V5 分页 700 文件大目录列全）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd）、`test_ftp_parallel.py`（11，控制面并发/连接复用/延迟收敛/热重载竞态/断连熔断自愈，需 vsftpd；自起延迟中继，占用 127.0.0.1:2121；阶段 B 列 12 个不同目录以绕开 V5 LIST 缓存）、`test_ftp_truncate_list.py`（truncate 清 LIST 缓存：直编后端 + 桩 mux/curl 注入服务端状态，无网络——旧实现不清 LIST 时列举命中旧缓存把截断前 size 回灌 stat） |
+| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（15，需 vsftpd；含 V5 分页 700 文件大目录列全）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd）、`test_ftp_parallel.py`（11，控制面并发/连接复用/延迟收敛/热重载竞态/断连熔断自愈，需 vsftpd；自起延迟中继，占用 127.0.0.1:2121；阶段 B 列 12 个不同目录以绕开 V5 LIST 缓存）、`test_ftp_truncate_list.py`（truncate 清 LIST 缓存：直编后端 + 桩 mux/curl 注入服务端状态，无网络——旧实现不清 LIST 时列举命中旧缓存把截断前 size 回灌 stat）、`test_ftp_upload_lock.py`（**上传锁泄漏判别用例**：直编后端 + 桩 mux/curl，乱序改写→FLUSH 全量重传→trylock 断言锁未泄漏 + 看门狗断言续写/release 不挂起；旧实现上必失败） |
 | `src/modules/ftp/ftp_mux.c`（epoll + curl_multi 控制面复用器）或 `backend_rc_is_business`（业务 errno 豁免） | `test_ftp_parallel.py`（连接复用与延迟收敛）、`test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
 | `src/config/path_vars.c` | `test_path_vars.py` |
 | injector 目标判定 / 注入方法（`inject_target.c`、`--inject-method=v1\|v2\|v3`） | `test_inject_method.py`（31，v1/v2/v3 判定矩阵：v3 忽略 `GLOBAL_INJECT`/`SKIP_SYSTEM_APPS` 而段头 `OFF` 仍生效、派生标志、非法值拒绝）、`test_global_replace.py`（rootless unshare 沙箱内 v2 替换/还原/审查生命周期，userns 不可用自动跳过） |
@@ -58,7 +60,31 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 特殊前置：`test_ftp.py` 需本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写）；`test_config_snapshot.py`、`test_module_abi.py` 不经 Meson，直接用本机 `cc` 临时编译实际源码（前者另需 json-c），故不依赖 `build_gnu/`；
 
-失败处理：退出码 1 为失败（勿用管道吞退出码）；残留挂载点（`/tmp/fuse_proxy_test/mnt`、`/tmp/fuse_rules_test/mnt`、`/tmp/fuse_neg_test/mnt`）用 `fusermount3 -u` 清理后重跑；测试规则文件在 `/tmp/Namespace-Proxy/injector.conf`。
+失败处理：退出码 1 为失败（勿用管道吞退出码）；**跳过（77/78）不算通过**——验收用 `python3 tests/run.py --all --strict` 让 gap 计为失败，并逐条核对跳过原因；残留挂载点（`/tmp/fuse_proxy_test/mnt`、`/tmp/fuse_rules_test/mnt`、`/tmp/fuse_neg_test/mnt`）用 `fusermount3 -u` 清理后重跑；测试规则文件在 `/tmp/Namespace-Proxy/injector.conf`。
+
+内存验收：`meson setup build_asan2 -Dtarget_os=gnu -Denable_debug=true -Db_sanitize=address,undefined`（等价 `-Dwith_asan=true -Dwith_ubsan=true`）。**sanitizer 标志必须同时进编译与链接**——只进 `link_flags` 会「链接了运行时但零插桩」，核对方式：`compile_commands.json` 里每条命令都含 `-fsanitize`（`-Dwith_asan/with_ubsan` 仅在 `enable_debug=true` 下生效，release 下给出 warning 并忽略）。
+
+**环境坑（WorkBuddy/CodeBuddy CLI 宿主）**：这类宿主的 shell 会注入 `PYTHONPATH=<…>/cli/vendor/shim`（其 `sitecustomize.py` 把 `os.unlink`/`shutil.rmtree` 重定向到回收站）与 `BASH_ENV=<…>/shell-runtime-bash-env.sh`（把 `safe-bin` 垫到 `PATH` 最前）。这会让 `test_module_circuit`（删 `/var/fuse-proxy/log/module_errors.log`）、`test_inject_mount_env`（沙箱内批量删除）等**假失败**（`PermissionError: /.Trash-1000`）。跑测试须剥掉这两项：
+
+```
+env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin" python3 tests/run.py --all
+```
+
+### 分层验收流程（尽量贴近 Android）
+
+- **L0 静态/契约**（无挂载无网络，可并行）：`config_snapshot`、`monitor_layers`、`path_vars`、`pending_close`、`cfg_watch`、`rule_file_lock`、`ns_combined_rollback`、`reaped_managed`、`ftp_read_restart`、`ftp_truncate_list`、`ftp_upload_lock`、`module_abi`、`backing_gate`。
+- **L1 GNU 真实 FUSE**（串行）：`functional`、`rules`、`decision_enforce`、`negative_timeout`、`readdir_skel_fallback`、`modules`、`module_circuit`、`backend_lifecycle`、`ftp*`。
+- **L2 Android 拓扑仿真**：`inject_mount_env`（v1/v2/v3 全生命周期 + 宿主 mountinfo 前后比对）、`global_replace`——各自在 rootless unshare 沙箱内，宿主零污染。
+- **L3 真实 Android 内核/权限**（需 emulator/AVD 或真机；本机无，未做）：SELinux/Bionic/vold/FUSE-BPF/Zygisk 双 ABI/多用户。
+- **L4 设备最终验收**：仅授权后经 `scripts/adb-sh.sh`（强制降权 `su shell`、`SAFE_ROOT` 合成 fixture）。
+
+**验收标准**（全绿方可提交）：
+
+1. GNU 与 Android 交叉构建零**新增**告警、产物齐全（含 `src/zygisk/*.so` 的 `readelf -d` 无 `libc++_shared.so`）。
+2. `python3 tests/run.py --all --strict` 退出码 0：跳过项（77/78）为 0，或逐条记录原因并确认非产品缺陷。
+3. **判别性**：新增回归用例必须在旧实现上失败（本仓库套路：`FTP_BACKEND_SRC=<git show HEAD:旧副本>` 复验，或直编旧源码副本）。
+4. 隔离证据：L2 套件宿主 `mountinfo` 前后零变化；挂载未消失前禁删 fixture。
+5. L2 通过 ≠ Android 运行时已验证——SELinux/Bionic/vold/Zygisk/多用户须 L3–L4 覆盖。
 
 ## 设备操作（生产级隔离，血的教训）
 

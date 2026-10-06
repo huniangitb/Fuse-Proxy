@@ -20,6 +20,9 @@ import os, sys, time, subprocess, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CTL = os.environ.get("GLOBAL_REPLACE_CTL") or os.path.join(ROOT, "build_gnu", "global_replace_ctl")
 
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=环境不具备跳过(gap)
+SKIP_RC = 77
+
 PASS = 0
 FAIL = 0
 ERRORS = []
@@ -75,7 +78,7 @@ def is_target(conf, method, pkg, uid, pid=4321, ipc=1):
 def main():
     if not os.path.isfile(CTL):
         log(f"SKIP: 找不到测试驱动 {CTL}（先执行 scripts/build.sh）")
-        return 0
+        return SKIP_RC
 
     tmp = tempfile.mkdtemp(prefix="inject_method_test_")
     # A：GLOBAL_INJECT ON / SKIP_SYSTEM_APPS ON + 应用段显式 OFF

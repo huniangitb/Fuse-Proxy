@@ -27,6 +27,7 @@ common.h 仍直接定义 CONFIG_DIR 字面量的旧布局。
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -91,7 +92,7 @@ def prepare_include(tmpdir, config_dir):
 def compile_binary(tmpdir, inc_dir):
     exe = os.path.join(tmpdir, "cfg_snapshot_test")
     cmd = [
-        os.environ.get("CC", "cc"),
+        *shlex.split(os.environ.get("CC", "cc")),
         "-std=c23",
         "-DTARGET_GNU=1",
         "-D_GNU_SOURCE",

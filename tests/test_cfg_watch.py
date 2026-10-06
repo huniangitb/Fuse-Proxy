@@ -16,6 +16,7 @@
 """
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -37,7 +38,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="cfgwatch_build_") as tmpdir:
         exe = os.path.join(tmpdir, "cfg_watch_test")
         cmd = [
-            os.environ.get("CC", "cc"), "-std=c23", "-D_GNU_SOURCE",
+            *shlex.split(os.environ.get("CC", "cc")), "-std=c23", "-D_GNU_SOURCE",
             "-Wall", "-Wextra", "-Wno-unused-parameter",
             "-I", os.path.join(ROOT, "src", "daemon"), "-I", os.path.join(ROOT, "include"),
             DRIVER, *SOURCES, "-o", exe, "-pthread",

@@ -9,6 +9,7 @@
     python3 tests/run.py --base <ref>    # 与指定提交对比（默认 HEAD，即未提交改动）
     python3 tests/run.py test_rules.py …  # 显式指定套件（同时跳过自动匹配）
     python3 tests/run.py --jobs 4        # Tier 0 白名单套件并行，其余仍串行
+    python3 tests/run.py --strict        # 验收模式：跳过项（gap）计为失败
 
 改动来源：`git diff --name-only <base>` + 未跟踪文件（新文件按整体内容匹配符号）。
 映射规则：每个条目给出 **文件路径子串**（任一命中即选中）与 **符号**（该符号出现在
@@ -16,6 +17,18 @@
 仍会跑「通用回归」基线——它对所有改动恒定生效。
 
 对应 AGENTS.md「测试流程」映射表；两边需同步维护。
+
+退出码约定（防「假绿」）：
+  0   = 全部通过
+  1   = 存在失败，或 --strict 下存在跳过/部分跳过
+  77  = 单套件「环境不具备，整套跳过」（gap，不计通过）
+  78  = 单套件「部分子组跳过」（跑了一部分，仍有子组 gap；不计通过）
+  127 = 套件文件不存在（计为失败——此前按「跳过」处理，拼错名字也 rc=0）
+
+宿主环境坑：WorkBuddy/CodeBuddy CLI 会注入 PYTHONPATH（sitecustomize 把
+unlink/rmtree 重定向到回收站）与 BASH_ENV（safe-bin 垫 PATH），会让删文件的
+套件假失败。跑测试请剥掉：
+  env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin" python3 tests/run.py --all
 """
 import argparse
 import concurrent.futures
@@ -43,10 +56,11 @@ SUITE_MAP = [
       "fw_data_mediation_required", "fw_backing_mediation_required_for"),
      "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
 
-    (("test_ftp.py", "test_ftp_read_restart.py", "test_ftp_truncate_list.py"),
+    (("test_ftp.py", "test_ftp_read_restart.py", "test_ftp_truncate_list.py",
+      "test_ftp_upload_lock.py"),
      ("src/modules/ftp/",),
      ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read",
-      "ftp_backend_truncate", "ftp_list_cache_clear"),
+      "ftp_backend_truncate", "ftp_list_cache_clear", "ftp_backend_upload"),
      "src/modules/ftp/ 或框架后端分派"),
 
     (("test_ftp_parallel.py",),
@@ -247,6 +261,7 @@ PARALLEL_SAFE = frozenset({
     "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权
     "test_reaped_managed.py",     # cc 直编收尸留档 + 真实 fork 子进程，无共享状态
     "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
+    "test_ftp_upload_lock.py",    # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
@@ -262,6 +277,39 @@ TIER_EXCLUSIVE = frozenset({
 # Tier 1/2（挂载/独占类）恒串行，不受 --jobs 影响。
 DEFAULT_JOBS = min(4, os.cpu_count() or 1)
 MAX_JOBS = 8
+
+# 单套件退出码约定（见模块 docstring）：77 = 环境不具备整套跳过（gap），
+# 78 = 部分子组跳过（gap），127 = 套件文件不存在（计为失败，不得静默当跳过）。
+SKIP_RC = 77
+GAP_RC = 78
+MISSING_RC = 127
+
+
+def classify(rc):
+    """把套件退出码归入 PASS / SKIP / GAP / FAIL 四态。"""
+    if rc == 0:
+        return "PASS"
+    if rc == SKIP_RC:
+        return "SKIP"
+    if rc == GAP_RC:
+        return "GAP"
+    return "FAIL"
+
+
+def is_gap(rc):
+    """SKIP/GAP 均为「不计通过」的缺口。"""
+    return classify(rc) in ("SKIP", "GAP")
+
+
+def gap_note(rc):
+    kind = classify(rc)
+    if kind == "SKIP":
+        return "  ← 环境不具备，整套跳过=gap，不计通过"
+    if kind == "GAP":
+        return "  ← 部分子组跳过=gap，不计通过"
+    if rc == MISSING_RC:
+        return "  ← 套件文件不存在"
+    return ""
 
 
 def tier_of(name):
@@ -279,11 +327,13 @@ def run_suite(name, capture=False):
     capture=False（串行默认）：子进程输出直接透传终端，行为与旧版一致。
     capture=True（并行用）：输出截获后由调用方在任务完成时统一打印，
     避免多套件刷屏交错；退出码原样回传（不用管道吞退出码）。
+    套件文件不存在返回 MISSING_RC（计为失败）——此前返回 None 被当作
+    「跳过」，拼错套件名也会 rc=0（假绿）。
     """
     path = os.path.join(TESTS, name)
     if not os.path.exists(path):
-        print(f"⚠ 缺少 {name}，跳过")
-        return None, 0.0, ""
+        print(f"❌ 套件不存在：{name}（计为失败；拼写错误不会被静默跳过）")
+        return MISSING_RC, 0.0, ""
     t0 = time.time()
     if capture:
         r = subprocess.run([sys.executable, path], cwd=ROOT,
@@ -306,13 +356,13 @@ def run_parallel(safe, jobs):
         for fut in concurrent.futures.as_completed(futs):
             s = futs[fut]
             rc, dt, out = fut.result()
-            if rc is None:
-                continue
             print(f"\n{'━' * 60}\n▶ {s}（并行，{dt:.1f}s）\n{'━' * 60}",
                   flush=True)
             print(out, end="", flush=True)
-            if rc != 0:
+            if classify(rc) == "FAIL":
                 print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
+            elif is_gap(rc):
+                print(f"\n⏭ {s} 跳过（退出码 {rc}，gap 不计通过）")
             done[s] = (rc, dt)
     return done
 
@@ -328,6 +378,8 @@ def main():
                     help=f"Tier 0 套件（PARALLEL_SAFE 白名单）并行worker数，"
                          f"默认{DEFAULT_JOBS}（上限{MAX_JOBS}）；"
                          "Tier 1/2（挂载/独占类）恒串行")
+    ap.add_argument("--strict", action="store_true",
+                    help="验收模式：跳过项（环境不具备，gap）计为失败，rc=1")
     args = ap.parse_args()
     if args.jobs > MAX_JOBS:
         print(f"⚠ --jobs {args.jobs} 超过上限 {MAX_JOBS}，钳制为 {MAX_JOBS}")
@@ -363,34 +415,50 @@ def main():
         return 0
 
     results = []
-    if args.jobs > 1 and t0:
+    # Tier 0 恒执行（此前 `if args.jobs > 1 and t0` 使 --jobs 1 时整组 Tier0
+    # 被漏跑，且 t1+t2 为空时汇总仍「共 0、通过」、rc=0）。--jobs 1 走串行分支
+    # 以保留输出透传；>1 时进线程池并行。
+    if t0 and args.jobs > 1:
         # 先并行 Tier 0，再串行 Tier 1，最后独占 Tier 2：挂载类/独占类之间
         # 仍保持选中顺序语义，且独占类（log_monitor/vsftpd/userns）不受
         # 并行任务干扰，收尾时系统 log_monitor 已还原
         para = run_parallel(t0, args.jobs)
-        by_name = dict(para)
-        for s in suites:
-            if s in by_name:
-                rc, dt = by_name[s]
-                results.append((s, rc, dt))
+        for s in t0:
+            rc, dt = para[s]
+            results.append((s, rc, dt))
+    else:
+        for s in t0:
+            rc, dt, _ = run_suite(s)
+            results.append((s, rc, dt))
+            if classify(rc) == "FAIL":
+                print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
+            elif is_gap(rc):
+                print(f"\n⏭ {s} 跳过（退出码 {rc}，gap 不计通过）")
     for s in t1 + t2:
         rc, dt, _ = run_suite(s)
-        if rc is None:
-            continue
         results.append((s, rc, dt))
-        if rc != 0:
+        if classify(rc) == "FAIL":
             print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
+        elif is_gap(rc):
+            print(f"\n⏭ {s} 跳过（退出码 {rc}，gap 不计通过）")
 
     print(f"\n{'═' * 60}")
-    failed = [r for r in results if r[1] != 0]
-    print(f"测试汇总 | ✅ {len(results) - len(failed)} 通过 | ❌ {len(failed)} 失败 | 共 {len(results)}")
+    passed = [r for r in results if classify(r[1]) == "PASS"]
+    gaps = [r for r in results if is_gap(r[1])]
+    failed = [r for r in results if classify(r[1]) == "FAIL"]
+    print(f"测试汇总 | ✅ {len(passed)} 通过 | ❌ {len(failed)} 失败 | "
+          f"⏭ {len(gaps)} 跳过(gap) | 共 {len(results)}")
     for s, rc, dt in results:
-        mark = "✅" if rc == 0 else "❌"
-        print(f"  {mark} {s:<34} {dt:6.1f}s  rc={rc}")
+        mark = {"PASS": "✅", "SKIP": "⏭", "GAP": "⏭", "FAIL": "❌"}[classify(rc)]
+        print(f"  {mark} {s:<34} {dt:6.1f}s  rc={rc}{gap_note(rc)}")
+    if gaps:
+        print("⚠ 跳过项（gap，不计通过）：" + "、".join(s for s, _, _ in gaps))
     if failed:
         print("存在失败套件——按 AGENTS.md 要求全绿方可提交")
+    if gaps and args.strict:
+        print("--strict（验收模式）：跳过项计为失败")
     print("═" * 60)
-    return 1 if failed else 0
+    return 1 if (failed or (args.strict and gaps)) else 0
 
 
 if __name__ == "__main__":

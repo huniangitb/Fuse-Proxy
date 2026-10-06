@@ -22,6 +22,7 @@
 """
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="fdq_test_") as tmpdir:
         exe = os.path.join(tmpdir, "fdq_test")
         cmd = [
-            os.environ.get("CC", "cc"), "-std=c23", "-D_GNU_SOURCE",
+            *shlex.split(os.environ.get("CC", "cc")), "-std=c23", "-D_GNU_SOURCE",
             "-Wall", "-Wextra", "-Wno-unused-parameter",
             "-I", QUEUE_INC,
             DRIVER, QUEUE_SRC,
