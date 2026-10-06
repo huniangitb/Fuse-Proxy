@@ -161,12 +161,14 @@ static void readdir_join(char* dst, size_t cap, const char* base, const char* na
 /* 虚拟目录判空（原 vfs_is_virtual_dir_empty 的分派器版）：
    - 虚拟祖先 → 视为非空（拒绝删除）
    - 否则扫描真实目录，跳过规则隐藏/重定向子项（与 readdir 过滤一致） */
-static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
-                                 const char* current_pkg, int path_user_id, uid_t uid) {
+static bool fw_virtual_dir_empty(const char* fuse_path, const char* sub_path,
+                                 const char* real_path, const char* current_pkg, int path_user_id,
+                                 uid_t uid) {
     if (uid != 0) {
         struct fuse_context* c = fuse_get_context();
+        /* probe 收带 <uid>/ 层的原始路径（同 readdir 侧），否则探针早退、过滤失效 */
         NspQueryCtx q0 = {
-            .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = sub_path};
+            .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = fuse_path};
         NspProbeResult r0;
         memset(&r0, 0, sizeof r0);
         fw_rules_probe(&q0, &r0);
@@ -186,14 +188,20 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
        readdir/scan_local 同一合成语义，免 "/a//name" 双斜杠哈希漂移 */
     char norm_base[2048];
     readdir_base_normalize(norm_base, sizeof norm_base, sub_path);
+    char norm_fuse_base[2048];
+    readdir_base_normalize(norm_fuse_base, sizeof norm_fuse_base, fuse_path);
     while ((de = readdir(dp)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
         if (path_contains_invalid_chars(de->d_name)) continue;
         char item_sub_path[2048];
         int w = snprintf(item_sub_path, sizeof item_sub_path, "%s/%s", norm_base, de->d_name);
         if (w < 0 || (size_t)w >= sizeof item_sub_path) continue; /* 超长 fail-closed：跳过该条目 */
+        char item_fuse_path[2048];
+        int wf = snprintf(item_fuse_path, sizeof item_fuse_path, "%s/%s", norm_fuse_base, de->d_name);
+        if (wf < 0 || (size_t)wf >= sizeof item_fuse_path) continue; /* 同上：超长跳过 */
         if (uid != 0) {
-            /* 轻量探测；user_id 目录条目豁免 redirect_target（与 readdir 一致） */
+            /* 轻量探测；user_id 目录条目豁免 redirect_target（与 readdir 一致）。
+               探针入参用原始 FUSE 路径（带 <uid>/ 层），uid 目录判定用剥层形式 */
             bool uid_dir = false;
             if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
                 const char* d = item_sub_path + 1;
@@ -202,7 +210,7 @@ static bool fw_virtual_dir_empty(const char* sub_path, const char* real_path,
             }
             struct fuse_context* c = fuse_get_context();
             NspQueryCtx iq = {
-                .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_sub_path};
+                .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_fuse_path};
             NspProbeResult ir;
             memset(&ir, 0, sizeof ir);
             fw_rules_probe(&iq, &ir);
@@ -949,7 +957,7 @@ static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
    lstat + filler，并记录 Android/data/obb/自身包名骨架项是否已出现。
    dp 由调用方打开并负责关闭。返回 false = filler 缓冲已满，须立即结束。 */
 static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
-    char item_sub_path[2048], item_real_path[2048];
+    char item_sub_path[2048], item_fuse_path[2048], item_real_path[2048];
     /* 循环外复用查询上下文，只改 path——省每条目结构初始化 */
     NspQueryCtx probe_q = {
         .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = NULL};
@@ -961,6 +969,14 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         char norm_base[2048];
         readdir_base_normalize(norm_base, sizeof norm_base, d->sub_path);
         readdir_join(item_sub_path, sizeof item_sub_path, norm_base, de->d_name);
+        /* probe 的入参契约是**带 <uid>/ 层的原始 FUSE 路径**（引擎据此剥层后匹配，
+           见 fw_rules.h 的 NspQueryCtx 注释与 fw_rules_path_has_uid_layer）。此前传
+           的是剥过层的 item_sub_path，探针因"无用户层"直接早退（valid=false 即不过
+           滤）——于是 HIDE 的条目照旧出现在父目录列表里，stat 却 ENOENT（隐藏不彻底，
+           正是下方注释想修的反例）。剥层形式仍保留给 uid 目录判定用。 */
+        char norm_fuse_base[2048];
+        readdir_base_normalize(norm_fuse_base, sizeof norm_fuse_base, d->fuse_path);
+        readdir_join(item_fuse_path, sizeof item_fuse_path, norm_fuse_base, de->d_name);
         if (path_contains_invalid_chars(de->d_name)) continue;
         /* 子项轻量探测（probe）：只判 hidden/redirect_target，不构建真实路径、
            不触发 sandbox 目录创建（无模块时直通不过滤）。
@@ -975,7 +991,7 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
             while (isdigit((unsigned char)*dg)) dg++;
             uid_dir = (*dg == '\0' || *dg == '/');
         }
-        probe_q.path = item_sub_path;
+        probe_q.path = item_fuse_path;
         NspProbeResult ir;
         memset(&ir, 0, sizeof ir);
         fw_rules_probe(&probe_q, &ir);
@@ -1427,7 +1443,7 @@ static int vfs_rmdir(const char* path) {
     vfs_log_io(current_pkg, ctx->uid, "RMDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                monitor_on);
     if (rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET) {
-        if (!fw_virtual_dir_empty(sub_path, p, current_pkg, path_user_id, ctx->uid)) {
+        if (!fw_virtual_dir_empty(path, sub_path, p, current_pkg, path_user_id, ctx->uid)) {
             log_fuse_err("RMDIR_NOT_EMPTY", path, ENOTEMPTY);
             VFS_RETURN(-ENOTEMPTY);
         }

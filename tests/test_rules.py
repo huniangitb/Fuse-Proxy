@@ -77,6 +77,11 @@ def run(conf,checks,label=""):
                     # exp=="" 表示期望目录为空
                     passed = (items == []) if exp == "" else (exp in items)
                     ok(name) if passed else fail(name,f"entries={items}")
+                elif want=="NOT_LISTED":
+                    # 断言该名字**不**出现在目录列举里（HIDE 必须隐藏彻底：
+                    # 旧实现 probe 传剥层路径而早退，条目照旧列出、stat 却 ENOENT）
+                    items=sorted(os.listdir(fp))
+                    ok(name) if c[3] not in items else fail(name,f"{c[3]} 出现在列表 {items}")
                 elif want=="LIST_ALL":
                     # exp=期望全集（set）：断点续扫回归——必须一字不差（含裸条目数）
                     raw=os.listdir(fp); items=set(raw); exp=set(c[3])
@@ -343,6 +348,16 @@ PRIO_X=/PrioB/
 REDIRECT /prios/ $PRIO_X""", [
         ("P4:类别段变量规则压过GLOBAL静态","0/prios/prio.txt","prio-b"),
     ],"24.作用域优先-类别变量 vs GLOBAL静态")
+
+    # HIDE 必须隐藏彻底：条目不能只"打不开"，还必须**不出现在父目录列举**里
+    # （probe 入参是带 <uid>/ 层的原始 FUSE 路径；旧实现传剥层路径让探针直接早退）
+    run("""[GLOBAL] MONITOR OFF
+HIDE /Download/Pics/
+HIDE /Download/*.mp3""", [
+        ("H1:静态 HIDE 条目不在父目录列举","0/Download","NOT_LISTED","Pics"),
+        ("H2:通配 HIDE 条目不在父目录列举","0/Download/Music","NOT_LISTED","song.mp3"),
+        ("H3:未被隐藏的兄弟条目仍在","0/Download","EXISTS"),
+    ],"25.HIDE 条目不得出现在父目录列举")
 
     # cleanup
     subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)

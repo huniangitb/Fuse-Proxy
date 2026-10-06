@@ -171,7 +171,7 @@ FUSE 回调（如 getattr）
 
 ### 4.4 跨应用隔离
 
-`br_is_other_app_pkg` 判定应用访问 `/Android/data|obb/<其他包>/`。隔离**只作用于列举**——readdir 条目级 probe 过滤；resolve（getattr/open）**不判隐藏**，已知路径的文件可正常打开（修复 MT 管理器跨应用列表可见但打开 ENOENT）。该标志只存在于 `NspProbeResult`（`is_other_app_pkg`），`NspPathDecision` 不携带。`CONFIG_DIR` 下所有访问无条件隐藏。
+`br_is_other_app_pkg` 判定应用访问 `/Android/data|obb/<其他包>/`。隔离**只作用于列举**——readdir 条目级 probe 过滤；resolve（getattr/open）**不判隐藏**，已知路径的文件可正常打开（修复 MT 管理器跨应用列表可见但打开 ENOENT）。**probe 的入参契约是带 `<uid>/` 层的原始 FUSE 路径**（引擎自行剥层后匹配，见 `NspQueryCtx` 注释）：两个调用点（readdir 本地扫描、虚拟目录判空）若传剥过层的路径，探针会因「无用户层」直接早退，等于列举侧完全不过滤——HIDE 条目照旧列出而 stat 报 ENOENT（`test_rules.py` §25 守护）。该标志只存在于 `NspProbeResult`（`is_other_app_pkg`），`NspPathDecision` 不携带。`CONFIG_DIR` 下所有访问无条件隐藏。
 
 ### 4.5 决策强制（框架单点）
 
