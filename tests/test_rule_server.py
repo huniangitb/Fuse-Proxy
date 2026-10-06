@@ -337,13 +337,14 @@ def check(proc, sock_name, conf_dir):
     expect("内建 MONITOR switch 1:1",
            any(t["type"] == "MONITOR" and t["format"] == "switch" and t["argc_min"] == 1
                and t["argc_max"] == 1 for t in types), types)
-    expect("内建 global_only 仅 GLOBAL_INJECT/SKIP_SYSTEM_APPS",
-           {t["type"] for t in types if t["global_only"]} == {"GLOBAL_INJECT", "SKIP_SYSTEM_APPS"},
+    expect("内建 global_only 仅 GLOBAL_INJECT/SKIP_SYSTEM_APPS/SANDBOX_DIR",
+           {t["type"] for t in types if t["global_only"]} ==
+           {"GLOBAL_INJECT", "SKIP_SYSTEM_APPS", "SANDBOX_DIR"},
            types)
-    expect("内建类型 8 个且全部标 builtin",
+    expect("内建类型 9 个且全部标 builtin",
            {t["type"] for t in types if t["builtin"]} ==
            {"HIDE", "RO", "REDIRECT", "ALLOW", "MONITOR", "SANDBOX",
-            "GLOBAL_INJECT", "SKIP_SYSTEM_APPS"}, types)
+            "GLOBAL_INJECT", "SKIP_SYSTEM_APPS", "SANDBOX_DIR"}, types)
 
     # 1.1 多语言描述：默认（不传 lang）回传中文 desc；lang=en 回传英文 desc；
     #     同时含 desc_map 全语言映射与 argc 参数约束
@@ -687,6 +688,70 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "FTP_LIST"})
     expect("FTP_REMOVE 后剩一条", len(r["data"]["servers"]) == 1
            and r["data"]["servers"][0]["name"] == "云盘", r)
+
+    # ---- EXPORT_LOGS：一键导出日志（落点/私有性/打包内容/prune 收敛） ----
+    import tarfile as _tarfile
+    log_dir = os.path.join(conf_dir, "log")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "io.log"), "w", encoding="utf-8") as f:
+        f.write("1:export_probe io line\n")
+    exp_dir = os.path.join(conf_dir, "export")
+
+    r = send_cmd(proc, sock_name, {"cmd": "EXPORT_LOGS"})
+    ok = r.get("status") == "ok"
+    expect("EXPORT_LOGS 成功", ok, r)
+    pkg = r["data"]["file"] if ok else ""
+    # 落点必须在 <CONFIG_DIR>/export（root 私有），不得落在共享存储 STORAGE_BASE
+    expect("EXPORT_LOGS 落点在 <CONFIG_DIR>/export",
+           bool(pkg) and pkg.startswith(exp_dir + os.sep)
+           and os.path.basename(pkg).startswith("log_export_")
+           and pkg.endswith(".tar.gz"), pkg)
+    expect("EXPORT_LOGS 产物存在且非空", bool(pkg) and os.path.isfile(pkg)
+           and os.path.getsize(pkg) > 0, pkg)
+    expect("EXPORT_LOGS 导出目录 0700（root 私有）",
+           os.path.isdir(exp_dir) and (os.stat(exp_dir).st_mode & 0o777) == 0o700,
+           oct(os.stat(exp_dir).st_mode & 0o777) if os.path.isdir(exp_dir) else "missing")
+    names = []
+    try:
+        with _tarfile.open(pkg, "r:gz") as tf:
+            names = tf.getnames()
+    except Exception as e:  # noqa: BLE001
+        names = [f"<open failed: {e}>"]
+    expect("EXPORT_LOGS 包内含 log/io.log",
+           any(n.endswith("io.log") for n in names), names)
+
+    # 连续两次导出：只保留最新一份（旧实现同秒互相覆盖 / 留两份）
+    r2 = send_cmd(proc, sock_name, {"cmd": "EXPORT_LOGS"})
+    expect("EXPORT_LOGS 第二次成功", r2.get("status") == "ok", r2)
+    pkgs = sorted(n for n in os.listdir(exp_dir)
+                  if n.startswith("log_export_") and n.endswith(".tar.gz"))
+    expect("EXPORT_LOGS 只保留最新一份", len(pkgs) == 1, pkgs)
+    expect("EXPORT_LOGS 保留的是最新那份",
+           len(pkgs) == 1 and pkgs[0] == os.path.basename(r2["data"]["file"]), pkgs)
+
+    # 预置历史堆积（模拟多次导出遗留的旧包）→ 一次调用即收敛到 1 份
+    stale_names = []
+    for i in range(3):
+        sn = f"log_export_1000000000_1_{i}.tar.gz"
+        stale_names.append(sn)
+        sp = os.path.join(exp_dir, sn)
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("stale")
+        os.utime(sp, (1000 + i, 1000 + i))  # 旧 mtime，确保被当作最旧
+    r3 = send_cmd(proc, sock_name, {"cmd": "EXPORT_LOGS"})
+    expect("EXPORT_LOGS 第三次成功", r3.get("status") == "ok", r3)
+    left = sorted(n for n in os.listdir(exp_dir)
+                  if n.startswith("log_export_") and n.endswith(".tar.gz"))
+    expect("EXPORT_LOGS 一次调用清空历史堆积（收敛到 1 份）", len(left) == 1, left)
+    expect("EXPORT_LOGS 历史旧包全部删除",
+           not any(n in left for n in stale_names), left)
+
+    # 日志目录缺失 → 明确失败（不生成空包）
+    shutil.rmtree(log_dir, ignore_errors=True)
+    r4 = send_cmd(proc, sock_name, {"cmd": "EXPORT_LOGS"})
+    expect("EXPORT_LOGS 日志目录缺失时拒绝",
+           r4.get("status") == "error", r4)
+    os.makedirs(log_dir, exist_ok=True)
 
     # ---- STATUS ----
     r = send_cmd(proc, sock_name, {"cmd": "STATUS"})

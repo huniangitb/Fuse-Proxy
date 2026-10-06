@@ -17,6 +17,8 @@
  *   RELOAD                        向 injector 发送 SIGHUP 触发配置重载
  *   STOP                          向 injector 发送 SIGTERM 停止注入服务
  *   STATUS                        系统状态概览
+ *   EXPORT_LOGS                   把 <CONFIG_DIR>/log 打包到 <CONFIG_DIR>/export/
+ *                                 （root 私有，只保留最新一份；见函数头安全说明）
  *   QUIT                          退出本守护进程（测试/管理用）
  *
  * 双平台适配：路径全部基于 CONFIG_DIR（Android=/data/Namespace-Proxy，
@@ -36,6 +38,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <ctype.h>
 #include <errno.h>
@@ -215,7 +219,14 @@ static const char BUILTIN_RULE_TYPES[] =
     "format = switch\n"
     "global-only = true\n"
     "desc = 跳过系统应用\n"
-    "desc.en = Skip system apps switch\n";
+    "desc.en = Skip system apps switch\n"
+    "\n"
+    "[SANDBOX_DIR]\n"
+    "format = path\n"
+    "argc = 1\n"
+    "global-only = true\n"
+    "desc = 沙盒目录名（单级目录名，覆盖默认 sandbox）\n"
+    "desc.en = Sandbox dir name (overrides default \"sandbox\")\n";
 
 /* 解析内嵌声明文本（定义见 conf 解析段）：前向声明供 rule_types_init 使用，
    与模块 .rules 文件走同一套行解析与合并语义 */
@@ -818,6 +829,9 @@ static void reply_error(int fd, const char* cmd, const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    /* 错误应答单点留痕：前端发来无法接受的参数 / 规则写入失败等均经此应答，
+       以警告级别落日志（含命令与原因），便于从 sys.log 侧审计前端误用 */
+    LOG_WRN("规则请求被拒绝: cmd=%s 原因=%s", cmd ? cmd : "?", msg);
     reply_json(fd, "error", cmd, NULL, msg);
 }
 
@@ -1745,14 +1759,19 @@ static int stop_proc(int pid, int sig) {
     return proc_alive(pid) ? -1 : 0;
 }
 
-/* 启动一个守护进程：fork+exec（setsid 脱离会话，防 shell 退出连带 kill）。
-   argv 以 NULL 结尾；返回子进程 pid，失败返回 -1 */
+/* 启动一个守护进程：双 fork + exec（setsid 脱离会话，防 shell 退出连带 kill）。
+   双 fork 让实际守护进程被 init 收养，rule_server 只回收中间子进程——避免
+   守护进程退出后在其下留僵尸（§A7-1）。
+   argv 以 NULL 结尾；成功返回 >0，失败返回 -1 */
 static int spawn_daemon(const char* path, char* const argv[]) {
     if (!path || access(path, X_OK) != 0) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         setsid();
+        pid_t pid2 = fork();
+        if (pid2 < 0) _exit(127);
+        if (pid2 > 0) _exit(0); /* 中间子进程退出，孙进程由 init 收养 */
         int nullfd = open("/dev/null", O_RDWR);
         if (nullfd >= 0) {
             dup2(nullfd, 0);
@@ -1763,6 +1782,9 @@ static int spawn_daemon(const char* path, char* const argv[]) {
         execv(path, argv);
         _exit(127);
     }
+    /* 回收中间子进程（不阻塞：其 setsid+fork 后立即退出） */
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     return (int)pid;
 }
 
@@ -1922,6 +1944,216 @@ static void handle_status(int fd, json_object* req) {
     json_object_object_add(data, "injector", inj);
     json_object_object_add(data, "global", build_global_json());
     reply_ok(fd, "STATUS", data);
+}
+
+/* ==================== EXPORT_LOGS：一键导出日志 ====================
+   把 <CONFIG_DIR>/log 整目录 tar.gz 到 <CONFIG_DIR>/export/（root 私有 0700），
+   只保留最新 LOG_EXPORT_KEEP 份；供前端经 UDS 取回或 root 侧显式 copy-out。
+
+   落点为何**不在**共享存储（review-findings §A7-0 / §A7-4）：
+   1. io.log 记录全部应用的文件访问路径，投递到 /sdcard 等于对所有有存储权限的
+      应用公开，与本栈既有脱敏姿态（ftp.conf 密码只写不读、nsp_ini_save 收紧
+      0600）方向相反；
+   2. /sdcard 由本 FUSE 承载、任意应用可写，且旧实现的文件名只含 time(NULL)
+      完全可预测，root 身份的 tar/chmod 会跟随应用预置的软链覆盖 injector.conf
+      或模块 .so 并放宽其权限——在本栈上是**确定的提权原语**。
+   故落点搬到 root 私有目录，创建带 O_CREAT|O_EXCL|O_NOFOLLOW，权限经 fchmod 施加。
+
+   执行模型：同步等待但**有界**——WNOHANG 轮询 + 硬超时 SIGKILL，避免 tar 卡在
+   慢存储时唯一 epoll 事件循环无限停摆（SIGTERM 亦可在轮询间隙生效）。 */
+#define LOG_EXPORT_KEEP       1
+#define LOG_EXPORT_TIMEOUT_MS 10000
+
+/* 在候选路径中挑第一个可执行的 tar（Android /system/bin、通用 /bin、/usr/bin）。
+   绝对路径直接 execl，不依赖继承 PATH（与旧实现的口径差异见 §A7-6）。 */
+static const char* export_logs_tar_path(void) {
+    static const char* const cands[] = {"/system/bin/tar", "/bin/tar", "/usr/bin/tar"};
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
+        if (access(cands[i], X_OK) == 0) return cands[i];
+    }
+    return NULL;
+}
+
+/* 导出包所在目录：<CONFIG_DIR>/export（root 私有；随 --config-dir 走，GNU 可测） */
+static void export_logs_dir(char* out, size_t sz) {
+    snprintf(out, sz, "%s/export", g_config_dir);
+}
+
+/* 是否为导出包名（宽前缀 + 后缀） */
+static bool export_logs_is_pkg(const char* name) {
+    static const char* const prefix = "log_export_";
+    static const char* const suffix = ".tar.gz";
+    size_t plen = strlen(prefix), slen = strlen(suffix), nlen = strlen(name);
+    return nlen >= plen + slen && strncmp(name, prefix, plen) == 0 &&
+           strcmp(name + nlen - slen, suffix) == 0;
+}
+
+/* 按宽前缀扫描，删除最旧的使剩余 ≤ keep 份；返回实际删除数。
+   循环删除而非只删一份：目录里堆积 N 份时一次调用即收敛（§A7-2）。 */
+static int export_logs_prune(const char* dir, int keep) {
+    int removed = 0;
+    for (;;) {
+        DIR* d = opendir(dir);
+        if (!d) break;
+        char oldest[PATH_MAX] = {0};
+        time_t oldest_mtime = 0;
+        int count = 0;
+        struct dirent* de;
+        while ((de = readdir(d))) {
+            if (!export_logs_is_pkg(de->d_name)) continue;
+            char p[PATH_MAX];
+            snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+            struct stat st;
+            if (lstat(p, &st) != 0) continue; /* 不跟随软链 */
+            count++;
+            if (!oldest[0] || st.st_mtime < oldest_mtime ||
+                (st.st_mtime == oldest_mtime && strcmp(p, oldest) < 0)) {
+                oldest_mtime = st.st_mtime;
+                snprintf(oldest, sizeof(oldest), "%s", p);
+            }
+        }
+        closedir(d);
+        if (count <= keep || !oldest[0]) break;
+        if (unlink(oldest) != 0) break;
+        removed++;
+    }
+    return removed;
+}
+
+static void handle_export_logs(int fd, json_object* req) {
+    (void)req;
+    char log_dir[PATH_MAX], exp_dir[PATH_MAX], out[PATH_MAX];
+    snprintf(log_dir, sizeof(log_dir), "%s/log", g_config_dir);
+
+    const char* tar_bin = export_logs_tar_path();
+    if (!tar_bin) {
+        reply_error(fd, "EXPORT_LOGS", "未找到 tar 可执行文件");
+        return;
+    }
+    struct stat st;
+    if (stat(log_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        reply_error(fd, "EXPORT_LOGS", "日志目录不存在: %s", log_dir);
+        return;
+    }
+    /* 导出目录：root 私有 0700（幂等收紧，已存在时也保证私有） */
+    export_logs_dir(exp_dir, sizeof(exp_dir));
+    if (nsp_mkdir_p(exp_dir, 0700) != 0) {
+        reply_error(fd, "EXPORT_LOGS", "创建导出目录失败: %s: %s", exp_dir, strerror(errno));
+        return;
+    }
+    (void)chmod(exp_dir, 0700);
+
+    /* 唯一包名：时间 + pid + 递增序号，避免同秒多次导出互相覆盖（§A7-2） */
+    static unsigned s_export_seq = 0;
+    snprintf(out, sizeof(out), "%s/log_export_%ld_%d_%u.tar.gz", exp_dir, (long)time(NULL),
+             (int)getpid(), s_export_seq++);
+
+    /* 以 O_EXCL|O_NOFOLLOW 占名：不覆盖既有文件、不跟随软链（§A7-0） */
+    int ofd = open(out, O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY | O_CLOEXEC, 0600);
+    if (ofd < 0) {
+        reply_error(fd, "EXPORT_LOGS", "创建导出文件失败: %s: %s", out, strerror(errno));
+        return;
+    }
+    close(ofd); /* 名字已安全占位；tar 随后 O_TRUNC 复用（目录私有，无软链窗口） */
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "fork 失败: %s", strerror(e));
+        return;
+    }
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, 0);
+            dup2(nullfd, 1);
+            dup2(nullfd, 2);
+            if (nullfd > 2) close(nullfd);
+        }
+        execl(tar_bin, "tar", "-czf", out, "-C", log_dir, ".", (char*)NULL);
+        _exit(127);
+    }
+
+    /* 有界等待：WNOHANG 轮询 + 硬超时 kill，避免慢存储把唯一事件循环卡死（§A7-1） */
+    int status = 0;
+    bool reaped = false, timed_out = false, wait_err = false;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            reaped = true;
+            break;
+        }
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            wait_err = true;
+            break;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long ms = (long)(now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000;
+        if (ms >= LOG_EXPORT_TIMEOUT_MS || g_should_exit) {
+            timed_out = true;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            break;
+        }
+        usleep(20000);
+    }
+    if (timed_out) {
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "导出超时（>%d ms），已终止", LOG_EXPORT_TIMEOUT_MS);
+        return;
+    }
+    if (wait_err) {
+        int e = errno;
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "等待 tar 失败: %s", strerror(e));
+        return;
+    }
+    /* 失败应答据实：区分信号死亡 / 非零退出，不再用残留 errno 冒充原因（§A7-3） */
+    if (reaped && WIFSIGNALED(status)) {
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "tar 被信号 %d 终止", WTERMSIG(status));
+        return;
+    }
+    if (!reaped || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        int code = (reaped && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "tar 打包失败（exit=%d）", code);
+        return;
+    }
+
+    /* 收紧权限并取大小：经 fd（O_NOFOLLOW）施加，不跟随软链（§A7-0） */
+    int rfd = open(out, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (rfd < 0) {
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "导出产物缺失: %s", out);
+        return;
+    }
+    fchmod(rfd, 0600);
+    struct stat stf;
+    if (fstat(rfd, &stf) != 0) {
+        int e = errno;
+        close(rfd);
+        unlink(out);
+        reply_error(fd, "EXPORT_LOGS", "读取导出产物失败: %s", strerror(e));
+        return;
+    }
+    close(rfd);
+
+    /* 成功发布后按宽前缀收敛到 LOG_EXPORT_KEEP 份（含本次） */
+    int pruned = export_logs_prune(exp_dir, LOG_EXPORT_KEEP);
+
+    json_object* data = json_object_new_object();
+    json_object_object_add(data, "file", json_object_new_string(out));
+    json_object_object_add(data, "dir", json_object_new_string(exp_dir));
+    json_object_object_add(data, "size_bytes", json_object_new_int64((long long)stf.st_size));
+    json_object_object_add(data, "generated_at", json_object_new_int64((long long)time(NULL)));
+    json_object_object_add(data, "pruned", json_object_new_int(pruned));
+    reply_ok(fd, "EXPORT_LOGS", data);
 }
 
 static void handle_quit(int fd, json_object* req) {
@@ -2345,6 +2577,8 @@ static void dispatch(int fd, json_object* req) {
         handle_service(fd, req);
     else if (strcasecmp(cmd, "STATUS") == 0)
         handle_status(fd, req);
+    else if (strcasecmp(cmd, "EXPORT_LOGS") == 0)
+        handle_export_logs(fd, req);
     else if (strcasecmp(cmd, "QUIT") == 0)
         handle_quit(fd, req);
     else
