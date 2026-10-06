@@ -81,8 +81,17 @@ typedef struct {
 int config_read_view(const char* main_path, NspCfgRec** out_recs, int* out_count);
 void config_free_view(NspCfgRec* recs, int count);
 /* 由扁平视图重建配置并 COW 发布（不读文件系统；模块消费框架下发的视图）。
-   视图仅 RULE 记录被逐行复制后解析，其余记录按值读取。 */
+   视图仅 RULE 记录被逐行复制后解析，其余记录按值读取。
+   调用方须持 config_lock_write。 */
 void config_build_from_view(const NspCfgRec* recs, int count);
+
+/* 发布期派生缓存作废钩子（进程内单一注册者：内建规则引擎）：config_publish 在
+   「旧代际读者已排空、新读者仍被封锁」的窗口内调用一次，此时没有任何读者能
+   重算并缓存即将释放的配置指针。派生缓存（uid→AppConfig 指针等）必须在此刻
+   作废：早于该窗口，读者会把旧指针以新代际重新缓存（发布后即成悬垂）；晚于
+   发布（放行新读者之后），则留出命中已释放指针的窗口。
+   钩子运行在发布写者线程、已持 config_lock_write 的上下文里，不得再取该锁。 */
+void config_set_publish_invalidate_hook(void (*fn)(void));
 
 extern AppConfig g_global_cfg;
 extern AppConfig** g_app_cfgs;

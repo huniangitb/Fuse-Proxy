@@ -61,7 +61,7 @@ static UidCacheSlot g_uid_cache[UID_CACHE_SIZE];
    配置重载（g_br_cfg_gen 递增，写锁内）后失效，杜绝 trie/cfg 悬垂。 */
 typedef struct {
     bool valid;
-    uint64_t gen; /* 配置代际（fw_rules_on_reload 递增） */
+    uint64_t gen; /* 配置代际（发布期钩子 fw_rules_invalidate_caches 递增） */
     uid_t uid;
     pid_t pid;
     char dir[PATH_MAX]; /* 父目录 sub_path（"/" 或 "/a/b"） */
@@ -98,14 +98,17 @@ static void clear_uid_cache(void) {
     }
 }
 
-/* 框架换入新配置索引后调用（fw_config 的 reload_once 内，紧接
-   config_build_from_view 之后）：只作废本引擎的 uid→AppConfig 指针缓存。
-   索引构建、uid.map 重读、sys_pkgs.cache 刷新都已由 fw_config 完成。 */
-void fw_rules_on_reload(void) {
-    config_lock_write();
+/* 配置发布临界区内的派生缓存作废：经 config_set_publish_invalidate_hook 注册，
+   由 config_publish 在「旧代际读者已排空、新读者仍被封锁」的窗口内调用（见
+   config_parser.h 的钩子契约）。这是唯一的作废安全窗口：发布前作废，读者会把
+   旧 AppConfig 指针以新代际重新缓存（COW 释放后即悬垂）；发布后作废，则留出
+   命中已释放指针的窗口。
+   调用方已持 config 写锁，此处**不得**再取 config 锁。
+   作废范围：uid→(AppConfig, 类别) 指针缓存（seqlock 读者按代际校验）；线程本地
+   的 readdir probe 目录缓存（_Thread_local，本线程清不到）靠同一代际失配失效。 */
+void fw_rules_invalidate_caches(void) {
     atomic_fetch_add_explicit(&g_br_cfg_gen, 1, memory_order_release);
     clear_uid_cache();
-    config_unlock_write();
 }
 
 int fw_rules_init(const char* rules_path, bool disable_sandbox) {
@@ -120,7 +123,9 @@ int fw_rules_init(const char* rules_path, bool disable_sandbox) {
         g_uid_cache[i].gen = 0;
     }
     /* 配置不在此读取：fw_config 在 init 之后（同一次启动流程内）构建索引并
-       调 fw_rules_on_reload。sys_pkg/config lock 的初始化也归 fw_config。 */
+       触发发布，本引擎的派生缓存作废挂在发布临界区内（钩子）。
+       sys_pkg/config lock 的初始化也归 fw_config。 */
+    config_set_publish_invalidate_hook(fw_rules_invalidate_caches);
     LOG("规则引擎已就绪 (rules=%s, sandbox=%s)",
         g_br_rules_path[0] ? g_br_rules_path : "(none)", disable_sandbox ? "off" : "on");
     return 0;

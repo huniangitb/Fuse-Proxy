@@ -86,7 +86,9 @@ SUITE_MAP = [
       "nsp_getline_capped", "nsp_snprintf_dyn", "nsp_format_dynamic"),
      "日志链路（生产 → 通讯 → log_monitor → 查询）"),
 
-    (("test_monitor_layers.py",),
+    # fw_config.c 含规则文件/App-rules 的 inotify 监听线程——热重载触发路径本身，
+    # 故改动它同时跑 test_rules.py（重载语义端到端）
+    (("test_monitor_layers.py", "test_cfg_watch.py", "test_rules.py"),
      ("src/daemon/fw_config.c", "src/daemon/fw_config.h", "src/daemon/fw_pkg.c",
       "src/daemon/fw_pkg.h"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),
@@ -96,6 +98,11 @@ SUITE_MAP = [
      ("src/daemon/fd_close_queue.c", "src/daemon/fd_close_queue.h"),
      ("fdq_defer", "fdq_flush"),
      "延迟 close 环形队列（Android backing fd 回收）"),
+
+    (("test_cfg_watch.py",),
+     ("src/daemon/cfg_watch.c", "src/daemon/cfg_watch.h"),
+     ("cfg_watch_sync",),
+     "配置目录 watch 对账（App-rules 子目录热更新）"),
 ]
 
 
@@ -223,6 +230,7 @@ PARALLEL_SAFE = frozenset({
     "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
     "test_pending_close.py",      # cc 直编队列实现 + 驱动，TemporaryDirectory，无挂载
+    "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。

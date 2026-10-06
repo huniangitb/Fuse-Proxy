@@ -367,6 +367,69 @@ static void check_capacity(const char* main_conf) {
     ck(miss_ftp == 0, "capacity.FTP 40 条全部保留（含末尾规则）");
 }
 
+/* ===== 发布期派生缓存作废钩子的契约（见 include/config_parser.h） =====
+   唯一安全窗口的性质：钩子运行时旧代际读者已排空、**新读者仍被封锁**（代际为
+   奇数）。验证：钩子内唤醒观察线程去 config_read_begin()——若封锁成立，它只能
+   等到发布放行才返回，且读到的代际必为「发布前代际 + 2」（绝不可能读到发布前
+   的偶数代际）。钩子内再等观察线程确实已进入（entered），确保它是在窗口内尝试
+   进入的，而不是发布结束后才轮到调度。 */
+static pthread_mutex_t g_hk_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_hk_cv = PTHREAD_COND_INITIALIZER;
+static int g_hk_count;
+static bool g_hk_go, g_hk_entered;
+static uint64_t g_hk_reader_gen;
+
+static void* hk_reader(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_hk_mu);
+    while (!g_hk_go) pthread_cond_wait(&g_hk_cv, &g_hk_mu);
+    g_hk_entered = true;
+    pthread_cond_broadcast(&g_hk_cv);
+    pthread_mutex_unlock(&g_hk_mu);
+    uint64_t gen = config_read_begin(); /* 封锁期间在奇数代际上自旋等待 */
+    config_read_end(gen);
+    pthread_mutex_lock(&g_hk_mu);
+    g_hk_reader_gen = gen;
+    pthread_mutex_unlock(&g_hk_mu);
+    return NULL;
+}
+
+static void hk_publish_hook(void) {
+    pthread_mutex_lock(&g_hk_mu);
+    g_hk_count++;
+    g_hk_go = true;
+    pthread_cond_broadcast(&g_hk_cv);
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 2;
+    while (!g_hk_entered)
+        if (pthread_cond_timedwait(&g_hk_cv, &g_hk_mu, &dl) != 0) break;
+    pthread_mutex_unlock(&g_hk_mu);
+}
+
+static void check_publish_hook(const char* conf) {
+    config_set_publish_invalidate_hook(hk_publish_hook);
+    uint64_t before = config_read_begin(); /* 发布前代际（偶数） */
+    config_read_end(before);
+    pthread_t th;
+    if (pthread_create(&th, NULL, hk_reader, NULL) != 0) {
+        ck(false, "publish_hook.观察线程创建");
+        return;
+    }
+    load_config_rules(conf);
+    /* 兜底唤醒（正常情况下钩子已唤醒观察线程）：钩子缺失时测试以 count 断言失败
+       收尾，而不是 join 永久挂起 */
+    pthread_mutex_lock(&g_hk_mu);
+    g_hk_go = true;
+    pthread_cond_broadcast(&g_hk_cv);
+    pthread_mutex_unlock(&g_hk_mu);
+    pthread_join(th, NULL);
+    ck(g_hk_count == 1, "publish_hook.每次发布恰好调用一次");
+    ck(g_hk_entered, "publish_hook.窗口内观察线程已进入（确为窗口内尝试读配置）");
+    ck(g_hk_reader_gen == before + 2,
+       "publish_hook.窗口内新读者被封锁：读到代际=发布前+2（未读到发布前快照）");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <main_conf>\n", argv[0]);
@@ -388,6 +451,7 @@ int main(int argc, char** argv) {
        "static.请求不触发配置重载（live 快照未替换）");
 
     check_capacity(argv[1]);
+    check_publish_hook(argv[1]);
 
     printf("SUMMARY pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

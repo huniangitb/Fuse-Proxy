@@ -24,6 +24,8 @@
 #include <string.h>
 #include <sys/inotify.h>
 #include <unistd.h>
+#include "nsp_util.h" /* nsp_is_app_rules_dirname */
+#include "cfg_watch.h" /* App-rules 子目录 watch 对账（inotify 不递归） */
 
 /* 每个模块的订阅与下发视图 */
 typedef struct {
@@ -202,8 +204,9 @@ static void reload_once(void) {
     config_build_from_view(new_recs, new_count);
     sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     config_unlock_write();
-    /* 内建规则引擎的 uid→AppConfig 指针缓存随之作废（旧索引已被 COW 释放） */
-    fw_rules_on_reload();
+    /* 内建规则引擎的 uid→AppConfig 指针缓存不在这里作废：容器会在发布临界区
+       （旧读者已排空、新读者仍封锁）内经 config_set_publish_invalidate_hook
+       自动作废——发布后补调会留出「命中已释放指针」的窗口 */
 
     pthread_mutex_lock(&g_lock);
     NspCfgRec* old_recs = g_recs;
@@ -230,11 +233,15 @@ static void reload_once(void) {
     config_free_view(old_recs, old_count);
 }
 
-/* 监听规则文件所在目录（沿用原模块内 watch 重建/归并模式） */
+/* 监听规则文件所在目录 + 各 App-rules* 子目录（沿用原模块内 watch 重建/归并模式） */
 static void* config_monitor_thread(void* arg) {
     (void)arg;
     int inotify_fd = -1;
     int wd = -1;
+    CfgDirWatch appw[CFG_WATCH_MAX];
+    int appn = 0;
+    bool appw_ok = false;
+    time_t last_fallback = 0;
     while (!g_stop && !g_log_shutdown) {
         if (inotify_fd < 0) {
             inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -242,6 +249,9 @@ static void* config_monitor_thread(void* arg) {
                 sleep(2);
                 continue;
             }
+            appn = 0; /* 新 fd：旧 watch 全部作废，重新对账 */
+            wd = -1;
+            appw_ok = false;
         }
         if (wd < 0) {
             char dir[PATH_MAX];
@@ -255,9 +265,7 @@ static void* config_monitor_thread(void* arg) {
                 continue;
             }
             *slash = '\0';
-            wd = inotify_add_watch(inotify_fd, dir,
-                                   IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO | IN_MOVED_FROM |
-                                       IN_CREATE | IN_DELETE | IN_DELETE_SELF);
+            wd = inotify_add_watch(inotify_fd, dir, NSP_CFG_WATCH_MASK);
             if (wd < 0) {
                 close(inotify_fd);
                 inotify_fd = -1;
@@ -265,6 +273,7 @@ static void* config_monitor_thread(void* arg) {
                 continue;
             }
         }
+        if (!appw_ok) appw_ok = cfg_watch_sync(inotify_fd, CONFIG_DIR, appw, &appn);
         struct pollfd pfds[2] = {{.fd = inotify_fd, .events = POLLIN},
                                  {.fd = g_wake[0], .events = POLLIN}};
         int pr = poll(pfds, 2, 5000);
@@ -272,35 +281,53 @@ static void* config_monitor_thread(void* arg) {
         if (pr < 0) {
             if (errno == EINTR) continue;
             inotify_rm_watch(inotify_fd, wd);
-            wd = -1;
             close(inotify_fd);
             inotify_fd = -1;
             continue;
         }
-        if (pr == 0) continue;
+        if (pr == 0) {
+            /* 超时：App-rules watch 未就位时重试对账；仍不齐则定时重扫兜底
+               （节流到 10s，避免 watch 超限时持续整份重载 + 下发模块） */
+            if (!appw_ok) {
+                appw_ok = cfg_watch_sync(inotify_fd, CONFIG_DIR, appw, &appn);
+                time_t now = time(nullptr);
+                if (!appw_ok && now - last_fallback >= 10) {
+                    last_fallback = now;
+                    reload_once();
+                }
+            }
+            continue;
+        }
         char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
         ssize_t len = read(inotify_fd, buf, sizeof(buf));
         if (len < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             inotify_rm_watch(inotify_fd, wd);
-            wd = -1;
             close(inotify_fd);
             inotify_fd = -1;
             continue;
         }
         if (len == 0) continue;
-        bool watch_invalidated = false;
+        int inval_wd = -1;
+        bool top_change = false;
         for (char* p = buf; p < buf + len;) {
             struct inotify_event* ev = (struct inotify_event*)p;
-            if (ev->mask & IN_IGNORED) watch_invalidated = true;
+            if (ev->mask & IN_IGNORED) inval_wd = ev->wd;
+            if (ev->wd == wd && (ev->mask & (IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM)))
+                top_change = true; /* App-rules 目录可能新增/移除：重新对账 watch */
             p += sizeof(struct inotify_event) + ev->len;
         }
         sleep(1); /* 归并写者连击：等待写者落定再读 */
         reload_once();
-        if (watch_invalidated) wd = -1;
+        if (inval_wd == wd) wd = -1;
+        for (int i = 0; i < appn; i++)
+            if (appw[i].wd == inval_wd) appw[i].wd = -1;
+        if (top_change) appw_ok = cfg_watch_sync(inotify_fd, CONFIG_DIR, appw, &appn);
     }
     if (inotify_fd >= 0) {
         if (wd >= 0) inotify_rm_watch(inotify_fd, wd);
+        for (int i = 0; i < appn; i++)
+            if (appw[i].wd >= 0) inotify_rm_watch(inotify_fd, appw[i].wd);
         close(inotify_fd);
     }
     return nullptr;
