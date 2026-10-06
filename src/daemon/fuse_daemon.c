@@ -40,6 +40,7 @@
 #include "fw_config.h"
 #include "fw_pkg.h"
 #include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
+#include "fd_close_queue.h"
 #include "nsp_comm.h"
 #include "crash_dump.h"
 #include "fault_fence.h"
@@ -84,56 +85,18 @@ static char g_modules_dir_arg[PATH_MAX] = {0};      /* --modules-dir: 热插拔�
 static int g_fuse_threads = 2;                      /* --fuse-threads: FUSE worker 线程数上限
                                                    （默认 2=双线程；0/-s=单线程；-1=libfuse 默认 10） */
 
-#define MAX_PENDING_CLOSE  64
-#define PENDING_CLOSE_MASK (MAX_PENDING_CLOSE - 1)
-static int g_pending_close_fds[MAX_PENDING_CLOSE];
-/* 无锁环形队列（多生产者单消费者）：
-   - next：生产分配水位（fetch_add 分配槽位 idx）
-   - ready：生产完成水位（写 fds[idx&MASK] 后推进到 idx+1）
-   - consumed：消费水位（flush 已 close 的槽位数）
-   MAX_PENDING_CLOSE 为 2 的幂，槽位 = idx & MASK。
-   安全性：flush 在 close 全部完成后才 release 更新 consumed；生产者写槽位
-   idx 要求 idx - consumed < MAX，故其槽位上一周期值必已被 close，写与 close
-   不重叠。空队列时 flush 走零原子写快速路径，不再抢全局互斥锁。 */
-static _Atomic(unsigned) g_pc_ready = 0;
-static _Atomic(unsigned) g_pc_consumed = 0;
+/* 延迟 close 队列（Android backing 路径）：daemon 把 backing fd 交给内核后不能
+   立刻 close（内核可能在 reply 发送完成前仍引用它），故入队，等下一次 FUSE
+   回调时机统一回收。并发语义与不变量（多生产者/多消费者、每个 fd 恰好关闭
+   一次、队满不阻塞且不制造被放弃的槽位）见 src/daemon/fd_close_queue.h。
+   静态实例按该头注释直接以 PTHREAD_MUTEX_INITIALIZER 初始化 lock。 */
+static FdCloseQueue g_pending_closes = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
 #ifdef TARGET_ANDROID
-static _Atomic(unsigned) g_pc_next = 0; /* 生产分配水位（仅 Android defer 使用） */
-static void vfs_defer_close(int fd) {
-    if (fd < 0) return;
-    unsigned idx = atomic_fetch_add_explicit(&g_pc_next, 1, memory_order_relaxed);
-    unsigned consumed = atomic_load_explicit(&g_pc_consumed, memory_order_acquire);
-    if (idx - consumed >= MAX_PENDING_CLOSE) {
-        close(fd); /* 队列满：直接关闭（不阻塞生产者） */
-        return;
-    }
-    g_pending_close_fds[idx & PENDING_CLOSE_MASK] = fd;
-    /* 推进 ready 水位到 idx+1：前序（< idx）生产者写入完成后才能推进 */
-    for (;;) {
-        unsigned r = atomic_load_explicit(&g_pc_ready, memory_order_acquire);
-        if (r > idx) break; /* 已被前序推进覆盖 */
-        if (r == idx) {
-            if (atomic_compare_exchange_weak_explicit(&g_pc_ready, &r, idx + 1,
-                                                      memory_order_release, memory_order_relaxed))
-                break;
-            continue;
-        }
-        /* r < idx：前序未完成，自旋等待其推进（前序临界区极小，等待极短） */
-    }
-}
+static void vfs_defer_close(int fd) { fdq_defer(&g_pending_closes, fd); }
 #endif
 
-static void vfs_flush_pending_closes(void) {
-    unsigned ready = atomic_load_explicit(&g_pc_ready, memory_order_acquire);
-    unsigned consumed = atomic_load_explicit(&g_pc_consumed, memory_order_relaxed);
-    if (ready == consumed) return; /* 空队列快速路径：零原子写 */
-    do {
-        close(g_pending_close_fds[consumed & PENDING_CLOSE_MASK]);
-        consumed++;
-    } while (consumed < ready);
-    atomic_store_explicit(&g_pc_consumed, consumed, memory_order_release);
-}
+static void vfs_flush_pending_closes(void) { fdq_flush(&g_pending_closes); }
 
 static char g_lower_dir[PATH_MAX] = {0};
 static char g_upper_dir[PATH_MAX] = {0};

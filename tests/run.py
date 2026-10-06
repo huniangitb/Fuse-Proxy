@@ -91,6 +91,11 @@ SUITE_MAP = [
       "src/daemon/fw_pkg.h"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),
      "监控开关三层合并 / uid→包名（框架权威）"),
+
+    (("test_pending_close.py",),
+     ("src/daemon/fd_close_queue.c", "src/daemon/fd_close_queue.h"),
+     ("fdq_defer", "fdq_flush"),
+     "延迟 close 环形队列（Android backing fd 回收）"),
 ]
 
 
@@ -217,6 +222,7 @@ PARALLEL_SAFE = frozenset({
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
     "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
+    "test_pending_close.py",      # cc 直编队列实现 + 驱动，TemporaryDirectory，无挂载
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
