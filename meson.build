@@ -278,7 +278,7 @@ common_sources = [
     'src/core/sys_pkg.c'
 ]
 
-fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/daemon/fw_rules.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c',
+fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/fw_config.c', 'src/daemon/fw_pkg.c', 'src/daemon/fw_rules.c', 'src/daemon/fd_close_queue.c', 'src/core/crash_dump.c', 'src/core/build_info.c', 'src/core/fast_pid.c', 'src/module/loader.c', 'src/module/fault_fence.c', 'src/module/module_guard.c',
   # 配置**读取**在框架侧完成（文件 I/O + inotify + 词法/段头识别，产出扁平视图
   # 经 fw_config 下发给模块），模块不再自行读文件。框架另建一份 AppConfig 索引
   # （config_build_from_view），但只用于回答 MONITOR 的三层合并——它是配置开关，
