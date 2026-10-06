@@ -63,7 +63,12 @@ BACKEND_NORENAME_MOD = "lifecycle_backend_norename"  # rename NULL（EXDEV 分�
 SWAP_MOD = "lifecycle_swap"                 # 热重载回滚用例（同名两版本）
 SWAP_V2_SO = SWAP_MOD + "_v2.so"            # v2 构建产物（v1 走通用 <name>.so）
 SWAP_EXIT_TAG = "swap-exit-v2"              # 仅 v2 的 exit 会落此标记
-SWAP_HOLD_CAP_MS = 30000                    # 阻塞 rename 的兜底上限（防用例异常时永不返回）
+SWAP_INIT_TAG = "swap-init-v2"              # 仅 v2 的 init 会落此标记（与 exit 成对判别）
+# 阻塞 rename 的兜底上限（防用例异常时永不返回）。**必须大于 §C 的全部等待窗口**
+# （3 次重放 × 12s）：hold 中途到期会让旧实例引用归零、卸载成功而走 commit 分支
+# ——那时 v2 的 init 跑了而 exit 不该跑，会被误判成"exit 未执行"的真缺陷。
+SWAP_HOLD_CAP_MS = 120000
+
 
 # 用例等待上限（秒）：事件触发扫描（1s 归并窗口 + 0.5s 稳定性校验）+ 卸载 drain 等待 2s + 余量
 LOAD_TIMEOUT = 25.0
@@ -251,6 +256,10 @@ static int swap_init(const NspFrameworkApi* api) {
     (void)api;
     swap_stop = 0;
     if (pthread_create(&swap_tid, NULL, swap_thread, NULL) != 0) return -1;
+    /* 与 exit 标记成对出现：init 标记证明「新实例 prepare 成功、已起自有线程」，
+       是"放弃分支真的走到了"的可靠证据（daemon 日志走 UDS 给 log_monitor，
+       测试进程拿不到，不能拿来判别——实测拿到的 daemon.log 恒为空）。 */
+    swap_mark(NSP_SWAP_INIT_TAG);
     return 0;
 }
 
@@ -308,7 +317,9 @@ def build_modules():
         compile_so(name, src)
     # v2：同一模块名的第二版本（init 起线程 / exit 停线程并落唯一标记），
     # 编译到独立 .so，测试中途原子替换到模块目录触发热重载
-    compile_so(SWAP_MOD + "_v2", swap_source("2"), [f'-DNSP_SWAP_EXIT_TAG="{SWAP_EXIT_TAG}"'])
+    compile_so(SWAP_MOD + "_v2", swap_source("2"),
+               [f'-DNSP_SWAP_EXIT_TAG="{SWAP_EXIT_TAG}"',
+                f'-DNSP_SWAP_INIT_TAG="{SWAP_INIT_TAG}"'])
 
 
 def stage_file(name, so_name):
@@ -620,30 +631,42 @@ def case_hot_reload_rollback_calls_exit(p, name):
     # .so 原子替换 → 热重载：prepare(v2) 成功（init 已起线程），unload(v1) 因
     # 在途引用超时失败 → 放弃新实例——此分支必须调 v2 的 exit。
     # 期间旧实例一直持引用（用例控制放行时机），故与扫描/prepare 快慢无关。
-    stage_file(name, SWAP_V2_SO)
-    marked = wait_marker(SWAP_EXIT_TAG, UNLOAD_TIMEOUT)
+    #
+    # 判别用**模块侧标记对**（init/exit），不用 daemon 日志：日志走 UDS 交给
+    # log_monitor，测试进程拿不到（实测 DLOG 恒为空，grep 日志判别会把真缺陷
+    # 误报成"环境问题"）。三态：
+    #   exit 有          → 放弃分支走到且 exit 已执行（正常）
+    #   init 有/ exit 无 → **真缺陷**：init 成功的新实例被拒绝却没停线程就 dlclose
+    #   两者皆无         → 热重载本次未触发（事件/扫描/prepare 未到），与 exit 无关
+    #
+    # 热重载是**事件驱动**的：实测约两成概率单次 stage 后 daemon 没走到 prepare
+    # （inotify 事件与扫描窗口的竞态）。这与 exit 缺陷无关，故允许最多 3 次重放；
+    # 只要任一次走到 prepare（init 标记出现），判定立即收敛——重放不会掩盖缺陷。
+    marked = False
+    inited = False
+    mtext = ""
+    for _ in range(3):
+        stage_file(name, SWAP_V2_SO)
+        if wait_marker(SWAP_EXIT_TAG, 12.0):
+            marked = True
+            break
+        mtext = marker_text()
+        if SWAP_INIT_TAG in mtext:
+            inited = True
+            break  # prepare 已通过 → 放弃分支必然走到，再重放也无意义
+    if not marked and not inited:
+        mtext = marker_text()
     RELEASE.write_text("go")  # 放行旧实例的 rename，后续流程照常
     if marked:
         ok("热重载放弃分支执行了新实例 exit（线程已停后再 dlclose）")
+    elif inited:
+        fail("新实例 exit 未执行（init 已成功）",
+             f"marker={mtext!r}：prepare 已通过（{SWAP_INIT_TAG}），放弃分支必然走到，"
+             f"却没落 {SWAP_EXIT_TAG}——旧实现 dlclose 不带 exit，残留线程会带崩 daemon")
     else:
-        # 区分两种「标记缺失」，否则环境时序问题会被误读成产品缺陷：
-        #   ① 放弃分支确实走到了（daemon 日志有「热重载放弃」）却没落 exit 标记
-        #      → 本用例要抓的缺陷；
-        #   ② 根本没走到放弃分支（prepare 校验未过 / 扫描未触发，例如 sanitizer
-        #      下模块加载变慢）→ 环境/时序，重跑确认，不算产品缺陷。
-        dlog = ""
-        try:
-            dlog = DLOG.read_text(errors="ignore")
-        except OSError:
-            pass
-        if "热重载放弃" in dlog:
-            fail("新实例 exit 未执行",
-                 f"marker={marker_text()!r}（放弃分支已走到但 exit 未执行——"
-                 f"旧实现 dlclose 不带 exit，残留线程会带崩 daemon）")
-        else:
-            fail("热重载放弃分支未走到（≠ exit 缺失）",
-                 f"marker={marker_text()!r}；daemon 日志无「热重载放弃」，"
-                 f"疑为 prepare/扫描未触发（sanitizer 下加载变慢时偶发，请重跑确认）")
+        fail("热重载 3 次重放均未触发（≠ exit 缺失）",
+             f"marker={mtext!r}：v2 的 init 标记始终没出现，热重载根本没走到 prepare，"
+             f"与 exit 无关（热插拔监控线程/事件链路需排查）")
 
     th.join(timeout=40)
     HOLD.unlink(missing_ok=True)
@@ -705,7 +728,12 @@ def main():
     finally:
         # 精确清理自身挂载点与临时目录（daemon 已由各用例 finally 终止）
         subprocess.run(["fusermount3", "-u", str(MNT)], capture_output=True)
-        shutil.rmtree(TMP, ignore_errors=True)
+        # KEEP_TMP=1 保留现场：否则 daemon.log 随临时目录一起删掉，「放弃分支
+        # 未走到」这类时序问题只能靠猜（本轮定位 §C 偶发即靠它取日志）。
+        if os.environ.get("KEEP_TMP") == "1":
+            print(f"[KEEP_TMP] 保留现场：{TMP}")
+        else:
+            shutil.rmtree(TMP, ignore_errors=True)
 
     print("\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS + FAIL}")
