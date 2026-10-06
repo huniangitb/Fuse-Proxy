@@ -1083,6 +1083,11 @@ static void stream_logs(const char* stream_cmd) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) usage(argv[0]);
+    /* 配置读写锁的初始化（config_parser 的 g_rules_lock）：本进程多处
+       config_lock_read/write（api 查询与规则编辑），不初始化就依赖"全零恰等于
+       PTHREAD_RWLOCK_INITIALIZER"这一实现细节，属未定义行为（换 libc/带调试的
+       pthread 实现即可能挂） */
+    config_init_lock();
     bool api_mode = false;
     bool force_uid = false;
     bool static_mode = false;
