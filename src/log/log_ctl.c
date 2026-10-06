@@ -755,8 +755,10 @@ static ssize_t config_broadcast_recv(int sock, char* buf, size_t size, int timeo
     int ret = poll(&pfd, 1, timeout_ms);
     if (ret < 0) return -1;
     if (ret == 0) return -2;
-    ssize_t n = recv(sock, buf, size - 1, MSG_DONTWAIT);
-    if (n > 0) buf[n] = '\0';
+    /* MSG_TRUNC：数据报超过缓冲时返回**真实长度**而非截断长度，调用方据此明确
+       报错；不加则把半截 JSON 交给解析器，只报"JSON 解析失败"，看不出是截断 */
+    ssize_t n = recv(sock, buf, size - 1, MSG_DONTWAIT | MSG_TRUNC);
+    if (n > 0 && (size_t)n < size) buf[n] = '\0';
     return n;
 }
 
@@ -781,6 +783,12 @@ static void handle_get_config(bool api_mode, bool static_mode) {
     close(sock);
     if (n < 0) {
         fprintf(stderr, "未获取到配置信息（%s）\n", (n == -2) ? "超时" : strerror(errno));
+        free(resp);
+        return;
+    }
+    if ((size_t)n >= BROADCAST_RECEIVE_MAX_SIZE) {
+        fprintf(stderr, "配置响应超过 %d 字节上限（实际 %zd），已拒绝解析（避免把截断内容当配置）\n",
+                BROADCAST_RECEIVE_MAX_SIZE, n);
         free(resp);
         return;
     }
