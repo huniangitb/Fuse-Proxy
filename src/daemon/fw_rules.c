@@ -1030,7 +1030,8 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/类别/global 完整匹配节点），
        直接判定虚拟目录性质，避免各自再全路径遍历：
        - ANCESTOR：最深节点下存在带规则子节点（trie_is_ancestor 语义）
-       - TARGET：最深节点本身是重定向目标（trie_is_redirect_target 语义）
+       - TARGET：最深节点**本身**是 REDIRECT 的虚拟前缀（trie_is_redirect_target
+         语义——函数名沿用历史，判的不是"真实目标"；见 fw_rules.h 的 NspVirtualKind）
        （节点为 NULL = 路径未完整命中，两语义均为 false，与 trie_* 一致）
        线性兜底仅覆盖通配/变量 redir 规则（未入 trie），全静态时跳过。
        ANCESTOR 优先于 TARGET：祖先性质决定是否合成目录，语义更强 */

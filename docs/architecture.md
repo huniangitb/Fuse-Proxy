@@ -183,7 +183,23 @@ FUSE 回调（如 getattr）
 
 > 位图而非「特殊值哨兵」：若用 `mode == UNSET` 表示不改，模块惯用的 `memset(out,0,...)` 会静默变成「权限清 0 + 属主 root」。位图让零初始化等于「什么都不改」。
 
-收敛前，`hidden`/`ro` 判定散落在 27 个回调里各写一遍（写类还各自映射 `EACCES`），新增回调极易漂移。回归见 `tests/test_module_overrides.py`（逐回调 errno 矩阵）。
+收敛前，`hidden`/`ro` 判定散落在 27 个回调里各写一遍（写类还各自映射 `EACCES`），新增回调极易漂移。回归见 `tests/test_decision_enforce.py`（逐回调 errno 矩阵）。
+
+### 4.6 虚拟目录性质（`virtual_kind`）
+
+引擎在决策里额外给出 `NspVirtualKind`（`NspPathDecision` 与 `NspProbeResult` 各带一份），只用于**让重定向的虚拟名字在视图里自洽**，不参与规则求值、不改变重定向指向：
+
+| 取值 | 含义（全部按 `REDIRECT <vpath> <target>` 的**第一参数**理解） | 框架动作 |
+|---|---|---|
+| `NSP_VK_ANCESTOR` | 该路径是某虚拟前缀的**祖先** | 底层缺失时合成目录属性；`rmdir` 前用 `fw_virtual_dir_empty` 判空（祖先恒非空） |
+| `NSP_VK_TARGET` | 该路径**本身**是某虚拟前缀（会被重定向） | 同上合成目录；且 readdir 逐条目探针**跳过真实同名条目**，改由虚拟目录合成提供该名字 |
+| `NSP_VK_NONE` | 普通路径 | 无特殊处理 |
+
+`ANCESTOR` 优先于 `TARGET`（祖先性质决定是否合成目录，语义更强）。消费点集中在 `fuse_daemon.c` 的 `getattr`（缺失时合成 `S_IFDIR`，mode/属主继承上级目录）、`readdir`/`opendir`（容忍虚拟目录的底层 `ENOENT`/`EACCES`）、`readdir` 条目过滤、`rmdir`。
+
+**命名陷阱**：`NSP_VK_TARGET` 与 `trie_is_redirect_target()` 的名字都沿用历史，判的是「**虚拟前缀**」，**与"重定向的真实目标（第二参数）"无关**——真实目标仍是普通路径，照常列举与访问。因此 `REDIRECT /Shadow/ /Docs/` 的可见效果是：列表里的 `Shadow` 指向 `/Docs`（真实同名条目不再单独出现），而 `Docs` 本身依旧可见可读。
+
+**为什么"跨作用域并集"不构成偏差**：`br_is_redirect_target` / `br_is_virtual_ancestor` 对**调用者生效的三层**（本应用段 + 该调用者的类别段 + `[GLOBAL]`）取并集，而 REDIRECT 的"是否存在"本来就是这三层的 OR（首命中只决定**指向哪**），故并集 ≡ 调用者的生效规则集。已实测：非生效层（如调用者走 system 分支时写 `[USER_APPS:0]`）写虚拟前缀既不遮蔽真目录、也不生成幻影目录；生效层则正常遮蔽/合成；作为重定向**目标**的真实目录完整可见。
 
 ## 5. 进程协作
 

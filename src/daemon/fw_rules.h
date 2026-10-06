@@ -32,11 +32,23 @@ typedef struct NspQueryCtx {
 
 /* ================= 决策结果（引擎 → 框架） ================= */
 
-/* 虚拟路径性质（合成目录判定） */
+/* 虚拟路径性质（合成目录判定）。
+
+   命名提示：`ANCESTOR` / `TARGET`（及 `trie_is_redirect_target`）都沿用历史命名，
+   均按**重定向的虚拟前缀**（`REDIRECT <vpath> <target>` 的第一参数）理解——
+   - ANCESTOR：该路径是某虚拟前缀的**祖先**（需要合成中间目录）；
+   - TARGET：该路径**本身**就是某虚拟前缀，即它会被重定向，故该名字在视图里
+     必须表现为虚拟目录；真实底层若存在同名条目不再单独列举（避免同名重复，
+     也避免"列表里是真实目录而 stat 落到重定向目标"的不一致）。
+
+   **TARGET 与"重定向的真实目标（第二参数）"无关**：真实目标仍是普通路径，
+   照常列举与访问。判定按**调用者生效的三层**（应用段 + 该调用者的类别段 +
+   `[GLOBAL]`）取并集——与 REDIRECT 的"是否存在"同构（首命中只决定指向哪），
+   故并集 ≡ 调用者的生效规则集：非生效层既不会遮蔽真目录，也不会合成幻影目录。 */
 typedef enum {
     NSP_VK_NONE = 0,     /* 普通路径 */
-    NSP_VK_ANCESTOR = 1, /* 某 REDIRECT 前缀的祖先（合成目录） */
-    NSP_VK_TARGET = 2,   /* 路径本身是某 REDIRECT 的真实目标 */
+    NSP_VK_ANCESTOR = 1, /* 某 REDIRECT 虚拟前缀的祖先（合成目录） */
+    NSP_VK_TARGET = 2,   /* 本身是某 REDIRECT 的虚拟前缀（会被重定向） */
 } NspVirtualKind;
 
 /* 声明式决策：引擎只声明"这个路径该怎么表现"，由框架单点强制（fw_route），
@@ -68,7 +80,8 @@ typedef struct NspPathDecision {
 typedef struct NspProbeResult {
     bool valid;              /* false = 不参与规则，框架视为不过滤 */
     bool appear_missing;     /* 条目应视为不存在 → 跳过 */
-    uint8_t virtual_kind;    /* NspVirtualKind：TARGET 条目跳过（避免与虚拟目录重复） */
+    uint8_t virtual_kind;    /* NspVirtualKind；readdir 侧对 TARGET 条目跳过真实项，
+                                改由虚拟目录合成提供（语义见上方 NspVirtualKind 注释） */
     bool is_other_app_pkg;   /* 跨应用隔离 */
 } NspProbeResult;
 

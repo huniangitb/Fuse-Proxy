@@ -56,7 +56,9 @@ const TrieNode* trie_lookup_full(const TrieNode* root, const char* path,
                                  char* out_redir, size_t max_len,
                                  char* out_ftp, size_t ftp_max_len);
 
-/* path 对应节点是否本身就是一个 redirect 目标。 */
+/* path 对应节点本身是否为某条 REDIRECT 的**虚拟前缀**（即该路径会被重定向）。
+   函数名沿用历史（与"重定向的真实目标"无关——真实目标照常列举/访问）；
+   下降途中任一缺失即 false，故不等价于 trie_is_ancestor。 */
 bool trie_is_redirect_target(const TrieNode* root, const char* path);
 
 /* path 是否是某条规则的（真）前缀祖先——即其子孙中存在带规则的节点。 */
