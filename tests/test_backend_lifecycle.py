@@ -56,14 +56,14 @@ DAEMON = os.environ.get("FUSE_DAEMON") or str(ROOT / "build_gnu" / "fuse_daemon"
 CC = os.environ.get("CC", "cc")
 
 # —— 临时 fixture 路径：由 main() 用 mkdtemp 建立（import 无副作用）——
-TMP = MNT = STORAGE = MODDIR = BUILT = SRCDIR = CONF = MARKER = DLOG = HOLD = None
+TMP = MNT = STORAGE = MODDIR = BUILT = SRCDIR = CONF = MARKER = DLOG = HOLD = RELEASE = None
 
 BACKEND_MOD = "lifecycle_backend"           # 含 backend_rename（成功分支）
 BACKEND_NORENAME_MOD = "lifecycle_backend_norename"  # rename NULL（EXDEV 分支）
 SWAP_MOD = "lifecycle_swap"                 # 热重载回滚用例（同名两版本）
 SWAP_V2_SO = SWAP_MOD + "_v2.so"            # v2 构建产物（v1 走通用 <name>.so）
 SWAP_EXIT_TAG = "swap-exit-v2"              # 仅 v2 的 exit 会落此标记
-SWAP_HOLD_MS = 6000                         # 阻塞 rename 时长：须明显超过 drain 的 ~2s
+SWAP_HOLD_CAP_MS = 30000                    # 阻塞 rename 的兜底上限（防用例异常时永不返回）
 
 # 用例等待上限（秒）：事件触发扫描（1s 归并窗口 + 0.5s 稳定性校验）+ 卸载 drain 等待 2s + 余量
 LOAD_TIMEOUT = 25.0
@@ -180,6 +180,9 @@ SWAP_SRC = r'''
 #ifndef NSP_TEST_HOLD
 #error "编译需 -DNSP_TEST_HOLD=\"/path\""
 #endif
+#ifndef NSP_TEST_RELEASE
+#error "编译需 -DNSP_TEST_RELEASE=\"/path\""
+#endif
 
 static void swap_mark(const char* what) {
     FILE* f = fopen(NSP_TEST_MARKER, "a");
@@ -196,8 +199,14 @@ static int swap_match(const char* path) {
 static int swap_rename(const char* from, const char* to) {
     if (access(NSP_TEST_HOLD, F_OK) == 0) {
         swap_mark("hold-begin");
-        struct timespec ts = {__HOLD_MS__ / 1000, (__HOLD_MS__ % 1000) * 1000000L};
-        nanosleep(&ts, NULL);
+        /* 阻塞到测试写 RELEASE 为止（上限 NSP_SWAP_CAP_MS 兜底）：**固定时长**会被
+           机器负载吃掉——扫描/prepare 一慢，卸载侧反而等到了引用归零、走成"正常
+           热重载"，用例断言随之失真。开放阻塞让"卸载必然超时"与时序无关。 */
+        for (int i = 0; i < __HOLD_MS__ / 10; i++) {
+            if (access(NSP_TEST_RELEASE, F_OK) == 0) break;
+            struct timespec ts = {0, 10 * 1000 * 1000L};
+            nanosleep(&ts, NULL);
+        }
     }
     char a[PATH_MAX], b[PATH_MAX];
     if (snprintf(a, sizeof a, "%s/0%s", NSP_TEST_STORAGE, from) >= (int)sizeof a) return -36;
@@ -257,7 +266,7 @@ static void swap_exit(void) {
 def swap_source(version):
     init_exit = SWAP_V2_INIT_EXIT if version == "2" else ""
     return (SWAP_SRC.replace("__SWAP_INIT_EXIT__", init_exit)
-                   .replace("__HOLD_MS__", str(SWAP_HOLD_MS))
+                   .replace("__HOLD_MS__", str(SWAP_HOLD_CAP_MS))
                    .replace("__VERSION__", version)
                    .replace("__INIT__", "swap_init" if version == "2" else "NULL")
                    .replace("__EXIT__", "swap_exit" if version == "2" else "NULL")
@@ -269,7 +278,7 @@ def build_modules():
     for d in (MODDIR, BUILT, SRCDIR):
         d.mkdir(parents=True, exist_ok=True)
     defs = [f'-DNSP_TEST_STORAGE="{STORAGE}"', f'-DNSP_TEST_MARKER="{MARKER}"',
-            f'-DNSP_TEST_HOLD="{HOLD}"']
+            f'-DNSP_TEST_HOLD="{HOLD}"', f'-DNSP_TEST_RELEASE="{RELEASE}"']
 
     def compile_so(so_name, src, extra=()):
         cfile = SRCDIR / f"{so_name}.c"
@@ -604,19 +613,23 @@ def case_hot_reload_rollback_calls_exit(p, name):
     if not wait_marker("hold-begin", LOAD_TIMEOUT):
         fail("旧实例 rename 未进入阻塞", f"marker={marker_text()!r}")
         HOLD.unlink(missing_ok=True)
+        RELEASE.write_text("go")  # 兜底放行，别把 daemon 卡住
         return
-    ok(f"旧实例在途 rename 阻塞（drain 窗口内持续持引用，>{SWAP_HOLD_MS}ms）")
+    ok("旧实例在途 rename 阻塞（drain 窗口内持续持引用，开放阻塞直到放行）")
 
     # .so 原子替换 → 热重载：prepare(v2) 成功（init 已起线程），unload(v1) 因
-    # 在途引用超时失败 → 放弃新实例——此分支必须调 v2 的 exit
+    # 在途引用超时失败 → 放弃新实例——此分支必须调 v2 的 exit。
+    # 期间旧实例一直持引用（用例控制放行时机），故与扫描/prepare 快慢无关。
     stage_file(name, SWAP_V2_SO)
-    if wait_marker(SWAP_EXIT_TAG, UNLOAD_TIMEOUT):
+    marked = wait_marker(SWAP_EXIT_TAG, UNLOAD_TIMEOUT)
+    RELEASE.write_text("go")  # 放行旧实例的 rename，后续流程照常
+    if marked:
         ok("热重载放弃分支执行了新实例 exit（线程已停后再 dlclose）")
     else:
         fail("新实例 exit 未执行",
              f"marker={marker_text()!r}（旧实现 dlclose 不带 exit，残留线程会带崩 daemon）")
 
-    th.join(timeout=SWAP_HOLD_MS / 1000.0 + 20)
+    th.join(timeout=40)
     HOLD.unlink(missing_ok=True)
     if p.poll() is None:
         ok("daemon 存活（无语义残留线程踩空）")
@@ -633,7 +646,7 @@ def case_hot_reload_rollback_calls_exit(p, name):
 
 
 def main():
-    global TMP, MNT, STORAGE, MODDIR, BUILT, SRCDIR, CONF, MARKER, DLOG, HOLD
+    global TMP, MNT, STORAGE, MODDIR, BUILT, SRCDIR, CONF, MARKER, DLOG, HOLD, RELEASE
     if not Path(DAEMON).exists():
         print(f"!! 缺少 {DAEMON}，请先构建 GNU 产物（scripts/build.sh）")
         return 2
@@ -653,6 +666,7 @@ def main():
     CONF = TMP / "injector.conf"
     MARKER = TMP / "backend_marker"
     HOLD = TMP / "hold_flag"
+    RELEASE = TMP / "release_flag"
     DLOG = TMP / "daemon.log"
 
     print(f"临时目录: {TMP}")

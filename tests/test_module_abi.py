@@ -169,6 +169,8 @@ def main():
                    # fw_pkg.c 是 fw_config 自建索引/ MONITOR 合并的 uid→包名输入
                    # loader → fw_config →（内建引擎）fw_rules 的链路须一并链接
                    "src/daemon/fw_config.c", "src/daemon/fw_pkg.c", "src/daemon/fw_rules.c",
+                   # fw_config 的监听线程用 cfg_watch 对账 App-rules* 子目录 watch
+                   "src/daemon/cfg_watch.c",
                    "src/config/config_parser.c",
                    "src/config/path_vars.c", "src/core/path_trie.c", "src/core/uid_map.c",
                    "src/core/sys_pkg.c", "src/core/fast_search.c", "src/core/fast_pid.c"]
