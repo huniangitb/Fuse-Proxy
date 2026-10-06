@@ -21,7 +21,7 @@ getdents64 解析（Python 的 scandir/is_dir 在 UNKNOWN 时会 stat 兜底，
     测试非空转（若垫片未拦截，对照名将是正常 DIR，测试失败）。
 
 前置：GNU 产物 build_gnu/fuse_daemon、fusermount3、/dev/fuse、cc；
-缺失则跳过（rc=0，沿用仓库约定）。
+缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
 """
 import ctypes
 import os
@@ -32,6 +32,9 @@ import subprocess
 import sys
 import time
 import uuid
+
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=环境不具备跳过(gap)
+SKIP_RC = 77
 
 BASE = "/tmp/fuse_skel_test"
 MNT = BASE + "/mnt"
@@ -225,18 +228,18 @@ def main():
     rc = 0
     if not os.path.exists(DAEMON):
         log(f"跳过：找不到 fuse_daemon 产物 {DAEMON}")
-        return 0
+        return SKIP_RC
     if not os.path.exists("/dev/fuse"):
         log("跳过：缺少 /dev/fuse（内核未启用 FUSE）")
-        return 0
+        return SKIP_RC
     if shutil.which("fusermount3") is None or shutil.which("cc") is None:
         log("跳过：缺少 fusermount3/cc")
-        return 0
+        return SKIP_RC
     try:
         setup_env()
     except RuntimeError as e:
         log(f"跳过：{e}")
-        return 0
+        return SKIP_RC
 
     log("场景: lstat EACCES 下骨架名回退合成（LD_PRELOAD 模拟 lower 层拒绝）")
     proc = start_daemon()

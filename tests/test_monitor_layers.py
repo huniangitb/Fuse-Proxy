@@ -31,6 +31,7 @@
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -130,7 +131,7 @@ def prepare_include(tmpdir, config_dir):
 def compile_binary(tmpdir, inc_dir):
     exe = os.path.join(tmpdir, "monitor_layers_test")
     cmd = [
-        os.environ.get("CC", "cc"), "-std=c23", "-DTARGET_GNU=1", "-D_GNU_SOURCE",
+        *shlex.split(os.environ.get("CC", "cc")), "-std=c23", "-DTARGET_GNU=1", "-D_GNU_SOURCE",
         "-Wall", "-Wno-unused-parameter",
         "-I", inc_dir, "-I", os.path.join(ROOT, "include"),
         # fw_config.h / fw_pkg.h 随实现放在 src/daemon（框架侧私有头）

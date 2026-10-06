@@ -30,6 +30,13 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULE_SERVER = os.environ.get("RULE_SERVER", os.path.join(ROOT, "build_gnu", "rule_server"))
 
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=整套跳过(gap)
+# 78=部分子组跳过(gap)——SERVICE 段需 bin 目录下有 log_monitor，缺则跳过该段，
+# 其余断言仍有效，故与整套跳过区分，但同样不计通过。
+SKIP_RC = 77
+GAP_RC = 78
+GAPS = []
+
 
 def abstract_sockaddr(name):
     """构造 Linux 抽象命名空间 AF_UNIX 地址：sun_path[0]='\\0' + 名称。
@@ -82,7 +89,7 @@ def main():
     if not os.path.exists(RULE_SERVER):
         print(f"错误: 未找到 rule_server 产物: {RULE_SERVER}", file=sys.stderr)
         print("请先执行: meson setup build_gnu -Dtarget_os=gnu && ninja -C build_gnu rule_server", file=sys.stderr)
-        return 1
+        return SKIP_RC
 
     tmpdir = tempfile.mkdtemp(prefix="rule_srv_test_")
     conf_dir = os.path.join(tmpdir, "conf")
@@ -120,6 +127,9 @@ def main():
     try:
         wait_server_ready(proc, sock_name)
         check(proc, sock_name, conf_dir)
+        if GAPS:
+            print(f"跳过项（gap，不计通过）: {GAPS}", file=sys.stderr)
+            return GAP_RC
         print("rule_server 测试通过 ✔")
         return 0
     finally:
@@ -738,6 +748,7 @@ def check(proc, sock_name, conf_dir):
             pass
     else:
         print("  (跳过 SERVICE 启停控制：bin 目录无 log_monitor)")
+        GAPS.append("SERVICE 启停控制（bin 目录无 log_monitor）")
 
     # ---- QUIT：服务应退出 ----
     r = send_cmd(proc, sock_name, {"cmd": "QUIT"})

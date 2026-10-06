@@ -195,7 +195,7 @@ def main():
     wconf("berr", "bhealth")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败"); return
+    if not p: fail("启动失败"); return 1
     try:
         ok("普通路径直通") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "n.txt 不可见")
         ok("模块加载：/0/bhealth 由后端服务") if alive("bhealth") else fail("后端前置", "backend_bad 加载后 /0/bhealth 不是目录")
@@ -220,7 +220,7 @@ def main():
     wconf("bcrash", "bmatch")
     stage_module("backend_crash")
     p = start()
-    if not p: fail("启动失败（backend_crash）"); return
+    if not p: fail("启动失败（backend_crash）"); return 1
     try:
         ok("模块加载：/0/bmatch 由后端服务") if alive("bmatch") else fail("后端前置", "backend_crash 加载后 /0/bmatch 不是目录")
         try: (MNT/"0/bcrash/x").stat()
@@ -249,7 +249,7 @@ def main():
     wconf("bmatch")
     stage_module("backend_crash")   # 只实现 match/getattr/readdir，无 open/read/write
     p = start()
-    if not p: fail("启动失败（BADFN）"); return
+    if not p: fail("启动失败（BADFN）"); return 1
     try:
         ok("模块加载：/0/bmatch 由后端服务") if alive("bmatch") else fail("后端前置", "bmatch 不是目录")
         ok("普通路径直通") if (MNT/"0/normal/n.txt").exists() else fail("普通路径", "n.txt 不可见")
@@ -278,7 +278,7 @@ def main():
     wconf("berr", "bhealth")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败（ban 重写测试）"); return
+    if not p: fail("启动失败（ban 重写测试）"); return 1
     try:
         ok("模块加载：/0/bhealth 由后端服务") if alive("bhealth") else fail("后端前置", "bhealth 不是目录")
         storm("berr")
@@ -304,7 +304,7 @@ def main():
     wconf("berr", "bhealth")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败（ban 持久化测试）"); return
+    if not p: fail("启动失败（ban 持久化测试）"); return 1
     try:
         ok("模块加载：/0/bhealth 由后端服务") if alive("bhealth") else fail("后端前置", "bhealth 不是目录")
         storm("berr")
@@ -313,7 +313,7 @@ def main():
         stop(p)
     # 同 mtime .so 仍在目录：重启后必须被 ban 拦截，不重载
     p = start()
-    if not p: fail("重启失败"); return
+    if not p: fail("重启失败"); return 1
     try:
         time.sleep(1.5)
         ok("重启后同 mtime 坏模块未重载") if not alive("bhealth", timeout=3) else fail("ban 失效", "重启后坏模块又被加载")
@@ -328,7 +328,7 @@ def main():
     wconf("breaddir_crash", "bhealth")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败（readdir 崩溃）"); return
+    if not p: fail("启动失败（readdir 崩溃）"); return 1
     try:
         ok("模块加载：/0/bhealth 由后端服务") if alive("bhealth") else fail("后端前置", "bhealth 不是目录")
         try: list(node("breaddir_crash").iterdir())
@@ -358,7 +358,7 @@ def main():
     wconf("bovf", "bhealth")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败（readdir 超限）"); return
+    if not p: fail("启动失败（readdir 超限）"); return 1
     try:
         ok("模块加载：/0/bhealth 由后端服务") if alive("bhealth") else fail("后端前置", "bhealth 不是目录")
         entries = []
@@ -383,7 +383,7 @@ def main():
     stage_module("backend_crash")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败（连续崩溃）"); return
+    if not p: fail("启动失败（连续崩溃）"); return 1
     try:
         try: (MNT/"0/bcrash/x").stat()
         except OSError: pass
@@ -405,12 +405,14 @@ def main():
     wconf("biznoent")
     stage_module("backend_crash")
     p = start()
-    if not p: fail("启动失败（业务 errno）"); return
+    if not p: fail("启动失败（业务 errno）"); return 1
     try:
-        for i in range(6):
-            try: (MNT/"0" / f"biznoent{i}").stat()
-            except OSError: pass
-            time.sleep(0.15)
+        # FTP 是**组件级**前缀：规则 `FTP /biznoent` 只覆盖 /0/biznoent 及其子路径，
+        # 不覆盖 /0/biznoent0（那是另一个组件名）。旧实现 stat /0/biznoent0..5 全部
+        # 落本地直通，业务 errno 生产者（backend_crash 的 bc_getattr）根本没被调用
+        # ——用例空转。storm() 在 /0/biznoent/<叶子> 逐次换名，既落在组件作用域内，
+        # 又绕开内核失败 lookup 的负 dentry 缓存（同名只触达一次）。
+        storm("biznoent")
         time.sleep(1.0)
         ok("daemon 存活") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
         if "backend_crash" not in banned_text():
@@ -428,7 +430,7 @@ def main():
     wconf("berr", "bhealth")
     stage_module("backend_bad")
     p = start()
-    if not p: fail("启动失败（ban 自愈）"); return
+    if not p: fail("启动失败（ban 自愈）"); return 1
     try:
         ok("坏版本加载并生效") if alive("bhealth") else fail("后端前置", "bhealth 不是目录")
         storm("berr")
@@ -445,7 +447,7 @@ def main():
     unstage_module("backend_bad")
     stage_module("backend_bad_fixed", as_name="backend_bad")
     p = start()
-    if not p: fail("重启失败（修复版）"); return
+    if not p: fail("重启失败（修复版）"); return 1
     try:
         ok("换修复版后重载恢复（mtime 变化绕过 ban）") if alive("bhealth") else fail(
             "修复版未恢复", "bhealth 仍不可用（ban 未按 mtime 放行）")
@@ -459,7 +461,9 @@ def main():
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")
     if ERRS:
         for d, dt in ERRS: print(f"  失败: {d}: {dt}")
-        sys.exit(1)
+    # 退出码必须反映失败：此前入口是裸 main()，子用例 fail() 后仍 0 退出（假绿）。
+    # 各前置失败分支已改为 return 1，此处兜住正常走完的路径。
+    return 1 if ERRS else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -626,8 +626,24 @@ def case_hot_reload_rollback_calls_exit(p, name):
     if marked:
         ok("热重载放弃分支执行了新实例 exit（线程已停后再 dlclose）")
     else:
-        fail("新实例 exit 未执行",
-             f"marker={marker_text()!r}（旧实现 dlclose 不带 exit，残留线程会带崩 daemon）")
+        # 区分两种「标记缺失」，否则环境时序问题会被误读成产品缺陷：
+        #   ① 放弃分支确实走到了（daemon 日志有「热重载放弃」）却没落 exit 标记
+        #      → 本用例要抓的缺陷；
+        #   ② 根本没走到放弃分支（prepare 校验未过 / 扫描未触发，例如 sanitizer
+        #      下模块加载变慢）→ 环境/时序，重跑确认，不算产品缺陷。
+        dlog = ""
+        try:
+            dlog = DLOG.read_text(errors="ignore")
+        except OSError:
+            pass
+        if "热重载放弃" in dlog:
+            fail("新实例 exit 未执行",
+                 f"marker={marker_text()!r}（放弃分支已走到但 exit 未执行——"
+                 f"旧实现 dlclose 不带 exit，残留线程会带崩 daemon）")
+        else:
+            fail("热重载放弃分支未走到（≠ exit 缺失）",
+                 f"marker={marker_text()!r}；daemon 日志无「热重载放弃」，"
+                 f"疑为 prepare/扫描未触发（sanitizer 下加载变慢时偶发，请重跑确认）")
 
     th.join(timeout=40)
     HOLD.unlink(missing_ok=True)

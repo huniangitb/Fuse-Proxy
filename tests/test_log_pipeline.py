@@ -55,6 +55,13 @@ SYS_LOG = os.path.join(LOG_DIR, "sys.log")
 SYS_ROT = SYS_LOG + ".1"
 LOG_SOCKET_NAME = "nsp_log_socket"  # 抽象地址，权威在 include/common.h
 
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=整套跳过(gap)
+# 78=部分子组跳过(gap)——本套件有「产物缺失/uid 语义不同/日志目录不可写」等
+# 子组级跳过，整套仍有有效断言，故与整套跳过区分，但同样不计通过。
+SKIP_RC = 77
+GAP_RC = 78
+GAPS = []  # 子组级跳过原因（收尾汇总，run.py 据此判 gap）
+
 # 落盘/查询/流式三处统一的行格式：时间|LEVEL|msg（LEVEL 为名称，见 nsp_log.h）
 LEVEL_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\|(DEBUG|INFO|WARN|ERROR)\|")
 
@@ -372,6 +379,7 @@ def test_gate_matrix():
     if os.getuid() >= 10000:
         log("⚠ 本进程 uid=%d 属用户应用，类别段用例（1.5/1.6）语义不同，跳过",
             os.getuid())
+        GAPS.append(f"类别段用例 1.5/1.6（本进程 uid={os.getuid()} 非系统 uid）")
     else:
         run_gate_case("1.5 类别段不越界(USER_APPS vs system)", CAT_UA_OFF, ops_uid,
                       expect_log=True)
@@ -401,6 +409,7 @@ def test_disk_history():
         write_hist(IO_LOG, 1 + n_old, n_new)
     except OSError as e:
         log("⚠ 无法写入 %s（%s），跳过本组", LOG_DIR, e)
+        GAPS.append(f"磁盘历史组（无法写入 {LOG_DIR}：{e}）")
         return
     total = n_old + n_new
 
@@ -447,6 +456,7 @@ def test_level_format():
                 f.write("%s|%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), body))
     except OSError as e:
         log("⚠ 无法写入 %s（%s），跳过本组", SYS_LOG, e)
+        GAPS.append(f"等级渲染组（无法写入 {SYS_LOG}：{e}）")
         return
 
     if not start_logmon():
@@ -508,10 +518,10 @@ def main():
         if not os.path.exists(path):
             log("❌ 缺少 %s: %s", label, path)
             log("   先执行 ninja -C build_gnu（或用环境变量指定产物路径）")
-            return 1
+            return SKIP_RC
     if not os.path.exists("/dev/fuse"):
         log("❌ /dev/fuse 不可用，跳过全部")
-        return 1
+        return SKIP_RC
 
     # 备份磁盘历史：本测试会改写 io.log/.1 与 sys.log/.1，收尾原样还原
     backup = {}
@@ -562,8 +572,14 @@ def main():
         log("失败详情:")
         for desc, detail in ERRORS[:10]:
             log("  ❌ %s  %s", desc, detail)
+    if GAPS:
+        log("跳过项（gap，不计通过）:")
+        for g in GAPS:
+            log("  ⏭ %s", g)
     log("═══════════════════════════════════════")
-    return 0 if FAIL == 0 else 1
+    if FAIL:
+        return 1
+    return GAP_RC if GAPS else 0
 
 
 if __name__ == "__main__":

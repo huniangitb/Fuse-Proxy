@@ -18,9 +18,13 @@ build_gnu/global_replace_ctl 验证新方法的完整生命周期：
 
 运行要求：免 root——经 `unshare --user --map-root-user --mount`
 进 rootless 沙箱（映射根用户后即具挂载权限），先 `mount --make-rprivate /`
-切断传播，全程不污染宿主；userns 不可用时跳过。
+切断传播，全程不污染宿主；userns 不可用时以 SKIP_RC 退出（环境不具备 = gap，
+不计通过）。
 """
 import os, sys, time, subprocess, shutil, ctypes
+
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=环境不具备跳过(gap)
+SKIP_RC = 77
 
 CLONE_NEWNS = 0x00020000
 LIB_C = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -398,10 +402,10 @@ def userns_available():
 def main():
     if not os.path.exists(CTL):
         log(f"跳过：找不到测试驱动 {CTL}（请先构建 build_gnu）")
-        return 0
+        return SKIP_RC
     if not userns_available():
         log("跳过：user/mount ns 不可用（需要 unshare 与 userns 权限）")
-        return 0
+        return SKIP_RC
     host_before = mountinfo_snapshot()
     # rootless 沙箱：映射根用户后具挂载权限；测试挂载 confined 于私有命名空间，
     # 进程退出即随命名空间销毁，宿主零残留（另有前后 mountinfo 比对兜底）

@@ -61,7 +61,8 @@ TERM→KILL 升级、宿主 mountinfo 前后比对、按 cmdline 标记甄别残
                         仓库内——沙箱按原路径绑定，且其旁须有 ``fuse_daemon``，
                         injector 经 ``get_self_dir()`` 定位它）
 
-前置：GNU 产物、``/dev/fuse``、可用的 unshare(1)；userns 不可用时自动跳过。
+前置：GNU 产物、``/dev/fuse``、可用的 unshare(1)；userns 不可用时以 SKIP_RC
+退出（环境不具备 = gap，不计通过）。
 失败诊断：``<workdir>/inner.log``（沙箱控制台）与 ``<workdir>/chan/log/``
 （``sys.log`` / ``io.log`` / ``fuse_crash.log``，经 chan 绑定直达宿主）。
 """
@@ -82,6 +83,10 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INJECTOR = os.environ.get("INJECTOR") or os.path.join(REPO, "build_gnu", "injector")
+
+# 退出码约定（与 tests/run.py 一致）：0=通过 1=失败 77=环境不具备跳过(gap)
+SKIP_RC = 77
+
 LOG_MONITOR = os.path.join(os.path.dirname(INJECTOR), "log_monitor")
 ROOTBASE = "/tmp/fuse_proxy_test/mnt_env"
 METHODS = ("v1", "v2", "v3")
@@ -267,7 +272,8 @@ def mountinfo_snapshot():
 
 
 def preflight():
-    """返回 (skips, errors)：skips → 环境不支持，退出 0；errors → 产物缺失，也退出 0（沿用仓库跳过约定）。"""
+    """返回 (skips, errors)：skips → 环境不支持；errors → 产物缺失。
+    两者都以 SKIP_RC 退出（gap：不计通过，验收须核对跳过原因）。"""
     skips, errors = [], []
     if not os.path.exists("/dev/fuse"):
         skips.append("缺少 /dev/fuse（内核未启用 FUSE）")
@@ -415,11 +421,11 @@ def main():
     if skips:
         for s in skips:
             log(f"跳过：{s}")
-        return 0
+        return SKIP_RC
     if errors:
         for e in errors:
-            log(f"跳过：{e}")
-        return 0
+            log(f"跳过（产物缺失）：{e}")
+        return SKIP_RC
 
     global MOUNTINFO_SNAPSHOT
     MOUNTINFO_SNAPSHOT = mountinfo_snapshot()
