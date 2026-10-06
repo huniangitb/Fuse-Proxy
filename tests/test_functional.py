@@ -4,7 +4,7 @@ fuse_daemon 完整测试套件
 =======================
 测试场景: 基础文件操作 / SQLite 数据库 / 并发压力 / inode 非零一致性
 """
-import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json, sqlite3
+import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json, sqlite3, errno
 from pathlib import Path
 
 MNT     = "/tmp/fuse_proxy_test/mnt"
@@ -477,6 +477,58 @@ def test_concurrent():
     ok(f"50线程 stat风暴: {total_stats} 次 {elapsed:.2f}s ({total_stats/elapsed:.0f} stat/s)")
 
 # ═══════════════════════════════════════════════════════
+# 模块 4：rmdir 标准语义
+# ═══════════════════════════════════════════════════════
+RMDIR_DIR = "0/网盘/rmdir_sem"
+
+def test_rmdir_nonempty_semantics():
+    """rmdir 非空目录必须返回 ENOTEMPTY，且**不得**递归删除子树（POSIX）。
+
+    旧实现（51abd2c 引入）在 ENOTEMPTY 时静默递归删掉整个子树，等于 rmdir
+    变成 rm -r：依赖 rmdir 失败的调用方（rmdir(1)、清理逻辑、探测空目录）
+    会误以为目录已空，并连带丢失全部内容。同一函数的虚拟路径分支本就返回
+    ENOTEMPTY，两条分支语义不一致。本用例在旧实现上必失败
+    （os.rmdir 返回 0 且子树消失）。
+    """
+    log("\n━━━ 模块4: rmdir 标准语义 ━━━")
+    m = Path(MNT)
+    d = m / RMDIR_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "a.txt").write_text("A")
+    (d / "b.txt").write_text("B")
+    (d / "sub").mkdir(exist_ok=True)
+    (d / "sub" / "c.txt").write_text("C")
+
+    # 4.1 非空 → ENOTEMPTY（而非静默递归删除）
+    try:
+        os.rmdir(d)
+        fail("rmdir 非空目录", "未报错（旧实现递归删除的迹象）")
+    except OSError as e:
+        if e.errno == errno.ENOTEMPTY:
+            ok("rmdir 非空目录 → ENOTEMPTY")
+        else:
+            fail("rmdir 非空目录 errno",
+                 f"期望 ENOTEMPTY({errno.ENOTEMPTY}) 实得 {e.errno}({os.strerror(e.errno)})")
+
+    # 4.2 失败后子树必须原封不动
+    keep = d.is_dir() and (d / "a.txt").exists() and (d / "sub" / "c.txt").exists()
+    if keep:
+        ok("rmdir 失败后子树完整保留（未递归删除）")
+    else:
+        fail("rmdir 失败后子树保留",
+             f"dir={d.is_dir()} a={(d/'a.txt').exists()} subc={(d/'sub'/'c.txt').exists()}")
+
+    # 4.3 正对照：清空后 rmdir 应成功
+    try:
+        (d / "a.txt").unlink(); (d / "b.txt").unlink()
+        (d / "sub" / "c.txt").unlink(); (d / "sub").rmdir()
+        os.rmdir(d)
+        ok("清空后 rmdir 成功（正对照）")
+    except Exception as e:
+        fail("清空后 rmdir", str(e))
+
+
+# ═══════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════
 def main():
@@ -499,6 +551,7 @@ def main():
     try:
         test_basic_operations()
         test_inode_nonzero()
+        test_rmdir_nonempty_semantics()
         test_sqlite()
         test_concurrent()
     finally:

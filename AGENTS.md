@@ -41,7 +41,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | 改动 | 测试 |
 |---|---|
 | 内建规则引擎（`src/daemon/fw_rules.c`）/ `fuse_daemon.c` / `config_parser.c` | `test_rules.py`（44，含本地大目录断点续扫）、`test_config_snapshot.py`、`test_monitor_layers.py`（MONITOR 三层合并）、`test_decision_enforce.py`（决策强制单点 errno 矩阵）、`test_negative_timeout.py`（-o negative_timeout 熔断：未命中后建文件立即可见）、`test_readdir_skel_fallback.py`（lstat 拒绝时骨架名回退合成目录条目）、`test_backing_gate.py`（backing 仲裁门 16 项：全局 8 + 按路径 8） |
-| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（15，需 vsftpd；含 V5 分页 700 文件大目录列全；**收尾按 `nsp_` 前缀自清 `/home/bdy/ftp/upload` 残留**——该目录同时是用户投递目录）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd）、`test_ftp_parallel.py`（11，控制面并发/连接复用/延迟收敛/热重载竞态/断连熔断自愈，需 vsftpd；自起延迟中继，占用 127.0.0.1:2121；阶段 B 列 12 个不同目录以绕开 V5 LIST 缓存；工件用 `nsp_par_<pid>_` 前缀并在 finally 自清）、`test_ftp_truncate_list.py`（truncate 清 LIST 缓存：直编后端 + 桩 mux/curl 注入服务端状态，无网络——旧实现不清 LIST 时列举命中旧缓存把截断前 size 回灌 stat）、`test_ftp_upload_lock.py`（**上传锁泄漏判别用例**：直编后端 + 桩 mux/curl，乱序改写→FLUSH 全量重传→trylock 断言锁未泄漏 + 看门狗断言续写/release 不挂起；旧实现上必失败） |
+| `src/modules/ftp/` 或框架后端分派 | `test_ftp.py`（19，需 vsftpd；含 V5 分页 700 文件大目录列全；3c **fsync 落远端判别用例**——write+fsync 后、close 之前核对远端已有内容，旧实现 `vfs_fsync` 对后端句柄返回 0 时必失败；**收尾按 `nsp_` 前缀自清 `/home/bdy/ftp/upload` 残留**——该目录同时是用户投递目录）、`test_backend_lifecycle.py`（后端引用配对/真卸载，无需 vsftpd）、`test_ftp_read_restart.py`（读缓冲随机跳变竞态，无需 vsftpd）、`test_ftp_parallel.py`（14，控制面并发/连接复用/延迟收敛/热重载竞态/断连熔断自愈，需 vsftpd；自起延迟中继，占用 127.0.0.1:2121；阶段 B 列 12 个不同目录以绕开 V5 LIST 缓存；工件用 `nsp_par_` 前缀并在 finally 对 `upload/` 与 chroot 根下 `upload2/` **两处**按宽前缀自清——按 pid 限定只能清自己那份，历史/异常退出的会永久堆积）、`test_ftp_truncate_list.py`（truncate 清 LIST 缓存：直编后端 + 桩 mux/curl 注入服务端状态，无网络——旧实现不清 LIST 时列举命中旧缓存把截断前 size 回灌 stat）、`test_ftp_upload_lock.py`（**上传锁泄漏判别用例**：直编后端 + 桩 mux/curl，乱序改写→FLUSH 全量重传→trylock 断言锁未泄漏 + 看门狗断言续写/release 不挂起；旧实现上必失败） |
 | `src/modules/ftp/ftp_mux.c`（epoll + curl_multi 控制面复用器）或 `backend_rc_is_business`（业务 errno 豁免） | `test_ftp_parallel.py`（连接复用与延迟收敛）、`test_module_circuit.py` §9（业务 errno 不得触发熔断/ban） |
 | `src/config/path_vars.c` | `test_path_vars.py` |
 | injector 目标判定 / 注入方法（`inject_target.c`、`--inject-method=v1\|v2\|v3`） | `test_inject_method.py`（31，v1/v2/v3 判定矩阵：v3 忽略 `GLOBAL_INJECT`/`SKIP_SYSTEM_APPS` 而段头 `OFF` 仍生效、派生标志、非法值拒绝）、`test_global_replace.py`（rootless unshare 沙箱内 v2 替换/还原/审查生命周期，userns 不可用自动跳过） |
@@ -55,7 +55,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | `src/daemon/fw_config.c`（含规则文件/App-rules 的 inotify 监听线程——热重载触发路径本身） | `test_monitor_layers.py`、`test_cfg_watch.py`、`test_rules.py`（重载语义端到端） |
 | `src/daemon/cfg_watch.c`（App-rules* 子目录 watch 对账） | `test_cfg_watch.py`（7：只对 `App-rules[-<uid>]` 挂 watch、普通子目录不挂；子目录内 tmp+rename 能产生可读事件（旧实现完全不监听这些目录→应用级规则改了不生效）；目录消失摘表、基目录不可读返回 false 走兜底重扫） |
 | 框架侧规则解析：uid→包名（`fw_pkg.c`）、MONITOR 三层合并（`fw_config_monitor_for`）、沙盒/ALLOW 解析（`fw_rules.c`） | `test_monitor_layers.py`（20：uid→包名与 MONITOR 合并 11 项；**沙盒解析契约 9 项**——`SANDBOX ON` 时 Download/Pictures/Documents 等共享目录一并重定向进本应用沙盒、自己的 data/obb 与 `/Android` 下非 data/obb 不重定向、`ALLOW` 落回真实路径。本机 uid<10000 恒走 system 分支测不到这些，故自编译实际源码 + 合成 uid，不经 Meson）、`test_cfg_watch.py`（`fw_config.c` 改动同时跑配置目录 watch 套件） |
-| 通用回归 | `test_functional.py`（34，IO/SQLite/并发）、`test_crash_log.py` |
+| 通用回归 | `test_functional.py`（62，IO/SQLite/并发/rmdir 标准语义）、`test_crash_log.py` |
 | 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
 
 特殊前置：`test_ftp.py` 需本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写）；`test_config_snapshot.py`、`test_module_abi.py` 不经 Meson，直接用本机 `cc` 临时编译实际源码（前者另需 json-c），故不依赖 `build_gnu/`；
@@ -118,29 +118,25 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
   `build_gnu/` 需 `chown` 给客户端，收尾再 `chown -R 0:0` 归还，否则仓库里会留下
   宿主无法覆盖的 subuid 属主 .so。
 
-## 待裁决（不擅自定契约，需用户裁定）
+## 已按标准语义修复（原「待裁决」，2026-10-06 裁定）
 
-以下两处行为文档从未定义，代码里是既有实现。已取证但**未改动**，裁定后再动。
+以下两处此前只取证未改，现按标准语义修复，各配判别性用例（旧实现上均必失败）。
 
-1. **`vfs_rmdir` 对 ENOTEMPTY 递归删除**（`src/daemon/fuse_daemon.c`，引入提交 `51abd2c`，
-   提交说明「目录非空时自动调用 recursive_rmdir 兜底，避免应用反复重试」）。
-   本地真实路径上 `rmdir()` 返回 ENOTEMPTY 时会 `recursive_rmdir(p)` 并返回 0——
-   即**对非空目录调 `rmdir` 会静默删掉整个子树**，不符合 POSIX（应返回 ENOTEMPTY）。
-   注意同一函数的**虚拟路径分支**（`NSP_VK_ANCESTOR/TARGET`）是返回 ENOTEMPTY 的，
-   两条分支语义不一致。方向上是**放大破坏面**（本该失败的删除变成了递归删除），
-   而 `rm -rf` 这类正常递归删除路径并不依赖它。
-   倾向：本地分支改为返回 `-ENOTEMPTY`，与虚拟分支对齐；`recursive_rmdir` 保留给
-   `rename`（1971/1974/1978 行）的既有用途。
+1. **`vfs_rmdir` 非空目录返回 ENOTEMPTY**（`src/daemon/fuse_daemon.c`，旧实现由 `51abd2c`
+   引入）。旧实现对本地真实路径的 ENOTEMPTY 直接 `recursive_rmdir(p)` 并返回 0——即
+   **对非空目录调 `rmdir` 会静默删掉整个子树**（实测一次普通 `os.rmdir()` 让
+   `dir/a/sub/c` 全部消失），不符 POSIX，也与同函数的虚拟路径分支（返回 ENOTEMPTY）不一致。
+   现本地分支直接返回 `-ENOTEMPTY`。`recursive_rmdir` 仍保留给 `rename` 的 EXDEV 回退
+   （跨设备移动 = 拷贝后删源树，那里递归删除才是正确语义）。
+   用例：`test_functional.py` 模块4「rmdir 标准语义」——非空→ENOTEMPTY、失败后子树完整
+   保留、清空后 rmdir 成功（正对照）。
 
-2. **`vfs_fsync` 对后端句柄直接返回 0**（同上文件）。后端文件（`NSP_FH_BACKEND_FLAG`）
-   的 fsync 不做任何同步，注释称「同步交给模块 FLUSH/RELEASE」。风险面：依赖
-   `fsync()` 保证持久化的调用方（SQLite `synchronous=FULL`、编辑器保存）在 close 之前
-   调 fsync 会拿到「成功」而数据仍在本地 tmp / 网络缓冲里。FTP 后端本就不提供原子
-   持久化，且 FUSE 每次 close 都会触发 FLUSH——实际影响取决于是否存在「close 前依赖
-   fsync」的调用方（Android 侧未观测到，但无证据表明不存在）。
-   倾向：二选一并写进 `docs/architecture.md`——(a) 明确「后端不保证 fsync 语义」；
-    (b) 让 fsync 触发一次 FLUSH 收尾。前者零成本，后者语义更强但会给每次 fsync 加一次
-   网络往返。
+2. **`vfs_fsync` 对后端句柄真正落盘**（同上文件）。旧实现对后端句柄直接返回 0，数据留在
+   模块缓冲里——依赖 `fsync()` 持久化的调用方（SQLite `synchronous=FULL`、编辑器保存）
+   会拿到「成功」而远端无数据。现改为调用模块 `backend_flush`（与 FLUSH 同一条收尾路径，
+   已抽成 `vfs_backend_finish_data` 供两者共用），成功则失效路径缓存；不销毁句柄，可重复
+   调用（FUSE 的 FLUSH 会因 dup/fork 对同一句柄多次触发）。
+   用例：`test_ftp.py` 3c——write+fsync 后、**close 之前**核对远端已有内容。
 
 ## 设备操作（生产级隔离，血的教训）
 

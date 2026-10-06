@@ -181,10 +181,33 @@ def main():
             if wait_ftp_content(dupf, "AAAABBBB"):
                 ok("FLUSH 后续写（dup/close）：远端内容完整")
             else:
-                p = Path(FTP_UPLOAD) / dupf
-                got = p.read_text(errors="replace") if p.exists() else "<文件不存在>"
+                # 变量名不得用 p——p 是 main 里的 fuse_daemon 进程句柄，
+                # 遮蔽后 finally 的 stop_fuse(p) 会炸在 PosixPath 上（掩盖真错误）
+                fp = Path(FTP_UPLOAD) / dupf
+                got = fp.read_text(errors="replace") if fp.exists() else "<文件不存在>"
                 fail("FLUSH 后续写", f"远端={got!r}（期望 'AAAABBBB'）")
         except Exception as e: fail("FLUSH 后续写", str(e))
+
+        # 3c. fsync 必须把数据交给后端（不得依赖 close/FLUSH 兜底）
+        #     旧实现 vfs_fsync 对后端句柄直接返回 0，数据仍留在模块缓冲里——依赖
+        #     fsync 持久化的调用方（SQLite synchronous=FULL、编辑器保存）会拿到
+        #     「成功」而远端无数据。判别方式：write + fsync 之后、**close 之前**
+        #     就核对远端内容已出现（旧实现此处必为「文件不存在」或空）。
+        syncf = "nsp_test_fsync.txt"
+        try:
+            fd = os.open(str(m/"0"/SERVER/syncf), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                os.write(fd, b"SYNCED-DATA")
+                os.fsync(fd)                      # 关键：此刻数据应已落远端
+                fp = Path(FTP_UPLOAD) / syncf     # 勿用 p（会遮蔽进程句柄）
+                got = fp.read_text(errors="replace") if fp.exists() else "<文件不存在>"
+                if got == "SYNCED-DATA":
+                    ok("fsync 后远端已有数据（close 之前）")
+                else:
+                    fail("fsync 落远端", f"远端={got!r}（期望 'SYNCED-DATA'，close 之前）")
+            finally:
+                os.close(fd)
+        except Exception as e: fail("fsync 落远端", str(e))
 
         # 4. 读回（经 fuse）
         try:
