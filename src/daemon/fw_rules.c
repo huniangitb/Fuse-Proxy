@@ -249,6 +249,7 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
     out->hidden = false;
     out->ro = false;
     out->has_redir = false;
+    out->redir_scope = BR_SCOPE_NONE;
     out->redir[0] = '\0';
     out->ftp_app[0] = '\0';
     out->ftp_cat[0] = '\0';
@@ -273,6 +274,8 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
         }
         if (redir[0] != '\0') {
             out->has_redir = true;
+            out->redir_scope = BR_SCOPE_APP; /* 记录作用域：供 br_to_real_path 与
+                                                线性通道按「作用域优先」比较 */
             strcpy(out->redir, redir); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         }
     }
@@ -292,7 +295,8 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
         }
         if (!out->has_redir && redir[0] != '\0') {
             out->has_redir = true;
-            strcpy(out->redir, redir);
+            out->redir_scope = BR_SCOPE_CAT;
+            strcpy(out->redir, redir); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         }
     }
     if (g_global_cfg.trie_root) {
@@ -310,8 +314,19 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
         }
         if (!out->has_redir && redir[0] != '\0') {
             out->has_redir = true;
+            out->redir_scope = BR_SCOPE_GLOBAL;
             strcpy(out->redir, redir); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         }
+    }
+}
+
+/* 作用域 → 该层的 AppConfig（应用段/类别段/[GLOBAL]） */
+static AppConfig* br_scope_cfg(AppConfig* cfg, AppConfig* cat, BrRuleScope scope) {
+    switch (scope) {
+        case BR_SCOPE_APP: return cfg;
+        case BR_SCOPE_CAT: return cat;
+        case BR_SCOPE_GLOBAL: return &g_global_cfg;
+        default: return NULL;
     }
 }
 
@@ -603,34 +618,39 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     char temp[PATH_MAX] = {0};
     bool redir = false;
 
-    if (tm && tm->valid) {
-        if (tm->has_redir) {
+    /* 重定向解析：**作用域优先**——应用段 > 类别段 > [GLOBAL]（docs/config.md §2）。
+       同一作用域内静态（Trie）与线性（通配/变量）通道等价：Trie 只是静态规则的
+       加速索引，不是更高的优先级层，故同层内先看静态命中、再看该层线性规则。
+       旧实现先取「任一作用域的静态命中」、再无条件跳到线性，于是 [GLOBAL] 的静态
+       REDIRECT 会压过应用/类别段的动态规则（与文档优先级相反）。 */
+    const bool tm_ok = (tm && tm->valid);
+    const bool static_hit = tm_ok && tm->has_redir;
+    for (int layer = BR_SCOPE_APP; layer >= BR_SCOPE_GLOBAL && !redir; layer--) {
+        AppConfig* c = br_scope_cfg(cfg, cat, (BrRuleScope)layer);
+        if (static_hit && (int)tm->redir_scope == layer) {
             strncpy(temp, tm->redir, sizeof(temp) - 1);
             temp[sizeof(temp) - 1] = '\0';
             redir = true;
+            break;
         }
-    } else {
-        bool dummy_hidden = false;
-        bool dummy_ro = false;
-        if (cfg && cfg->trie_root) {
-            if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp,
-                            sizeof(temp))) {
-                if (temp[0] != '\0') redir = true;
+        /* tm 无效（调用方未给缓存）时逐层现查 trie，保持旧 else 分支的兜底语义 */
+        if (!tm_ok && c && c->trie_root) {
+            bool dummy_hidden = false;
+            bool dummy_ro = false;
+            char static_tgt[PATH_MAX];
+            static_tgt[0] = '\0';
+            if (trie_lookup(c->trie_root, sub_path, &dummy_hidden, &dummy_ro, static_tgt,
+                            sizeof(static_tgt)) &&
+                static_tgt[0] != '\0') {
+                strncpy(temp, static_tgt, sizeof(temp) - 1);
+                temp[sizeof(temp) - 1] = '\0';
+                redir = true;
+                break;
             }
         }
-        if (!redir && cat && cat->trie_root) {
-            temp[0] = '\0';
-            if (trie_lookup(cat->trie_root, sub_path, &dummy_hidden, &dummy_ro, temp,
-                            sizeof(temp))) {
-                if (temp[0] != '\0') redir = true;
-            }
-        }
-        if (!redir && g_global_cfg.trie_root) {
-            temp[0] = '\0';
-            if (trie_lookup(g_global_cfg.trie_root, sub_path, &dummy_hidden, &dummy_ro, temp,
-                            sizeof(temp))) {
-                if (temp[0] != '\0') redir = true;
-            }
+        if (c && c->dyn_redir) {
+            redir = br_check_redir_rule(c, sub_path, temp, user_id, current_pkg, true,
+                                        sizeof(temp), uid);
         }
     }
 

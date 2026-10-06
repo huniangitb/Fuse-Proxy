@@ -29,6 +29,11 @@ def setup():
     (Path(STORAGE)/"0/Download/report.pdf").write_text("pdf-orig")
     (Path(STORAGE)/"0/Download/report.pdf.bak").write_text("bak-orig")
     (Path(STORAGE)/"0/Download/Docs/report.pdf").write_text("pdf-redir")
+    # 作用域优先级 fixture：同一虚拟前缀在不同作用域指向不同目标（内容可区分）
+    (Path(STORAGE)/"0/PrioA").mkdir(exist_ok=True)
+    (Path(STORAGE)/"0/PrioB").mkdir(exist_ok=True)
+    (Path(STORAGE)/"0/PrioA/prio.txt").write_text("prio-a")
+    (Path(STORAGE)/"0/PrioB/prio.txt").write_text("prio-b")
     Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").parent.mkdir(parents=True,exist_ok=True)
     Path(f"{STORAGE}/0/a/b/c/d/e/f/g/h/i/j/k.txt").write_text("deep")
     Path(f"{STORAGE}/0/Empty").mkdir(exist_ok=True)
@@ -298,6 +303,46 @@ HIDE /Download/Music/""", [
         ("USR:Pics仍可见","0/Download/Pics/1.jpg","img1"),
         ("USR:Music仍可见","0/Download/Music/song.mp3","music"),
     ],"20.USER_APPS不污染system")
+
+    # 作用域优先：**跨作用域的静态/动态通道不得互相压过**（Trie 只是同层静态规则的
+    # 加速索引，不是更高优先级层）。旧实现先取「任一作用域的静态命中」再才看线性，
+    # 于是 GLOBAL 的静态 REDIRECT 会压过类别段的动态规则 → 用例 21 会读到 prio-a。
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /prio/ /PrioA/
+REDIRECT /prio3/ /PrioA/
+[SYSTEM_APPS] MONITOR OFF
+REDIRECT /prio/* /PrioB/""", [
+        ("P1:类别动态（通配）压过GLOBAL静态","0/prio/prio.txt","prio-b"),
+        ("P2:未被类别覆盖时GLOBAL静态仍生效","0/prio3/prio.txt","prio-a"),
+    ],"21.作用域优先-类别动态 vs GLOBAL静态")
+
+    # 反向组合：GLOBAL 动态 + 类别静态 → 仍是类别（静态）胜（防过度纠正）
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /prio2/* /PrioB/
+[SYSTEM_APPS] MONITOR OFF
+REDIRECT /prio2/ /PrioA/""", [
+        ("P3:类别静态压过GLOBAL动态","0/prio2/prio.txt","prio-a"),
+    ],"22.作用域优先-类别静态 vs GLOBAL动态")
+
+    # 变量目标：只有**真正依赖 $package** 的规则才在包名不可解析时失效
+    # （旧实现见目标含变量即要求包名可解析，把自定义变量的规则一并否掉；
+    #  测试进程 uid=1000 → pkg 恒为 system 不可解析，正好是这个分支）
+    run("""[GLOBAL] MONITOR OFF
+PRIO_DST=/PrioB/
+REDIRECT /priov/ $PRIO_DST
+REDIRECT /priop/ /PrioA/$package/""", [
+        ("V1:自定义变量目标生效","0/priov/prio.txt","prio-b"),
+        ("V2:$package 目标在包名不可解析时失效","0/priop/prio.txt","NOT_EXISTS"),
+    ],"23.变量目标：仅 $package 依赖才按包名否决")
+
+    # 作用域优先 × 变量目标：类别段的变量规则同样压过 GLOBAL 静态
+    run("""[GLOBAL] MONITOR OFF
+REDIRECT /prios/ /PrioA/
+[SYSTEM_APPS] MONITOR OFF
+PRIO_X=/PrioB/
+REDIRECT /prios/ $PRIO_X""", [
+        ("P4:类别段变量规则压过GLOBAL静态","0/prios/prio.txt","prio-b"),
+    ],"24.作用域优先-类别变量 vs GLOBAL静态")
 
     # cleanup
     subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)

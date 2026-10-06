@@ -275,6 +275,31 @@ void analyze_var_staticness(AppConfig* cfg, const AppConfig* global_cfg) {
     free(state);
 }
 
+/* 目标展开是否**依赖 $package**：直接引用 `$package`，或引用了非静态（值里含
+   $package 或引用动态变量）的自定义变量。判定复用 analyze_var_staticness 预计算
+   的 var_is_static——不必自己重跑静态度分析（那会与扫描逻辑各写一份）。 */
+static bool target_needs_pkg(const char* target, const AppConfig* app, const AppConfig* global) {
+    for (const char* p = target; p && *p;) {
+        if (*p != '$') {
+            p++;
+            continue;
+        }
+        char name[128];
+        bool ok;
+        p = parse_dollar(p, name, sizeof name, &ok);
+        if (!ok || !name[0]) continue;
+        if (strcmp(name, "package") == 0) return true;
+        for (int a = 0; a < 2; a++) {
+            const AppConfig* cfg = (a == 0) ? app : global;
+            int idx = find_var_index(cfg, name);
+            if (idx < 0) continue;
+            if (!cfg->var_is_static || !cfg->var_is_static[idx]) return true;
+            break; /* 静态变量：var_resolved 已是展开结果，不含 $package */
+        }
+    }
+    return false;
+}
+
 bool build_real_base_from_target(const char* target, int user_id, char* real_base, size_t sz,
                                  const AppConfig* app_cfg, const AppConfig* global_cfg,
                                  const char* current_pkg) {
@@ -282,7 +307,11 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
     char expanded[PATH_MAX * 4];
     const char* t = target;
     if (has_path_var(target)) {
-        if (!pkg_resolvable(current_pkg)) return false; /* 规则失效 */
+        /* 只有**真正依赖 $package** 的目标才在包名不可解析时失效（config.md §5）。
+           旧实现一见目标含变量就要求 pkg_resolvable，把自定义变量（DEST=/Pics/ 这类
+           与包名无关）的规则也从 system/unknown 访问者身上一并否掉了。 */
+        if (target_needs_pkg(target, app_cfg, global_cfg) && !pkg_resolvable(current_pkg))
+            return false; /* 规则失效 */
         expand_path_vars(target, expanded, sizeof expanded, app_cfg, global_cfg, current_pkg);
         t = expanded;
     }
