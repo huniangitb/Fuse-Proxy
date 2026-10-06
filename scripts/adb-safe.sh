@@ -264,7 +264,8 @@ HARNESS=\$(dirname "\$0")/../adb-safe.sh
 . "\$HARNESS"
 case "$c" in
     rm|mv) guard_mv "\$@";;
-    cp|tee) guard_cp "\$@";;
+    cp) guard_cp "\$@";;
+    tee) guard_tee "\$@";;   # tee 的每个操作数都是写入目标，不能只查最后一个
     dd) guard_dd "\$@";;
     umount) guard_umount "\$@";;
     kill) guard_kill "\$@";;
