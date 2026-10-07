@@ -239,10 +239,18 @@ def memfd_count(proc, name=None):
         return -1
 
 def ban_lines(name):
-    """<modules_dir>/.banned 里该模块的记录（name|mtime|reason|ts）。"""
+    """<modules_dir>/.banned 里该模块的记录（name|mtime|reason|ts[|abi]）。"""
     p = Path(MODDIR) / ".banned"
     if not p.exists(): return []
     return [l for l in p.read_text().splitlines() if l.startswith(name + "|")]
+
+def framework_abi():
+    """从公开 ABI 头取当前 NSP_MODULE_ABI_VERSION（ban 记录末字段即此值）。"""
+    for ln in (ROOT / "include" / "nsp_module.h").read_text().splitlines():
+        s = ln.strip()
+        if s.startswith("#define NSP_MODULE_ABI_VERSION"):
+            return int(s.split()[-1].rstrip("uU"))
+    raise RuntimeError("未在 include/nsp_module.h 找到 NSP_MODULE_ABI_VERSION")
 
 def start(extra_env=None):
     env = dict(os.environ)
@@ -426,6 +434,62 @@ def main():
         ok("旧格式 ban 记录被清除") if not ban_lines("backend_abi") else fail(
             "旧格式 ban 未清除", str(ban_lines("backend_abi")))
     run_case("6. 旧哈希格式 ban 自愈", case6)
+
+    def case6b(p, m):
+        """框架 ABI 变化后旧 ban 必须自愈（**升级框架不挡模块**）
+
+        现场：框架 ABI 从旧值升到当前值之前，模块已因 ABI 不匹配被落 ban
+        （`name|mtime|ABI mismatch|ts`）。用户升级框架后通常**不会重装/触碰
+        .so**，mtime 不变 → 修复前该 ban 永久命中：新框架明明支持该模块，却一直
+        静默跳过（症状就是「更新框架后模块再也起不来」）。
+
+        判别构造：手工写 .banned（同名 + 当前 .so 的 mtime），只改末字段 ABI：
+          (1) ABI = 当前值     → ban 仍生效（模块**不得**加载）；
+          (2) ABI = 别的值     → 视为 stale，记录被清除且模块**加载**。
+        修复前（记录无 ABI 字段、查询不看 ABI）(2) 必失败。"""
+        # 前置：卸载干净 + 无残留 ban
+        shutil.rmtree(f"{MODDIR}/backend_abi", ignore_errors=True)
+        try: (Path(MODDIR) / ".banned").unlink()
+        except OSError: pass
+        deadline = time.time() + 20
+        while time.time() < deadline and memfd_count(p, "backend_abi") != 0:
+            time.sleep(0.5)
+
+        abi = framework_abi()
+        stage = f"/tmp/fm_abi_stage_{os.getpid()}.so"
+        shutil.copy(ROOT / "build_gnu" / "backend_abi.so", stage)
+        T = int(time.time()) - 60          # 确定的过去时刻，避免与当前秒撞车
+        os.utime(stage, (T, T))
+        cur_mtime = int(os.stat(stage).st_mtime)
+
+        def install_with_ban(abi_field):
+            """写 .banned（同名 + 该 mtime + 指定 ABI 字段）后装入模块。"""
+            with open(Path(MODDIR) / ".banned", "w") as f:
+                f.write(f"backend_abi|{cur_mtime}|ABI mismatch|{int(time.time())}|{abi_field}\n")
+            os.makedirs(f"{MODDIR}/backend_abi", exist_ok=True)
+            tmp = f"{MODDIR}/backend_abi/backend_abi.so.tmp"
+            shutil.copy2(stage, tmp)        # copy2 保留 mtime
+            os.utime(tmp, (T, T))           # 双保险
+            os.replace(tmp, f"{MODDIR}/backend_abi/backend_abi.so")
+
+        # (1) 同 ABI：ban 语义不得被削弱
+        install_with_ban(str(abi))
+        time.sleep(8)
+        ok("框架 ABI 未变时 ban 仍生效（模块不加载）") if memfd_count(p, "backend_abi") == 0 else fail(
+            "同 ABI 的 ban 被误放行", "模块被加载了，ban 语义被破坏")
+
+        # (2) ABI 变化（模拟框架已升级）：旧 ban 必须自愈
+        install_with_ban(str(abi + 1))
+        deadline = time.time() + 20
+        while time.time() < deadline and memfd_count(p, "backend_abi") == 0:
+            time.sleep(0.5)
+        ok("框架 ABI 变化后旧 ban 自愈（模块加载）") if memfd_count(p, "backend_abi") > 0 else fail(
+            "框架升级仍被旧 ban 挡住", "改 ABI 字段后模块仍未加载（升级框架救不回来）")
+        ok("自愈后陈旧记录被清除") if not ban_lines("backend_abi") else fail(
+            "陈旧记录未清除", str(ban_lines("backend_abi")))
+        try: os.unlink(stage)
+        except OSError: pass
+    run_case("6b. 框架 ABI 变化后旧 ban 自愈（升级框架不挡模块）", case6b)
 
     def case7(p, m):
         """A23-2：.so 首次 stat 失败（替换间隙）→ 立即放弃本轮，不得继续跑完

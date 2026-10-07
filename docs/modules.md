@@ -187,7 +187,7 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 **ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|mtime|原因|时间戳`）。扫描线程或热重载前先按文件 mtime 查 ban（`module_ban_blocks`）：一致即跳过（加载与重载都不做），mtime 变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
 
-**加载前就被拒的情形同样落 ban**（`module_prepare` 内）：`abi_version` 不匹配、内部 `name` 与目录名不一致——这两种都发生在 `dlopen` 之后、`commit` 之前，槽位从未建立，若只报错不落 ban，每次事件扫描就重试一轮（0.5s 稳定性等待 + 整份 `.so` 复制进新 memfd），并**每次泄漏一个内存副本 fd**（实测残留旧 ABI 模块时每次扫描漏 1 个，累积到 nofile 上限后 socket/open 全面 EMFILE）。现落 ban 后只报一次（`检测到新模块` + 具体原因 ERROR + 一次 `ban 名单命中` WARN），之后静默跳过；日志按 `(模块名, 文件 mtime)` 去重，文件一变重新提示一次（`sys.log` 里 DEBUG 不受最小级别过滤，靠降级日志级别解决不了刷屏）。`module_prepare` 的所有失败路径经 `module_prepare_reject()` 统一回收 memfd。
+**加载前就被拒的情形同样落 ban**（`module_prepare` 内）：`abi_version` 不匹配、内部 `name` 与目录名不一致——这两种都发生在 `dlopen` 之后、`commit` 之前，槽位从未建立，若只报错不落 ban，每次事件扫描就重试一轮（0.5s 稳定性等待 + 整份 `.so` 复制进新 memfd），并**每次泄漏一个内存副本 fd**（实测残留旧 ABI 模块时每次扫描漏 1 个，累积到 nofile 上限后 socket/open 全面 EMFILE）。现落 ban 后只报一次（`检测到新模块` + 具体原因 ERROR + 一次 `ban 名单命中` WARN），之后静默跳过；日志按 `(模块名, 文件 mtime)` 去重，文件一变重新提示一次（`sys.log` 里 DEBUG 不受最小级别过滤，靠降级日志级别解决不了刷屏）。`module_prepare` 的所有失败路径经 `module_prepare_reject()` 统一回收 memfd。ban 记录**含框架 ABI 字段**（见 §3 末）：**框架升级到新 ABI 后这些 ban 自动失效**，用户不必手工删 `.banned`。
 
 **旧模块残留**：框架内建规则引擎后 `basic_rules` 已退役，而 `CONFIG_DIR/modules/` 不在 Magisk 模块目录内，卸载/更新都不会清它，安装脚本此前只 `cp` 不删 → 旧 `.so` 会永久留在设备上（症状就是启动后反复出现 `模块 basic_rules ABI 不匹配`）。现两条一起处理：安装脚本（`customize.sh`）按 `RETIRED_MODULES` 清理**已知退役**的模块目录（不做白名单全清，避免误删用户自己放的模块），框架侧按上面的 ban 机制兜底（用户手动放的坏模块同理）。回归用例见 `test_modules.py` §5。
 
@@ -285,7 +285,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 
 ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。V5 同理（`backend_readdir` 加 `offset` 分页 + 超长名跳过语义），递增到 5 并拒绝 V1/V2/V3/V4——V4 模块无分页，大目录静默丢尾。
 
-**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。模块版本区分按 `.so` 文件 mtime 秒粒度（`st.st_mtime`）：同秒内替换不放行 ban、不触发重载，需 `touch` 续秒或等下次变化。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。`ftp.conf` 失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
+**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。模块版本区分按 `.so` 文件 mtime 秒粒度（`st.st_mtime`）：同秒内替换不放行 ban、不触发重载，需 `touch` 续秒或等下次变化。**ban 记录还带框架 ABI 维度**（行末第 5 字段 = 落 ban 时的 `NSP_MODULE_ABI_VERSION`）：框架 ABI 与记录不同（或记录为无该字段的旧格式）即视为 stale 丢弃并放行——否则「旧框架因 ABI 不匹配落 ban → 用户升级框架到新 ABI」后，模块 mtime 未变、旧 ban 永久命中，**新框架明明支持该模块却再也加载不回来**（升级框架通常不会重装/触碰 `.so`）。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。`ftp.conf` 失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
 
 ## 7. 参考实现
 

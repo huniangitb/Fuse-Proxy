@@ -698,11 +698,15 @@ static int module_unload_one(const char* name) {
 }
 
 /* ================= ban 记录（崩溃/熔断后防重载震荡） =================
- * <modules_dir>/.banned，每行: 模块名|mtime|原因(不含|)|时间戳
- * 查询语义：同名记录存在且 mtime 一致 → ban 生效；mtime 不同（.so 已更新）
- * → 记录失效，重写文件移除该行并允许加载（版本更新自愈）。
- * 旧格式行（第二字段为 64 位哈希而非纯数字 mtime）一律视为 stale 丢弃：
- * 内容哈希校验已弃用，旧 verdict 无参照意义，删后按新语义重建。
+ * <modules_dir>/.banned，每行: 模块名|mtime|原因(不含|)|时间戳|框架ABI
+ * 查询语义：同名记录存在、mtime 一致**且框架 ABI 一致** → ban 生效；
+ * 任一不符 → 记录失效，重写文件移除该行并允许加载（自愈）：
+ *   - mtime 不同 = .so 已更新（版本更新自愈）；
+ *   - 框架 ABI 不同 = 换了运行环境——**框架升级到新 ABI 后，此前因 ABI 不匹配
+ *     落的 ban 必须失效**，否则新框架明明支持该模块却一直跳过（用户升级框架
+ *     通常不会重装/触碰 .so，mtime 不变，旧 ban 会永久命中）。
+ * 旧格式行一律视为 stale 丢弃（一次性迁移）：第二字段为 64 位哈希（内容哈希
+ * 校验已弃用），或无第 5 字段（无法判定其框架 ABI）——删后按新语义重建。
  * 运行上下文：monitor 线程 / FUSE 线程（普通上下文，可文件 I/O）。 */
 
 static char g_banned_path[PATH_MAX] = {0};
@@ -767,16 +771,25 @@ static bool module_ban_lookup(const char* name, time_t cur_mtime, char reason_ou
                 overflow = true;
             continue;
         }
-        /* 同名：比对 mtime；旧哈希格式行直接判 stale（一次性迁移） */
+        /* 同名：比对 mtime 与**框架 ABI**；旧格式行（旧哈希 / 无 ABI 字段）判 stale */
         char* l2 = strchr(l1 + 1, '|');
         const char* mfield = l1 + 1;
         size_t mlen = l2 ? (size_t)(l2 - mfield) : strlen(mfield);
         char lreason[96] = {0};
+        /* 第 5 字段 = 落 ban 时的框架 ABI；**缺失即旧格式记录**（本字段是本轮
+           新加的），同样判 stale——与上面「旧哈希格式一次性迁移」同处理：
+           无法判定其框架版本，宁可放行重试一次（有围栏兜底）也不让升级后的
+           框架被历史 ban 永久挡住。 */
+        bool abi_match = false;
         if (l2) {
             char* l3 = strchr(l2 + 1, '|');
             size_t rl2 = l3 ? (size_t)(l3 - (l2 + 1)) : strlen(l2 + 1);
             if (rl2 >= sizeof lreason) rl2 = sizeof lreason - 1;
             memcpy(lreason, l2 + 1, rl2);
+            if (l3) {
+                char* l4 = strchr(l3 + 1, '|'); /* ts 之后的 '|' → ABI 字段 */
+                if (l4) abi_match = ((unsigned)atol(l4 + 1) == (unsigned)NSP_MODULE_ABI_VERSION);
+            }
         }
         if (!comparable) {
             /* stat 失败：保留该行，不阻挡 */
@@ -789,6 +802,11 @@ static bool module_ban_lookup(const char* name, time_t cur_mtime, char reason_ou
                 overflow = true;
         } else if (!ban_field_is_mtime(mfield, mlen)) {
             stale = true; /* 旧哈希格式：记录失效，重写时丢弃该行 */
+        } else if (!abi_match) {
+            /* 框架 ABI 与落 ban 时不同（或旧格式无该字段）：这条 ban 针对的是
+               另一套 ABI 的运行环境，不再作数——**这正是「框架升级到新 ABI 后
+               旧 ban 仍挡住新模块」的修复点**。重写时丢弃该行并放行加载。 */
+            stale = true;
         } else if ((time_t)atoll(mfield) == cur_mtime) {
             found = true;
             if (reason_out && lreason[0]) {
@@ -835,9 +853,13 @@ static void module_ban_record(const char* name, time_t mtime, const char* reason
     if (!fp) return;
     flock(fileno(fp), LOCK_EX);
     time_t now = time(NULL);
-    /* reason 为固定串（不含 '|'），name 受 is_valid_module_name 约束，防格式破坏 */
-    fprintf(fp, "%s|%ld|%s|%ld\n", name, (long)mtime, reason ? reason : "unknown",
-            (long)now);
+    /* reason 为固定串（不含 '|'），name 受 is_valid_module_name 约束，防格式破坏。
+       末字段 = **落 ban 时的框架 ABI**：查询侧据它判定「这条 ban 还作不作数」——
+       框架升到新 ABI 后，此前因 ABI 不匹配（或任何原因）落的 ban 必须失效，
+       否则模块永远加载不回来（用户升级框架后并不一定会重装/触碰 .so，mtime 不变
+       → 旧 ban 命中 → 新框架明明支持该模块却一直跳过）。 */
+    fprintf(fp, "%s|%ld|%s|%ld|%u\n", name, (long)mtime, reason ? reason : "unknown",
+            (long)now, (unsigned)NSP_MODULE_ABI_VERSION);
     fflush(fp);
     fsync(fileno(fp));
     flock(fileno(fp), LOCK_UN);
