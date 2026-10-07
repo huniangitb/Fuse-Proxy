@@ -874,18 +874,28 @@ static struct {
     char mt[32];
 } g_ban_quiet[MAX_BAN_QUIET];
 static int g_ban_quiet_count = 0;
+static int g_ban_quiet_next = 0; /* 表满后的环形覆盖游标 */
 
-/* 首次见到该 (name,mtime) 返回 true（应当记录），之后返回 false（静默跳过） */
+/* 首次见到该 (name,mtime) 返回 true（应当记录），之后返回 false（静默跳过）。
+   表满时环形覆盖最旧一项（等价 FIFO 淘汰），而不是"满后不再记录"——后者会让
+   去重彻底失效，超过 16 个被 ban 的模块时每次扫描重打全部日志（正是本表要
+   消灭的噪音）。环形覆盖的代价仅是极久未见的条目可能重复提示一次。 */
 static bool ban_quiet_first(const char* name, const char* mt) {
     for (int i = 0; i < g_ban_quiet_count; i++) {
         if (strcmp(g_ban_quiet[i].name, name) == 0 && strcmp(g_ban_quiet[i].mt, mt) == 0)
             return false;
     }
+    int slot;
     if (g_ban_quiet_count < MAX_BAN_QUIET) {
-        strncpy(g_ban_quiet[g_ban_quiet_count].name, name, sizeof g_ban_quiet[0].name - 1);
-        strncpy(g_ban_quiet[g_ban_quiet_count].mt, mt, sizeof g_ban_quiet[0].mt - 1);
-        g_ban_quiet_count++;
+        slot = g_ban_quiet_count++;
+    } else {
+        slot = g_ban_quiet_next;
+        g_ban_quiet_next = (g_ban_quiet_next + 1) % MAX_BAN_QUIET;
     }
+    strncpy(g_ban_quiet[slot].name, name, sizeof g_ban_quiet[0].name - 1);
+    g_ban_quiet[slot].name[sizeof g_ban_quiet[0].name - 1] = '\0';
+    strncpy(g_ban_quiet[slot].mt, mt, sizeof g_ban_quiet[0].mt - 1);
+    g_ban_quiet[slot].mt[sizeof g_ban_quiet[0].mt - 1] = '\0';
     return true;
 }
 
