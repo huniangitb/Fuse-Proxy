@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <curl/curl.h> /* curl_global_init */
 #include <pthread.h>
 #include <poll.h>
 #include <sys/inotify.h>
@@ -112,6 +113,15 @@ static void* ftp_conf_watch_thread(void* arg) {
 
 static int ftp_module_init(const NspFrameworkApi* api) {
     if (!api || api->api_version < NSP_FRAMEWORK_API_VERSION) return -1;
+    /* libcurl 全局初始化必须在**任何** curl_easy_init 之前完成：不调则 libcurl
+       走隐式初始化，而该路径非线程安全（文档明示），本模块的 easy 句柄由任意
+       FUSE worker 线程经 ftp_easy_new 并发创建 → 有竞态。幂等（libcurl 内部
+       引用计数，重复调用安全），故热重载重复 init 无碍。
+       取舍：exit 侧**不**调 curl_global_cleanup——热重载会 dlclose 本 .so，
+       若 cleanup 释放了全局 SSL/解析器状态，而其它仍映射的实例（或框架侧
+       残留句柄）还在用，就会踩释放后的映射/状态。进程退出时由 libcurl 的
+       析构器统一回收，不泄漏。 */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     /* ftp.conf 与规则配置同目录：--rules=<dir>/injector.conf → <dir>/ftp.conf */
     if (api && api->get_rules_path) {
         const char* rp = api->get_rules_path();
@@ -145,6 +155,8 @@ static void ftp_module_exit(void) {
         g_hotload_tid = 0;
     }
     ftp_backend_clear();
+    /* 不调 curl_global_cleanup：理由见 ftp_module_init 顶部注释（热重载
+       dlclose 场景下清理全局状态会让仍在映射的实例踩空） */
 }
 
 static const NspModuleOps ftp_module_ops = {
