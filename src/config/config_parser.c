@@ -980,7 +980,16 @@ static void view_first_token(const char* line, char* out, size_t sz) {
 }
 
 /* 段头行 → (段名, :uid, ON/OFF)；非段头返回 false。
-   段名与 :uid 就地切分（入参为可写行缓冲，调用方已在行内原地清理）。 */
+   段名与 :uid 就地切分（入参为可写行缓冲，调用方已在行内原地清理）。
+   OFF/ON 后缀必须**整词**匹配（后接空白或行尾）：`[X] OFFX` 此前被当开关
+   静默接受，与 nsp_rule_file.c 的边界口径不一致。 */
+static bool view_token_is(const char* p, const char* word) {
+    size_t n = strlen(word);
+    if (strncmp(p, word, n) != 0) return false;
+    char c = p[n];
+    return c == '\0' || isspace((unsigned char)c);
+}
+
 static bool view_parse_section(char* p, char** name_out, int* uid_out, bool* enabled_out) {
     if (p[0] != '[') return false;
     char* end = strchr(p, ']');
@@ -990,15 +999,34 @@ static bool view_parse_section(char* p, char** name_out, int* uid_out, bool* ena
     char* after = end + 1;
     bool enabled = true;
     while (isspace((unsigned char)*after)) after++;
-    if (strncmp(after, "OFF", 3) == 0)
+    if (view_token_is(after, "OFF"))
         enabled = false;
-    else if (strncmp(after, "ON", 2) == 0)
+    else if (view_token_is(after, "ON"))
         enabled = true;
+    /* 段头含 `:uid` 时校验数字：`[com.foo:abc]` 此前 atoi 静默成 uid 0（命中
+       系统用户），规则落到错误的用户作用域。非数字整段视为无 uid 标记
+       （uid=-1），并由调用方日志告警——比静默归 0 安全。 */
     int uid = -1;
     char* colon = strchr(sec, ':');
     if (colon) {
         *colon = '\0';
-        uid = atoi(colon + 1);
+        const char* d = colon + 1;
+        while (isspace((unsigned char)*d)) d++;
+        bool numeric = (*d != '\0');
+        for (const char* q = d; *q; q++)
+            if (!isdigit((unsigned char)*q)) {
+                numeric = false;
+                break;
+            }
+        if (numeric) {
+            long v = strtol(d, NULL, 10);
+            if (v < 0 || v > 99999)
+                numeric = false; /* 越界（含 atoi 溢出 UB）→ 无 uid 标记 */
+            else
+                uid = (int)v;
+        }
+        if (!numeric)
+            LOG_WRN("段头 [%s] 的 uid 标记 \"%s\" 非法，按无 uid（-1）处理", sec, colon + 1);
     }
     *name_out = sec;
     *uid_out = uid;
