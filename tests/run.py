@@ -50,6 +50,9 @@ SUITE_MAP = [
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py", "test_negative_timeout.py",
       "test_readdir_skel_fallback.py", "test_backing_gate.py",
+      # C1：沙盒落点的目录创建不得发生在 config_read_begin 持槽期间
+      # （br_check_redir_rule 的 access+mkdir 已移出读槽）
+      "test_c1_sandbox_slot.py",
       # 后端 read/write 回传长度钳制（vfs_read/vfs_write）住 fuse_daemon.c，
       # 判别用例在 test_module_circuit.py §7b/7c（谎报 got/wrote 的后端模块）
       "test_module_circuit.py"),

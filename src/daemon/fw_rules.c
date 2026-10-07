@@ -510,7 +510,7 @@ static bool br_is_wildcard(const char* str) {
 
 static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id,
                                 const char* current_pkg, bool skip_sandbox, size_t temp_size,
-                                uid_t uid) {
+                                uid_t uid, char* mkdir_out, size_t mkdir_sz) {
     if (!c) return false;
     bool matched = false;
     if (c->redir_rules && c->redir_count > 0) {
@@ -609,7 +609,11 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
             LOG_WRN("sandbox 路径过长，放弃沙盒重定向: pkg=%s", current_pkg);
             return false;
         }
-        if (access(sandbox_target, F_OK) != 0) mkdir_recursive_p(sandbox_target, 0775);
+        /* 沙盒落点**不在此创建**：本函数在 config_read_begin 持槽期间被调用，持槽内
+           做 access()/mkdir_recursive_p() 会在慢存储上放大发布线程等读者归零的全局
+           停顿（C1），且给 resolve 热路径引入副作用与 TOCTOU。只把待建目录交给出参，
+           由调用方在出槽后补建（见 br_ensure_sandbox_dir）。 */
+        if (mkdir_out && mkdir_sz) snprintf(mkdir_out, mkdir_sz, "%s", sandbox_target);
         int sw = snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
         if (sw < 0 || (size_t)sw >= temp_size) return false; /* 超截断 fail-closed */
         return true;
@@ -617,9 +621,19 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
     return false;
 }
 
+/* 沙盒落点补建（**槽外**）：决策阶段（config_read_begin 持槽内）只记录待建目录，
+   出槽后在此补建——持槽内做 FS 操作会在慢存储上放大发布线程等读者归零的全局停顿
+   （C1），也避免给 resolve 热路径引入副作用与 TOCTOU。目录已存在或补建失败都不影响
+   已算出的真实路径：后续 open/mkdir 以真实 errno 裁决。 */
+static void br_ensure_sandbox_dir(const char* dir) {
+    if (!dir || !dir[0]) return;
+    if (access(dir, F_OK) != 0) mkdir_recursive_p(dir, 0775);
+}
+
 static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf,
                            size_t size, int user_id, bool* is_redir_out, const char* current_pkg,
-                           const FwRulesTrieMatch* tm, uid_t uid) {
+                           const FwRulesTrieMatch* tm, uid_t uid, char* mkdir_out,
+                           size_t mkdir_sz) {
     char temp[PATH_MAX] = {0};
     bool redir = false;
 
@@ -655,7 +669,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
         }
         if (c && c->dyn_redir) {
             redir = br_check_redir_rule(c, sub_path, temp, user_id, current_pkg, true,
-                                        sizeof(temp), uid);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
         }
     }
 
@@ -672,13 +686,13 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
        顺序：应用 > 类别 > 全局（类别变量展开以类别段为专属作用域） */
     if (!redir && cfg && cfg->dyn_redir)
         redir =
-            br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid);
+            br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid, mkdir_out, mkdir_sz);
     if (!redir && cat && cat->dyn_redir)
         redir =
-            br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid);
+            br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid, mkdir_out, mkdir_sz);
     if (!redir && g_global_cfg.dyn_redir)
         redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, true,
-                                    sizeof(temp), uid);
+                                    sizeof(temp), uid, mkdir_out, mkdir_sz);
     /* sandbox 三层：应用显式 OFF 否决类别+全局；类别显式 OFF 否决全局；
        应用显式 ON（或类别显式 ON 且应用未显式）时各自 sandbox 生效 */
     bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
@@ -686,17 +700,17 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     if (!redir && !g_br_disable_sandbox) {
         if (!app_sandbox_off)
             redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
     }
     if (!redir && !g_br_disable_sandbox) {
         if (!app_sandbox_off)
             redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
     }
     if (!redir && !g_br_disable_sandbox) {
         if (!app_sandbox_off && !cat_sandbox_off)
             redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
     }
     if (!redir) {
         common_default_real_path(user_id, sub_path, temp, sizeof(temp));
@@ -1026,9 +1040,11 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
             continue;
         }
         char p[PATH_MAX];
+        char sandbox_mkdir[MAX_PATH_LEN];
+        sandbox_mkdir[0] = '\0';
         bool is_redir = false;
         if (br_to_real_path(cfg, cat, sub_path, p, sizeof p, path_user_id, &is_redir, current_pkg,
-                            &tm, q->uid) != 0) {
+                            &tm, q->uid, sandbox_mkdir, sizeof sandbox_mkdir) != 0) {
             out->valid = false;
             if (config_read_end(cfg_gen)) return;
             continue;
@@ -1061,8 +1077,11 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
        下降一次取得（替代 config_ftp_match 每请求 O(N) 线性扫描）；
        命中后由框架分派给 FTP 后端模块 */
         out->is_ftp = tm.ftp_app[0] || tm.ftp_cat[0] || tm.ftp_global[0];
-        if (config_read_end(cfg_gen)) return;
-        /* 读期间发生发布：整体重试 */
+        if (config_read_end(cfg_gen)) {
+            br_ensure_sandbox_dir(sandbox_mkdir); /* 槽外补建沙盒落点（C1） */
+            return;
+        }
+        /* 读期间发生发布：整体重试（下次循环重新决策、重新记录待建目录） */
     }
 }
 
