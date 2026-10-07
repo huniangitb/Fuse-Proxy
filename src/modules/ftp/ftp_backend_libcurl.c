@@ -316,6 +316,12 @@ typedef struct FtpBackendFile {
     bool up_first;          /* 下一块用 STOR（首块截断）而非 APPE（追加） */
     off_t up_upto;          /* 已流式上传字节数（f_lock 保护） */
     off_t file_end;         /* 已写最大偏移（写模式跟踪，f_lock 保护） */
+    /* ---- 句柄生命周期（见 ftp_handle_get/put）----
+       框架保证 FLUSH 与 RELEASE 不会对同一 h 并发（见 fuse_daemon 的
+       "FLUSH 必须早于 RELEASE 且不并发"契约），但防御性地支持乱序/重入：
+       refs 计数让"release 拆除"与"在途 flush/write"互不 UAF。 */
+    _Atomic int refs;       /* 在途用户计数（0 = 可拆除）；拆除责任只在最后一个 put */
+    bool dead;              /* release 已从表中摘除：新 get 一律拒绝 */
 } FtpBackendFile;
 
 static FtpBackendFile* g_handles[FTP_HANDLE_MAX];
@@ -711,14 +717,46 @@ static uint64_t ftp_handle_alloc(FtpBackendFile* f) {
     return 0;
 }
 
+/* 最终拆除：仅在「已 dead（release 摘表）且 refs 归零」时执行。
+   调用者持有最后一个引用（ftp_handle_put 内调用）或 release 自身即最后一个。
+   注意本函数不碰 g_handles（摘表已由 release 完成）。 */
+static void ftp_handle_destroy_final(FtpBackendFile* f);
+
+/* 取句柄并**在表锁内**增加在途引用（见 FtpBackendFile.refs 注释）。
+   返回 NULL 表示 id 非法或已被 RELEASE 摘除。
+   调用方**必须**在结束使用后调用 ftp_handle_put()（不区分成功/失败路径）。
+   这样"release 查表 → 释放 f"与"flush/write 查表 → 用 f"之间不再有
+   无保护窗口：release 只有在 refs 归零时才真正 free。 */
 static FtpBackendFile* ftp_handle_get(uint64_t id) {
     if (id <= 0 || id >= FTP_HANDLE_MAX) return NULL;
     pthread_mutex_lock(&g_handles_mutex);
     FtpBackendFile* f = g_handles[id];
+    if (f) atomic_fetch_add_explicit(&f->refs, 1, memory_order_acq_rel);
     pthread_mutex_unlock(&g_handles_mutex);
     return f;
 }
 
+/* 归还一次在途引用。refs 归零且 release 已置 dead → 由本调用执行最终拆除
+   （此前 release 把拆除推迟到这里，避免与在途使用者竞态）。 */
+static void ftp_handle_put(uint64_t id, FtpBackendFile* f) {
+    if (!f) return;
+    if (atomic_fetch_sub_explicit(&f->refs, 1, memory_order_acq_rel) == 1) {
+        /* 最后一个引用：仅当 release 已置 dead（拆表）才真正拆除；
+           否则句柄仍在使用中（无人 release），保留。
+           表锁内复核 dead，与 release 的"摘表后置 dead"形成单点同步：
+           要么本线程看到 dead 并拆，要么 release 稍后自己看到 refs==0 并拆。 */
+        bool do_destroy = false;
+        pthread_mutex_lock(&g_handles_mutex);
+        do_destroy = f->dead;
+        pthread_mutex_unlock(&g_handles_mutex);
+        if (do_destroy) ftp_handle_destroy_final(f);
+    }
+    (void)id;
+}
+
+/* 仅从注册表摘除（不改 dead / refs / 不 free）：供 ftp_backend_clear 与单元
+   驱动在"绕过 release"的受控场景下注销句柄用。
+   正常路径请走 ftp_backend_release（含 refs 归零后的最终拆除）。 */
 static void ftp_handle_free(uint64_t id) {
     if (id <= 0 || id >= FTP_HANDLE_MAX) return;
     pthread_mutex_lock(&g_handles_mutex);
@@ -1445,6 +1483,8 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     if (!f) return -ENOMEM;
     f->bk = bk;
     f->tmp_fd = -1;
+    atomic_store_explicit(&f->refs, 0, memory_order_relaxed); /* 表内登记后才可能被 get */
+    f->dead = false;
     pthread_mutex_init(&f->f_lock, NULL); /* 保护读缓冲状态 */
     build_url(bk, path, f->ftp_path, sizeof f->ftp_path);
     if (f->ftp_path[0] == '\0') { /* 路径过长组不出 URL（业务 errno，不熔断），不进 curl */
@@ -1768,12 +1808,14 @@ int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got)
     if (f->tmp_fd >= 0) {
         // 写模式：本地临时文件
         ssize_t n = pread(f->tmp_fd, buf, size, off);
-        if (n < 0) return -errno;
-        *got = (size_t)n;
-        return 0;
+        int r = (n < 0) ? -errno : 0;
+        if (n >= 0) *got = (size_t)n;
+        ftp_handle_put(h, f);
+        return r;
     }
     if (size == 0) {
         *got = 0;
+        ftp_handle_put(h, f);
         return 0;
     }
 
@@ -1847,6 +1889,7 @@ out:
     f->n_readers--;
     if (f->dl_released) pthread_cond_broadcast(&f->dl_cond); /* 通知 release 等待循环可继续 */
     pthread_mutex_unlock(&f->f_lock);
+    ftp_handle_put(h, f);
     return rc;
 }
 
@@ -1857,7 +1900,10 @@ static void* ftp_up_thread(void* arg);
 int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote) {
     FtpBackendFile* f = ftp_handle_get(h);
     if (!f || !buf || !wrote) return -EINVAL;
-    if (f->tmp_fd < 0) return -EBADF;
+    if (f->tmp_fd < 0) {
+        ftp_handle_put(h, f);
+        return -EBADF;
+    }
     pthread_mutex_lock(&f->f_lock);
     /* S4 乱序检测：改写已流式上传的前缀（off < up_upto）→ 已传字节作废，
        流式无法覆盖，置 retransmit 转全量重传（flush STOR 覆盖）；
@@ -1878,7 +1924,11 @@ int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_
     pthread_mutex_unlock(&f->f_lock);
 
     ssize_t n = pwrite(f->tmp_fd, buf, size, off);
-    if (n < 0) return -errno;
+    if (n < 0) {
+        int e = errno;
+        ftp_handle_put(h, f);
+        return -e;
+    }
     *wrote = (size_t)n;
 
     pthread_mutex_lock(&f->f_lock);
@@ -1893,6 +1943,7 @@ int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_
             pthread_cond_wait(&f->up_cond, &f->f_lock);
     }
     pthread_mutex_unlock(&f->f_lock);
+    ftp_handle_put(h, f);
     return 0;
 }
 
@@ -2005,108 +2056,120 @@ static void* ftp_up_thread(void* arg) {
     return NULL;
 }
 
-/* 写模式上传：读本地临时文件 → STOR 全量上传（带并发重试）。
+/* 写模式上传：把本地临时文件全量推送到远端，**内存恒定、不持 f_lock 做网络 I/O**。
    成功置 uploaded；FLUSH（同步收尾）与 RELEASE（防御补传）共用。
-   f_lock 互斥：FLUSH 与延迟 RELEASE 可能并发进入（两阶段拆除后句柄
-   存活到 RELEASE），无锁会让两个线程同时 lseek/read/close(tmp_fd)
-   → 上传失败（写模式场景 f_lock 无其他竞争，read 只用于读模式）。
+
+   旧实现的两个缺陷（review A26-④）：
+   ① 全程持 f_lock 做网络 I/O（最多 5 次重试 + 指数退避，单次可长达数秒），
+      同一句柄的 read/write 在此期间全部阻塞——FUSE worker 被长时间占用；
+   ② `malloc((size_t)sz)` 把整个文件读进内存（2GB 改写 = 2GB 常驻），
+      OOM 时直接 -ENOMEM 返回，数据既不落远端也无重试。
+
+   新做法：**锁内只取快照**（大小、tmp_fd、write_curl），随后释放 f_lock，
+   在锁外按 FTP_UP_CHUNK 分块 pread + STOR/APPE 推送（复用 ftp_stream_chunk
+   的重试与熔断分类），最后再短暂持锁发布结果。
+   半写语义：中途失败时远端留下已推前缀（部分文件），此时置 up_error 且
+   uploaded=false，由下一次 FLUSH/RELEASE 重试全量——绝不谎报成功。
    返回 0 成功，负值 errno 风格。 */
 static int ftp_backend_upload(FtpBackendFile* f) {
-    /* 统一出口：f_lock 必须恰好释放一次。此前主路径（全量 STOR 成功/失败）
-       直接 return 而漏解锁 → 锁随句柄泄漏，存活 fd 的下一次 write（1762）
-       与 release（ftp_write_sync）永久阻塞（乱序改写→close→再写必现）。 */
-    char* data = NULL;
-    off_t sz = 0;
-    int rc = 0;
     pthread_mutex_lock(&f->f_lock);
     /* 是否需要上传由调用方（ftp_write_sync）判定，此处只挡「非写模式」与
        「本地缓存已被 RELEASE 回收」两态。用 uploaded 早退会让「FLUSH 置位后
        又写入」的补传被静默跳过——数据不落远端（dup/fork 下的数据丢失根因） */
-    if (!f->writing || f->tmp_fd < 0) goto out; /* rc=0：无需上传 */
-    sz = lseek(f->tmp_fd, 0, SEEK_END);
-    if (sz < 0) {
-        rc = -EIO;
-        goto out;
+    if (!f->writing || f->tmp_fd < 0) {
+        pthread_mutex_unlock(&f->f_lock);
+        return 0; /* 无需上传 */
     }
-    lseek(f->tmp_fd, 0, SEEK_SET);
+    off_t sz = lseek(f->tmp_fd, 0, SEEK_END);
+    if (sz < 0 || lseek(f->tmp_fd, 0, SEEK_SET) < 0) {
+        pthread_mutex_unlock(&f->f_lock);
+        return -EIO;
+    }
+    /* 句柄缓存到文件上（同文件多次 FLUSH/补传复用连接池） */
+    if (!f->write_curl) f->write_curl = ftp_easy_new(&f->bk->cfg);
+    bool have_curl = (f->write_curl != NULL);
+    int tmp_fd = f->tmp_fd; /* 句柄在本函数结束前不会被 RELEASE 拆除（调用方持引用） */
+    pthread_mutex_unlock(&f->f_lock);
 
-    data = sz > 0 ? malloc((size_t)sz) : NULL;
-    if (sz > 0 && !data) {
-        rc = -ENOMEM;
-        goto out;
+    if (!have_curl) return -EIO;
+    if (sz == 0) {
+        /* 空文件：仍须发一次 STOR 截断（否则 TRUNC 到 0 的远端仍保留旧内容） */
+        int r0 = ftp_stream_chunk(f, "", 0, false);
+        pthread_mutex_lock(&f->f_lock);
+        if (r0 == 0) {
+            f->uploaded = true;
+            f->up_upto = f->file_end = 0;
+            f->up_first = false;
+            f->retransmit = f->up_error = false;
+        } else {
+            f->uploaded = false;
+            f->up_error = f->retransmit = true;
+        }
+        pthread_mutex_unlock(&f->f_lock);
+        if (r0 == 0) {
+            mark_success(f->bk);
+            ftp_stat_cache_clear(f->bk);
+            ftp_list_cache_clear(f->bk);
+        }
+        return r0;
     }
 
-    size_t got = 0;
-    if (sz > 0) {
-        /* 单次 read() 对 32MB 级大文件可能读不满（内核限制单次返回量），
-           必须循环读满——否则 got < sz，STOR 上传长度不匹配/失败，
-           FTP 服务器留下 0 字节文件（大文件写入静默丢失） */
-        while (got < (size_t)sz) {
-            ssize_t n = read(f->tmp_fd, data + got, (size_t)sz - got);
-            if (n <= 0) break;
+    char* buf = malloc(FTP_UP_CHUNK);
+    if (!buf) return -ENOMEM;
+    int rc = 0;
+    off_t off = 0;
+    bool first = true; /* 首块 STOR（截断创建），其后 APPE（追加） */
+    while (off < sz) {
+        size_t want = (size_t)(sz - off);
+        if (want > FTP_UP_CHUNK) want = FTP_UP_CHUNK;
+        size_t got = 0;
+        /* 单次 pread 可能读不满（内核单次返回量上限/信号中断）：循环补齐 */
+        while (got < want) {
+            ssize_t n = pread(tmp_fd, buf + got, want - got, off + (off_t)got);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                rc = -EIO;
+                break;
+            }
+            if (n == 0) break; /* 文件被截短：按已得部分继续（尾部会由下一轮同步补齐） */
             got += (size_t)n;
         }
-    }
-    /* 不关闭 tmp_fd：FUSE 的 FLUSH 可多次（dup/fork 每次 close 一次），句柄在
-       RELEASE 前仍可继续写。保留本地文件才能续写、续传与再次全量同步；
-       tmp_fd 与临时文件由 RELEASE 统一回收 */
-
-    /* 独立写句柄（持久选项同读句柄：用户名/密码/弱网超时）：不走控制面 mux，
-       并发多文件 STOR 因此互不竞争（此前 res=43 的竞争窗口由此根除）；
-       句柄缓存在文件上，同文件多次 FLUSH/补传复用连接池 */
-    if (!f->write_curl) f->write_curl = ftp_easy_new(&f->bk->cfg);
-    if (f->write_curl) {
-        struct ReadBuf rb = {data ? data : "", got, 0};
-        CURLcode res = CURLE_OK;
-        /* 上传失败自动重试：网络瞬态让 perform 返回 CURLE_BAD_FUNCTION_ARGUMENT
-           等瞬时错误（已实测 res=43）；重试吸收竞争窗口，避免上传静默丢失
-           （FLUSH 错误会传播给 close() → 应用读到 EIO） */
-        int backoff_ms = 200; /* 弱网适配：上传失败指数退避 200ms→3.2s 封顶 */
-        for (int attempt = 0; attempt < 5; attempt++) {
-            if (attempt > 0) {
-                usleep((useconds_t)backoff_ms * 1000);
-                if (backoff_ms < 3200) backoff_ms *= 2;
-            }
-            rb.pos = 0;
-            ftp_reset_opts_curl(f->write_curl);
-            curl_easy_setopt(f->write_curl, CURLOPT_URL, f->ftp_path);
-            curl_easy_setopt(f->write_curl, CURLOPT_UPLOAD, 1L);
-            curl_easy_setopt(f->write_curl, CURLOPT_INFILESIZE, (long)got);
-            curl_easy_setopt(f->write_curl, CURLOPT_READFUNCTION, read_cb);
-            curl_easy_setopt(f->write_curl, CURLOPT_READDATA, &rb);
-            res = curl_easy_perform(f->write_curl);
-            curl_easy_setopt(f->write_curl, CURLOPT_UPLOAD, 0L);
-            if (res == CURLE_OK) break;
-            if (f->bk->silent) break; /* 静默模式：失败后不再重试（无网络空转） */
-        }
-        if (res != CURLE_OK) {
-            long resp = 0;
-            curl_easy_getinfo(f->write_curl, CURLINFO_RESPONSE_CODE, &resp); /* 须在 cleanup 前取 */
-            curl_easy_cleanup(f->write_curl); /* 失败句柄可能已半损坏，重建 */
-            f->write_curl = NULL;
-            /* 分类见 res_is_unavailable：仅后端不可达计熔断（服务器已应答的
-               业务失败不计，避免误杀） */
-            if (res_is_unavailable(res, resp)) mark_failure(f->bk);
+        if (rc != 0) break;
+        if (got == 0) break;
+        if (ftp_stream_chunk(f, buf, got, !first) != 0) {
             rc = -EIO;
+            break;
         }
-    } else {
-        rc = -EIO;
+        first = false;
+        off += (off_t)got;
     }
-    if (rc == 0) {
-        /* 全量 STOR 覆盖成功：远端内容 == 本地内容，流式状态复位（此后增量
-           走 APPE，乱序/出错标记清除，流式上传可恢复） */
+    free(buf);
+
+    pthread_mutex_lock(&f->f_lock);
+    if (rc == 0 && off == sz) {
+        /* 全量覆盖成功：远端内容 == 本地内容，流式状态复位（此后增量走 APPE，
+           乱序/出错标记清除，流式上传可恢复） */
         f->uploaded = true;
-        f->up_upto = f->file_end;
+        f->up_upto = off;
         f->up_first = false;
         f->retransmit = false;
         f->up_error = false;
+    } else {
+        /* 中途失败（或未推完）：远端可能留下部分前缀。标记重传，让下一次
+           同步再试；uploaded 保持 false，不谎报成功（否则收尾路径会走
+           「零开销」早退，残缺文件被当成已同步） */
+        f->uploaded = false;
+        f->up_error = true;
+        f->retransmit = true;
+        if (rc == 0) rc = -EIO; /* 未推完同样算失败 */
+    }
+    pthread_mutex_unlock(&f->f_lock);
+
+    if (rc == 0) {
         mark_success(f->bk);         /* 上传成功：清零熔断计数（网络恢复退出静默） */
         ftp_stat_cache_clear(f->bk); /* STOR 完成：整表失效，杜绝写后旧 stat */
         ftp_list_cache_clear(f->bk); /* 新条目出现：LIST 缓存失效 */
     }
-out:
-    free(data);
-    pthread_mutex_unlock(&f->f_lock);
     return rc;
 }
 
@@ -2119,50 +2182,61 @@ out:
 static int ftp_write_sync(FtpBackendFile* f) {
     if (f->up_started) {
         pthread_mutex_lock(&f->f_lock);
-        f->up_stop = true; /* 追平剩余尾部后退出 */
-        pthread_cond_broadcast(&f->up_cond);
-        while (f->up_upto < f->file_end && !f->retransmit && !f->up_error)
-            pthread_cond_wait(&f->up_cond, &f->f_lock);
-        pthread_mutex_unlock(&f->f_lock);
-        pthread_join(f->up_tid, NULL);
-        pthread_mutex_lock(&f->f_lock);
-        f->up_started = false;
-        pthread_mutex_unlock(&f->f_lock);
+        /* 复查 up_started：两个 FLUSH 并发（vfs_fsync 与 vfs_flush 同时到达，
+           或 dup/fork 下多个 close）时，先到者已 join 并把 up_started 清 false；
+           后到者若不再复查就会对同一 tid 再次 pthread_join → UB（tid 可能已
+           被复用，join 到无关线程或永久挂起）。
+           复查与 up_tid 捕获同临界区：要么本线程拿到 up_started==true 并成为
+           唯一的 join 者，要么直接跳过。 */
+        if (!f->up_started) {
+            pthread_mutex_unlock(&f->f_lock);
+        } else {
+            f->up_stop = true; /* 追平剩余尾部后退出 */
+            pthread_cond_broadcast(&f->up_cond);
+            while (f->up_upto < f->file_end && !f->retransmit && !f->up_error)
+                pthread_cond_wait(&f->up_cond, &f->f_lock);
+            f->up_started = false; /* 先清标志再放锁：另一个 join 者立即看到并跳过 */
+            pthread_t tid = f->up_tid;
+            pthread_mutex_unlock(&f->f_lock);
+            pthread_join(tid, NULL);
+        }
     }
-    if (f->retransmit || f->up_error || f->up_upto < f->file_end)
-        return ftp_backend_upload(f); /* 乱序/出错/未追平：全量重传覆盖 */
-    if (f->uploaded) return 0; /* 已同步且无新写入：零网络开销 */
-    f->uploaded = true;
-    mark_success(f->bk);
-    ftp_stat_cache_clear(f->bk); /* 流式 STOR/APPE 完成：整表失效 */
-    ftp_list_cache_clear(f->bk); /* 新条目出现：LIST 缓存失效 */
+    /* 尾部判定读 up_upto/file_end 等状态：释放 f_lock 前后保持一致快照——
+       撕裂读会跳过最后一次全量重传，尾部数据不落远端。故在同一临界区内取快照 */
+    pthread_mutex_lock(&f->f_lock);
+    bool need_full = f->retransmit || f->up_error || f->up_upto < f->file_end;
+    bool already = f->uploaded;
+    if (!need_full && !already) {
+        f->uploaded = true;
+    }
+    pthread_mutex_unlock(&f->f_lock);
+    if (need_full) return ftp_backend_upload(f); /* 乱序/出错/未追平：全量重传覆盖 */
+    if (!already) {
+        mark_success(f->bk);
+        ftp_stat_cache_clear(f->bk); /* 流式 STOR/APPE 完成：整表失效 */
+        ftp_list_cache_clear(f->bk); /* 新条目出现：LIST 缓存失效 */
+    }
     return 0;
 }
 
 /* FLUSH 数据收尾：写模式同步尾部上传但**保留句柄**——FUSE 的 FLUSH 在
    每次 close() 调用（dup/fork 可多次），句柄销毁必须等 RELEASE（最后一个
    引用关闭后），否则存活 fd 的后续读写会命中已销毁句柄（-EINVAL）；
-   读模式无操作。返回 0 成功。 */
+   读模式无操作。返回 0 成功。
+   可重入：多线程同时 FLUSH（fsync+flush 并发 / dup 多份 close）不会 double
+   join——见 ftp_write_sync 内的 up_started 复查。 */
 int ftp_backend_flush(uint64_t h) {
     FtpBackendFile* f = ftp_handle_get(h);
     if (!f) return -EINVAL;
-    if (!f->writing) return 0;
-    return ftp_write_sync(f);
+    int rc = 0;
+    if (f->writing) rc = ftp_write_sync(f);
+    ftp_handle_put(h, f);
+    return rc;
 }
 
-int ftp_backend_release(uint64_t h) {
-    FtpBackendFile* f = ftp_handle_get(h);
-    if (!f) return -EINVAL;
-    int rc = 0;
-
-    /* S4：写模式最后同步一次（内部先停止并 join 流式上传线程，确保随后的
-       全量补传不再有并发读 tmp_fd）。FLUSH 之后仍可能从存活的 dup fd 写入
-       （每次 close 触发一次 FLUSH），那些数据必须在这里补传；已同步且无新
-       写入时该调用零网络开销 */
-    if (f->writing && (f->up_started || !f->uploaded || f->up_upto < f->file_end)) {
-        if (ftp_write_sync(f) != 0) rc = -EIO;
-    }
-
+/* 句柄最终拆除（release 与最后一个在途一起走到才执行；见 .refs 注释）。
+   内含：停止/join 读写线程、归还 curl 句柄、销毁同步原语、free(f)。 */
+static void ftp_handle_destroy_final(FtpBackendFile* f) {
     // 读模式：停止并 join 下载线程 + 等待在途 read 完成 + 释放滑动缓冲 + 销毁独立读句柄
     if (f->dl_started) {
         pthread_mutex_lock(&f->f_lock);
@@ -2193,9 +2267,38 @@ int ftp_backend_release(uint64_t h) {
     f->rbuf = NULL;
     if (f->writing) pthread_cond_destroy(&f->up_cond); /* 写模式 open 时 init */
     pthread_mutex_destroy(&f->f_lock);
-
-    ftp_handle_free(h);
     free(f);
+}
+
+/* 释放句柄（最后一个 close/RELEASE）。
+   两阶段拆除（修 A26-④⑥）：先把句柄从表内摘除并置 dead（此后新 get 一律
+   拒绝——新 open 拿不到旧句柄），再把自己的引用还掉；**真正 free 由
+   "refs 归零的那个线程"执行**。这样在途 write/flush 不会执行到已 free 的句柄，
+   也不存在"两个 FLUSH 对同一 tid 双 join"（join 与 free 只在最后一次性做）。 */
+int ftp_backend_release(uint64_t h) {
+    FtpBackendFile* f = ftp_handle_get(h);
+    if (!f) return -EINVAL;
+    int rc = 0;
+
+    /* S4：写模式最后同步一次（内部先停止并 join 流式上传线程，确保随后的
+       全量补传不再有并发读 tmp_fd）。FLUSH 之后仍可能从存活的 dup fd 写入
+       （每次 close 触发一次 FLUSH），那些数据必须在这里补传；已同步且无新
+       写入时该调用零网络开销 */
+    if (f->writing && (f->up_started || !f->uploaded || f->up_upto < f->file_end)) {
+        if (ftp_write_sync(f) != 0) rc = -EIO;
+    }
+
+    /* 摘表 + 置 dead：此后没有任何新使用者能拿到本句柄 */
+    pthread_mutex_lock(&g_handles_mutex);
+    if (g_handles[h] == f) {
+        g_handles[h] = NULL;
+        atomic_fetch_sub_explicit(&g_active_handles, 1, memory_order_acq_rel);
+    }
+    f->dead = true;
+    pthread_mutex_unlock(&g_handles_mutex);
+
+    /* 归还自己的引用；若此时仍无其他在途者，本调用即执行最终拆除 */
+    ftp_handle_put(h, f);
     return rc;
 }
 
