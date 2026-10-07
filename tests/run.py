@@ -136,6 +136,11 @@ SUITE_MAP = [
      ("src/core/nsp_rule_file.c", "src/core/nsp_rule_file.h"),
      ("nsp_rule_file_write", "nsp_rule_file_app_active_path"),
      "规则文件编辑（nsp_rule_file：并发/持久性/停用态路径）"),
+
+    (("test_a26_misc.py",),
+     ("src/core/nsp_ini_store.c", "src/modules/ftp/ftp_conf.c"),
+     ("nsp_ini_save", "ftp_conf_load", "strip_comment"),
+     "A26 杂项（ftp_conf `#`/port 校验 + nsp_ini_store 落盘持久性）"),
 ]
 
 
@@ -273,6 +278,7 @@ PARALLEL_SAFE = frozenset({
     "test_ftp_upload_lock.py",    # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_fw_config_view.py",     # cc 直编 fw_config.c + 依赖，TemporaryDirectory，无挂载
     "test_inject_tracked_race.py",  # cc 直编 inject_target.c + ASan + --wrap 桩 kill，无挂载/特权
+    "test_a26_misc.py",           # cc 直编 ftp_conf.c/nsp_ini_store.c，/tmp mkdtemp，无挂载/网络
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
