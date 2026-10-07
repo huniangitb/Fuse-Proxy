@@ -375,24 +375,42 @@ static void* grow_rule_array(void* arr, int* cap, int count, size_t elem_size) {
     return grown;
 }
 
+/* 定长缓冲写入（放不下即失败）：返回 false 时 out 已置空，调用方须丢弃该规则。
+   规则路径被静默截断会变成更短的前缀，HIDE/RO 命中范围随之**放大**——违反
+   AGENTS 红线「MAX_PATH_LEN 放不下返回 -1 而非截断」，故配置面一律 fail-closed。 */
+static bool path_fmt(char* out, size_t outsz, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out, outsz, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= outsz) {
+        if (outsz) out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 /* 规则路径前缀归一（HIDE/RO/ALLOW/REDIRECT 共用）：剥离 /storage/emulated/<uid>、
    补前导 '/'、不含通配符时去尾斜杠。keep_star_head=true 保留以 '*' 开头的写法
-   （HIDE/RO 语义：'*' 视为通配起始，不补 '/'）。 */
-static void normalize_rule_path(const char* in, char* out, size_t outsz, bool keep_star_head) {
+   （HIDE/RO 语义：'*' 视为通配起始，不补 '/'）。
+   返回 false = 放不下 out（已置空），调用方须告警并忽略该行。 */
+static bool normalize_rule_path(const char* in, char* out, size_t outsz, bool keep_star_head) {
     const char* p = strip_storage_prefix(in);
-    if (p[0] == '/' || (keep_star_head && p[0] == '*'))
-        snprintf(out, outsz, "%s", p);
-    else
-        snprintf(out, outsz, "/%s", p);
+    bool ok = (p[0] == '/' || (keep_star_head && p[0] == '*')) ? path_fmt(out, outsz, "%s", p)
+                                                               : path_fmt(out, outsz, "/%s", p);
+    if (!ok) return false;
     if (strpbrk(out, "*?[]") == nullptr) strip_trailing_slash(out);
+    return true;
 }
 
 /* FTP 前缀归一：FTP 虚拟前缀是后端段名入口而非存储路径，故不做
-   /storage/emulated 剥离，仅补前导 '/' 并无条件去尾斜杠。 */
-static void normalize_ftp_prefix(const char* in, char* out, size_t outsz) {
-    snprintf(out, outsz, "%s%s", in[0] == '/' ? "" : "/", in);
+   /storage/emulated 剥离，仅补前导 '/' 并无条件去尾斜杠。
+   返回 false = 放不下 out（已置空）。 */
+static bool normalize_ftp_prefix(const char* in, char* out, size_t outsz) {
+    if (!path_fmt(out, outsz, "%s%s", in[0] == '/' ? "" : "/", in)) return false;
     strip_trailing_slash(out);
     if (out[0] == '\0') snprintf(out, outsz, "/");
+    return true;
 }
 
 /* 追加字符串规则到 char** 数组（HIDE/RO 共用）：false = 增长或 strdup 失败
@@ -488,7 +506,15 @@ static bool grow_var_arrays(AppConfig* cur) {
 static bool parse_variable_rule(AppConfig* cur, const char* line, int line_num,
                                 const char* file_path) {
     char vname[128], vvalue[MAX_PATH_LEN];
-    if (!parse_var_assignment(line, vname, sizeof vname, vvalue, sizeof vvalue)) return false;
+    int vr = parse_var_assignment(line, vname, sizeof vname, vvalue, sizeof vvalue);
+    if (vr == 0) return false; /* 非赋值行，按规则行继续解析 */
+    if (vr < 0) {
+        /* 值放不下：拒绝该行。截断的值会让引用它的 $变量 展开出更短前缀，
+           HIDE/RO 命中范围被放大——fail-closed，与路径规则同一红线 */
+        LOG_WRN("变量值过长（限 %d 字节），该行已忽略 (行 %d, 文件 %s)", (int)MAX_PATH_LEN - 1,
+                line_num, file_path);
+        return true; /* 已识别为赋值行：不再交给规则分派 */
+    }
     if (strcmp(vname, "package") == 0) {
         LOG_WRN("不允许覆盖系统保留变量 package (行 %d, 文件 %s)", line_num, file_path);
         return true;
@@ -585,7 +611,11 @@ static void parse_path_rule(AppConfig* cur, char* p_ptr, bool is_hide, int line_
     char* val = get_next_token(&p_ptr);
     if (!val) return;
     char path[MAX_PATH_LEN];
-    normalize_rule_path(val, path, sizeof path, true);
+    if (!normalize_rule_path(val, path, sizeof path, true)) {
+        LOG_WRN("%s 路径过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                is_hide ? "HIDE" : "RO", (int)MAX_PATH_LEN - 1, line_num, file_path);
+        return;
+    }
     append_path_rule(cur, path, is_hide, line_num, file_path);
 }
 
@@ -594,9 +624,17 @@ static void parse_allow_rule(AppConfig* cur, char* p_ptr, int line_num, const ch
     char* val = get_next_token(&p_ptr);
     if (!val) return;
     char virtual_prefix[MAX_PATH_LEN];
-    normalize_rule_path(val, virtual_prefix, sizeof virtual_prefix, false);
+    if (!normalize_rule_path(val, virtual_prefix, sizeof virtual_prefix, false)) {
+        LOG_WRN("ALLOW 路径过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                (int)MAX_PATH_LEN - 1, line_num, file_path);
+        return;
+    }
     char real_target[MAX_PATH_LEN];
-    snprintf(real_target, MAX_PATH_LEN - 1, "?%s", virtual_prefix);
+    if (!path_fmt(real_target, sizeof real_target, "?%s", virtual_prefix)) {
+        LOG_WRN("ALLOW 路径过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                (int)MAX_PATH_LEN - 2, line_num, file_path);
+        return;
+    }
     if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
     append_redirect_rule(cur, virtual_prefix, real_target, true, line_num, file_path);
 }
@@ -608,20 +646,30 @@ static void parse_redirect_rule(AppConfig* cur, char* p_ptr, int line_num, const
     char* v2 = get_next_token(&p_ptr);
     if (!v1 || !v2) return;
     char virtual_prefix[MAX_PATH_LEN];
-    normalize_rule_path(v1, virtual_prefix, sizeof virtual_prefix, false);
+    if (!normalize_rule_path(v1, virtual_prefix, sizeof virtual_prefix, false)) {
+        LOG_WRN("REDIRECT 虚拟路径过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                (int)MAX_PATH_LEN - 1, line_num, file_path);
+        return;
+    }
     char real_target[MAX_PATH_LEN];
+    bool ok;
     if (has_path_var(v2)) {
-        snprintf(real_target, MAX_PATH_LEN, "%s", v2);
+        ok = path_fmt(real_target, sizeof real_target, "%s", v2);
     } else if (strncmp(v2, NSP_ANDROID_EMULATED_ROOT "/",
                        sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1) == 0) {
         const char* p = v2 + sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1;
         while (*p && isdigit((unsigned char)*p)) p++;
         if (*p == '/') p++;
-        snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", p);
+        ok = path_fmt(real_target, sizeof real_target, "?/%s", p);
     } else if (is_system_abs_path(v2)) {
-        snprintf(real_target, MAX_PATH_LEN, "%s", v2);
+        ok = path_fmt(real_target, sizeof real_target, "%s", v2);
     } else {
-        snprintf(real_target, MAX_PATH_LEN - 1, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
+        ok = path_fmt(real_target, sizeof real_target, "?/%s", v2[0] == '/' ? v2 + 1 : v2);
+    }
+    if (!ok) {
+        LOG_WRN("REDIRECT 目标路径过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                (int)MAX_PATH_LEN - 1, line_num, file_path);
+        return;
     }
     if (strpbrk(real_target, "*?[]") == nullptr) strip_trailing_slash(real_target);
     append_redirect_rule(cur, virtual_prefix, real_target, false, line_num, file_path);
@@ -637,7 +685,18 @@ static void parse_ftp_rule(AppConfig* cur, char* p_ptr, int line_num, const char
         return;
     }
     char virtual_prefix[MAX_PATH_LEN];
-    normalize_ftp_prefix(v1, virtual_prefix, sizeof virtual_prefix);
+    if (!normalize_ftp_prefix(v1, virtual_prefix, sizeof virtual_prefix)) {
+        LOG_WRN("FTP 虚拟前缀过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                (int)MAX_PATH_LEN - 1, line_num, file_path);
+        return;
+    }
+    /* 段名放不下即拒绝：截断的段名会指向另一个（可能不存在的）后端配置，
+       与「放不下返回错误而非截断」同一红线；先校验再占用数组槽位 */
+    if (strlen(v2) >= sizeof(((FtpRule*)nullptr)->backend_name)) {
+        LOG_WRN("FTP 段名过长（限 %d 字节），该规则已忽略 (行 %d, 文件 %s)",
+                (int)sizeof(((FtpRule*)nullptr)->backend_name) - 1, line_num, file_path);
+        return;
+    }
     FtpRule* grown =
         grow_rule_array(cur->ftp_rules, &cur->ftp_capacity, cur->ftp_count, sizeof(FtpRule));
     if (!grown) {
