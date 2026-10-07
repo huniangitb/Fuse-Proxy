@@ -606,6 +606,54 @@ def test_rule_server_log_injection():
           (seen[:1] or ["未找到含 marker 的日志行"])[0])
 
 
+def test_query_channel():
+    """用例组4：查询通道判定必须取自**固定前缀**（A24）
+
+    旧实现在**整行**（含搜索关键字）上 `strstr("IO")`/`strstr("LOGCAT")` 判通道，
+    并用 9/13/10 三档偏移切 rest：`log_ctl search-sys IO` 拼出的
+    `QUERY_SYS:-1:IO:100:0` 因关键字含 "IO" 被判成 io 通道，且 rest 从 `line+9`
+    切到前缀中间 → key 变成 "-1"、limit 被 atoi("IO:100:0") 成 0
+    → 静默查了**另一个环**且一条都不返回（前端看到"没有日志"）。
+    关键字含 "LOGCAT" 时同理落到 logcat 环。
+
+    判别：sys 历史里合成只存在于 sys 环的关键字行，`search-sys <含 IO 的关键字>`
+    必须命中；旧实现命中不到。对照 `search-io` 用同一关键字仍正常（证明问题出在
+    通道判定而不是关键字本身）。
+    """
+    log("\n━━━ 用例组4: 查询通道判定取自固定前缀（A24） ━━━")
+    stop_logmon()
+    mark_sys = "A24SYSIO-" + TEST_ID
+    mark_sys_lc = "A24SYSLOGCAT-" + TEST_ID
+    mark_io = "A24IOIO-" + TEST_ID
+    try:
+        with open(SYS_LOG, "w") as f:
+            for body in ("INFO|[hist] %s" % mark_sys, "INFO|[hist] %s" % mark_sys_lc):
+                f.write("%s|%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), body))
+        with open(IO_LOG, "w") as f:
+            f.write("%s|%s|%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), "INFO",
+                                    "[hist] " + mark_io))
+    except OSError as e:
+        GAPS.append(f"查询通道组（无法写入日志历史：{e}）")
+        log("  ⏭ 无法写入日志历史（%s），跳过本组", e)
+        return
+
+    if not start_logmon():
+        fail("log_monitor 启动失败（查询通道组）", "见 /tmp/log_pipeline_monitor.out")
+        return
+    try:
+        got = ctl("search-sys", "IO")
+        check("4.1 search-sys 关键字含 IO → 仍查 sys 环", mark_sys in got,
+              got[:200].replace("\n", " "))
+        got_lc = ctl("search-sys", "LOGCAT")
+        check("4.2 search-sys 关键字含 LOGCAT → 仍查 sys 环", mark_sys_lc in got_lc,
+              got_lc[:200].replace("\n", " "))
+        got_io = ctl("search-io", "IO")
+        check("4.3 对照：search-io 用同一关键字仍正常命中", mark_io in got_io,
+              got_io[:200].replace("\n", " "))
+    finally:
+        stop_logmon()
+
+
 # ───────────────────────────────────────────────────────────
 # 主流程
 # ───────────────────────────────────────────────────────────
@@ -647,6 +695,7 @@ def main():
             test_gate_matrix()
             test_disk_history()
             test_level_format()
+            test_query_channel()
             test_rule_server_log_injection()
     finally:
         stop_fuse(None)

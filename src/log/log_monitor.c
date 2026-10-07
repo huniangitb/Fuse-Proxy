@@ -1366,9 +1366,23 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         return 1;
     } else if (strncmp(line, "QUERY_IO:", 9) == 0 || strncmp(line, "QUERY_SYS:", 10) == 0 ||
                strncmp(line, "QUERY_LOGCAT:", 13) == 0) {
-        bool is_io = (strstr(line, "IO") != nullptr);
-        bool is_logcat = (strstr(line, "LOGCAT") != nullptr);
-        char* rest = line + (is_io ? 9 : (is_logcat ? 13 : 10));
+        /* 通道由**已匹配的固定前缀**三选一决定，偏移取定值。旧实现在**整行**
+           （含搜索关键字）上 strstr("IO")/strstr("LOGCAT")：`log_ctl search-sys IO`
+           拼出的 `QUERY_SYS:-1:IO:100:0` 会被判成 io 通道，且 rest 错位到前缀中间
+           → 静默返回另一个环的数据（关键字含 "IO"/"LOGCAT" 即触发）。 */
+        enum { CH_IO, CH_SYS, CH_LOGCAT } ch;
+        size_t skip;
+        if (strncmp(line, "QUERY_IO:", 9) == 0) {
+            ch = CH_IO;
+            skip = 9;
+        } else if (strncmp(line, "QUERY_LOGCAT:", 13) == 0) {
+            ch = CH_LOGCAT;
+            skip = 13;
+        } else {
+            ch = CH_SYS;
+            skip = 10;
+        }
+        char* rest = line + skip;
         int limit = DEFAULT_LIMIT, offset = 0, level_filter = -1;
         char* key = rest;
         char* level_s = strchr(rest, ':');
@@ -1390,9 +1404,13 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
                 limit = atoi(limit_s);
             }
         }
-        search_log_paged(fd, is_io ? &g_io_buf : (is_logcat ? &g_logcat_buf : &g_sys_buf),
-                         is_io ? &g_io_disk : (is_logcat ? nullptr : &g_sys_disk), key, limit,
-                         offset, level_filter, is_io ? "io" : (is_logcat ? "logcat" : "sys"));
+        search_log_paged(fd,
+                         ch == CH_IO ? &g_io_buf
+                                     : (ch == CH_LOGCAT ? &g_logcat_buf : &g_sys_buf),
+                         ch == CH_IO ? &g_io_disk
+                                     : (ch == CH_LOGCAT ? nullptr : &g_sys_disk),
+                         key, limit, offset, level_filter,
+                         ch == CH_IO ? "io" : (ch == CH_LOGCAT ? "logcat" : "sys"));
         return 1;
     } else if (strcmp(line, "CLEAR_IO") == 0) {
         g_io_buf.head = g_io_buf.tail = 0;
