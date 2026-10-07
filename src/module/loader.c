@@ -31,7 +31,6 @@ typedef struct {
     time_t mtime;       /* .so 文件 mtime，热重载检测 */
 
     bool active;
-    _Atomic int backend_refs; /* 后端 ops 在途引用计数（防热卸载 dlclose 悬垂） */
     int mfd; /* 模块映像的 memfd（-1 = 无）：加载成功后保持打开到模块卸载——
                 内存副本是模块的唯一可执行映像，提前 close 虽不解除已 dlopen 的
                 映射，但会让 maps 失去 `memfd:nsp_module_<名>` 可观测证据。 */
@@ -77,8 +76,6 @@ static _Atomic(int) g_backend_slot_refs[MAX_MODULES]; /* 槽位在途引用（ac
    ops_slot）只扫 0..hwm，不扫 1024 空槽。unload 不收缩——收缩会让并发无锁读
    越界，hwm 常驻是正确性代价（一个 int）。 */
 static _Atomic(int) g_backend_hwm = 0;
-/* 初始扫描是否完成：完成前不向 injector 上报模块变更（避免启动时误触发全量重挂） */
-static volatile sig_atomic_t g_boot_scan_done = 0;
 
 /* ================= 框架服务表 ================= */
 
@@ -407,8 +404,13 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
         if (irc != 0) {
             /* init 返回非 0：模块自认初始化失败，清理责任在模块侧（约定不为
                失败路径留线程）。不调 exit——对半初始化状态再调模块代码可能
-               造成重复清理。 */
-            LOG_ERR("模块 %s init 失败 (rc=%d)", name, irc);
+               造成重复清理。
+               **必须落 ban**：否则扫描线程按"瞬时失败"（module_ban_has==false）
+               每 5s 重试一轮，每轮 0.5s 稳定性等待 + 整份 .so 复制进新 memfd，
+               永不收敛（init 恒返回同一个非 0 → 重试恒失败）。落 ban 后 mtime
+               一致即不再尝试，模块更新（mtime 变）自然解禁。 */
+            LOG_ERR("[MOD_ERR] module=%s op=init rc=%d detail=拒绝加载并落盘 ban", name, irc);
+            module_ban_record(name, so_mtime(so_path), "init returned nonzero");
             fault_fence_unregister_slot(tent_slot);
             return module_prepare_reject(h, mfd, -5);
         }
@@ -632,11 +634,8 @@ static int module_unload_one(const char* name) {
        卸载，由下次模块变更再次触发——宁可延迟卸载，绝不 dlclose 在途模块 */
     bool drained = false;
     for (int i = 0; i < 2000; i++) {
-        bool busy = false;
-        pthread_rwlock_rdlock(&g_module_lock);
-        busy = (m->backend_refs > 0);
-        pthread_rwlock_unlock(&g_module_lock);
-        if (!busy && atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_seq_cst) == 0) {
+        bool busy = atomic_load_explicit(&g_backend_slot_refs[slot], memory_order_seq_cst) != 0;
+        if (!busy) {
             drained = true;
             break;
         }
@@ -1428,7 +1427,6 @@ int module_system_init(const char* rules_path, const char* modules_dir) {
         g_mod_thread_started = true; /* 不 detach：shutdown 要 join，确保退出前线程已停 */
     }
     /* 初始扫描完成后标记，后续热插拔变更才通知 injector */
-    g_boot_scan_done = 1;
     int active = 0;
     pthread_rwlock_rdlock(&g_module_lock);
     for (int i = 0; i < g_module_count; i++)
