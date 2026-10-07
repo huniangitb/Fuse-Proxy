@@ -962,8 +962,12 @@ static void do_cleanup() {
         g_inotify_fd = -1;
     }
     force_recover_tracked_mounts();
-    /* 全局替换模式：退出前先恢复系统 emulated 视图，再终结 FUSE */
-    if (inject_is_global_replace() && g_fuse_ready) {
+    /* 全局替换模式：退出前先恢复系统 emulated 视图，再终结 FUSE。
+       **不得**以 g_fuse_ready 为门控：FUSE 崩溃时 check_and_recover_fuse 会把它清 0，
+       而那恰恰是最需要还原的时刻——跳过还原会让族根停在失效的代理 bind（或裸挂载点）
+       上，关机后系统存储视图丢失。还原只依赖备份树与 FUSE 的 mount ns（pid），
+       与 FUSE 是否存活无关；备份已被消费时重复调用是无害空操作。 */
+    if (inject_is_global_replace() && g_global_fuse.pid > 0) {
         LOG("退出前恢复系统 emulated 视图");
         ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT);
     }
