@@ -17,7 +17,9 @@
  *
  * 退出码：0=系统支持 FD 透传  1=系统不支持  2=检测环境错误（挂载/INIT 握手失败）
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>

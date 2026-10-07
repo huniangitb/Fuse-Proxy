@@ -48,14 +48,23 @@ static void* fuse_thread_entry(void* raw) {
 int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start_routine)(void*),
                    void* arg) {
     if (!s_real_pthread_create) {
-        void* sym = dlsym(RTLD_NEXT, "pthread_create");
-        if (!sym) return 11; /* EAGAIN：调用方走建线程失败分支 */
-        s_real_pthread_create = sym;
+        /* dlsym 返回 void*，转函数指针在 ISO C 下不允许直接强转（-Wpedantic）：
+           经 union 双关（写入 obj / 读出 fn 良定义） */
+        union {
+            void* obj;
+            int (*fn)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+        } sym;
+        sym.obj = dlsym(RTLD_NEXT, "pthread_create");
+        if (!sym.obj) return 11; /* EAGAIN：调用方走建线程失败分支 */
+        s_real_pthread_create = sym.fn;
     }
-    if (!start_routine) return 22; /* EINVAL：与 glibc 语义对齐 */
+    /* 先拷入局部再判空：形参带 nonnull 属性，直接 `!start_routine` 会触发
+       -Wnonnull-compare；语义不变（返回 EINVAL，与 glibc 对齐） */
+    void* (*entry)(void*) = start_routine;
+    if (!entry) return 22;
     FuseThreadTrampoline* t = malloc(sizeof *t);
     if (!t) return 11; /* EAGAIN */
-    t->start = start_routine;
+    t->start = entry;
     t->arg = arg;
     int rc = s_real_pthread_create(thread, attr, fuse_thread_entry, t);
     if (rc != 0) free(t);

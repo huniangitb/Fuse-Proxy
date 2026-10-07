@@ -17,7 +17,9 @@
  *
  * 编译：gcc -shared -fPIC -O1 -g -DNSP_MODULE_BUILD -pthread -Iinclude backend_hold.c -o backend_hold.so
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "nsp_module.h"
 #include <errno.h>
 #include <pthread.h>

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 版权所有 (C) 2026 huniangitb <3361107168@qq.com> */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -474,8 +476,11 @@ static void handle_status(bool api_mode) {
         char line[512];
         while (fgets(line, sizeof(line), fp)) {
             if (strstr(line, "fuse") && strstr(line, "nsp_global")) {
-                char* tok = strtok(line, " ");
-                for (int i = 0; tok && i < 4; i++) tok = strtok(NULL, " ");
+                /* strtok_r：bionic 无条件弃用 strtok（非线程安全）；非嵌套使用，
+                   行为等价 */
+                char* save = NULL;
+                char* tok = strtok_r(line, " ", &save);
+                for (int i = 0; tok && i < 4; i++) tok = strtok_r(NULL, " ", &save);
                 if (tok) fuse_pid = atoi(tok);
                 break;
             }
@@ -973,7 +978,8 @@ static void handle_list_injected(bool api_mode) {
         return;
     }
     int total = 0;
-    char* line = strtok(resp, "\n");
+    char* save = nullptr;
+    char* line = strtok_r(resp, "\n", &save);
     printf("\n已注入应用列表:\n");
     printf("%-4s %-40s %-7s %-8s %-5s %-5s %-5s\n", "序号", "包名", "PID", "UID", "重定向", "隐藏",
            "只读");
@@ -990,7 +996,7 @@ static void handle_list_injected(bool api_mode) {
         } else if (strncmp(line, "DONE|", 5) == 0) {
             sscanf(line + 5, "%d", &total);
         }
-        line = strtok(nullptr, "\n");
+        line = strtok_r(nullptr, "\n", &save);
     }
     printf("\n共计 %d 个应用已注入\n", total);
     free(resp);
@@ -1376,7 +1382,8 @@ int main(int argc, char* argv[]) {
                             json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
             json_object_put(root);
         } else {
-            char* line = strtok(resp, "\n");
+            char* save = nullptr;
+            char* line = strtok_r(resp, "\n", &save);
             while (line) {
                 if (strncmp(line, "DONE|", 5) == 0) {
                     if (!api_mode) {
@@ -1388,7 +1395,7 @@ int main(int argc, char* argv[]) {
                 } else if (strcmp(line, "OK") != 0) {
                     process_and_print(line, force_uid, api_mode);
                 }
-                line = strtok(nullptr, "\n");
+                line = strtok_r(nullptr, "\n", &save);
             }
         }
     }

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "ipc_server.h"
 #include "common.h"
 #include "nsp_util.h"

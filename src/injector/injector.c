@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 版权所有 (C) 2026 huniangitb <3361107168@qq.com> */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "injector.h"
 #include "common.h"
 #include "nsp_util.h"
@@ -487,14 +489,17 @@ static void inject_global_fuse() {
             char extra_copy[512];
             strncpy(extra_copy, g_global_cfg.fuse_extra_args, sizeof(extra_copy) - 1);
             extra_copy[sizeof(extra_copy) - 1] = '\0';
-            char* tok = strtok(extra_copy, " ");
+            /* strtok_r：bionic 无条件弃用 strtok（非线程安全）；此处非嵌套使用，
+               换 strtok_r 行为等价（save 为本次分割的显式游标） */
+            char* save = nullptr;
+            char* tok = strtok_r(extra_copy, " ", &save);
             while (tok) {
                 if (ai >= fuse_args_cap - fuse_args_tail) {
                     extra_truncated = true;
                     break;
                 }
                 args[ai++] = tok;
-                tok = strtok(nullptr, " ");
+                tok = strtok_r(nullptr, " ", &save);
             }
         }
         if (extra_truncated) {

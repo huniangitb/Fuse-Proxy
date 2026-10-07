@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * fw_config.c — 框架侧配置持有者（见 fw_config.h）
  *

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * fw_rules.c — 框架内建规则引擎（见 fw_rules.h）
  *
@@ -513,7 +515,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
             const char* suffix;
             if (br_is_wildcard(prefix)) {
                 /* 命中后取 prefix 中首个通配符之前的字面前缀长度切 suffix，
-                   使 /Download/*.mp3 命中 /Download/a.mp3 → suffix="a.mp3" */
+                   使 /Download/<name>.mp3 命中 /Download/a.mp3 → suffix="a.mp3" */
                 const char* wp = prefix;
                 while (*wp && !strchr("*?[", *wp)) wp++;
                 suffix = sub_path + (size_t)(wp - prefix);
@@ -1493,7 +1495,10 @@ static bool br_cfg_mediates_path(const AppConfig* c, const char* query) {
         if (backing_rule_hits(c, c->redir_rules[i].virtual_prefix, query)) return true;
     }
     for (int i = 0; i < c->ftp_count; i++) {
-        if (!c->ftp_rules || !c->ftp_rules[i].virtual_prefix) continue;
+        /* virtual_prefix 是 char[MAX_PATH_LEN]（恒非 NULL），空串由
+           backing_rule_hits 内部（backing_literal_hits/backing_var_hits）
+           直接判否——此处只需判规则数组本身 */
+        if (!c->ftp_rules) continue;
         if (backing_rule_hits(c, c->ftp_rules[i].virtual_prefix, query)) return true;
     }
     return false;

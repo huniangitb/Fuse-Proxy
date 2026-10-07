@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "sys_pkg.h"
 #include "common.h"
 #include <stdio.h>

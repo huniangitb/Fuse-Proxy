@@ -17,7 +17,9 @@
  *            锁被持有时逐个断言阻塞，而手工「读-改-写」形态立即返回
  *            （见 case_edit_entries_locked）。C6 后库只保留 nsp_rule_file_edit
  *            一条写入路径，任何入口都不可能退化成锁外读改写。 */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>

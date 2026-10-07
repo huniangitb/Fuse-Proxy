@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * build_info.c — 构建水印与设备环境采集实现
  *

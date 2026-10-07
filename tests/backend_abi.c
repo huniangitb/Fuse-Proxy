@@ -14,7 +14,9 @@
  * 编译：gcc -shared -fPIC -O1 -DNSP_MODULE_BUILD -Iinclude [-DNSP_TEST_ABI=1] \
  *          backend_abi.c -o backend_abi.so
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "nsp_module.h"
 
 #ifndef NSP_TEST_ABI

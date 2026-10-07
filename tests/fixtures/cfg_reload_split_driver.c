@@ -16,7 +16,9 @@
  * argv[1] = 规则文件路径（其所在目录即被 watch 的配置目录）
  * argv[2] = 配置目录（写 uid.map / sys_pkgs.cache 用；与编译期 CONFIG_DIR 一致）
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

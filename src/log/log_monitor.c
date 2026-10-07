@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 版权所有 (C) 2026 huniangitb <3361107168@qq.com> */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1066,11 +1068,11 @@ static void load_ignore_rules() {
     push_log(&g_sys_buf, msg, 2, LOG_DEBUG);
 }
 static bool should_ignore_io(const char* line) {
-    char* op_bracket = strchr(line, '[');
+    const char* op_bracket = strchr(line, '[');
     if (!op_bracket) return false;
     op_bracket = strchr(op_bracket + 1, '[');
     if (!op_bracket) return false;
-    char* op_end = strchr(op_bracket, ']');
+    const char* op_end = strchr(op_bracket, ']');
     if (!op_end) return false;
     char op_buf[32];
     size_t op_len = op_end - (op_bracket + 1);
@@ -1079,10 +1081,10 @@ static bool should_ignore_io(const char* line) {
     op_buf[op_len] = '\0';
     int op_mask = parse_op_string(op_buf);
     if (op_mask == 0) return false;
-    char* path_start = op_end + 1;
+    const char* path_start = op_end + 1;
     while (isspace((unsigned char)*path_start)) path_start++;
     if (*path_start == '\0') return false;
-    char* path_end = strstr(path_start, " -> ");
+    const char* path_end = strstr(path_start, " -> ");
     if (!path_end) path_end = path_start + strlen(path_start);
     char path_buf[PATH_MAX];
     size_t path_len = path_end - path_start;

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * fw_pkg.c — 框架侧 uid → 包名解析（见 fw_pkg.h）
  *

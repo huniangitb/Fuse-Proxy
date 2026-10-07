@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 版权所有 (C) 2026 huniangitb <3361107168@qq.com> */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * ns_mountinfo.c — /proc/<pid>/mountinfo 的**唯一**扫描实现（review-todo §C7）
  *

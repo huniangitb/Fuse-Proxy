@@ -11,7 +11,9 @@
  *
  * 退出码：0 全通过；1 有失败；78 仅表示"整组不具备条件"（本驱动不用）。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>

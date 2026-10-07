@@ -7,7 +7,9 @@
  * 有查询参数时逐行打印 fw_backing_mediation_required_for(query) 的 0/1
  * 判定（按路径细粒度门）。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 

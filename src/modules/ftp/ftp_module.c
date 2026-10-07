@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "ftp_conf.h"
 #include "ftp_backend.h"
 #include "nsp_module.h"
