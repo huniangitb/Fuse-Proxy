@@ -10,9 +10,13 @@
  *
  * 输出：一行汇总 + RESULT OK/FAIL；失败退出码 1。
  *
- * 另含两组回归：
+ * 另含三组回归：
  *   A10 —— 规则文件读失败（EACCES）时编辑必须失败且不覆盖原文件；
- *   A6  —— ENABLE/DISABLE（toggle）必须与 upsert 走同一把目录 flock（见 case_toggle_locked）。 */
+ *   A6/C6 —— **全部**公共编辑入口（upsert_line / upsert_in_section / remove_nth /
+ *            remove_nth_scoped / toggle_nth_scoped）必须走同一把目录 flock：
+ *            锁被持有时逐个断言阻塞，而手工「读-改-写」形态立即返回
+ *            （见 case_edit_entries_locked）。C6 后库只保留 nsp_rule_file_edit
+ *            一条写入路径，任何入口都不可能退化成锁外读改写。 */
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <poll.h>
@@ -89,16 +93,43 @@ static int case_read_failure(void) {
     return ok ? 0 : 1;
 }
 
-/* ==================== A6：ENABLE/DISABLE 必须走同一把目录 flock ====================
+/* ============ A6/C6：全部公共编辑入口必须走同一把目录 flock ============
  * 判别方式（确定性，不靠竞态概率）：
- *   另起一个进程持有规则文件**所在目录**的 flock 不放，然后分别执行
- *     ① 旧形态：read 全文 → 改一行 → write 覆盖（不持锁）
- *     ② nsp_rule_file_toggle_nth_scoped（新入口）
- *   ① 必须**立即**返回（证明该形态完全没有串行化——这就是丢并发修改的窗口）；
- *   ② 必须**阻塞**，直到锁释放才返回。
- * 若 toggle 又退化成调用侧的读改写（A6 的原始形态），② 会像 ① 一样立即返回，
- * 本组即失败。
+ *   另起一个进程持有规则文件**所在目录**的 flock 不放，然后逐个执行
+ *     ① 手工「读-改-写」形态（不经库、不取锁）
+ *     ② 库的全部公共编辑入口
+ *   ① 必须**立即**返回（证明锁是协作式的、绕过路径在原理上存在）；
+ *   ② 必须**全部阻塞**，直到锁释放才返回。
+ * C6 后库只保留 nsp_rule_file_edit 一条写入路径，任何入口都不可能在锁外完成
+ * 读改写；若某个入口退化成不持锁的读改写，本组即失败。
  */
+
+/* 手工「读-改-写」落盘（不经库、不取锁）：C6 后库不再对外暴露 rule_file_write，
+ * 调用方若要绕过目录 flock 只能自己重写这一套——本函数即演示该路径**在原理上
+ * 可行**（故被要求阻塞的是库入口，而不是「任何代码」）。tmp+rename 与库同形，
+ * 避免留下半截文件影响后续断言。 */
+static int manual_write_file(const char* path, char** lines, int count) {
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.manual.%ld", path, (long)getpid());
+    FILE* fp = fopen(tmp, "w");
+    if (!fp) return -1;
+    for (int i = 0; i < count; i++) {
+        if (fputs(lines[i], fp) < 0) {
+            fclose(fp);
+            unlink(tmp);
+            return -1;
+        }
+    }
+    if (fclose(fp) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
 
 /* 旧形态：读全文 → 把第 0 条 HIDE 加/去 # → 覆盖写。不带任何锁。 */
 static int old_shape_toggle(void) {
@@ -130,16 +161,9 @@ static int old_shape_toggle(void) {
         free(lines[found]);
         lines[found] = nl;
     }
-    int ok = nsp_rule_file_write(g_conf, lines, count) ? 0 : -1;
+    int ok = manual_write_file(g_conf, lines, count);
     nsp_rule_file_free(lines, count);
     return ok;
-}
-
-/* 新入口：加锁版 toggle（GLOBAL 段内第 0 条 HIDE，切换为停用） */
-static int new_shape_toggle(void) {
-    NspRuleScope scope = {"GLOBAL", NSP_RULE_SEC_PREFIX};
-    bool changed = false;
-    return nsp_rule_file_toggle_nth_scoped(g_conf, &scope, "HIDE", 0, false, NULL, 0, &changed);
 }
 
 /* 在子进程里跑 fn()，返回「400ms 内是否仍未返回」（true = 被阻塞） */
@@ -168,21 +192,47 @@ static bool call_blocks_over_400ms(int (*fn)(void)) {
     return blocked;
 }
 
-static int case_toggle_locked(void) {
+static int e_old_manual(void) {
+    return old_shape_toggle();
+}
+static int e_upsert_line(void) {
+    bool ch = false;
+    return nsp_rule_file_upsert_line(g_conf, false, "HIDE", "HIDE /c6-line\n", &ch);
+}
+static int e_upsert_section(void) {
+    bool ch = false;
+    return nsp_rule_file_upsert_in_section(g_conf, "GLOBAL", NSP_RULE_SEC_PREFIX, false, "HIDE",
+                                           "HIDE /c6-sec\n", &ch);
+}
+static int e_remove_nth(void) {
+    return nsp_rule_file_remove_nth(g_conf, "HIDE", 0, NULL, 0);
+}
+static int e_remove_nth_scoped(void) {
+    NspRuleScope s = {"GLOBAL", NSP_RULE_SEC_PREFIX};
+    return nsp_rule_file_remove_nth_scoped(g_conf, &s, "HIDE", 0, NULL, 0);
+}
+static int e_toggle_nth(void) {
+    NspRuleScope s = {"GLOBAL", NSP_RULE_SEC_PREFIX};
+    bool ch = false;
+    return nsp_rule_file_toggle_nth_scoped(g_conf, &s, "HIDE", 0, false, NULL, 0, &ch);
+}
+
+static int case_edit_entries_locked(void) {
     char path[512];
     snprintf(path, sizeof path, WORKDIR "/toggle.conf");
     FILE* f = fopen(path, "w");
     if (!f) {
-        printf("FAIL A6 无法创建 %s\n", path);
+        printf("FAIL A6/C6 无法创建 %s\n", path);
         return 1;
     }
-    fputs("[GLOBAL]\nHIDE /tgl\n", f);
+    /* 5 条 HIDE：释放锁后逐个入口都要能正常完成（remove 不因越界而 ENOTFND） */
+    fputs("[GLOBAL]\nHIDE /e0\nHIDE /e1\nHIDE /e2\nHIDE /e3\nHIDE /e4\n", f);
     fclose(f);
     snprintf(g_conf, sizeof g_conf, "%s", path);
 
     int ready[2], rel[2];
     if (pipe(ready) != 0 || pipe(rel) != 0) {
-        printf("FAIL A6 pipe 失败\n");
+        printf("FAIL A6/C6 pipe 失败\n");
         return 1;
     }
     pid_t locker = fork();
@@ -210,32 +260,52 @@ static int case_toggle_locked(void) {
     ssize_t rr = read(ready[0], &c, 1);
     close(ready[0]);
     if (rr != 1 || c != 'R') {
-        printf("FAIL A6 锁持有者未就绪\n");
+        printf("FAIL A6/C6 锁持有者未就绪\n");
         close(rel[1]);
         (void)waitpid(locker, NULL, 0);
         return 1;
     }
 
-    bool old_blocked = call_blocks_over_400ms(old_shape_toggle);
-    bool new_blocked = call_blocks_over_400ms(new_shape_toggle);
+    bool old_blocked = call_blocks_over_400ms(e_old_manual);
+    struct {
+        const char* name;
+        int (*fn)(void);
+    } entries[] = {
+        {"upsert_line", e_upsert_line},
+        {"upsert_in_section", e_upsert_section},
+        {"remove_nth", e_remove_nth},
+        {"remove_nth_scoped", e_remove_nth_scoped},
+        {"toggle_nth_scoped", e_toggle_nth},
+    };
+    int n = (int)(sizeof entries / sizeof entries[0]);
+    bool all_blocked = true;
+    printf("    入口阻塞矩阵：旧形态(手工读改写)=%d(期望0)", (int)old_blocked);
+    for (int i = 0; i < n; i++) {
+        bool b = call_blocks_over_400ms(entries[i].fn);
+        printf(" %s=%d(期望1)", entries[i].name, (int)b);
+        if (!b) all_blocked = false;
+    }
+    printf("\n");
 
-    /* 放行锁持有者，并确认加锁入口随后能正常完成 */
+    /* 放行锁持有者，并确认各入口随后都能正常完成 */
     ssize_t w = write(rel[1], "G", 1);
     (void)w;
     close(rel[1]);
     (void)waitpid(locker, NULL, 0);
-    int rc_after = new_shape_toggle();
 
-    int count = 0, cap = 0;
-    char** lines = nsp_rule_file_read(path, &count, &cap);
-    int tgl = 0;
-    for (int i = 0; lines && i < count; i++)
-        if (strstr(lines[i], "/tgl")) tgl++;
-    if (lines) nsp_rule_file_free(lines, count);
+    int rc[5];
+    rc[0] = e_upsert_line();
+    rc[1] = e_upsert_section();
+    rc[2] = e_remove_nth();
+    rc[3] = e_remove_nth_scoped();
+    rc[4] = e_toggle_nth();
+    int rc_ok = 0;
+    for (int i = 0; i < n; i++)
+        if (rc[i] == 0) rc_ok++;
 
-    int ok = (!old_blocked && new_blocked && rc_after == 0 && tgl == 1);
-    printf("%s A6 toggle 串行化：旧形态阻塞=%d(期望0) 新入口阻塞=%d(期望1) 释放后 rc=%d 目标行数=%d\n",
-           ok ? "PASS" : "FAIL", (int)old_blocked, (int)new_blocked, rc_after, tgl);
+    int ok = (!old_blocked && all_blocked && rc_ok == n);
+    printf("%s A6/C6 编辑入口串行化：旧形态未阻塞=%d 全部入口阻塞=%d 释放后成功=%d/%d\n",
+           ok ? "PASS" : "FAIL", (int)!old_blocked, (int)all_blocked, rc_ok, n);
     return ok ? 0 : 1;
 }
 
@@ -278,7 +348,7 @@ int main(void) {
     int a10 = case_read_failure();
     if (a10 == 1) fail = 1;
     else if (a10 == 2) gap = 1;
-    if (case_toggle_locked() != 0) fail = 1;
+    if (case_edit_entries_locked() != 0) fail = 1;
 
     printf("%s\n", fail ? "RESULT FAIL" : (gap ? "RESULT GAP" : "RESULT OK"));
     if (fail) return 1;

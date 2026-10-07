@@ -134,7 +134,7 @@ SUITE_MAP = [
 
     (("test_rule_file_lock.py", "test_log_ctl_rules.py", "test_rule_server.py"),
      ("src/core/nsp_rule_file.c", "src/core/nsp_rule_file.h"),
-     ("nsp_rule_file_write", "nsp_rule_file_app_active_path"),
+     ("nsp_rule_file_edit", "nsp_rule_file_app_active_path"),
      "规则文件编辑（nsp_rule_file：并发/持久性/停用态路径）"),
 
     (("test_a26_misc.py",),
