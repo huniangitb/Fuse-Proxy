@@ -438,15 +438,32 @@ static void inject_global_fuse() {
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
         if (log_lvl) args[ai++] = (char*)log_lvl;
+        /* FUSE_EXTRA_ARGS 分词追加：守卫必须按「尾部固定项数」预留——尾部还要
+           无条件追加 -f / -o / 挂载选项 / NULL 共 4 项。旧守卫 ai < 31 会让
+           末条 token 落到 args[31] 之后（FUSE_EXTRA_ARGS 上限 512 字节，24 个
+           空格分隔 token 轻易达到），fork 后子进程栈损坏、execv 参数不可控
+           （review-findings §A11）。超限 loud 告警并截断。 */
+        const int fuse_args_cap = (int)(sizeof args / sizeof args[0]);
+        const int fuse_args_tail = 4; /* -f / -o / 挂载选项 / NULL */
+        bool extra_truncated = false;
         if (g_global_cfg.fuse_extra_args[0]) {
             char extra_copy[512];
             strncpy(extra_copy, g_global_cfg.fuse_extra_args, sizeof(extra_copy) - 1);
             extra_copy[sizeof(extra_copy) - 1] = '\0';
             char* tok = strtok(extra_copy, " ");
-            while (tok && ai < 31) {
+            while (tok) {
+                if (ai >= fuse_args_cap - fuse_args_tail) {
+                    extra_truncated = true;
+                    break;
+                }
                 args[ai++] = tok;
                 tok = strtok(nullptr, " ");
             }
+        }
+        if (extra_truncated) {
+            /* stderr 已重定向至 fuse_crash.log（见上），子进程内不做日志环写入 */
+            fprintf(stderr, "[injector] FUSE_EXTRA_ARGS 超出参数上限（%d 项），已截断: %s\n",
+                    fuse_args_cap - fuse_args_tail, g_global_cfg.fuse_extra_args);
         }
         args[ai++] = "-f";
         args[ai++] = "-o";

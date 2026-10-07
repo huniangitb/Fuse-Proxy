@@ -116,9 +116,16 @@ HOST_MARKERS = ("--inject-method=", "--ready-fd=", "--workdir",
 
 # 配置：GLOBAL_INJECT OFF → v1 不拉媒体 FUSE；目标段带实质规则（否则 v1
 # perform_app_mount 走「无规则保留原生视图」跳过且不 mark_injected）
-CONFIG_TEXT = """[GLOBAL]
+#
+# FUSE_EXTRA_ARGS 塞 24 个空格分隔 token（字段上限 512 字节，轻易达到）——
+# A11 判别：旧实现的 token 守卫 `ai < 31` 未为尾部固定的 -f/-o/挂载选项/NULL
+# 4 项预留，末条 token 落到 args[31] 之后写越界（fork 后子进程栈损坏）。
+# 24 个 `-f` 对 libfuse 全部合法且重复无副作用，只暴露越界本身。
+_FUSE_EXTRA_ARGS = " ".join(["-f"] * 24)
+CONFIG_TEXT = f"""[GLOBAL]
 GLOBAL_INJECT OFF
 SKIP_SYSTEM_APPS OFF
+FUSE_EXTRA_ARGS {_FUSE_EXTRA_ARGS}
 
 [com.test.target] ON
 HIDE /HIDE_ME/

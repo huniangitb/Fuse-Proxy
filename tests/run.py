@@ -78,7 +78,7 @@ SUITE_MAP = [
      "injector 目标判定 / 注入方法"),
 
     (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py"),
-     ("src/injector/ns_utils.c", "src/injector/ns_global_replace.c"),
+     ("src/injector/ns_utils.c", "src/injector/ns_global_replace.c", "src/injector/injector.c"),
      ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
 
