@@ -308,79 +308,27 @@ static int do_bind_mount(void* raw_args) {
     if (mount(args->src, args->target, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
     return 0;
 }
-/* 把挂载点拷入定长槽。放不下（≥ 槽容量）返回 -1 由调用方跳过并告警——
-   **绝不静默截断**：截断后的路径会 umount 到错误位置（A9）。 */
-static int ns_store_mount_point(char* dst, size_t dst_sz, const char* mp) {
-    size_t n = strlen(mp);
-    if (n >= dst_sz) return -1;
-    memcpy(dst, mp, n + 1);
-    return 0;
-}
+/* mountinfo 扫描的唯一实现已移至 src/injector/ns_mountinfo.c（C7 收口）：
+   ns_scan_mountinfo / ns_collect_mounts_under_pid，声明见 ns_global_replace.h。 */
 
 static int do_umount_recursive(void* raw_args) {
     const char* target = (const char*)raw_args;
-    size_t tlen = strlen(target);
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char mounts[128][256];
-        const int cap = (int)(sizeof(mounts) / sizeof(mounts[0]));
-        int count = 0;
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                if (count >= cap) {
-                    LOG_WRN("递归卸载: %s 下匹配挂载点达到 %d 上限，拒绝静默截断", target, cap);
-                    break;
-                }
-                if (ns_store_mount_point(mounts[count], sizeof(mounts[count]), mp) != 0) {
-                    LOG_WRN("递归卸载: 挂载点路径超长（%zu 字节）已跳过: %.64s...", strlen(mp), mp);
-                    continue;
-                }
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-    }
+    char mounts[128][NS_MOUNT_PATH_MAX];
+    int count = ns_collect_mounts_under_pid(getpid(), target, mounts, 128, "递归卸载");
+    for (int i = count - 1; i >= 0; i--)
+        for (int t = 0; t < 8; t++)
+            if (umount2(mounts[i], MNT_DETACH) == 0) break;
     for (int t = 0; t < 8; t++)
         if (umount2(target, MNT_DETACH) == 0) break;
     return 0;
 }
 static int do_umount_and_rmdir(void* raw_args) {
     const char* target = (const char*)raw_args;
-    size_t tlen = strlen(target);
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char mounts[64][256];
-        const int cap = (int)(sizeof(mounts) / sizeof(mounts[0]));
-        int count = 0;
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 && mp[tlen] == '/') {
-                if (count >= cap) {
-                    LOG_WRN("卸载并删除: %s 下匹配挂载点达到 %d 上限，拒绝静默截断", target, cap);
-                    break;
-                }
-                if (ns_store_mount_point(mounts[count], sizeof(mounts[count]), mp) != 0) {
-                    LOG_WRN("卸载并删除: 挂载点路径超长（%zu 字节）已跳过: %.64s...", strlen(mp), mp);
-                    continue;
-                }
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-    }
+    char mounts[64][NS_MOUNT_PATH_MAX];
+    int count = ns_collect_mounts_under_pid(getpid(), target, mounts, 64, "卸载并删除");
+    for (int i = count - 1; i >= 0; i--)
+        for (int t = 0; t < 8; t++)
+            if (umount2(mounts[i], MNT_DETACH) == 0) break;
     for (int t = 0; t < 8; t++) {
         if (umount2(target, MNT_DETACH) == 0) break;
     }
@@ -399,30 +347,13 @@ static int do_umount_and_rmdir(void* raw_args) {
  */
 static int do_force_umount_stale(void* raw_args) {
     const char* target = (const char*)raw_args;
-    size_t tlen = strlen(target);
     /* 1. 先递归卸载所有子挂载点（从最深层开始） */
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char mounts[64][256];
-        int count = 0;
-        char line[1024];
-        while (fgets(line, sizeof(line), fp) && count < 64) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue; /* 目标本身稍后处理 */
-            if (strncmp(mp, target, tlen) == 0 && mp[tlen] == '/') {
-                strncpy(mounts[count], mp, sizeof(mounts[count]) - 1);
-                mounts[count][sizeof(mounts[count]) - 1] = '\0';
-                count++;
-            }
-        }
-        fclose(fp);
-        /* 逆序卸载（最深优先） */
-        for (int i = count - 1; i >= 0; i--) {
-            for (int t = 0; t < 8; t++) {
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-                if (errno == EINVAL) break; /* 本就不是挂载点 */
-            }
+    char mounts[64][NS_MOUNT_PATH_MAX];
+    int count = ns_collect_mounts_under_pid(getpid(), target, mounts, 64, "强制卸载");
+    for (int i = count - 1; i >= 0; i--) {
+        for (int t = 0; t < 8; t++) {
+            if (umount2(mounts[i], MNT_DETACH) == 0) break;
+            if (errno == EINVAL) break; /* 本就不是挂载点 */
         }
     }
     /* 2. 强制卸载目标挂载点本身 */
@@ -724,62 +655,20 @@ static int do_combined_mount(void* raw_args) {
         }
         LOG_DBG("[%s] %s 已就绪（等待后出现），继续合并挂载", pkg, target);
     }
-    size_t tlen = strlen(target);
-    size_t blen = strlen(backup);
-    size_t nread = 0;
-    char* buf = read_file_dynamic("/proc/self/mountinfo", &nread, 0);
-    if (!buf) {
+    size_t tlen = strlen(target); /* preserve 恢复段用它剥前缀（见下方 rel 解析） */
+    char backup_mounts[128][NS_MOUNT_PATH_MAX];
+    char target_mounts[128][NS_MOUNT_PATH_MAX];
+    int backup_count =
+        ns_collect_mounts_under_pid(getpid(), backup, backup_mounts, 128, "合并挂载(备份)");
+    if (backup_count < 0) {
         log_ns_error("[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d\n", pkg, errno);
         log_internal(LOG_ERROR, "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg,
                      errno);
         return errno;
     }
-    char backup_mounts[128][256];
-    int backup_count = 0;
-    char target_mounts[128][256];
-    int target_count = 0;
-    char* line = buf;
-    while (line < buf + nread) {
-        char* next_line = strchr(line, '\n');
-        if (next_line) *next_line = '\0';
-        if (fast_strstr(line, backup) != nullptr || fast_strstr(line, target) != nullptr) {
-            char* p = line;
-            int fields_skipped = 0;
-            while (fields_skipped < 4 && *p) {
-                if (*p == ' ') {
-                    fields_skipped++;
-                    while (*p == ' ') p++;
-                } else {
-                    p++;
-                }
-            }
-            if (fields_skipped == 4 && *p) {
-                char* mp_start = p;
-                while (*p && *p != ' ') p++;
-                size_t mp_len = p - mp_start;
-                if (mp_len > 0 && mp_len < 256) {
-                    char mp[256];
-                    memcpy(mp, mp_start, mp_len);
-                    mp[mp_len] = '\0';
-                    if (strcmp(mp, backup) != 0 && strncmp(mp, backup, blen) == 0 &&
-                        (mp[blen] == '/' || mp[blen] == '\0')) {
-                        if (backup_count < 128) {
-                            strcpy(backup_mounts[backup_count++], mp);
-                        }
-                    }
-                    if (strcmp(mp, target) != 0 && strncmp(mp, target, tlen) == 0 &&
-                        (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                        if (target_count < 128) {
-                            strcpy(target_mounts[target_count++], mp);
-                        }
-                    }
-                }
-            }
-        }
-        if (!next_line) break;
-        line = next_line + 1;
-    }
-    free(buf);
+    int target_count =
+        ns_collect_mounts_under_pid(getpid(), target, target_mounts, 128, "合并挂载(目标)");
+    if (target_count < 0) target_count = 0;
     for (int i = backup_count - 1; i >= 0; i--) {
         for (int t = 0; t < 8; t++) {
             if (umount2(backup_mounts[i], MNT_DETACH) == 0) break;

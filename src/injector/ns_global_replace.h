@@ -26,6 +26,37 @@ typedef struct NsMountEntry {
 #define NS_MOUNTINFO_MAX 4096
 #endif
 
+/* 挂载点定长槽容量：所有 mountinfo 收集路径统一用它。超长条目一律「告警并跳过」
+   而非静默截断——截断后的路径会 umount 到错误位置（A9/C7）。 */
+#ifndef NS_MOUNT_PATH_MAX
+#define NS_MOUNT_PATH_MAX 256
+#endif
+
+/* mountinfo 单行视图：字段指针指向**扫描函数的栈缓冲**，仅在本回调内有效，
+   不得跨行留存（需保存请自行拷贝）。 */
+typedef struct {
+    const char* mount_point; /* 第 5 字段（挂载点） */
+    const char* source;      /* " - " 之后第 2 字段（源/fsname），缺省 "" */
+    const char* fstype;      /* " - " 之后第 1 字段（文件系统类型），缺省 "" */
+    const char* dev;         /* 第 3 字段（major:minor） */
+    int depth;               /* mount_point 中 '/' 的个数 */
+} NsMountLine;
+
+/* 逐行扫描回调：返回非 0 立即停止扫描（提前退出）。 */
+typedef int (*NsMountinfoLineFn)(const NsMountLine* ln, void* ctx);
+
+/* mountinfo 解析的**唯一实现**（定义于 ns_utils.c，C7 收口）：逐行读取
+ * /proc/<pid>/mountinfo，解析后逐条回调。超长行（≥ 4096 字节）整行丢弃并 loud
+ * 告警——不静默裂成两条畸形条目（与配置读取的「超长整行丢弃」语义一致）。
+ * 返回已回调的行数；-1 = 打开失败（errno 有效）。 */
+int ns_scan_mountinfo(int pid, NsMountinfoLineFn cb, void* ctx);
+
+/* 收集 base 之下（严格子路径，不含 base 自身）的挂载点，按扫描顺序写入 out。
+ * 容量触顶或路径 ≥ NS_MOUNT_PATH_MAX 一律 loud 告警并拒绝（绝不静默截断）；
+ * who 为告警前缀（如 "递归卸载"）。返回收集条数；-1 = 打开 mountinfo 失败。 */
+int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_PATH_MAX],
+                                int max, const char* who);
+
 /* 日志：定义于 ns_utils.c（ns 操作错误日志，写入 ERROR_LOG_PATH） */
 void log_ns_error(const char* format, ...);
 

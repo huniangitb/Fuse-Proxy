@@ -35,38 +35,41 @@
 #define NS_MOUNTINFO_MAX 4096
 #endif
 
-/* 读取指定进程的 mountinfo（本函数不进入命名空间，仅解析文件） */
-int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
-    FILE* fp = fopen(path, "re");
-    if (!fp) return -1;
-    int count = 0;
-    char line[4096];
-    while (fgets(line, sizeof(line), fp) && count < max) {
-        char mp[PATH_MAX] = {0}, dev[64] = {0};
-        if (sscanf(line, "%*d %*d %63s %*s %4095s", dev, mp) != 2) continue;
-        const char* sep = fast_strstr(line, " - ");
-        char fstype[64] = {0}, src[PATH_MAX] = {0};
-        if (sep) {
-            if (sscanf(sep + 3, "%63s %4095s", fstype, src) < 1) src[0] = '\0';
-        }
-        strncpy(out[count].mount_point, mp, PATH_MAX - 1);
-        out[count].mount_point[PATH_MAX - 1] = '\0';
-        strncpy(out[count].source, src, PATH_MAX - 1);
-        out[count].source[PATH_MAX - 1] = '\0';
-        strncpy(out[count].fstype, fstype, sizeof(out[count].fstype) - 1);
-        out[count].fstype[sizeof(out[count].fstype) - 1] = '\0';
-        strncpy(out[count].dev, dev, sizeof(out[count].dev) - 1);
-        out[count].dev[sizeof(out[count].dev) - 1] = '\0';
-        int d = 0;
-        for (char* p = mp; *p; p++)
-            if (*p == '/') d++;
-        out[count].depth = d;
-        count++;
+struct NsReadAllCtx {
+    NsMountEntry* out;
+    int max;
+    int n;
+    bool truncated;
+};
+
+static int ns_read_all_cb(const NsMountLine* ln, void* vctx) {
+    struct NsReadAllCtx* c = vctx;
+    if (c->n >= c->max) { /* 容量触顶：拒绝静默截断（族根漏处理会让替换失败） */
+        c->truncated = true;
+        return 1;
     }
-    fclose(fp);
-    return count;
+    NsMountEntry* e = &c->out[c->n];
+    snprintf(e->mount_point, sizeof e->mount_point, "%s", ln->mount_point);
+    snprintf(e->source, sizeof e->source, "%s", ln->source);
+    snprintf(e->fstype, sizeof e->fstype, "%s", ln->fstype);
+    snprintf(e->dev, sizeof e->dev, "%s", ln->dev);
+    e->depth = ln->depth;
+    c->n++;
+    return 0;
+}
+
+/* 读取指定进程的 mountinfo 全字段（本函数不进入命名空间，仅解析文件）。
+ * 解析统一走 ns_scan_mountinfo（唯一实现，C7）：超长行整行丢弃、容量触顶 loud
+ * 告警而非静默丢弃——旧实现各自 fopen+sscanf 且触顶无声。 */
+int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
+    if (!out || max <= 0) return -1;
+    struct NsReadAllCtx c = {.out = out, .max = max};
+    if (ns_scan_mountinfo(pid, ns_read_all_cb, &c) < 0) return -1;
+    if (c.truncated)
+        LOG_WRN("mountinfo 条数达到上限 %d（pid=%d），其余条目被忽略——上限不足会让族根/"
+                "目标挂载点漏处理",
+                max, pid);
+    return c.n;
 }
 
 bool ns_is_digit_char(char c) {

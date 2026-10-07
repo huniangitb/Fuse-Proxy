@@ -132,6 +132,9 @@ int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
 
 /* ══════════════ 实际源码 ══════════════ */
 
+/* C7：mountinfo 扫描原语独立成 TU（src/injector/ns_mountinfo.c），此处一并编入
+   本 TU——ns_utils.c 的四处扫描都经它收口（ns_collect_mounts_under_pid）。 */
+#include "ns_mountinfo.c"
 #include NS_UTILS_SRC
 
 /* ══════════════ 用例 ══════════════ */
@@ -226,6 +229,19 @@ int main(void) {
     check("C1 对照：3 条正常子挂载 + target 全量卸载",
           g_umount_calls == 4, "卸载请求数与预期不符");
     check("C2 对照：无超长告警", !log_has("超长"), "不该出现超长告警");
+
+    /* D. C7：do_force_umount_stale 容量触顶必须 loud 告警。
+       旧实现各自手写扫描，此处的 `while (fgets(...) && count < 64)` 触顶后**静默**
+       停止——与 do_umount_recursive 的告警语义不一致，正是「各写一套」的漂移证据；
+       C7 收口到 ns_collect_mounts_under_pid 后统一告警。 */
+    reset_case();
+    build_mountinfo(target, 70, 8); /* 70 条匹配 > 容量 64 */
+    do_force_umount_stale((void*)target);
+    check("D1 容量触顶 loud 告警（拒绝静默截断）", log_has("上限"), "缺少容量触顶告警");
+    check("D2 已收集的 64 条 + target 仍全量卸载",
+          g_umount_calls == 65, "卸载请求数与预期不符");
+    check("D3 触顶丢弃的 6 条未产生卸载请求（不越界、不错卸）",
+          count_oversize_umounts() == 0, "出现超长 umount2 请求");
 
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
     return g_fail;
