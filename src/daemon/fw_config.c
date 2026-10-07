@@ -242,16 +242,48 @@ static void rebuild_filter(ModuleSub* s) {
     view_release(old);
 }
 
-/* 读出主视图并换入；旧视图与旧过滤视图在推送完成后释放（见 publish） */
-static void reload_once(void) {
+/* 两份主视图是否逐字相同（C11「无变化则跳过发布」的判据）。
+   任一项不同即视为变化——**宁可多发布一次，不可漏发布**：漏发布 = 规则静默不
+   生效。line_no 一并比对（App-rules 目录列举顺序变化会改变记录顺序，从而判为
+   变化，只损失一次优化，不影响正确性）。 */
+static bool recs_identical(const NspCfgRec* a, int an, const NspCfgRec* b, int bn) {
+    if (an != bn) return false;
+    for (int i = 0; i < an; i++) {
+        if (a[i].kind != b[i].kind || a[i].enabled != b[i].enabled ||
+            a[i].uid != b[i].uid || a[i].line_no != b[i].line_no)
+            return false;
+        const char* av[3] = {a[i].file, a[i].type, a[i].text};
+        const char* bv[3] = {b[i].file, b[i].type, b[i].text};
+        for (int k = 0; k < 3; k++) {
+            if ((av[k] == nullptr) != (bv[k] == nullptr)) return false;
+            if (av[k] && strcmp(av[k], bv[k]) != 0) return false;
+        }
+    }
+    return true;
+}
+
+/* 读出主视图并换入；旧视图与旧过滤视图在推送完成后释放（见 publish）。
+   also_nonrule：本批 inotify 事件里还含 uid.map / sys_pkgs.cache（非规则产物）——
+   此时即便规则视图逐字未变也不能跳过：那两个全局表仍需刷新（见 C11 分流）。 */
+static void reload_once(bool also_nonrule) {
     NspCfgRec* new_recs = nullptr;
     int new_count = 0;
     config_read_view(g_rules_path, &new_recs, &new_count);
 
+    /* C11：重解析结果与当前发布视图逐字相同 → 整条发布路径（代际递增 / 索引
+       重建 / 过滤视图重建 / 模块推送）都无意义，直接返回。首次装载
+       （g_recs == nullptr）必须发布，否则模块拿不到初始配置。
+       g_recs/g_rec_count 仅本线程与关停路径写，此处裸读安全。 */
+    if (!also_nonrule && g_recs != nullptr &&
+        recs_identical(new_recs, new_count, g_recs, g_rec_count)) {
+        config_free_view(new_recs, new_count);
+        return;
+    }
+
     /* 先递增代际使框架侧派生缓存（monitor 决策）失效，再换入新索引：
        config_build_from_view 的 COW 发布会释放旧 AppConfig，缓存若仍以旧代际
        命中就会读到悬垂段指针（与模块 br_rules_apply_config 同序）。
-       uid.map 随应用启动增长、无独立监听，搭本次重载顺带重读。 */
+       uid.map 变化已有独立事件分流（见 C11），此处重读仅作兜底。 */
     atomic_fetch_add_explicit(&g_gen, 1, memory_order_release);
     fw_pkg_reload();
     config_lock_write();
@@ -373,7 +405,7 @@ static void* config_monitor_thread(void* arg) {
                 time_t now = time(nullptr);
                 if (!appw_ok && now - last_fallback >= 10) {
                     last_fallback = now;
-                    reload_once();
+                    reload_once(false); /* 定时兜底重扫：无并发的非规则事件 */
                 }
             }
             continue;
@@ -417,7 +449,10 @@ static void* config_monitor_thread(void* arg) {
         }
         sleep(1); /* 归并写者连击：等待写者落定再读 */
         if (ev_rules)
-            reload_once(); /* 规则类：全量重解析 + 重建索引 + 推送所有模块 */
+            /* 规则类：全量重解析 + 重建索引 + 推送所有模块。同批若还含
+               uid.map / sys_pkgs.cache 事件则即便规则视图未变也不跳过
+               （那两个全局表仍需刷新） */
+            reload_once(ev_pkg || ev_sys);
         else if (ev_pkg)
             reload_pkg_only();
         else if (ev_sys)
@@ -454,7 +489,7 @@ int fw_config_init(const char* rules_path) {
         LOG_WRN("未提供 --rules= 路径，框架配置视图为空（模块将收不到任何规则）");
         return 0;
     }
-    reload_once();
+    reload_once(false); /* 首次装载：g_recs == nullptr，必发布初始视图 */
     g_stop = false;
     if (pipe2(g_wake, O_NONBLOCK | O_CLOEXEC) != 0) g_wake[0] = g_wake[1] = -1;
     if (pthread_create(&g_monitor_tid, nullptr, config_monitor_thread, nullptr) == 0) {
