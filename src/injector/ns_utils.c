@@ -169,8 +169,19 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
     if (status_ready) {
         int child_ret = -1;
         ssize_t r_len = read(status_pipe[0], &child_ret, sizeof(child_ret));
-        int status;
-        waitpid(child, &status, 0);
+        int status = 0;
+        /* waitpid 返回值必须检查：主循环的 reap_zombies（waitpid(-1,WNOHANG)）
+           可能已抢先收走本子进程（ns 子进程与主循环并发 wait），此时返回
+           -1/ECHILD，status 保持初值 0（WIFEXITED(0)=true、WEXITSTATUS=0），
+           下面的退出码还原会把"未知"误判成"成功"。子进程先写 status 管道再
+           _exit，故 r_len 命中时 status 用不上；r_len 未命中才依赖它——那种
+           情况下拿不到真实状态必须判失败，不能默认成 0。
+           更稳的做法是让主循环收尸时把 ns 子进程也留档（见 reaped_managed），
+           此处先做"返回值必查"的最小修复。 */
+        pid_t w = waitpid(child, &status, 0);
+        bool know_status = (w == child);
+        if (w < 0 && errno != ECHILD && errno != EINTR)
+            LOG_WRN("ns操作 waitpid 失败 pid=%d: %s", target_pid, strerror(errno));
         if (r_len == sizeof(child_ret)) {
             ret_val = child_ret;
             if (child_err) *child_err = child_ret;
@@ -183,6 +194,12 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
             } else if (elapsed > 50) {
                 LOG_DBG("ns操作 pid=%d 耗时: %ldms", target_pid, elapsed);
             }
+        } else if (!know_status) {
+            /* 子进程状态被通用收尸抢先取走且未留档：无法判定结果，按失败处理
+               （fail-closed——把"未知"当成功会让上层认为挂载/卸载已完成） */
+            LOG_WRN("ns操作 pid=%d 子进程状态不可得（已被通用收尸取走），按失败处理", target_pid);
+            if (child_err) *child_err = ECHILD;
+            ret_val = -1;
         } else {
             /* 子进程未写 status 管道（异常路径）：以退出码还原返回值。
                func 退出码映射（见 fork 子进程 _exit）：0=成功, 正数=业务
@@ -202,7 +219,9 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
         }
     } else {
         kill(child, SIGKILL);
-        waitpid(child, NULL, 0);
+        /* 强制终止后回收：同样不能假设成功——ECHILD 说明已被主循环收走 */
+        if (waitpid(child, NULL, 0) < 0 && errno != ECHILD)
+            LOG_WRN("ns操作超时后 waitpid 失败 pid=%d: %s", target_pid, strerror(errno));
         if (child_err) *child_err = ETIMEDOUT;
         errno = ETIMEDOUT;
         LOG_WRN("ns操作 pid=%d 超时(%dms), 予以强制终止", target_pid, timeout_ms);
@@ -1261,10 +1280,20 @@ void handle_async_mount_event(void* ptr) {
     MountTaskCtx* ctx = (MountTaskCtx*)ptr;
     int child_ret = -1;
     ssize_t r = read(ctx->status_pipe_fd, &child_ret, sizeof(child_ret));
-    int status;
-    waitpid(ctx->child_pid, &status, 0);
+    int status = 0;
+    /* 返回值必查：主循环 reap_zombies 可能已收走该子进程（ECHILD），此时
+       status 保持初值。r 命中时 child_ret 才是权威判据；r 未命中则必须要求
+       确实取到状态，否则按失败处理（不得把"未知"当成功）。 */
+    pid_t w = waitpid(ctx->child_pid, &status, 0);
+    bool know_status = (w == ctx->child_pid);
     if (r == sizeof(child_ret) && child_ret == 0) {
         LOG_DBG("异步挂载成功: App=%s, PID=%d", ctx->pkg_name, ctx->target_pid);
+    } else if (!know_status) {
+        LOG_ERR("异步挂载结果不可得: App=%s, PID=%d, read=%zd（子进程状态已被通用收尸取走）",
+                ctx->pkg_name, ctx->target_pid, r);
+        /* 归入失败路径：见下方既有失败处理 */
+        child_ret = -1;
+        r = -1;
     } else {
         LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%zd, exit_status=%d", ctx->pkg_name,
                 ctx->target_pid, r, child_ret);
