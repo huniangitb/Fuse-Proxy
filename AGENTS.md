@@ -38,6 +38,14 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`GLOBAL_REPLACE_CTL`、`LOG_CTL`、`LOG_MONITOR`。
 
+**ASan+UBSan 复跑（`build_asan2`）**：把上述环境变量指向 `build_asan2/` 的对应产物即可（`ninja -C build_asan2`）。两个必须知道的点：
+
+1. **报告要落文件**：套件把守护进程的 stderr 重定向到自己的日志/devnull，sanitizer 报错会被吞。用 `ASAN_OPTIONS=log_path=/tmp/asanrep:detect_leaks=1:print_stacktrace=1`（`UBSAN_OPTIONS=log_path=/tmp/ubsanrep:print_stacktrace=1`）——报告写 `/tmp/asanrep.<pid>`。**先做阳性对照**（故意越界的探针）确认落盘机制真的生效，再据「无报告」下结论。
+2. **`failed to deallocate ... munmap ... error code 22` 是本环境的 ASan 噪声**（分配器 release-to-OS 的 munmap 失败），**非产品缺陷**：加 `allocator_release_to_os_interval_ms=-1` 即消失；最小单线程/多线程复现程序都不触发，且无任何 interceptor（overflow/UAF/leak）报错。判定时看有没有 `heap-buffer-overflow`/`use-after-free`/`LeakSanitizer` 之类的 interceptor 报告，别被这条吓到。
+3. **LD_PRELOAD 类套件**（`test_readdir_skel_fallback.py` / `test_modules.py`）在 ASan 链接的 daemon 下必须把 ASan 运行时**前置到 `LD_PRELOAD` 首位**，否则 daemon 以「ASan runtime does not come first in initial library list」拒启（两个套件均已内置 `asan_runtime_path()` 处理）。
+
+已跑基线（2026-10-07）：`build_asan2` 下 `test_rules` / `test_functional` / `test_readdir_skel_fallback` / `test_negative_timeout` / `test_crash_log` / `test_modules` / `test_module_circuit` / `test_log_pipeline` / `test_backend_lifecycle` 全绿，**无任何内存安全报错**。
+
 按改动跑映射（全绿方可提交）：
 
 | 改动 | 测试 |

@@ -50,6 +50,28 @@ PASS = 0
 FAIL = 0
 ERRORS = []
 
+
+def asan_runtime_path():
+    """daemon 若动态链接了 ASan 运行时，返回其路径（否则空串）。
+
+    本套件用 LD_PRELOAD 垫片拦 lstat；ASan 要求自己的运行时**在 LD_PRELOAD 里排
+    第一**，垫片必须排在它之后——否则 ASan 链接的 daemon 直接以「ASan runtime
+    does not come first in initial library list」拒启（内存验收跑本套件时必踩）。
+    与 test_modules.py 的 asan_runtime_path 同源。"""
+    try:
+        out = subprocess.run(["ldd", DAEMON], capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+    for ln in out.splitlines():
+        if "libasan" not in ln:
+            continue
+        parts = ln.split("=>")
+        if len(parts) == 2:
+            p = parts[1].strip().split(" ")[0]
+            if p.startswith("/"):
+                return p
+    return ""
+
 DT_UNKNOWN = 0
 DT_DIR = 4
 
@@ -194,7 +216,8 @@ def setup_env():
 
 def start_daemon():
     env = dict(os.environ)
-    env["LD_PRELOAD"] = SHIM_SO
+    # ASan 链接的 daemon 要求其运行时在 LD_PRELOAD 首位（垫片排后），否则拒启
+    env["LD_PRELOAD"] = ":".join(p for p in (asan_runtime_path(), SHIM_SO) if p)
     # 真实存在但 daemon 侧 lstat 恒 EACCES：骨架名 + 非骨架对照名
     env["NSP_TEST_LSTAT_DENY"] = "/Android/data,/Android/otherdir"
     proc = subprocess.Popen(
