@@ -1810,8 +1810,12 @@ static void* ftp_dl_thread(void* arg) {
 }
 
 int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got) {
+    /* 参数校验**必须先于取句柄**：ftp_handle_get 会 +1 在途引用，早退若不归还，
+       refs 永不归零、句柄永不拆除（active_handles 不归零 → 热重载 quiescence
+       门控永久阻塞）。C9：所有 backend_* 出口都必须与 get 配对。 */
+    if (!buf || !got) return -EINVAL;
     FtpBackendFile* f = ftp_handle_get(h);
-    if (!f || !buf || !got) return -EINVAL;
+    if (!f) return -EINVAL;
 
     if (f->tmp_fd >= 0) {
         // 写模式：本地临时文件
@@ -1906,8 +1910,10 @@ static int ftp_stream_chunk(FtpBackendFile* f, const char* data, size_t len, boo
 static void* ftp_up_thread(void* arg);
 
 int ftp_backend_write(uint64_t h, const char* buf, size_t size, off_t off, size_t* wrote) {
+    /* 参数校验先于取句柄（同 ftp_backend_read：早退必须不泄漏在途引用） */
+    if (!buf || !wrote) return -EINVAL;
     FtpBackendFile* f = ftp_handle_get(h);
-    if (!f || !buf || !wrote) return -EINVAL;
+    if (!f) return -EINVAL;
     if (f->tmp_fd < 0) {
         ftp_handle_put(h, f);
         return -EBADF;
