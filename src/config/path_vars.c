@@ -28,22 +28,23 @@ bool is_system_abs_path(const char* path) {
            starts_with_root(path, "/storage");
 }
 
-bool parse_var_assignment(const char* line, char* name, size_t nname, char* value, size_t nval) {
-    if (!line || !name || !value || nname == 0 || nval == 0) return false;
+int parse_var_assignment(const char* line, char* name, size_t nname, char* value, size_t nval) {
+    if (!line || !name || !value || nname == 0 || nval == 0) return 0;
     const char* p = line;
     while (isspace((unsigned char)*p)) p++;
-    if (!isalpha((unsigned char)*p) && *p != '_') return false;
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
     const char* name_start = p;
     while (isalnum((unsigned char)*p) || *p == '_') p++;
-    if (*p != '=') return false;
+    if (*p != '=') return 0;
     size_t name_len = (size_t)(p - name_start);
-    if (name_len == 0 || name_len >= nname) return false;
+    if (name_len == 0 || name_len >= nname) return 0;
     memcpy(name, name_start, name_len);
     name[name_len] = '\0';
     p++; /* 跳过 '=' */
-    strncpy(value, p, nval - 1);
-    value[nval - 1] = '\0';
-    return true;
+    size_t vlen = strlen(p);
+    if (vlen >= nval) return -1; /* 值放不下：拒绝（截断的值会放大后续规则范围） */
+    memcpy(value, p, vlen + 1);
+    return 1;
 }
 
 typedef struct {
@@ -53,12 +54,16 @@ typedef struct {
     const AppConfig* app_cfg;
     const AppConfig* global_cfg;
     const char* current_pkg;
+    bool overflow;      /* 有字符因缓冲不足被丢弃——结果已截断，调用方须 fail-closed */
     char stack[32][64]; /* 展开栈，循环检测 */
     int stack_n;
 } expand_ctx;
 
 static void out_ch(expand_ctx* c, char ch) {
-    if (c->pos + 1 < c->outsz) c->out[c->pos++] = ch;
+    if (c->pos + 1 < c->outsz)
+        c->out[c->pos++] = ch;
+    else
+        c->overflow = true; /* 记溢出：截断的规则路径会放大 HIDE/RO 命中范围 */
 }
 
 static void out_raw(expand_ctx* c, const char* s, size_t n) {
@@ -167,15 +172,19 @@ static void expand_into(expand_ctx* c, const char* in) {
     }
 }
 
-size_t expand_path_vars(const char* in, char* out, size_t outsz, const AppConfig* app_cfg,
-                        const AppConfig* global_cfg, const char* current_pkg) {
-    if (!in || !out || outsz == 0) return 0;
+bool expand_path_vars(const char* in, char* out, size_t outsz, const AppConfig* app_cfg,
+                      const AppConfig* global_cfg, const char* current_pkg) {
+    if (!in || !out || outsz == 0) return false;
     if (!strchr(in, '$')) { /* memchr 短路 */
         size_t n = strlen(in);
-        if (n >= outsz) n = outsz - 1;
+        if (n >= outsz) {
+            memcpy(out, in, outsz - 1);
+            out[outsz - 1] = '\0';
+            return false; /* 无变量仍放不下：截断，调用方丢弃该规则 */
+        }
         memcpy(out, in, n);
         out[n] = '\0';
-        return n;
+        return true;
     }
     expand_ctx c;
     memset(&c, 0, sizeof c);
@@ -187,7 +196,7 @@ size_t expand_path_vars(const char* in, char* out, size_t outsz, const AppConfig
     expand_into(&c, in);
     if (c.pos >= outsz) c.pos = outsz - 1;
     out[c.pos] = '\0';
-    return c.pos;
+    return !c.overflow;
 }
 
 static int find_var_index(const AppConfig* cfg, const char* name) {
@@ -264,14 +273,18 @@ void analyze_var_staticness(AppConfig* cfg, const AppConfig* global_cfg) {
     for (int i = 0; i < n; i++) cfg->var_is_static[i] = false;
     for (int i = 0; i < n; i++) {
         if (state[i] == 1) {
-            cfg->var_resolved[i] = malloc(PATH_MAX);
-            if (cfg->var_resolved[i]) {
-                expand_path_vars(cfg->var_values[i], cfg->var_resolved[i], PATH_MAX, cfg,
-                                 global_cfg, "pkg");
+            char* buf = malloc(PATH_MAX);
+            if (buf && expand_path_vars(cfg->var_values[i], buf, PATH_MAX, cfg, global_cfg, "pkg")) {
+                cfg->var_resolved[i] = buf;
+            } else {
+                /* 展开放不下（截断）：不预计算、不标静态——该变量降级为动态，
+                   匹配时展开同样失败并丢弃规则（fail-closed），绝不用截断值当
+                   静态结果（那会让 HIDE/RO 命中更短前缀，放大范围） */
+                free(buf);
             }
         }
     }
-    for (int i = 0; i < n; i++) cfg->var_is_static[i] = (state[i] == 1);
+    for (int i = 0; i < n; i++) cfg->var_is_static[i] = (state[i] == 1 && cfg->var_resolved[i]);
     free(state);
 }
 
@@ -334,7 +347,9 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
         while (*rest && isdigit((unsigned char)*rest)) rest++;
         if (*rest == '/') rest++;
     } else if (is_system_abs_path(t)) {
-        /* 系统绝对路径（/data、/mnt、/storage 开头，非挂载镜像）：原样使用 */
+        /* 系统绝对路径（/data、/mnt、/storage 开头，非挂载镜像）：原样使用。
+           放不下即失效——截断的绝对路径会指向另一个（更浅的）位置 */
+        if (strlen(t) >= sz) return false;
         strncpy(real_base, t, sz - 1);
         real_base[sz - 1] = '\0';
         return true;
@@ -350,6 +365,7 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
        rest 无前导 '/'，补 '/' 后语义与原 "%s/%d/%s" 分支逐字节一致 */
     char with_slash[PATH_MAX];
     with_slash[0] = '/';
+    if (strlen(rest) + 1 >= sizeof(with_slash)) return false; /* 放不下即失效，不截断 */
     strncpy(with_slash + 1, rest, sizeof(with_slash) - 2);
     with_slash[sizeof(with_slash) - 1] = '\0';
     common_default_real_path(user_id, with_slash, real_base, sz);

@@ -359,6 +359,45 @@ HIDE /Download/*.mp3""", [
         ("H3:未被隐藏的兄弟条目仍在","0/Download","EXISTS"),
     ],"25.HIDE 条目不得出现在父目录列举")
 
+    # ── A18：超长规则路径/变量值必须被**拒绝**，不得静默截断成更短前缀 ──
+    #    截断后的规则是原路径的**前缀**，HIDE/RO 命中范围被放大（隐藏/只读更多
+    #    路径），违反 AGENTS 红线「MAX_PATH_LEN 放不下返回 -1 而非截断」。
+    #    判别构造：把「截断后的那个前缀」在底层真实建成目录/文件——
+    #      旧实现（snprintf/strncpy 截断）→ 该前缀被隐藏/被重定向命中；
+    #      新实现（放不下即拒绝该行）→ 前缀照常可见、重定向不生效。
+    LONG_A, LONG_B = "A" * 300, "B" * 300
+    # 直接 HIDE：/Dl/<A*300> → snprintf(out, 256) 截断为 255 字节 = "/Dl/" + A*251
+    trunc_hide = "Dl/" + "A" * 251
+    Path(f"{STORAGE}/0/{trunc_hide}").mkdir(parents=True, exist_ok=True)
+    (Path(STORAGE) / "0" / trunc_hide / "keep.txt").write_text("trunc-visible")
+    # 变量值：LONGVAR=/Dv/<A*300> → strncpy 截断为 255 字节 = "/Dv/" + A*251。
+    # 用 **REDIRECT 引用变量**（而非 HIDE）观察：变量 HIDE 走 dyn 分支且受
+    # pkg_resolvable 门控（测试进程 uid=1000 → pkg=system 不可解析 → 整条跳过），
+    # 只有「目标含自定义变量」的 REDIRECT 不经包名门控（config.md §5）。
+    trunc_var = "Dv/" + "A" * 251
+    Path(f"{STORAGE}/0/{trunc_var}").mkdir(parents=True, exist_ok=True)
+    (Path(STORAGE) / "0" / trunc_var / "probe.txt").write_text("var-visible")
+    # REDIRECT 目标：/Download/<B*300> → "?/Download/<B*300>" 被截断到目标缓冲
+    # 之内。截断点取决于旧实现的 snprintf 尺寸参数（MAX_PATH_LEN 与 -1 两处写法
+    # 不一致，落在 254/255 字节上），故把该区间内每个可能的截断名都建成真实目录：
+    # 旧实现无论截到哪一个都会命中，新实现（整行拒绝）一个都不命中。
+    trunc_b_len = 243
+    for k in range(trunc_b_len, trunc_b_len + 4):
+        d = Path(STORAGE) / "0/Download" / ("B" * k)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "probe.txt").write_text("trunc-target")
+    run(f"""[GLOBAL] MONITOR OFF
+HIDE /Dl/{LONG_A}
+HIDE /Download/Pics/
+LONGVAR=/Dv/{LONG_A}
+REDIRECT /vv/ $LONGVAR
+REDIRECT /rv/ /Download/{LONG_B}""", [
+        ("A18-1:超长 HIDE 被拒绝（截断前缀未被隐藏）", "0/" + trunc_hide, "EXISTS"),
+        ("A18-2:同配置正常 HIDE 仍生效（配置整体未被拒）", "0/Download/Pics/1.jpg", "NOT_EXISTS"),
+        ("A18-3:超长变量值被拒绝，引用它的 REDIRECT 不放大", "0/vv/probe.txt", "NOT_EXISTS"),
+        ("A18-4:超长 REDIRECT 目标被拒绝（截断目标未命中）", "0/rv/probe.txt", "NOT_EXISTS"),
+    ], "26.A18 超长规则路径 fail-closed（不截断）")
+
     # cleanup
     subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)
     subprocess.run(["fusermount3","-u",MNT],capture_output=True)

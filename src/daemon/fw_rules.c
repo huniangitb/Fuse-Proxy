@@ -363,7 +363,10 @@ static bool br_cat_hide_linear(AppConfig* cat, const char* sub_path, const char*
             const char* match_str = rule;
             if (has_path_var(rule)) {
                 if (!pkg_resolvable(current_pkg)) continue;
-                expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg, current_pkg);
+                /* 展开放不下（截断）：丢弃该规则——截断成更短前缀会放大命中范围 */
+                if (!expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg,
+                                      current_pkg))
+                    continue;
                 match_str = expanded;
             }
             if (fnmatch(match_str, sub_path, 0) == 0) return true;
@@ -410,8 +413,9 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const cha
                 const char* match_str = rule;
                 if (has_path_var(rule)) {
                     if (!pkg_resolvable(current_pkg)) continue;
-                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                     current_pkg);
+                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
+                                          current_pkg))
+                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
                     match_str = expanded;
                 }
                 if (fnmatch(match_str, sub_path, 0) == 0) return true;
@@ -431,8 +435,9 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const cha
                 const char* match_str = rule;
                 if (has_path_var(rule)) {
                     if (!pkg_resolvable(current_pkg)) continue;
-                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                     current_pkg);
+                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
+                                          current_pkg))
+                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
                     match_str = expanded;
                 }
                 if (fnmatch(match_str, sub_path, 0) == 0) return true;
@@ -713,7 +718,10 @@ static bool br_cat_ro_linear(AppConfig* cat, const char* sub_path, const char* c
             const char* match_str = rule;
             if (has_path_var(rule)) {
                 if (!pkg_resolvable(current_pkg)) continue;
-                expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg, current_pkg);
+                /* 展开放不下（截断）：丢弃该规则——截断成更短前缀会放大命中范围 */
+                if (!expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg,
+                                      current_pkg))
+                    continue;
                 match_str = expanded;
             }
             if (fnmatch(match_str, sub_path, 0) == 0) return true;
@@ -759,8 +767,9 @@ static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                 const char* match_str = rule;
                 if (has_path_var(rule)) {
                     if (!pkg_resolvable(current_pkg)) continue;
-                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                     current_pkg);
+                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
+                                          current_pkg))
+                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
                     match_str = expanded;
                 }
                 if (fnmatch(match_str, sub_path, 0) == 0) return true;
@@ -780,8 +789,9 @@ static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                 const char* match_str = rule;
                 if (has_path_var(rule)) {
                     if (!pkg_resolvable(current_pkg)) continue;
-                    expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                     current_pkg);
+                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
+                                          current_pkg))
+                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
                     match_str = expanded;
                 }
                 if (fnmatch(match_str, sub_path, 0) == 0) return true;
