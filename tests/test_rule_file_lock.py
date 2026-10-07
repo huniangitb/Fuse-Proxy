@@ -55,6 +55,9 @@ def main():
             print(f"规则文件并发编辑测试超时（>{RUN_TIMEOUT}s）", file=sys.stderr)
             return 1
     print(run.stdout, end="")
+    if run.returncode == 78:
+        print("跳过项（gap，不计通过）: A10 读失败不覆盖（以 root 运行）", file=sys.stderr)
+        return 78
     if run.returncode != 0:
         print("规则文件并发编辑测试失败", file=sys.stderr)
         return 1

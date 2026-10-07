@@ -50,8 +50,18 @@ typedef enum {
  * 行尾换行已归一：文件末行缺少 \n 时会补齐，故数组内每行均以 \n 结尾
  * （避免"插到末行之后"的写入与之粘连成同一行）。
  * 文件不存在或读取失败：*out_count = *out_cap = 0，返回 NULL（调用方按空文件处理）。
- * 成功返回数组（调用方经 nsp_rule_file_free 释放）。 */
+ * 成功返回数组（调用方经 nsp_rule_file_free 释放）。
+ * **注意**：NULL 同时表示「不存在」与「读失败」——编辑类入口须改用
+ * nsp_rule_file_read_ex 区分，否则读失败会被当空文件、用「段头 + 1 条」覆盖
+ * 整份规则文件（review-findings §A10）。本函数保留给只读视图使用。 */
 char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap);
+
+/* 同 nsp_rule_file_read，但经 out_err 区分「文件不存在」与「读取失败」：
+ *   *out_err == 0           读取成功（空文件亦为 0，lines 可为 NULL / count 0）
+ *   *out_err == ENOENT      文件不存在（可安全按空文件处理并新建）
+ *   *out_err == 其他 errno  真失败（EACCES/EIO/ENOMEM…）
+ * 编辑类入口在真失败时**必须放弃写入**并返回错误，不得覆盖既有文件。 */
+char** nsp_rule_file_read_ex(const char* path, int* out_count, int* out_cap, int* out_err);
 
 /* 原子落盘：写 <path>.tmp → rename（同目录 rename 保证读端不见半截文件）。
  * 失败时清理 tmp 并保留原文件。
