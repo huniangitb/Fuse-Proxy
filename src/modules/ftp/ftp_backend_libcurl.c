@@ -1369,6 +1369,55 @@ static void ftp_read_curl_release(FtpBackend* bk, CURL* c) {
     curl_easy_cleanup(c);
 }
 
+/* ============ 写模式 open 的回灌（A8） ============
+   open(O_RDWR) / open(O_WRONLY|O_APPEND) 等「就地改写」语义下，远端已有内容
+   必须先灌进本地 tmp，否则后续 pwrite 只写命中区域、上传时按 tmp 长度全量
+   STOR——远端被替换成「空洞(读作 0) + 新数据」，原内容全丢（SQLite
+   synchronous=FULL 就地写、编辑器保存必现）。 */
+
+/* curl 写回调：把 RETR 数据顺序落盘到 tmp_fd（不占内存，支持大文件） */
+struct FdWriteCtx {
+    int fd;
+    off_t pos;
+};
+
+static size_t write_fd_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    struct FdWriteCtx* c = (struct FdWriteCtx*)userdata;
+    size_t total = size * nmemb;
+    size_t done = 0;
+    while (done < total) {
+        ssize_t w = pwrite(c->fd, ptr + done, total - done, c->pos + (off_t)done);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            return done; /* 短写 → curl 以 CURLE_WRITE_ERROR 中止 */
+        }
+        done += (size_t)w;
+    }
+    return total;
+}
+
+/* 把远端内容整体下载进 f->tmp_fd（复用池化读句柄，选项集与下载线程一致）。
+   返回 0 成功；负 errno 失败。调用方须在 open 的写模式分支内、上传线程启动前调用。 */
+static int ftp_write_backfill(FtpBackend* bk, FtpBackendFile* f) {
+    CURL* c = ftp_read_curl_acquire(bk);
+    if (!c) return -EIO;
+    struct FdWriteCtx ctx = {.fd = f->tmp_fd, .pos = 0};
+    char range[32];
+    snprintf(range, sizeof range, "0-");
+    curl_easy_setopt(c, CURLOPT_URL, f->ftp_path);
+    curl_easy_setopt(c, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(c, CURLOPT_UPLOAD, 0L);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, NULL);
+    curl_easy_setopt(c, CURLOPT_RESUME_FROM, 0L);
+    curl_easy_setopt(c, CURLOPT_RANGE, range);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_fd_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &ctx);
+    CURLcode res = curl_easy_perform(c);
+    ftp_read_curl_release(bk, c); /* 内部已重置操作选项，防 RANGE/WRITEDATA 残留 */
+    if (res != CURLE_OK) return -EIO;
+    return 0;
+}
+
 int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     FtpBackend* bk = ftp_backend_find(path);
     if (!bk || !h) return -ENOENT;
@@ -1419,6 +1468,42 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
         f->writing = true;
         f->up_first = true;
         pthread_cond_init(&f->up_cond, NULL);
+
+        /* A8 回灌：目标已存在且非 O_TRUNC → 先把远端内容下载进 tmp。
+           - 远端不存在（ENOENT）：按新建处理，零下载（避免 open 期多一次往返）；
+           - getattr 真失败：放弃 open（fail-closed）——不知远端内容就改写等于
+             赌「原内容会被静默丢弃」；
+           - 回灌后把 file_end/up_upto 都设为远端长度、up_first=false：
+             内容与远端一致，视作「已上传」，后续增量走 APPE 而非 STOR 截断；
+             若应用改写前缀（off < up_upto）则由 write 置 retransmit 转全量重传。 */
+        if (!(flags & O_TRUNC)) {
+            struct stat rst;
+            int grc = ftp_backend_getattr(path, &rst);
+            if (grc == -ENOENT) {
+                /* 新文件：保持零下载 */
+            } else if (grc != 0) {
+                close(tfd);
+                f->tmp_fd = -1;
+                pthread_cond_destroy(&f->up_cond);
+                pthread_mutex_destroy(&f->f_lock);
+                free(f);
+                return grc;
+            } else if (S_ISREG(rst.st_mode) && rst.st_size > 0) {
+                int brc = ftp_write_backfill(bk, f);
+                if (brc != 0) {
+                    close(tfd);
+                    f->tmp_fd = -1;
+                    pthread_cond_destroy(&f->up_cond);
+                    pthread_mutex_destroy(&f->f_lock);
+                    free(f);
+                    return brc;
+                }
+                f->file_end = rst.st_size;
+                f->up_upto = rst.st_size;
+                f->up_first = false;
+            }
+        }
+
         *h = ftp_handle_alloc(f);
         if (*h == 0) {
             close(tfd);
