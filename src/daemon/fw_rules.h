@@ -144,7 +144,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out);
    data 目录被系统程序以 ENOENT 拒绝（直接访问 backing 则正常），daemon 日志
    零痕迹；挂接后 SANDBOX 过滤/REDIRECT/HIDE/RO 对该子树同样整体失效。
    故挂接前须确认没有任何规则需要对此子树仲裁。判定保守（fail-closed）：
-   任一段 SANDBOX ON，或任一条 REDIRECT（ALLOW 除外，ALLOW 即直通）/HIDE/RO/
+   任一段 **MONITOR ON**（监控需 daemon 记录 IO，直通会让 vfs_log_io 静默归零），
+   或任一段 SANDBOX ON，或任一条 REDIRECT（ALLOW 除外，ALLOW 即直通）/HIDE/RO/
    FTP 前缀的字面量或其变量展开值与 data/obb 相交（其下、其本身、其祖先、
    或规则即 "/"），即要求仲裁。经 config_read_begin/end 快照协议读索引。 */
 bool fw_data_mediation_required(void);

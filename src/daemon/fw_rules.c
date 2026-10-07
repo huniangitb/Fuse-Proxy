@@ -1308,6 +1308,10 @@ static bool br_rule_touches_data(const AppConfig* c, const char* rule) {
 
 static bool br_cfg_touches_data(const AppConfig* c) {
     if (!c) return false;
+    /* MONITOR ON（B1）：该段调用者的 IO 要进 io.log，而 backing 直通后内核绕过
+       daemon、vfs_log_io 静默归零——故监控优先，本子树不做 backing 直通（牺牲
+       部分加速）。门原先只扫 sandbox/hide/ro/redir/ftp，遗漏了监控这一维。 */
+    if (c->monitor) return true;
     /* 任一段 SANDBOX ON：共享目录重定向目标落进 data 沙盒，且跨应用隔离
        过滤依赖 daemon，必须仲裁（--disable-sandbox 全局关闭时除外） */
     if (c->sandbox && !g_br_disable_sandbox) return true;
@@ -1471,6 +1475,9 @@ static bool backing_rule_hits(const AppConfig* c, const char* rule, const char* 
 /* 单段配置是否在该查询路径上产生 per-caller 差异 */
 static bool br_cfg_mediates_path(const AppConfig* c, const char* query) {
     if (!c || !query || !query[0]) return false;
+    /* MONITOR ON：该段调用者的 IO 需要 daemon 记录（见 br_cfg_touches_data 说明），
+       故本子树整体需要仲裁 */
+    if (c->monitor) return true;
     /* SANDBOX ON：共享目录重定向 + 跨应用隔离影响整树，任一查询均需仲裁 */
     if (c->sandbox && !g_br_disable_sandbox) return true;
     for (int i = 0; i < c->hide_count; i++) {
