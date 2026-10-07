@@ -9,10 +9,19 @@
 
 /* 去首尾空白经 nsp_util 公共库复用（nsp_str_trim），禁私刻 trim 副本 */
 
-/* 去掉行内注释（'#' 前导）与尾部空白 */
+/* 去掉行内注释与尾部空白。
+   `#` 仅在**行首或前面是空白**时才起注释——此前无条件截断，含 '#' 的密码
+   （如 `pass = p#ssw0rd`）被静默改成 `p`，服务器按 530 拒绝，而 530 被判为
+   业务失败不熔断 → 永久静默失败且配置看不出问题。
+   与「shell/INI 惯例一致」：`#` 作注释符需在行首或空白之后；词中间视作普通
+   字符（与同样在本栈的 nsp_ini_store 取值语义对齐）。 */
 static void strip_comment(char* line) {
-    char* hash = strchr(line, '#');
-    if (hash) *hash = '\0';
+    for (char* p = line; *p; p++) {
+        if (*p == '#' && (p == line || isspace((unsigned char)p[-1]))) {
+            *p = '\0'; /* 行首整行注释，或空白后的行内注释 */
+            return;
+        }
+    }
 }
 
 /* 失败闭合拷贝：放得下返回 true；放不下返回 false 且 dst 置空
@@ -128,7 +137,18 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
         if (strcmp(key, "host") == 0) {
             if (!set_str_checked(cur->host, sizeof cur->host, val)) cur->bad = true;
         } else if (strcmp(key, "port") == 0) {
-            cur->port = atoi(val);
+            /* 端口范围校验：此前 atoi 直取，0/负数/超 65535/非数字（atoi→0）
+               全被照收，最终以 "ftp://host:0/" 形式交给 libcurl，报错信息
+               完全指不到配置行。非法值整段作废（同字段超长的失败闭合姿态），
+               并 loud 告警指出段名与原始值。 */
+            char* endp = NULL;
+            long v = strtol(val, &endp, 10);
+            if (endp == val || *nsp_str_trim(endp) != '\0' || v < 1 || v > 65535) {
+                LOG_WRN("ftp.conf [%s] port 非法（\"%s\"，须 1..65535），整段作废", cur->name, val);
+                cur->bad = true;
+            } else {
+                cur->port = (int)v;
+            }
         } else if (strcmp(key, "user") == 0) {
             if (!set_str_checked(cur->user, sizeof cur->user, val)) cur->bad = true;
         } else if (strcmp(key, "password") == 0 || strcmp(key, "pass") == 0) {
