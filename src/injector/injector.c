@@ -100,7 +100,20 @@ static int g_async_mount_fds[MAX_ASYNC_MOUNTS];
 static void* g_async_mount_ctxs[MAX_ASYNC_MOUNTS];
 static int g_async_mount_count = 0;
 
+/* 注册新的 FUSE 就绪管道。同一时刻只跟踪一条就绪管道（g_fuse_ready_pipe_fd
+   是单值，见 epoll 分发）——若上一次的还没就绪就被覆盖，旧 fd 会永久泄漏，
+   且旧 daemon 若稍后写入就绪字节，EPOLLIN 仍会触发但主循环按**新** ctx 处理，
+   把旧 fd 当新管道读（读不到就绪字节 → 走失败分支，旧 daemon 被误判）。
+   故覆盖前必须把旧 fd 从 epoll 摘除并关闭，同时释放其 ctx（ctx 由本文件的
+   malloc 分配，所有权随管道转移）。 */
 void register_fuse_ready_pipe(int fd, void* ctx) {
+    if (g_fuse_ready_pipe_fd >= 0 && g_fuse_ready_pipe_fd != fd) {
+        LOG_WRN("FUSE 就绪管道被重新注册（旧 fd=%d 尚未就绪），关闭旧管道",
+                g_fuse_ready_pipe_fd);
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_fuse_ready_pipe_fd, nullptr);
+        close(g_fuse_ready_pipe_fd);
+        free(g_fuse_ready_ctx);
+    }
     g_fuse_ready_pipe_fd = fd;
     g_fuse_ready_ctx = ctx;
 }
