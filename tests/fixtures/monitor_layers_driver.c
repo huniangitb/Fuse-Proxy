@@ -48,8 +48,8 @@ int main(int argc, char** argv) {
             NspQueryCtx q = {.uid = ruid, .pid = 0, .gid = 0, .path = path};
             NspPathDecision d;
             fw_rules_resolve(&q, &d);
-            printf("resolve uid=%u path=%s valid=%d real=%s ro=%d\n", (unsigned)ruid, path,
-                   (int)d.valid, d.real_path, (int)d.read_only);
+            printf("resolve uid=%u path=%s valid=%d real=%s ro=%d missing=%d\n", (unsigned)ruid,
+                   path, (int)d.valid, d.real_path, (int)d.read_only, (int)d.appear_missing);
             continue;
         }
         size_t alen = strlen(arg);
