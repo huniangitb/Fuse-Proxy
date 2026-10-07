@@ -204,26 +204,50 @@ void notify_fuses(int sig) {
         LOG_ERR("通知媒体 FUSE 失败");
 }
 
-static void setup_inotify_watches() {
+/* 建监听并挂到 epoll。返回是否**全部**成功；失败 loud 告警（此前静默吞掉
+   返回值 → 规则改了不生效且无任何提示）。
+   每次重载 close/新建 fd：IN_IGNORED 后旧 fd 上的 watch 全失效，复用会
+   得到"看着在监听、事件全丢"的假象；重建是唯一可靠口径。 */
+static bool setup_inotify_watches(void) {
     if (g_inotify_fd >= 0) {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_inotify_fd, nullptr);
         close(g_inotify_fd);
+        g_inotify_fd = -1;
     }
     g_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (g_inotify_fd < 0) return;
-    inotify_add_watch(g_inotify_fd, CONFIG_DIR,
-                      IN_MODIFY | IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO | IN_DELETE);
+    if (g_inotify_fd < 0) {
+        LOG_ERR("inotify_init1 失败: %s（配置热重载失效，改配置需重启）", strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    int wd = inotify_add_watch(g_inotify_fd, CONFIG_DIR,
+                               IN_MODIFY | IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO | IN_DELETE);
+    if (wd < 0) {
+        LOG_ERR("inotify 监听 %s 失败: %s（该目录下配置变更不会热重载）", CONFIG_DIR,
+                strerror(errno));
+        ok = false;
+    }
     config_lock_read();
     for (int i = 0; i < g_active_user_count; i++) {
         char dir_path[128];
         nsp_app_rule_dir(CONFIG_DIR, g_active_users[i], dir_path, sizeof(dir_path));
         mkdir(dir_path, 0755);
-        inotify_add_watch(g_inotify_fd, dir_path,
-                          IN_MODIFY | IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO | IN_DELETE);
+        int wd_u = inotify_add_watch(g_inotify_fd, dir_path,
+                                     IN_MODIFY | IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO |
+                                         IN_DELETE);
+        if (wd_u < 0) {
+            LOG_ERR("inotify 监听 %s 失败: %s（该用户目录规则变更不会热重载）", dir_path,
+                    strerror(errno));
+            ok = false;
+        }
     }
     config_unlock_read();
     struct epoll_event ev = {.events = EPOLLIN, .data.fd = g_inotify_fd};
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_inotify_fd, &ev);
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_inotify_fd, &ev) != 0) {
+        LOG_ERR("inotify fd 挂入 epoll 失败: %s（配置热重载整体失效）", strerror(errno));
+        ok = false;
+    }
+    return ok;
 }
 
 static void reload_injector_config() {
