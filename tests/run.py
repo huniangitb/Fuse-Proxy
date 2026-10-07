@@ -96,7 +96,7 @@ SUITE_MAP = [
     (("test_decision_enforce.py",), (),
      ("fw_route", "appear_missing", "vfs_check_read_only"), "决策强制单点（errno 矩阵）"),
 
-    (("test_log_ctl_rules.py", "test_rule_server.py"),
+    (("test_log_ctl_rules.py", "test_rule_server.py", "test_log_pipeline.py"),
      ("src/rule/", "src/log/log_ctl.c"),
      ("nsp_rule_file",),
      "log_ctl / rule_server 规则编辑"),

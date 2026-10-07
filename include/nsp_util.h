@@ -20,6 +20,15 @@
  * config_parser clean_path_string 的公共前半段） */
 char* nsp_str_trim(char* s);
 
+/* 把可能含换行/控制字符的文本清洗成**单行安全日志文本**：\r\n 转义为 "\\r"/"\\n"、
+ * 其余不可打印字符转义为 "\\xHH"，结果截断到 out_sz-1（恒以 NUL 结尾）。
+ *
+ * 动机：log_monitor 按 '\n' 拆行、按行首 "<数字>:" 取等级（见 log_monitor.c 的
+ * 行协议），任何外部可控文本（客户端请求原文、包名等）直接拼进日志行即可伪造
+ * 等级行（如 `garbage\n3:伪造` → 一条伪造的 ERROR 行）。凡把外部输入拼进日志
+ * 的地方都先经此出口（与路径合成走 common_* 同一红线精神：唯一出处）。 */
+void nsp_log_line_sanitize(const char* in, char* out, size_t out_sz);
+
 /* 全量发送循环（MSG_NOSIGNAL，内部重试 EINTR）：替代各处手写 while(send)。
  * 全部发出返回 true；出错或对端关闭返回 false（调用方自行决定是否关闭 fd）。 */
 bool nsp_send_all(int fd, const char* buf, size_t len);

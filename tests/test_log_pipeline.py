@@ -35,8 +35,10 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -47,6 +49,7 @@ BUILD = os.environ.get("BUILD_DIR") or os.path.join(ROOT, "build_gnu")
 DAEMON = os.environ.get("FUSE_DAEMON") or os.path.join(BUILD, "fuse_daemon")
 LOG_MON = os.environ.get("LOG_MONITOR") or os.path.join(BUILD, "log_monitor")
 LOG_CTL = os.environ.get("LOG_CTL") or os.path.join(BUILD, "log_ctl")
+RULE_SERVER = os.environ.get("RULE_SERVER") or os.path.join(BUILD, "rule_server")
 
 LOG_DIR = os.environ.get("NSP_LOG_DIR") or "/var/fuse-proxy/log"
 IO_LOG = os.path.join(LOG_DIR, "io.log")
@@ -507,6 +510,103 @@ def test_level_format():
 
 
 # ───────────────────────────────────────────────────────────
+# 用例 4：rule_server 拒绝日志注入防护（A17）
+# ───────────────────────────────────────────────────────────
+def _rs_send(sock_name, cmd_obj, timeout=5.0):
+    """连抽象套接字发一条 JSON 命令，返回响应 dict（与 test_rule_server 同法）。"""
+    import json as _json
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(("\0" + sock_name).encode())
+    s.sendall((_json.dumps(cmd_obj, ensure_ascii=False) + "\n").encode("utf-8"))
+    s.shutdown(socket.SHUT_WR)
+    buf = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        if b"\n" in buf:
+            break
+    s.close()
+    return _json.loads(buf.decode("utf-8"))
+
+
+def test_rule_server_log_injection():
+    """A17：rule_server 拒绝应答落日志前必须清洗客户端可控文本。
+
+    log_monitor 按 '\\n' 拆行、按行首 "<数字>:" 取等级，故未清洗时一次
+    `{"cmd":"GET","pkg":"x\\n3:伪造\\n"}`（JSON 转义解码后是真换行）即可向
+    sys.log 注入伪造的 ERROR 行。断言：sys.log 无伪造等级行，且原文本以转义
+    （`\\n`）形式保留在单条 WARN 行内。
+    """
+    log("── 用例 4：rule_server 拒绝日志注入防护（A17） ──")
+    if not os.path.exists(RULE_SERVER):
+        GAPS.append("rule_server 产物缺失，A17 注入用例跳过")
+        log("  ⏭ 缺少 rule_server 产物，跳过 A17")
+        return
+    # 用例 3 收尾停了 log_monitor 以便刷盘读取；本用例需重新拉起（生产者要能建链）
+    if not start_logmon():
+        GAPS.append("log_monitor 未就绪，A17 注入用例跳过")
+        log("  ⏭ log_monitor 未就绪，跳过 A17")
+        return
+    marker = "A17FORGE" + TEST_ID
+    tmpdir = tempfile.mkdtemp(prefix="log_pipe_rs_")
+    conf_dir = os.path.join(tmpdir, "conf")
+    os.makedirs(conf_dir, exist_ok=True)
+    with open(os.path.join(conf_dir, "injector.conf"), "w", encoding="utf-8") as f:
+        f.write("[GLOBAL]\nMONITOR ON\n")
+    sock_name = "nsp_logpipe_rs_%d" % os.getpid()
+    proc = subprocess.Popen(
+        [RULE_SERVER, "--foreground", "--config-dir", conf_dir, "--socket", sock_name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        ready = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                if _rs_send(sock_name, {"cmd": "PING"}, timeout=0.5).get("status") == "ok":
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+        if not ready:
+            fail("A17 rule_server 未就绪", "见构建产物与抽象套接字")
+            return
+        # pkg 里带真换行 + 伪造等级前缀；valid_pkg 拒绝 → reply_error 落日志
+        _rs_send(sock_name, {"cmd": "GET", "pkg": "x\n3:%s\n" % marker})
+        time.sleep(1.5)  # 等 comm 环 + 500ms 刷盘 tick
+    finally:
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(3)
+        except Exception:
+            proc.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        stop_logmon()  # SIGTERM → 退出刷盘，确保 sys.log 可读
+
+    try:
+        with open(SYS_LOG) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        fail("A17 读取 sys.log 失败", str(e))
+        return
+    forged = [x for x in lines if "|ERROR|" in x and marker in x]
+    check("4.1 客户端换行不得注入伪造等级行（无 |ERROR| 伪造行）", not forged,
+          (forged[:2] or ["无"])[0])
+    # 正向确认载荷确实到达日志（否则 4.1 会因「没日志」而假绿）
+    seen = [x for x in lines if marker in x]
+    check("4.2 拒绝日志仍留痕且为单行（换行转义为 \\n）",
+          bool(seen) and all(("\\n" in x) for x in seen),
+          (seen[:1] or ["未找到含 marker 的日志行"])[0])
+
+
+# ───────────────────────────────────────────────────────────
 # 主流程
 # ───────────────────────────────────────────────────────────
 def main():
@@ -547,6 +647,7 @@ def main():
             test_gate_matrix()
             test_disk_history()
             test_level_format()
+            test_rule_server_log_injection()
     finally:
         stop_fuse(None)
         stop_logmon()

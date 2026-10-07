@@ -823,6 +823,44 @@ static void reply_ok(int fd, const char* cmd, json_object* data) {
     reply_json(fd, "ok", cmd, data, NULL);
 }
 
+/* 拒绝日志限频：同一 cmd 每秒最多一条（防日志洪泛），被抑制条数并入下一条。
+   服务端单线程串行处理请求，故无需加锁。 */
+#define REPLY_RL_SLOTS 16
+static struct {
+    char cmd[32];
+    time_t last;
+    unsigned suppressed;
+} g_reply_rl[REPLY_RL_SLOTS];
+
+/* 返回 true 表示本条应当落日志；*out_suppressed 给出上次落日志至今被抑制的条数 */
+static bool reply_log_gate(const char* cmd, unsigned* out_suppressed) {
+    time_t now = time(NULL);
+    int free_i = -1, oldest_i = 0;
+    for (int i = 0; i < REPLY_RL_SLOTS; i++) {
+        if (g_reply_rl[i].cmd[0] && strcmp(g_reply_rl[i].cmd, cmd) == 0) {
+            if (now - g_reply_rl[i].last >= 1) {
+                g_reply_rl[i].last = now;
+                *out_suppressed = g_reply_rl[i].suppressed;
+                g_reply_rl[i].suppressed = 0;
+                return true;
+            }
+            g_reply_rl[i].suppressed++;
+            return false;
+        }
+        if (!g_reply_rl[i].cmd[0]) {
+            if (free_i < 0) free_i = i;
+        } else if (g_reply_rl[i].last < g_reply_rl[oldest_i].last) {
+            oldest_i = i;
+        }
+    }
+    int slot = (free_i >= 0) ? free_i : oldest_i;
+    snprintf(g_reply_rl[slot].cmd, sizeof g_reply_rl[slot].cmd, "%s", cmd);
+    g_reply_rl[slot].last = now;
+    g_reply_rl[slot].suppressed = 0;
+    *out_suppressed = 0;
+    return true;
+}
+
 static void reply_error(int fd, const char* cmd, const char* fmt, ...) {
     char msg[512];
     va_list ap;
@@ -830,8 +868,23 @@ static void reply_error(int fd, const char* cmd, const char* fmt, ...) {
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
     /* 错误应答单点留痕：前端发来无法接受的参数 / 规则写入失败等均经此应答，
-       以警告级别落日志（含命令与原因），便于从 sys.log 侧审计前端误用 */
-    LOG_WRN("规则请求被拒绝: cmd=%s 原因=%s", cmd ? cmd : "?", msg);
+       以警告级别落日志（含命令与原因），便于从 sys.log 侧审计前端误用。
+
+       cmd 与 msg 都可能含**客户端可控文本**（请求原文、包名等），落日志前必须
+       清洗成单行：log_monitor 按 '\n' 拆行、按行首 "<数字>:" 取等级，未清洗时
+       一次 `garbage\n3:伪造` 即可向 sys.log 注入伪造的 ERROR 行（且每条坏请求
+       落一行 = 日志洪泛面）。故清洗 + 同 cmd 限频。 */
+    char safe_cmd[48], safe_msg[512];
+    nsp_log_line_sanitize(cmd ? cmd : "?", safe_cmd, sizeof safe_cmd);
+    nsp_log_line_sanitize(msg, safe_msg, sizeof safe_msg);
+    unsigned suppressed = 0;
+    if (reply_log_gate(safe_cmd, &suppressed)) {
+        if (suppressed)
+            LOG_WRN("规则请求被拒绝: cmd=%s 原因=%s（另有 %u 条同类被抑制）", safe_cmd, safe_msg,
+                    suppressed);
+        else
+            LOG_WRN("规则请求被拒绝: cmd=%s 原因=%s", safe_cmd, safe_msg);
+    }
     reply_json(fd, "error", cmd, NULL, msg);
 }
 
