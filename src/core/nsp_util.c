@@ -85,6 +85,17 @@ socklen_t nsp_uds_abstract_addr(struct sockaddr_un* addr, const char* name) {
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(addr->sun_path + 1));
 }
 
+int nsp_peer_cred(int fd, pid_t* pid, uid_t* uid, gid_t* gid) {
+    struct ucred cred;
+    socklen_t len = sizeof cred;
+    if (fd < 0) return -1;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return -1;
+    if (pid) *pid = cred.pid;
+    if (uid) *uid = cred.uid;
+    if (gid) *gid = cred.gid;
+    return 0;
+}
+
 int nsp_mkdir_p(const char* path, mode_t mode) {
     if (!path || !*path) return -1;
     char tmp[4096];

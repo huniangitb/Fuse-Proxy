@@ -37,6 +37,14 @@ bool nsp_send_all(int fd, const char* buf, size_t len);
  * 用法 struct sockaddr_un a; socklen_t n = nsp_uds_abstract_addr(&a, NAME); */
 socklen_t nsp_uds_abstract_addr(struct sockaddr_un* addr, const char* name);
 
+/* 取对端凭据（SO_PEERCRED：pid/uid/gid）。成功返回 0 并填非 NULL 出参；
+ * 失败返回 -1（errno 有效；fd 非法 / 非 UDS 连接）。
+ *
+ * 用途：UDS 控制面在 dispatch 前做**对端鉴权**——仅靠 SELinux 域兜底不足
+ * （模块骨架 sepolicy 已允许 untrusted_app_all 连接 root 的 stream socket），
+ * 任何本地进程都能发控制命令；客户端自报的 pid/uid/pkg 不得直接采信。 */
+int nsp_peer_cred(int fd, pid_t* pid, uid_t* uid, gid_t* gid);
+
 /* 递归建目录（最小实现，不继承 SELinux/属主；需属性继承用 common.c 的
  * mkdir_recursive_p）：替代 rule_server 私刻 mkdir_p */
 int nsp_mkdir_p(const char* path, mode_t mode);

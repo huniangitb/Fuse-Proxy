@@ -123,6 +123,9 @@ def main():
         [RULE_SERVER, "--foreground", "--config-dir", conf_dir, "--socket", sock_name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # B2：高危命令（STOP/QUIT/EXPORT_LOGS）默认仅 root 可执行；本用例以当前
+        # 用户身份跑，故把自己的 uid 列入受信任白名单（负例见 check 里的 B2 段）
+        env={**os.environ, "NSP_TRUSTED_UIDS": str(os.getuid())},
     )
     try:
         wait_server_ready(proc, sock_name)
@@ -859,6 +862,34 @@ def check(proc, sock_name, conf_dir):
     else:
         print("  (跳过 SERVICE 启停控制：bin 目录无 log_monitor)")
         GAPS.append("SERVICE 启停控制（bin 目录无 log_monitor）")
+
+    # ---- B2：对端鉴权（高危命令白名单） ----
+    # 另起一个**未配置 NSP_TRUSTED_UIDS** 的实例：本测试进程（非 root）对它的
+    # STOP / EXPORT_LOGS 必须被拒且进程存活，PING 等非高危命令仍放行。
+    # 判别点：旧实现 accept 后直接 dispatch，这两条会真的生效（STOP 会停服）。
+    if os.getuid() != 0:
+        auth_sock = f"nsp_rule_auth_{os.getpid()}"
+        env_no_trust = {k: v for k, v in os.environ.items() if k != "NSP_TRUSTED_UIDS"}
+        aproc = subprocess.Popen(
+            [RULE_SERVER, "--foreground", "--config-dir", conf_dir, "--socket", auth_sock],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env_no_trust)
+        try:
+            wait_server_ready(aproc, auth_sock)
+            ra = send_cmd(aproc, auth_sock, {"cmd": "STOP"})
+            expect("B2 非受信任 uid 的 STOP 被拒", ra.get("status") == "error", ra)
+            ra = send_cmd(aproc, auth_sock, {"cmd": "EXPORT_LOGS"})
+            expect("B2 非受信任 uid 的 EXPORT_LOGS 被拒", ra.get("status") == "error", ra)
+            ra = send_cmd(aproc, auth_sock, {"cmd": "PING"})
+            expect("B2 非高危命令仍放行（PING）", ra.get("status") == "ok", ra)
+            expect("B2 拒绝后服务存活（命令未生效）", aproc.poll() is None, aproc.poll())
+        finally:
+            try:
+                aproc.send_signal(signal.SIGTERM)
+                aproc.wait(timeout=3)
+            except Exception:
+                aproc.kill()
+    else:
+        print("  (跳过 B2 负例：以 root 运行，对端 uid=0 属受信任)")
 
     # ---- QUIT：服务应退出 ----
     r = send_cmd(proc, sock_name, {"cmd": "QUIT"})
