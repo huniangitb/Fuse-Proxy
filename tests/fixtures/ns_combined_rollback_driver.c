@@ -143,6 +143,19 @@ int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
     return 1;
 }
 
+/* C7：do_combined_mount 的子挂载点收集经 ns_collect_mounts_under_pid 收口。
+   本用例聚焦「合并挂载失败后的回滚」，与收集到的子挂载点无关——桩返回 0
+   （无子挂载点），与上方 read_file_dynamic 桩返回不含匹配项的内容等价。 */
+int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_PATH_MAX],
+                                int max, const char* who) {
+    (void)pid;
+    (void)base;
+    (void)out;
+    (void)max;
+    (void)who;
+    return 0;
+}
+
 /* ══════════════ 实际源码（static do_combined_mount 由此可见） ══════════════ */
 
 #include NS_UTILS_SRC

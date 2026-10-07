@@ -135,6 +135,9 @@ int mkdir_recursive(const char* dir) {
 
 /* ══════════════ 实际源码（static do_global_replace 由此可见） ══════════════ */
 
+/* C7：mountinfo 扫描原语独立成 TU（src/injector/ns_mountinfo.c），此处一并编入
+   本 TU——ns_global_replace.c 的 ns_read_mountinfo_pid 经 ns_scan_mountinfo 收口。 */
+#include "ns_mountinfo.c"
 #include NS_GLOBAL_REPLACE_SRC
 
 /* ══════════════ 用例 ══════════════ */
