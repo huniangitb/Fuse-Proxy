@@ -23,11 +23,6 @@
 #include "fast_search.h"
 #include "injector.h"
 #include "inject_target.h"
-struct DebugMountArgs {
-    const char* pkg;
-    int pid;
-    const char* stage;
-};
 /* 非 static 导出：全局替换方案（ns_global_replace.c）共用此 ns 错误日志 */
 void log_ns_error(const char* format, ...) {
     int fd = open(ERROR_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
@@ -467,20 +462,6 @@ static int do_make_shared(void* raw_args) {
     if (mount(nullptr, target, nullptr, MS_SHARED, nullptr) != 0) return errno;
     return 0;
 }
-static int do_move_mount(void* raw_args) {
-    struct MountArgs* args = (struct MountArgs*)raw_args;
-    char parent[PATH_MAX];
-    strncpy(parent, args->target, PATH_MAX - 1);
-    parent[PATH_MAX - 1] = '\0';
-    char* last = strrchr(parent, '/');
-    if (last && last != parent) {
-        *last = '\0';
-        mkdir(parent, 0755);
-    }
-    mkdir(args->target, 0755);
-    if (mount(args->src, args->target, nullptr, MS_MOVE, nullptr) != 0) return errno;
-    return 0;
-}
 int ns_bind_mount(int pid, const char* source, const char* target) {
     struct MountArgs args = {source, target, -1};
     int child_err = 0;
@@ -591,13 +572,6 @@ int ns_umount_recursive(int pid, const char* target) {
 int ns_umount_and_rmdir(int pid, const char* target) {
     return run_in_mnt_ns(pid, do_umount_and_rmdir, (void*)target, nullptr);
 }
-int ns_move_mount(int pid, const char* source, const char* target) {
-    struct MountArgs args = {source, target, -1};
-    int child_err = 0;
-    int ret = run_in_mnt_ns(pid, do_move_mount, &args, &child_err);
-    if (ret < 0 && child_err != 0) errno = child_err;
-    return ret;
-}
 int ns_make_shared(int pid, const char* target) {
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_make_shared, (void*)target, &child_err);
@@ -659,102 +633,6 @@ int ns_find_native_submounts(int pid, const char* base_path, char mount_points[]
     }
     free(buf);
     return count;
-}
-struct PreserveMountArgs {
-    const char* source;
-    const char* target;
-    char (*preserve_paths)[256];
-    int preserve_count;
-};
-static int do_bind_mount_with_preserve(void* raw_args) {
-    struct PreserveMountArgs* args = (struct PreserveMountArgs*)raw_args;
-    const char* source = args->source;
-    const char* target = args->target;
-    char (*preserve_paths)[256] = args->preserve_paths;
-    int preserve_count = args->preserve_count;
-    if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
-    char backup_base[PATH_MAX];
-    snprintf(backup_base, sizeof(backup_base), BACKUP_DIR "/storage");
-    size_t target_len = strlen(target);
-    for (int i = 0; i < preserve_count; i++) {
-        const char* mp = preserve_paths[i];
-        if (mp[0] == '\0') continue;
-        const char* rel = mp + target_len;
-        while (*rel == '/') rel++;
-        char backup_src[PATH_MAX];
-        snprintf(backup_src, sizeof(backup_src), "%s/%s", backup_base, rel);
-        mkdir_recursive(mp);
-        mount(backup_src, mp, nullptr, MS_BIND | MS_REC, nullptr);
-    }
-    return 0;
-}
-int ns_bind_mount_with_preserve(int pid, const char* source, const char* target,
-                                char preserve_paths[][256], int preserve_count) {
-    struct PreserveMountArgs args = {source, target, preserve_paths, preserve_count};
-    int child_err = 0;
-    int ret = run_in_mnt_ns(pid, do_bind_mount_with_preserve, &args, &child_err);
-    if (ret < 0 && child_err != 0) errno = child_err;
-    return ret;
-}
-struct BackupTargetArgs {
-    const char* target;
-    const char* backup;
-};
-static int do_backup_and_clear_target(void* raw_args) {
-    struct BackupTargetArgs* args = (struct BackupTargetArgs*)raw_args;
-    const char* target = args->target;
-    const char* backup = args->backup;
-    size_t tlen = strlen(target);
-    size_t blen = strlen(backup);
-    FILE* fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char line[4096], mounts[128][PATH_MAX];
-        int count = 0;
-        while (fgets(line, sizeof(line), fp) && count < 128) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, backup) == 0) continue;
-            if (strncmp(mp, backup, blen) == 0 && (mp[blen] == '/' || mp[blen] == '\0')) {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-    }
-    for (int t = 0; t < 8; t++)
-        if (umount2(backup, MNT_DETACH) == 0) break;
-    if (mount(target, backup, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
-    fp = fopen("/proc/self/mountinfo", "re");
-    if (fp) {
-        char line[4096], mounts[128][PATH_MAX];
-        int count = 0;
-        while (fgets(line, sizeof(line), fp) && count < 128) {
-            char mp[PATH_MAX] = {0};
-            if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
-            if (strcmp(mp, target) == 0) continue;
-            if (strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
-                count++;
-            }
-        }
-        fclose(fp);
-        for (int i = count - 1; i >= 0; i--)
-            for (int t = 0; t < 8; t++)
-                if (umount2(mounts[i], MNT_DETACH) == 0) break;
-    }
-    for (int t = 0; t < 8; t++)
-        if (umount2(target, MNT_DETACH) == 0) break;
-    return 0;
-}
-int ns_backup_and_clear_target(int pid, const char* target, const char* backup) {
-    struct BackupTargetArgs bargs = {target, backup};
-    int child_err = 0;
-    int ret = run_in_mnt_ns(pid, do_backup_and_clear_target, &bargs, &child_err);
-    if (ret < 0 && child_err != 0) errno = child_err;
-    return ret;
 }
 struct CombinedMountArgs {
     const char* pkg;
@@ -1171,109 +1049,6 @@ int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name) 
     }
     fclose(fp);
     return found;
-}
-static int do_debug_log_mounts(void* raw_args) {
-    struct DebugMountArgs* args = (struct DebugMountArgs*)raw_args;
-    mkdir_recursive(LOG_DIR);
-    FILE* log_fp = fopen(LOG_DIR "/mount_debug.log", "ae");
-    if (!log_fp) return errno;
-    time_t now = time(nullptr);
-    struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
-    char time_buf[64];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
-    fprintf(log_fp, "[%s] [PKG: %s] [PID: %d] [STAGE: %s]\n", time_buf, args->pkg, args->pid,
-            args->stage);
-    FILE* mounts_fp = fopen("/proc/self/mounts", "re");
-    if (mounts_fp) {
-        char line[1024];
-        bool found = false;
-        while (fgets(line, sizeof(line), mounts_fp)) {
-            if (fast_strstr(line, NSP_ANDROID_EMULATED_ROOT) != nullptr) {
-                fprintf(log_fp, "  %s", line);
-                found = true;
-            }
-        }
-        if (!found) {
-            fprintf(log_fp, "  (未找到包含 /storage/emulated 的挂载点)\n");
-        }
-        fclose(mounts_fp);
-    } else {
-        fprintf(log_fp, "  错误：无法读取 /proc/self/mounts\n");
-    }
-    fprintf(log_fp, "------------------------------------------------------------\n");
-    fflush(log_fp);
-    fclose(log_fp);
-    return 0;
-}
-int ns_debug_log_mounts(int pid, const char* pkg, const char* stage) {
-    struct DebugMountArgs args = {pkg, pid, stage};
-    return run_in_mnt_ns(pid, do_debug_log_mounts, &args, nullptr);
-}
-struct SysFuseArgs {
-    char fuse_src[PATH_MAX];
-    char backup_path[PATH_MAX];
-};
-static int do_backup_and_remove_sys_fuse(void* raw_args) {
-    struct SysFuseArgs* args = (struct SysFuseArgs*)raw_args;
-    struct stat st;
-    if (stat(NSP_ANDROID_EMULATED_ROOT, &st) != 0) return -1;
-    if (mkdir_recursive(args->backup_path) != 0) {
-        return -1;
-    }
-    if (mount(NSP_ANDROID_EMULATED_ROOT, args->backup_path, nullptr, MS_BIND | MS_REC, nullptr) !=
-        0) {
-        return -2;
-    }
-    if (umount2(NSP_ANDROID_EMULATED_ROOT, MNT_DETACH) != 0) {
-        umount2(args->backup_path, MNT_DETACH);
-        return -1;
-    }
-    if (mount(args->fuse_src, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        mount(args->backup_path, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr);
-        return -2;
-    }
-    mount(nullptr, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_SHARED, nullptr);
-    return 0;
-}
-static int do_restore_sys_fuse(void* raw_args) {
-    struct SysFuseArgs* args = (struct SysFuseArgs*)raw_args;
-    if (access(args->backup_path, F_OK) != 0) return -1;
-    umount2(NSP_ANDROID_EMULATED_ROOT, MNT_DETACH);
-    struct stat st;
-    if (stat(NSP_ANDROID_EMULATED_ROOT, &st) != 0) {
-        mount(args->backup_path, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr);
-        return 0;
-    }
-    mount(args->backup_path, NSP_ANDROID_EMULATED_ROOT, nullptr, MS_BIND | MS_REC, nullptr);
-    return 0;
-}
-int ns_backup_and_remove_system_fuse(int mnt_ns_pid, const char* fuse_src,
-                                     const char* backup_path) {
-    struct SysFuseArgs args;
-    memset(&args, 0, sizeof(args));
-    strncpy(args.fuse_src, fuse_src, sizeof(args.fuse_src) - 1);
-    strncpy(args.backup_path, backup_path, sizeof(args.backup_path) - 1);
-    int child_err = 0;
-    int ret =
-        run_in_mnt_ns_timeout(mnt_ns_pid, do_backup_and_remove_sys_fuse, &args, &child_err, 2000);
-    if (ret != 0) {
-        LOG_ERR("系统 FUSE 备份/卸载失败 (ret=%d, err=%d)", ret, child_err);
-    } else {
-        LOG("系统 FUSE 已备份至 %s 并卸载", backup_path);
-    }
-    return ret;
-}
-int ns_restore_system_fuse(int mnt_ns_pid, const char* fuse_src, const char* backup_path) {
-    (void)fuse_src;
-    struct SysFuseArgs args;
-    memset(&args, 0, sizeof(args));
-    strncpy(args.backup_path, backup_path, sizeof(args.backup_path) - 1);
-    int ret = run_in_mnt_ns_timeout(mnt_ns_pid, do_restore_sys_fuse, &args, nullptr, 2000);
-    if (ret == 0) {
-        LOG("系统 FUSE 已从 %s 恢复", backup_path);
-    }
-    return ret;
 }
 /* 核心优化：异步合并挂载完成后，用于回收父进程内存的全局回调 */
 void handle_async_mount_event(void* ptr) {
