@@ -209,6 +209,44 @@ def main():
                 os.close(fd)
         except Exception as e: fail("fsync 落远端", str(e))
 
+        # 3d. 写模式必须回灌远端已有内容（A8 判别）
+        #     旧实现 open(写模式) 只 mkstemp 一个**空** tmp，从不下载远端内容，
+        #     上传按 tmp 长度全量 STOR 覆盖——open(O_RDWR)+pwrite(尾部) 会把远端
+        #     前段替换成 NUL 空洞，原内容全丢（SQLite 就地写 / 编辑器保存必现）。
+        #     判别：远端预置非空文件 → O_RDWR 打开先 pread（应读到远端内容）→
+        #     在尾部 pwrite → close → 远端**前段必须仍在**。探针名选套件不碰的。
+        #     注意探针须 0666：匿名 ftp 用户要能覆盖/追加（bdy:0644 的文件对它只读，
+        #     会把环境权限问题伪装成产品缺陷）。
+        bf = "nsp_a8_backfill.txt"
+        prefix = "REMOTE-PREFIX-DATA"
+        try:
+            bpath = Path(FTP_UPLOAD) / bf
+            bpath.write_text(prefix)
+            os.chmod(bpath, 0o666)
+            fd = os.open(str(m/"0"/SERVER/bf), os.O_RDWR)
+            try:
+                got0 = os.pread(fd, len(prefix), 0).decode(errors="replace")
+                if got0 == prefix:
+                    ok("O_RDWR 打开后 pread 读到远端已有内容（回灌生效）")
+                else:
+                    fail("O_RDWR pread 远端内容", f"got={got0!r}（期望 {prefix!r}）")
+                os.pwrite(fd, b"TAIL", len(prefix))
+            finally:
+                os.close(fd)
+            if wait_ftp_content(bf, prefix + "TAIL"):
+                ok("O_RDWR 尾部改写后远端前段仍在（不丢全文）")
+            else:
+                fp = Path(FTP_UPLOAD) / bf
+                got = fp.read_text(errors="replace") if fp.exists() else "<文件不存在>"
+                fail("O_RDWR 就地改写", f"远端={got!r}（期望 {prefix + 'TAIL'!r}，前段丢失即旧实现）")
+        except Exception as e:
+            fail("写模式回灌远端内容", str(e))
+        finally:
+            try:
+                (Path(FTP_UPLOAD) / bf).unlink()
+            except Exception:
+                pass
+
         # 4. 读回（经 fuse）
         try:
             got = (m/"0"/SERVER/newf).read_text().strip()
