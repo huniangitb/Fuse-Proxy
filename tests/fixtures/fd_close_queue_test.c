@@ -9,17 +9,29 @@
  *      在旧实现（先占号再判满、占号者直接返回）下会把 ready 水位永久卡住：
  *      新生产者要么自旋等待永不发布的槽位（挂死），要么永远走直接 close
  *      （队列静默失效）。此处断言新 fd 仍被延迟（未立即 close）且最终恰好关一次。
- *   3) 多生产者/多消费者并发下不重不漏。 */
+ *   3) 多生产者/多消费者并发下不重不漏。
+ *   4) **饱和时不得提前关闭本次 fd**（A22）——旧实现「满则直接 close」会让内核
+ *      拿到已关闭的 fd（fd 号可被另一 worker 的 open 立刻复用 → backing 挂到无关
+ *      文件）。判别：填满队列后再 defer 一个探针 fd，断言它**此刻未被关闭**；
+ *      旧实现立即关闭，新实现先促消费腾位再入队。 */
 #include "fd_close_queue.h"
+#include "nsp_log.h"
 
 #include <pthread.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* 本驱动直编 fd_close_queue.c（它经 LOG_ERR 上报饱和兜底），故需提供日志符号 */
+void log_internal(LogLevel level, const char* format, ...) {
+    (void)level;
+    (void)format;
+}
 
 #define ID_SPACE 1000000
 
@@ -213,10 +225,39 @@ static void test_concurrent(void) {
     check("concurrent_no_bad_fd", atomic_load(&g_bad_fd) == 0, "关闭了非法 fd");
 }
 
+/* 5) 饱和时不得提前关闭本次 fd（A22 判别）。
+   填满到恰好 CAP 条（不 flush）→ 再 defer 一个探针：旧实现在此处直接
+   close(probe)（内核可能仍在 reply 前引用它，且 fd 号可被复用），新实现先
+   促消费腾位再入队 → 探针此刻仍未被关闭。 */
+static void test_saturation_no_early_close(void) {
+    track_reset();
+    FdCloseQueue q;
+    fdq_init(&q);
+    const int base = 500000;
+    for (int i = 0; i < FD_CLOSE_QUEUE_CAP; i++) fdq_defer(&q, base + i);
+    check("sat_fill_deferred_no_close", atomic_load(&g_close_calls) == 0,
+          "填满过程中就有 fd 被提前关闭（未 flush）");
+
+    const int probe = base + FD_CLOSE_QUEUE_CAP;
+    fdq_defer(&q, probe); /* 旧实现：满 → 立即 close(probe) */
+    check("sat_probe_not_closed_immediately", !was_closed(probe),
+          "饱和时本次 fd 被立即关闭（内核可能仍引用该 fd / fd 号可被复用）");
+
+    fdq_flush(&q);
+    check("sat_probe_closed_once_after_flush", was_closed(probe) && atomic_load(&g_dup_close) == 0,
+          "探针 fd 未恰好关闭一次");
+    int missing = 0;
+    for (int i = 0; i < FD_CLOSE_QUEUE_CAP; i++)
+        if (!was_closed(base + i)) missing++;
+    check("sat_batch_all_closed_once", missing == 0 && atomic_load(&g_dup_close) == 0,
+          "腾位回收的批次有 fd 未关闭或重复关闭");
+}
+
 int main(void) {
     fdq_set_close_fn(counting_close);
     test_defer_and_flush();
     test_saturate_then_reuse();
+    test_saturation_no_early_close();
     test_two_consumers_exclusive();
     test_concurrent();
     if (g_fail) {
