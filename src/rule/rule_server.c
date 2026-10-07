@@ -2567,11 +2567,55 @@ static void handle_ftp_remove(int fd, json_object* req) {
     reply_ok(fd, "FTP_REMOVE", data);
 }
 
+/* 受信任调用者 uid 白名单（root 之外的额外放行项）：由环境变量
+ * NSP_TRUSTED_UIDS 给出（逗号分隔，最多 8 项），启动时读一次。生产由模块的
+ * service.sh 设为管理器 App 的 uid；**未设置时只有 root** 能执行高危命令。 */
+static uid_t g_trusted_uids[8];
+static int g_trusted_uid_count;
+
+static void load_trusted_uids(void) {
+    g_trusted_uid_count = 0;
+    const char* env = getenv("NSP_TRUSTED_UIDS");
+    if (!env) return;
+    const char* p = env;
+    while (*p && g_trusted_uid_count < (int)(sizeof g_trusted_uids / sizeof g_trusted_uids[0])) {
+        char* end = NULL;
+        unsigned long v = strtoul(p, &end, 10);
+        if (end == p) break; /* 非数字：停止（不猜测） */
+        if (v <= 0xFFFFFFFFul) g_trusted_uids[g_trusted_uid_count++] = (uid_t)v;
+        p = end;
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+    }
+}
+
+static bool peer_is_privileged(uid_t uid) {
+    if (uid == 0) return true;
+    for (int i = 0; i < g_trusted_uid_count; i++)
+        if (g_trusted_uids[i] == uid) return true;
+    return false;
+}
+
+/* 高危命令：能停服（STOP/QUIT）或把全机访问日志导出到落点（EXPORT_LOGS）。
+ * 其余命令（查询/规则编辑）保持开放——控制面可用性优先，且它们不越权。 */
+static bool cmd_is_privileged(const char* cmd) {
+    return strcasecmp(cmd, "STOP") == 0 || strcasecmp(cmd, "QUIT") == 0 ||
+           strcasecmp(cmd, "EXPORT_LOGS") == 0;
+}
+
 /* ==================== 命令分发 ==================== */
-static void dispatch(int fd, json_object* req) {
+static void dispatch(int fd, json_object* req, uid_t peer_uid) {
     const char* cmd = json_object_get_string(json_object_object_get(req, "cmd"));
     if (!cmd) {
         reply_error(fd, "?", "缺少 cmd 字段");
+        return;
+    }
+    /* 高危命令（停服 / 导出全机日志）仅 root 或白名单 uid 可执行（B2：对端鉴权） */
+    if (cmd_is_privileged(cmd) && !peer_is_privileged(peer_uid)) {
+        char clean[128];
+        nsp_log_line_sanitize(cmd, clean, sizeof clean);
+        LOG_WRN("拒绝高危命令 %s：对端 uid=%u 不在白名单（仅 root / NSP_TRUSTED_UIDS）", clean,
+                (unsigned)peer_uid);
+        reply_error(fd, cmd, "权限不足：该命令仅限 root 或受信任 uid");
         return;
     }
     /* 每次命令前刷新规则类型表：模块 .rules 增删即动态追加/回收类型（热更新） */
@@ -2624,6 +2668,11 @@ static void dispatch(int fd, json_object* req) {
 
 /* ==================== 服务端 ==================== */
 static void handle_client(int client_fd) {
+    /* 对端鉴权：取 SO_PEERCRED 的 uid。失败（非 UDS/异常）按最不可信处理，
+       高危命令随即被拒——仅靠 SELinux 域兜底不足（见 nsp_peer_cred 注释）。 */
+    uid_t peer_uid = (uid_t)-1;
+    if (nsp_peer_cred(client_fd, NULL, &peer_uid, NULL) != 0) peer_uid = (uid_t)-1;
+
     /* 500ms 读写超时，防止异常客户端挂起 */
     struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -2666,7 +2715,7 @@ static void handle_client(int client_fd) {
         close(client_fd);
         return;
     }
-    dispatch(client_fd, req);
+    dispatch(client_fd, req, peer_uid);
     json_object_put(req);
     close(client_fd);
 }
@@ -2680,6 +2729,7 @@ static int run_server(void) {
     /* 记录启动时刻：UPTIME 查询基准（单调时钟，不受系统改时间影响） */
     clock_gettime(CLOCK_MONOTONIC, &g_start_mono);
     g_start_wall = time(NULL);
+    load_trusted_uids();
 
     /* 统一日志：daemonize 之后建链（comm 线程不跨 fork），此后 LOG_*
      * 经 comm 线程进 sys.log；启动失败同时保留 stderr，service.sh 仍可见 */

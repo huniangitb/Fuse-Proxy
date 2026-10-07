@@ -275,6 +275,19 @@ void handle_ipc_client_readable(int client_fd) {
     int pid = 0, uid = 0;
     if (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3 ||
         sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3) {
+        /* B2：对端鉴权——客户端自报的 pid/uid/pkg 不得直接采信（污染 uid→包名即可
+           让 HIDE/RO 整体失配）。合法发送方只有两类：root（zygisk companion 的
+           REPORT）与**目标应用自身**（模块在应用进程内发 REQ，peer uid 即应用 uid）。
+           故要求对端 uid 为 root 或与自报 uid 相等，否则拒绝。 */
+        uid_t peer_uid = (uid_t)-1;
+        if (nsp_peer_cred(client_fd, NULL, &peer_uid, NULL) != 0) peer_uid = (uid_t)-1;
+        if (peer_uid != 0 && (uid_t)uid != peer_uid) {
+            LOG_WRN("IPC: 拒绝 uid 不匹配的请求（自报 uid=%d，对端 uid=%u）", uid,
+                    (unsigned)peer_uid);
+            send(client_fd, "ERR", 3, MSG_NOSIGNAL);
+            close(client_fd);
+            return;
+        }
         /* 输入校验：拒绝越界 pid/uid，避免后续 /proc/<pid> 路径被构造用于越权访问 */
         if (pid <= 0 || pid >= 1048576 /* PID_BITMAP_MAX, Android PID 上限 */) {
             LOG_WRN("IPC: 拒绝非法 pid=%d", pid);
