@@ -36,6 +36,7 @@
 #include <libgen.h>
 #include <sys/syscall.h>
 #include <ctype.h>
+#include <limits.h>
 #include "common.h"
 #include "fw_config.h"
 #include "fw_pkg.h"
@@ -1242,7 +1243,8 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
             if (ctx_len > 0)
                 lsetxattr(real_path, "security.selinux", context, (size_t)ctx_len, 0);
             else if (strstr(real_path, STORAGE_BASE) == real_path)
-                lsetxattr(real_path, "security.selinux", "u:object_r:media_rw_data_file:s0", 35, 0);
+                lsetxattr(real_path, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
+                          sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
 #endif
         }
     }
@@ -1556,7 +1558,19 @@ static int vfs_read(const char* path, char* buf, size_t size, off_t off,
                 FTP_DBG("vfs_read: 后端返回 rc=%d got=%zu\n", rc, got);
                 if (rc != 0 && rc != NSP_FENCE_BADFN && !backend_rc_is_business(rc))
                     module_guard_error(slot, "backend_read", rc, path, "read 返回异常");
-                return rc == 0 ? (int)got : (rc < 0 ? rc : -EIO);
+                if (rc == 0) {
+                    /* 契约：got 不得超过请求的 size——libfuse 只为本次读备了 size
+                       字节缓冲，回传超长会被当有效数据取走（堆越界读）；且须落在
+                       int 正值域：FUSE read 回包长度是 int，got > INT_MAX 经 (int)
+                       变负会被上层当 -errno。与 readdir 的「条目数超限」同源防御。 */
+                    if (got > size || got > (size_t)INT_MAX) {
+                        module_guard_error(slot, "backend_read", 0, path,
+                                           "回传长度超过请求(越界读)");
+                        return -EIO;
+                    }
+                    return (int)got;
+                }
+                return rc < 0 ? rc : -EIO;
             }
             /* 模块未提供 read 回调：释放引用后按未命中处理 */
             module_backend_release_slot(slot);
@@ -1595,7 +1609,18 @@ static int vfs_write(const char* path, const char* buf, size_t size, off_t off,
                 }
                 if (rc != 0 && rc != NSP_FENCE_BADFN && !backend_rc_is_business(rc))
                     module_guard_error(slot, "backend_write", rc, path, "write 返回异常");
-                return rc == 0 ? (int)wrote : (rc < 0 ? rc : -EIO);
+                if (rc == 0) {
+                    /* 契约：wrote 不得超过请求的 size——回报「写入量大于请求量」会
+                       让 libfuse/内核认为多写了字节（调用方据此推进文件偏移）；且须
+                       落在 int 正值域（FUSE write 回包长度是 int）。 */
+                    if (wrote > size || wrote > (size_t)INT_MAX) {
+                        module_guard_error(slot, "backend_write", 0, path,
+                                           "回传写入量超过请求(越界写)");
+                        return -EIO;
+                    }
+                    return (int)wrote;
+                }
+                return rc < 0 ? rc : -EIO;
             }
             module_backend_release_slot(slot);
         }
@@ -2193,15 +2218,14 @@ static int vfs_getxattr(const char* path, const char* name, char* value, size_t 
         if (errno == ENODATA || errno == EOPNOTSUPP) {
 #ifdef TARGET_ANDROID
             if (strcmp(name, "security.selinux") == 0) {
-                const char* default_ctx = "u:object_r:media_rw_data_file:s0";
-                size_t len = strlen(default_ctx) + 1;
+                size_t len = sizeof(NSP_DEFAULT_FILE_CONTEXT);
                 if (size == 0) {
                     VFS_RETURN((int)len);
                 }
                 if (size < len) {
                     VFS_RETURN(-ERANGE);
                 }
-                strcpy(value, default_ctx);
+                memcpy(value, NSP_DEFAULT_FILE_CONTEXT, len);
                 VFS_RETURN((int)len);
             }
 #endif
