@@ -75,10 +75,10 @@ SUITE_MAP = [
 
     (("test_path_vars.py",), ("src/config/path_vars.c",), (), "src/config/path_vars.c"),
 
-    (("test_inject_method.py", "test_global_replace.py"),
+    (("test_inject_method.py", "test_global_replace.py", "test_inject_tracked_race.py"),
      ("src/injector/inject_target.c",),
      ("inject-method",),
-     "injector 目标判定 / 注入方法"),
+     "injector 目标判定 / 注入方法 / 追踪表并发遍历"),
 
     (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py",
       "test_ns_global_replace_rollback.py"),
@@ -272,6 +272,7 @@ PARALLEL_SAFE = frozenset({
     "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_ftp_upload_lock.py",    # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_fw_config_view.py",     # cc 直编 fw_config.c + 依赖，TemporaryDirectory，无挂载
+    "test_inject_tracked_race.py",  # cc 直编 inject_target.c + ASan + --wrap 桩 kill，无挂载/特权
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
