@@ -18,10 +18,12 @@ STORAGE  = "/tmp/fuse_ftp_test/storage"
 FTP_BASE = "/tmp/fuse_ftp_test/storage/0"     # ftp_module --mount-base
 FTP_ROOT = "/home/bdy/ftp"                     # vsftpd anon_root（chroot 根，须对 ftp 用户不可写）
 FTP_UPLOAD = f"{FTP_ROOT}/upload"              # 匿名可写区（777），ftp.conf remote_dir=/upload
+FTP_UPLOAD2 = f"{FTP_ROOT}/upload2"            # 第二个 server 的可写区（A13 跨 server rename）
 MODDIR   = "/tmp/fuse_ftp_test/modules"
 CONF_FTP = "/tmp/Namespace-Proxy/ftp.conf"   # 与规则配置同目录（ftp_module init 经 get_rules_path 推导）
 CONF     = "/tmp/Namespace-Proxy/injector.conf"
 SERVER   = "云盘"
+SERVER2  = "备份"
 REPO     = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DAEMON   = os.environ.get("FUSE_DAEMON") or f"{REPO}/build_gnu/fuse_daemon"
 FTP_MOD_SO = os.environ.get("FTP_MODULE_SO") or f"{REPO}/build_gnu/ftp_module.so"
@@ -48,6 +50,9 @@ def setup():
         os.chmod(FTP_ROOT, 0o755)
     os.makedirs(FTP_UPLOAD, exist_ok=True)
     os.chmod(FTP_UPLOAD, 0o777)
+    # 第二个 server（A13 跨 server rename）：同一 vsftpd、不同 remote_dir
+    os.makedirs(FTP_UPLOAD2, exist_ok=True)
+    os.chmod(FTP_UPLOAD2, 0o777)
     with open(CONF_FTP, "w") as fh:
         fh.write(f"""
 [{SERVER}]
@@ -56,6 +61,13 @@ port = 21
 user = anonymous
 password =
 remote_dir = /upload
+
+[{SERVER2}]
+host = 127.0.0.1
+port = 21
+user = anonymous
+password =
+remote_dir = /upload2
 """.strip())
 
 def wait_ftp_ready(timeout=10.0):
@@ -77,7 +89,8 @@ def start_fuse():
     # HIDE 规则供 A4 用例：后端列举必须与本地列举同一可见性过滤（旧实现后端
     # 零过滤 → HIDE 条目在列表里可见而 stat ENOENT，既是反向形态也是名字泄露）
     with open(CONF, "w") as fh:
-        fh.write(f"[GLOBAL]\nFTP /{SERVER} {SERVER}\nHIDE /{SERVER}/nsp_hide_secret.txt\n")
+        fh.write(f"[GLOBAL]\nFTP /{SERVER} {SERVER}\nFTP /{SERVER2} {SERVER2}\n"
+                 f"HIDE /{SERVER}/nsp_hide_secret.txt\n")
     p = subprocess.Popen([DAEMON, "--root="+STORAGE, "--rules="+CONF,
                           "--modules-dir="+MODDIR, "-f", MNT, "info"],
                          stdout=open("/tmp/fuse_ftp_test/fuse.log", "w"),
@@ -337,6 +350,34 @@ def main():
                 except Exception:
                     pass
 
+        # 6c. A13 跨 server rename：一个 ftp_module 注册多个 server，框架侧只校验
+        #     「同一模块」，到不了 server 粒度。旧实现按 from 取后端、把 to 的远程
+        #     路径拼到 from 的 server 上 → 文件留在 from 的 server 上被改名，应用
+        #     以为搬到了另一个挂载点（两边都不对）。必须显式拒绝（EXDEV）且两端原样。
+        xf, xd = "nsp_a13_src.txt", "nsp_a13_dst.txt"
+        try:
+            (Path(FTP_UPLOAD) / xf).write_text("A13SRC")
+            (Path(FTP_UPLOAD2) / xd).unlink(missing_ok=True)
+            try:
+                (m/"0"/SERVER/xf).rename(m/"0"/SERVER2/xd)
+                fail("跨 server rename 应被拒绝", "未报错（旧实现把文件改名到错误 server）")
+            except OSError as e:
+                if e.errno == errno.EXDEV:
+                    ok("跨 server rename → EXDEV（明确拒绝）")
+                else:
+                    fail("跨 server rename errno",
+                         f"期望 EXDEV 实得 {e.errno}({os.strerror(e.errno)})")
+            ok("源端原样保留") if (Path(FTP_UPLOAD)/xf).exists() else fail(
+                "源端被搬走", f"{xf} 已不在 upload/")
+            ok("目标端未被创建") if not (Path(FTP_UPLOAD2)/xd).exists() else fail(
+                "目标端被凭空创建", f"{xd} 出现在 upload2/")
+        except Exception as e:
+            fail("跨 server rename", str(e))
+        finally:
+            for pth in (Path(FTP_UPLOAD)/xf, Path(FTP_UPLOAD2)/xd):
+                try: pth.unlink()
+                except Exception: pass
+
         # 7. unlink → FTP 消失
         try:
             (m/"0"/SERVER/"nsp_renamed.txt").unlink()
@@ -476,6 +517,19 @@ def main():
                     fp.unlink()
                 except OSError:
                     pass
+        # 第二个 server 的可写区（A13）同样按宽前缀自清
+        if os.path.isdir(FTP_UPLOAD2):
+            for n in os.listdir(FTP_UPLOAD2):
+                if not (n.startswith("nsp_") or n.startswith(".nsp_")):
+                    continue
+                fp = Path(FTP_UPLOAD2) / n
+                if fp.is_dir():
+                    shutil.rmtree(fp, ignore_errors=True)
+                else:
+                    try:
+                        fp.unlink()
+                    except OSError:
+                        pass
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")
