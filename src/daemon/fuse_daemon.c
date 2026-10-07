@@ -1747,6 +1747,8 @@ static int vfs_symlink(const char* target, const char* linkpath) {
     VFS_RETURN(0);
 }
 
+/* 递归删除（跨设备搬移的清理/删源用）。返回码统一为 0 / -errno——旧实现
+   opendir 失败回 -errno 而 unlink/rmdir 失败回 -1，调用方无法区分（§A2）。 */
 static int recursive_rmdir(const char* path) {
     DIR* d = opendir(path);
     if (!d) return -errno;
@@ -1757,22 +1759,24 @@ static int recursive_rmdir(const char* path) {
         char buf[PATH_MAX];
         snprintf(buf, sizeof(buf), "%s/%s", path, p->d_name);
         struct stat statbuf;
-        if (!lstat(buf, &statbuf)) {
-            if (S_ISDIR(statbuf.st_mode))
-                r = recursive_rmdir(buf);
-            else
-                r = unlink(buf);
+        if (lstat(buf, &statbuf) != 0) {
+            r = -errno;
+            break;
         }
+        if (S_ISDIR(statbuf.st_mode))
+            r = recursive_rmdir(buf);
+        else
+            r = unlink(buf) == 0 ? 0 : -errno;
     }
     closedir(d);
-    if (!r) r = rmdir(path);
+    if (!r) r = rmdir(path) == 0 ? 0 : -errno;
     return r;
 }
 
 static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid) {
     struct stat st;
     if (lstat(src, &st) != 0) return -errno;
-    if (mkdir(dst, st.st_mode & 07777) != 0 && errno != EEXIST) return -errno;
+    if (mkdir(dst, st.st_mode & 07777) != 0) return -errno;
     lchown(dst, st.st_uid, st.st_gid);
     DIR* d = opendir(src);
     if (!d) return -errno;
@@ -1784,57 +1788,79 @@ static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t
         snprintf(s_path, sizeof(s_path), "%s/%s", src, p->d_name);
         snprintf(d_path, sizeof(d_path), "%s/%s", dst, p->d_name);
         struct stat s_st;
-        if (!lstat(s_path, &s_st)) {
-            if (S_ISDIR(s_st.st_mode)) {
-                r = recursive_copy_dir(s_path, d_path, uid, gid);
-            } else if (S_ISREG(s_st.st_mode)) {
-                int fd_src = open(s_path, O_RDONLY | O_CLOEXEC);
-                if (fd_src >= 0) {
-                    int fd_dst =
-                        open(d_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, s_st.st_mode & 0777);
-                    if (fd_dst >= 0) {
-                        char buf[16384];
-                        ssize_t r_len;
-                        bool copy_ok = true;
-                        while ((r_len = read(fd_src, buf, sizeof(buf))) > 0) {
-                            ssize_t w_off = 0;
-                            while (w_off < r_len) {
-                                ssize_t w_len = write(fd_dst, buf + w_off, r_len - w_off);
-                                if (w_len < 0) {
-                                    if (errno == EINTR) continue;
-                                    copy_ok = false;
-                                    break;
-                                }
-                                w_off += w_len;
+        /* lstat 失败必须报错：旧实现静默跳过该条目仍返回成功，随后调用方
+           删掉源树 → 条目永久丢失（§A2） */
+        if (lstat(s_path, &s_st) != 0) {
+            r = -errno;
+            break;
+        }
+        if (S_ISDIR(s_st.st_mode)) {
+            r = recursive_copy_dir(s_path, d_path, uid, gid);
+        } else if (S_ISREG(s_st.st_mode)) {
+            int fd_src = open(s_path, O_RDONLY | O_CLOEXEC);
+            if (fd_src >= 0) {
+                int fd_dst =
+                    open(d_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, s_st.st_mode & 0777);
+                if (fd_dst >= 0) {
+                    char buf[16384];
+                    ssize_t r_len;
+                    bool copy_ok = true;
+                    while ((r_len = read(fd_src, buf, sizeof(buf))) > 0) {
+                        ssize_t w_off = 0;
+                        while (w_off < r_len) {
+                            ssize_t w_len = write(fd_dst, buf + w_off, r_len - w_off);
+                            if (w_len < 0) {
+                                if (errno == EINTR) continue;
+                                copy_ok = false;
+                                break;
                             }
-                            if (!copy_ok) break;
+                            w_off += w_len;
                         }
-                        if (r_len < 0) copy_ok = false;
-                        if (copy_ok) {
-                            struct timespec ts[2] = {s_st.st_atim, s_st.st_mtim};
-                            futimens(fd_dst, ts);
-                            fchown(fd_dst, s_st.st_uid, s_st.st_gid);
-                            fchmod(fd_dst, s_st.st_mode & 07777);
-#ifdef TARGET_ANDROID
-                            char context[256];
-                            ssize_t ctx_len =
-                                lgetxattr(s_path, "security.selinux", context, sizeof(context));
-                            if (ctx_len > 0)
-                                lsetxattr(d_path, "security.selinux", context, (size_t)ctx_len, 0);
-#endif
-                        } else {
-                            r = -EIO;
-                        }
-                        close(fd_dst);
-                        if (!copy_ok) unlink(d_path);
-                    } else {
-                        r = -errno;
+                        if (!copy_ok) break;
                     }
-                    close(fd_src);
+                    if (r_len < 0) copy_ok = false;
+                    if (copy_ok) {
+                        struct timespec ts[2] = {s_st.st_atim, s_st.st_mtim};
+                        futimens(fd_dst, ts);
+                        fchown(fd_dst, s_st.st_uid, s_st.st_gid);
+                        fchmod(fd_dst, s_st.st_mode & 07777);
+#ifdef TARGET_ANDROID
+                        char context[256];
+                        ssize_t ctx_len =
+                            lgetxattr(s_path, "security.selinux", context, sizeof(context));
+                        if (ctx_len > 0)
+                            lsetxattr(d_path, "security.selinux", context, (size_t)ctx_len, 0);
+#endif
+                    } else {
+                        r = -EIO;
+                    }
+                    close(fd_dst);
+                    if (!copy_ok) unlink(d_path);
                 } else {
                     r = -errno;
                 }
+                close(fd_src);
+            } else {
+                r = -errno;
             }
+        } else if (S_ISLNK(s_st.st_mode)) {
+            /* 符号链接必须复制链接本身：旧实现静默跳过，随后删源即永久丢失 */
+            char target[PATH_MAX];
+            ssize_t tl = readlink(s_path, target, sizeof(target) - 1);
+            if (tl < 0) {
+                r = -errno;
+            } else {
+                target[tl] = '\0';
+                if (symlink(target, d_path) != 0)
+                    r = -errno;
+                else
+                    lchown(d_path, s_st.st_uid, s_st.st_gid);
+            }
+        } else {
+            /* 其余类型（fifo/socket/设备）无法在此安全重建：拒绝而非静默跳过——
+               返回成功会让调用方删掉源树，条目永久丢失 */
+            LOG_WRN("跨设备复制：不支持的条目类型（mode=0%o）: %s", s_st.st_mode & 07777, s_path);
+            r = -EOPNOTSUPP;
         }
     }
     closedir(d);
@@ -1922,6 +1948,13 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     bool bf_hit = (ok1 && r1.is_ftp && module_backend_lookup(sub_from, &bf_ops) == 0);
     bool bt_hit = (ok2 && r2.is_ftp && module_backend_lookup(sub_to, &bt_ops) == 0);
     if (bf_hit || bt_hit) {
+        /* 后端 rename 不带 flags：带 flags 的语义（NOREPLACE/EXCHANGE）无法表达，
+           明确拒绝而非让模块按普通 rename 处理（否则目标被静默覆盖，§A1） */
+        if (flags) {
+            if (bf_hit) module_backend_put(bf_ops);
+            if (bt_hit) module_backend_put(bt_ops);
+            return -EINVAL;
+        }
         if (bf_hit && bt_hit && bf_ops == bt_ops && bf_ops->backend_rename) {
             int bslot = module_ops_slot(bf_ops);
             int brc = nsp_fence_backend_rename(bslot, "backend_rename", bf_ops->backend_rename,
@@ -1945,47 +1978,94 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
         if (bt_hit) module_backend_put(bt_ops);
         return -EXDEV;
     }
+    /* 带 flags 的 rename（FUSE_RENAME2）：语义无法用普通 rename 表达，
+       失败**禁止退化**——NOREPLACE 目标已存在时退化成普通 rename 会静默覆盖
+       目标，EXCHANGE 失败后退化成单向移动会丢源（§A1）。原样返回 errno。 */
+    if (flags) {
 #ifdef SYS_renameat2
-    if (flags && syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
+        if (syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
+        int ferr = errno;
+#else
+        int ferr = EINVAL; /* 本平台无 renameat2：flags 语义不可满足 */
 #endif
-    char *p_to_dup = strdup(p_to), *p_to_dir = dirname(p_to_dup);
+        LOG_WRN("rename flags=0x%x 未生效（errno=%d），拒绝退化: %s -> %s", flags, ferr, p_from,
+                p_to);
+        return -ferr;
+    }
+    /* 无 flags：走普通 rename + 跨设备(EXDEV)回退。strdup 须判 NULL（§A3） */
+    char* p_to_dup = strdup(p_to);
+    if (!p_to_dup) return -ENOMEM;
+    char* p_to_dir = dirname(p_to_dup);
     int mkdir_res = mkdir_recursive_p(p_to_dir, 0775);
-    free(p_to_dup);
+    int mkdir_err = mkdir_res != 0 ? errno : 0;
+    free(p_to_dup); /* p_to_dir 随之失效：此后只许用 p_to 打日志 */
     if (mkdir_res != 0) {
-        LOG_ERR("重命名创建目标父目录失败: %s (errno=%d)", p_to_dir, errno);
-        return -errno;
+        if (mkdir_err == 0) mkdir_err = EIO;
+        LOG_ERR("重命名创建目标父目录失败: %s (errno=%d)", p_to, mkdir_err);
+        return -mkdir_err; /* 旧实现 free 后用 p_to_dir 打日志（UAF）且取残留 errno */
     }
     if (rename(p_from, p_to) == 0) return 0;
     int err = errno;
     if (err == EXDEV) {
         struct stat st;
-        if (lstat(p_from, &st) == 0) {
-            if (S_ISREG(st.st_mode)) {
-                int copy_res = vfs_rename_copy_file(p_from, p_to, &st);
-                if (copy_res == 0) {
-                    unlink(p_from);
-                    return 0;
-                }
-                LOG_ERR("跨设备复制文件失败: %s -> %s (err=%d)", p_from, p_to, copy_res);
-                return copy_res;
-            } else if (S_ISDIR(st.st_mode)) {
-                int copy_res = recursive_copy_dir(p_from, p_to, ctx->uid, ctx->gid);
-                if (copy_res == 0) {
-                    if (recursive_rmdir(p_from) == 0)
-                        return 0;
-                    else {
-                        recursive_rmdir(p_to);
-                        return -errno;
-                    }
-                } else {
-                    recursive_rmdir(p_to);
-                    LOG_ERR("跨设备复制文件夹失败: %s -> %s (err=%d)", p_from, p_to, copy_res);
-                    return copy_res;
-                }
+        if (lstat(p_from, &st) != 0) return -errno;
+        /* 跨设备搬移：先复制到同父目录下的临时名，成功后再就位。
+           临时名的意义是「失败清理只影响本次产物」——旧实现失败时
+           recursive_rmdir(p_to) 会连既有目标一起销毁，且删源失败时源树可能
+           已被部分删除、目标又被整体销毁，**两边都不完整**（§A2）。 */
+        char tmp_to[PATH_MAX];
+        int tn = snprintf(tmp_to, sizeof(tmp_to), "%s.nsp_xdev_%ld", p_to, (long)getpid());
+        if (tn < 0 || (size_t)tn >= sizeof(tmp_to)) return -ENAMETOOLONG;
+        int copy_res;
+        bool src_is_dir = S_ISDIR(st.st_mode);
+        if (S_ISREG(st.st_mode))
+            copy_res = vfs_rename_copy_file(p_from, tmp_to, &st);
+        else if (src_is_dir)
+            copy_res = recursive_copy_dir(p_from, tmp_to, ctx->uid, ctx->gid);
+        else if (S_ISLNK(st.st_mode)) {
+            /* 符号链接搬移：重建链接本身（不跟随目标） */
+            char target[PATH_MAX];
+            ssize_t tl = readlink(p_from, target, sizeof(target) - 1);
+            if (tl < 0) {
+                copy_res = -errno;
+            } else {
+                target[tl] = '\0';
+                copy_res = symlink(target, tmp_to) == 0 ? 0 : -errno;
+                if (copy_res == 0) lchown(tmp_to, st.st_uid, st.st_gid);
             }
         } else {
-            return -errno;
+            copy_res = -EOPNOTSUPP; /* 其余类型不支持跨设备搬移 */
         }
+        if (copy_res != 0) {
+            LOG_ERR("跨设备复制失败: %s -> %s (err=%d)", p_from, p_to, copy_res);
+            return copy_res;
+        }
+        /* 就位：清掉既有目标后 rename（跨设备搬移本就非原子） */
+        struct stat dst_st;
+        if (lstat(p_to, &dst_st) == 0) {
+            if (S_ISDIR(dst_st.st_mode))
+                recursive_rmdir(p_to);
+            else
+                unlink(p_to);
+        }
+        if (rename(tmp_to, p_to) != 0) {
+            int e = errno;
+            if (src_is_dir)
+                recursive_rmdir(tmp_to);
+            else
+                unlink(tmp_to);
+            LOG_ERR("跨设备搬移：临时产物就位失败: %s -> %s (err=%d)", tmp_to, p_to, e);
+            return -e;
+        }
+        /* 就位成功后才删源；删源失败**不得**回删目标（否则两边都不完整），
+           如实回报错误并保留完整的目标 */
+        int rm_res = src_is_dir ? recursive_rmdir(p_from)
+                                : (unlink(p_from) == 0 ? 0 : -errno);
+        if (rm_res != 0) {
+            LOG_ERR("跨设备搬移：源删除失败（目标已完整，保留）: %s (err=%d)", p_from, rm_res);
+            return rm_res;
+        }
+        return 0;
     }
     log_fuse_err("RENAME", from, err);
     return -err;
