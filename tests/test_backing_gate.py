@@ -8,12 +8,17 @@ stat 他包 data 目录被判 ENOENT（直接访问 backing 则正常），且 S
 /REDIRECT/HIDE/RO 对该子树整体失效。故挂接前须确认无规则需仲裁。
 
 两层门：
-- 全局门 `fw_data_mediation_required()`（8 组）：任一规则触及 data 即要求仲裁。
-- 按路径门 `fw_backing_mediation_required_for(query)`（8 组）：仅自身/其下/
+- 全局门 `fw_data_mediation_required()`（9 组）：任一规则触及 data 即要求仲裁。
+- 按路径门 `fw_backing_mediation_required_for(query)`（9 组）：仅自身/其下/
   直接父命中才要求仲裁，远祖先（/、/0、/Android）不强制，SANDBOX ON 除外
   （整树仲裁）。REDIRECT 只看 virtual_prefix（ALLOW 跳过）。
 
-本用例临时编译实际源码（fw_rules.c 等，不经 Meson）并断言 16 组配置。
+**MONITOR 维度（B1）**：`MONITOR ON` 的段其调用者 IO 要进 io.log，而 backing 直通后
+内核绕过 daemon、`vfs_log_io` 静默归零——故任一段 MONITOR ON 即要求整树仲裁
+（监控优先，牺牲该子树的部分加速）。旧实现的门只扫 sandbox/hide/ro/redir/ftp，
+仅 `MONITOR ON`（无改路径规则）时子树仍被挂 backing，监控静默失效。
+
+本用例临时编译实际源码（fw_rules.c 等，不经 Meson）并断言 18 组配置。
 前置：本机 cc、json-c；缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
 """
 import os
@@ -65,6 +70,8 @@ CASES = [
      "ALLOW /Android/data/com.foo\n", 0),
     ("注释提及", "[GLOBAL]\nGLOBAL_INJECT ON\n"
      "#HIDE /Android/data/com.foo/*\n", 0),
+    # B1：MONITOR ON 要求仲裁（监控需 daemon 记录 IO；旧实现遗漏此维度 → 期望 0）
+    ("MONITOR ON", "[GLOBAL]\nGLOBAL_INJECT ON\nMONITOR ON\n", 1),
 ]
 
 REDIR_FOO = ("[GLOBAL]\nGLOBAL_INJECT ON\n"
@@ -83,6 +90,10 @@ PCASES = [
     ("变量展开命中", "[GLOBAL]\nGLOBAL_INJECT ON\n"
      "MYD=/Android/data/com.foo\n"
      "HIDE $MYD/*\n", "/0/Android/data/com.foo/a", 1),
+    # B1：MONITOR ON 对任意查询路径（含远祖先）均要求仲裁（整树，监控优先）
+    ("MONITOR 整树仲裁", "[GLOBAL]\nGLOBAL_INJECT ON\nMONITOR ON\n",
+     "/0/Download", 1),
+    ("MONITOR 整树仲裁（远祖先）", "[GLOBAL]\nGLOBAL_INJECT ON\nMONITOR ON\n", "/", 1),
 ]
 
 
