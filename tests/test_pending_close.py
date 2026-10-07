@@ -13,6 +13,10 @@
    会把 ready 水位永久卡住：「饱和 → flush → 再入队」后新生产者要么自旋等待一个
    永不发布的槽位（FUSE worker 挂死），要么永远走直接 close（队列静默失效）。
 3. 多生产者/多消费者并发下不重不漏。
+4. **饱和时不得提前关闭本次 fd**（A22）——旧实现「满则直接 close」正好做了队列要
+   防的事：内核可能在 reply 发送完成前仍引用该 fd，且 fd 号可被另一 worker 的 open
+   立刻复用 → backing 挂到无关文件。判别：填满 CAP 条后再 defer 一个探针 fd，断言
+   它此刻**未被关闭**（旧实现立即关闭 → 必失败）。
 
 该队列本体在 Android 才被 backing 路径使用（defer 调用点在 #ifdef TARGET_ANDROID
 内），GNU 侧挂载类用例覆盖不到，故此处不经 Meson 直编实现做单测。
@@ -28,8 +32,9 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QUEUE_SRC = os.path.join(ROOT, "src", "daemon", "fd_close_queue.c")
+QUEUE_SRC = os.environ.get("FDQ_SRC") or os.path.join(ROOT, "src", "daemon", "fd_close_queue.c")
 QUEUE_INC = os.path.join(ROOT, "src", "daemon")
+INC = os.path.join(ROOT, "include")
 DRIVER = os.path.join(ROOT, "tests", "fixtures", "fd_close_queue_test.c")
 
 # 并发用例规模：4 生产者 × 2000 + 3 消费者循环 flush，足以在旧实现下暴露
@@ -47,7 +52,7 @@ def main():
         cmd = [
             *shlex.split(os.environ.get("CC", "cc")), "-std=c23", "-D_GNU_SOURCE",
             "-Wall", "-Wextra", "-Wno-unused-parameter",
-            "-I", QUEUE_INC,
+            "-I", QUEUE_INC, "-I", INC,
             DRIVER, QUEUE_SRC,
             "-o", exe, "-pthread",
         ]
