@@ -13,3 +13,6 @@ __pycache__/
 
 # Meson wrap 锁文件（本机生成）
 subprojects/.wraplock
+
+# 验收报告（本机生成，scripts/acceptance.sh）
+.acceptance/
