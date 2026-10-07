@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,20 @@
 #include "nsp_util.h" /* nsp_is_app_rules_dirname */
 #include "cfg_watch.h" /* App-rules 子目录 watch 对账（inotify 不递归） */
 
+/* 下发视图：**不可变 + 引用计数 + 自持字符串**的快照。
+   旧实现每个 ModuleSub 持一份「浅拷贝数组 + 借用主视图字符串」，而该数组在
+   fw_config_view_for 解锁后才交出去、reload_once 又在配置线程原地 free 同一
+   数组——模块监听线程（loader 推送 config_update）与配置线程并发即读已释放
+   数组（A14）。改为：每次重载为每个订阅者建一份新快照，记录里的字符串一并
+   strdup 归本快照所有，故快照自包含、与主视图生命周期解耦；快照不可变，
+   重建只换指针，旧快照延迟到最后一个持有者释放才 free。 */
+typedef struct ConfigView {
+    _Atomic int refs;    /* 订阅表 1 份 + 每个在飞回调 1 份 */
+    NspCfgRec* recs;     /* 深拷贝的记录数组（字符串归本视图所有） */
+    int count;
+    NspModuleConfig cfg; /* cfg.recs/count 指向本视图自有数组 */
+} ConfigView;
+
 /* 每个模块的订阅与下发视图 */
 typedef struct {
     bool used;
@@ -34,9 +49,7 @@ typedef struct {
     char** types; /* 订阅的规则类型名（strdup 归本结构所有） */
     int type_count;
     void (*listener)(const NspModuleConfig*);
-    NspCfgRec* filtered; /* 浅拷贝自主视图（字符串指向主视图，不拥有） */
-    int filtered_count;
-    NspModuleConfig cfg;
+    ConfigView* view; /* 当前下发视图（订阅表持 1 份引用） */
 } ModuleSub;
 
 static ModuleSub g_subs[MAX_MODULES];
@@ -164,28 +177,69 @@ static bool rec_wanted(const ModuleSub* s, const NspCfgRec* r) {
     return false;
 }
 
-/* 用当前主视图重建某模块的过滤视图（浅拷贝记录，不复制字符串） */
-static void rebuild_filter(ModuleSub* s) {
-    free(s->filtered);
-    s->filtered = nullptr;
-    s->filtered_count = 0;
+static char* rec_dup(const char* s) { return s ? strdup(s) : nullptr; }
+
+static void view_free(ConfigView* v) {
+    if (!v) return;
+    for (int i = 0; i < v->count; i++) {
+        free((char*)v->recs[i].file);
+        free((char*)v->recs[i].type);
+        free((char*)v->recs[i].text);
+    }
+    free(v->recs);
+    free(v);
+}
+
+/* 用当前主视图新建一份自包含快照（记录与字符串均深拷贝）。OOM 返回 NULL
+   （调用方置空视图，绝不交出半成品/已释放指针）。订阅为空 = 不过滤。 */
+static ConfigView* view_create(const ModuleSub* s) {
     int n = 0;
     for (int i = 0; i < g_rec_count; i++) {
         if (rec_wanted(s, &g_recs[i])) n++;
     }
-    if (n > 0) {
-        s->filtered = malloc((size_t)n * sizeof(NspCfgRec));
-        if (!s->filtered) return;
-        int k = 0;
-        for (int i = 0; i < g_rec_count; i++) {
-            if (rec_wanted(s, &g_recs[i])) s->filtered[k++] = g_recs[i];
-        }
+    ConfigView* v = calloc(1, sizeof *v);
+    if (!v) return nullptr;
+    atomic_init(&v->refs, 1); /* 订阅表自持 1 份 */
+    v->cfg.version = NSP_CFG_VIEW_VERSION;
+    v->cfg.generation = atomic_load_explicit(&g_gen, memory_order_acquire);
+    if (n == 0) return v;
+    v->recs = calloc((size_t)n, sizeof(NspCfgRec));
+    if (!v->recs) {
+        free(v);
+        return nullptr;
     }
-    s->filtered_count = n;
-    s->cfg.version = NSP_CFG_VIEW_VERSION;
-    s->cfg.generation = atomic_load_explicit(&g_gen, memory_order_acquire);
-    s->cfg.recs = s->filtered;
-    s->cfg.count = s->filtered_count;
+    int k = 0;
+    for (int i = 0; i < g_rec_count; i++) {
+        if (!rec_wanted(s, &g_recs[i])) continue;
+        NspCfgRec r = g_recs[i];
+        r.file = rec_dup(g_recs[i].file);
+        r.type = rec_dup(g_recs[i].type);
+        r.text = rec_dup(g_recs[i].text);
+        if ((g_recs[i].file && !r.file) || (g_recs[i].type && !r.type) ||
+            (g_recs[i].text && !r.text)) {
+            v->count = k; /* 只释放已填条目，view_free 按 count 遍历 */
+            view_free(v);
+            return nullptr;
+        }
+        v->recs[k++] = r;
+    }
+    v->count = n;
+    v->cfg.recs = v->recs;
+    v->cfg.count = v->count;
+    return v;
+}
+
+static void view_release(ConfigView* v) {
+    if (!v) return;
+    if (atomic_fetch_sub_explicit(&v->refs, 1, memory_order_acq_rel) == 1) view_free(v);
+}
+
+/* 用当前主视图重建某模块的下发视图（新快照，旧快照按引用延迟释放） */
+static void rebuild_filter(ModuleSub* s) {
+    ConfigView* nv = view_create(s);
+    ConfigView* old = s->view;
+    s->view = nv;
+    view_release(old);
 }
 
 /* 读出主视图并换入；旧视图与旧过滤视图在推送完成后释放（见 publish） */
@@ -211,17 +265,10 @@ static void reload_once(void) {
     pthread_mutex_lock(&g_lock);
     NspCfgRec* old_recs = g_recs;
     int old_count = g_rec_count;
-    /* 旧过滤视图的字符串指向旧主视图：先整体丢弃（模块索引已自持副本），
-       推送完成后旧主视图才释放，故此处丢弃是安全的 */
-    for (int i = 0; i < MAX_MODULES; i++) {
-        if (g_subs[i].used) {
-            free(g_subs[i].filtered);
-            g_subs[i].filtered = nullptr;
-            g_subs[i].filtered_count = 0;
-        }
-    }
     g_recs = new_recs;
     g_rec_count = new_count;
+    /* 旧快照自包含（字符串深拷贝），换指针即可；持有者（在飞回调）按引用计数
+       延迟释放，故此处 release 不会打断任何并发读 */
     for (int i = 0; i < MAX_MODULES; i++) {
         if (g_subs[i].used) rebuild_filter(&g_subs[i]);
     }
@@ -376,8 +423,8 @@ void fw_config_shutdown(void) {
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MAX_MODULES; i++) {
         if (!g_subs[i].used) continue;
-        free(g_subs[i].filtered);
-        g_subs[i].filtered = nullptr;
+        view_release(g_subs[i].view);
+        g_subs[i].view = nullptr;
         for (int t = 0; t < g_subs[i].type_count; t++) free(g_subs[i].types[t]);
         free(g_subs[i].types);
         g_subs[i].types = nullptr;
@@ -402,16 +449,29 @@ uint64_t fw_config_generation(void) {
     return atomic_load_explicit(&g_gen, memory_order_acquire);
 }
 
-const NspModuleConfig* fw_config_view_for(const char* module_name) {
+const NspModuleConfig* fw_config_view_acquire(const char* module_name) {
+    if (!module_name) return nullptr;
     pthread_mutex_lock(&g_lock);
     ModuleSub* s = find_sub(module_name);
+    /* 已注册但尚未建视图（只设了监听器、未订阅；或重载前的首份推送）时补建：
+       「订阅为空 = 不过滤（申请全部）」是契约，故空订阅视图 = 全量记录。
+       旧实现在此交出未构建的 s->cfg（空视图），契约不符且首次推送拿不到规则。 */
+    if (s && !s->view) s->view = view_create(s);
     const NspModuleConfig* out = nullptr;
-    if (s) {
-        s->cfg.generation = atomic_load_explicit(&g_gen, memory_order_acquire);
-        out = &s->cfg;
+    if (s && s->view) {
+        /* 快照不可变、代际在创建时固化；取用时抬引用，回调期间不会被释放 */
+        atomic_fetch_add_explicit(&s->view->refs, 1, memory_order_relaxed);
+        out = &s->view->cfg;
     }
     pthread_mutex_unlock(&g_lock);
     return out;
+}
+
+void fw_config_view_release(const NspModuleConfig* view) {
+    if (!view) return;
+    /* NspModuleConfig 是 ConfigView 的末成员：经容器偏移回退取宿主 */
+    ConfigView* v = (ConfigView*)(void*)((char*)(uintptr_t)view - offsetof(ConfigView, cfg));
+    view_release(v);
 }
 
 void fw_config_set_subscription(const char* module_name, const char* const* types, int count) {
@@ -451,7 +511,7 @@ void fw_config_forget_module(const char* module_name) {
     pthread_mutex_lock(&g_lock);
     ModuleSub* s = find_sub(module_name);
     if (s) {
-        free(s->filtered);
+        view_release(s->view);
         for (int t = 0; t < s->type_count; t++) free(s->types[t]);
         free(s->types);
         memset(s, 0, sizeof *s);

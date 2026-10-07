@@ -89,7 +89,7 @@ SUITE_MAP = [
      "受管子进程收尸留档（崩溃现场入日志环）"),
 
     (("test_modules.py", "test_module_circuit.py", "test_module_abi.py",
-      "test_backend_lifecycle.py"),
+      "test_backend_lifecycle.py", "test_fw_config_view.py"),
      ("src/module/",), ("memfd_create", "module_backend_", "module_fault_poison"),
      "src/module/（加载器/内存副本加载/围栏/熔断/ABI）"),
 
@@ -111,7 +111,8 @@ SUITE_MAP = [
 
     # fw_config.c 含规则文件/App-rules 的 inotify 监听线程——热重载触发路径本身，
     # 故改动它同时跑 test_rules.py（重载语义端到端）
-    (("test_monitor_layers.py", "test_cfg_watch.py", "test_rules.py"),
+    (("test_monitor_layers.py", "test_cfg_watch.py", "test_rules.py",
+      "test_fw_config_view.py"),
      ("src/daemon/fw_config.c", "src/daemon/fw_config.h", "src/daemon/fw_pkg.c",
       "src/daemon/fw_pkg.h"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),
@@ -265,6 +266,7 @@ PARALLEL_SAFE = frozenset({
     "test_reaped_managed.py",     # cc 直编收尸留档 + 真实 fork 子进程，无共享状态
     "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_ftp_upload_lock.py",    # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
+    "test_fw_config_view.py",     # cc 直编 fw_config.c + 依赖，TemporaryDirectory，无挂载
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。

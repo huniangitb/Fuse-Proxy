@@ -145,9 +145,12 @@ static const NspFrameworkApi g_api = {
 static int push_config_to_slot(int slot, const char* name) {
     void (*cb)(const NspModuleConfig*) = fw_config_listener_for(name);
     if (!cb) return 0;
-    const NspModuleConfig* cfg = fw_config_view_for(name);
+    /* 取用即持引用：回调期间视图不会被并发重载释放（围栏 longjmp 恢复后仍走到
+       release，故崩溃路径不泄漏引用） */
+    const NspModuleConfig* cfg = fw_config_view_acquire(name);
     if (!cfg) return 0;
     int rc = nsp_fence_config_update(slot, "config_update", cb, cfg);
+    fw_config_view_release(cfg);
     if (rc == NSP_FENCE_FAULT) {
         module_guard_fault(slot, "config_update", name);
         return rc;
