@@ -23,7 +23,7 @@ int ftp_backend_add(const FtpServerCfg* cfg);
 void ftp_backend_clear(void);
 int ftp_backend_count(void);
 /* 每分钟重连探活：对每个后端尝试 FTP 连接（服务器恢复后无需重启模块） */
-void ftp_backend_retry_all(void);
+/* 注：曾声明 ftp_backend_retry_all()，全树无定义与调用（YAGNI），已删除 */
 
 /* ---- NspModuleOps.backend_* 实现（由框架调用） ---- */
 int ftp_backend_match(const char* path);
