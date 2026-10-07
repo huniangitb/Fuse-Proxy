@@ -74,8 +74,10 @@ def wait_ftp_ready(timeout=10.0):
 def start_fuse():
     # FTP 规则：`FTP <虚拟前缀> <段名>` 写在 [GLOBAL]（全局生效）。
     # /0/云盘 剥离 /0/ 后命中规则 → 框架分派给 ftp_module（段名=SERVER）
+    # HIDE 规则供 A4 用例：后端列举必须与本地列举同一可见性过滤（旧实现后端
+    # 零过滤 → HIDE 条目在列表里可见而 stat ENOENT，既是反向形态也是名字泄露）
     with open(CONF, "w") as fh:
-        fh.write(f"[GLOBAL]\nFTP /{SERVER} {SERVER}\n")
+        fh.write(f"[GLOBAL]\nFTP /{SERVER} {SERVER}\nHIDE /{SERVER}/nsp_hide_secret.txt\n")
     p = subprocess.Popen([DAEMON, "--root="+STORAGE, "--rules="+CONF,
                           "--modules-dir="+MODDIR, "-f", MNT, "info"],
                          stdout=open("/tmp/fuse_ftp_test/fuse.log", "w"),
@@ -149,6 +151,11 @@ def main():
     orig = "compute_bench_origin.txt"
     (Path(FTP_UPLOAD)/orig).write_text("ftp-original-content")
     known_file = "compute_bench.cpp"
+    # A4 探针：必须在**首次列举之前**落盘（LIST 有 TTL 缓存，事后新增要等
+    # 空闲超时才可见）；名字用 nsp_ 前缀，收尾统一清扫
+    a4_vis, a4_sec = "nsp_hide_visible.txt", "nsp_hide_secret.txt"
+    (Path(FTP_UPLOAD)/a4_vis).write_text("VISIBLE")
+    (Path(FTP_UPLOAD)/a4_sec).write_text("SECRET")
 
     m = Path(MNT)
     try:
@@ -264,6 +271,28 @@ def main():
             except Exception:
                 pass
 
+        # 3e. 后端列举必须与本地列举同一可见性过滤（A4 判别）
+        #     旧实现 vfs_readdir_backend 对后端条目**零 probe 过滤** → HIDE 的
+        #     条目在列举里可见（名字泄露）而直接访问 ENOENT——正是
+        #     architecture.md §4.4 明令修掉的「列表可见但打开 ENOENT」反向形态。
+        try:
+            items = os.listdir(m/"0"/SERVER)
+            if a4_vis in items and a4_sec not in items:
+                ok("后端列举过滤 HIDE 条目（可见项在、隐藏项不在）")
+            else:
+                fail("后端列举过滤 HIDE",
+                     f"visible={a4_vis in items} secret={a4_sec in items}（旧实现后端不过滤）")
+            try:
+                (m/"0"/SERVER/a4_sec).stat()
+                fail("HIDE 条目直接访问", "未报错（应 ENOENT）")
+            except FileNotFoundError:
+                ok("HIDE 条目直接访问 → ENOENT（与列举一致）")
+        except Exception as e:
+            fail("后端列举过滤 HIDE", str(e))
+
+        # 3f. 点文件不得被丢弃（A15）：本机 vsftpd 默认 `force_dot_files=NO`，
+        #     LIST 根本不回点条目，故端到端不可观测——A15 的判别性用例落在
+        #     tests/test_ftp_truncate_list.py（直编后端 + 合成 LIST 正文）。
         # 4. 读回（经 fuse）
         try:
             got = (m/"0"/SERVER/newf).read_text().strip()
@@ -437,7 +466,7 @@ def main():
         # nsp_truncate_size.txt / nsp_test_flush_then_write.txt 等，于是在
         # **真实** FTP 树上持续累积——upload/ 同时是用户的投递目录，不能留垃圾。
         for n in os.listdir(FTP_UPLOAD):
-            if not n.startswith("nsp_"):
+            if not (n.startswith("nsp_") or n.startswith(".nsp_")):
                 continue
             fp = Path(FTP_UPLOAD) / n
             if fp.is_dir():

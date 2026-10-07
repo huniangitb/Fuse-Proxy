@@ -1261,10 +1261,15 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
             char* e = nl;
             if (e > name && *(e - 1) == '\r') e--;
             size_t nlen = (size_t)(e - name);
-            if (nlen > 0 && name[0] != '.') {
+            /* 只跳过真正的点条目 "." / ".."（A15）：旧写法 `name[0] != '.'`
+               会把**所有**点开头文件一起丢掉，于是 .nomedia/.git 等完全不可见，
+               而 backend_getattr 对它们返回成功 → ls -a 空、rsync/rm -r 漏删、
+               只含点文件的目录 rmdir 报 ENOTEMPTY 却列不出内容。 */
+            bool dot_entry = (nlen == 1 && name[0] == '.') ||
+                             (nlen == 2 && name[0] == '.' && name[1] == '.');
+            if (nlen > 0 && !dot_entry) {
                 /* V5：超长名整条跳过（ABI 约束：禁止截断安装，同前缀长名
-                   截断后会互相覆盖；且内核 NAME_MAX=255 本就装不下）。
-                   点条目（./..）沿旧行为跳过。 */
+                   截断后会互相覆盖；且内核 NAME_MAX=255 本就装不下）。 */
                 if (nlen >= sizeof arr[0].name) {
                     skipped_long++;
                 } else {

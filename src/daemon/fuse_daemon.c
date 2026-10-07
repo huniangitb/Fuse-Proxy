@@ -159,10 +159,81 @@ static void fw_default_real_path(int user_id, const char* sub_path, char* out, s
 /* 前向声明：readdir 路径合成唯一出口（定义在后，probe/ino 派生先用） */
 static void readdir_base_normalize(char* dst, size_t cap, const char* src);
 static void readdir_join(char* dst, size_t cap, const char* base, const char* name);
+static int readdir_join_checked(char* dst, size_t cap, const char* base, const char* name);
+
+/* ================= 列举条目可见性单点（C2） =================
+ * 「该目录条目对本次调用者是否可见」的唯一判定出口：本地物理扫描
+ * （vfs_readdir_scan_local）、虚拟目录判空（fw_virtual_dir_empty）、后端
+ * （FTP 等）列举（vfs_readdir_backend）三条路径共用——历史上三份副本各自
+ * 处理 probe 且已分叉：后端路径**完全漏了过滤**（HIDE 条目在列举里可见而
+ * stat ENOENT，既是「列表可见但打开 ENOENT」的反向形态，也构成名字泄露），
+ * 另两份的路径过长截断策略还相反（一份 fail-closed、一份截断后 fail-open）。
+ *
+ * 契约：
+ *   - probe 入参必须是**带 <uid>/ 层的原始 FUSE 路径**（fw_rules.h 的
+ *     NspQueryCtx 注释）：传剥层路径会让探针早退（valid=false）而恒不过滤。
+ *     故 item_fuse_out 由 fuse_path（未剥层）拼出；item_sub_out 仅作旁路输出
+ *     （uid 目录判定等）。
+ *   - 路径放不下返回 NSP_VIS_TOO_LONG（fail-closed 跳过），**绝不截断**后
+ *     拿去 probe/lstat——截断路径可能命中另一个真实文件。
+ *   - user_id 目录条目（/0、/1…）豁免 redirect_target：剥层后会被误判成根目录
+ *     的 sandbox 重定向目标（与 getattr 的 uid 目录语义一致）。
+ *   - hidden 对所有访问者生效（含 root），与 getattr 的 hidden 拒绝一致：
+ *     否则 root 列举时被 HIDE 的条目仍出现而 stat 失败，隐藏不彻底。
+ */
+typedef enum {
+    NSP_VIS_EMIT = 0, /* 可见：允许上架 */
+    NSP_VIS_SKIP,     /* 不可见：跳过该条目 */
+    NSP_VIS_TOO_LONG, /* 路径过长：跳过该条目（fail-closed） */
+} NspVisibility;
+
+static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse_path,
+                                          const char* name, const char* current_pkg,
+                                          int path_user_id, uid_t uid, char* item_sub_out,
+                                          size_t sub_sz, char* item_fuse_out, size_t fuse_sz) {
+    if (path_contains_invalid_chars(name)) return NSP_VIS_SKIP;
+    char norm_base[2048], norm_fuse_base[2048];
+    /* base 先剥尾部 '/'（与 getattr/child_ino 同一合成语义）：非规范 sub_path
+       （如 "/Android/data/"）会拼出 "//name"，与 getattr 规范形式的哈希不一致 */
+    readdir_base_normalize(norm_base, sizeof norm_base, sub_path);
+    readdir_base_normalize(norm_fuse_base, sizeof norm_fuse_base, fuse_path);
+    if (readdir_join_checked(item_sub_out, sub_sz, norm_base, name) != 0) return NSP_VIS_TOO_LONG;
+    if (readdir_join_checked(item_fuse_out, fuse_sz, norm_fuse_base, name) != 0)
+        return NSP_VIS_TOO_LONG;
+
+    /* Android/data|obb 只显示自身包名（沙盒/无用户层时该语义不适用） */
+    bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
+    bool hide_others = (!skip_sandbox && current_pkg && current_pkg[0] &&
+                        strcmp(current_pkg, "system") != 0 && strcmp(current_pkg, "unknown") != 0);
+    if (hide_others &&
+        (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
+         strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)) {
+        if (strcmp(name, current_pkg) != 0) return NSP_VIS_SKIP;
+    }
+
+    /* 子项轻量探测：只判 hidden/redirect_target，不构建真实路径、不触发
+       sandbox 目录创建（无规则时直通不过滤） */
+    bool uid_dir = false;
+    if (item_sub_out[0] == '/' && isdigit((unsigned char)item_sub_out[1])) {
+        const char* dg = item_sub_out + 1;
+        while (isdigit((unsigned char)*dg)) dg++;
+        uid_dir = (*dg == '\0' || *dg == '/');
+    }
+    struct fuse_context* c = fuse_get_context();
+    NspQueryCtx q = {
+        .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_fuse_out};
+    NspProbeResult r;
+    memset(&r, 0, sizeof r);
+    fw_rules_probe(&q, &r);
+    if (r.valid && (r.appear_missing || (!uid_dir && r.virtual_kind == NSP_VK_TARGET)))
+        return NSP_VIS_SKIP;
+    return NSP_VIS_EMIT;
+}
 
 /* 虚拟目录判空（原 vfs_is_virtual_dir_empty 的分派器版）：
    - 虚拟祖先 → 视为非空（拒绝删除）
-   - 否则扫描真实目录，跳过规则隐藏/重定向子项（与 readdir 过滤一致） */
+   - 否则扫描真实目录，跳过规则隐藏/重定向子项（与 readdir 过滤一致，共用
+     vfs_entry_visibility 单点） */
 static bool fw_virtual_dir_empty(const char* fuse_path, const char* sub_path,
                                  const char* real_path, const char* current_pkg, int path_user_id,
                                  uid_t uid) {
@@ -181,50 +252,15 @@ static bool fw_virtual_dir_empty(const char* fuse_path, const char* sub_path,
     if (lstat(real_path, &st) == -1) return true;
     DIR* dp = opendir(real_path);
     if (!dp) return false;
-    bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
-    bool hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
-                        strcmp(current_pkg, "unknown") != 0);
     struct dirent* de;
     bool empty = true;
-    /* probe 路径归一（readdir_base_normalize）：根传空 base 得 "/name"，与
-       readdir/scan_local 同一合成语义，免 "/a//name" 双斜杠哈希漂移 */
-    char norm_base[2048];
-    readdir_base_normalize(norm_base, sizeof norm_base, sub_path);
-    char norm_fuse_base[2048];
-    readdir_base_normalize(norm_fuse_base, sizeof norm_fuse_base, fuse_path);
     while ((de = readdir(dp)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (path_contains_invalid_chars(de->d_name)) continue;
-        char item_sub_path[2048];
-        int w = snprintf(item_sub_path, sizeof item_sub_path, "%s/%s", norm_base, de->d_name);
-        if (w < 0 || (size_t)w >= sizeof item_sub_path) continue; /* 超长 fail-closed：跳过该条目 */
-        char item_fuse_path[2048];
-        int wf = snprintf(item_fuse_path, sizeof item_fuse_path, "%s/%s", norm_fuse_base, de->d_name);
-        if (wf < 0 || (size_t)wf >= sizeof item_fuse_path) continue; /* 同上：超长跳过 */
-        if (uid != 0) {
-            /* 轻量探测；user_id 目录条目豁免 redirect_target（与 readdir 一致）。
-               探针入参用原始 FUSE 路径（带 <uid>/ 层），uid 目录判定用剥层形式 */
-            bool uid_dir = false;
-            if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
-                const char* d = item_sub_path + 1;
-                while (isdigit((unsigned char)*d)) d++;
-                uid_dir = (*d == '\0' || *d == '/');
-            }
-            struct fuse_context* c = fuse_get_context();
-            NspQueryCtx iq = {
-                .uid = uid, .pid = c ? c->pid : 0, .gid = c ? c->gid : 0, .path = item_fuse_path};
-            NspProbeResult ir;
-            memset(&ir, 0, sizeof ir);
-            fw_rules_probe(&iq, &ir);
-            if (ir.valid &&
-                (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)))
-                continue;
-        }
-        if (hide_others &&
-            (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
-             strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)) {
-            if (strcmp(de->d_name, current_pkg) != 0) continue;
-        }
+        char item_sub[2048], item_fuse[2048];
+        if (vfs_entry_visibility(sub_path, fuse_path, de->d_name, current_pkg, path_user_id, uid,
+                                 item_sub, sizeof item_sub, item_fuse, sizeof item_fuse) !=
+            NSP_VIS_EMIT)
+            continue;
         empty = false;
         break;
     }
@@ -698,6 +734,19 @@ static void readdir_join(char* dst, size_t cap, const char* base, const char* na
     }
 }
 
+/* readdir_join 的带检查版本：放不下（含恰好占满，需留 NUL）返回 -1。
+   列举可见性判定用它——截断路径拿去做 probe/lstat 可能命中另一个真实文件
+   （fail-open），必须让调用方 fail-closed 跳过该条目（C2）。 */
+static int readdir_join_checked(char* dst, size_t cap, const char* base, const char* name) {
+    size_t bl = strlen(base);
+    size_t nl = strlen(name);
+    if (bl + 1 + nl + 1 > cap) return -1;
+    memcpy(dst, base, bl);
+    dst[bl] = '/';
+    memcpy(dst + bl + 1, name, nl + 1);
+    return 0;
+}
+
 /* ================= readdir 分阶段实现 =================
  * vfs_readdir 拆为：后端分派 → 本地目录扫描（probe 过滤/去重/filler）
  * → 骨架与虚拟目录合成 → . / .. 收尾。各阶段共享 VfsReaddirCtx，
@@ -721,6 +770,7 @@ typedef struct {
     bool is_root;    /* sub_path 为挂载点根 */
     bool is_android_dir;
     bool hide_others; /* 跨应用隔离生效（沙盒开启 + 非 root/未知访问者） */
+    int path_user_id; /* 路由解析出的 user_id（<0 = 无用户层）；可见性单点用 */
     bool has_data, has_obb, has_android, has_pkg;
 } VfsReaddirCtx;
 
@@ -763,9 +813,9 @@ static void backend_put_before_guard(const NspModuleOps** ops) {
    （含 FTP 单 LIST 缓存）在短页处自然收尾，走不到该分支。 */
 #define VFS_READDIR_PAGE      256
 #define VFS_READDIR_MAX_TOTAL 65536
-static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, bool is_ftp,
-                                void* buf, fuse_fill_dir_t filler, uint64_t skip, int* rc_out) {
-    (void)ctx; /* 上下文经 VfsReaddirCtx/探测路径自取，保留形参以统一分派签名 */
+static bool vfs_readdir_backend(struct fuse_context* ctx, const char* fuse_path, const char* sub_path,
+                                const char* current_pkg, int path_user_id, bool is_ftp, void* buf,
+                                fuse_fill_dir_t filler, uint64_t skip, int* rc_out) {
     if (!is_ftp) return false;
     const NspModuleOps* bops = NULL;
     if (module_backend_lookup(sub_path, &bops) != 0) return false;
@@ -790,15 +840,20 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
        与后端 getattr 侧的 synthetic 兜底语义矛盾（见 vfs_readdir_fill_dots
        同一写法）。编号 1/2（断点续扫 skip 覆盖点条目）。 */
     uint64_t next = 1;
+    /* A16：rc/offset/total 的声明必须在首个 goto done **之前**——旧实现把
+       `int rc = 0;` 放在两处 goto 之后，filler 对 . / .. 满缓冲时跳转越过
+       初始化，done: 处 `*rc_out = rc` 读未初始化对象（C11 6.2.4p6），该值
+       直接成为 vfs_readdir 返回码，为正数时 libfuse 错误语义失真。 */
+    uint64_t offset = 0;
+    size_t total = 0;
+    int rc = 0;
     if (vfs_emit_raw(buf, filler, &next, skip, ".", nullptr) < 0) goto done;
     if (vfs_emit_raw(buf, filler, &next, skip, "..", nullptr) < 0) goto done;
     /* 后端分页起点对齐 skip（点条目占 off 1/2，后端条目从 off 3 起）：
        大 offset 续扫时免空翻前面页——编号连续性由 next += offset 保持
        （跳过的条目仍占号，跨调用序列稳定）。 */
-    uint64_t offset = (skip > 2) ? skip - 2 : 0;
+    offset = (skip > 2) ? skip - 2 : 0;
     next += offset;
-    size_t total = 0;
-    int rc = 0;
     for (;;) {
         int n = nsp_fence_backend_readdir(bslot, "backend_readdir", bops->backend_readdir,
                                           sub_path, entries, VFS_READDIR_PAGE, offset);
@@ -843,6 +898,19 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* sub_path, 
             /* d_ino 必须非 0（use_ino=1 下直接进内核）且与该路径 getattr 一致：
                经 vfs_readdir_child_ino 派生，与 getattr 的 synthetic_inode 同源 */
             st.st_ino = vfs_readdir_child_ino(sub_path, entries[i].name);
+            /* 可见性单点（A4）：后端条目与本地条目同一过滤语义。此前该路径
+               **零过滤** → HIDE/重定向目标条目在列举里可见而 stat ENOENT，
+               既违反 architecture.md §4.4 又构成名字泄露。
+               被过滤条目**仍消耗一个编号**（next++），使「后端 raw offset ==
+               发射编号 - 3」恒成立，分页 resume 才能按 raw offset 直接续扫；
+               若过滤条目不占号，resume 会漏项/重复。 */
+            char vis_sub[2048], vis_fuse[2048];
+            if (vfs_entry_visibility(sub_path, fuse_path, entries[i].name, current_pkg,
+                                     path_user_id, ctx ? ctx->uid : 0, vis_sub, sizeof vis_sub,
+                                     vis_fuse, sizeof vis_fuse) != NSP_VIS_EMIT) {
+                next++;
+                continue;
+            }
             int er = vfs_emit_raw(buf, filler, &next, skip, entries[i].name, &st);
             if (er < 0) goto done; /* 内核缓冲满 */
         }
@@ -875,6 +943,7 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     d->sub_path = sub_path;
     d->real_path = real_path;
     d->current_pkg = current_pkg;
+    d->path_user_id = path_user_id;
     d->buf = buf;
     d->filler = filler;
     vfs_hash_init(&d->ht);
@@ -960,51 +1029,16 @@ static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
    dp 由调用方打开并负责关闭。返回 false = filler 缓冲已满，须立即结束。 */
 static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
     char item_sub_path[2048], item_fuse_path[2048], item_real_path[2048];
-    /* 循环外复用查询上下文，只改 path——省每条目结构初始化 */
-    NspQueryCtx probe_q = {
-        .uid = d->ctx->uid, .pid = d->ctx->pid, .gid = d->ctx->gid, .path = NULL};
     struct dirent* de;
     while ((de = readdir(dp)) != nullptr) {
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        /* probe 路径归一：base 先剥尾部 '/'（复用 readdir_base_normalize，与
-           fw_virtual_dir_empty/vfs_readdir_child_ino 同一合成语义） */
-        char norm_base[2048];
-        readdir_base_normalize(norm_base, sizeof norm_base, d->sub_path);
-        readdir_join(item_sub_path, sizeof item_sub_path, norm_base, de->d_name);
-        /* probe 的入参契约是**带 <uid>/ 层的原始 FUSE 路径**（引擎据此剥层后匹配，
-           见 fw_rules.h 的 NspQueryCtx 注释与 fw_rules_path_has_uid_layer）。此前传
-           的是剥过层的 item_sub_path，探针因"无用户层"直接早退（valid=false 即不过
-           滤）——于是 HIDE 的条目照旧出现在父目录列表里，stat 却 ENOENT（隐藏不彻底，
-           正是下方注释想修的反例）。剥层形式仍保留给 uid 目录判定用。 */
-        char norm_fuse_base[2048];
-        readdir_base_normalize(norm_fuse_base, sizeof norm_fuse_base, d->fuse_path);
-        readdir_join(item_fuse_path, sizeof item_fuse_path, norm_fuse_base, de->d_name);
-        if (path_contains_invalid_chars(de->d_name)) continue;
-        /* 子项轻量探测（probe）：只判 hidden/redirect_target，不构建真实路径、
-           不触发 sandbox 目录创建（无模块时直通不过滤）。
-           user_id 目录条目（/0、/1...）旧语义用原始串判 redirect_target 恒 false
-           （Trie 无数字前缀规则）；剥离 /0/ 后会误判为根目录 sandbox 重定向目标，
-           故豁免其 redirect_target 检查（仅 hidden 生效）。
-           hidden 过滤对所有访问者生效（含 root，与 getattr 的 hidden 拒绝一致）：
-           否则 root ls 时被 HIDE 的条目仍出现在列表（stat 却失败），隐藏不彻底 */
-        bool uid_dir = false;
-        if (item_sub_path[0] == '/' && isdigit((unsigned char)item_sub_path[1])) {
-            const char* dg = item_sub_path + 1;
-            while (isdigit((unsigned char)*dg)) dg++;
-            uid_dir = (*dg == '\0' || *dg == '/');
-        }
-        probe_q.path = item_fuse_path;
-        NspProbeResult ir;
-        memset(&ir, 0, sizeof ir);
-        fw_rules_probe(&probe_q, &ir);
-        if (ir.valid && (ir.appear_missing || (!uid_dir && ir.virtual_kind == NSP_VK_TARGET)))
+        /* 可见性判定走框架单点（C2）：路径归一/过长 fail-closed/uid 目录豁免/
+           hidden+redirect_target 探测/Android/data|obb 自身包名，三条列举路径
+           共用同一份语义，杜绝再次漂移 */
+        if (vfs_entry_visibility(d->sub_path, d->fuse_path, de->d_name, d->current_pkg,
+                                 d->path_user_id, d->ctx->uid, item_sub_path, sizeof item_sub_path,
+                                 item_fuse_path, sizeof item_fuse_path) != NSP_VIS_EMIT)
             continue;
-        if (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
-                               strcmp(d->sub_path, "/Android/data/") == 0 ||
-                               strcmp(d->sub_path, "/Android/obb") == 0 ||
-                               strcmp(d->sub_path, "/Android/obb/") == 0)) {
-            if (strcmp(de->d_name, d->current_pkg) != 0) continue;
-        }
         /* 骨架名判定（与后继 fill_* 合成条件同源）：lstat 失败时不上架 NULL 条目、
            也不置 has_* 标记，交由 fill 阶段合成标准目录条目（S_IFDIR|0755 + 同源
            ino）。否则 DT_UNKNOWN 条目会让管理器显示为文件且无法点击，而按名
@@ -1150,7 +1184,9 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
 
     /* 后端分派：readdir 由模块方法返回条目，框架负责 filler */
     int brc = 0;
-    if (vfs_readdir_backend(ctx, sub_path, rr.is_ftp, buf, filler, skip, &brc)) VFS_RETURN(brc);
+    if (vfs_readdir_backend(ctx, path, sub_path, current_pkg, path_user_id, rr.is_ftp, buf, filler,
+                            skip, &brc))
+        VFS_RETURN(brc);
 
     VfsReaddirCtx d;
     vfs_readdir_ctx_init(&d, ctx, path, sub_path, p, current_pkg, path_user_id, buf, filler);

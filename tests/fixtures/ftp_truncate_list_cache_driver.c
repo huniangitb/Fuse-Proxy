@@ -84,12 +84,14 @@ CURL* ftp_easy_new(const FtpServerCfg* cfg) {
     return (CURL*)(void*)g_dummy_easy;
 }
 
-/* 合成一页 FTP LIST 正文（含固定条目 f 与邻居 keep） */
+/* 合成一页 FTP LIST 正文（含固定条目 f 与邻居 keep；另含 A15 用的点条目） */
 static size_t emit_list_body(void) {
     char body[512];
     int n = snprintf(body, sizeof body,
                      "-rw-r--r-- 1 user group %ld Jan  1 00:00 f\r\n"
-                     "-rw-r--r-- 1 user group 33 Jan  1 00:00 keep\r\n",
+                     "-rw-r--r-- 1 user group 33 Jan  1 00:00 keep\r\n"
+                     "-rw-r--r-- 1 user group 7 Jan  1 00:00 .hidden\r\n"
+                     "drwxr-xr-x 2 user group 0 Jan  1 00:00 .git\r\n",
                      g_remote_size);
     size_t wrote = 0;
     if (g_cur_wf && g_cur_wd && n > 0)
@@ -240,6 +242,28 @@ int main(void) {
     memset(&st, 0, sizeof st);
     bool g3 = ftp_backend_getattr("/ftproot/dir/keep", &st) == 0 && st.st_size == 33;
     ck(g3, "C1 邻居条目 size 未被误伤（33）", "邻居条目 size 异常");
+
+    /* D. A15：点条目只跳 "." / ".."，其余点开头名字照常上架。
+       旧实现 `name[0] != '.'` 把所有点开头名字一起丢掉 → .nomedia/.git 完全
+       不可见（ls -a 空、rsync/rm -r 漏删、只含点文件的目录 rmdir 报 ENOTEMPTY
+       却列不出内容），而 getattr 对它们返回成功。端到端不可观测（本机 vsftpd
+       默认 force_dot_files=NO，LIST 根本不回点条目），故在此以合成 LIST 正文
+       判别。 */
+    {
+        NspDirEntry entries[16];
+        memset(entries, 0, sizeof entries);
+        int dn = ftp_backend_readdir(dir, entries, 16, 0);
+        bool has_hidden = false, has_git = false, has_keep = false;
+        for (int i = 0; dn > 0 && i < dn; i++) {
+            if (strcmp(entries[i].name, ".hidden") == 0) has_hidden = true;
+            if (strcmp(entries[i].name, ".git") == 0) has_git = true;
+            if (strcmp(entries[i].name, "keep") == 0) has_keep = true;
+        }
+        ck(dn > 0, "D1 列举返回条目", "readdir 返回 <= 0");
+        ck(has_hidden, "D2 点文件 .hidden 在列举中可见（旧实现被丢弃）", "未返回 .hidden");
+        ck(has_git, "D3 点目录 .git 在列举中可见（旧实现被丢弃）", "未返回 .git");
+        ck(has_keep, "D4 普通条目不受影响", "未返回 keep");
+    }
 
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
     return g_fail;
