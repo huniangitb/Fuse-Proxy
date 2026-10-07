@@ -384,6 +384,58 @@ static inline bool backend_rc_is_business(int rc) {
     return rc < 0 && rc >= -4095;
 }
 
+/* ================= 后端分派统一收口（C5） =================
+ * 八个回调（getattr/open/create/mkdir/unlink/rmdir/truncate/readdir）原先各抄
+ * 一遍同一串「lookup → 判空 → 围栏 → 三类判据（FAULT / BADFN / 业务 errno）
+ * → guard → put」。A20 的三个漏网点（回传长度钳制、backend_put_before_guard
+ * 顺序约束、业务 errno 豁免）全都出在这份复制里——复制几份就漏几处。
+ *
+ * 这里把「拿到 ops 之后的收尾」抽成一条窄原语，让每处调用点只剩
+ * 「lookup + 一次 put + 一次统一收尾」：
+ *
+ *   backend_dispatch_after  —— 通用收尾。调用方在围栏返回后**已**交还在途
+ *       引用（`module_backend_put(bops)`）再调用它；它按 brc 分三类处置，
+ *       返回 true 表示「已处理，调用方应直接 VFS_RETURN(*out_rc)」，
+ *       false 表示「brc == 0，继续走成功路径」。
+ *
+ * 分类核心 backend_dispatch_classify 只有这一份定义——「哪些码算业务失败」
+ * 不再各回调各判一遍，正是 C5 要防的漂移。
+ *
+ * readdir 未走此原语：它的分页循环有五个早退分支，每个分支的「上报码 +
+ * 人可读消息」都不同（FAULT→-EIO、"条目名未终止"→-EIO、业务 errno→原样…），
+ * 且须在置毒前 `backend_put_before_guard` 交还引用。强行套通用原语会让
+ * 调用点比展开版更绕，故保留其显式写法；但「业务 errno 判定」**仍复用**
+ * backend_rc_is_business 单点定义。 */
+
+static inline int backend_dispatch_classify(int bslot, const char* op, int brc, const char* sub_path,
+                                            const char* what) {
+    if (brc == NSP_FENCE_FAULT) {
+        /* 模块在围栏内崩溃：置毒卸载（规则/能力自动失效）并落盘 ban */
+        module_guard_fault(bslot, op, sub_path);
+        return -EIO;
+    }
+    if (brc != 0) {
+        /* BADFN = 函数指针缺失（按未实现处理，不算违约）；
+           业务 errno（-4095..0）是 backend_* 的**契约**，原样回传；
+           其余（正数 / 超出 errno 范围）才是契约违规 → 计错误熔断。 */
+        if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
+            module_guard_error(bslot, op, brc, sub_path, what);
+        return brc < 0 ? brc : -EIO;
+    }
+    return 0; /* 成功 */
+}
+
+/* 通用收尾：调用方已 put。true = 已处理（*out_rc 为 FUSE 返回码）。 */
+static inline bool backend_dispatch_after(int bslot, const char* op, int brc, const char* sub_path,
+                                          const char* what, int* out_rc) {
+    int rc = backend_dispatch_classify(bslot, op, brc, sub_path, what);
+    if (rc != 0) {
+        *out_rc = rc;
+        return true;
+    }
+    return false;
+}
+
 #define VFS_SETUP_CORE(path_val, op_kind)                                         \
     struct fuse_context* ctx = fuse_get_context();                                \
     if (!ctx) return -EIO; /* 不可达：libfuse 在每个回调内均设置上下文 */          \
@@ -583,15 +635,10 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             int brc = nsp_fence_backend_getattr(bslot, "backend_getattr", bops->backend_getattr,
                                                 sub_path, st);
             module_backend_put(bops);
-            if (brc == NSP_FENCE_FAULT) {
-                module_guard_fault(bslot, "backend_getattr", sub_path);
-                VFS_RETURN(-EIO);
-            }
-            if (brc != 0) {
-                if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                    module_guard_error(bslot, "backend_getattr", brc, sub_path, "getattr 返回异常");
-                VFS_RETURN(brc < 0 ? brc : -EIO);
-            }
+            int drc;
+            if (backend_dispatch_after(bslot, "backend_getattr", brc, sub_path, "getattr 返回异常",
+                                       &drc))
+                VFS_RETURN(drc);
             /* 后端不提供真实属主（uid/gid=0）时继承其本地上级——用户存储根
                /data/media/<uid>/（FTP 虚拟路径在本地不存在，直接父目录 lstat
                必失败，故取用户存储根的真实属主，而非固定 root） */
@@ -884,8 +931,7 @@ static bool vfs_readdir_backend(struct fuse_context* ctx, const char* fuse_path,
             module_guard_error(bslot, "backend_readdir", 0, sub_path, "返回条目数超限(越界写)");
             rc = -EIO;
             break;
-        }
-        for (int i = 0; i < n; i++) {
+        }        for (int i = 0; i < n; i++) {
             /* 条目名跨 ABI 由模块填写：未终止的名字会被 filler 当野指针读，
                故逐条校验（超长名由后端整条跳过，框架侧只防未终止） */
             if (!nsp_guard_dir_entry_ok(&entries[i])) {
@@ -1284,15 +1330,9 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
             int brc = nsp_fence_backend_open(bslot, "backend_open", bops->backend_open, sub_path,
                                              fi->flags, &h);
             module_backend_put(bops);
-            if (brc == NSP_FENCE_FAULT) {
-                module_guard_fault(bslot, "backend_open", sub_path);
-                VFS_RETURN(-EIO);
-            }
-            if (brc != 0) {
-                if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                    module_guard_error(bslot, "backend_open", brc, sub_path, "open 返回异常");
-                VFS_RETURN(brc < 0 ? brc : -EIO);
-            }
+            int drc;
+            if (backend_dispatch_after(bslot, "backend_open", brc, sub_path, "open 返回异常", &drc))
+                VFS_RETURN(drc);
             /* FTP 路径：句柄为模块小整数 ID（非 fd），不设 FD 透传等本地
                文件系统才可用的优化（passthrough 仅对下方本地 open 的 fd）；
                设 direct_io 绕过内核 page cache——FUSE 内核在 close 后可能
@@ -1352,15 +1392,10 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
             int brc = nsp_fence_backend_create(bslot, "backend_create", bops->backend_create,
                                                sub_path, mode, &h);
             module_backend_put(bops);
-            if (brc == NSP_FENCE_FAULT) {
-                module_guard_fault(bslot, "backend_create", sub_path);
-                VFS_RETURN(-EIO);
-            }
-            if (brc != 0) {
-                if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                    module_guard_error(bslot, "backend_create", brc, sub_path, "create 返回异常");
-                VFS_RETURN(brc < 0 ? brc : -EIO);
-            }
+            int drc;
+            if (backend_dispatch_after(bslot, "backend_create", brc, sub_path, "create 返回异常",
+                                       &drc))
+                VFS_RETURN(drc);
             fi->fh =
                 h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & (NSP_FH_BACKEND_SLOT_MAX - 1)) << NSP_FH_BACKEND_SLOT_SHIFT);
             VFS_RETURN(0);
@@ -1412,15 +1447,9 @@ static int vfs_mkdir(const char* path, mode_t mode) {
         int brc =
             nsp_fence_backend_mkdir(bslot, "backend_mkdir", bops->backend_mkdir, sub_path, mode);
         module_backend_put(bops);
-        if (brc == NSP_FENCE_FAULT) {
-            module_guard_fault(bslot, "backend_mkdir", sub_path);
-            VFS_RETURN(-EIO);
-        }
-        if (brc != 0) {
-            if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                module_guard_error(bslot, "backend_mkdir", brc, sub_path, "mkdir 返回异常");
-            VFS_RETURN(brc < 0 ? brc : -EIO);
-        }
+        int drc;
+        if (backend_dispatch_after(bslot, "backend_mkdir", brc, sub_path, "mkdir 返回异常", &drc))
+            VFS_RETURN(drc);
         VFS_RETURN(0);
     }
     /* fallback：lookup 成功但未走后端分支时释放引用，防止 backend_refs 泄漏
@@ -1459,15 +1488,10 @@ static int vfs_unlink(const char* path) {
             int brc =
                 nsp_fence_backend_simple(bslot, "backend_unlink", bops->backend_unlink, sub_path);
             module_backend_put(bops);
-            if (brc == NSP_FENCE_FAULT) {
-                module_guard_fault(bslot, "backend_unlink", sub_path);
-                VFS_RETURN(-EIO);
-            }
-            if (brc != 0) {
-                if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                    module_guard_error(bslot, "backend_unlink", brc, sub_path, "unlink 返回异常");
-                VFS_RETURN(brc < 0 ? brc : -EIO);
-            }
+            int drc;
+            if (backend_dispatch_after(bslot, "backend_unlink", brc, sub_path, "unlink 返回异常",
+                                       &drc))
+                VFS_RETURN(drc);
             VFS_RETURN(0);
         }
     }
@@ -1508,15 +1532,10 @@ static int vfs_rmdir(const char* path) {
             int brc =
                 nsp_fence_backend_simple(bslot, "backend_rmdir", bops->backend_rmdir, sub_path);
             module_backend_put(bops);
-            if (brc == NSP_FENCE_FAULT) {
-                module_guard_fault(bslot, "backend_rmdir", sub_path);
-                VFS_RETURN(-EIO);
-            }
-            if (brc != 0) {
-                if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                    module_guard_error(bslot, "backend_rmdir", brc, sub_path, "rmdir 返回异常");
-                VFS_RETURN(brc < 0 ? brc : -EIO);
-            }
+            int drc;
+            if (backend_dispatch_after(bslot, "backend_rmdir", brc, sub_path, "rmdir 返回异常",
+                                       &drc))
+                VFS_RETURN(drc);
             VFS_RETURN(0);
         }
     }
@@ -2172,16 +2191,10 @@ static int vfs_truncate(const char* path, off_t size, struct fuse_file_info* fi)
             int brc = nsp_fence_backend_truncate(bslot, "backend_truncate", bops->backend_truncate,
                                                  sub_path, size);
             module_backend_put(bops);
-            if (brc == NSP_FENCE_FAULT) {
-                module_guard_fault(bslot, "backend_truncate", sub_path);
-                VFS_RETURN(-EIO);
-            }
-            if (brc != 0) {
-                if (brc != NSP_FENCE_BADFN && !backend_rc_is_business(brc))
-                    module_guard_error(bslot, "backend_truncate", brc, sub_path,
-                                       "truncate 返回异常");
-                VFS_RETURN(brc < 0 ? brc : -EIO);
-            }
+            int drc;
+            if (backend_dispatch_after(bslot, "backend_truncate", brc, sub_path, "truncate 返回异常",
+                                       &drc))
+                VFS_RETURN(drc);
             VFS_RETURN(0);
         }
     }
