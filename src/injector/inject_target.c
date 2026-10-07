@@ -199,6 +199,41 @@ void cleanup_stale_tracked(void) {
     prune_stale_tracked();
 }
 
+/* 追踪表 pid 快照：**锁内**复制 pid 列表，供调用方在**锁外**做重活
+   （/proc 读取、mount/umount、config 判定）。三条遍历路径统一走它——
+   直接裸遍历 g_tracked_hash 与 add_tracked/remove_tracked/prune_stale_tracked
+   并发时，游标指向的 next 槽所属节点可能被释放，`pp = &(*pp)->next` 读到
+   悬垂地址、下一次迭代解引用即 UAF；且这些路径本身要调 cleanup_app_mounts /
+   perform_app_mount，它们内部会再取 g_tracked_mutex，持锁遍历必然自锁。
+
+   返回 malloc 的数组，*n_out 为条数（空表返回 NULL 且 *n_out=0）；
+   分配失败返回 NULL 且 *n_out=-1（调用方应放弃本轮，下次重试）。调用方 free。 */
+static int* tracked_snapshot(int* n_out) {
+    int* out = nullptr;
+    int n = 0, cap = 0;
+    pthread_mutex_lock(&g_tracked_mutex);
+    for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
+        for (TrackedEntry* e = g_tracked_hash[i]; e; e = e->next) {
+            if (n >= cap) {
+                int ncap = cap > 0 ? cap * 2 : 16;
+                int* grown = realloc(out, (size_t)ncap * sizeof *grown);
+                if (!grown) {
+                    pthread_mutex_unlock(&g_tracked_mutex);
+                    free(out);
+                    *n_out = -1;
+                    return nullptr;
+                }
+                out = grown;
+                cap = ncap;
+            }
+            out[n++] = e->pid;
+        }
+    }
+    pthread_mutex_unlock(&g_tracked_mutex);
+    *n_out = n;
+    return out;
+}
+
 /* ================= 全量应用 PID 缓存 =================
    非被动模式下每次扫描刷新：缓存所有 zygote 子进程（含已停用/未追踪
    的应用），便于规则变化时快速定位 pid 立即挂载，无需等待应用重启
@@ -579,22 +614,24 @@ void force_recover_tracked_mounts() {
            此处仅清理追踪表 */
         LOG_DBG("全局替换: force_recover 跳过逐应用卸载，由全局恢复统一处理");
     } else {
-        for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-            TrackedEntry* e = g_tracked_hash[i];
-            while (e) {
-                int pid = e->pid;
-                if (kill(pid, 0) == 0) {
-                    uid_t uid = get_app_uid(pid);
-                    char target_path[128];
-                    get_target_storage_path(uid, target_path, sizeof(target_path));
-                    char backup_path[PATH_MAX];
-                    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
-                    cleanup_app_mounts(pid, target_path, backup_path, uid);
-                }
-                e = e->next;
+        int n = 0;
+        int* pids = tracked_snapshot(&n);
+        for (int k = 0; pids && k < n; k++) {
+            int pid = pids[k];
+            if (kill(pid, 0) == 0) {
+                uid_t uid = get_app_uid(pid);
+                char target_path[128];
+                get_target_storage_path(uid, target_path, sizeof(target_path));
+                char backup_path[PATH_MAX];
+                snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+                cleanup_app_mounts(pid, target_path, backup_path, uid);
             }
         }
+        free(pids);
     }
+    /* 整表摘除：必须在锁内（旧实现锁外 free，与并发 add_tracked 竞争：
+       新节点可能刚挂上就被这轮 free 走，或摘除后残留悬垂桶头） */
+    pthread_mutex_lock(&g_tracked_mutex);
     for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
         TrackedEntry* e = g_tracked_hash[i];
         while (e) {
@@ -604,20 +641,23 @@ void force_recover_tracked_mounts() {
         }
         g_tracked_hash[i] = nullptr;
     }
+    pthread_mutex_unlock(&g_tracked_mutex);
 }
 
 /* 核心优化：配置审查时，就算应用解除注入，只要进程依然物理存活，就必须保持哈希追踪监听 */
 void audit_tracked_apps() {
     prune_stale_tracked();
-    for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry** pp = &g_tracked_hash[i];
-        while (*pp) {
-            int pid = (*pp)->pid;
+    /* 锁内快照 → 锁外处理：本函数会调 cleanup_app_mounts / perform_app_mount /
+       perform_app_restore，它们内部再取 g_tracked_mutex（持锁遍历必自锁），
+       而裸遍历又会被并发的 add_tracked/remove_tracked 摘链致 UAF。 */
+    int n = 0;
+    int* pids = tracked_snapshot(&n);
+    for (int k = 0; pids && k < n; k++) {
+        {
+            int pid = pids[k];
             char cmd[256] = {0};
             if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) {
-                TrackedEntry* tmp = *pp;
-                *pp = (*pp)->next;
-                free(tmp);
+                remove_tracked(pid); /* 锁内摘除（快照遍历下不得直接改链） */
                 continue;
             }
             uid_t uid = get_app_uid(pid);
@@ -666,25 +706,23 @@ void audit_tracked_apps() {
                     }
                 }
             }
-            // 绝不在此处释放物理存活的追踪节点，始终沿链表后移
-            pp = &(*pp)->next;
         }
     }
+    free(pids);
 }
 
 /* 核心优化：局部规则发生变化时，解除注入仅做解挂视图动作，绝对保留 PID 节点的物理追踪 */
 void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
     prune_stale_tracked();
     const char* mnt_src = get_active_mnt_src();
-    for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry** pp = &g_tracked_hash[i];
-        while (*pp) {
-            int pid = (*pp)->pid;
+    int n = 0;
+    int* pids = tracked_snapshot(&n);
+    for (int k = 0; pids && k < n; k++) {
+        {
+            int pid = pids[k];
             char cmd[256] = {0};
             if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) {
-                TrackedEntry* tmp = *pp;
-                *pp = (*pp)->next;
-                free(tmp);
+                remove_tracked(pid); /* 锁内摘除（快照遍历下不得直接改链） */
                 continue;
             }
             uid_t uid = get_app_uid(pid);
@@ -734,11 +772,9 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                     }
                 }
             }
-            // 安全保留追踪节点。由于 add_tracked 的无副作用性（若 PID 重复则不改变任何链表指针），
-            // 直接进行 pp 后移是 100% 内存安全的，杜绝了重置外层大循环（i = -1）产生的多余 CPU 轮转
-            pp = &(*pp)->next;
         }
     }
+    free(pids);
     /* 缓存补充：变更包不在追踪列表（如曾被停用的应用）时，从全量应用
        缓存快速定位运行中的 pid 立即挂载，无需等待应用重启或下次扫描 */
     for (int c = 0; c < count; c++) {
@@ -774,28 +810,23 @@ void handle_list_injected(int client_fd) {
     }
     int offset = 0;
     int total = 0;
-    for (int i = 0; i < TRACKED_HASH_SIZE; i++) {
-        TrackedEntry* e = g_tracked_hash[i];
-        while (e) {
-            int pid = e->pid;
-            if (kill(pid, 0) != 0) {
-                e = e->next;
-                continue;
-            }
+    /* 锁内快照 → 锁外遍历：本函数在遍历中调 config_lock_read 与 /proc 读取，
+       而并发的 add_tracked/remove_tracked 会摘链释放节点 → 裸遍历的
+       `e = e->next` 读到悬垂地址（A25 同类缺陷，一并收敛到 tracked_snapshot） */
+    int np = 0;
+    int* pids = tracked_snapshot(&np);
+    for (int k = 0; pids && k < np; k++) {
+        {
+            int pid = pids[k];
+            if (kill(pid, 0) != 0) continue;
             char cmdline[256] = {0};
-            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) {
-                e = e->next;
-                continue;
-            }
+            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) continue;
             uid_t uid = get_app_uid(pid);
             /* 注入状态以显式标志为权威：不再探测 mountinfo（GLOBAL_INJECT
                下全局替换无逐应用挂载/异步挂载时序会导致 is_project_fuse_cached
                误判），也不再二次跑 is_target_app（注入路径已判定过）——
                mark_injected 只在注入成功路径置位，还原/卸载路径已清除 */
-            if (!is_injected(pid)) {
-                e = e->next;
-                continue;
-            }
+            if (!is_injected(pid)) continue;
             char base_pkg[256];
             strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
             char* colon = strchr(base_pkg, ':');
@@ -825,9 +856,9 @@ void handle_list_injected(int client_fd) {
                                    base_pkg, pid, uid, total_redir, total_hide, total_ro);
             }
             total++;
-            e = e->next;
         }
     }
+    free(pids);
     int dn = snprintf(nullptr, 0, "DONE|%d\n", total);
     if ((size_t)offset + dn + 1 > cap) {
         cap = (size_t)offset + dn + 1;
@@ -841,26 +872,19 @@ void handle_list_injected(int client_fd) {
 
 int get_injected_snapshot(int* out_pids, char (*out_pkgs)[256], uid_t* out_uids, int max_count) {
     int count = 0;
-    for (int i = 0; i < TRACKED_HASH_SIZE && count < max_count; i++) {
-        TrackedEntry* e = g_tracked_hash[i];
-        while (e && count < max_count) {
-            int pid = e->pid;
-            if (kill(pid, 0) != 0) {
-                e = e->next;
-                continue;
-            }
+    /* 锁内快照 → 锁外遍历（同 handle_list_injected：并发摘链会致悬垂） */
+    int np = 0;
+    int* pids = tracked_snapshot(&np);
+    for (int k = 0; pids && k < np && count < max_count; k++) {
+        {
+            int pid = pids[k];
+            if (kill(pid, 0) != 0) continue;
             char cmdline[256] = {0};
-            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) {
-                e = e->next;
-                continue;
-            }
+            if (!proc_get_cmdline(pid, cmdline, sizeof(cmdline))) continue;
             uid_t uid = get_app_uid(pid);
             /* 与 handle_list_injected 一致：以显式注入标志为权威，
                不再探测 mountinfo（GLOBAL_INJECT 下挂载状态不可靠） */
-            if (!is_injected(pid)) {
-                e = e->next;
-                continue;
-            }
+            if (!is_injected(pid)) continue;
             char base_pkg[256];
             strncpy(base_pkg, cmdline, sizeof(base_pkg) - 1);
             base_pkg[sizeof(base_pkg) - 1] = '\0';
@@ -871,9 +895,9 @@ int get_injected_snapshot(int* out_pids, char (*out_pkgs)[256], uid_t* out_uids,
             out_pkgs[count][255] = '\0';
             out_uids[count] = uid;
             count++;
-            e = e->next;
         }
     }
+    free(pids);
     return count;
 }
 
