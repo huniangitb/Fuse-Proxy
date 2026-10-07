@@ -214,6 +214,123 @@ struct AppRestoreArgs {
     int user_id;
 };
 
+/* ==================== 单族根还原（备份树 → 族根） ====================
+   把 root（/mnt/<族>/<uid>/emulated）从备份树 btop 还原：
+     1. 卸下 root 上当前全部挂载（最深优先，含项目 FUSE bind 与传播子挂载）
+     2. mkdir root
+     3. 按**父先子后**把备份树各节点 bind 回 root（只 bind 顶层会丢失
+        Android/data|obb 等 f2fs 直通子挂载）
+     4. 置 MS_SHARED 恢复传播
+   bsub/bn：**已按最浅优先排序**的备份树节点（调用方收集）。
+   scratch/scratch_cap：收集 root 当前挂载的临时数组。
+   返回 0=全部节点绑定成功；-1=有节点失败（root 可能不完整，但备份树仍在，
+   可重试——调用方据此保留备份副本）。
+   本函数同时服务于全局恢复、替换失败回滚与崩溃恢复，是「从备份树还原一个族根」
+   的唯一出口。 */
+static int restore_root_from_backup(const char* root, const char* btop, const NsMountEntry* bsub,
+                                    int bn, const NsMountEntry* all, int n, NsMountEntry* scratch,
+                                    int scratch_cap) {
+    int cn = ns_gather_mounts_under(all, n, root, true, true, scratch, scratch_cap);
+    if (cn >= scratch_cap) {
+        LOG_ERR("还原: 族根 %s 子挂载达到 %d 上限，拒绝静默截断（还原将不完整）", root,
+                scratch_cap);
+        return -1;
+    }
+    ns_sort_deepest_first(scratch, cn);
+    for (int k = 0; k < cn; k++) {
+        for (int t = 0; t < 8; t++) {
+            if (umount2(scratch[k].mount_point, MNT_DETACH) == 0) break;
+            if (errno == EINVAL) break;
+        }
+    }
+    if (mkdir_recursive((char*)root) != 0 && errno != EEXIST) {
+        LOG_WRN("还原: mkdir %s 失败: %s", root, strerror(errno));
+        return -1;
+    }
+    int failed = 0;
+    for (int k = 0; k < bn; k++) {
+        const char* rel = bsub[k].mount_point + strlen(btop); /* "" 或 "/0/Android/data" */
+        char target[PATH_MAX];
+        snprintf(target, sizeof(target), "%s%s", root, rel);
+        if (mkdir_recursive(target) != 0) {
+            LOG_WRN("还原: mkdir %s 失败", target);
+            failed++;
+            continue;
+        }
+        if (mount(bsub[k].mount_point, target, nullptr, MS_BIND, nullptr) != 0) {
+            LOG_WRN("还原: bind %s -> %s 失败: %s", bsub[k].mount_point, target, strerror(errno));
+            failed++;
+            continue;
+        }
+        LOG_DBG("还原: bind %s -> %s", bsub[k].mount_point, target);
+    }
+    if (mount(nullptr, root, nullptr, MS_SHARED, nullptr) != 0) {
+        LOG_WRN("还原: 置 MS_SHARED %s 失败: %s（传播不可用）", root, strerror(errno));
+    }
+    return failed ? -1 : 0;
+}
+
+/* ==================== 替换失败回滚 ====================
+   替换步骤先卸族根全部挂载再 bind fuse_src；任一步失败若直接返回，族根就停在
+   **裸挂载点**（/mnt/{user,androidwritable,installer}/… 下系统存储视图整体消失，
+   且与备份树不再对应）。备份树就在手边，故失败时把**本次已动过的族根**（含失败者
+   本身，其挂载已被卸下）逐一根 bind 回去。
+   备份树按 uid 存放（backup_root/user_<uid>/emulated），三族是同源视图，故任一族根
+   都可用该 uid 的备份还原。
+   每次迭代重读 mountinfo：回滚本身在改变挂载表，进入 do_global_replace 时的快照已
+   过期（不含替换阶段新加的 bind），用它卸载会漏掉节点。
+   返回 0=全部族根回滚成功；-1=有族根无法回滚（备份缺失或 bind 失败，已 loud 告警，
+   备份树保留待重试）。 */
+static int rollback_replaced_roots(const NsMountEntry* roots, int count, const char* backup_root) {
+    if (count <= 0) return 0;
+    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+    NsMountEntry* bsub = malloc(128 * sizeof(NsMountEntry));
+    NsMountEntry* scratch = malloc(128 * sizeof(NsMountEntry));
+    if (!all || !bsub || !scratch) {
+        free(all);
+        free(bsub);
+        free(scratch);
+        LOG_ERR("全局替换回滚: 分配内存失败，无法回滚（族根可能停在裸挂载点）");
+        return -1;
+    }
+    bool failed = false;
+    for (int i = 0; i < count; i++) {
+        const char* root = roots[i].mount_point;
+        int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
+        if (n <= 0) {
+            LOG_ERR("全局替换回滚: 读取 mountinfo 失败，族根 %s 无法回滚", root);
+            failed = true;
+            continue;
+        }
+        int uid = 0;
+        (void)ns_parse_family_root(root, &uid);
+        char btop[PATH_MAX];
+        snprintf(btop, sizeof(btop), "%s/user_%d/emulated", backup_root, uid);
+        if (ns_backup_point_state(getpid(), btop) != 1) {
+            LOG_ERR("全局替换回滚: 族根 %s 的备份点 %s 不可用，无法回滚", root, btop);
+            failed = true;
+            continue;
+        }
+        int bn = ns_gather_mounts_under(all, n, btop, true, true, bsub, 128);
+        if (bn <= 0 || bn >= 128) {
+            LOG_ERR("全局替换回滚: 备份点 %s 下挂载数异常(%d)，无法回滚族根 %s", btop, bn, root);
+            failed = true;
+            continue;
+        }
+        ns_sort_shallowest_first(bsub, bn);
+        if (restore_root_from_backup(root, btop, bsub, bn, all, n, scratch, 128) != 0) {
+            LOG_ERR("全局替换回滚: 族根 %s 还原不完整（备份树保留待重试）", root);
+            failed = true;
+            continue;
+        }
+        LOG("全局替换回滚: 族根 %s 已从备份 %s 还原", root, btop);
+    }
+    free(all);
+    free(bsub);
+    free(scratch);
+    return failed ? -1 : 0;
+}
+
 /* 在目标命名空间内执行：备份一个族 + 三族全部替换 */
 static int do_global_replace(void* raw) {
     struct GlobalReplaceArgs* args = (struct GlobalReplaceArgs*)raw;
@@ -397,17 +514,19 @@ static int do_global_replace(void* raw) {
         }
     }
 
-    /* 4. 替换：三族全部族根，最深优先卸载后 bind fuse_src，并置 MS_SHARED 传播 */
+    /* 4. 替换：三族全部族根，最深优先卸载后 bind fuse_src，并置 MS_SHARED 传播。
+       事务性：任一族根任一步失败即把**本次已动过的全部族根**（含失败者本身，
+       其挂载已被卸下）从备份树 bind 回去——绝不留下裸挂载点。 */
+    int moved = 0; /* roots[0..moved) 已被本次替换步骤动过（卸载/替换），失败需回滚 */
     for (int i = 0; i < root_count; i++) {
         const char* root = roots[i].mount_point;
         int sn = ns_gather_mounts_under(all, n, root, true, true, sub, 128);
         if (sn >= 128) {
             LOG_ERR("全局替换: 族根 %s 子挂载达到 128 上限，拒绝静默截断（替换将不完整）", root);
-            free(all);
-            free(roots);
-            free(sub);
-            return -1;
+            goto replace_failed;
         }
+        /* 即将卸载该族根：此后无论哪一步失败都要把它纳入回滚范围 */
+        moved = i + 1;
         ns_sort_deepest_first(sub, sn); /* 最深优先卸载 */
         for (int k = 0; k < sn; k++) {
             for (int t = 0; t < 8; t++) {
@@ -422,20 +541,14 @@ static int do_global_replace(void* raw) {
             log_ns_error("[global_replace] replace bind %s -> %s failed errno=%d (%s)\n", fuse_src,
                          root, errno, strerror(errno));
             LOG_ERR("全局替换: bind %s -> %s 失败: %s", fuse_src, root, strerror(errno));
-            free(all);
-            free(roots);
-            free(sub);
-            return -1;
+            goto replace_failed;
         }
         if (mount(nullptr, root, nullptr, MS_SHARED, nullptr) != 0) {
             log_ns_error("[global_replace] MS_SHARED %s failed errno=%d (%s)\n", root, errno,
                          strerror(errno));
             LOG_ERR("全局替换: 置 MS_SHARED %s 失败: %s（传播不可用，替换视为失败）", root,
                     strerror(errno));
-            free(all);
-            free(roots);
-            free(sub);
-            return -1;
+            goto replace_failed;
         }
         LOG_DBG("全局替换: %s -> %s", root, fuse_src);
     }
@@ -443,6 +556,15 @@ static int do_global_replace(void* raw) {
     free(roots);
     free(sub);
     return 0;
+
+replace_failed:
+    LOG_ERR("全局替换: 失败，从备份树回滚已动过的 %d 个族根（避免族根停在裸挂载点）", moved);
+    if (rollback_replaced_roots(roots, moved, backup_root) != 0)
+        LOG_ERR("全局替换: 回滚不完整，系统视图可能仍不完整（备份树保留待重试）");
+    free(all);
+    free(roots);
+    free(sub);
+    return -1;
 }
 
 int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* backup_root) {
@@ -519,46 +641,11 @@ static int do_global_restore(void* raw) {
             static const char* const fam_names[] = {"installer", "androidwritable", "user"};
             char root[PATH_MAX];
             snprintf(root, sizeof(root), "/mnt/%s/%d/emulated", fam_names[fam], uid);
-            /* 卸载当前族根上的全部挂载（含 fuse_src bind 与传播子挂载） */
-            int cn = ns_gather_mounts_under(all, n, root, true, true, cur, 128);
-            if (cn >= 128) {
-                LOG_ERR("全局恢复: 族根 %s 子挂载达到 128 上限，拒绝静默截断", root);
-                free(all);
-                free(bsub);
-                free(cur);
-                return -1;
-            }
-            ns_sort_deepest_first(cur, cn);
-            for (int k = 0; k < cn; k++) {
-                for (int t = 0; t < 8; t++) {
-                    if (umount2(cur[k].mount_point, MNT_DETACH) == 0) break;
-                    if (errno == EINVAL) break;
-                }
-            }
-            if (mkdir_recursive(root) != 0 && errno != EEXIST) {
-                LOG_WRN("全局恢复: mkdir %s 失败: %s", root, strerror(errno));
+            /* 卸载当前族根全部挂载 → bind 备份树（父先子后）→ 置 MS_SHARED：
+               与替换失败回滚共用同一出口（restore_root_from_backup） */
+            if (restore_root_from_backup(root, btop, bsub, bn, all, n, cur, 128) != 0) {
                 failed = true;
                 continue;
-            }
-            /* 父先子后 bind 备份树节点到族根 */
-            for (int k = 0; k < bn; k++) {
-                const char* rel = bsub[k].mount_point + strlen(btop); /* "" 或 "/0/Android/data" */
-                char target[PATH_MAX];
-                snprintf(target, sizeof(target), "%s%s", root, rel);
-                if (mkdir_recursive(target) != 0) {
-                    LOG_WRN("全局恢复: mkdir %s 失败", target);
-                    failed = true;
-                    continue;
-                }
-                if (mount(bsub[k].mount_point, target, nullptr, MS_BIND, nullptr) != 0) {
-                    LOG_WRN("全局恢复: bind %s -> %s 失败: %s", bsub[k].mount_point, target,
-                            strerror(errno));
-                    failed = true;
-                    continue;
-                }
-            }
-            if (mount(nullptr, root, nullptr, MS_SHARED, nullptr) != 0) {
-                LOG_WRN("全局恢复: 置 MS_SHARED %s 失败: %s（传播不可用）", root, strerror(errno));
             }
             LOG_DBG("全局恢复: 用户 %d 族 %s 已还原", uid, fam_names[fam]);
         }
