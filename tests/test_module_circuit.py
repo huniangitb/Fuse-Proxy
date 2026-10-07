@@ -20,6 +20,8 @@ V4 起规则引擎已内建（`src/daemon/fw_rules.c`），模块只剩「后端
   5. ban 持久化：重启 daemon 后同 mtime 坏 .so 不重载（防崩溃-重载震荡）
   6. backend_readdir 崩溃围栏 → 恢复 + 置毒
   7. backend_readdir 谎报条数（>max）→ 整批丢弃 + 计错误，ls 无垃圾条目
+  7b. backend_read 谎报读取量（>size）→ read 返回 EIO + 计错误（不得越界读）
+  7c. backend_write 谎报写入量（>size）→ write 返回 EIO + 计错误
   8. 同进程连续两次崩溃（两个模块各一次）daemon 均存活（in_handler 复位）
   9. backend_match 崩溃围栏 + 业务 errno 不计熔断（连续多次 -ENOENT 不得置毒）
   10. ban 自愈 + 槽位复用：坏模块熔断后换同名修复版 .so（mtime 变化）→ 重载恢复
@@ -27,11 +29,12 @@ V4 起规则引擎已内建（`src/daemon/fw_rules.c`），模块只剩「后端
 测试模块（gcc 现场编译，第三方视角仅依赖 nsp_module.h，见 docs/modules.md）：
   backend_crash.so — backend_match: bcrash→SIGSEGV / bmatch→认领 / biznoent→业务 -ENOENT
   backend_bad.so   — berr→非 errno 契约违规 / bovf→谎报条数 / breaddir_crash→SIGSEGV
-                     / bhealth→健康基线；-DFIXED 编译出同名修复版供用例 10
+                     / brovf→read 谎报量 / bwovf→write 谎报量 / bhealth→健康基线；
+                     -DFIXED 编译出同名修复版供用例 10
 
 前置：build_gnu/ 产物；/dev/fuse；gcc；fusermount3；/var/fuse-proxy/log 可写。
 """
-import subprocess, os, sys, time, shutil
+import subprocess, os, sys, time, shutil, errno
 from pathlib import Path
 
 HERE  = Path(__file__).resolve().parent
@@ -392,6 +395,93 @@ def main():
             "越界条目", f"entries={entries[:6]}")
         ok("超限被记为契约违规（累计够阈值即熔断）") if gone("bhealth") else fail(
             "超限未记账", f"bhealth 仍由后端服务；errlog: {errlog_text()[:200]!r}")
+    finally:
+        stop(p)
+        unstage_module("backend_bad")
+    if BANFILE.exists(): BANFILE.unlink()
+
+    # ── 7b. backend_read 回传 got>size：拒绝 + 计错误（不得越界读） ──
+    #     判别：旧实现 `return rc == 0 ? (int)got : …` 直接回包，libfuse 从只有
+    #     size 字节的读缓冲取数（ASan 实测 got=4160 时命中堆异常）；且**不计契约
+    #     违规**——模块不被熔断、module_errors.log 无记录。新实现按契约违规拒绝
+    #     （-EIO）并计错误，窗口内累计 5 次即置毒落 ban。判别看**记账**（ban +
+    #     errlog），不只看 read 的 errno：越界回包会被内核拒收，两侧 errno 都是 EIO。
+    print("\n── 7b. backend_read 谎报读取量（>size）：拒绝 + 计错误 ──")
+    wconf("brovf")
+    stage_module("backend_bad")
+    p = start()
+    if not p: fail("启动失败（read 超限）"); return 1
+    try:
+        got_eio = False
+        try:
+            fd = os.open(str(node("brovf")), os.O_RDONLY)
+            try:
+                os.read(fd, 4096)
+            except OSError as e:
+                got_eio = (e.errno == errno.EIO)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            fail("read 超限前置：open 后端文件", str(e))
+        ok("backend_read 回传超长 → read 不返回成功（EIO）") if got_eio else fail(
+            "read 超长未拒绝", "read 未返回 EIO（旧实现直接回包，堆越界读）")
+        # 累计到熔断阈值（窗口内 5 次）→ 置毒卸载 + ban 落盘 + module_errors.log
+        for _ in range(6):
+            try:
+                fd = os.open(str(node("brovf")), os.O_RDONLY)
+                try: os.read(fd, 4096)
+                except OSError: pass
+                finally: os.close(fd)
+            except OSError: pass
+            time.sleep(0.2)
+        ok("daemon 存活（read 超限不越界）") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+        ok("read 超限被记为契约违规（累计够阈值即熔断落 ban）") if (
+            BANFILE.exists() and "backend_bad" in BANFILE.read_text()) else fail(
+            "read 超限未记账", f"ban: {BANFILE.read_text()[:200] if BANFILE.exists() else '(无)'!r}")
+        # 注意 "op=backend_read)" 带右括号：避免被 backend_readdir 的日志误命中
+        ok("module_errors.log 记录 op=backend_read") if "op=backend_read)" in errlog_text() else fail(
+            "errlog 缺 op=backend_read", f"内容: {errlog_text()[:200]!r}")
+    finally:
+        stop(p)
+        unstage_module("backend_bad")
+    if BANFILE.exists(): BANFILE.unlink()
+
+    # ── 7c. backend_write 回传 wrote>size：拒绝 + 计错误 ──
+    #     判别同 7b：旧实现回报「写入量大于请求量」且不计契约违规（模块不被熔断）；
+    #     新实现拒绝（-EIO）并计错误 → 累计熔断落 ban + errlog。
+    print("\n── 7c. backend_write 谎报写入量（>size）：拒绝 + 计错误 ──")
+    wconf("bwovf")
+    stage_module("backend_bad")
+    p = start()
+    if not p: fail("启动失败（write 超限）"); return 1
+    try:
+        got_eio = False
+        try:
+            fd = os.open(str(node("bwovf")), os.O_WRONLY)
+            try:
+                os.write(fd, b"x" * 128)
+            except OSError as e:
+                got_eio = (e.errno == errno.EIO)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            fail("write 超限前置：open 后端文件", str(e))
+        ok("backend_write 回传超长 → write 不返回成功（EIO）") if got_eio else fail(
+            "write 超长未拒绝", "write 未返回 EIO（旧实现回报大于请求量）")
+        for _ in range(6):
+            try:
+                fd = os.open(str(node("bwovf")), os.O_WRONLY)
+                try: os.write(fd, b"x" * 128)
+                except OSError: pass
+                finally: os.close(fd)
+            except OSError: pass
+            time.sleep(0.2)
+        ok("daemon 存活（write 超限不越界）") if p.poll() is None else fail("daemon 崩溃", f"rc={p.poll()}")
+        ok("write 超限被记为契约违规（累计够阈值即熔断落 ban）") if (
+            BANFILE.exists() and "backend_bad" in BANFILE.read_text()) else fail(
+            "write 超限未记账", f"ban: {BANFILE.read_text()[:200] if BANFILE.exists() else '(无)'!r}")
+        ok("module_errors.log 记录 op=backend_write") if "op=backend_write)" in errlog_text() else fail(
+            "errlog 缺 op=backend_write", f"内容: {errlog_text()[:200]!r}")
     finally:
         stop(p)
         unstage_module("backend_bad")

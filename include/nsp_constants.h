@@ -42,6 +42,18 @@
 #define NSP_SANDBOX_DIRNAME "sandbox"
 #define NSP_SANDBOX_DIR_ENV "NSP_SANDBOX_DIR"
 
+/* ================= 默认 SELinux 文件上下文 =================
+ * 存储区新建文件/目录在无法从父目录继承（lgetxattr 无结果）时回填的默认
+ * context。**唯一出处**：common.c 的 sync_attributes 与 fuse_daemon.c 的
+ * 属性继承 / getxattr 回填共用，长度一律用 sizeof(...)（含结尾 NUL），
+ * 不得手写字节数——曾出现字面量 32 字符却传 35 的越界读（off-by-3）。 */
+#define NSP_DEFAULT_FILE_CONTEXT "u:object_r:media_rw_data_file:s0"
+/* 编译期锁死长度（含结尾 NUL = 33）：曾出现字面量 32 字符却手写 35 传给
+   lsetxattr → 越过字面量读 2 字节写进 SELinux 上下文值。改成宏 + sizeof 后
+   长度由编译器保证，本断言再钉住取值不被误改。 */
+_Static_assert(sizeof(NSP_DEFAULT_FILE_CONTEXT) == 33,
+               "NSP_DEFAULT_FILE_CONTEXT length changed: callers pass sizeof(), keep them in sync");
+
 /* ================= 缓冲区上限 =================
  * NSP_CONFIG_LINE_MAX：配置/规则文件单行上限（docs/config.md「单行 ≤2048 字节」，
  *   超长行不参与段/键匹配）；NSP_LOG_MSG_MAX：单条日志消息上限（common.c 组帧
