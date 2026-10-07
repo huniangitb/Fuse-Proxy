@@ -895,7 +895,8 @@ static void build_file_rules(const char* path, json_object* rules, json_object* 
 }
 
 /* 类别段 JSON：只取主文件内精确段头（[USER_APPS:<uid>]/[SYSTEM_APPS]）
-   到下一段头之间的行；段不存在返回空规则（file 照样回主文件路径） */
+   覆盖的行区间（段不存在则空规则，file 照样回主文件路径）。
+   索引为**段内**局部序号——与 REMOVE/TOGGLE 的 scope 口径同源（§A5）。 */
 static json_object* build_category_json(const char* pkg, int uid) {
     char path[PATH_MAX];
     char sec_name[64], hdr[72];
@@ -908,17 +909,10 @@ static json_object* build_category_json(const char* pkg, int uid) {
     int count = 0, cap = 0;
     char** lines = nsp_rule_file_read(path, &count, &cap);
     if (lines) {
-        int hdr_idx = nsp_rule_file_find_header(lines, count, hdr);
-        if (hdr_idx >= 0) {
-            int end = hdr_idx + 1;
-            while (end < count) {
-                char* p = lines[end];
-                while (isspace((unsigned char)*p)) p++;
-                if (*p == '[') break;
-                end++;
-            }
-            build_lines_rules(lines + hdr_idx + 1, end - hdr_idx - 1, rules, switches);
-        }
+        NspRuleScope scope = {sec_name, NSP_RULE_SEC_EXACT};
+        int beg = 0, end = 0;
+        if (nsp_rule_file_scope_range(lines, count, &scope, &beg, &end))
+            build_lines_rules(lines + beg, end - beg, rules, switches);
         nsp_rule_file_free(lines, count);
     }
     json_object_object_add(cat, "pkg", json_object_new_string(pkg));
@@ -930,13 +924,24 @@ static json_object* build_category_json(const char* pkg, int uid) {
     return cat;
 }
 
+/* 全局视图：只取 [GLOBAL] 段（含文件起始到首个非 GLOBAL 段头之间的行，与解析器
+   的全局作用域一致）。此前扫整份主文件，会把类别段（[USER_APPS:<uid>]/
+   [SYSTEM_APPS]）的规则与开关一并混进 GLOBAL 视图（§A5）。 */
 static json_object* build_global_json(void) {
     char path[PATH_MAX];
     main_conf_path(path, sizeof(path));
     json_object* global = json_object_new_object();
     json_object* switches = json_object_new_object();
     json_object* rules = json_object_new_array();
-    build_file_rules(path, rules, switches);
+    int count = 0, cap = 0;
+    char** lines = nsp_rule_file_read(path, &count, &cap);
+    if (lines) {
+        NspRuleScope scope = {"GLOBAL", NSP_RULE_SEC_PREFIX};
+        int beg = 0, end = count;
+        if (nsp_rule_file_scope_range(lines, count, &scope, &beg, &end))
+            build_lines_rules(lines + beg, end - beg, rules, switches);
+        nsp_rule_file_free(lines, count);
+    }
     json_object_object_add(global, "file", json_object_new_string(path));
     json_object_object_add(global, "switches", switches);
     json_object_object_add(global, "rules", rules);
@@ -1188,8 +1193,8 @@ static void handle_get(int fd, json_object* req) {
         reply_error(fd, "GET", "非法 uid: %d", uid);
         return;
     }
-    /* 类别段视图：主文件内精确段头切片（索引为段内局部序号，仅展示用；
-       REMOVE/TOGGLE 仍用主文件全局索引，与 pkg=GLOBAL 语义一致） */
+    /* 类别段视图：主文件内精确段头切片；索引为**段内**局部序号，
+       与 REMOVE/TOGGLE 的 scope 口径同源（§A5） */
     if (nsp_rule_file_is_category_pkg(pkg)) {
         json_object* data = json_object_new_object();
         json_object_object_add(data, "category", build_category_json(pkg, uid));
@@ -1437,17 +1442,36 @@ static void handle_add(int fd, json_object* req) {
     }
 }
 
-/* 定位规则所在文件路径；scope=GLOBAL/类别段返回主配置文件，否则返回应用规则
-   **当前生效**文件（停用状态返回 .conf.disabled，保证后续操作写入同一文件、
-   不丢规则）。类别段 REMOVE/TOGGLE 用主文件全局索引（与 GLOBAL 一致）。 */
-static void resolve_rule_path(const char* pkg, int uid, bool* is_global, char* out, size_t sz) {
-    if (!pkg || strcasecmp(pkg, "GLOBAL") == 0 || nsp_rule_file_is_category_pkg(pkg)) {
-        *is_global = true;
-        main_conf_path(out, sz);
-    } else {
-        *is_global = false;
-        nsp_rule_file_app_active_path(g_config_dir, uid, pkg, out, sz);
+/* 定位规则所在文件与**作用域**（索引口径）。
+ *   GLOBAL / 类别段 → 主配置文件，作用域限定在该段（段内索引）；
+ *   应用            → 应用规则**当前生效**文件（停用状态为 .conf.disabled，
+ *                     保证后续操作写同一文件、不丢规则），作用域为整文件。
+ * 作用域必须与 GET 输出一致：GET 类别段只回段内切片、GET GLOBAL 只回 [GLOBAL]
+ * 段；若删除/切换仍按整文件全局序号计数，就会删错规则（§A5）。 */
+typedef struct {
+    char path[PATH_MAX];
+    char sec[64];        /* scope.sec_name 的存储（NULL 时不用） */
+    NspRuleScope scope;  /* sec_name == NULL 表示整文件 */
+} RuleTarget;
+
+static void resolve_rule_target(const char* pkg, int uid, RuleTarget* t) {
+    memset(t, 0, sizeof *t);
+    t->scope.sec_match = NSP_RULE_SEC_EXACT;
+    if (!pkg || strcasecmp(pkg, "GLOBAL") == 0) {
+        main_conf_path(t->path, sizeof(t->path));
+        snprintf(t->sec, sizeof(t->sec), "GLOBAL");
+        t->scope.sec_name = t->sec;
+        t->scope.sec_match = NSP_RULE_SEC_PREFIX;
+        return;
     }
+    if (nsp_rule_file_is_category_pkg(pkg)) {
+        main_conf_path(t->path, sizeof(t->path));
+        nsp_rule_file_category_name(pkg, uid, t->sec, sizeof(t->sec));
+        t->scope.sec_name = t->sec;
+        return;
+    }
+    nsp_rule_file_app_active_path(g_config_dir, uid, pkg, t->path, sizeof(t->path));
+    t->scope.sec_name = NULL;
 }
 
 /* REMOVE：按 (类型, 索引) 删除规则行（索引与 LIST 输出一致，含已停用行） */
@@ -1479,22 +1503,22 @@ static void handle_remove(int fd, json_object* req) {
         reply_error(fd, "REMOVE", "非法包名: %s", pkg);
         return;
     }
-    bool is_global = false;
-    char path[PATH_MAX];
-    resolve_rule_path(pkg, uid, &is_global, path, sizeof(path));
-    /* 索引计入已停用行（与 LIST 输出一致） */
+    RuleTarget tgt;
+    resolve_rule_target(pkg, uid, &tgt);
+    /* 索引计入已停用行，且限定在该段内（与 GET 展示索引一致） */
     char removed[MAX_LINE];
-    int rc = nsp_rule_file_remove_nth(path, rule_type_name(t), index, removed, sizeof removed);
+    int rc = nsp_rule_file_remove_nth_scoped(tgt.path, &tgt.scope, rule_type_name(t), index, removed,
+                                             sizeof removed);
     if (rc == NSP_RULE_FILE_ENOTFND) {
         reply_error(fd, "REMOVE", "未找到 %s 类型的第 %d 条规则", type_s, index);
         return;
     }
     if (rc != NSP_RULE_FILE_OK) {
-        reply_error(fd, "REMOVE", "写入 %s 失败: %s", path, strerror(errno));
+        reply_error(fd, "REMOVE", "写入 %s 失败: %s", tgt.path, strerror(errno));
         return;
     }
     json_object* data = json_object_new_object();
-    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "file", json_object_new_string(tgt.path));
     json_object_object_add(data, "removed", json_object_new_string(removed));
     reply_ok(fd, "REMOVE", data);
 }
@@ -1532,68 +1556,28 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
         reply_error(fd, cmd, "非法包名: %s", pkg);
         return;
     }
-    bool is_global = false;
-    char path[PATH_MAX];
-    resolve_rule_path(pkg, uid, &is_global, path, sizeof(path));
-    int count = 0, cap = 0;
-    char** lines = nsp_rule_file_read(path, &count, &cap);
-    if (!lines) {
-        reply_error(fd, cmd, "无法打开规则文件 %s", path);
-        return;
-    }
-    int found = nsp_rule_file_find_nth(lines, count, rule_type_name(t), index);
-    if (found < 0) {
-        nsp_rule_file_free(lines, count);
+    RuleTarget tgt;
+    resolve_rule_target(pkg, uid, &tgt);
+    /* 加锁事务：读-改-写全程持目录 flock，且在**段内**按索引定位（与 GET 一致）。
+       此前在调用侧自行「读全文→改一行→覆盖写」既不持锁（并发 ADD 会被旧快照
+       覆盖，§A6），索引又是整文件全局序号（会改错类别段的行，§A5）。 */
+    char updated[MAX_LINE];
+    bool changed = false;
+    int rc = nsp_rule_file_toggle_nth_scoped(tgt.path, &tgt.scope, rule_type_name(t), index, enable,
+                                             updated, sizeof updated, &changed);
+    if (rc == NSP_RULE_FILE_ENOTFND) {
         reply_error(fd, cmd, "未找到 %s 类型的第 %d 条规则", type_s, index);
         return;
     }
-    char* p = lines[found];
-    while (*p == ' ' || *p == '\t') p++;
-    bool already = (enable ? !line_is_disabled(lines[found]) : line_is_disabled(lines[found]));
-    if (!already) {
-        if (enable) {
-            /* 去掉行首 #（及紧随其后的空白）——向前移动，长度缩小，安全 */
-            if (*p == '#') {
-                char* q = p + 1;
-                while (*q == ' ' || *q == '\t') q++;
-                memmove(p, q, strlen(q) + 1);
-            }
-        } else {
-            /* 行首插入 #：行变长，必须重建缓冲，禁止原地 memmove 越界
-               （strdup 分配 len+1 字节，插入后需 len+2 字节） */
-            size_t prefix = (size_t)(p - lines[found]);
-            size_t len = strlen(lines[found]);
-            if (len + 2 >= MAX_LINE) {
-                nsp_rule_file_free(lines, count);
-                reply_error(fd, cmd, "规则行过长，无法停用");
-                return;
-            }
-            char* nl = malloc(len + 2);
-            if (!nl) {
-                nsp_rule_file_free(lines, count);
-                reply_error(fd, cmd, "内存不足");
-                return;
-            }
-            memcpy(nl, lines[found], prefix);
-            nl[prefix] = '#';
-            strcpy(nl + prefix + 1, p);
-            free(lines[found]);
-            lines[found] = nl;
-        }
-        if (!nsp_rule_file_write(path, lines, count)) {
-            reply_error(fd, cmd, "写入 %s 失败: %s", path, strerror(errno));
-            nsp_rule_file_free(lines, count);
-            return;
-        }
+    if (rc != NSP_RULE_FILE_OK) {
+        reply_error(fd, cmd, "写入 %s 失败: %s", tgt.path, strerror(errno));
+        return;
     }
-    char updated[MAX_LINE];
-    snprintf(updated, sizeof(updated), "%s", lines[found]);
-    nsp_rule_file_free(lines, count);
     json_object* data = json_object_new_object();
-    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "file", json_object_new_string(tgt.path));
     json_object_object_add(data, "line", json_object_new_string(updated));
     json_object_object_add(data, "enabled", json_object_new_boolean(enable));
-    json_object_object_add(data, "changed", json_object_new_boolean(!already));
+    json_object_object_add(data, "changed", json_object_new_boolean(changed));
     reply_ok(fd, cmd, data);
 }
 

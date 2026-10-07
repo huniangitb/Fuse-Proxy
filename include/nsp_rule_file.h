@@ -118,8 +118,41 @@ void nsp_rule_file_category_name(const char* pkg, int uid, char* out, size_t sz)
 bool nsp_rule_file_line_is_type(const char* line, const char* type_name);
 
 /* 定位第 index 条 type_name 规则的行号（**计入已停用行**，与 LIST 索引一致）；
- * 未找到返回 NSP_RULE_FILE_ENOTFND */
+ * 未找到返回 NSP_RULE_FILE_ENOTFND。
+ * 索引为**整文件**全局序号——仅适用于无段文件（App-rules/<pkg>.conf）。段式文件
+ * 请改用 nsp_rule_file_find_nth_scoped，否则与 GET 的段内索引口径不一致（§A5）。 */
 int nsp_rule_file_find_nth(char** lines, int count, const char* type_name, int index);
+
+/* ==================== 作用域（段内索引口径） ==================== */
+
+/* 规则作用域：把「第 index 条」限定在某个段覆盖的行区间内，使编辑入口的索引
+ * 口径与 GET/LIST 的展示索引一致（GET 类别段只回段内切片、GET GLOBAL 只回
+ * [GLOBAL] 段——见 rule_server 的 build_category_json / build_global_json）。
+ *
+ *   sec_name == NULL  → 整文件（无段文件 App-rules/<pkg>.conf）；
+ *   sec_name != NULL  → 该段覆盖的行区间，区间形状由 sec_match 决定：
+ *     · NSP_RULE_SEC_PREFIX（GLOBAL）：**文件起始**到首个非本段段头；本段段头
+ *       自身透明（不计为边界）。与解析器语义一致——首个段头之前的规则与
+ *       [GLOBAL] 段内的规则同归全局（config_parser.c 的 cur 初值为
+ *       &g_global_cfg_stage）。
+ *     · NSP_RULE_SEC_EXACT（类别段）：精确段头之后到下一段头之前。
+ *
+ * 行首为 '[' 的行一律视为段边界（与既有切片实现一致；畸形段头同样断段）。 */
+typedef struct {
+    const char* sec_name; /* NULL = 整文件 */
+    NspRuleSectionMatch sec_match;
+} NspRuleScope;
+
+/* 计算 scope 覆盖的行区间 [*out_beg, *out_end)（end 为独占上界）。
+ * 整文件作用域恒成功；EXACT 段头缺失（段不存在）返回 false，出参不动。 */
+bool nsp_rule_file_scope_range(char** lines, int count, const NspRuleScope* scope, int* out_beg,
+                               int* out_end);
+
+/* 在 scope 内定位第 index 条 type_name 规则的行号（计入已停用行）。
+ * scope 为 NULL 或 sec_name 为 NULL 时等价于 nsp_rule_file_find_nth（整文件）。
+ * 未找到返回 NSP_RULE_FILE_ENOTFND。 */
+int nsp_rule_file_find_nth_scoped(char** lines, int count, const NspRuleScope* scope,
+                                  const char* type_name, int index);
 
 /* ==================== 段式文件写入 ==================== */
 
@@ -156,5 +189,25 @@ int nsp_rule_file_upsert_line(const char* path, bool is_switch, const char* type
  * 0=成功；NSP_RULE_FILE_ENOTFND=未找到该索引；负值为错误码。 */
 int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index, char* out_removed,
                              size_t removed_sz);
+
+/* 同 nsp_rule_file_remove_nth，但索引限定在 scope 内（scope 为 NULL 时整文件）。
+ * 全程持目录 flock 串行化读-改-写（§A6）。 */
+int nsp_rule_file_remove_nth_scoped(const char* path, const NspRuleScope* scope,
+                                    const char* type_name, int index, char* out_removed,
+                                    size_t removed_sz);
+
+/* ==================== 启用/停用（# 注释切换） ==================== */
+
+/* 切换 scope 内第 index 条 type_name 规则的启用状态（索引计入已停用行）。
+ *   enable=true  → 去掉行首 '#'（及其后空白）
+ *   enable=false → 在行首插入 '#'（行变长，内部重建缓冲）
+ * out_line 非 NULL 时写入改后整行（截断到 out_sz）；out_changed 表是否实际改动
+ * （已处于目标状态时返回成功、false，且不落盘）。
+ * 全程持目录 flock 串行化读-改-写——编辑入口一律走本函数，不得在调用侧自行
+ * 「读全文→改一行→覆盖写」（那条路径不持锁，会丢并发修改，§A6）。
+ * 0=成功；NSP_RULE_FILE_ENOTFND=未找到该索引；负值为错误码。 */
+int nsp_rule_file_toggle_nth_scoped(const char* path, const NspRuleScope* scope,
+                                    const char* type_name, int index, bool enable, char* out_line,
+                                    size_t out_sz, bool* out_changed);
 
 #endif /* NSP_RULE_FILE_H */

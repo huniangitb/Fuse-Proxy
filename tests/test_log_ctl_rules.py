@@ -196,6 +196,35 @@ def test_category_scope():
     c.close()
 
 
+def test_category_remove_scope():
+    """remove-rule 的索引口径必须与展示一致（段内），不能按整文件序号计数。
+
+    回归背景（§A5）：[GLOBAL] 已有同类型规则时，类别段的 `index=0` 若按整文件
+    全局序号解释，会删到 [GLOBAL] 的那条——用户的类别规则原封不动，反而丢了
+    全局规则。
+    """
+    print("── remove-rule 段内索引口径（混合段） ──")
+    c = Cfg("[GLOBAL]\nHIDE /global_first\n")
+    c.run("set-rule", "USER_APPS", "HIDE", "/cat_hide")
+    ls = lines_of(c.main_text())
+    check("预置：全局与类别段各一条 HIDE",
+          ls.count("HIDE /global_first") == 1 and ls.count("HIDE /cat_hide") == 1, True)
+    rc, out = c.run("remove-rule", "USER_APPS", "HIDE", "0")
+    check("remove-rule USER_APPS index=0 成功", rc, 0)
+    ls = lines_of(c.main_text())
+    check("删的是类别段那条", "HIDE /cat_hide" not in ls, True)
+    check("GLOBAL 的 HIDE 原样保留", "HIDE /global_first" in ls, True)
+
+    # 反向：GLOBAL index=0 不得动类别段
+    c.run("set-rule", "USER_APPS", "HIDE", "/cat_hide2")
+    rc, out = c.run("remove-rule", "GLOBAL", "HIDE", "0")
+    check("remove-rule GLOBAL index=0 成功", rc, 0)
+    ls = lines_of(c.main_text())
+    check("GLOBAL 的 HIDE 被删", "HIDE /global_first" not in ls, True)
+    check("类别段的 HIDE 未受影响", "HIDE /cat_hide2" in ls, True)
+    c.close()
+
+
 def test_category_header_variants():
     """类别段头的容错形态：写入不得另起重复段、不得破坏原段头、不得粘连末行。
 
@@ -282,6 +311,7 @@ def main():
     test_app_scope()
     test_app_disabled_scope()
     test_category_scope()
+    test_category_remove_scope()
     test_category_header_variants()
     test_unknown_type()
     test_remove_index_semantics()
