@@ -132,8 +132,22 @@ static int mux_socket_cb(CURL* easy, curl_socket_t s, int what, void* userp, voi
         ev.events = EPOLLIN | EPOLLOUT;
     else
         ev.events = 0; /* CURL_POLL_NONE：登记但暂不关心可读性 */
-    if (epoll_ctl(m->epfd, EPOLL_CTL_ADD, s, &ev) != 0 && errno == EEXIST)
-        (void)epoll_ctl(m->epfd, EPOLL_CTL_MOD, s, &ev);
+    if (epoll_ctl(m->epfd, EPOLL_CTL_ADD, s, &ev) != 0) {
+        if (errno == EEXIST) {
+            if (epoll_ctl(m->epfd, EPOLL_CTL_MOD, s, &ev) != 0)
+                LOG_WRN("ftp_mux: epoll MOD fd=%d 失败: %s（该 socket 靠超时推进）", s,
+                        strerror(errno));
+        } else {
+            /* 非 EEXIST 失败（EPERM/ENOSPC/EBADF...）：此 socket 不会被监视，
+                libcurl 收不到可读/可写通知 → 传输只能靠定时器空转或 30s 超时
+                （甚至永久卡住）。此前静默吞掉，故障现场无任何线索。
+                libcurl 的 socket 回调无法报错（返回非 0 会让 multi 句柄中止，
+                libcurl 也未定义其语义），故 loud 日志后仍返回 0，由超时兜底。 */
+            LOG_ERR("ftp_mux: epoll ADD fd=%d events=0x%x 失败: %s"
+                    "（socket 未被监视，本次传输可能靠超时推进）",
+                    s, (unsigned)ev.events, strerror(errno));
+        }
+    }
     return 0;
 }
 
