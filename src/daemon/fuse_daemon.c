@@ -2282,11 +2282,12 @@ static int vfs_removexattr(const char* path, const char* name) {
 static void vfs_destroy(void* private_data) {
     (void)private_data;
     LOG_DBG("FUSE 守护进程正在退出，清理资源...");
-    /* 先投递 EXIT（comm 线程仍存活），再 log_close 做最尽力 drain + join */
+    /* 只投递 EXIT（comm 线程仍存活），日志在 main 尾部
+       module_system_shutdown() 之后再关——否则模块 exit 钩子、卸载失败告警、
+       provider 收尾日志全被丢弃（此前 log_close 先于卸载，退出期日志为空）。 */
     char msg[256];
     snprintf(msg, sizeof(msg), "FUSE_EXIT %d", getpid());
     nsp_comm_post(NSP_CH_IPC, msg, strlen(msg) + 1);
-    log_close();
 }
 
 /* 透传会话 fd：经 fuse_get_context()->fuse → fuse_get_session → fuse_session_fd 解析
@@ -2921,5 +2922,9 @@ int main(int argc, char* argv[]) {
        因 truncate 失效、重定位丢失）就会跳到未重定位地址而崩在退出瞬间。
        module_system_shutdown 内部对失效镜像走"不调 exit、直接 dlclose"。 */
     module_system_shutdown();
+    /* 日志关闭必须在模块卸载之后：module_system_shutdown 内部的 exit 钩子、
+       镜像失效/ban 告警、provider 收尾统计都要落盘。log_close 自身的"最尽力
+       drain + join comm 线程"语义不变，只是位置后移。 */
+    log_close();
     return fmain_rc;
 }
