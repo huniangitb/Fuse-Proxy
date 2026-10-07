@@ -569,6 +569,16 @@ static int module_load_one(const char* name) {
     return module_commit(name, h, &info, mfd);
 }
 
+/* quiescence 门控（唯一判定点）：模块仍有活跃句柄（应用 open 中）时**不得卸载/
+ * dlclose**。理由：exit 只能停模块**自己起的**线程；而应用持有的句柄背后的
+ * 数据面线程（如 FTP 的 nsp_ftpdl/nsp_ftpup）由该句柄的 release 收尾，exit 无从
+ * 知道句柄何时关闭。dlclose 解除映射后这些线程继续执行失效代码，且它们不在任何
+ * 围栏窗口内（非框架发起的调用）→ 归因失败 → 走原崩溃处理器 → 整个 daemon 死。
+ * 三条卸载入口（扫描/置毒/关停）共用本判定，避免再漂移出漏网点。 */
+static bool module_quiescent(const ModuleEntry* m) {
+    return !(m->active_handles_fn && m->active_handles_fn() > 0);
+}
+
 static int module_unload_one(const char* name) {
     pthread_rwlock_wrlock(&g_module_lock);
     int slot = find_slot(name);
@@ -577,6 +587,14 @@ static int module_unload_one(const char* name) {
         return -1;
     }
     ModuleEntry* m = &g_modules[slot];
+    /* quiescence 门控：仍有活跃句柄则放弃本次卸载（返回 1 = 已推迟，非失败），
+       由调用方（扫描线程）定时重试；daemon 关停路径同样跳过——进程即将退出，
+       保持 .so 映射比 dlclose 后带崩退出更安全。 */
+    if (!module_quiescent(m)) {
+        pthread_rwlock_unlock(&g_module_lock);
+        LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），跳过卸载（保持 .so 映射）", name);
+        return 1;
+    }
     void* h = m->handle;
     NspModuleInfo info = m->info;
     if (info.ops && info.ops->backend_match)
@@ -902,6 +920,8 @@ int module_fault_poison(int slot, const char* reason) {
     void* h = m->handle;
     NspModuleInfo info = m->info;
     bool was_active = m->active;
+    /* 句柄门控判定所需的函数指针：在写锁内一并取出（指针加载后不变） */
+    int (*active_handles_fn)(void) = m->active_handles_fn;
     pthread_rwlock_unlock(&g_module_lock);
 
     /* 关键顺序（修复重载竞态）：ban 记录必须**先于槽位置空**落盘。
@@ -970,8 +990,18 @@ int module_fault_poison(int slot, const char* reason) {
        为安全调用不可信模块代码而设，exit 内二次崩溃被 longjmp 收敛。
        唯一不能 dlclose 的情形是 exit 自身崩溃——那说明无法确认线程已停，
        此时保持 .so 映射（同 !drained 分支的"绝不 dlclose 存活模块"）。
-       exit 缺失视为模块声明无清理需求，与优雅卸载路径同样直接 dlclose。 */
-    bool can_unload = true;
+       exit 缺失视为模块声明无清理需求，与优雅卸载路径同样直接 dlclose。
+
+       A12 quiescence 门控：exit 只能停模块**自己起的**线程；应用仍持有的句柄
+       背后的数据面线程由该句柄的 release 收尾（FTP 的 nsp_ftpdl/nsp_ftpup），
+       exit 不保证停它们 → 此时同样不 dlclose（exit 照调，让模块先收自己的线程）。 */
+    bool quiescent = !(active_handles_fn && active_handles_fn() > 0);
+    bool can_unload = quiescent;
+    if (!quiescent) {
+        LOG_WRN("[MOD_ERR] module=%s op=poison reason=%s detail=仍有活跃句柄,"
+                ".so 保持映射不 dlclose（句柄由 release 收尾）",
+                name, reason ? reason : "(null)");
+    }
     if (info.exit) {
         int erc = nsp_fence_exit_call(slot, "exit", info.exit);
         if (erc == NSP_FENCE_FAULT) {
@@ -985,8 +1015,9 @@ int module_fault_poison(int slot, const char* reason) {
         fault_fence_unregister_slot(slot);
         fw_config_forget_module(name); /* 注销订阅/监听与过滤视图 */
         LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=槽位已置空,规则立即失效,"
-                ".so 保持映射（exit 崩溃故不 dlclose）",
-                name, reason ? reason : "(null)");
+                ".so 保持映射（%s）",
+                name, reason ? reason : "(null)",
+                quiescent ? "exit 崩溃故不 dlclose" : "仍有活跃句柄故不 dlclose");
         return 0;
     }
     dlclose(h);
@@ -1058,7 +1089,7 @@ static bool module_scan_diff(void) {
         if (!found) {
             /* quiescence 门控：模块仍有活跃句柄（应用 open 中）则延迟卸载，
                返回 pending 由调用方定时重试——避免热重载竞态崩溃 */
-            if (g_modules[i].active_handles_fn && g_modules[i].active_handles_fn() > 0) {
+            if (!module_quiescent(&g_modules[i])) {
                 LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟卸载", g_modules[i].name);
                 pending = true;
                 continue;
@@ -1089,7 +1120,7 @@ static bool module_scan_diff(void) {
             if (stat(so, &st) == 0 && st.st_mtime != g_modules[slot].mtime) {
                 /* quiescence 门控：模块仍有活跃句柄（应用 open 中）则延迟
                    热重载，返回 pending 定时重试——"无应用 open、写入完成后才热加载" */
-                if (g_modules[slot].active_handles_fn && g_modules[slot].active_handles_fn() > 0) {
+                if (!module_quiescent(&g_modules[slot])) {
                     LOG_WRN("模块 %s 仍有活跃句柄（应用使用中），延迟热重载", present[p]);
                     pending = true;
                     continue;

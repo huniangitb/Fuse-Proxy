@@ -59,7 +59,9 @@ def build_modules():
     for name, extra, cflags in (("backend_crash", "-O1 -g", []),
                                 ("backend_bad", "-O1 -g", []),
                                 # 同名修复版：模块名仍是 backend_bad，只有 mtime 不同
-                                ("backend_bad_fixed", "-O1 -DFIXED", [])):
+                                ("backend_bad_fixed", "-O1 -DFIXED", []),
+                                # A12：自带配置线程 + 由句柄拥有的数据面线程（exit 不收）
+                                ("backend_hold", "-O1 -g", ["-pthread"])):
         out = ROOT / "build_gnu" / f"{name}.so"
         r = subprocess.run(["gcc", "-shared", "-fPIC", *extra.split(), "-DNSP_MODULE_BUILD",
                             *cflags, f"-I{ROOT}/include", "-o", str(out), str(HERE / f"{name.split('_fixed')[0]}.c")],
@@ -100,9 +102,11 @@ def wconf(*kws):
     lines += [f"FTP /{kw} seg1" for kw in kws]
     CONF.write_text("\n".join(lines) + "\n")
 
-def start():
+def start(extra_env=None):
     """启动 daemon 并等待挂载就绪（任意内容可见即返回）"""
     env = dict(os.environ, **GUARD_ENV)
+    if extra_env:
+        env.update(extra_env)
     p = subprocess.Popen([DAEMON, f"--root={STORAGE}", f"--rules={CONF}",
                           f"--modules-dir={MODDIR}", "-f", str(MNT)],
                          stdout=open(DLOG, "w"), stderr=subprocess.STDOUT, env=env)
@@ -157,6 +161,22 @@ def maps_gone(pid, needle, timeout=8.0):
         time.sleep(0.3)
     try:
         return needle not in Path(f"/proc/{pid}/maps").read_text()
+    except OSError:
+        return False
+
+
+def maps_has(pid, needle, timeout=8.0):
+    """轮询 /proc/<pid>/maps 直到 needle 出现（模块内存副本仍映射）"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if needle in Path(f"/proc/{pid}/maps").read_text():
+                return True
+        except OSError:
+            return False
+        time.sleep(0.3)
+    try:
+        return needle in Path(f"/proc/{pid}/maps").read_text()
     except OSError:
         return False
 
@@ -455,6 +475,42 @@ def main():
     finally:
         stop(p)
         unstage_module("backend_bad")
+    if BANFILE.exists(): BANFILE.unlink()
+
+    # ── 11. A12 quiescence 门控：应用仍持有句柄时置毒不得 dlclose ──
+    # 建模 FTP 形态：模块自有**数据面**线程由「打开句柄」拥有（exit 不 join），
+    # active_handles>0 时 dlclose 会让它在失效页上执行 → 不在围栏窗口内 → daemon 死。
+    print("\n── 11. A12 置毒 quiescence 门控：活跃句柄 > 0 → 保持 .so 映射不 dlclose ──")
+    wconf("bhbad", "bhok")
+    stage_module("backend_hold")
+    active_marker = MODDIR / "hold_active"
+    active_marker.write_text("1")  # 标记文件存在 → nsp_module_active_handles() 返回 1
+    p = start(extra_env={"NSP_TEST_ACTIVE": str(active_marker)})
+    if not p: fail("启动失败（A12 quiescence）"); return 1
+    needle = "memfd:nsp_module_backend_hold"
+    try:
+        ok("模块加载：/0/bhok 由后端服务") if alive("bhok") else fail(
+            "后端前置", "backend_hold 加载后 /0/bhok 不是目录")
+        storm("bhbad")
+        time.sleep(0.8)
+        ok("daemon 存活（活跃句柄时置毒不 dlclose → 数据面线程不踩空）") if p.poll() is None else fail(
+            "daemon 崩溃", f"rc={p.poll()}（残留数据面线程执行已解除映射的代码）")
+        ok("置毒后模块失效（槽位已置空）") if gone("bhok") else fail(
+            "bhok 应失效", "置毒后仍由后端服务")
+        if "backend_hold" in banned_text():
+            ok("ban 落盘（circuit_break）")
+        else:
+            fail("ban 落盘", f".banned: {banned_text()!r}")
+        # A12 的判别证据：活跃句柄 > 0 → 门控跳过 dlclose → memfd 映射必须仍在
+        if maps_has(p.pid, needle, 1.5):
+            ok("活跃句柄 > 0 → 保持 .so 映射（未 dlclose）")
+        else:
+            fail("模块映射被解除", f"{needle} 已从 maps 消失"
+                 "（旧实现 dlclose → 残留数据面线程带崩 daemon）")
+    finally:
+        active_marker.unlink(missing_ok=True)
+        stop(p)
+        unstage_module("backend_hold")
     if BANFILE.exists(): BANFILE.unlink()
 
     print(f"\n═══════════════════════════════════════")
