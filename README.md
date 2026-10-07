@@ -36,35 +36,42 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 
 ## 产物
 
-在构建目录根下（`meson install` 后进 `bin/`）：
+构建目录根下（`meson install` 后按下表落位）：
 
-| 产物 | 说明 |
-|---|---|
-| `fuse_daemon` | FUSE 文件系统守护进程（框架，规则能力来自 dlopen 模块） |
-| `injector` | 挂载命名空间注入守护进程（仅 Android） |
-| `rule_server` | 规则控制服务（JSON 行协议动态改规则） |
-| `log_monitor` / `log_ctl` | 日志收集服务 / 查询流式输出 CLI |
-| `basic_rules.so` / `ftp_module.so` | 热插拔模块（规则引擎 / FTP 存储后端） |
-| `src/zygisk/{arm64-v8a,armeabi-v7a}.so` | Zygisk 应用创建通知模块（仅 Android，双 ABI） |
+| 产物 | 安装位置 | 说明 |
+|---|---|---|
+| `fuse_daemon` | `bin/` | FUSE 文件系统守护进程（框架：FUSE 回调 + 内建规则引擎 `fw_rules` + 模块调度） |
+| `injector` | `bin/`（仅 Android 安装） | 挂载命名空间注入守护进程。GNU 下也编一份但不 install，供 `tests/test_inject_mount_env.py` 用 |
+| `rule_server` | `bin/` | 规则控制服务（JSON 行协议动态改规则） |
+| `log_monitor` / `log_ctl` | `bin/` | 日志收集服务 / 查询流式输出 CLI |
+| `ftp_module.so` | `bin/modules/ftp_module/` | FTP 存储后端模块（热插拔；当前唯一模块，见下） |
+| `src/zygisk/{arm64-v8a,armeabi-v7a}.so` | `zygisk/` | Zygisk 应用创建通知模块（仅 Android，双 ABI） |
+| `global_replace_ctl` | 不 install | 全局替换挂载测试驱动（仅 GNU，供 `tests/test_global_replace.py`） |
+
+**规则能力在框架内，不在模块里**：自模块 ABI V4 起，规则决策（REDIRECT/SANDBOX/HIDE/ALLOW/RO）、uid→包名、MONITOR 开关全部由框架自持（`src/daemon/fw_rules.c`、`fw_pkg.c`、`fw_config.c`）——否则「模块缺席」会让规则与监控一起失效。模块只剩**后端存储提供者**一种形态（不实现 FUSE，只提供 `backend_*` 方法）。详见 [docs/modules.md](docs/modules.md)。
 
 ## 测试
 
 ```bash
-python3 tests/test_functional.py  # 基础 IO/SQLite/并发（默认用 build_gnu/ 产物）
-python3 tests/test_rules.py       # 规则边界（REDIRECT/HIDE/RO/通配符/热重载）
+python3 tests/run.py                  # 按本次改动自动选套件（推荐）
+python3 tests/run.py --layer L0       # 只跑 L0 静态/契约层（无挂载无网络）
+python3 tests/run.py --all --strict    # 全量验收：跳过项计为失败
+scripts/acceptance.sh                 # 完整验收门（构建 + 全量测试 + 文档一致性 + 报告）
 ```
 
-需 `fusermount3`、`/dev/fuse`；`tests/test_ftp.py` 需本机 vsftpd 匿名服务，`tests/test_global_replace.py` 需 root。完整映射表见 `AGENTS.md`。
+前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`；`tests/test_ftp.py` 另需本机 vsftpd 匿名服务。
+
+分层说明、套件映射表、退出码约定与环境坑见 [docs/testing.md](docs/testing.md)。
 
 ## 结构
 
 ```
 include/      # 公共头文件（含 nsp_module.h，第三方模块唯一依赖）
 src/
-  daemon/     # fuse_daemon（框架：FUSE 回调骨架 + 模块调度 + 存储原语）
+  daemon/     # fuse_daemon（框架：FUSE 回调 + 内建规则引擎 fw_rules + 模块调度）
   injector/   # injector（主控：挂载/命名空间/IPC/配置广播）
   module/     # 模块框架（加载器 + 故障围栏 + 熔断）
-  modules/    # basic_rules（规则引擎）、ftp（FTP 后端）
+  modules/    # ftp（FTP 存储后端，当前唯一模块）
   zygisk/     # Zygisk 应用创建通知模块（仅 Android，双 ABI）
   rule/       # rule_server
   config/     # 规则解析 + 路径变量
@@ -73,7 +80,9 @@ src/
 subprojects/  # 第三方源码子模块（随主项目编译）
 compat/       # 头文件布局转接（<fuse3/...> → 子模块平铺头）
 conf/         # 示例配置
-tests/        # Python 功能测试
+scripts/      # 构建 / 打包 / 隔离测试 / 设备操作脚本
+tests/        # Python 测试套件（统一入口 run.py）
+tools/        # 开发辅助工具
 docs/         # 设计文档
 ```
 
@@ -81,10 +90,13 @@ docs/         # 设计文档
 
 | 文档 | 内容 |
 |---|---|
-| `docs/architecture.md` | 进程架构、规则引擎、并发、维护规范 |
-| `docs/modules.md` | 模块架构、ABI 契约、第三方模块开发 |
-| `docs/config.md` | 配置语法、路径变量、禁忌清单 |
-| `AGENTS.md` | 构建陷阱、开发红线、测试映射表 |
+| [docs/README.md](docs/README.md) | **文档索引**：先读哪份、各份管什么契约 |
+| [docs/architecture.md](docs/architecture.md) | 进程架构、规则引擎、并发、维护规范 |
+| [docs/modules.md](docs/modules.md) | 模块架构、ABI 契约、第三方模块开发 |
+| [docs/config.md](docs/config.md) | 配置语法、路径变量、禁忌清单 |
+| [docs/testing.md](docs/testing.md) | 测试分层、套件映射、验收门与证据要求 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发流程、红线、提交与验收规范 |
+| [AGENTS.md](AGENTS.md) | 构建陷阱、判别性用例细节、AI 协作约定 |
 
 ## 许可证
 

@@ -1,0 +1,133 @@
+# 贡献与维护规范
+
+Android 13+ 用户态 FUSE 存储代理，C23 + Meson/Ninja。仓库文档与提交信息**用中文**。
+
+本文是**流程**的权威出处：怎么开工、代码放哪、什么不能碰、提交前要过哪些门。
+技术细节在 `docs/`（见 `docs/README.md` 的归属表），构建陷阱与逐套件判别性细节
+在 `AGENTS.md`。
+
+## 1. 开发流程
+
+1. **先读对应文档**：架构 `docs/architecture.md`、模块 `docs/modules.md`、
+   配置语法 `docs/config.md`、测试 `docs/testing.md`。
+2. **按归属写代码**（见 §2）。
+3. **同步测试**：改了行为就地补用例，并按 `docs/testing.md` 的映射表跑全绿。
+   新套件按 `docs/testing.md` §9 的清单登记。
+4. **自测验收门**：`python3 tests/run.py`（日常）/ `scripts/acceptance.sh`（提交前）。
+5. **提交**：Conventional Commits 前缀 + 中文正文（见 §5）。
+
+## 2. 代码归属
+
+同一能力只能有一份实现，放错位置就会出现「各文件私刻副本」然后缓慢分叉。
+
+| 代码性质 | 去处 |
+|---|---|
+| 纯 libc、无全局依赖的公共工具 | `src/core/nsp_util.c`（**禁止各文件私刻副本**） |
+| 依赖项目全局（`g_real_root`、日志、SELinux） | `src/core/common.c` |
+| 跨进程/跨模块常量 | `include/nsp_constants.h`（唯一出处） |
+| 日志级别与宏 | `include/nsp_log.h`（唯一出处） |
+| 规则决策、uid→包名、MONITOR 合并 | 框架侧 `src/daemon/fw_rules.c` / `fw_pkg.c` / `fw_config.c`——**不要放进模块** |
+| 后端存储能力（FTP 等） | `src/modules/<名>/`，只实现 `backend_*` |
+
+两条配套约定：
+
+- **新增跨文件函数必须带域前缀**（`fw_*`/`vfs_*`/`nsp_*`/`common_*`/`fdq_*`/`cfg_*`/
+  `ns_*`… 完整清单见 `docs/architecture.md` §7）。
+- **`nsp_util` 是树内共享实现，不是模块 SDK 的公开 ABI**：第三方模块只能依赖
+  `include/nsp_module.h`（及其代含的公开头），否则 ABI 链接例外保不住。
+
+## 3. 红线（破坏即回滚）
+
+1. **同一模块 ABI 版本内不改 `fuse_daemon` 导出表公共符号签名**——已编译模块靠
+   `b_lundef=false` + `--export-dynamic` 解析它们。授权升 ABI 时允许破坏签名/删字段，
+   但必须递增 `NSP_MODULE_ABI_VERSION` 让加载器拒绝旧版本
+   （见 `docs/modules.md` §3/§6.5），**不得静默改变既有版本的语义**。
+2. **不破坏「REDIRECT 虚拟前缀不含 user_id，FUSE 层剥离 `/0/` 后再匹配」约定。**
+3. **路径合成走 `common_*` 唯一出口**：禁止裸拼 `STORAGE_BASE "/%d…"`；
+   `MAX_PATH_LEN` 放不下时**返回 -1 而非截断**。截断会**放大** HIDE/RO 的命中范围
+   （更短的前缀匹配更多路径），属安全缺陷而非显示问题。
+4. **决策强制只在 `fw_route` 单点**：新增回调必须走
+   `VFS_SETUP_CORE(path, VFS_OP_READ|VFS_OP_MUTATE)`，不得自行手写 hidden/ro 判定
+   ——那正是 V3 收敛掉的漂移来源。
+5. **YAGNI**：不留无调用者的预留实现。
+6. **文档即契约**：文档与实现冲突时按文档改实现；文档没写清的决策列为待裁决，
+   不臆断。
+
+## 4. 提交前验收门
+
+完整定义与证据要求见 `docs/testing.md` §4。一条命令跑完：
+
+```bash
+scripts/acceptance.sh
+```
+
+最低要求（全绿方可提交）：
+
+| | 门 | 判据 |
+|---|---|---|
+| G1 | GNU 构建 | 零**新增**代码告警（基线见 `docs/testing.md` §4） |
+| G2 | Android 交叉构建 | 产物齐全；`src/zygisk/*.so` 的 `readelf -d` 无 `libc++_shared.so` |
+| G3 | 文档/台账一致性 | `python3 tests/test_docs_sync.py` 通过 |
+| G4 | 全量测试 | `python3 tests/run.py --all --strict` 退出码 0，gap 为 0 或逐条记录原因并确认非产品缺陷 |
+| G7 | **判别性** | 新增回归用例**在旧实现上失败**（见下） |
+| G8 | 层级诚实 | 结论写清覆盖到哪层；L3/L4 未做就写未做 |
+
+G5（ASan+UBSan）与 G6（宿主隔离）较重，按改动面酌情跑——碰内存/并发/挂载的改动
+必跑。
+
+### 判别性：本仓库最重要的一条
+
+**新增回归用例必须能在旧实现上失败**，否则它只是「跑了一遍」而没有验证力。
+本仓库的套路是把旧实现副本编进测试：
+
+```bash
+FTP_BACKEND_SRC=<git show HEAD:旧副本>   # FTP 后端
+FW_CONFIG_SRC=<旧源码>                   # fw_config
+FDQ_SRC=<旧实现>                         # 延迟 close 队列
+PROBE_VARIANT=old                        # 透传探测
+```
+
+或直接 `cc` 编译旧源码副本 + `-Wl,--wrap=<函数>` 注入失败。写完用例请**实测它在旧
+实现上失败**，并在提交信息或 `AGENTS.md` 映射表里写明判别信号是什么
+（看 errno 还是看记账？看日志还是看标记文件？）。
+
+两个常见陷阱：
+
+- **别靠 grep daemon 日志判别**：daemon 日志走 UDS 交给 `log_monitor`，测试进程拿到的
+  `daemon.log` 恒为空，靠它判别会把真缺陷误报成环境问题。用模块侧标记文件或套件自记
+  的事件文件。
+- **两侧 errno 相同不等于没区别**：例如后端越界回包被内核拒收时，新旧实现都返回
+  EIO；判别要看**记账**（模块是否被熔断、`module_errors.log` 有无记录）。
+
+## 5. 提交规范
+
+- **Conventional Commits 前缀**：`fix:` / `feat:` / `docs:` / `refactor:` / `perf:` /
+  `test:` / `build:`。
+- **正文用中文**，说清**为什么**而不只是改了什么；修缺陷请写清原实现错在哪、
+  新实现凭什么对、判别用例是什么。
+- **按功能粒度拆提交**：多个功能拆多个提交，每段**逐段可编译**，
+  被依赖的修复排在前面。不要攒一个大提交。
+
+## 6. 设备操作（生产级隔离）
+
+**真机视为生产环境。** 一切设备命令经 `scripts/adb-sh.sh` 执行，
+**禁止裸 `adb shell` 做变更**。动手前完整读 `AGENTS.md`「设备操作」一节。
+
+核心纪律（内核强制，非约定）：
+
+- 测试 I/O 一律 `su shell` 降级执行（uid=gid=2000、`CapEff=0`），
+  `assert_downgraded()` 每次先验。
+- root 只用于建/卸挂载（`/dev/fuse` 0600 只能 root 开），且 `need_root()` 留痕。
+- backing 只用 `SAFE_ROOT` 合成 fixture——**生产 backing 永不进测试挂载**；
+  需要真实下层行为时 `cp -a` 快照到沙盒。
+- 设备侧脚本 source harness 即自动影子危险命令（`rm`/`umount`/`mv`/`cp`/`dd`/`tee`/
+  `chcon`/`chmod`/`chown`/`restorecon`/`setenforce`/`kill`），绕过须用 `command` 或
+  绝对路径（评审可见）。
+- `set -u` 常开；umount 循环卸直到消失，失败即 die 且**错误禁止重定向吞掉**。
+
+## 7. 相关文档
+
+- `docs/README.md` — 文档索引与各文档权威范围
+- `docs/testing.md` — 测试分层、验收门、环境坑
+- `docs/architecture.md` §7 — 维护规范（命名、归属、不变量）
+- `AGENTS.md` — 构建陷阱、逐套件判别性细节、设备操作

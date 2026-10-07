@@ -49,7 +49,7 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 
 当前 `NSP_MODULE_ABI_VERSION = 5`、`NSP_FRAMEWORK_API_VERSION = 4`。
 
-**V3 是决策结果的不兼容重构**：`NspResolveResult` 被声明式的 `NspPathDecision` 取代，模块只声明「这个路径该怎么表现」，errno 映射与权限策略全部收归框架单点（`fw_route` 强制 appear_missing/read_only，`vfs_apply_attr_override` 落实属性覆盖，只读判定统一走 `vfs_check_read_only`）。字段变化：
+**V3 是决策结果的不兼容重构**：`NspResolveResult` 被声明式的 `NspPathDecision` 取代，模块只声明「这个路径该怎么表现」，errno 映射与权限策略全部收归框架单点（`fw_route` 强制 appear_missing/read_only，只读判定统一走 `vfs_check_read_only`；V3 时代另有属性覆盖的落实函数，已随 V4 删除）。字段变化：
 
 | 删除 | 新增/替换 | 理由 |
 |---|---|---|
@@ -58,7 +58,7 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 | `is_virtual_ancestor` + `is_redirect_target` | `virtual_kind`（`NSP_VK_NONE/ANCESTOR/TARGET`） | 两个并列 bool 合并为单枚举，合并策略明确（ANCESTOR 优先）。命名沿用历史：`TARGET` 指该路径**本身是重定向的虚拟前缀**，与"重定向的真实目标"无关（见 `architecture.md` §4.6） |
 | `is_redir` | `is_redirect` | 仅改名 |
 | `user_id` / `sub_path` | —（框架自算） | 框架的 `fw_parse_path` 与模块侧剥离逻辑逐行等价，无需跨 ABI 传递；结果结构由 8336 降到约 4.2KB |
-| — | `attr_override` + `mode`/`uid`/`gid`（V4 已删，见 `src/daemon/fw_rules.h:42-47`） | 模块可覆盖权限位与属主（见 §3.3 历史记录） |
+| — | `attr_override` + `mode`/`uid`/`gid`（V4 已删，理由见 `src/daemon/fw_rules.h` 的 `NspPathDecision` 注释） | 模块可覆盖权限位与属主（见 §3.3 历史记录） |
 
 **V4 删除了 `pkg` / `monitor_on` / `get_pkg`**：包名与 `MONITOR` 都是配置语义的输入，模块缺席时必须仍有正确值，故早已归框架——包名由 `fw_pkg.c` 自算（`uid.map` → `/proc` 回退），`MONITOR` 由 `fw_config_monitor_for` 自算三层合并（应用 > 类别 > 全局）。`monitor_on` 也不再由决策结构承载（`fw_route` 经出参单独给出，它本就不是路径决策）。
 
@@ -70,7 +70,9 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 
 ### 3.1 类型与能力位（V4 已删，历史保留）
 
-> V4 起 `NspModuleInfo` 已无 `type`/`caps` 字段：现行模块形态只由 `ops` 决定（声明了 `backend_match` 即后端模块），见 `include/nsp_module.h:61-84`。下表仅为 V3 及以前的历史记录，重编译须删掉这两处赋值。
+> V4 起 `NspModuleInfo` 已无 `type`/`caps` 字段：现行模块形态只由 `ops` 决定（声明了 `backend_match` 即后端模块），见 `include/nsp_module.h` 的 `NspModuleInfo` 定义。下表仅为 V3 及以前的历史记录，重编译须删掉这两处赋值。
+
+<!-- history:begin V3 及以前的 type/caps 位图，仅作迁移参照，勿照此写新模块 -->
 
 | 类型 | 说明 |
 |------|------|
@@ -84,6 +86,8 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 | 12 | `NSP_CAP_BACKEND_IO` 路径命中时由框架调用模块方法完成文件操作 | 后端 |
 
 位图按整组判断：0-4 位任一置位即视为规则模块（参与 `resolve`/`probe` 分派）。V2 删除了 `VIRTUAL_DIR`（位 6）、`MOUNT_POINT`（位 10）、`VAR`（位 11）——虚拟目录性质由 `NspPathDecision` 的 `virtual_kind` 表达，无需单独能力位；后端虚拟前缀不再由模块注册变量，改由 `FTP <虚拟前缀> <段名>` 规则 + `is_ftp` 表达。
+
+<!-- history:end -->
 
 ### 3.2 框架服务表 `NspFrameworkApi`（框架 → 模块）
 
@@ -108,7 +112,9 @@ typedef struct NspFrameworkApi {
 
 所有字段可选，未实现置 NULL。返回 `0` 成功 / **负值 errno** 失败。
 
-> V4 起只剩 `backend_*`（历史记录）：`resolve` / `probe` / `readdir_extra` 随规则引擎内建一起删除，决策结构 `NspQueryCtx` / `NspPathDecision` / `NspProbeResult` 已搬进 `src/daemon/fw_rules.h:42-47`，不再是 ABI。以下 `resolve` / `probe` / `attr_override` 段落仅为 V3 及以前的历史语义，现行模块不要实现它们。
+> V4 起只剩 `backend_*`（历史记录）：`resolve` / `probe` / `readdir_extra` 随规则引擎内建一起删除，决策结构 `NspQueryCtx` / `NspPathDecision` / `NspProbeResult` 已搬进 `src/daemon/fw_rules.h`，不再是 ABI。以下 `resolve` / `probe` / 属性覆盖段落仅为 V3 及以前的历史语义，现行模块不要实现它们。
+
+<!-- history:begin V3 规则模块的 resolve/probe/属性覆盖语义，仅作迁移参照 -->
 
 规则模块（V4 已删，历史保留）：
 
@@ -131,9 +137,11 @@ int (*readdir_extra)(const NspQueryCtx*, const char* sub_path, int user_id,
 
 > **属性覆盖为何用位图而非"特殊值哨兵"**：若用 `mode == UNSET`/`uid == -1` 表示"不改"，模块惯用的 `memset` 零初始化会静默变成"权限清 0 + 属主 root"。位图让"零初始化 = 什么都不改"成立。
 
-> **初始化不变量**：`resolve` 输出必须**逐字段**重置（框架经 `nsp_decision_init` 统一初始化，`NspDecisionGuard` 与之共用同一实现），不能只置 `valid=false`。FUSE 回调在模块未命中时仍会读 `read_only`/`is_ftp`/`virtual_kind` 等标志；历史上"未命中只置 valid + 固定栈填充恰好稳定"曾把不存在的路径合成为目录，逐字段初始化是回归防线。
+> **初始化不变量**：`resolve` 输出必须**逐字段**重置，不能只置 `valid=false`。FUSE 回调在模块未命中时仍会读 `read_only`/`is_ftp`/`virtual_kind` 等标志；历史上"未命中只置 valid + 固定栈填充恰好稳定"曾把不存在的路径合成为目录，逐字段初始化是回归防线。（规则内建后此事归 `fw_rules_resolve` 单点，见 `architecture.md` §7。）
 
-后端模块（`NSP_CAP_BACKEND_IO`）：
+<!-- history:end -->
+
+后端模块（现行唯一形态——声明了 `backend_match` 即后端模块，无需任何类型/能力位声明）：
 
 ```c
 int (*backend_match)(const char* path);        /* 1=管理该路径（前缀匹配） 0=否 */
@@ -182,14 +190,14 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 框架对全部模块调用（`backend_*`/`init`/`exit`）做三层防护，**模块错误不会带崩 fuse_daemon**：
 
 1. **调用围栏**（`src/module/fault_fence.c`）：每 worker 线程一套 TLS `sigsetjmp` 围栏；`sigaltstack` 是 **per-thread** 的——`fault_fence_init` 设置的全局 altstack 只覆盖主线程，每个首次调用围栏的线程还会为自己设置独立 TLS altstack（worker 不继承主线程的 altstack）。调用窗口内崩溃（SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT）→ 归因到肇事模块槽位 → `siglongjmp` 恢复，daemon 存活、该请求按 `-EIO` 失败。归因失败（如堆损坏延迟到框架代码爆发）走原 `crash_dump` 链路。
-2. **输出校验**（`src/module/module_guard.c`）：`NspPathDecision` 前后 canary 哨兵 + 字符串字段 NUL 终止检查 + `virtual_kind` 值域与 `attr_override` 未知位检查 + readdir 条目名校验。
+2. **输出校验**（`src/module/module_guard.c`）：跨 ABI 的字符串只剩后端 `readdir` 的条目名，故校验面也只剩两个——`nsp_guard_str_ok`（字符串 NUL 终止）与 `nsp_guard_dir_entry_ok`（readdir 单条目）。规则决策不再跨 ABI（引擎已内建），**决策结构的 canary 哨兵与值域校验随之删除**（见 `include/module_guard.h` 顶部说明）。
 3. **熔断器**：每模块滑动窗口（默认 10 秒 5 次错误，env `NSP_GUARD_WINDOW_SEC` / `NSP_GUARD_ERR_MAX` 可覆盖）触发即 `module_fault_poison`——槽位置空（该模块规则立即全部失效，走直通回退）+ 卸载 + ban 落盘。崩溃单次即置毒。**`backend_*` 的 errno 风格返回码（`-1..-4095`）不计入**：后端模块以返回码回传业务失败（`-ENOENT` 路径不存在、`-EPERM` 命令被拒、`-ENOTEMPTY` 目录非空、`-EIO` 后端暂不可达）是其唯一通道；若计入，应用扫描缺失路径（`os.path.exists`、文件管理器存在性探测）十秒内即可打满阈值，把健康模块置毒 + ban（文件不变则不再重载）。豁免判定见 `fuse_daemon.c` 的 `backend_rc_is_business()`，回归用例见 `test_module_circuit.py` §9。V4 起规则引擎内建，`resolve`/`probe` 已不在 ABI 中——熔断只对后端模块生效。
 
 **ban 机制**：记录写 `<MODULES_DIR>/.banned`（每行 `模块名|mtime|原因|时间戳`）。扫描线程或热重载前先按文件 mtime 查 ban（`module_ban_blocks`）：一致即跳过（加载与重载都不做），mtime 变化（发布新版本）记录失效，**版本更新自愈**；daemon 重启后 ban 仍有效。
 
 **加载前就被拒的情形同样落 ban**（`module_prepare` 内）：`abi_version` 不匹配、内部 `name` 与目录名不一致——这两种都发生在 `dlopen` 之后、`commit` 之前，槽位从未建立，若只报错不落 ban，每次事件扫描就重试一轮（0.5s 稳定性等待 + 整份 `.so` 复制进新 memfd），并**每次泄漏一个内存副本 fd**（实测残留旧 ABI 模块时每次扫描漏 1 个，累积到 nofile 上限后 socket/open 全面 EMFILE）。现落 ban 后只报一次（`检测到新模块` + 具体原因 ERROR + 一次 `ban 名单命中` WARN），之后静默跳过；日志按 `(模块名, 文件 mtime)` 去重，文件一变重新提示一次（`sys.log` 里 DEBUG 不受最小级别过滤，靠降级日志级别解决不了刷屏）。`module_prepare` 的所有失败路径经 `module_prepare_reject()` 统一回收 memfd。ban 记录**含框架 ABI 字段**（见 §3 末）：**框架升级到新 ABI 后这些 ban 自动失效**，用户不必手工删 `.banned`。
 
-**旧模块残留**：框架内建规则引擎后 `basic_rules` 已退役，而 `CONFIG_DIR/modules/` 不在 Magisk 模块目录内，卸载/更新都不会清它，安装脚本此前只 `cp` 不删 → 旧 `.so` 会永久留在设备上（症状就是启动后反复出现 `模块 basic_rules ABI 不匹配`）。现两条一起处理：安装脚本（`customize.sh`）按 `RETIRED_MODULES` 清理**已知退役**的模块目录（不做白名单全清，避免误删用户自己放的模块），框架侧按上面的 ban 机制兜底（用户手动放的坏模块同理）。回归用例见 `test_modules.py` §5。
+**旧模块残留**：框架内建规则引擎后 `basic_rules` 已退役，而 `CONFIG_DIR/modules/` 不在 Magisk 模块目录内，卸载/更新都不会清它，安装脚本此前只 `cp` 不删 → 旧 `.so` 会永久留在设备上（症状就是启动后反复出现 `模块 basic_rules ABI 不匹配`）。现两条一起处理：**打包时**由 `scripts/pack-module.sh` 按本次构建的模块清单（`KNOWN_MODULES`，源自 `MODULE_PAIRS`）清掉骨架 `bin/modules/` 下不在清单内的目录，使发布包里不含退役模块；框架侧按上面的 ban 机制兜底（用户手动放进设备的坏模块同理）。注意两者作用域不同：脚本只管**发布包内容**，设备上 `CONFIG_DIR/modules/` 里用户自放的模块由 ban 机制处理，脚本不会去删。回归用例见 `test_modules.py` §5。
 
 **排障入口**：`log_ctl search-sys --level 2 MOD_ERR <模块名>` 按模块过滤结构化错误行（`module=/op=/rc=/path=/detail=`）。窗口内前 5 条明细全打、之后每 100 条打 1 条汇总，坏模块不会淹没日志环；熔断与崩溃恢复两类高危事件无条件追加到 `<LOG_DIR>/module_errors.log`；崩溃转储附 `Crash attribution: module=<名> slot=<N> op=<op>` 归因行。`module_health_snapshot()` 输出每模块 `err_count`/`err_total`/`banned`/`ban_reason`/`last_err_time` 供前端展示。
 
@@ -252,7 +260,7 @@ const NspModuleInfo nsp_module_info = {
 };
 ```
 
-> V4 起 `NspModuleInfo` 已无 `.type` / `.caps`（见 `include/nsp_module.h:61-84`）：旧骨架照抄必编译失败，以本节为准。
+> V4 起 `NspModuleInfo` 已无 `.type` / `.caps`（见 `include/nsp_module.h` 的 `NspModuleInfo` 定义）：旧骨架照抄必编译失败，以本节为准。
 
 ### 6.3 编译与安装
 
@@ -270,7 +278,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 ### 6.4 契约（违反即被熔断）
 
 - 返回值：`0` 成功 / 负值 errno 失败（**返回正数非 0 会被计为错误**）。
-- 输出字符串字段**必须 NUL 终止**，越界写会破坏 canary 触发置毒。
+- 输出字符串字段**必须 NUL 终止**：框架按 `nsp_guard_str_ok` / `nsp_guard_dir_entry_ok` 校验，不合法即计一次契约违规（累计触发熔断置毒）。
 - 回调内**不得阻塞**：围栏窗口内不可恢复地持锁会破坏 longjmp 安全性（框架侧已保证分派路径不持锁）。
 - 置毒时框架**仍会调用 `exit()`**（经围栏，崩溃会被 longjmp 收敛）——模块可能持有自己的 pthread，`exit` 是停掉它们的唯一途径，不调就 `dlclose` 会让残留线程踩空带崩 daemon。仅当 `exit` 自身崩溃（无法确认线程已停）才保留 `.so` 映射不 `dlclose`。因此模块 `exit` 必须幂等、且负责 join 自己创建的线程。
 
@@ -280,7 +288,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 |------|------|
 | 不兼容变更（改表结构/删字段） | `NSP_MODULE_ABI_VERSION` 递增 → 旧模块被校验拒绝，须重编译 |
 | 兼容新增框架能力 | `NspFrameworkApi` 尾部追加字段 + `NSP_FRAMEWORK_API_VERSION` 递增 |
-| 新能力 / 新模块类型 | `caps` 位图扩展（32 位预留），框架按位判断 |
+| 新增模块方法 | `NspModuleOps` 尾部追加字段（模块未实现置 NULL，框架调用前判空）；改变既有方法签名属第一类 |
 | 模块自身版本 | `NspModuleInfo.version` 字符串（不影响加载兼容性） |
 
 ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。V5 同理（`backend_readdir` 加 `offset` 分页 + 超长名跳过语义），递增到 5 并拒绝 V1/V2/V3/V4——V4 模块无分页，大目录静默丢尾。

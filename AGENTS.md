@@ -17,24 +17,30 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 ## 开发流程
 
-1. 先读对应文档：架构 `docs/architecture.md`、模块 `docs/modules.md`、配置语法 `docs/config.md`。
+**流程与红线的权威出处是 `CONTRIBUTING.md`**（代码归属、提交规范、验收门），测试
+分层与退出码约定在 `docs/testing.md`。本文件只保留**构建陷阱**与**逐套件判别性细节**
+——那是别处没有的内容。下面四条是摘要，冲突时以 `CONTRIBUTING.md` 为准。
+
+1. 先读对应文档：架构 `docs/architecture.md`、模块 `docs/modules.md`、配置语法 `docs/config.md`、测试 `docs/testing.md`。
 2. 按归属写代码：纯 libc 无全局依赖的公共工具进 `src/core/nsp_util.c`（禁止各文件私刻副本）；依赖项目全局（`g_real_root`、日志）的进 `src/core/common.c`；跨进程/跨模块常量进 `include/nsp_constants.h`、日志级别与宏进 `include/nsp_log.h`（两者均为唯一出处）；新跨文件函数必须带域前缀（见 `docs/architecture.md` §7）。
-3. 同步测试：改了行为就地补用例，跑下方映射表全绿。
-4. 提交：仓库文档与提交信息均中文，Conventional Commits 前缀（`fix:`/`feat:`/`docs:`/`refactor:`/`perf:`）。
+3. 同步测试：改了行为就地补用例，跑下方映射表全绿。**新套件须同时登记进 `tests/run.py` 的 `SUITE_MAP` 与 `LAYERS`**，否则 `tests/test_docs_sync.py` 失败（清单见 `docs/testing.md` §9）。
+4. 提交前过验收门：`scripts/acceptance.sh`（构建 + 文档一致性 + 全量测试 + 报告）。仓库文档与提交信息均中文，Conventional Commits 前缀（`fix:`/`feat:`/`docs:`/`refactor:`/`perf:`）。
 
 ### 红线（破坏即回滚）
 
 - 同一模块 ABI 版本内不改 fuse_daemon 导出表公共符号签名——已编译模块靠 `b_lundef=false` + `--export-dynamic` 解析它们。授权升 ABI 时（如本次 V1→V2）允许破坏签名/删字段，但必须递增 `NSP_MODULE_ABI_VERSION` 让加载器拒绝旧版本（见 `docs/modules.md` §3/§6.5），不得静默改变既有版本的语义。
 - 不破坏"REDIRECT 虚拟前缀不含 user_id，FUSE 层剥离 `/0/` 后再匹配"约定。
 - 路径合成走 `common_*` 唯一出口（禁止裸拼，`MAX_PATH_LEN` 放不下返回 -1 而非截断）。
-- 决策强制只在 `fw_route` / `vfs_apply_attr_override` 单点——新增回调不得自行手写 hidden/ro 判定（V3 已收敛，散落判定会重新漂移）。
+- 决策强制只在 `fw_route` 单点（新增回调必须走 `VFS_SETUP_CORE`）——不得在各回调里自行手写 hidden/ro 判定（V3 已收敛，散落判定会重新漂移）。V3 时代并列的属性覆盖落实点已随 V4 删除（`attr_override` 无规则语法生产者）。
 - YAGNI——不留无调用者的预留实现。
 
 ## 测试流程（纯 Python，无 C 测试目标）
 
-**一条命令**：`python3 tests/run.py` —— 自动按「本次改动的文件 + 改动行里的符号」匹配下表，依次执行选中的套件并汇总退出码。`--list` 只看会跑哪些、`--all` 忽略映射跑全量、`--base <ref>` 换对比基线（默认 `HEAD`，即暂存+未暂存+未跟踪）、尾部直接给脚本名则跳过自动匹配、`--strict` 为验收模式（跳过项计为失败）。`--jobs N` 并行加速：仅 `PARALLEL_SAFE` 白名单内的无共享状态套件进线程池（挂载类恒串行，`test_rule_server.py` 因全局 `pkill log_monitor` 副作用被排除），其余仍串行；`--jobs 1` 亦会跑 Tier0（不再整组漏跑）。下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`，**两边须同步维护**；各脚本仍可单独直接跑。
+**一条命令**：`python3 tests/run.py` —— 自动按「本次改动的文件 + 改动行里的符号」匹配下表，依次执行选中的套件并汇总退出码。`--list` 只看会跑哪些、`--all` 忽略映射跑全量（不含 `ON_DEMAND` 按需套件）、`--layer L0|L1|L2` 只跑某验收层、`--base <ref>` 换对比基线（默认 `HEAD`，即暂存+未暂存+未跟踪）、尾部直接给脚本名则跳过自动匹配、`--strict` 为验收模式（跳过项计为失败）。`--jobs N` 并行加速：仅 `PARALLEL_SAFE` 白名单内的无共享状态套件进线程池（挂载类恒串行，`test_rule_server.py` 因全局 `pkill log_monitor` 副作用被排除），其余仍串行；`--jobs 1` 亦会跑 Tier0（不再整组漏跑）。
 
-**套件退出码约定（防假绿）**：`0`=通过、`1`=失败、`77`=环境不具备**整套**跳过（gap）、`78`=**部分子组**跳过（gap，如 `test_log_pipeline` 的类别段组、`test_rule_server` 的 SERVICE 段）、`127`=套件文件不存在（**计为失败**——拼错名字不得静默通过）。`run.py` 汇总区分 PASS/FAIL/跳过(gap)，**跳过不计通过**；验收须用 `--strict` 让 gap 变成失败。
+下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`；**一致性已由 `tests/test_docs_sync.py` 机器校验**（套件台账闭合、每套件恰好属一层、拼错名字当场失败），不再靠人工两边同步。各脚本仍可单独直接跑。
+
+**退出码约定、分层（L0–L4）、验收门、ASan 复跑、隔离跑、环境坑的权威出处是 `docs/testing.md`**——下面只留一句摘要：`0` 通过、`1` 失败、`77` 整套跳过、`78` 部分子组跳过、`127` 套件不存在（计为失败）；**跳过不计通过**，验收须用 `--strict`。完整验收门跑 `scripts/acceptance.sh`。
 
 前置：GNU 产物 `build_gnu/`、`fusermount3`、`/dev/fuse`、Python `sqlite3`。非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`GLOBAL_REPLACE_CTL`、`LOG_CTL`、`LOG_MONITOR`。
 
@@ -96,19 +102,30 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 
 ### 分层验收流程（尽量贴近 Android）
 
-- **L0 静态/契约**（无挂载无网络，可并行）：`config_snapshot`、`monitor_layers`、`path_vars`、`pending_close`、`cfg_watch`、`rule_file_lock`、`ns_combined_rollback`、`reaped_managed`、`ftp_read_restart`、`ftp_truncate_list`、`ftp_upload_lock`、`module_abi`、`backing_gate`。
-- **L1 GNU 真实 FUSE**（串行）：`functional`、`rules`、`decision_enforce`、`negative_timeout`、`readdir_skel_fallback`、`modules`、`module_circuit`、`backend_lifecycle`、`ftp*`。
-- **L2 Android 拓扑仿真**：`inject_mount_env`（v1/v2/v3 全生命周期 + 宿主 mountinfo 前后比对）、`global_replace`——各自在 rootless unshare 沙箱内，宿主零污染。
+**层定义与套件归属的唯一出处是 `tests/run.py` 的 `LAYERS`**（可执行：`run.py --layer L0`），
+说明见 `docs/testing.md` §3.2。此前这里是散文清单，既跑不了也对不上账——实测 38 个套件
+里有 13 个没被任何层点名，分层验收悄悄跑不到它们；现由 `tests/test_docs_sync.py` 强制
+「每个套件恰好属一层」。
+
+- **L0 静态/契约**（无挂载无网络，可并行）：多为「直编实际源码 + `--wrap` 桩/ASan」的判别性用例，只需 `cc`。
+- **L1 GNU 真实 FUSE**（串行）：起真 daemon、真挂载，部分需 vsftpd 或系统 log_monitor。
+- **L2 Android 拓扑仿真**：rootless unshare 沙箱内仿真安卓拓扑，须核对宿主 `mountinfo` 前后零变化。
 - **L3 真实 Android 内核/权限**（需 emulator/AVD 或真机；本机无，未做）：SELinux/Bionic/vold/FUSE-BPF/Zygisk 双 ABI/多用户。
 - **L4 设备最终验收**：仅授权后经 `scripts/adb-sh.sh`（强制降权 `su shell`、`SAFE_ROOT` 合成 fixture）。
 
-**验收标准**（全绿方可提交）：
+```bash
+python3 tests/run.py --layer L0 --list    # 看某层有哪些套件
+scripts/acceptance.sh                     # 跑完整验收门并落报告
+```
+
+**验收标准**（全绿方可提交；完整门定义见 `docs/testing.md` §4，`CONTRIBUTING.md` §4 是提交侧清单）：
 
 1. GNU 与 Android 交叉构建零**新增**告警、产物齐全（含 `src/zygisk/*.so` 的 `readelf -d` 无 `libc++_shared.so`）。
 2. `python3 tests/run.py --all --strict` 退出码 0：跳过项（77/78）为 0，或逐条记录原因并确认非产品缺陷。
-3. **判别性**：新增回归用例必须在旧实现上失败（本仓库套路：`FTP_BACKEND_SRC=<git show HEAD:旧副本>` 复验，或直编旧源码副本）。
-4. 隔离证据：L2 套件宿主 `mountinfo` 前后零变化；挂载未消失前禁删 fixture。
-5. L2 通过 ≠ Android 运行时已验证——SELinux/Bionic/vold/Zygisk/多用户须 L3–L4 覆盖。
+3. `python3 tests/test_docs_sync.py` 通过：文档陈述与代码一致、套件台账闭合、每套件已分层。
+4. **判别性**：新增回归用例必须在旧实现上失败（本仓库套路：`FTP_BACKEND_SRC=<git show HEAD:旧副本>` 复验，或直编旧源码副本）。
+5. 隔离证据：L2 套件宿主 `mountinfo` 前后零变化；挂载未消失前禁删 fixture。
+6. L2 通过 ≠ Android 运行时已验证——SELinux/Bionic/vold/Zygisk/多用户须 L3–L4 覆盖，未做就写未做。
 
 ### 隔离跑全量（宿主零污染）
 
@@ -158,7 +175,7 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 
 ## 架构要点
 
-- **多进程 + UDS**：`injector`（主控：epoll + inotify + zygote fork 检测）启动 `fuse_daemon`（约 27 个 FUSE 回调 + 模块调度）；`rule_server` 以 JSON 行协议动态改规则；`log_monitor` 收日志、`log_ctl` 查询。injector 维护全局 + 媒体模块两棵 FUSE 树，共用同一二进制与配置。
+- **多进程 + UDS**：`injector`（主控：epoll + inotify + zygote fork 检测）启动 `fuse_daemon`（28 个 FUSE 回调，Android 29 含 `bpf_setup`；+ 模块调度）；`rule_server` 以 JSON 行协议动态改规则；`log_monitor` 收日志、`log_ctl` 查询。injector 维护全局 + 媒体模块两棵 FUSE 树，共用同一二进制与配置。
 - **模块化（V4 起只有一种模块）**：规则决策（REDIRECT/SANDBOX/HIDE/ALLOW/RO + FTP 前缀归属）与 uid→包名、MONITOR 开关都是**框架能力**（`src/daemon/fw_rules.c` / `fw_pkg.c` / `fw_config.c`）——放进模块会让「模块缺席 ⇒ 规则与监控一起失效」。模块只剩**后端存储提供者**（如 `ftp_module.so`）：**不实现 FUSE**，只提供 `backend_*` 方法。FTP 映射由 `FTP <虚拟前缀> <段名>` 规则决定，作用域随所在段（`[GLOBAL]` 全局 / `[包名]` 仅该应用）。模块目录 `<CONFIG_DIR>/modules/<名>/<名>.so`，inotify 热插拔；**模块从内存副本加载**（memfd，maps 里呈现为 `memfd:nsp_module_<名>`），故磁盘上那份文件无论原子替换还是就地覆盖都伤不到运行中的模块。
 - **模块 ABI**：第三方模块只以 `include/nsp_module.h` 为唯一入口（该头代含 `nsp_log.h` / `nsp_constants.h` / `nsp_cfg_view.h`，分发 SDK 须一并给出），编译须带 `-DNSP_MODULE_BUILD`；日志等公共符号经导出表解析——改签名会破坏已编译模块。当前 `NSP_MODULE_ABI_VERSION=5`、`NSP_FRAMEWORK_API_VERSION=4`。**V3 是决策结果的不兼容重构**：声明式 `NspPathDecision` 取代 `NspResolveResult`（`hidden`→`appear_missing`、`ro`→`read_only`、两个虚拟目录 bool→`virtual_kind`、删 `user_id`/`sub_path`（框架自算）、新增 `attr_override`+`mode`/`uid`/`gid`）；`appear_missing` 在所有回调统一 ENOENT（V2 写类是 EACCES，属有意行为修正）。**V4 删掉已归框架的三个成员**——`NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`：包名（`fw_pkg.c`）与 MONITOR 三层合并（`fw_config_monitor_for`）都是配置语义，模块缺席时也必须成立，故框架自算；`monitor_on` 同时**移出决策结构**（`fw_route` 经出参单独给出——它本就不是路径决策）。**V5 给 `backend_readdir` 加 `offset` 分页**（大目录不再 512 截断）+ 超长名跳过语义 + 注册表动态化（初容 16/硬上限 1024）。**V1/V2/V3/V4 模块须重编译**，加载器在 `dlopen` 之后、`init`/`ops` 之前按版本拒载；`NspFrameworkApi` 不变（仍 4）。模块不链接 `nsp_comm`；`nsp_ini_store` 已退出模块 ABI，是 rule_server 的私有静态库（log_ctl 不用）。
 - **决策强制归属**：引擎只声明「路径该怎么表现」（`NspPathDecision`，见 `src/daemon/fw_rules.h`），errno 映射与权限策略在框架单点——`fw_route()` 统一 `appear_missing`→ENOENT 与 `read_only`→EROFS（含 root 豁免）。框架一律原样上报真实属主/权限（「伪造属主=访问者」的默认模式与 `--preserve-perms` 开关均已删除；V3 的 `attr_override` 因无规则语法生产者已随 V4 删除）。**新增回调时必须走 `VFS_SETUP_CORE(path, VFS_OP_READ|VFS_OP_MUTATE)`**，不要在各回调里手写 hidden/ro 判定——那正是 V3 收敛掉的漂移来源。
