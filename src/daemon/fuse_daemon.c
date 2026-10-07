@@ -2206,7 +2206,14 @@ static int vfs_utimens(const char* path, const struct timespec ts[2], struct fus
 
 static int vfs_statfs(const char* path, struct statvfs* st) {
     (void)path;
-    int ret = statvfs(STORAGE_BASE, st);
+    /* 由 common 唯一出口合成：--root=<dir> 时统计该文件系统（此前硬编码
+       STORAGE_BASE，测试根/迁移根下 df 与写前查空间拿到另一文件系统的容量，
+       可能"显示有空但实际写满"或反之）。root 为空回退 STORAGE_BASE，与
+       common_default_real_path 同口径。 */
+    char root[PATH_MAX];
+    common_default_real_path(-1, "", root, sizeof(root));
+    if (root[0] == '\0') return -ENAMETOOLONG; /* 超长失败闭合 */
+    int ret = statvfs(root, st);
     if (ret == -1) return -errno;
     return 0;
 }
