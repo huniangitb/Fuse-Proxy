@@ -11,12 +11,15 @@
 断言最终恰好 600 条且无重复；去掉目录 flock 后实测只剩约 200 条（确定性失败）。
 写入路径另做：文件内容 fsync + rename + 目录 fsync（掉电后 rename 不会指向旧内容）。
 
-另含两组判别：
+另含三组判别：
   A10 —— 文件 chmod 000 后 upsert 必须返回 EIO 且原文件逐字不动（旧实现把读失败的
          NULL 当空文件，写回「段头+1 条」把原规则全丢）；以 root 运行时跳过（gap）。
-  A6  —— toggle 必须与 upsert 共用同一把目录 flock：另起进程持锁不放，断言
-         「调用侧读改写」形态立即返回、nsp_rule_file_toggle_nth_scoped 阻塞到放行。
-         若 toggle 又退化成不持锁的读改写，本组失败。
+  A6/C6 —— **全部**公共编辑入口必须共用同一把目录 flock：另起进程持锁不放，断言
+         手工「读改写」形态立即返回，而 upsert_line / upsert_in_section /
+         remove_nth / remove_nth_scoped / toggle_nth_scoped 逐个阻塞到放行。
+  C6  —— 公共 API 面不得再暴露无锁写入口：探针引用 nsp_rule_file_write 编译——
+         旧实现暴露该符号、可自行拼出不持锁的读改写（探针编译成功 → 本组失败）；
+         新实现已将其下沉为内部 static（未声明 → 探针编译失败 → 通过）。
 
 前置：本机 cc。失败退出码 1（勿用管道吞掉退出码）。
 """
@@ -34,6 +37,27 @@ SOURCES = [
     os.path.join(ROOT, "src", "core", "nsp_util.c"),
 ]
 RUN_TIMEOUT = 120
+
+
+def probe_no_public_write(tmpdir, include_dir):
+    """C6 判别：公共 API 面不得再暴露无锁写入口。
+
+    旧实现暴露 nsp_rule_file_write，调用方可自行拼「读全文→改一行→write」而绕过
+    目录 flock（fixture 的 old_shape_toggle 正是这一形态）→ 探针能编译 → 本组失败；
+    新实现将其下沉为内部 static → 头文件里无声明，探针编译失败 → 通过。
+    返回 (已撤下?, 编译器 stderr)。"""
+    src = os.path.join(tmpdir, "probe_public_write.c")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write('#include "nsp_rule_file.h"\n'
+                'int main(void) { void* p = (void*)nsp_rule_file_write; return p == 0; }\n')
+    obj = os.path.join(tmpdir, "probe_public_write.o")
+    cmd = [
+        *shlex.split(os.environ.get("CC", "cc")), "-std=c23", "-D_GNU_SOURCE",
+        "-Werror=implicit-function-declaration",
+        "-I", include_dir, "-c", src, "-o", obj,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode != 0, r.stderr
 
 
 def main():
@@ -61,7 +85,15 @@ def main():
         except subprocess.TimeoutExpired:
             print(f"规则文件并发编辑测试超时（>{RUN_TIMEOUT}s）", file=sys.stderr)
             return 1
+        no_public_write, probe_err = probe_no_public_write(tmpdir, os.path.join(ROOT, "include"))
     print(run.stdout, end="")
+    if no_public_write:
+        print("PASS C6 公共 API 面已撤下无锁写入口（nsp_rule_file_write 不可见）")
+    else:
+        print("FAIL C6 公共 API 面仍暴露 nsp_rule_file_write——调用方可拼出不持锁的读改写",
+              file=sys.stderr)
+        print(probe_err, file=sys.stderr, end="")
+        return 1
     if run.returncode == 78:
         print("跳过项（gap，不计通过）: A10 读失败不覆盖（以 root 运行）", file=sys.stderr)
         return 78

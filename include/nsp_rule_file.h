@@ -63,10 +63,10 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap);
  * 编辑类入口在真失败时**必须放弃写入**并返回错误，不得覆盖既有文件。 */
 char** nsp_rule_file_read_ex(const char* path, int* out_count, int* out_cap, int* out_err);
 
-/* 原子落盘：写 <path>.tmp → rename（同目录 rename 保证读端不见半截文件）。
- * 失败时清理 tmp 并保留原文件。
- * true = 成功，false = 失败（errno 有效）。 */
-bool nsp_rule_file_write(const char* path, char** lines, int count);
+/* 原子落盘（写 <path>.tmp → fsync → rename → 目录 fsync）由本文件内部独占，
+ * **不对外暴露**：对外唯一的写入路径是 nsp_rule_file_edit（见下），它把
+ * 「取目录 flock → 读 → 改 → 原子写回」封成事务，使调用方在结构上无法拼出
+ * 不带锁的读改写（§C6）。只读视图仍可经 nsp_rule_file_read/read_ex 获取。 */
 
 /* 释放行数组（count 为元素数；lines 可为 NULL） */
 void nsp_rule_file_free(char** lines, int count);
@@ -80,6 +80,31 @@ void nsp_rule_file_remove(char** lines, int* count, int pos);
 
 /* 追加 text 的副本到末尾，返回新行数；失败返回 NSP_RULE_FILE_EINVAL */
 int nsp_rule_file_append(char*** lines, int* cap, int count, const char* text);
+
+/* ==================== 唯一编辑入口（持锁读-改-写事务） ==================== */
+
+/* 编辑回调：在目录 flock 事务内被调用（见 nsp_rule_file_edit）。
+ *
+ *   lines / count / cap : 当前文件的行数组。*lines 可被替换、*cap 随之更新
+ *                         （nsp_rule_file_insert/append 扩容时会就地更新 *cap）。
+ *                         每行以 \n 结尾，元素由 strdup 分配。
+ *   ctx                 : 调用方上下文（原样透传）
+ *   out_changed         : 回调置为「是否修改了行数组」；false 时事务跳过落盘
+ *
+ * 返回 NSP_RULE_FILE_OK 时由事务负责原子写回；负值 = 错误码（事务放弃写入，
+ * 原文件保持不动）。**回调不得自行读写文件或取锁**——读入与写回统一由事务
+ * 承担，这正是「忘记取锁」在结构上不可能发生的原因（§C6）。
+ * 回调返回后行数组由事务释放，回调不得留存其指针。 */
+typedef int (*NspRuleFileEditFn)(char*** lines, int* count, int* cap, void* ctx,
+                                 bool* out_changed);
+
+/* 规则文件编辑的**唯一入口**：取目录 flock → 读全文 → 调 fn → 原子写回 → 放锁。
+ * 段式/无段 upsert、按索引删除、启用切换（及未来新增命令）全部是本原语的回调
+ * 实现，故不存在「读-改-写却没取锁」的调用侧路径（§C6）。
+ * 锁不可用时按 fail-open 继续（绝不因锁不可用而拒绝编辑）。
+ * 读失败（非 ENOENT）时**不调用 fn**、不写文件，返回 NSP_RULE_FILE_EIO。
+ * 0=成功（*out_changed 表是否实际改动并落盘）；负值为错误码。 */
+int nsp_rule_file_edit(const char* path, NspRuleFileEditFn fn, void* ctx, bool* out_changed);
 
 /* ==================== 段与类型匹配 ==================== */
 
@@ -203,8 +228,8 @@ int nsp_rule_file_remove_nth_scoped(const char* path, const NspRuleScope* scope,
  *   enable=false → 在行首插入 '#'（行变长，内部重建缓冲）
  * out_line 非 NULL 时写入改后整行（截断到 out_sz）；out_changed 表是否实际改动
  * （已处于目标状态时返回成功、false，且不落盘）。
- * 全程持目录 flock 串行化读-改-写——编辑入口一律走本函数，不得在调用侧自行
- * 「读全文→改一行→覆盖写」（那条路径不持锁，会丢并发修改，§A6）。
+ * 经 nsp_rule_file_edit 事务（唯一编辑入口，全程持目录 flock）——库不再对外
+ * 暴露无锁写路径，调用侧无从拼出「读全文→改一行→覆盖写」（§C6）。
  * 0=成功；NSP_RULE_FILE_ENOTFND=未找到该索引；负值为错误码。 */
 int nsp_rule_file_toggle_nth_scoped(const char* path, const NspRuleScope* scope,
                                     const char* type_name, int index, bool enable, char* out_line,

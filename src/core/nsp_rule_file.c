@@ -121,7 +121,10 @@ static void rule_file_fsync_dir(const char* path) {
     close(fd);
 }
 
-bool nsp_rule_file_write(const char* path, char** lines, int count) {
+/* 原子落盘（内部独占）：对外唯一的写入路径是 nsp_rule_file_edit，见文件末尾。
+ * 本函数刻意不进入公共头文件——调用方拿不到无锁写入口，也就无法自行拼出
+ * 「读全文 → 改一行 → 覆盖写」而绕过目录 flock（§C6）。 */
+static bool rule_file_write(const char* path, char** lines, int count) {
     if (!path || count < 0) return false;
     /* 临时名带 pid：同一目录可能被多个进程（rule_server 与多个 log_ctl）同时编辑，
        固定 <path>.tmp 会让两个写者互相 rename 掉对方尚未写完的临时文件 */
@@ -404,77 +407,72 @@ int nsp_rule_file_find_nth_scoped(char** lines, int count, const NspRuleScope* s
 
 /* ==================== 段式文件写入 ==================== */
 
-static int upsert_in_section_impl(const char* path, const char* sec_name,
-                                    NspRuleSectionMatch sec_match, bool is_switch,
-                                    const char* type_name, const char* line, bool* out_changed) {
-    if (!path || !sec_name || !line) return NSP_RULE_FILE_EINVAL;
-    if (is_switch && !type_name) return NSP_RULE_FILE_EINVAL;
-    if (out_changed) *out_changed = false;
+typedef struct {
+    const char* sec_name;
+    NspRuleSectionMatch sec_match;
+    bool is_switch;
+    const char* type_name;
+    const char* line;
+} EditUpsertSectionCtx;
+
+/* 段式 upsert 的编辑体（在 nsp_rule_file_edit 事务内改行数组；不读写文件、不取锁）。
+ * 出错时直接返回错误码——行数组所有权归事务，本函数不得释放它。 */
+static int edit_upsert_in_section(char*** lines_p, int* count_p, int* cap_p, void* vctx,
+                                  bool* out_changed) {
+    const EditUpsertSectionCtx* c = vctx;
+    char** lines = *lines_p;
+    int count = *count_p;
+    int cap = *cap_p;
 
     /* 匹配文本与写入文本必须分开：find_header 靠"段头之后为空白或 ON/OFF"
-       来容忍 [X] OFF / [X]␠␠ / 末行无换行，传入带 \n 的文本会让这些形态全部
-       失配（\n 与行内的空白/ON/OFF 首字符不等），误判段头缺失后追加重复段 ——
-       而重复段的段头是默认 ON，会把显式 [X] OFF 的类别悄悄重新使能 */
+       来容忍 [X] OFF / [X] 带尾随空白 / 末行无换行，传入带 \n 的文本会让这些
+       形态全部失配（\n 与行内的空白/ON/OFF 首字符不等），误判段头缺失后追加
+       重复段 —— 而重复段的段头是默认 ON，会把显式 [X] OFF 的类别悄悄重新使能 */
     char sec_match_hdr[128];
-    int mn = snprintf(sec_match_hdr, sizeof sec_match_hdr, "[%s]", sec_name);
+    int mn = snprintf(sec_match_hdr, sizeof sec_match_hdr, "[%s]", c->sec_name);
     if (mn < 0 || (size_t)mn >= sizeof sec_match_hdr) return NSP_RULE_FILE_EINVAL;
     char sec_hdr[132];
     int hn = snprintf(sec_hdr, sizeof sec_hdr, "%s\n", sec_match_hdr);
     if (hn < 0 || (size_t)hn >= sizeof sec_hdr) return NSP_RULE_FILE_EINVAL;
 
-    int count = 0, cap = 0;
-    int rerr = 0;
-    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
-    /* 读失败（非 ENOENT）绝不当空文件：否则会以「段头 + 本次 1 条」覆盖整份
-       规则文件（EMFILE/EACCES/EIO/OOM 时静默丢全部既有规则，§A10） */
-    if (!lines && rerr != 0 && rerr != ENOENT) {
-        errno = rerr;
-        return NSP_RULE_FILE_EIO;
-    }
     bool changed = false;
 
-    int hdr = (sec_match == NSP_RULE_SEC_PREFIX)
-                  ? nsp_rule_file_find_section(lines, count, sec_name)
+    int hdr = (c->sec_match == NSP_RULE_SEC_PREFIX)
+                  ? nsp_rule_file_find_section(lines, count, c->sec_name)
                   : nsp_rule_file_find_header(lines, count, sec_match_hdr);
 
-    if (is_switch) {
+    if (c->is_switch) {
         /* 开关：段内就地替换（保持唯一），无则插段头后；段头缺失则新建段 */
         if (hdr >= 0) {
-            int old = nsp_rule_file_find_switch(lines, count, hdr, type_name);
+            int old = nsp_rule_file_find_switch(lines, count, hdr, c->type_name);
             if (old >= 0) {
-                if (strcmp(lines[old], line) != 0) {
-                    char* dup = strdup(line);
-                    if (!dup) {
-                        nsp_rule_file_free(lines, count);
-                        return NSP_RULE_FILE_EINVAL;
-                    }
+                if (strcmp(lines[old], c->line) != 0) {
+                    char* dup = strdup(c->line);
+                    if (!dup) return NSP_RULE_FILE_EINVAL;
                     free(lines[old]);
                     lines[old] = dup;
                     changed = true;
                 }
             } else {
-                int nc = nsp_rule_file_insert(&lines, &cap, count, hdr + 1, line);
-                if (nc < 0) {
-                    nsp_rule_file_free(lines, count);
-                    return NSP_RULE_FILE_EINVAL;
-                }
+                int nc = nsp_rule_file_insert(&lines, &cap, count, hdr + 1, c->line);
+                if (nc < 0) return NSP_RULE_FILE_EINVAL;
                 count = nc;
                 changed = true;
             }
         } else {
-            if (nsp_rule_file_append(&lines, &cap, count, sec_hdr) < 0 ||
-                nsp_rule_file_append(&lines, &cap, count + 1, line) < 0) {
-                nsp_rule_file_free(lines, count);
+            if (nsp_rule_file_append(&lines, &cap, count, sec_hdr) < 0)
                 return NSP_RULE_FILE_EINVAL;
-            }
-            count += 2;
+            count++;
+            if (nsp_rule_file_append(&lines, &cap, count, c->line) < 0)
+                return NSP_RULE_FILE_EINVAL;
+            count++;
             changed = true;
         }
     } else {
         /* 规则行：全文件去重后插段头之后；段头缺失则新建段 */
         bool dup = false;
         for (int i = 0; i < count; i++) {
-            if (strcmp(lines[i], line) == 0) {
+            if (strcmp(lines[i], c->line) == 0) {
                 dup = true;
                 break;
             }
@@ -482,76 +480,62 @@ static int upsert_in_section_impl(const char* path, const char* sec_name,
         if (!dup) {
             int pos = (hdr >= 0) ? hdr + 1 : count;
             if (hdr < 0) {
-                if (nsp_rule_file_append(&lines, &cap, count, sec_hdr) < 0) {
-                    nsp_rule_file_free(lines, count);
+                if (nsp_rule_file_append(&lines, &cap, count, sec_hdr) < 0)
                     return NSP_RULE_FILE_EINVAL;
-                }
                 count++;
                 pos = count;
             }
-            int nc = nsp_rule_file_insert(&lines, &cap, count, pos, line);
-            if (nc < 0) {
-                nsp_rule_file_free(lines, count);
-                return NSP_RULE_FILE_EINVAL;
-            }
+            int nc = nsp_rule_file_insert(&lines, &cap, count, pos, c->line);
+            if (nc < 0) return NSP_RULE_FILE_EINVAL;
             count = nc;
             changed = true;
         }
     }
 
-    if (changed && !nsp_rule_file_write(path, lines, count)) {
-        nsp_rule_file_free(lines, count);
-        return NSP_RULE_FILE_EIO;
-    }
-    nsp_rule_file_free(lines, count);
-    if (out_changed) *out_changed = changed;
+    *lines_p = lines;
+    *count_p = count;
+    *cap_p = cap;
+    *out_changed = changed;
     return NSP_RULE_FILE_OK;
 }
 
 /* ==================== 无段文件写入 ==================== */
 
-static int upsert_line_impl(const char* path, bool is_switch, const char* type_name,
-                              const char* line, bool* out_changed) {
-    if (!path || !line) return NSP_RULE_FILE_EINVAL;
-    if (is_switch && !type_name) return NSP_RULE_FILE_EINVAL;
-    if (out_changed) *out_changed = false;
+typedef struct {
+    bool is_switch;
+    const char* type_name;
+    const char* line;
+} EditUpsertLineCtx;
 
-    int count = 0, cap = 0;
-    int rerr = 0;
-    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
-    /* 读失败绝不当空文件覆盖（§A10） */
-    if (!lines && rerr != 0 && rerr != ENOENT) {
-        errno = rerr;
-        return NSP_RULE_FILE_EIO;
-    }
+/* 无段文件 upsert 的编辑体（在事务内改行数组）。 */
+static int edit_upsert_line(char*** lines_p, int* count_p, int* cap_p, void* vctx,
+                            bool* out_changed) {
+    const EditUpsertLineCtx* c = vctx;
+    char** lines = *lines_p;
+    int count = *count_p;
+    int cap = *cap_p;
     bool changed = false;
 
-    if (is_switch) {
+    if (c->is_switch) {
         /* 开关：替换文件中首个同类型开关行（保持唯一，后写覆盖），无则追加 */
         int old = -1;
         for (int i = 0; i < count; i++) {
-            if (nsp_rule_file_line_is_type(lines[i], type_name)) {
+            if (nsp_rule_file_line_is_type(lines[i], c->type_name)) {
                 old = i;
                 break;
             }
         }
         if (old >= 0) {
-            if (strcmp(lines[old], line) != 0) {
-                char* dup = strdup(line);
-                if (!dup) {
-                    nsp_rule_file_free(lines, count);
-                    return NSP_RULE_FILE_EINVAL;
-                }
+            if (strcmp(lines[old], c->line) != 0) {
+                char* dup = strdup(c->line);
+                if (!dup) return NSP_RULE_FILE_EINVAL;
                 free(lines[old]);
                 lines[old] = dup;
                 changed = true;
             }
         } else {
-            int nc = nsp_rule_file_append(&lines, &cap, count, line);
-            if (nc < 0) {
-                nsp_rule_file_free(lines, count);
-                return NSP_RULE_FILE_EINVAL;
-            }
+            int nc = nsp_rule_file_append(&lines, &cap, count, c->line);
+            if (nc < 0) return NSP_RULE_FILE_EINVAL;
             count = nc;
             changed = true;
         }
@@ -559,28 +543,23 @@ static int upsert_line_impl(const char* path, bool is_switch, const char* type_n
         /* 规则行：全文件去重后追加 */
         bool dup = false;
         for (int i = 0; i < count; i++) {
-            if (strcmp(lines[i], line) == 0) {
+            if (strcmp(lines[i], c->line) == 0) {
                 dup = true;
                 break;
             }
         }
         if (!dup) {
-            int nc = nsp_rule_file_append(&lines, &cap, count, line);
-            if (nc < 0) {
-                nsp_rule_file_free(lines, count);
-                return NSP_RULE_FILE_EINVAL;
-            }
+            int nc = nsp_rule_file_append(&lines, &cap, count, c->line);
+            if (nc < 0) return NSP_RULE_FILE_EINVAL;
             count = nc;
             changed = true;
         }
     }
 
-    if (changed && !nsp_rule_file_write(path, lines, count)) {
-        nsp_rule_file_free(lines, count);
-        return NSP_RULE_FILE_EIO;
-    }
-    nsp_rule_file_free(lines, count);
-    if (out_changed) *out_changed = changed;
+    *lines_p = lines;
+    *count_p = count;
+    *cap_p = cap;
+    *out_changed = changed;
     return NSP_RULE_FILE_OK;
 }
 
@@ -594,60 +573,60 @@ static bool rule_line_is_disabled(const char* line) {
     return *p == '#';
 }
 
-static int remove_nth_scoped_impl(const char* path, const NspRuleScope* scope,
-                                  const char* type_name, int index, char* out_removed,
-                                  size_t removed_sz) {
-    if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
+typedef struct {
+    const NspRuleScope* scope;
+    const char* type_name;
+    int index;
+    char* out_removed;
+    size_t removed_sz;
+} EditRemoveNthCtx;
 
-    int count = 0, cap = 0;
-    int rerr = 0;
-    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
-    /* 读失败（非 ENOENT）绝不当空文件（§A10）；ENOENT 按空文件 → 下面报 ENOTFND */
-    if (!lines && rerr != 0 && rerr != ENOENT) {
-        errno = rerr;
-        return NSP_RULE_FILE_EIO;
-    }
+/* 删除编辑体：未找到返回 ENOTFND（事务据此放弃落盘）。 */
+static int edit_remove_nth(char*** lines_p, int* count_p, int* cap_p, void* vctx,
+                           bool* out_changed) {
+    (void)cap_p; /* 删除不扩容 */
+    const EditRemoveNthCtx* c = vctx;
+    char** lines = *lines_p;
+    int count = *count_p;
 
-    int found = nsp_rule_file_find_nth_scoped(lines, count, scope, type_name, index);
-    if (found < 0) {
-        nsp_rule_file_free(lines, count);
-        return NSP_RULE_FILE_ENOTFND;
-    }
-    if (out_removed && removed_sz) snprintf(out_removed, removed_sz, "%s", lines[found]);
+    int found = nsp_rule_file_find_nth_scoped(lines, count, c->scope, c->type_name, c->index);
+    if (found < 0) return NSP_RULE_FILE_ENOTFND;
+    if (c->out_removed && c->removed_sz)
+        snprintf(c->out_removed, c->removed_sz, "%s", lines[found]);
 
     nsp_rule_file_remove(lines, &count, found);
-    if (!nsp_rule_file_write(path, lines, count)) {
-        nsp_rule_file_free(lines, count);
-        return NSP_RULE_FILE_EIO;
-    }
-    nsp_rule_file_free(lines, count);
+    *lines_p = lines;
+    *count_p = count;
+    *out_changed = true;
     return NSP_RULE_FILE_OK;
 }
 
-static int toggle_nth_scoped_impl(const char* path, const NspRuleScope* scope,
-                                  const char* type_name, int index, bool enable, char* out_line,
-                                  size_t out_sz, bool* out_changed) {
-    if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
-    if (out_changed) *out_changed = false;
+typedef struct {
+    const NspRuleScope* scope;
+    const char* type_name;
+    int index;
+    bool enable;
+    char* out_line;
+    size_t out_sz;
+} EditToggleNthCtx;
 
-    int count = 0, cap = 0;
-    int rerr = 0;
-    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
-    if (!lines && rerr != 0 && rerr != ENOENT) {
-        errno = rerr;
-        return NSP_RULE_FILE_EIO;
-    }
-    int found = nsp_rule_file_find_nth_scoped(lines, count, scope, type_name, index);
-    if (found < 0) {
-        nsp_rule_file_free(lines, count);
-        return NSP_RULE_FILE_ENOTFND;
-    }
+/* 启用/停用编辑体：已处于目标状态时不改动（out_changed=false，事务跳过落盘）。 */
+static int edit_toggle_nth(char*** lines_p, int* count_p, int* cap_p, void* vctx,
+                           bool* out_changed) {
+    (void)cap_p; /* 切换不扩容 */
+    const EditToggleNthCtx* c = vctx;
+    char** lines = *lines_p;
+    int count = *count_p;
+
+    int found = nsp_rule_file_find_nth_scoped(lines, count, c->scope, c->type_name, c->index);
+    if (found < 0) return NSP_RULE_FILE_ENOTFND;
     bool disabled = rule_line_is_disabled(lines[found]);
-    bool already = enable ? !disabled : disabled;
+    bool already = c->enable ? !disabled : disabled;
+    bool changed = false;
     if (!already) {
         char* p = lines[found];
         while (*p == ' ' || *p == '\t') p++;
-        if (enable) {
+        if (c->enable) {
             /* 去掉行首 #（及紧随其后的空白）——向前移动，长度缩小，安全 */
             if (*p == '#') {
                 char* q = p + 1;
@@ -660,51 +639,74 @@ static int toggle_nth_scoped_impl(const char* path, const NspRuleScope* scope,
             size_t prefix = (size_t)(p - lines[found]);
             size_t len = strlen(lines[found]);
             if (len + 2 > (size_t)NSP_DYN_FORMAT_MAX) { /* 与读入上限同界，防御性 */
-                nsp_rule_file_free(lines, count);
                 return NSP_RULE_FILE_EINVAL;
             }
             char* nl = malloc(len + 2);
-            if (!nl) {
-                nsp_rule_file_free(lines, count);
-                return NSP_RULE_FILE_EINVAL;
-            }
+            if (!nl) return NSP_RULE_FILE_EINVAL;
             memcpy(nl, lines[found], prefix);
             nl[prefix] = '#';
             strcpy(nl + prefix + 1, p);
             free(lines[found]);
             lines[found] = nl;
         }
-        if (!nsp_rule_file_write(path, lines, count)) {
-            nsp_rule_file_free(lines, count);
-            return NSP_RULE_FILE_EIO;
-        }
-        if (out_changed) *out_changed = true;
+        changed = true;
     }
-    if (out_line && out_sz) snprintf(out_line, out_sz, "%s", lines[found]);
-    nsp_rule_file_free(lines, count);
+    if (c->out_line && c->out_sz) snprintf(c->out_line, c->out_sz, "%s", lines[found]);
+    *lines_p = lines;
+    *count_p = count;
+    *out_changed = changed;
     return NSP_RULE_FILE_OK;
 }
 
-/* ==================== 加锁包装（读-改-写全程持目录 flock） ====================
-   所有入口都是「读全文件 → 改内存 → 覆盖写」，跨进程并发时必须串行，否则后写者
-   吃掉前者的修改。实现体不改，包装只负责取/放锁（fail-open）。 */
+/* ==================== 唯一编辑入口（持锁读-改-写事务） ====================
+   库对外的写入路径只有这一条：取目录 flock → 读全文 → 调编辑体 → 原子写回 → 放锁。
+   四个编辑语义（段式/无段 upsert、按索引删除、启用切换）都是本原语的回调实现，
+   故「读-改-写却没取锁」在结构上不可能出现（§C6）；原子落盘函数 rule_file_write
+   亦不进入公共头文件，调用方无从自行拼出无锁写路径。
+   锁不可用时按 fail-open 继续（绝不因锁不可用而拒绝编辑）。 */
+
+int nsp_rule_file_edit(const char* path, NspRuleFileEditFn fn, void* ctx, bool* out_changed) {
+    if (!path || !fn) return NSP_RULE_FILE_EINVAL;
+    if (out_changed) *out_changed = false;
+
+    int lk = rule_file_lock_dir(path);
+    int count = 0, cap = 0, rerr = 0;
+    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
+    /* 读失败（非 ENOENT）绝不当空文件：否则会以「段头 + 本次 1 条」覆盖整份
+       规则文件（EMFILE/EACCES/EIO/OOM 时静默丢全部既有规则，§A10） */
+    if (!lines && rerr != 0 && rerr != ENOENT) {
+        rule_file_unlock_dir(lk);
+        errno = rerr;
+        return NSP_RULE_FILE_EIO;
+    }
+
+    bool changed = false;
+    int rc = fn(&lines, &count, &cap, ctx, &changed);
+    if (rc == NSP_RULE_FILE_OK && changed && !rule_file_write(path, lines, count))
+        rc = NSP_RULE_FILE_EIO;
+    if (rc != NSP_RULE_FILE_OK) changed = false; /* 未落盘即不算改动 */
+    nsp_rule_file_free(lines, count);
+    rule_file_unlock_dir(lk);
+    if (out_changed) *out_changed = changed;
+    return rc;
+}
 
 int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
                                     NspRuleSectionMatch sec_match, bool is_switch,
                                     const char* type_name, const char* line, bool* out_changed) {
-    int lk = rule_file_lock_dir(path);
-    int rc = upsert_in_section_impl(path, sec_name, sec_match, is_switch, type_name, line,
-                                    out_changed);
-    rule_file_unlock_dir(lk);
-    return rc;
+    if (!path || !sec_name || !line) return NSP_RULE_FILE_EINVAL;
+    if (is_switch && !type_name) return NSP_RULE_FILE_EINVAL;
+    EditUpsertSectionCtx ctx = {.sec_name = sec_name, .sec_match = sec_match,
+                                .is_switch = is_switch, .type_name = type_name, .line = line};
+    return nsp_rule_file_edit(path, edit_upsert_in_section, &ctx, out_changed);
 }
 
 int nsp_rule_file_upsert_line(const char* path, bool is_switch, const char* type_name,
                               const char* line, bool* out_changed) {
-    int lk = rule_file_lock_dir(path);
-    int rc = upsert_line_impl(path, is_switch, type_name, line, out_changed);
-    rule_file_unlock_dir(lk);
-    return rc;
+    if (!path || !line) return NSP_RULE_FILE_EINVAL;
+    if (is_switch && !type_name) return NSP_RULE_FILE_EINVAL;
+    EditUpsertLineCtx ctx = {.is_switch = is_switch, .type_name = type_name, .line = line};
+    return nsp_rule_file_edit(path, edit_upsert_line, &ctx, out_changed);
 }
 
 int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index, char* out_removed,
@@ -715,18 +717,17 @@ int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index,
 int nsp_rule_file_remove_nth_scoped(const char* path, const NspRuleScope* scope,
                                     const char* type_name, int index, char* out_removed,
                                     size_t removed_sz) {
-    int lk = rule_file_lock_dir(path);
-    int rc = remove_nth_scoped_impl(path, scope, type_name, index, out_removed, removed_sz);
-    rule_file_unlock_dir(lk);
-    return rc;
+    if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
+    EditRemoveNthCtx ctx = {.scope = scope, .type_name = type_name, .index = index,
+                            .out_removed = out_removed, .removed_sz = removed_sz};
+    return nsp_rule_file_edit(path, edit_remove_nth, &ctx, NULL);
 }
 
 int nsp_rule_file_toggle_nth_scoped(const char* path, const NspRuleScope* scope,
                                     const char* type_name, int index, bool enable, char* out_line,
                                     size_t out_sz, bool* out_changed) {
-    int lk = rule_file_lock_dir(path);
-    int rc = toggle_nth_scoped_impl(path, scope, type_name, index, enable, out_line, out_sz,
-                                    out_changed);
-    rule_file_unlock_dir(lk);
-    return rc;
+    if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
+    EditToggleNthCtx ctx = {.scope = scope, .type_name = type_name, .index = index,
+                            .enable = enable, .out_line = out_line, .out_sz = out_sz};
+    return nsp_rule_file_edit(path, edit_toggle_nth, &ctx, out_changed);
 }
