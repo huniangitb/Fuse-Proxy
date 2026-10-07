@@ -77,7 +77,7 @@ SUITE_MAP = [
      ("inject-method",),
      "injector 目标判定 / 注入方法"),
 
-    (("test_inject_mount_env.py", "test_ns_combined_rollback.py"),
+    (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py"),
      ("src/injector/ns_utils.c", "src/injector/ns_global_replace.c"),
      ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
@@ -261,6 +261,7 @@ PARALLEL_SAFE = frozenset({
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
     "test_rule_file_lock.py",     # cc 直编 nsp_rule_file + 子进程并发写，/tmp 工作目录
     "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权
+    "test_ns_umount_overflow.py",    # cc 直编 ns_utils.c + ASan + --wrap 桩 fopen/umount2，无挂载
     "test_reaped_managed.py",     # cc 直编收尸留档 + 真实 fork 子进程，无共享状态
     "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_ftp_upload_lock.py",    # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE

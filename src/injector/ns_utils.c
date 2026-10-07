@@ -294,20 +294,37 @@ static int do_bind_mount(void* raw_args) {
     if (mount(args->src, args->target, nullptr, MS_BIND | MS_REC, nullptr) != 0) return errno;
     return 0;
 }
+/* 把挂载点拷入定长槽。放不下（≥ 槽容量）返回 -1 由调用方跳过并告警——
+   **绝不静默截断**：截断后的路径会 umount 到错误位置（A9）。 */
+static int ns_store_mount_point(char* dst, size_t dst_sz, const char* mp) {
+    size_t n = strlen(mp);
+    if (n >= dst_sz) return -1;
+    memcpy(dst, mp, n + 1);
+    return 0;
+}
+
 static int do_umount_recursive(void* raw_args) {
     const char* target = (const char*)raw_args;
     size_t tlen = strlen(target);
     FILE* fp = fopen("/proc/self/mountinfo", "re");
     if (fp) {
         char mounts[128][256];
+        const int cap = (int)(sizeof(mounts) / sizeof(mounts[0]));
         int count = 0;
         char line[1024];
-        while (fgets(line, sizeof(line), fp) && count < 128) {
+        while (fgets(line, sizeof(line), fp)) {
             char mp[PATH_MAX] = {0};
             if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
             if (strcmp(mp, target) == 0) continue;
             if (strncmp(mp, target, tlen) == 0 && (mp[tlen] == '/' || mp[tlen] == '\0')) {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
+                if (count >= cap) {
+                    LOG_WRN("递归卸载: %s 下匹配挂载点达到 %d 上限，拒绝静默截断", target, cap);
+                    break;
+                }
+                if (ns_store_mount_point(mounts[count], sizeof(mounts[count]), mp) != 0) {
+                    LOG_WRN("递归卸载: 挂载点路径超长（%zu 字节）已跳过: %.64s...", strlen(mp), mp);
+                    continue;
+                }
                 count++;
             }
         }
@@ -326,14 +343,22 @@ static int do_umount_and_rmdir(void* raw_args) {
     FILE* fp = fopen("/proc/self/mountinfo", "re");
     if (fp) {
         char mounts[64][256];
+        const int cap = (int)(sizeof(mounts) / sizeof(mounts[0]));
         int count = 0;
         char line[1024];
-        while (fgets(line, sizeof(line), fp) && count < 64) {
+        while (fgets(line, sizeof(line), fp)) {
             char mp[PATH_MAX] = {0};
             if (sscanf(line, "%*d %*d %*d:%*d %*s %4095s", mp) != 1) continue;
             if (strcmp(mp, target) == 0) continue;
             if (strncmp(mp, target, tlen) == 0 && mp[tlen] == '/') {
-                strncpy(mounts[count], mp, PATH_MAX - 1);
+                if (count >= cap) {
+                    LOG_WRN("卸载并删除: %s 下匹配挂载点达到 %d 上限，拒绝静默截断", target, cap);
+                    break;
+                }
+                if (ns_store_mount_point(mounts[count], sizeof(mounts[count]), mp) != 0) {
+                    LOG_WRN("卸载并删除: 挂载点路径超长（%zu 字节）已跳过: %.64s...", strlen(mp), mp);
+                    continue;
+                }
                 count++;
             }
         }
