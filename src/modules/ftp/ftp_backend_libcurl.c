@@ -120,7 +120,14 @@ typedef struct FtpBackend {
 
 /* V5 分页缓存上限 = 框架页循环总数上限(VFS_READDIR_MAX_TOTAL=65536)+1 哨兵：
    解析到此数后仍有行即 truncated，服务到缓存末尾时报 E2BIG（fail-closed，
-   与框架侧总数上限对齐，>64K 条的 FTP 目录 loud 报错而非静默丢尾）。 */
+   与框架侧总数上限对齐，>64K 条的 FTP 目录**拒绝服务残页**而非静默丢尾）。
+
+   注意（C3）：此处回传的 -E2BIG 落在框架 `backend_rc_is_business` 区间
+   （-4095..0），被框架当作**业务 errno** 原样回给 readdir 调用者——**不会**
+   触发 module_guard_error，故**没有**框架 loud 日志、也不计模块错误。这与
+   框架自身在 `vfs_readdir_ctx` 里对"无限产条目"的防御（那一路会
+   `module_guard_error` 后 loud 报错）是两回事：本模块是**如实上报**一个
+   业务失败（远端条目数超出可服务范围），契约上就该走业务通道。 */
 #define FTP_LIST_CACHE_MAX 65537u
 
 typedef struct FtpListEntry {
@@ -1165,7 +1172,8 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
 
 /* 从已缓存数组服务一页（纯函数，无锁，调用方持 bk->lock）：
    返回填充数；页尾恰为缓存末尾但远端还有未知条目（truncated）→ -E2BIG
-   fail-closed（框架中止并 loud 报错，不静默丢尾）；offset 越界时同理，
+   fail-closed（拒给残页，由调用方回给框架；见 FTP_LIST_CACHE_MAX 处关于
+   "走业务通道、无 loud" 的说明）；offset 越界时同理，
    否则（确到末尾）返回 0。 */
 static int ftp_list_serve_page(const FtpListEntry* arr, size_t count, bool truncated,
                                NspDirEntry* out, int max, uint64_t offset) {
@@ -1178,7 +1186,7 @@ static int ftp_list_serve_page(const FtpListEntry* arr, size_t count, bool trunc
         out[i].is_dir = arr[(size_t)offset + i].is_dir;
     }
     /* 页尾恰达缓存末尾但远端还有未知条目：宁可报错不给残页（fail-closed，
-       框架中止并 loud 报错，不静默丢尾） */
+       调用方回 -E2BIG 给框架；该值走业务 errno 通道，非框架 loud 路径） */
     if ((uint64_t)offset + n == (uint64_t)count && truncated) return -E2BIG;
     return (int)n;
 }
