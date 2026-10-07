@@ -3,10 +3,14 @@
 #include "nsp_util.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/file.h> /* flock：跨进程串行化读改写 */
 #include <sys/stat.h>
 
 struct NspIniStore {
@@ -34,7 +38,10 @@ static bool parse_header(const char* line, char* name_out, size_t name_sz) {
     return name_out[0] != '\0';
 }
 
-/* 键行解析：含 `=` 则拆 key（去空白，非空）与 value（剥行内 `#` 后去空白） */
+/* 键行解析：含 `=` 则拆 key（去空白，非空）与 value（剥行内注释后去空白）。
+   `#` 仅在行首或前导空白后起注释——与 ftp_conf.c 同口径。此前无条件
+   `strchr(v,'#')` 截断，含 `#` 的密码（`pass = p#ssw0rd`）被静默改成 `p`，
+   服务器 530 拒绝且配置看不出异常（review §A26 同类缺陷）。 */
 static bool parse_kv(char* line, char** key_out, char** val_out) {
     char* eq = strchr(line, '=');
     if (!eq) return false;
@@ -42,8 +49,12 @@ static bool parse_kv(char* line, char** key_out, char** val_out) {
     char* k = nsp_str_trim(line);
     if (!k[0]) return false;
     char* v = eq + 1;
-    char* hash = strchr(v, '#'); /* 与 ftp_conf 一致：首个 `#` 起皆为注释 */
-    if (hash) *hash = '\0';
+    for (char* p = v; *p; p++) {
+        if (*p == '#' && (p == v || isspace((unsigned char)p[-1]))) {
+            *p = '\0';
+            break;
+        }
+    }
     v = nsp_str_trim(v);
     *key_out = k;
     *val_out = v;
@@ -340,12 +351,69 @@ int nsp_ini_del_section(NspIniStore* s, const char* section) {
     return 0;
 }
 
+/* 目录 fsync（rename 的持久化点）：失败不致命，仅尽力而为。与
+   nsp_rule_file.c 同口径——rename 本身也要落盘，否则掉电后可能回到旧 inode */
+static void ini_fsync_dir(const char* path) {
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof dir, "%s", path ? path : "");
+    if (n < 0 || (size_t)n >= sizeof dir) return;
+    char* slash = strrchr(dir, '/');
+    if (!slash) return;
+    if (slash == dir)
+        dir[1] = '\0';
+    else
+        *slash = '\0';
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return;
+    fsync(fd);
+    close(fd);
+}
+
+/* 跨进程串行化「读-改-写」：flock 于文件所在目录（目录 fd 上 flock 合法，
+   无需额外锁文件）。rule_server 的多个请求线程/多个控制连接可能同时改
+   ftp.conf，两个写者各读同一份再各自写回会吃掉对方修改。取锁失败 fail-open
+   （绝不因锁不可用而拒绝编辑），与 nsp_rule_file.c 一致。
+   注意本函数只保护 save 自身；上层若做 read-modify-write，需在调用方持有
+   同目录 flock（rule_server 侧已由其规则文件锁覆盖同一目录）。 */
+static int ini_lock_dir(const char* path) {
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof dir, "%s", path ? path : "");
+    if (n < 0 || (size_t)n >= sizeof dir) return -1;
+    char* slash = strrchr(dir, '/');
+    if (!slash) return -1;
+    if (slash == dir)
+        dir[1] = '\0';
+    else
+        *slash = '\0';
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno == EINTR) continue;
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void ini_unlock_dir(int fd) {
+    if (fd < 0) return;
+    flock(fd, LOCK_UN);
+    close(fd);
+}
+
 int nsp_ini_save(const NspIniStore* s) {
     if (!s || !s->path[0]) return -1;
-    char tmp[4096];
-    snprintf(tmp, sizeof tmp, "%s.tmp", s->path);
+    /* 临时名带 pid：固定 <path>.tmp 会让两个写者互相 rename 掉对方尚未写完的
+       临时文件（与 nsp_rule_file.c 同因） */
+    char tmp[PATH_MAX];
+    int tn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", s->path, (long)getpid());
+    if (tn < 0 || (size_t)tn >= sizeof tmp) return -1;
+    int lock_fd = ini_lock_dir(s->path); /* fail-open：-1 时无锁继续 */
     FILE* fp = fopen(tmp, "w");
-    if (!fp) return -1;
+    if (!fp) {
+        ini_unlock_dir(lock_fd);
+        return -1;
+    }
     /* 0600：经本接口落盘的文件可能含明文密码（如 ftp.conf），与读侧
        "密码只写不读"的脱敏姿态一致；已存在文件的旧权限一并收紧 */
     fchmod(fileno(fp), S_IRUSR | S_IWUSR);
@@ -353,17 +421,30 @@ int nsp_ini_save(const NspIniStore* s) {
         if (fputs(s->lines[i], fp) < 0 || fputc('\n', fp) < 0) {
             fclose(fp);
             unlink(tmp);
+            ini_unlock_dir(lock_fd);
             return -1;
         }
     }
+    /* 持久性：fclose 只把数据交给内核，掉电时可能"rename 已生效、内容还是旧
+       的/空"。先 fsync 文件内容，再 rename，最后 fsync 目录让 rename 本身持久化 */
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        unlink(tmp);
+        ini_unlock_dir(lock_fd);
+        return -1;
+    }
     if (fclose(fp) != 0) {
         unlink(tmp);
+        ini_unlock_dir(lock_fd);
         return -1;
     }
     if (rename(tmp, s->path) != 0) {
         unlink(tmp);
+        ini_unlock_dir(lock_fd);
         return -1;
     }
+    ini_fsync_dir(s->path);
+    ini_unlock_dir(lock_fd);
     return 0;
 }
 
