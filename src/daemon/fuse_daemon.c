@@ -79,7 +79,9 @@ typedef enum {
     PT_METHOD_ANDROID_V0, /* Android V0 旧式 ioctl */
 } passthrough_method_t;
 static passthrough_method_t g_pt_method = PT_METHOD_NONE;
-static bool g_pt_probe_pending = false;             /* GNU：init 无会话 fd，探测推迟到首次 open */
+static atomic_bool g_pt_probe_pending = false;      /* GNU：init 无会话 fd，探测推迟到首次 open。
+                                                       多 worker 并发 open 时用原子 test-and-set 保证
+                                                       只探测一次（见 B3；原先 bool 检查-清零非原子） */
 static int passthrough_enable_fixed_method(int fd); /* 实现见文件后部 */
 static bool g_is_media_fuse = false;                /* --media-fuse: 媒体模块专属 FUSE */
 static char g_modules_dir_arg[PATH_MAX] = {0};      /* --modules-dir: 热插拔模块目录覆盖 */
@@ -2315,7 +2317,15 @@ static void passthrough_probe(int dev_fd) {
 #else
     snprintf(probe_path, sizeof(probe_path), "/tmp/.fuse_pt_probe.%d", getpid());
 #endif
-    int test_fd = open(probe_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    /* 安全契约（B3）：探测目录（/tmp、/data/local/tmp）对所有用户可写，名字可预测。
+       用 O_CREAT|O_EXCL 拒绝攻击者预置的同名文件；用 O_NOFOLLOW 拒绝其预置的符号
+       链接（否则 root daemon 会把 fd 作为 backing 交给 ioctl → 打开任意路径）。
+       残留同名（上次异常退出）先 unlink 再独占创建（unlink 不跟随符号链接，安全）。 */
+    int test_fd = open(probe_path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (test_fd < 0 && errno == EEXIST) {
+        unlink(probe_path);
+        test_fd = open(probe_path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    }
     if (test_fd < 0) {
         LOG_ERR("FUSE Passthrough: ❌ 无法创建探测文件 %s: %s", probe_path, strerror(errno));
         return;
@@ -2414,9 +2424,11 @@ static void passthrough_probe(int dev_fd) {
 static int passthrough_enable_fixed_method(int fd) {
     int sfd = passthrough_session_fd();
     if (sfd < 0) return -1;
-    /* GNU：init 阶段无会话 fd，探测推迟到首次 open 时补执行一次 */
-    if (g_pt_probe_pending) {
-        g_pt_probe_pending = false;
+    /* GNU：init 阶段无会话 fd，探测推迟到首次 open 时补执行一次。
+       用原子 exchange 做 test-and-set：多 worker 并发首次 open 时只有一个线程
+       进入探测，其余直接复用其结果（B3：原先 bool 检查-清零存在并发重入）。 */
+    bool expected_pending = true;
+    if (atomic_compare_exchange_strong(&g_pt_probe_pending, &expected_pending, false)) {
         passthrough_probe(sfd);
     }
     if (!g_passthrough_enabled) return -1;
@@ -2490,7 +2502,7 @@ static void* vfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
 #else
     /* GNU：init 回调拿不到会话 fd（高层 fuse_main），探测推迟到首次文件 open，
        per-open 经 fuse_get_context 取会话 fd 后补执行一次 */
-    g_pt_probe_pending = true;
+    atomic_store(&g_pt_probe_pending, true);
     LOG_DBG("FUSE Passthrough: GNU 下 ioctl 探测推迟到首次文件 open");
 #endif
 
@@ -2498,7 +2510,7 @@ passthrough_done:
 skip_passthrough:
     if (g_passthrough_enabled) {
         LOG("FUSE Passthrough: 🟢 启用成功");
-    } else if (g_pt_probe_pending) {
+    } else if (atomic_load(&g_pt_probe_pending)) {
         LOG("FUSE Passthrough: 透传探测已延迟，将在首次文件 open 时确认");
     } else {
         LOG_WRN("FUSE Passthrough: 所有文件I/O将走标准FUSE用户态路径 (性能较低)");
@@ -2512,7 +2524,7 @@ skip_passthrough:
        FUSE_MAP_ALIGNMENT 而拒绝回包） */
     LOG_DBG("FUSE 协商详情: 内核 capable=0x%x, 本端 want=0x%x, 透传=%s", (unsigned)conn->capable,
             (unsigned)conn->want,
-            g_passthrough_enabled ? "启用" : (g_pt_probe_pending ? "延迟探测" : "标准FUSE回退"));
+            g_passthrough_enabled ? "启用" : (atomic_load(&g_pt_probe_pending) ? "延迟探测" : "标准FUSE回退"));
     if (g_ready_fd >= 0) {
         write(g_ready_fd, "1", 1);
         close(g_ready_fd);
