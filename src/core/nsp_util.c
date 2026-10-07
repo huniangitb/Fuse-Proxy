@@ -31,6 +31,35 @@ char* nsp_str_trim(char* s) {
     return s;
 }
 
+void nsp_log_line_sanitize(const char* in, char* out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    size_t w = 0;
+    if (in) {
+        for (const unsigned char* p = (const unsigned char*)in; *p; p++) {
+            char esc[5];
+            size_t elen = 0;
+            switch (*p) {
+            case '\n': memcpy(esc, "\\n", 2); elen = 2; break;
+            case '\r': memcpy(esc, "\\r", 2); elen = 2; break;
+            case '\t': memcpy(esc, "\\t", 2); elen = 2; break;
+            case '\\': memcpy(esc, "\\\\", 2); elen = 2; break;
+            default:
+                if (*p < 0x20 || *p == 0x7f) {
+                    snprintf(esc, sizeof esc, "\\x%02x", *p);
+                    elen = 4;
+                } else {
+                    esc[0] = (char)*p;
+                    elen = 1;
+                }
+            }
+            if (w + elen + 1 > out_sz) break; /* 放不下即止（不半截转义） */
+            memcpy(out + w, esc, elen);
+            w += elen;
+        }
+    }
+    out[w] = '\0';
+}
+
 bool nsp_send_all(int fd, const char* buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
