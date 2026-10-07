@@ -571,7 +571,16 @@ static FtpBackend* ftp_backend_find(const char* path) {
 static void build_url(const FtpBackend* bk, const char* path, char* url, size_t sz) {
     if (!url || sz == 0) return;
     url[0] = '\0'; /* 先置空：任何失败路径都不外流截断串 */
-    const char* p = path + strlen(bk->prefix);
+    if (!bk || !path) return;
+    /* 前缀前置校验（与 ftp_backend_find 同一判据）：不匹配即保持空串，由调用方
+       按「空 URL」闭合（EIO/ENAMETOOLONG）。此前无条件 `path + strlen(prefix)`：
+       ① path 比 prefix 短时越过 NUL 读未初始化栈字节拼进 URL；② 把**别的
+       server** 的路径拼到本 server 的 URL 上——跨 server rename 因此静默写错
+       服务器（§A13）。 */
+    size_t plen = strlen(bk->prefix);
+    if (strncmp(bk->prefix, path, plen) != 0) return;
+    if (path[plen] != '\0' && path[plen] != '/') return;
+    const char* p = path + plen;
     while (*p == '/') p++;
     char rel_fixed[1024];
     char* rel_heap = NULL;
@@ -2283,6 +2292,13 @@ int ftp_backend_rename(const char* from, const char* to) {
     FtpBackend* bk = ftp_backend_find(from);
     if (!bk) return -ENOENT;
     if (backend_ready(bk) != 0) return -EIO;
+    /* 跨 server rename：一个 ftp_module 可注册多个 server，框架侧只校验
+       「同一模块」（bf_ops == bt_ops），到不了 server 粒度。RNFR/RNTO 只能落在
+       同一条控制连接上，若 to 属于另一个 server，旧实现会把文件留在 from 的
+       server 上、改名为 to 的**远程路径**——应用以为搬到了另一个挂载点，两边
+       都不对。此处显式拒绝：EXDEV 是「跨设备搬移」的既有语义，与应用可见的
+       真实语义一致（不是同一存储，无法原地改名）。 */
+    if (ftp_backend_find(to) != bk) return -EXDEV;
     char from_url[2048], to_url[2048], from_path[2048], to_path[2048], parent[2048], cmd1[4096],
         cmd2[4096];
     build_url(bk, from, from_url, sizeof from_url);
