@@ -264,13 +264,20 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
        校验窗口 0.5s：使用场景不要求低延迟热加载，稳定性优先——半写入
        窗口内一律延迟加载（延迟到下一次扫描）。 */
     struct stat st1, st2;
-    if (stat(so_path, &st1) == 0) {
-        usleep(500000);
-        if (stat(so_path, &st2) != 0 || st1.st_size != st2.st_size ||
-            st1.st_mtime != st2.st_mtime) {
-            LOG_WRN("模块 %s 的 .so 正在写入（大小/时间不稳定），延迟加载", name);
-            return -1;
-        }
+    memset(&st2, 0, sizeof st2);
+    /* 首次 stat 失败（文件不存在/不可访问/正处替换间隙）：稳定性比对没有基准，
+       继续加载等于放弃"半写入保护"（读取后的 st3 只能与未初始化的 st2 比）——
+       本轮直接放弃，下一次扫描重试。旧实现用 `if (stat(...st1) == 0)` 包住整个
+       稳定性块，stat 失败时 st2 保持未初始化却在下方与 st3 比较（UB）。 */
+    if (stat(so_path, &st1) != 0) {
+        LOG_WRN("模块 %s 的 .so 尚不可 stat（%s），放弃本轮加载", name, strerror(errno));
+        return -1;
+    }
+    usleep(500000);
+    if (stat(so_path, &st2) != 0 || st1.st_size != st2.st_size ||
+        st1.st_mtime != st2.st_mtime) {
+        LOG_WRN("模块 %s 的 .so 正在写入（大小/时间不稳定），延迟加载", name);
+        return -1;
     }
     /* **从内存副本加载**（memfd + /proc/self/fd）：模块一旦加载，其映像就只属于
        本进程，磁盘上那份文件无论被原子替换还是**就地覆盖**（truncate + 重写）都
@@ -613,7 +620,10 @@ static int module_unload_one(const char* name) {
     m->active = false;
     m->handle = NULL;
     pthread_rwlock_unlock(&g_module_lock);
-    if (mfd >= 0) close(mfd); /* dlclose 后映像无人引用，可安全关闭 */
+    /* mfd **不在此时关闭**：下面三段（drain 等待 / exit 围栏 / dlclose）都可能
+       放弃本次卸载并让模块继续服务，提前 close 会让 maps 丢掉
+       `memfd:nsp_module_<名>` 可观测证据而模块其实还活着（A23-1）。
+       只在真正 dlclose 之后关；放弃卸载的分支须把 mfd 还回槽位。 */
 
     /* 等待后端在途调用完成（防 ops 指针悬垂 SIGSEGV）。FTP 等后端网络操作
        可能远超 100ms（弱网/指数退避重试），若等待超时仍强行 dlclose，会让
@@ -641,6 +651,7 @@ static int module_unload_one(const char* name) {
         }
         m->active = true;
         m->handle = h;
+        m->mfd = mfd; /* 回滚必须复原 mfd：模块继续服务，memfd 可观测性不能丢 */
         pthread_rwlock_unlock(&g_module_lock);
         LOG_WRN("模块 %s 有在途调用（refs 未归零），延迟卸载", name);
         return -1;
@@ -663,6 +674,12 @@ static int module_unload_one(const char* name) {
     }
     if (can_unload) {
         dlclose(h);
+        if (mfd >= 0) close(mfd); /* 映像已解除映射，memfd 不再有持有者 */
+    } else {
+        /* exit 崩溃 → 保持 .so 映射：memfd 同样要留着（可观测性 + 与 .so 同命） */
+        pthread_rwlock_wrlock(&g_module_lock);
+        m->mfd = mfd;
+        pthread_rwlock_unlock(&g_module_lock);
     }
     fault_fence_unregister_slot(slot);
     /* 复位熔断器记账：重载时窗口计数/累计错误不应继承上一轮加载周期的数据，
@@ -965,7 +982,7 @@ int module_fault_poison(int slot, const char* reason) {
     m->active = false;
     m->handle = NULL;
     pthread_rwlock_unlock(&g_module_lock);
-    if (mfd >= 0) close(mfd); /* 与 unload 同序：dlclose 后映像无人引用 */
+    /* 同 unload：mfd 留到 dlclose 之后，见 module_unload_one 的注释（A23-1） */
 
     /* 等待在途引用归零（崩溃线程已 longjmp 返回会释放；其他线程的合法
        在途 backend 调用完成即释放）。超时不恢复（区别于 unload） */
@@ -979,6 +996,9 @@ int module_fault_poison(int slot, const char* reason) {
     }
     if (!drained) {
         LOG_WRN("模块 %s 置毒后在途引用未归零，跳过 dlclose（.so 保持映射,规则持续失效）", name);
+        pthread_rwlock_wrlock(&g_module_lock);
+        m->mfd = mfd; /* .so 仍映射：memfd 一并保留 */
+        pthread_rwlock_unlock(&g_module_lock);
         fault_fence_unregister_slot(slot);
         return 0; /* ban 已在槽位置空前落盘 */
     }
@@ -1015,6 +1035,9 @@ int module_fault_poison(int slot, const char* reason) {
         }
     }
     if (!can_unload) {
+        pthread_rwlock_wrlock(&g_module_lock);
+        m->mfd = mfd; /* .so 仍映射：memfd 一并保留 */
+        pthread_rwlock_unlock(&g_module_lock);
         fault_fence_unregister_slot(slot);
         fw_config_forget_module(name); /* 注销订阅/监听与过滤视图 */
         LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=槽位已置空,规则立即失效,"
@@ -1024,6 +1047,7 @@ int module_fault_poison(int slot, const char* reason) {
         return 0;
     }
     dlclose(h);
+    if (mfd >= 0) close(mfd); /* 映像已解除映射，memfd 不再有持有者 */
     fault_fence_unregister_slot(slot);
     fw_config_forget_module(name); /* 注销订阅/监听与过滤视图 */
     LOG_ERR("[MOD_ERR] module=%s op=poison reason=%s detail=exit 完成,dlclose 完成,ban 已落盘",
