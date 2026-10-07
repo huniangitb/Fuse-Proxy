@@ -14,8 +14,10 @@
  * 这一个问题；路径决策（REDIRECT/HIDE/RO）仍归模块。
  *
  * 线程模型：inotify 监听线程在配置变更后读出新视图，然后经 reload 钩子
- * （loader 注册）在**同一线程**内同步推送给各活跃模块——推送期间旧视图仍有效，
- * 推送完成才释放旧视图，故模块在回调内看到的视图始终一致。
+ * （loader 注册）在**同一线程**内同步推送给各活跃模块；同时模块加载线程也会
+ * 独立推送首份视图（module_prepare）。故下发视图为**不可变 + 引用计数的快照**
+ * （见 fw_config_view_acquire/release）：任一在飞回调持有的视图都不会被并发
+ * 重载释放，模块在回调内看到的视图始终一致。
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,10 +33,13 @@ void fw_config_shutdown(void);
 const NspCfgRec* fw_config_recs(int* count_out);
 uint64_t fw_config_generation(void);
 
-/* 按模块订阅过滤出的视图（浅拷贝记录，字符串仍指向主视图）。
-   返回的 NspModuleConfig 由本模块持有，直到下次重载或 shutdown；未知模块
-   返回 NULL。订阅为空 = 不过滤（申请全部）。 */
-const NspModuleConfig* fw_config_view_for(const char* module_name);
+/* 按模块订阅过滤出的视图（记录与字符串均为快照私有副本）。
+   **取用即持引用**：acquire 返回的视图在 release 之前始终有效，不受并发重载
+   影响（旧实现返回指向订阅表的借用指针，解锁后即可能被重载线程释放 → UAF）。
+   acquire 返回的指针必须原样交给 release；未知模块或快照创建失败返回 NULL。
+   订阅为空 = 不过滤（申请全部）。 */
+const NspModuleConfig* fw_config_view_acquire(const char* module_name);
+void fw_config_view_release(const NspModuleConfig* view);
 
 /* IO 监控开关（框架权威）：按 uid→包名做三层合并——应用段显式 > 类别段显式
    （USER_APPS[:uid] / SYSTEM_APPS）> `[GLOBAL]`。**不依赖任何模块**：模块未加载/被 ban、路径无 <uid>/ 用户层、模块
