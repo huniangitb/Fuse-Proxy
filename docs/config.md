@@ -107,7 +107,7 @@ MNT_BASE=/mnt/sdcard/$package
 - **作用域**：`[GLOBAL]` 段为全局共享，应用段为该应用专属并覆盖全局同名变量（`lookup_var` 先查应用、再查全局）。
 - **可见性（三层作用域 × 变量段，**此前未文档化的实际语义**）**：`fw_rules.c` 在三个求值入口传给 `expand_path_vars` 的「应用段」参数各不相同，故同一变量在不同规则来源下是否可见并不一致：
   - **应用段规则**（`[<pkg>]`）→ 传该应用自己的 `AppConfig`，故**能**看到自己的应用变量与 GLOBAL 变量。
-  - **类别段规则**（`[USER_APPS]` / `[USER_APPS:<uid>]` / `[SYSTEM_APPS]`）→ **同样传类别段自己的 `AppConfig`**；类别段内定义的变量属类别私有，**应用变量对类别规则不可见**（类别规则不能用「当前应用」的变量）。
+  - **类别段规则**（`[<category>]`，如 `[/data]`）→ **同样传类别段自己的 `AppConfig`**；类别段内定义的变量属类别私有，**应用变量对类别规则不可见**（类别规则不能用「当前应用」的变量）。
   - **全局段规则**（`[GLOBAL]`）→ 传全局 `AppConfig`，故只能看到 GLOBAL 变量，**看不到任何应用变量**。
   - 变量查找顺序恒为「传入的段 `AppConfig` → `global_cfg`」（`lookup_var`），`$package` 单独走 `current_pkg`（不经变量表，故在上述三层都可用）。
   - 因此：**应用变量只能被该应用自己的段规则看到**；类别/GLOBAL 规则写 `$APP_VAR` 时若该变量未在对应段定义，将保留字面（未定义变量语义）而非展开成当前应用的值。需要「随应用变化」的规则请写在**应用段**或用 `$package`。
@@ -150,8 +150,8 @@ HIDE /secret   # 这不是注释，会被并入规则
 | 单行超 2048 字节 | 整行删除或缩短后重载 | 超长行整行跳过（告警），不参与匹配 |
 | 路径超 255 字符 | 缩短路径 | `MAX_PATH_LEN=256` |
 | 包名超 127 字符 | 校验包名长度 | 结构体上限 128 |
-| `SANDBOX_DIR` 写在应用段/类别段 | 只写 `[GLOBAL]` 段 | 仅全局段有效，写在别处忽略并告警（`config_parser.c` 的 `SANDBOX_DIR` 分支）；目录名须单级、不含 `/`、上限 63 字节 |
-| `SANDBOX_TARGET = <路径>` | 用 `[GLOBAL]` 段的 `SANDBOX_DIR` 改目录名 | 无此配置项；沙盒落点固定为 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/<SANDBOX_DIR 或 sandbox>`，不能改成任意路径 |
+| `SANDBOX_DIR` | 全局段 | 沙盒落点目录名（单级目录名，不含 `/`，上限 63 字节）；覆盖默认 `sandbox`，实际落点 `<STORAGE_BASE>/<uid>/<pkg>/<目录名>`，热重载生效 |
+| `SANDBOX_TARGET` / 自定义沙箱目录 | — | 不用配置语法；目录名经 `SANDBOX_DIR` 配置项覆盖，默认落点 `<STORAGE_BASE>/<uid>/<pkg>/sandbox` |
 | 应用段写 `MONITOR OFF` 期望继承全局 | 全局段写 `MONITOR OFF`，或应用段显式写所需值 | 应用段显式写即覆盖全局 |
 | `FUSE_EXTRA_ARGS` 写在应用段 | 仅写 `[GLOBAL]` 段 | 应用段无该字段 |
 | 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `strip_storage_prefix` 不处理 `/sdcard` |
