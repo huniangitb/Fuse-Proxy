@@ -12,6 +12,8 @@ inotify 事件；旧实现对这些事件与规则文件一视同仁，都走 `r
   - 旧实现：改写 uid.map 后计数 +1（期望 0）→ 本组失败；
   - 新实现：uid.map / sys_pkgs.cache 只做轻量刷新（fw_pkg_reload / sys_pkg_refresh
     + 代际递增），只有规则文件才触发全量重载。
+另含 C11 第二半「重解析后与旧视图比对无变化则跳过发布」：把规则文件重写为**逐字
+相同**内容后计数不得再涨（旧实现无条件发布 → 本组失败）。
 
 复现旧实现：FW_CONFIG_SRC=<旧 fw_config.c 副本> python3 tests/test_cfg_reload_split.py
 
@@ -131,11 +133,15 @@ def main():
         if vals.get("after_syspkg") != vals.get("after_rules"):
             fails.append(f"sys_pkgs.cache 变更触发了全量规则重载（{vals.get('after_rules')} → "
                          f"{vals.get('after_syspkg')}，期望不变）")
+        if vals.get("after_same") != vals.get("after_rules"):
+            fails.append(f"规则文件重写为相同内容仍触发了全量重载（{vals.get('after_rules')} → "
+                         f"{vals.get('after_same')}，期望不变）")
         if fails:
             for f in fails:
                 print(f"  ❌ {f}", file=sys.stderr)
             return 1
         print("  ✅ uid.map / sys_pkgs.cache 不触发规则重载；规则文件仍触发（正对照）")
+        print("  ✅ 规则文件重写为相同内容不再发布（无变化跳过）")
         print("配置重载分流测试通过 ✔")
         return 0
 

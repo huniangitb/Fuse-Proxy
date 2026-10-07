@@ -8,9 +8,10 @@
  * 做法：直编 src/daemon/fw_config.c（-DFW_CONFIG_SRC，同 test_fw_config_view），
  * 并注册自己的 reload 钩子计数——驱动不链接 loader，钩子归驱动所有，故「钩子被
  * 调用次数」就是「全量重载次数」。随后依次改写三类文件，各等一个去抖窗口后打印
- * 累计次数。
+ * 累计次数；最后把规则文件重写为**逐字相同**内容，验证「无变化跳过发布」。
  *
- * 判别性：旧实现对任一事件都调 reload_once → 改写 uid.map 后计数 +1（期望 0）。
+ * 判别性：旧实现对任一事件都调 reload_once → 改写 uid.map 后计数 +1（期望 0），
+ * 且规则文件重写为相同内容也会 +1（期望 0）。
  *
  * argv[1] = 规则文件路径（其所在目录即被 watch 的配置目录）
  * argv[2] = 配置目录（写 uid.map / sys_pkgs.cache 用；与编译期 CONFIG_DIR 一致）
@@ -75,8 +76,14 @@ int main(int argc, char** argv) {
     settle();
     int after_syspkg = g_reloads;
 
-    printf("base=%d after_uidmap=%d after_rules=%d after_syspkg=%d\n", base, after_uidmap,
-           after_rules, after_syspkg);
+    /* 4) 规则文件重写为**逐字相同**内容 → 不得再触发全量重载（C11：重解析后与
+       旧视图比对无变化则跳过发布）。旧实现无条件发布，本组必失败。 */
+    write_file(dir, "injector.conf", "[GLOBAL]\nMONITOR ON\nHIDE /sdcard/x\n");
+    settle();
+    int after_same = g_reloads;
+
+    printf("base=%d after_uidmap=%d after_rules=%d after_syspkg=%d after_same=%d\n", base,
+           after_uidmap, after_rules, after_syspkg, after_same);
     fflush(stdout);
     fw_config_shutdown();
     return 0;
