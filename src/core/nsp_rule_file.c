@@ -320,9 +320,80 @@ bool nsp_rule_file_line_is_type(const char* line, const char* type_name) {
 }
 
 int nsp_rule_file_find_nth(char** lines, int count, const char* type_name, int index) {
+    return nsp_rule_file_find_nth_scoped(lines, count, NULL, type_name, index);
+}
+
+/* 该行是否为名为 name 的段头（match 决定精确/前缀匹配）。
+ * 与 find_section/find_header 的判定逐条对齐：PREFIX 接受 [name] / [name:...]；
+ * EXACT 要求 [name] 且其后为空白/ON/OFF/行尾。 */
+static bool line_is_section_named(const char* line, const char* name, NspRuleSectionMatch match) {
+    if (!line || !name) return false;
+    const char* p = line;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != '[') return false;
+    size_t nlen = strlen(name);
+    if (strncmp(p + 1, name, nlen) != 0) return false;
+    char after = p[1 + nlen];
+    if (match == NSP_RULE_SEC_PREFIX) return after == ']' || after == ':';
+    if (after != ']') return false;
+    const char* rest = p + 2 + nlen;
+    while (isspace((unsigned char)*rest)) rest++;
+    if (*rest == '\0' || *rest == '\n') return true;
+    if (strncmp(rest, "ON", 2) == 0 &&
+        (rest[2] == '\0' || rest[2] == '\n' || isspace((unsigned char)rest[2])))
+        return true;
+    if (strncmp(rest, "OFF", 3) == 0 &&
+        (rest[3] == '\0' || rest[3] == '\n' || isspace((unsigned char)rest[3])))
+        return true;
+    return false;
+}
+
+bool nsp_rule_file_scope_range(char** lines, int count, const NspRuleScope* scope, int* out_beg,
+                               int* out_end) {
+    int beg = 0, end = count;
+    if (scope && scope->sec_name) {
+        if (scope->sec_match == NSP_RULE_SEC_PREFIX) {
+            /* GLOBAL：文件起始到首个非本段段头（本段段头透明）。首个段头之前
+               的规则归属全局，与解析器 cur 初值一致。 */
+            for (int i = 0; i < count; i++) {
+                const char* p = lines[i];
+                while (isspace((unsigned char)*p)) p++;
+                if (*p != '[') continue;
+                if (line_is_section_named(lines[i], scope->sec_name, NSP_RULE_SEC_PREFIX)) continue;
+                end = i;
+                break;
+            }
+        } else {
+            char hdr[128];
+            int n = snprintf(hdr, sizeof hdr, "[%s]", scope->sec_name);
+            if (n < 0 || (size_t)n >= sizeof hdr) return false;
+            int h = nsp_rule_file_find_header(lines, count, hdr);
+            if (h < 0) return false;
+            beg = h + 1;
+            for (int i = beg; i < count; i++) {
+                const char* p = lines[i];
+                while (isspace((unsigned char)*p)) p++;
+                if (*p == '[') {
+                    end = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (out_beg) *out_beg = beg;
+    if (out_end) *out_end = end;
+    return true;
+}
+
+int nsp_rule_file_find_nth_scoped(char** lines, int count, const NspRuleScope* scope,
+                                  const char* type_name, int index) {
     if (!lines || !type_name || index < 0) return NSP_RULE_FILE_ENOTFND;
+    int beg = 0, end = count;
+    if (scope && scope->sec_name &&
+        !nsp_rule_file_scope_range(lines, count, scope, &beg, &end))
+        return NSP_RULE_FILE_ENOTFND;
     int seen = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = beg; i < end; i++) {
         if (nsp_rule_file_line_is_type(lines[i], type_name)) {
             if (seen == index) return i;
             seen++;
@@ -513,17 +584,31 @@ static int upsert_line_impl(const char* path, bool is_switch, const char* type_n
     return NSP_RULE_FILE_OK;
 }
 
-/* ==================== 按 (类型, 索引) 删除 ==================== */
+/* ==================== 按 (类型, 索引) 删除 / 切换启用状态 ==================== */
 
-static int remove_nth_impl(const char* path, const char* type_name, int index, char* out_removed,
-                             size_t removed_sz) {
+/* 行首（跳过空格/制表符）是否为 '#'——即该规则行处于停用态 */
+static bool rule_line_is_disabled(const char* line) {
+    if (!line) return false;
+    const char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    return *p == '#';
+}
+
+static int remove_nth_scoped_impl(const char* path, const NspRuleScope* scope,
+                                  const char* type_name, int index, char* out_removed,
+                                  size_t removed_sz) {
     if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
 
     int count = 0, cap = 0;
-    char** lines = nsp_rule_file_read(path, &count, &cap);
-    if (!lines) return NSP_RULE_FILE_EIO;
+    int rerr = 0;
+    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
+    /* 读失败（非 ENOENT）绝不当空文件（§A10）；ENOENT 按空文件 → 下面报 ENOTFND */
+    if (!lines && rerr != 0 && rerr != ENOENT) {
+        errno = rerr;
+        return NSP_RULE_FILE_EIO;
+    }
 
-    int found = nsp_rule_file_find_nth(lines, count, type_name, index);
+    int found = nsp_rule_file_find_nth_scoped(lines, count, scope, type_name, index);
     if (found < 0) {
         nsp_rule_file_free(lines, count);
         return NSP_RULE_FILE_ENOTFND;
@@ -539,8 +624,69 @@ static int remove_nth_impl(const char* path, const char* type_name, int index, c
     return NSP_RULE_FILE_OK;
 }
 
+static int toggle_nth_scoped_impl(const char* path, const NspRuleScope* scope,
+                                  const char* type_name, int index, bool enable, char* out_line,
+                                  size_t out_sz, bool* out_changed) {
+    if (!path || !type_name || index < 0) return NSP_RULE_FILE_EINVAL;
+    if (out_changed) *out_changed = false;
+
+    int count = 0, cap = 0;
+    int rerr = 0;
+    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
+    if (!lines && rerr != 0 && rerr != ENOENT) {
+        errno = rerr;
+        return NSP_RULE_FILE_EIO;
+    }
+    int found = nsp_rule_file_find_nth_scoped(lines, count, scope, type_name, index);
+    if (found < 0) {
+        nsp_rule_file_free(lines, count);
+        return NSP_RULE_FILE_ENOTFND;
+    }
+    bool disabled = rule_line_is_disabled(lines[found]);
+    bool already = enable ? !disabled : disabled;
+    if (!already) {
+        char* p = lines[found];
+        while (*p == ' ' || *p == '\t') p++;
+        if (enable) {
+            /* 去掉行首 #（及紧随其后的空白）——向前移动，长度缩小，安全 */
+            if (*p == '#') {
+                char* q = p + 1;
+                while (*q == ' ' || *q == '\t') q++;
+                memmove(p, q, strlen(q) + 1);
+            }
+        } else {
+            /* 行首插入 #：行变长，必须重建缓冲，禁止原地 memmove 越界
+               （strdup 分配 len+1 字节，插入后需 len+2 字节） */
+            size_t prefix = (size_t)(p - lines[found]);
+            size_t len = strlen(lines[found]);
+            if (len + 2 > (size_t)NSP_DYN_FORMAT_MAX) { /* 与读入上限同界，防御性 */
+                nsp_rule_file_free(lines, count);
+                return NSP_RULE_FILE_EINVAL;
+            }
+            char* nl = malloc(len + 2);
+            if (!nl) {
+                nsp_rule_file_free(lines, count);
+                return NSP_RULE_FILE_EINVAL;
+            }
+            memcpy(nl, lines[found], prefix);
+            nl[prefix] = '#';
+            strcpy(nl + prefix + 1, p);
+            free(lines[found]);
+            lines[found] = nl;
+        }
+        if (!nsp_rule_file_write(path, lines, count)) {
+            nsp_rule_file_free(lines, count);
+            return NSP_RULE_FILE_EIO;
+        }
+        if (out_changed) *out_changed = true;
+    }
+    if (out_line && out_sz) snprintf(out_line, out_sz, "%s", lines[found]);
+    nsp_rule_file_free(lines, count);
+    return NSP_RULE_FILE_OK;
+}
+
 /* ==================== 加锁包装（读-改-写全程持目录 flock） ====================
-   三个入口都是「读全文件 → 改内存 → 覆盖写」，跨进程并发时必须串行，否则后写者
+   所有入口都是「读全文件 → 改内存 → 覆盖写」，跨进程并发时必须串行，否则后写者
    吃掉前者的修改。实现体不改，包装只负责取/放锁（fail-open）。 */
 
 int nsp_rule_file_upsert_in_section(const char* path, const char* sec_name,
@@ -563,8 +709,24 @@ int nsp_rule_file_upsert_line(const char* path, bool is_switch, const char* type
 
 int nsp_rule_file_remove_nth(const char* path, const char* type_name, int index, char* out_removed,
                              size_t removed_sz) {
+    return nsp_rule_file_remove_nth_scoped(path, NULL, type_name, index, out_removed, removed_sz);
+}
+
+int nsp_rule_file_remove_nth_scoped(const char* path, const NspRuleScope* scope,
+                                    const char* type_name, int index, char* out_removed,
+                                    size_t removed_sz) {
     int lk = rule_file_lock_dir(path);
-    int rc = remove_nth_impl(path, type_name, index, out_removed, removed_sz);
+    int rc = remove_nth_scoped_impl(path, scope, type_name, index, out_removed, removed_sz);
+    rule_file_unlock_dir(lk);
+    return rc;
+}
+
+int nsp_rule_file_toggle_nth_scoped(const char* path, const NspRuleScope* scope,
+                                    const char* type_name, int index, bool enable, char* out_line,
+                                    size_t out_sz, bool* out_changed) {
+    int lk = rule_file_lock_dir(path);
+    int rc = toggle_nth_scoped_impl(path, scope, type_name, index, enable, out_line, out_sz,
+                                    out_changed);
     rule_file_unlock_dir(lk);
     return rc;
 }

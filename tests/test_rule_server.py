@@ -318,6 +318,51 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "SYSTEM_APPS"})
     expect("GET SYSTEM_APPS section", r.get("status") == "ok" and r["data"]["category"]["section"] == "[SYSTEM_APPS]", r)
 
+    # ---- A5：类别段索引口径必须与 GET 一致（混合段往返）----
+    # GET 类别段回的是**段内**索引；REMOVE/TOGGLE 若按整文件全局序号计数，
+    # 会删/改到 [GLOBAL] 里的同类型规则（旧实现：`[GLOBAL]` 已有 HIDE 时，
+    # GET USER_APPS 报 index=0，REMOVE index=0 删掉的却是 [GLOBAL] 那条）。
+    # 先补一条 [GLOBAL] HIDE，让全局与类别段各有一条同类型规则（歧义最大化）。
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "GLOBAL", "type": "HIDE", "value": "/sdcard/global_second"})
+    expect("A5 预置 GLOBAL 第二条 HIDE", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "GLOBAL"})
+    g_hides = [x["value"] for x in r["data"]["global"]["rules"] if x["type"] == "HIDE"]
+    expect("A5 GET GLOBAL 只含 [GLOBAL] 段规则（不混类别段）",
+           sorted(g_hides) == ["/sdcard/global_second", "/sdcard/secret"], g_hides)
+
+    r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "USER_APPS", "uid": 10})
+    cat_hides = [(x["index"], x["value"]) for x in r["data"]["category"]["rules"] if x["type"] == "HIDE"]
+    expect("A5 类别段 HIDE 段内索引从 0 起", cat_hides == [(0, "/sdcard/cat_secret")], cat_hides)
+
+    r = send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": "USER_APPS", "uid": 10, "type": "HIDE", "index": 0})
+    expect("A5 REMOVE 类别段 index=0 成功", r.get("status") == "ok", r)
+    expect("A5 REMOVE 删的是类别段那条（不是 GLOBAL）",
+           "cat_secret" in r["data"].get("removed", ""), r.get("data"))
+    conf_text = open(os.path.join(conf_dir, "injector.conf"), encoding="utf-8").read()
+    expect("A5 GLOBAL 两条 HIDE 原样保留",
+           "HIDE /sdcard/secret" in conf_text and "HIDE /sdcard/global_second" in conf_text, conf_text)
+    expect("A5 类别段 HIDE 已删除", "cat_secret" not in conf_text, conf_text)
+    r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "GLOBAL"})
+    expect("A5 REMOVE 后 GET GLOBAL 仍有 2 条 HIDE",
+           len([x for x in r["data"]["global"]["rules"] if x["type"] == "HIDE"]) == 2,
+           r["data"]["global"]["rules"])
+
+    # TOGGLE 同口径：类别段补一条 HIDE，DISABLE index=0 只注释类别段那条
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "USER_APPS", "uid": 10, "type": "HIDE", "value": "/sdcard/cat_toggle"})
+    expect("A5 类别段补一条 HIDE", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "DISABLE", "pkg": "USER_APPS", "uid": 10, "type": "HIDE", "index": 0})
+    expect("A5 DISABLE 类别段 index=0", r.get("status") == "ok" and r["data"]["enabled"] is False, r)
+    conf_text = open(os.path.join(conf_dir, "injector.conf"), encoding="utf-8").read()
+    expect("A5 DISABLE 只注释类别段那条", "#HIDE /sdcard/cat_toggle" in conf_text, conf_text)
+    expect("A5 DISABLE 未误注释 GLOBAL 的 HIDE",
+           "#HIDE /sdcard/secret" not in conf_text
+           and "#HIDE /sdcard/global_second" not in conf_text, conf_text)
+    r = send_cmd(proc, sock_name, {"cmd": "ENABLE", "pkg": "USER_APPS", "uid": 10, "type": "HIDE", "index": 0})
+    expect("A5 ENABLE 类别段 index=0", r.get("status") == "ok" and r["data"]["enabled"] is True, r)
+    # 清理类别段探针，恢复初始形态（后续 GLOBAL 索引断言不受类别段干扰）
+    r = send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": "USER_APPS", "uid": 10, "type": "HIDE", "index": 0})
+    expect("A5 清理类别段 HIDE 探针", r.get("status") == "ok", r)
+
     # ---- 动态规则类型（模块 .rules 注册）----
     # 1. PING 返回的类型表应含模块声明的 FTP（非内置、来源 ftp_module、pair 双参）
     r = send_cmd(proc, sock_name, {"cmd": "PING"})

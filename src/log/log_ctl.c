@@ -684,14 +684,27 @@ static void handle_remove_rule(bool api_mode, const char* pkg, const char* type,
         return;
     }
     char rule_path[PATH_MAX];
-    if (strcmp(pkg, "GLOBAL") == 0 || nsp_rule_file_is_category_pkg(pkg)) {
+    /* 作用域与 rule_server 的 GET 口径一致：GLOBAL / 类别段在主文件内按**段内**
+       索引计数（否则会删到别的段的同类型规则，§A5）；应用文件无段，整文件计数 */
+    NspRuleScope scope;
+    memset(&scope, 0, sizeof scope);
+    scope.sec_match = NSP_RULE_SEC_EXACT;
+    char sec_name[64];
+    if (strcmp(pkg, "GLOBAL") == 0) {
         snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
+        snprintf(sec_name, sizeof(sec_name), "GLOBAL");
+        scope.sec_name = sec_name;
+        scope.sec_match = NSP_RULE_SEC_PREFIX;
+    } else if (nsp_rule_file_is_category_pkg(pkg)) {
+        snprintf(rule_path, sizeof(rule_path), "%s", g_main_conf);
+        nsp_rule_file_category_name(pkg, user_id, sec_name, sizeof sec_name);
+        scope.sec_name = sec_name;
     } else {
         /* 同 set-rule：停用态继续操作 .disabled，保证删除也能命中 */
         nsp_rule_file_app_active_path(g_config_dir, user_id, pkg, rule_path, sizeof(rule_path));
     }
-    /* 索引计入已停用行（与 rule_server / LIST 输出一致） */
-    int rc = nsp_rule_file_remove_nth(rule_path, type, index, NULL, 0);
+    /* 索引计入已停用行，且限定在该段内（与 rule_server / LIST 输出一致） */
+    int rc = nsp_rule_file_remove_nth_scoped(rule_path, &scope, type, index, NULL, 0);
     if (rc == NSP_RULE_FILE_ENOTFND) {
         char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "未找到 %s 类型的第 %d 条规则", type, index);
