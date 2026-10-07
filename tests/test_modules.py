@@ -8,6 +8,8 @@ V4 起模块只有后端形态、规则引擎内建，故本套件覆盖：
   4. 损坏 .so：加载失败但 daemon 存活、其它路径正常
   5. 热拔后规则仍在（引擎不受模块存亡影响）
   6. 旧哈希格式 ban 自愈（内容哈希校验弃用后的迁移）
+  7. A23-2 首 stat 失败即放弃本轮加载（不得带着未初始化的 st2 继续跑完
+     整个「读文件 + memfd + dlopen」流程再误报「在读取期间被写入」）
 """
 import subprocess, os, sys, time, shutil
 from pathlib import Path
@@ -25,6 +27,141 @@ MODULE = "backend_bad"
 PASS = 0; FAIL = 0; ERRS = []
 def ok(d): global PASS; PASS += 1; print(f"  ✅ {d}")
 def fail(d, dt=""): global FAIL; FAIL += 1; print(f"  ❌ {d}: {dt}"); ERRS.append((d, dt))
+
+# ── A23-2 判别垫片：让 daemon 进程内**指定后缀路径的第 N 次 stat** 报 ENOENT ──
+#   daemon 以 -D_FILE_OFFSET_BITS=64 编译，只引用 stat64（readelf 可验），
+#   故两个符号都拦截；其余一律透传。
+#   为何要「第 N 次」而不是「首次」：扫描到新模块时 `module_ban_blocks` 先经
+#   so_mtime() 对 .so 做一次 stat（第 1 次），module_prepare 的 st1 才是第 2 次。
+#   只打第 2 次，恰好命中 st1 失败而 st2/st3 正常——正是 A23-2 的现场。
+STAT_SHIM_C = "/tmp/fuse_mod_test/stat_shim.c"
+STAT_SHIM_SO = "/tmp/fuse_mod_test/stat_shim.so"
+STAT_SHIM_LOG = "/tmp/fuse_mod_test/shim_events.log"
+STAT_SHIM_SRC = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+
+static int (*real_stat64)(const char*, struct stat64*) = NULL;
+static int (*real_stat)(const char*, struct stat*) = NULL;
+static int (*real_open64)(const char*, int, ...) = NULL;
+static int (*real_memfd)(const char*, unsigned int) = NULL;
+static int g_hits = 0;
+static long g_denied_ms = 0;
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* 「紧随首 stat 失败」的窗口：旧实现 stat 一失败就继续 open+memfd_create
+   （毫秒级），合法重试要等 5s 定时唤醒——1000ms 窗口两者绝不重叠。 */
+static int in_deny_window(void) {
+    return g_denied_ms && (now_ms() - g_denied_ms) < 1000;
+}
+
+/* 事件记录（本进程内独立文件，不经 daemon 日志系统）：判别「首 stat 失败后
+   是否仍继续 open/memfd_create 整个加载流程」——正是 A23-2 的行为分界。 */
+static void note(const char* what, const char* detail) {
+    const char* p = getenv("NSP_TEST_SHIM_LOG");
+    if (!p || !*p) return;
+    FILE* f = fopen(p, "a");
+    if (!f) return;
+    fprintf(f, "%s\t%s\n", what, detail ? detail : "");
+    fclose(f);
+}
+
+static int matches(const char* path) {
+    const char* suf = getenv("NSP_TEST_STAT_DENY_SUFFIX");
+    if (!suf || !*suf || !path) return 0;
+    size_t pl = strlen(path), sl = strlen(suf);
+    return (pl >= sl && strcmp(path + pl - sl, suf) == 0);
+}
+
+static int hit(const char* path) {
+    const char* nth_s = getenv("NSP_TEST_STAT_DENY_NTH");
+    if (!matches(path)) return 0;
+    int nth = nth_s ? atoi(nth_s) : 1;
+    if (++g_hits != nth) return 0;
+    g_denied_ms = now_ms();
+    note("STAT_DENIED", path);
+    return 1;
+}
+
+int stat64(const char* path, struct stat64* buf) {
+    if (!real_stat64) real_stat64 = dlsym(RTLD_NEXT, "stat64");
+    if (hit(path)) { errno = ENOENT; return -1; }
+    return real_stat64(path, buf);
+}
+
+int stat(const char* path, struct stat* buf) {
+    if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
+    if (hit(path)) { errno = ENOENT; return -1; }
+    return real_stat(path, buf);
+}
+
+/* 首 stat 被拒后**紧随窗口内**出现的 open/memfd_create = 旧实现「带着未初始化
+   的 st2 继续跑完整个加载流程」。注意 memfd_create 在 module_prepare 里排在
+   open 之前，故两者都要在窗口内独立判定，不能用「命中即清标记」的做法。 */
+int open64(const char* path, int flags, ...) {
+    if (!real_open64) real_open64 = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
+    }
+    if (in_deny_window() && matches(path)) note("OPEN_AFTER_DENY", path);
+    return real_open64(path, flags, mode);
+}
+
+int memfd_create(const char* name, unsigned int flags) {
+    if (!real_memfd) real_memfd = dlsym(RTLD_NEXT, "memfd_create");
+    if (in_deny_window()) note("MEMFD_AFTER_DENY", name);
+    return real_memfd(name, flags);
+}
+"""
+
+
+def build_stat_shim():
+    Path(STAT_SHIM_C).write_text(STAT_SHIM_SRC)
+    r = subprocess.run(["cc", "-std=c23", "-D_GNU_SOURCE", "-shared", "-fPIC", "-O1",
+                        "-Wno-deprecated-declarations",
+                        STAT_SHIM_C, "-o", STAT_SHIM_SO, "-ldl"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print("stat 垫片编译失败:", r.stderr, file=sys.stderr)
+        return False
+    return True
+
+
+def asan_runtime_path():
+    """daemon 若动态链接了 ASan 运行时，返回其路径（否则空串）。
+
+    ASan 要求自己的运行时**在 LD_PRELOAD 里排第一**，垫片必须排在它之后——
+    否则 daemon 直接以「ASan runtime does not come first in initial library
+    list」拒绝启动（内存验收跑本套件时就会踩到）。"""
+    try:
+        out = subprocess.run(["ldd", DAEMON], capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+    for ln in out.splitlines():
+        if "libasan" not in ln:
+            continue
+        parts = ln.split("=>")
+        if len(parts) == 2:
+            p = parts[1].strip().split(" ")[0]
+            if p.startswith("/"):
+                return p
+    return ""
+
 
 def build_module():
     """现场编译后端测试模块（第三方模块视角：仅 nsp_module.h）"""
@@ -107,10 +244,13 @@ def ban_lines(name):
     if not p.exists(): return []
     return [l for l in p.read_text().splitlines() if l.startswith(name + "|")]
 
-def start():
+def start(extra_env=None):
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
     p = subprocess.Popen([DAEMON, "--root="+STORAGE, "--rules="+CONF,
                           "--modules-dir="+MODDIR, "-f", MNT, "info"],
-                         stdout=open("/tmp/fm.log", "w"), stderr=subprocess.STDOUT)
+                         stdout=open("/tmp/fm.log", "w"), stderr=subprocess.STDOUT, env=env)
     for _ in range(30):
         time.sleep(0.3)
         try:
@@ -153,7 +293,7 @@ def backend_serves(timeout=10.0):
     except OSError:
         return False
 
-def run_case(label, body):
+def run_case(label, body, extra_env=None):
     print(f"\n── {label} ──")
     wconf("""
 [GLOBAL]
@@ -162,7 +302,7 @@ SANDBOX OFF
 REDIRECT /云盘 real_dir
 FTP /bhealth seg1
 """)
-    p = start()
+    p = start(extra_env)
     if not p: return fail("启动失败")
     try:
         body(p, Path(MNT))
@@ -286,6 +426,55 @@ def main():
         ok("旧格式 ban 记录被清除") if not ban_lines("backend_abi") else fail(
             "旧格式 ban 未清除", str(ban_lines("backend_abi")))
     run_case("6. 旧哈希格式 ban 自愈", case6)
+
+    def case7(p, m):
+        """A23-2：.so 首次 stat 失败（替换间隙）→ 立即放弃本轮，不得继续跑完
+        「读文件 + memfd + dlopen」再用**未初始化的 st2** 做比较。
+
+        旧实现把整个稳定性块包在 `if (stat(so_path,&st1)==0)` 里，st1 失败时
+        st2 保持未初始化，却仍在读取后与 st3 比较（UB）：文件明明完好，却按
+        「在读取期间被写入」误报并放弃加载，同时白白建/关一个 memfd。
+        判别：垫片只让第 2 次 .so stat（= st1）报 ENOENT，并记录此后是否
+        **立刻**出现 open/memfd_create（同一轮加载内）：
+          新实现 stat 一失败即返回，故只有 STAT_DENIED，无 OPEN/MEMFD_AFTER_DENY；
+          旧实现继续 open 该 .so 并建 memfd（UB 比较还在后面），两条都会出现。
+        两者都应在 5s 定时重试后成功加载（证明只是放弃本轮，不是卡死）。
+        daemon 日志经 UDS 通道、无 log_monitor 时不可观测，故判别信号取垫片
+        自记的事件文件（进程内旁路，不受日志系统开关影响）。
+        """
+        so = ROOT / "build_gnu" / f"{MODULE}.so"
+        put_so(so, MODULE)
+        deadline = time.time() + 25
+        while time.time() < deadline and memfd_count(p, MODULE) == 0:
+            time.sleep(0.5)
+        try:
+            events = Path(STAT_SHIM_LOG).read_text(errors="replace")
+        except OSError:
+            events = ""
+        kinds = {ln.split("\t", 1)[0] for ln in events.splitlines() if ln.strip()}
+        ok("首 stat 失败被垫片命中（用例非空转）") if "STAT_DENIED" in kinds else fail(
+            "垫片未命中 st1", f"事件: {events!r}（垫片/时序问题，非产品缺陷）")
+        ok("首 stat 失败即放弃本轮（未继续 open .so）") if "OPEN_AFTER_DENY" not in kinds else fail(
+            "stat 失败后仍 open", "旧实现带着未初始化的 st2 继续跑完加载流程")
+        ok("首 stat 失败后未建 memfd") if "MEMFD_AFTER_DENY" not in kinds else fail(
+            "stat 失败后仍建 memfd", "白建/白关一个 memfd 后才放弃")
+        ok("模块经定时重试后成功加载（未卡死）") if memfd_count(p, MODULE) > 0 else fail(
+            "重试未收敛", f"{MODULE} 25s 内仍未加载")
+        ok("后端接管路径") if backend_serves(timeout=5) else fail("后端未接管", "/0/bhealth 不是目录")
+    if build_stat_shim():
+        try:
+            os.remove(STAT_SHIM_LOG)
+        except OSError:
+            pass
+        preload = ":".join(p for p in (asan_runtime_path(),
+                                       os.environ.get("LD_PRELOAD", ""), STAT_SHIM_SO) if p)
+        run_case("7. A23-2 .so 首 stat 失败即放弃本轮", case7,
+                 extra_env={"LD_PRELOAD": preload,
+                            "NSP_TEST_STAT_DENY_SUFFIX": f"/{MODULE}/{MODULE}.so",
+                            "NSP_TEST_STAT_DENY_NTH": "2",
+                            "NSP_TEST_SHIM_LOG": STAT_SHIM_LOG})
+    else:
+        fail("stat 垫片不可用", "无法验证 A23-2（cc 缺失？）")
 
     print(f"\n═══════════════════════════════════════")
     print(f"[{time.strftime('%H:%M:%S')}] 测试完成 | ✅ {PASS} 通过 | ❌ {FAIL} 失败 | 共 {PASS+FAIL}")

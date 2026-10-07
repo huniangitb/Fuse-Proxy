@@ -184,6 +184,24 @@ def maps_has(pid, needle, timeout=8.0):
         return False
 
 
+def fd_has_memfd(pid, needle):
+    """/proc/<pid>/fd 下是否有指向该 memfd 的 fd（模块映像 memfd 仍被持有的内核证据）。
+
+    注意：不能用 maps 行是否带 `(deleted)` 判别——memfd 是匿名 inode，从创建起
+    maps 就恒显示 `/memfd:<名> (deleted)`，close 与否都一样；能区分 fd 是否仍被
+    持有的只有 /proc/<pid>/fd。"""
+    try:
+        for n in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                if needle in os.readlink(f"/proc/{pid}/fd/{n}"):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
+
+
 def stop(p):
     if p:
         p.terminate()
@@ -597,6 +615,18 @@ def main():
         else:
             fail("模块映射被解除", f"{needle} 已从 maps 消失"
                  "（旧实现 dlclose → 残留数据面线程带崩 daemon）")
+        # ── A23-1：模块继续持映射时，其 memfd **fd** 也不得提前 close ──
+        #    旧实现在 drain/exit 之前就 close(mfd)，且放弃卸载的回滚分支不复原
+        #    m->mfd → 模块还在册却已无 memfd fd，maps 行退化为 (deleted)，
+        #    违反「加载成功后保持打开到模块卸载」的槽位契约。
+        #    判别信号：/proc/<pid>/fd 里仍有该 memfd（maps 判别不了，见 fd_has_memfd
+        #    注释：memfd 从创建起 maps 就带 (deleted)）。
+        if fd_has_memfd(p.pid, needle):
+            ok("未卸载模块仍持有 memfd fd（无提前 close）")
+        else:
+            fail("memfd 被提前 close",
+                 f"/proc/{p.pid}/fd 下已无 {needle}（旧实现在 drain/exit 前就 close，"
+                 "且放弃卸载的回滚不复原 m->mfd）")
     finally:
         active_marker.unlink(missing_ok=True)
         stop(p)
