@@ -303,8 +303,10 @@ injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', '
 # ================= 构建可执行文件 =================
 install_bin_dir = 'bin'
 
-# fuse_daemon：纯框架（回调骨架 + 模块调度 + 存储原语），不链接规则引擎源，
-# 规则能力来自 dlopen 的热插拔模块（basic_rules.so 等）；common.c 为公共工具（日志/路径）。
+# fuse_daemon：框架（回调骨架 + 模块调度 + 存储原语）**并内建规则引擎**——
+# V4 起 fw_rules.c / fw_pkg.c / fw_config.c 直接编进本目标（见 fuse_daemon_sources），
+# 规则决策与 uid→包名、MONITOR 都不再来自模块；dlopen 的热插拔模块只剩后端存储
+# 提供者（ftp_module.so）。common.c 为公共工具（日志/路径）。
 
 # nsp_util 轻量公共库（纯 libc，无项目全局依赖）：收敛 UDS 抽象地址填充、send_all
 # 全量发送、str_trim、mkdir_p、daemonize、cgroup 逃逸，供各二进制与热插拔模块
