@@ -97,6 +97,16 @@ RESOLVE_CASES = [
     ("sandbox.conf", 10123, "/0/Download/q.txt", "/0/Android/data/com.demo.app/sandbox/Download/q.txt", None),
 ]
 
+# C10 语义固化（配置见 fixtures/monitor_layers/var_scope.conf）：
+# (配置, uid, 路径, 期望 appear_missing)。通配（dyn）HIDE 规则走 br_linear_match，
+# 三层（app 段 / 类别段 / GLOBAL 段）各自的线性扫描都必须生效——C10 把原先 6 份
+# 逐字复制的扫描块收成 br_linear_match 单点，本组固化「三层都在且不误伤」。
+HIDE_CASES = [
+    ("var_scope.conf", 10123, "/0/appval/h/x", True),     # app 段线性扫描命中
+    ("var_scope.conf", 10123, "/0/globalval/h/x", True),  # GLOBAL 段线性扫描命中
+    ("var_scope.conf", 10123, "/0/otherval/h/x", False),  # 三层均不命中（防过度匹配）
+]
+
 
 CASES = [
     # 全局 ON：类别/应用显式 OFF 必须否决
@@ -173,13 +183,14 @@ def parse(out):
 
 
 def parse_resolve(out):
-    """'resolve uid=10123 path=/0/Download/q.txt valid=1 real=... ro=0' → [(uid, path, real)]"""
+    """'resolve uid=.. path=.. valid=.. real=.. ro=.. missing=..' → [(uid, path, real, missing)]"""
     got = []
     for line in out.splitlines():
-        m = re.match(r"resolve uid=(\d+) path=(\S+) valid=(\d+) real=(\S*) ro=(\d+)$",
-                     line.strip())
+        m = re.match(
+            r"resolve uid=(\d+) path=(\S+) valid=(\d+) real=(\S*) ro=(\d+) missing=(\d+)$",
+            line.strip())
         if m:
-            got.append((int(m.group(1)), m.group(2), m.group(4)))
+            got.append((int(m.group(1)), m.group(2), m.group(4), m.group(6) == "1"))
     return got
 
 
@@ -209,29 +220,49 @@ def main():
         passed = failed = 0
         # 沙盒/ALLOW 解析契约（同一批配置，用 resolve: 参数逐路径解析）
         resolve_results = {}
-        for conf in sorted({c[0] for c in RESOLVE_CASES}):
+        for conf in sorted({c[0] for c in RESOLVE_CASES} | {c[0] for c in HIDE_CASES}):
             args = [f"resolve:{c[1]}:{c[2]}" for c in RESOLVE_CASES if c[0] == conf]
+            args += [f"resolve:{c[1]}:{c[2]}" for c in HIDE_CASES if c[0] == conf]
             r = subprocess.run([exe, os.path.join(tmpdir, "config", conf)] + args,
                                capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"驱动退出码 {r.returncode}: {r.stderr}", file=sys.stderr)
                 return 1
-            for uid, path, real in parse_resolve(r.stdout):
-                resolve_results[(conf, uid, path)] = real
+            for uid, path, real, missing in parse_resolve(r.stdout):
+                resolve_results[(conf, uid, path)] = (real, missing)
 
         for conf, uid, path, want_in, want_not in RESOLVE_CASES:
-            real = resolve_results.get((conf, uid, path))
+            entry = resolve_results.get((conf, uid, path))
             name = f"{conf} uid={uid} {path}"
-            if real is None:
+            if entry is None:
                 print(f"FAIL {name}: 无解析输出")
                 failed += 1
                 continue
+            real = entry[0]
             okp = (want_in is None or want_in in real) and (want_not is None or want_not not in real)
             if not okp:
                 print(f"FAIL {name}: real={real}（期望含 {want_in!r} / 不含 {want_not!r}）")
                 failed += 1
             else:
                 print(f"PASS {name}: real={real}")
+                passed += 1
+
+        # C10 语义固化：br_linear_match 的变量展开作用域（hide/ro 线性规则）。
+        # GLOBAL 段规则用调用者应用段作用域（V=/appval）→ 只隐藏 /appval/h；
+        # 若去重时误把 GLOBAL 的 scope 换成 &g_global_cfg，/globalval/h 会变成
+        # missing=1 而失败。
+        for conf, uid, path, want_missing in HIDE_CASES:
+            entry = resolve_results.get((conf, uid, path))
+            name = f"{conf} uid={uid} {path}"
+            if entry is None:
+                print(f"FAIL {name}: 无解析输出")
+                failed += 1
+                continue
+            if entry[1] != want_missing:
+                print(f"FAIL {name}: missing={int(entry[1])}（期望 {int(want_missing)}）")
+                failed += 1
+            else:
+                print(f"PASS {name}: missing={int(entry[1])}")
                 passed += 1
 
         results = {}

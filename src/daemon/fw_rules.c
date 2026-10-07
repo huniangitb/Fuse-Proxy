@@ -352,31 +352,39 @@ static bool br_hidden_static_part(const char* sub_path, const char* current_pkg,
     return false;
 }
 
+/* 线性（通配/变量）规则匹配的**单点实现**：hide 与 ro 共用，应用/类别/全局三层
+   共用同一段逻辑（原先是 6 份逐字复制——A9/C7 式的漂移源，一处语义改动会漏改其余）。
+   scope 是变量展开的**专属作用域**：类别段传 cat，应用段与 GLOBAL 段规则传 cfg
+   （三层变量可见性语义见 docs/config.md §5——应用变量对类别/GLOBAL 规则不可见）。
+   展开放不下（截断）一律丢弃该规则：截断成更短前缀会放大命中范围。 */
+static bool br_linear_match(char* const* rules, int count, const char* sub_path,
+                            const char* current_pkg, AppConfig* scope) {
+    for (int i = 0; i < count; i++) {
+        if (!rules[i]) continue;
+        const char* rule = rules[i];
+        char expanded[PATH_MAX];
+        const char* match_str = rule;
+        if (has_path_var(rule)) {
+            if (!pkg_resolvable(current_pkg)) continue;
+            if (!expand_path_vars(rule, expanded, sizeof expanded, scope, &g_global_cfg,
+                                  current_pkg))
+                continue;
+            match_str = expanded;
+        }
+        if (fnmatch(match_str, sub_path, 0) == 0) return true;
+        size_t len = strlen(match_str);
+        if (strncmp(sub_path, match_str, len) == 0 &&
+            (sub_path[len] == '\0' || sub_path[len] == '/'))
+            return true;
+    }
+    return false;
+}
+
 /* 类别 hide 线性扫描（USER_APPS/SYSTEM_APPS 动态规则）：变量展开以类别段
    为专属作用域（覆盖全局同名），与 app/global 展开对称 */
 static bool br_cat_hide_linear(AppConfig* cat, const char* sub_path, const char* current_pkg) {
     if (!(cat && cat->hide_rules && cat->dyn_hide)) return false;
-    for (int i = 0; i < cat->hide_count; i++) {
-        if (cat->hide_rules[i]) {
-            const char* rule = cat->hide_rules[i];
-            char expanded[PATH_MAX];
-            const char* match_str = rule;
-            if (has_path_var(rule)) {
-                if (!pkg_resolvable(current_pkg)) continue;
-                /* 展开放不下（截断）：丢弃该规则——截断成更短前缀会放大命中范围 */
-                if (!expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg,
-                                      current_pkg))
-                    continue;
-                match_str = expanded;
-            }
-            if (fnmatch(match_str, sub_path, 0) == 0) return true;
-            size_t len = strlen(match_str);
-            if (strncmp(sub_path, match_str, len) == 0 &&
-                (sub_path[len] == '\0' || sub_path[len] == '/'))
-                return true;
-        }
-    }
-    return false;
+    return br_linear_match(cat->hide_rules, cat->hide_count, sub_path, current_pkg, cat);
 }
 
 static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const char* sub_path,
@@ -405,49 +413,14 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const cha
             }
         }
     }
-    if (cfg && cfg->hide_rules && cfg->dyn_hide) {
-        for (int i = 0; i < cfg->hide_count; i++) {
-            if (cfg->hide_rules[i]) {
-                const char* rule = cfg->hide_rules[i];
-                char expanded[PATH_MAX];
-                const char* match_str = rule;
-                if (has_path_var(rule)) {
-                    if (!pkg_resolvable(current_pkg)) continue;
-                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                          current_pkg))
-                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
-                    match_str = expanded;
-                }
-                if (fnmatch(match_str, sub_path, 0) == 0) return true;
-                size_t len = strlen(match_str);
-                if (strncmp(sub_path, match_str, len) == 0 &&
-                    (sub_path[len] == '\0' || sub_path[len] == '/'))
-                    return true;
-            }
-        }
-    }
+    if (cfg && cfg->hide_rules && cfg->dyn_hide &&
+        br_linear_match(cfg->hide_rules, cfg->hide_count, sub_path, current_pkg, cfg))
+        return true;
     if (br_cat_hide_linear(cat, sub_path, current_pkg)) return true;
-    if (g_global_cfg.hide_rules && g_global_cfg.dyn_hide) {
-        for (int i = 0; i < g_global_cfg.hide_count; i++) {
-            if (g_global_cfg.hide_rules[i]) {
-                const char* rule = g_global_cfg.hide_rules[i];
-                char expanded[PATH_MAX];
-                const char* match_str = rule;
-                if (has_path_var(rule)) {
-                    if (!pkg_resolvable(current_pkg)) continue;
-                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                          current_pkg))
-                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
-                    match_str = expanded;
-                }
-                if (fnmatch(match_str, sub_path, 0) == 0) return true;
-                size_t len = strlen(match_str);
-                if (strncmp(sub_path, match_str, len) == 0 &&
-                    (sub_path[len] == '\0' || sub_path[len] == '/'))
-                    return true;
-            }
-        }
-    }
+    if (g_global_cfg.hide_rules && g_global_cfg.dyn_hide &&
+        br_linear_match(g_global_cfg.hide_rules, g_global_cfg.hide_count, sub_path, current_pkg,
+                        cfg))
+        return true;
     return false;
 }
 
@@ -725,27 +698,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
 /* 类别 RO 线性扫描：变量展开以类别段为专属作用域 */
 static bool br_cat_ro_linear(AppConfig* cat, const char* sub_path, const char* current_pkg) {
     if (!(cat && cat->ro_rules && cat->dyn_ro)) return false;
-    for (int i = 0; i < cat->ro_count; i++) {
-        if (cat->ro_rules[i]) {
-            const char* rule = cat->ro_rules[i];
-            char expanded[PATH_MAX];
-            const char* match_str = rule;
-            if (has_path_var(rule)) {
-                if (!pkg_resolvable(current_pkg)) continue;
-                /* 展开放不下（截断）：丢弃该规则——截断成更短前缀会放大命中范围 */
-                if (!expand_path_vars(rule, expanded, sizeof expanded, cat, &g_global_cfg,
-                                      current_pkg))
-                    continue;
-                match_str = expanded;
-            }
-            if (fnmatch(match_str, sub_path, 0) == 0) return true;
-            size_t len = strlen(match_str);
-            if (strncmp(sub_path, match_str, len) == 0 &&
-                (sub_path[len] == '\0' || sub_path[len] == '/'))
-                return true;
-        }
-    }
-    return false;
+    return br_linear_match(cat->ro_rules, cat->ro_count, sub_path, current_pkg, cat);
 }
 
 static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
@@ -773,49 +726,13 @@ static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
             }
         }
     }
-    if (cfg && cfg->ro_rules && cfg->dyn_ro) {
-        for (int i = 0; i < cfg->ro_count; i++) {
-            if (cfg->ro_rules[i]) {
-                const char* rule = cfg->ro_rules[i];
-                char expanded[PATH_MAX];
-                const char* match_str = rule;
-                if (has_path_var(rule)) {
-                    if (!pkg_resolvable(current_pkg)) continue;
-                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                          current_pkg))
-                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
-                    match_str = expanded;
-                }
-                if (fnmatch(match_str, sub_path, 0) == 0) return true;
-                size_t len = strlen(match_str);
-                if (strncmp(sub_path, match_str, len) == 0 &&
-                    (sub_path[len] == '\0' || sub_path[len] == '/'))
-                    return true;
-            }
-        }
-    }
+    if (cfg && cfg->ro_rules && cfg->dyn_ro &&
+        br_linear_match(cfg->ro_rules, cfg->ro_count, sub_path, current_pkg, cfg))
+        return true;
     if (br_cat_ro_linear(cat, sub_path, current_pkg)) return true;
-    if (g_global_cfg.ro_rules && g_global_cfg.dyn_ro) {
-        for (int i = 0; i < g_global_cfg.ro_count; i++) {
-            if (g_global_cfg.ro_rules[i]) {
-                const char* rule = g_global_cfg.ro_rules[i];
-                char expanded[PATH_MAX];
-                const char* match_str = rule;
-                if (has_path_var(rule)) {
-                    if (!pkg_resolvable(current_pkg)) continue;
-                    if (!expand_path_vars(rule, expanded, sizeof expanded, cfg, &g_global_cfg,
-                                          current_pkg))
-                        continue; /* 展开放不下：丢弃该规则（截断会放大范围） */
-                    match_str = expanded;
-                }
-                if (fnmatch(match_str, sub_path, 0) == 0) return true;
-                size_t len = strlen(match_str);
-                if (strncmp(sub_path, match_str, len) == 0 &&
-                    (sub_path[len] == '\0' || sub_path[len] == '/'))
-                    return true;
-            }
-        }
-    }
+    if (g_global_cfg.ro_rules && g_global_cfg.dyn_ro &&
+        br_linear_match(g_global_cfg.ro_rules, g_global_cfg.ro_count, sub_path, current_pkg, cfg))
+        return true;
     return false;
 }
 
