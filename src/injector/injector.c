@@ -1311,19 +1311,30 @@ static void on_timer_event(int timer_fd) {
 static void on_inotify_event(void) {
     char inotify_buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
     ssize_t len = read(g_inotify_fd, inotify_buf, sizeof(inotify_buf));
-    if (len > 0) {
-        bool need_reload = false;
-        for (char* ptr = inotify_buf; ptr < inotify_buf + len;) {
-            struct inotify_event* ev = (struct inotify_event*)ptr;
-            if (ev->len && (strcmp(ev->name, "injector.conf") == 0 || strstr(ev->name, ".conf"))) {
-                need_reload = true;
-            }
-            ptr += sizeof(struct inotify_event) + ev->len;
-        }
-        if (need_reload) {
-            g_reload_config = 1; /* 直接触发，去除 cooldown race */
-        }
+    if (len <= 0) {
+        /* EAGAIN：非阻塞 fd 被误唤醒，正常；其余 errno 记一行便于定位 */
+        if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            LOG_ERR("inotify read 失败: %s", strerror(errno));
+        return;
     }
+    bool need_reload = false;
+    bool overflow = false;
+    for (char* ptr = inotify_buf; ptr < inotify_buf + len;) {
+        struct inotify_event* ev = (struct inotify_event*)ptr;
+        /* IN_Q_OVERFLOW 是 wd == -1 的合成事件，**不代表任何具体文件**；
+           队列溢出说明此间有事件被内核丢弃（用户/规则目录可能已改而我们没
+           看到）。此前因 `ev->len` 为 0 被整条跳过 → 规则改了不生效且无提示。
+           这里保守地当成"有变更"触发一次全量重载（重载幂等，代价可接受）。 */
+        if (ev->mask & IN_Q_OVERFLOW) overflow = true;
+        if (ev->len && (strcmp(ev->name, "injector.conf") == 0 || strstr(ev->name, ".conf")))
+            need_reload = true;
+        ptr += sizeof(struct inotify_event) + ev->len;
+    }
+    if (overflow) {
+        LOG_WRN("inotify 队列溢出（事件被内核丢弃），触发一次全量配置重载以补齐");
+        need_reload = true;
+    }
+    if (need_reload) g_reload_config = 1; /* 直接触发，去除 cooldown race */
 }
 
 static void on_ipc_accept(int ipc_sock) {
@@ -1408,7 +1419,7 @@ static void injector_event_loop(const InjectorFds* fds) {
             } else if (fd == g_config_pub_fd) {
                 config_publisher_handle_readable(fd);
             } else if (fd == g_fuse_ready_pipe_fd) {
-                handle_fuse_ready_event(g_fuse_ready_ctx);
+                handle_fuse_ready_event(g_fuse_ready_ctx); /* 内部已 free(ctx) */
                 g_fuse_ready_pipe_fd = -1;
                 g_fuse_ready_ctx = nullptr;
             } else {
