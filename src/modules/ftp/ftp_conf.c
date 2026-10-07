@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "ftp_conf.h"
 #include "nsp_module.h" /* LOG_WRN（模块 ABI，经主程序导出表解析，与同目录后端一致） */
 #include "nsp_util.h"

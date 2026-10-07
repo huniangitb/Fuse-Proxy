@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "crash_dump.h"
 #include "build_info.h"
 #include "common.h"

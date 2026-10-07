@@ -16,7 +16,9 @@
  *       "resolve=<0|1> real=<最终真实路径> ro=<0|1>"——用于锁定沙盒/ALLOW 契约
  *       （沙盒把共享目录也重定向进本应用沙盒；ALLOW 则落回真实路径）。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

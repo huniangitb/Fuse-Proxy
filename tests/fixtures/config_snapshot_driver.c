@@ -17,7 +17,9 @@
  *
  * 输出：每项一行 "PASS <名称>" / "FAIL <名称>"，末尾汇总；有失败时退出码 1。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "fast_search.h"
 #include <string.h>
 #if defined(__aarch64__)

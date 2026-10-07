@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "module_loader.h"
 #include "common.h"
 #include "nsp_util.h"
@@ -534,8 +536,14 @@ static int module_commit(const char* name, void* h, const NspModuleInfo* info, i
     m->handle = h;
     m->mfd = mfd;
     m->info = *info; /* 浅拷贝：info->ops 指针有效 */
-    /* 可选活跃句柄查询（热重载 quiescence 门控）：模块导出则使用，缺省视为 0 */
-    m->active_handles_fn = (int (*)(void))dlsym(h, "nsp_module_active_handles");
+    /* 可选活跃句柄查询（热重载 quiescence 门控）：模块导出则使用，缺省视为 0。
+       dlsym 的 void* 经 union 双关转函数指针（ISO C 不允许直接强转，-Wpedantic） */
+    union {
+        void* obj;
+        int (*fn)(void);
+    } ah_sym;
+    ah_sym.obj = dlsym(h, "nsp_module_active_handles");
+    m->active_handles_fn = ah_sym.fn;
     m->active = true;
     struct stat st;
     if (stat(so_path, &st) == 0) m->mtime = st.st_mtime;

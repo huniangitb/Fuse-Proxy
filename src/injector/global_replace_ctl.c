@@ -12,7 +12,9 @@
  * （g_epoll_fd、register_async_mount_pipe、schedule_retry_mount、
  * get_active_mnt_src）由本文件提供最小 stub——测试仅走同步原语路径。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

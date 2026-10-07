@@ -17,7 +17,9 @@
  * argv[1] = 主配置路径；uid.map 由 Python 侧预置在同目录（fw_pkg_reload 装载）。
  * 输出：valid/is_redirect/mkdir_total/mkdir_in_slot/mkdir_last 各一行。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>

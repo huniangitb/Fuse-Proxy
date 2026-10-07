@@ -20,7 +20,9 @@
  *
  * 编译：见 tests/test_inject_tracked_race.py
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "mount_manager.h"
 #include "ns_utils.h"
 #include "config_parser.h"
@@ -274,8 +276,11 @@ static bool is_exact_media_module(const char* pkg) {
     return false;
 }
 
-/* ro.fuse.bpf.is_running 缓存：-1=未检查, 0=false, 1=true */
+/* ro.fuse.bpf.is_running 缓存：-1=未检查, 0=false, 1=true
+   （仅 TARGET_ANDROID 下使用；GNU 侧 is_bpf_fuse_running 直接 return false） */
+#ifdef TARGET_ANDROID
 static int g_bpf_fuse_running = -1;
+#endif
 
 static inline bool is_bpf_fuse_running(void) {
 #ifdef TARGET_ANDROID

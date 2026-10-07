@@ -14,7 +14,9 @@
  *
  * 退出码：0 全过，1 有失败。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <signal.h>
 #include <stdbool.h>

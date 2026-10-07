@@ -17,7 +17,9 @@
  *
  * 回归价值：移除 ns_utils.c 回滚分支（旧实现只 return err）后 A 必失败。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>

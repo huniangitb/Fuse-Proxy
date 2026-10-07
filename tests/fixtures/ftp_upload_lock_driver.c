@@ -24,7 +24,9 @@
  *
  * 退出码 0 = 全过；1 = 有失败（含看门狗超时，直接 _exit(1) 避免挂死）。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>

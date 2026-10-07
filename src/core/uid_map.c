@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "uid_map.h"
 #include "common.h"
 #include <stdio.h>
@@ -28,7 +30,7 @@ int uid_map_load(UidMapEntry* entries, int max_entries) {
     while (fgets(line, sizeof(line), fp) && count < max_entries) {
         uid_t u;
         char p[128];
-        if (sscanf(line, "%d %127s", &u, p) == 2) {
+        if (sscanf(line, "%u %127s", &u, p) == 2) {
             entries[count].uid = u;
             strncpy(entries[count].pkg, p, 127);
             entries[count].pkg[127] = '\0';

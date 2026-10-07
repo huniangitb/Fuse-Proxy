@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 版权所有 (C) 2026 huniangitb <3361107168@qq.com> */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #define _FILE_OFFSET_BITS 64
 /* 后端文件句柄标记：open/create 命中后端时置位（本地 fd 不置位），
    read/write/release/fsync 据此区分本地 fd 与模块句柄。

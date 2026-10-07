@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "inject_target.h"
 #include "injector.h"
 #include "common.h"

@@ -761,10 +761,11 @@ static void ftp_handle_put(uint64_t id, FtpBackendFile* f) {
     (void)id;
 }
 
-/* 仅从注册表摘除（不改 dead / refs / 不 free）：供 ftp_backend_clear 与单元
-   驱动在"绕过 release"的受控场景下注销句柄用。
-   正常路径请走 ftp_backend_release（含 refs 归零后的最终拆除）。 */
-static void ftp_handle_free(uint64_t id) {
+/* 仅从注册表摘除（不改 dead / refs / 不 free）：供**测试驱动**在"绕过 release"
+   的受控场景下注销句柄（tests/fixtures/ftp_read_restart_driver.c 直编本文件）。
+   生产路径不走此处——正常释放走 ftp_backend_release（含 refs 归零后的最终拆除），
+   故生产构建无调用者；标注 unused 以免 -Wunused-function 掩盖真正的新告警。 */
+static void __attribute__((unused)) ftp_handle_free(uint64_t id) {
     if (id <= 0 || id >= FTP_HANDLE_MAX) return;
     pthread_mutex_lock(&g_handles_mutex);
     if (g_handles[id]) {

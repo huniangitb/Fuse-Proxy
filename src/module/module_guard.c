@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * module_guard.c — 模块调用守卫实现（校验 + 熔断 + MOD_ERR 日志）
  *

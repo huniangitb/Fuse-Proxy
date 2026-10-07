@@ -26,7 +26,9 @@
  * 退出码 0 = 全过；1 = 有失败。移除 ftp_backend_truncate 里的
  * ftp_list_cache_clear 后 B 必失败。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <curl/curl.h>
 #include <errno.h>
 #include <stdarg.h>

@@ -18,7 +18,9 @@
  * 退出码：全部通过 0，任一失败 1。环境变量 NS_UTILS_SRC 可指向另一份源码副本
  * （用于在旧实现上复现失败）。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>

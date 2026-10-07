@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "config_parser.h"
 #include "nsp_constants.h"
 #include "common.h"
@@ -815,7 +817,7 @@ static AppConfig* get_or_create_app_cfg(const char* pkg, int user_id) {
 
    跳过 pm 探测的只读加载方（fuse_daemon 内建引擎、log_ctl）若某用户的
    /data/media/<uid> 不可读，该用户不会出现在 pm / /data/media 两轮扫描里，
-   load_config_rules 后续的 App-rules-<uid>/*.conf 扫描就整段跳过——injector
+   load_config_rules 后续的 App-rules-<uid>/<pkg>.conf 扫描就整段跳过——injector
    仍把这些应用当注入目标，而真正执行 HIDE/RO/REDIRECT 的进程却没有对应规则，
    静默失效且无任何报错。以磁盘上真实存在的规则目录为准可消除这一分叉，
    且纯只读、不 mkdir、不依赖 pm/binder。injector 侧同样执行以保持两端一致

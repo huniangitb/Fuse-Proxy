@@ -15,7 +15,9 @@
  * 注意：FtpBackendFile 等类型随实际源码定义，故涉及 f_lock/download 状态的
  * mock_wait_jump 与测试骨架一律放在 #include 之后；mock 只经前置声明调用它。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <curl/curl.h>
 #include <pthread.h>
 #include <stdarg.h>

@@ -16,7 +16,9 @@
  * 用法：fw_config_view_uaf_driver <rules.conf>
  * 输出：诊断行 + "PASS/FAIL ..." + "RESULT OK|FAIL"；退出码 0=通过 1=失败。
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>

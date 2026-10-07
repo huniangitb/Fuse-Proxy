@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /*
  * fault_fence.c — 模块调用围栏实现（崩溃→错误转换）
  *
@@ -37,7 +39,9 @@ typedef struct {
     /* volatile：信号处理器（本线程）安全读取；窗口登记只在普通上下文 */
     volatile int in_window;
     volatile int slot;
-    volatile const char* op;
+    /* volatile 限定**指针本身**（不是被指字符）：信号处理器读的是当前 op
+       指针值，故须 `const char* volatile` 而非 `volatile const char*` */
+    const char* volatile op;
 } FenceTls;
 
 /* sigjmp_buf 较大（含 ucontext），放堆块避免占用线程栈（模块深递归时
