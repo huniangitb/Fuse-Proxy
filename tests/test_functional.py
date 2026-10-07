@@ -5,6 +5,7 @@ fuse_daemon 完整测试套件
 测试场景: 基础文件操作 / SQLite 数据库 / 并发压力 / inode 非零一致性
 """
 import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json, sqlite3, errno
+import ctypes
 from pathlib import Path
 
 MNT     = "/tmp/fuse_proxy_test/mnt"
@@ -48,6 +49,11 @@ REDIRECT /应用数据/com.example.app/ /Download/AppData/
 # inode 一致性专用：目标目录无底层文件——readdir 条目须走合成 inode 回退
 # （lstat 失败 → synthetic_inode(sub)），与 getattr 虚拟分支同源
 REDIRECT /空盘/ /Download/notexist_target/
+
+# 跨设备 rename（EXDEV 回退）专用：目标经 .. 逃出真实根，落在 /dev/shm
+# （与 /tmp 存储不同文件系统），使 daemon 侧 rename(2) 返回 EXDEV，
+# 从而走「复制 + 删源」回退路径（见 test_rename_exdev）
+REDIRECT /xd/ /../../../../dev/shm/nsp_xd/
 """
 
 def setup_env():
@@ -528,6 +534,145 @@ def test_rmdir_nonempty_semantics():
         fail("清空后 rmdir", str(e))
 
 
+def _renameat2(old, new, flags):
+    """经 libc 调 renameat2（glibc ≥2.28）。成功返回 0；失败抛 OSError。"""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    fn = libc.renameat2
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    r = fn(-100, os.fsencode(old), -100, os.fsencode(new), ctypes.c_uint(flags))
+    if r != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    return 0
+
+
+def _renameat2_available():
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).renameat2
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
+def test_rename_flags():
+    """A1：FUSE_RENAME2 的 flags 必须生效。
+
+    旧实现在 renameat2 失败后**无条件**退化普通 rename：RENAME_NOREPLACE 目标
+    已存在时本应 EEXIST，却直接覆盖目标（静默数据丢失）；RENAME_EXCHANGE 失败后
+    退化成单向移动（源没了、目标被覆盖）。本用例在旧实现上必失败。
+    """
+    log("\n━━━ 模块5: rename flags（RENAME2）标准语义 ━━━")
+    m = Path(MNT)
+    d = m / "0/Download/rf"
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    src, dst = d / "src.txt", d / "dst.txt"
+    src.write_text("SRC"); dst.write_text("DST")
+
+    RENAME_NOREPLACE, RENAME_EXCHANGE = 1, 2
+    if not _renameat2_available():
+        log("  (跳过 rename flags：libc 无 renameat2)")
+        return
+
+    # 5.1 NOREPLACE + 目标已存在 → EEXIST，且两端内容都不许变
+    try:
+        _renameat2(str(src), str(dst), RENAME_NOREPLACE)
+        fail("RENAME_NOREPLACE 目标已存在", "未报错（旧实现退化为普通 rename 并覆盖目标）")
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            ok("RENAME_NOREPLACE 目标已存在 → EEXIST")
+        else:
+            fail("RENAME_NOREPLACE errno",
+                 f"期望 EEXIST({errno.EEXIST}) 实得 {e.errno}({os.strerror(e.errno)})")
+    try:
+        s_now = src.read_text(); d_now = dst.read_text()
+        if s_now == "SRC" and d_now == "DST":
+            ok("NOREPLACE 失败后两端内容完好（目标未被覆盖）")
+        else:
+            fail("NOREPLACE 失败后两端完好", f"src={s_now!r} dst={d_now!r}")
+    except Exception as e:
+        fail("NOREPLACE 失败后两端完好", str(e))
+
+    # 5.2 EXCHANGE → 两端内容互换
+    try:
+        _renameat2(str(src), str(dst), RENAME_EXCHANGE)
+        s_now, d_now = src.read_text(), dst.read_text()
+        if s_now == "DST" and d_now == "SRC":
+            ok("RENAME_EXCHANGE 两端内容互换")
+        else:
+            fail("RENAME_EXCHANGE 互换", f"src={s_now!r} dst={d_now!r}（单向移动即旧实现）")
+    except OSError as e:
+        fail("RENAME_EXCHANGE", f"{e.errno}({os.strerror(e.errno)})")
+
+    # 5.3 正对照：普通 rename 仍可用（flags=0 不得被 flags 分支挡住）
+    try:
+        os.rename(str(src), str(d / "plain.txt"))
+        ok("正对照：普通 rename（flags=0）成功")
+    except Exception as e:
+        fail("普通 rename 正对照", str(e))
+
+
+def test_rename_exdev():
+    """A2：跨设备目录搬移必须完整复制（含符号链接），且不得两边都毁。
+
+    经 REDIRECT 把 /xd/ 指向 /dev/shm（与 /tmp 存储不同文件系统），使 daemon 侧
+    rename(2) 返回 EXDEV，走「复制 + 删源」回退。旧实现 recursive_copy_dir 只处理
+    目录与普通文件，**符号链接被静默跳过**且整体返回成功，随后删源 → 条目永久丢失。
+    本用例在旧实现上必失败（目标缺 link）。
+    """
+    log("\n━━━ 模块6: 跨设备 rename（EXDEV 回退）━━━")
+    m = Path(MNT)
+    shm = "/dev/shm/nsp_xd"
+    shutil.rmtree(shm, ignore_errors=True)
+    tree = Path(shm) / "tree"
+    (tree / "sub").mkdir(parents=True, exist_ok=True)
+    (tree / "file.txt").write_text("XDEV")
+    (tree / "sub" / "deep.txt").write_text("DEEP")
+    os.symlink("file.txt", str(tree / "link"))  # 相对符号链接
+
+    dst = m / "0/Download/xd_dst"
+    shutil.rmtree(dst, ignore_errors=True)
+    src = m / "0/xd/tree"
+    try:
+        if not src.is_dir():
+            fail("跨设备 rename 前置", f"{src} 不可达（REDIRECT /xd/ 未生效？）")
+            return
+        os.rename(str(src), str(dst))
+        ok("跨设备 rename 返回成功")
+    except OSError as e:
+        fail("跨设备 rename", f"{e.errno}({os.strerror(e.errno)})")
+        return
+
+    # 目标必须完整：普通文件 + 子目录 + 符号链接
+    got_file = (dst / "file.txt").read_text() if (dst / "file.txt").exists() else None
+    got_deep = (dst / "sub" / "deep.txt").read_text() if (dst / "sub" / "deep.txt").exists() else None
+    got_link = os.path.islink(str(dst / "link"))
+    if got_file == "XDEV" and got_deep == "DEEP" and got_link:
+        ok("跨设备搬移目标完整（含符号链接）")
+    else:
+        fail("跨设备搬移目标完整性",
+             f"file={got_file!r} deep={got_deep!r} link={got_link}（旧实现静默跳过符号链接）")
+
+    # 源必须已删除（拷贝+删源语义）
+    if not os.path.exists(str(src)):
+        ok("跨设备搬移后源已删除")
+    else:
+        fail("跨设备搬移源删除", f"{src} 仍存在")
+
+    # 链接可解引用（指向搬移后的同级文件）
+    try:
+        with open(str(dst / "link")) as fh:
+            target_txt = fh.read()
+        ok("搬移后符号链接可解引用") if target_txt == "XDEV" else fail(
+            "搬移后链接解引用", f"读到 {target_txt!r}")
+    except Exception as e:
+        fail("搬移后链接解引用", str(e))
+
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.rmtree(shm, ignore_errors=True)
+
+
 # ═══════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════
@@ -552,6 +697,8 @@ def main():
         test_basic_operations()
         test_inode_nonzero()
         test_rmdir_nonempty_semantics()
+        test_rename_flags()
+        test_rename_exdev()
         test_sqlite()
         test_concurrent()
     finally:

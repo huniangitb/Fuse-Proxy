@@ -10,7 +10,7 @@
 并直接核对 vsftpd 匿名根（/home/bdy/ftp）验证 FTP 服务器实际变化。
 V5 分页回归：700 文件大目录一次列全（旧 512 整批上限会静默丢尾）。
 """
-import subprocess, os, sys, time, shutil
+import subprocess, os, sys, time, shutil, errno, ctypes
 from pathlib import Path
 
 MNT      = "/tmp/fuse_ftp_test/mnt"
@@ -95,6 +95,23 @@ def stop_fuse(p):
         try: p.wait(3)
         except: p.kill()
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
+
+def _renameat2(old, new, flags):
+    """经 libc 调 renameat2（glibc ≥2.28）。成功返回 0；失败抛 OSError；
+    libc 无该符号时返回 None（调用方跳过）。"""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        fn = libc.renameat2
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    r = fn(-100, os.fsencode(old), -100, os.fsencode(new), ctypes.c_uint(flags))
+    if r != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    return 0
+
 
 def wait_ftp_content(rel, want, timeout=6.0):
     """轮询等待 FTP 上传区文件内容（FUSE release 的 STOR 上传异步完成）"""
@@ -265,6 +282,31 @@ def main():
             (m/"0"/SERVER/newf).rename(m/"0"/SERVER/"nsp_renamed.txt")
             ok("rename（FTP 验证）") if (Path(FTP_UPLOAD)/"nsp_renamed.txt").exists() and not (Path(FTP_UPLOAD)/newf).exists() else fail("rename", "FTP 侧不一致")
         except Exception as e: fail("rename", str(e))
+
+        # 6b. 后端 rename 不接受 flags（A1）：带 flags 必须明确拒绝，不得静默降级。
+        #     旧实现忽略 flags 直接调 backend_rename——NOREPLACE 目标不存在时"看起来
+        #     成功"但语义未被保证，EXCHANGE 更会退化成单向移动（丢源/覆盖目标）。
+        fa, fb = "nsp_a1_flags_src.txt", "nsp_a1_flags_dst.txt"
+        try:
+            (Path(FTP_UPLOAD) / fb).unlink(missing_ok=True)
+            (Path(FTP_UPLOAD) / fa).write_text("FLAGSRC")
+            r = _renameat2(str(m/"0"/SERVER/fa), str(m/"0"/SERVER/fb), 1)  # RENAME_NOREPLACE
+            if r is None:
+                print("  (跳过 后端 rename flags：libc 无 renameat2)")
+            else:
+                fail("后端 rename 带 flags 应被拒绝", "未报错（旧实现忽略 flags 直接改名）")
+        except OSError as e:
+            if e.errno == errno.EINVAL:
+                ok("后端 rename 带 flags → EINVAL（明确拒绝，不静默降级）")
+            else:
+                fail("后端 rename 带 flags errno",
+                     f"期望 EINVAL 实得 {e.errno}({os.strerror(e.errno)})")
+        finally:
+            for stale in (fa, fb):
+                try:
+                    (Path(FTP_UPLOAD) / stale).unlink()
+                except Exception:
+                    pass
 
         # 7. unlink → FTP 消失
         try:
