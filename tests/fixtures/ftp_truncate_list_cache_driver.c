@@ -34,6 +34,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -263,6 +265,29 @@ int main(void) {
         ck(has_hidden, "D2 点文件 .hidden 在列举中可见（旧实现被丢弃）", "未返回 .hidden");
         ck(has_git, "D3 点目录 .git 在列举中可见（旧实现被丢弃）", "未返回 .git");
         ck(has_keep, "D4 普通条目不受影响", "未返回 keep");
+    }
+
+    /* E. C9：backend 入口的参数校验必须先于 ftp_handle_get——否则早退不归还
+       在途引用，refs 永不归零、句柄永不拆除（active_handles 不归零 → 热重载
+       quiescence 门控永久阻塞）。判别点直接取句柄的 refs 计数：非法参数调用
+       前后必须相等；旧实现两次早退各泄漏 1，refs 必增。 */
+    {
+        uint64_t h = 0;
+        int orc = ftp_backend_open("/ftproot/dir/w", O_RDWR | O_CREAT | O_TRUNC, &h);
+        ck(orc == 0 && h > 0 && h < FTP_HANDLE_MAX && g_handles[h] != NULL,
+           "E1 写模式 open 成功", "open 失败/句柄未注册");
+        if (orc == 0 && h > 0 && h < FTP_HANDLE_MAX && g_handles[h]) {
+            int before = atomic_load_explicit(&g_handles[h]->refs, memory_order_acquire);
+            size_t got = 0;
+            int rrc = ftp_backend_read(h, NULL, 8, 0, &got);
+            ck(rrc == -EINVAL, "E2 read 非法参数（buf=NULL）返回 -EINVAL", "返回码异常");
+            int wrc = ftp_backend_write(h, NULL, 8, 0, &got);
+            ck(wrc == -EINVAL, "E3 write 非法参数（buf=NULL）返回 -EINVAL", "返回码异常");
+            int after = atomic_load_explicit(&g_handles[h]->refs, memory_order_acquire);
+            ck(after == before, "E4 非法参数早退未泄漏在途引用（refs 不变）",
+               "refs 增加——早退路径漏了 ftp_handle_put");
+            (void)ftp_backend_release(h);
+        }
     }
 
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
