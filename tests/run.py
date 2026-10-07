@@ -119,7 +119,9 @@ SUITE_MAP = [
     # fw_config.c 含规则文件/App-rules 的 inotify 监听线程——热重载触发路径本身，
     # 故改动它同时跑 test_rules.py（重载语义端到端）
     (("test_monitor_layers.py", "test_cfg_watch.py", "test_rules.py",
-      "test_fw_config_view.py"),
+      "test_fw_config_view.py",
+      # C11：配置目录事件按 ev->name 分流（uid.map / sys_pkgs.cache 不触发规则重载）
+      "test_cfg_reload_split.py"),
      ("src/daemon/fw_config.c", "src/daemon/fw_config.h", "src/daemon/fw_pkg.c",
       "src/daemon/fw_pkg.h"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),

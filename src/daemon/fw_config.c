@@ -280,6 +280,39 @@ static void reload_once(void) {
     config_free_view(old_recs, old_count);
 }
 
+/* ---- 事件分流（C11）----
+   配置目录里除规则文件外还有两个**非规则**产物：uid.map（injector 每启动一个应用
+   就 tmp+rename 写入，高峰期密集）与 sys_pkgs.cache。旧实现对任一事件都做整份
+   重解析 + 重建 Trie + 作废 2048 槽 uid 缓存 + 推送所有模块——应用启动高峰期会把
+   FUSE 热路径的缓存持续冷启。故按 ev->name 分流：只有规则类事件才走全量 reload_once。 */
+
+typedef enum {
+    CFG_EV_PKG = 0, /* uid.map：只重装 uid→包名映射 */
+    CFG_EV_SYS_PKG, /* sys_pkgs.cache：只刷新系统包缓存 */
+    CFG_EV_RULES,   /* 其余（含无名/目录级事件）：全量重载（保守） */
+} CfgEvKind;
+
+static CfgEvKind cfg_ev_classify(const char* name) {
+    if (!name || !name[0]) return CFG_EV_RULES; /* 无名事件（目录级）→ 保守全量 */
+    if (strcmp(name, "uid.map") == 0 || strcmp(name, "uid.map.tmp") == 0) return CFG_EV_PKG;
+    if (strcmp(name, "sys_pkgs.cache") == 0 || strcmp(name, "sys_pkgs.cache.tmp") == 0)
+        return CFG_EV_SYS_PKG;
+    return CFG_EV_RULES;
+}
+
+/* 非规则产物的轻量刷新：只更新对应全局表并递增代际，让 monitor 决策缓存失效
+   （uid→包名 / 系统包集合变化会改变三层合并结果），**不**重解析规则、不重建索引、
+   不推送模块。 */
+static void reload_pkg_only(void) {
+    atomic_fetch_add_explicit(&g_gen, 1, memory_order_release);
+    fw_pkg_reload();
+}
+
+static void reload_sys_pkg_only(void) {
+    atomic_fetch_add_explicit(&g_gen, 1, memory_order_release);
+    sys_pkg_refresh();
+}
+
 /* 监听规则文件所在目录 + 各 App-rules* 子目录（沿用原模块内 watch 重建/归并模式） */
 static void* config_monitor_thread(void* arg) {
     (void)arg;
@@ -357,15 +390,38 @@ static void* config_monitor_thread(void* arg) {
         if (len == 0) continue;
         int inval_wd = -1;
         bool top_change = false;
+        bool ev_rules = false, ev_pkg = false, ev_sys = false;
         for (char* p = buf; p < buf + len;) {
             struct inotify_event* ev = (struct inotify_event*)p;
             if (ev->mask & IN_IGNORED) inval_wd = ev->wd;
-            if (ev->wd == wd && (ev->mask & (IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM)))
-                top_change = true; /* App-rules 目录可能新增/移除：重新对账 watch */
+            if (ev->wd == wd) {
+                if (ev->mask & (IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM))
+                    top_change = true; /* App-rules 目录可能新增/移除：重新对账 watch */
+                switch (cfg_ev_classify(ev->name)) {
+                case CFG_EV_PKG:
+                    ev_pkg = true;
+                    break;
+                case CFG_EV_SYS_PKG:
+                    ev_sys = true;
+                    break;
+                default:
+                    ev_rules = true;
+                    break;
+                }
+            } else {
+                /* App-rules 子目录内的事件即规则文件变更；队列溢出 / IN_IGNORED
+                   （wd 对不上）也落这里——保守按规则处理 */
+                ev_rules = true;
+            }
             p += sizeof(struct inotify_event) + ev->len;
         }
         sleep(1); /* 归并写者连击：等待写者落定再读 */
-        reload_once();
+        if (ev_rules)
+            reload_once(); /* 规则类：全量重解析 + 重建索引 + 推送所有模块 */
+        else if (ev_pkg)
+            reload_pkg_only();
+        else if (ev_sys)
+            reload_sys_pkg_only();
         if (inval_wd == wd) wd = -1;
         for (int i = 0; i < appn; i++)
             if (appw[i].wd == inval_wd) appw[i].wd = -1;

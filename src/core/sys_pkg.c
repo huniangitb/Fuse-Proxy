@@ -60,6 +60,31 @@ static void sys_pkg_cache_path(char* out, size_t sz) {
 }
 
 /* 原子落盘：tmp 写 + rename，避免 fuse_daemon 读到半截文件 */
+/* 两文件内容是否一致（任一不可读 → false，按"需要写"处理） */
+static bool sys_pkg_same_content(const char* a, const char* b) {
+    FILE* fa = fopen(a, "rb");
+    if (!fa) return false;
+    FILE* fb = fopen(b, "rb");
+    if (!fb) {
+        fclose(fa);
+        return false;
+    }
+    bool same = true;
+    for (;;) {
+        char ba[512], bb[512];
+        size_t na = fread(ba, 1, sizeof ba, fa);
+        size_t nb = fread(bb, 1, sizeof bb, fb);
+        if (na != nb || (na && memcmp(ba, bb, na) != 0)) {
+            same = false;
+            break;
+        }
+        if (na < sizeof ba) break; /* 两边同时到达 EOF */
+    }
+    fclose(fa);
+    fclose(fb);
+    return same;
+}
+
 static void sys_pkg_save_locked(void) {
     char path[PATH_MAX], tmp[PATH_MAX];
     sys_pkg_cache_path(path, sizeof path);
@@ -73,6 +98,12 @@ static void sys_pkg_save_locked(void) {
         for (SysPkgEntry* e = g_sys_pkg_hash[i]; e; e = e->next) fprintf(fp, "%s\n", e->pkg);
     }
     fclose(fp);
+    /* 内容与目标一致则不动目标文件：避免「刷新 → 落盘 → inotify 事件 → 再刷新」的
+       自激环（fw_config 按 ev->name 把 sys_pkgs.cache 事件分流为「只刷新」，见 C11） */
+    if (sys_pkg_same_content(tmp, path)) {
+        unlink(tmp);
+        return;
+    }
     if (rename(tmp, path) != 0) {
         LOG_WRN("sys_pkgs.cache 原子换入失败");
         unlink(tmp);
