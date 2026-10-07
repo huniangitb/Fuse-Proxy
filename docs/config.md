@@ -151,7 +151,7 @@ HIDE /secret   # 这不是注释，会被并入规则
 | 路径超 255 字符 | 缩短路径 | `MAX_PATH_LEN=256` |
 | 包名超 127 字符 | 校验包名长度 | 结构体上限 128 |
 | `SANDBOX_DIR` 写在应用段/类别段 | 只写 `[GLOBAL]` 段 | 仅全局段有效，写在别处忽略并告警（`config_parser.c` 的 `SANDBOX_DIR` 分支）；目录名须单级、不含 `/`、上限 63 字节 |
-| `SANDBOX_TARGET = <路径>` | 用 `[GLOBAL]` 段的 `SANDBOX_DIR` 改目录名 | 无此配置项；沙盒落点固定为 `<STORAGE_BASE>/<uid>/<pkg>/<SANDBOX_DIR 或 sandbox>`，不能改成任意路径 |
+| `SANDBOX_TARGET = <路径>` | 用 `[GLOBAL]` 段的 `SANDBOX_DIR` 改目录名 | 无此配置项；沙盒落点固定为 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/<SANDBOX_DIR 或 sandbox>`，不能改成任意路径 |
 | 应用段写 `MONITOR OFF` 期望继承全局 | 全局段写 `MONITOR OFF`，或应用段显式写所需值 | 应用段显式写即覆盖全局 |
 | `FUSE_EXTRA_ARGS` 写在应用段 | 仅写 `[GLOBAL]` 段 | 应用段无该字段 |
 | 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `strip_storage_prefix` 不处理 `/sdcard` |

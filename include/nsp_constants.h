@@ -37,10 +37,9 @@
 /* ================= 沙盒目录名 =================
  * `SANDBOX ON` 的默认数据落点：<STORAGE_BASE>/<uid>/Android/data/<pkg>/<NSP_SANDBOX_DIRNAME>
  * （唯一合成出口 common_sandbox_path，模块经导出表调用）。
- * 目录名可经环境变量 NSP_SANDBOX_DIR_ENV（仅 daemon 进程读一次，启动时生效）
- * 覆盖；未设置时为 "sandbox"。 */
+ * 目录名默认 "sandbox"，可经项目配置文件 [GLOBAL] 段的 SANDBOX_DIR 覆盖
+ * （不入环境变量）。 */
 #define NSP_SANDBOX_DIRNAME "sandbox"
-#define NSP_SANDBOX_DIR_ENV "NSP_SANDBOX_DIR"
 
 /* ================= 默认 SELinux 文件上下文 =================
  * 存储区新建文件/目录在无法从父目录继承（lgetxattr 无结果）时回填的默认

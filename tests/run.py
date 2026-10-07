@@ -5,7 +5,8 @@
 
     python3 tests/run.py                 # 默认：按本次改动匹配映射表后依次执行
     python3 tests/run.py --list          # 只打印将要执行的套件，不真正跑
-    python3 tests/run.py --all           # 忽略映射，跑全部套件
+    python3 tests/run.py --all           # 忽略映射，跑全部常规套件（不含按需套件）
+    python3 tests/run.py --layer L0      # 只跑某个验收层（可重复：--layer L0 --layer L1）
     python3 tests/run.py --base <ref>    # 与指定提交对比（默认 HEAD，即未提交改动）
     python3 tests/run.py test_rules.py …  # 显式指定套件（同时跳过自动匹配）
     python3 tests/run.py --jobs 4        # Tier 0 白名单套件并行，其余仍串行
@@ -16,7 +17,15 @@
 任一改动文件内容中即选中，二者为「或」）。改动为文档/脚本等未命中项时，
 仍会跑「通用回归」基线——它对所有改动恒定生效。
 
-对应 AGENTS.md「测试流程」映射表；两边需同步维护。
+两组正交的分类，各有唯一出处，别混用：
+  * **Tier**（`PARALLEL_SAFE` / `TIER_EXCLUSIVE`）= 能否并行，按共享状态冲突划分；
+  * **Layer**（`LAYERS`）= 验收分层，按「贴近 Android 的程度」划分，供 `--layer` 用。
+`LAYERS` 是 L0/L1/L2 归属的唯一出处（此前只在 AGENTS.md 里是散文，跑不了也对不上
+账：实测 38 个套件里有 13 个没被任何层点名）。新套件必须同时登记进 `SUITE_MAP`
+与 `LAYERS`，否则 `tests/test_docs_sync.py` 失败。
+
+对应 docs/testing.md 的映射表与分层清单；一致性由 `tests/test_docs_sync.py`
+机器校验（拼错/漏登记当场失败），不再依赖人工两边同步。
 
 退出码约定（防「假绿」）：
   0   = 全部通过
@@ -42,8 +51,9 @@ TESTS = os.path.join(ROOT, "tests")
 
 # (套件名, 路径子串, 符号, 说明)
 SUITE_MAP = [
-    # ── 基线：条目不给任何路径/符号谓词即恒定命中（IO/SQLite/并发 + 崩溃日志取证） ──
-    (("test_functional.py", "test_crash_log.py"), (), (),
+    # ── 基线：条目不给任何路径/符号谓词即恒定命中（IO/SQLite/并发 + 崩溃日志取证 ──
+    #    + 文档/映射表/分层一致性，后者恒跑是有意的：文档漂移正是靠它当场失败才拦住的）
+    (("test_functional.py", "test_crash_log.py", "test_docs_sync.py"), (), (),
      "通用回归基线"),
 
     # ── AGENTS.md 映射表 ──
@@ -154,6 +164,89 @@ SUITE_MAP = [
 ]
 
 
+# ── 验收分层（LAYERS）：L0/L1/L2 归属的唯一出处 ─────────────────────────────
+# 与 Tier（并行安全性）正交：Tier 管「能不能一起跑」，Layer 管「贴近 Android 到
+# 什么程度」，即验收时的递进顺序。docs/testing.md 的分层清单由此生成式对账，
+# 一致性与完整性由 tests/test_docs_sync.py 强制：
+#   * SUITE_MAP 里的每个套件必须恰好属于一层（漏登记 → 分层验收跑不到它）；
+#   * 每层里的套件必须真实存在且在 SUITE_MAP 里。
+#
+# L0 静态/契约：不挂载、不联网、不起 daemon。多为「直编实际源码 + --wrap 桩/ASan」
+#    的判别性用例，宿主零副作用，可并行。
+# L1 GNU 真实 FUSE：起真 daemon、真挂载（/dev/fuse + fusermount3），部分需 vsftpd
+#    或系统 log_monitor，故串行。
+# L2 Android 拓扑仿真：rootless unshare 沙箱内仿真安卓挂载拓扑，验收时须核对宿主
+#    mountinfo 前后零变化。
+# L3/L4 不在本文件内：L3 需 emulator/AVD 或真机（SELinux/Bionic/vold/FUSE-BPF/
+#    Zygisk 双 ABI/多用户），L4 经 scripts/adb-sh.sh 做设备最终验收。见 docs/testing.md。
+LAYERS = {
+    "L0": (
+        "静态/契约（无挂载无网络，可并行）",
+        (
+            "test_docs_sync.py",
+            "test_config_snapshot.py",
+            "test_monitor_layers.py",
+            "test_path_vars.py",
+            "test_pending_close.py",
+            "test_cfg_watch.py",
+            "test_cfg_reload_split.py",
+            "test_fw_config_view.py",
+            "test_rule_file_lock.py",
+            "test_module_abi.py",
+            "test_backing_gate.py",
+            "test_c1_sandbox_slot.py",
+            "test_a26_misc.py",
+            "test_pt_probe_toctou.py",
+            "test_reaped_managed.py",
+            "test_crash_log.py",
+            "test_ftp_read_restart.py",
+            "test_ftp_truncate_list.py",
+            "test_ftp_upload_lock.py",
+            "test_ns_combined_rollback.py",
+            "test_ns_umount_overflow.py",
+            "test_ns_global_replace_rollback.py",
+            "test_inject_method.py",
+            "test_inject_tracked_race.py",
+            "test_log_ctl_rules.py",
+        ),
+    ),
+    "L1": (
+        "GNU 真实 FUSE（串行，需 /dev/fuse + fusermount3）",
+        (
+            "test_functional.py",
+            "test_rules.py",
+            "test_decision_enforce.py",
+            "test_negative_timeout.py",
+            "test_readdir_skel_fallback.py",
+            "test_modules.py",
+            "test_module_circuit.py",
+            "test_backend_lifecycle.py",
+            "test_ftp.py",
+            "test_ftp_parallel.py",
+            "test_log_pipeline.py",
+            "test_rule_server.py",
+        ),
+    ),
+    "L2": (
+        "Android 拓扑仿真（rootless unshare 沙箱，须核对宿主 mountinfo 零变化）",
+        (
+            "test_inject_mount_env.py",
+            "test_global_replace.py",
+        ),
+    ),
+}
+
+# 按需套件：压力/基准类，耗时长且断言的是指标而非正确性，故**有意**不进 SUITE_MAP，
+# `--all` 也不跑（否则每次验收都要等它们）。显式写名字才跑：
+#   python3 tests/run.py test_ftp_stress.py
+# 登记在此是为了让 tests/test_docs_sync.py 能区分「有意按需」与「新套件漏登记」——
+# 不在 SUITE_MAP 又不在这里的 tests/test_*.py 一律判为漏登记（此前 test_ftp_stress.py
+# 就这样长期游离在 --all 之外，没人看得出是故意还是忘了）。
+ON_DEMAND = frozenset({
+    "test_ftp_stress.py",     # FTP 吞吐/长稳压力，需 vsftpd，分钟级
+})
+
+
 def git(*args):
     r = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
     return r.stdout
@@ -242,6 +335,24 @@ def all_suites():
     return sorted(out)
 
 
+def layer_of(name):
+    """套件所属验收层；未登记返回 None（test_docs_sync.py 会判失败）。"""
+    for layer, (_desc, suites) in LAYERS.items():
+        if name in suites:
+            return layer
+    return None
+
+
+def layer_suites(layers):
+    """按层取套件，依 L0→L1→L2 递进顺序返回（层内保持 LAYERS 里的书写顺序）。"""
+    out = []
+    for layer in sorted(layers):
+        for s in LAYERS[layer][1]:
+            if s not in out:
+                out.append(s)
+    return out
+
+
 # ── 共享状态冲突矩阵（逐个审计 tests/test_*.py 得出，2026-10）──
 # 资源 R1 固定 CONF=/tmp/Namespace-Proxy/injector.conf：
 #   test_functional / test_rules / test_ftp / test_ftp_parallel /
@@ -268,6 +379,7 @@ def all_suites():
 # 真实日志文件）。命中 --jobs 时仅这些进线程池并行，其余按 Tier 串行。
 # 新套件默认串行，要加入须先核对判据。
 PARALLEL_SAFE = frozenset({
+    "test_docs_sync.py",          # 纯静态读文件（文档/台账一致性），无子进程/无挂载
     "test_config_snapshot.py",    # cc 编译夹具直跑，TemporaryDirectory
     "test_module_abi.py",         # cc 编译 ABI 夹具，无 daemon（TemporaryDirectory）
     "test_path_vars.py",          # cc 编译直跑（mkdtemp）
@@ -398,7 +510,11 @@ def run_parallel(safe, jobs):
 def main():
     ap = argparse.ArgumentParser(description="按改动文件自动选套件的统一测试入口")
     ap.add_argument("suites", nargs="*", help="显式指定要跑的 tests/*.py（跳过自动匹配）")
-    ap.add_argument("--all", action="store_true", help="忽略映射，跑全部套件")
+    ap.add_argument("--all", action="store_true", help="忽略映射，跑全部常规套件（不含 ON_DEMAND 按需套件）")
+    ap.add_argument("--layer", action="append", choices=sorted(LAYERS), default=None,
+                    metavar="L0|L1|L2",
+                    help="只跑指定验收层（可重复，如 --layer L0 --layer L1）；"
+                         "层定义见 LAYERS 与 docs/testing.md")
     ap.add_argument("--list", action="store_true", help="只列出将要执行的套件")
     ap.add_argument("--base", default="HEAD",
                     help="与该提交对比以确定改动（默认 HEAD = 暂存+未暂存+未跟踪）")
@@ -418,6 +534,9 @@ def main():
     if args.suites:
         suites = [s if s.endswith(".py") else s + ".py" for s in args.suites]
         rows = ["显式指定"]
+    elif args.layer:
+        suites = layer_suites(args.layer)
+        rows = [f"{lv}（{LAYERS[lv][0]}）" for lv in sorted(args.layer)]
     elif args.all:
         suites, rows = all_suites(), ["--all 全量"]
     else:
@@ -437,7 +556,7 @@ def main():
     t2 = [s for s in suites if tier_of(s) == 2]
     for s in suites:
         tag = {0: "Tier0并行", 1: "Tier1串行", 2: "Tier2独占"}[tier_of(s)]
-        print(f"  [{tag}] {s}")
+        print(f"  [{tag}][{layer_of(s) or '未分层'}] {s}")
     print("命中条目：" + ("、".join(rows) if rows else "无"))
     if args.list:
         return 0

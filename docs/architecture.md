@@ -171,7 +171,7 @@ FUSE 回调（如 getattr）
 1. **应用段**：先静态（Trie 命中，`TrieMatch.redir`/`redir_scope`），再线性（含通配/变量的 `redir_rules`）。
 2. **类别段**（`USER_APPS[:uid]` / `SYSTEM_APPS`）：同上。
 3. **`[GLOBAL]`**：同上。
-4. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `<STORAGE_BASE>/<uid>/<pkg>/sandbox/`（目录名默认 `sandbox`，可经 `[GLOBAL]` 段 `SANDBOX_DIR` 配置项覆盖，配置发布单点下发；三层 OFF 否决语义见 `config.md` §2/§3）。
+4. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox/`（目录名默认 `sandbox`，可经 `[GLOBAL]` 段 `SANDBOX_DIR` 配置项覆盖，配置发布单点下发；三层 OFF 否决语义见 `config.md` §2/§3）。
 5. **fallback**：`STORAGE_BASE/<user_id><sub_path>`。
 
 > Trie 与线性通道是**同一作用域内的等价实现**——Trie 只是静态规则的加速索引，不是更高的优先级层：同层内静态命中先于该层线性规则，但**跨作用域不得互相压过**。旧实现先取「任一作用域的静态命中」再才看线性，于是 `[GLOBAL]` 的静态 REDIRECT 会压过应用/类别段的通配/变量规则（与 `config.md` §2 相反，`test_rules.py` §21 守护）。
