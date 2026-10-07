@@ -32,13 +32,20 @@
 
 /* ==================== 行数组原语 ==================== */
 
-char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
+char** nsp_rule_file_read_ex(const char* path, int* out_count, int* out_cap, int* out_err) {
     if (out_count) *out_count = 0;
     if (out_cap) *out_cap = 0;
-    if (!path) return NULL;
+    if (out_err) *out_err = 0;
+    if (!path) {
+        if (out_err) *out_err = EINVAL;
+        return NULL;
+    }
 
     FILE* fp = fopen(path, "r");
-    if (!fp) return NULL;
+    if (!fp) {
+        if (out_err) *out_err = errno ? errno : EIO;
+        return NULL;
+    }
 
     char** lines = NULL;
     int count = 0, cap = 0;
@@ -59,6 +66,7 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
                 nsp_rule_file_free(lines, count);
                 free(line);
                 fclose(fp);
+                if (out_err) *out_err = ENOMEM;
                 return NULL;
             }
             lines = grown;
@@ -80,6 +88,7 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
             nsp_rule_file_free(lines, count);
             free(line);
             fclose(fp);
+            if (out_err) *out_err = ENOMEM;
             return NULL;
         }
         count++;
@@ -89,6 +98,10 @@ char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
     if (out_count) *out_count = count;
     if (out_cap) *out_cap = cap;
     return lines;
+}
+
+char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap) {
+    return nsp_rule_file_read_ex(path, out_count, out_cap, NULL);
 }
 
 /* 目录 fsync（rename 的持久化点）：失败不致命，仅尽力而为 */
@@ -339,7 +352,14 @@ static int upsert_in_section_impl(const char* path, const char* sec_name,
     if (hn < 0 || (size_t)hn >= sizeof sec_hdr) return NSP_RULE_FILE_EINVAL;
 
     int count = 0, cap = 0;
-    char** lines = nsp_rule_file_read(path, &count, &cap);
+    int rerr = 0;
+    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
+    /* 读失败（非 ENOENT）绝不当空文件：否则会以「段头 + 本次 1 条」覆盖整份
+       规则文件（EMFILE/EACCES/EIO/OOM 时静默丢全部既有规则，§A10） */
+    if (!lines && rerr != 0 && rerr != ENOENT) {
+        errno = rerr;
+        return NSP_RULE_FILE_EIO;
+    }
     bool changed = false;
 
     int hdr = (sec_match == NSP_RULE_SEC_PREFIX)
@@ -426,7 +446,13 @@ static int upsert_line_impl(const char* path, bool is_switch, const char* type_n
     if (out_changed) *out_changed = false;
 
     int count = 0, cap = 0;
-    char** lines = nsp_rule_file_read(path, &count, &cap);
+    int rerr = 0;
+    char** lines = nsp_rule_file_read_ex(path, &count, &cap, &rerr);
+    /* 读失败绝不当空文件覆盖（§A10） */
+    if (!lines && rerr != 0 && rerr != ENOENT) {
+        errno = rerr;
+        return NSP_RULE_FILE_EIO;
+    }
     bool changed = false;
 
     if (is_switch) {

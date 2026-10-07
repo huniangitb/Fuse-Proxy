@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -36,6 +38,47 @@ static void child_work(int idx) {
         }
     }
     _exit(0);
+}
+
+/* A10：规则文件**读失败**（EACCES）时编辑必须失败且绝不覆盖原文件。
+ * 旧实现把 NULL（=读失败）当空文件 → 写回「段头 + 本次 1 条」把原规则全丢。
+ * 目录保持可写、只把文件本身置 000，使「读失败但写路径可用」——正是丢数据的窗口。
+ * 以 root 运行时 chmod 000 不生效，跳过该组（gap）。 */
+static int case_read_failure(void) {
+    char path[512];
+    snprintf(path, sizeof path, WORKDIR "/readfail.conf");
+    FILE* f = fopen(path, "w");
+    if (!f) {
+        printf("FAIL A10 无法创建 %s\n", path);
+        return 1;
+    }
+    fputs("[GLOBAL]\nHIDE /keep1\nHIDE /keep2\nHIDE /keep3\n", f);
+    fclose(f);
+
+    if (geteuid() == 0) {
+        printf("SKIP A10 以 root 运行，chmod 000 不阻断读取\n");
+        return 2; /* gap */
+    }
+    if (chmod(path, 0000) != 0) {
+        printf("FAIL A10 chmod 000 失败\n");
+        return 1;
+    }
+    bool changed = true;
+    int rc = nsp_rule_file_upsert_line(path, false, "HIDE", "HIDE /new\n", &changed);
+    (void)chmod(path, 0644);
+
+    int count = 0, cap = 0;
+    char** lines = nsp_rule_file_read(path, &count, &cap);
+    int keep = 0;
+    for (int i = 0; lines && i < count; i++) {
+        if (strstr(lines[i], "/keep")) keep++;
+    }
+    if (lines) nsp_rule_file_free(lines, count);
+
+    int ok = (rc != 0 && !changed && keep == 3);
+    printf("%s A10 读失败不覆盖原文件：rc=%d changed=%d 原规则保留=%d/3\n",
+           ok ? "PASS" : "FAIL", rc, changed, keep);
+    return ok ? 0 : 1;
 }
 
 int main(void) {
@@ -71,6 +114,14 @@ int main(void) {
     printf("%s 并发 upsert：期望 %d 条，实际 %d 条，重复 %d 条\n",
            (hits == want && dup == 0) ? "PASS" : "FAIL", want, hits, dup);
     if (lines) nsp_rule_file_free(lines, count);
-    printf((hits == want && dup == 0) ? "RESULT OK\n" : "RESULT FAIL\n");
-    return (hits == want && dup == 0) ? 0 : 1;
+
+    int fail = (hits == want && dup == 0) ? 0 : 1;
+    int gap = 0;
+    int a10 = case_read_failure();
+    if (a10 == 1) fail = 1;
+    else if (a10 == 2) gap = 1;
+
+    printf("%s\n", fail ? "RESULT FAIL" : (gap ? "RESULT GAP" : "RESULT OK"));
+    if (fail) return 1;
+    return gap ? 78 : 0; /* 78 = 部分子组跳过（gap），与 tests/run.py 约定一致 */
 }
