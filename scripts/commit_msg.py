@@ -27,8 +27,6 @@ TYPES = ("feat", "fix", "docs", "refactor", "perf", "test", "build", "chore")
 SCOPES = ("fw", "fuse", "module", "ftp", "injector", "zygisk", "log", "rule",
           "config", "core", "build", "scripts", "test", "docs")
 
-# 正文可省的 type：纯文档与杂项没有「以实现什么」可写
-BODY_EXEMPT = ("docs", "chore")
 HEADER_TARGET = 50
 HEADER_MAX = 72
 LINE_MAX = 72
@@ -74,7 +72,6 @@ FOOTER_RE = re.compile(
 BREAKING_RE = re.compile(r"^BREAKING[ -]CHANGE: \S", re.M)
 LIST_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>[-*+]|\d+[.)])(?P<space>\s+)")
 CODE_RE = re.compile(r"^(    |\t)")
-LABELS = ("以实现：", "凭什么对：")
 
 SECTIONS = (("feat", "新功能"), ("fix", "缺陷修复"), ("perf", "性能"),
             ("refactor", "重构"), ("build", "构建与打包"), ("test", "测试"),
@@ -298,22 +295,11 @@ def check(text, paths=None):
         lw = width(ln)
         if lw > LINE_MAX:
             errs.append("正文第 %d 行 %d 显示列 > %d：%s" % (lineno, lw, LINE_MAX, ln[:40] + "…"))
-    for idx, ln in enumerate(rest):
-        s = ln.strip()
-        if s in LABELS:
-            nxt = rest[idx + 1] if idx + 1 < len(rest) else ""
-            if not nxt.strip():
-                errs.append("空标签「%s」：写了标签就要写内容，不写就删掉整行" % s)
-
     for ref in LOCAL_REFS:
         if ref in text:
             errs.append("引用仓库外的本机材料「%s」（读者解析不了）" % ref)
 
-    if t not in BODY_EXEMPT:
-        if not body:
-            errs.append("%s 提交必须写正文（§5.2）：以实现什么 / 凭什么对" % t)
-        elif "以实现：" not in body:
-            errs.append("正文缺「以实现：」段——先答「让什么能力成立 / 让什么错误消失」")
+    # 正文可选：标题说清改了什么即可，正文只在需要补充时写（§5.2）。
 
     # trailer 必须在最后一个段落（与正文之间空一行）
     if body:

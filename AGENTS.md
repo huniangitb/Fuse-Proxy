@@ -24,7 +24,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 1. 先读对应文档：架构 `docs/architecture.md`、模块 `docs/modules.md`、配置语法 `docs/config.md`、测试 `docs/testing.md`。
 2. 按归属写代码：纯 libc 无全局依赖的公共工具进 `src/core/nsp_util.c`（禁止各文件私刻副本）；依赖项目全局（`g_real_root`、日志）的进 `src/core/common.c`；跨进程/跨模块常量进 `include/nsp_constants.h`、日志级别与宏进 `include/nsp_log.h`（两者均为唯一出处）；新跨文件函数必须带域前缀（见 `docs/architecture.md` §7）。
 3. 同步测试：改了行为就地补用例，跑下方映射表全绿。**新套件须同时登记进 `tests/run.py` 的 `SUITE_MAP` 与 `LAYERS`**，否则 `tests/test_docs_sync.py` 失败（清单见 `docs/testing.md` §9）。
-4. 提交前过验收门：`scripts/acceptance.sh`（构建 + 文档一致性 + 全量测试 + 报告）。仓库文档与提交信息均中文，规则见 `CONTRIBUTING.md` §5，可执行形式是 `scripts/commit_msg.py lint`——`scripts/setup-hooks.sh` 装配后由 `.githooks/commit-msg` 在每次提交时强制（标题写「做了什么更改」，正文写「以实现/修复什么功能」）。
+4. 提交前过验收门：`scripts/acceptance.sh`（构建 + 文档一致性 + 全量测试 + 报告）。仓库文档与提交信息均中文，规则见 `CONTRIBUTING.md` §5，可执行形式是 `scripts/commit_msg.py lint`——`scripts/setup-hooks.sh` 装配后由 `.githooks/commit-msg` 在每次提交时强制（标题写「做了什么更改」，正文按需直接描述改动）。
 
 ### 红线（破坏即回滚）
 
@@ -75,7 +75,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | `src/daemon/cfg_watch.c`（App-rules* 子目录 watch 对账） | `test_cfg_watch.py`（7：只对 `App-rules[-<uid>]` 挂 watch、普通子目录不挂；子目录内 tmp+rename 能产生可读事件（旧实现完全不监听这些目录→应用级规则改了不生效）；目录消失摘表、基目录不可读返回 false 走兜底重扫） |
 | 框架侧规则解析：uid→包名（`fw_pkg.c`）、MONITOR 三层合并（`fw_config_monitor_for`）、沙盒/ALLOW 解析（`fw_rules.c`） | `test_monitor_layers.py`（20：uid→包名与 MONITOR 合并 11 项；**沙盒解析契约 9 项**——`SANDBOX ON` 时 Download/Pictures/Documents 等共享目录一并重定向进本应用沙盒、自己的 data/obb 与 `/Android` 下非 data/obb 不重定向、`ALLOW` 落回真实路径。本机 uid<10000 恒走 system 分支测不到这些，故自编译实际源码 + 合成 uid，不经 Meson）、`test_cfg_watch.py`（`fw_config.c` 改动同时跑配置目录 watch 套件） |
 | 通用回归 | `test_functional.py`（73，IO/SQLite/并发/rmdir 标准语义/**rename flags**/**跨设备 rename**）、`test_crash_log.py` |
-| 提交信息规范（`scripts/commit_msg.py`、`.gitmessage`、`.githooks/`） | `test_commit_msg_lint.py`（**CJK 显示宽度判别**：60 个 ASCII 字符 = 60 列放行、30 个汉字 = 60 列放行，而 40 个汉字是 40 字符却占 80 列必须拒绝——按字符数计的校验器（commitlint 的默认口径）会放行第三种，本仓库实测 25% 的正文行超宽即由此而来。另含 `!`↔`BREAKING CHANGE:` 成对、空标签、正文行宽 URL 豁免、Merge/Revert/fixup! 跳过、未入库本地引用黑名单、`.gitmessage` 提示行必须全是 `#` 注释（漏了会被提交进正文）） |
+| 提交信息规范（`scripts/commit_msg.py`、`.gitmessage`、`.githooks/`） | `test_commit_msg_lint.py`（**CJK 显示宽度判别**：60 个 ASCII 字符 = 60 列放行、30 个汉字 = 60 列放行，而 40 个汉字是 40 字符却占 80 列必须拒绝——按字符数计的校验器（commitlint 的默认口径）会放行第三种，本仓库实测 25% 的正文行超宽即由此而来。另含 `!`↔`BREAKING CHANGE:` 成对、正文可选（无固定标签）、正文行宽 URL 豁免、Merge/Revert/fixup! 跳过、未入库本地引用黑名单、`.gitmessage` 提示行必须全是 `#` 注释（漏了会被提交进正文）） |
 | 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
 
 特殊前置：`test_ftp.py` 需本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写）；`test_config_snapshot.py`、`test_module_abi.py` 不经 Meson，直接用本机 `cc` 临时编译实际源码（前者另需 json-c），故不依赖 `build_gnu/`；
