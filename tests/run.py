@@ -166,7 +166,7 @@ SUITE_MAP = [
     # 模板 .gitmessage 与装配脚本同属这套（改任一都跑本套件）
     (("test_commit_msg_lint.py",),
      ("scripts/commit_msg.py", ".githooks/", ".gitmessage", "scripts/setup-hooks.sh"),
-     ("HEADER_MAX", "BREAKING CHANGE", "以实现"),
+     ("HEADER_MAX", "BREAKING CHANGE", "LOCAL_REFS"),
      "提交信息规范工具（lint + CHANGELOG）"),
 ]
 

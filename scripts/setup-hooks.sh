@@ -15,7 +15,7 @@ git config commit.template .gitmessage
 # 自检：钩子可执行、校验器真能跑（不真提交，只喂一条合规信息）
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-printf 'fix(fuse): 装配自检\n\n以实现：确认 .githooks/commit-msg 与校验器可用。\n' > "$tmp"
+printf 'fix(fuse): 装配自检\n\n确认 .githooks/commit-msg 与校验器可用。\n' > "$tmp"
 python3 scripts/commit_msg.py lint "$tmp"
 
 echo "已装配：core.hooksPath=$(git config --get core.hooksPath)  commit.template=$(git config --get commit.template)"

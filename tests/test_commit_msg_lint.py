@@ -28,8 +28,7 @@ SETUP = os.path.join(ROOT, "scripts", "setup-hooks.sh")
 TEMPLATE = os.path.join(ROOT, ".gitmessage")
 
 GOOD = ("fix(fuse): 修复列举可见性漂移\n\n"
-        "以实现：HIDE 条目不再出现在父目录的列举结果里。\n\n"
-        "凭什么对：probe 与 getattr 走同一套前缀剥离。\n")
+        "probe 与 getattr 现在走同一套前缀剥离。\n")
 
 # (用例名, 提交信息, 期望退出码, 期望出现在输出里的子串或 None)
 CASES = [
@@ -37,37 +36,36 @@ CASES = [
     ("合规 docs 免正文", "docs: 修正过期文档\n", 0, None),
     ("合规 chore 免正文", "chore: 忽略本机产物\n", 0, None),
     # ── 判别性：显示宽度 vs 字符数 ──
-    ("标题 40 汉字 = 80 列 必须拒绝", "fix(fuse): " + "中" * 40 + "\n\n以实现：x\n", 1, "显示列"),
-    ("标题 30 汉字 = 60 列 放行", "fix(fuse): " + "中" * 30 + "\n\n以实现：x\n", 0, None),
-    ("标题 60 ASCII = 60 列 放行", "fix(fuse): " + "a" * 60 + "\n\n以实现：x\n", 0, None),
+    ("标题 40 汉字 = 80 列 必须拒绝", "fix(fuse): " + "中" * 40 + "\n\n补充说明。\n", 1, "显示列"),
+    ("标题 30 汉字 = 60 列 放行", "fix(fuse): " + "中" * 30 + "\n\n补充说明。\n", 0, None),
+    ("标题 60 ASCII = 60 列 放行", "fix(fuse): " + "a" * 60 + "\n\n补充说明。\n", 0, None),
     # ── 标题 ──
-    ("type 不在词表", "nope: 改点东西\n\n以实现：x\n", 1, "不在词表"),
-    ("scope 不在词表", "fix(whatever): 改点东西\n\n以实现：x\n", 1, "不在词表"),
-    ("scope 写了两个", "fix(fuse,ftp): 改点东西\n\n以实现：x\n", 1, "只能有一个"),
-    ("标题含内部编号", "fix(B1): backing 仲裁门补 MONITOR 维度\n\n以实现：x\n", 1, "编号"),
-    ("标题句末句号", "fix(fuse): 改点东西。\n\n以实现：x\n", 1, "句号"),
-    ("标题含 + 挤了两件事", "fix(fuse): 甲 + 乙\n\n以实现：x\n", 1, "拆开"),
-    ("标题与正文之间没空行", "fix(fuse): 改点东西\n以实现：x\n", 1, "空一行"),
+    ("type 不在词表", "nope: 改点东西\n\n补充说明。\n", 1, "不在词表"),
+    ("scope 不在词表", "fix(whatever): 改点东西\n\n补充说明。\n", 1, "不在词表"),
+    ("scope 写了两个", "fix(fuse,ftp): 改点东西\n\n补充说明。\n", 1, "只能有一个"),
+    ("标题含内部编号", "fix(B1): backing 仲裁门补 MONITOR 维度\n\n补充说明。\n", 1, "编号"),
+    ("标题句末句号", "fix(fuse): 改点东西。\n\n补充说明。\n", 1, "句号"),
+    ("标题含 + 挤了两件事", "fix(fuse): 甲 + 乙\n\n补充说明。\n", 1, "拆开"),
+    ("标题与正文之间没空行", "fix(fuse): 改点东西\n补充说明。\n", 1, "空一行"),
     # ── 正文 ──
-    ("非 docs/chore 缺正文", "fix(fuse): 改点东西\n", 1, "必须写正文"),
-    ("正文缺以实现段", "fix(fuse): 改点东西\n\n凭什么对：x\n", 1, "以实现"),
-    ("正文行超宽", "fix(fuse): 改点东西\n\n以实现：" + "中" * 40 + "\n", 1, "正文第 3 行"),
-    ("正文含 URL 的行豁免", "fix(fuse): 改点东西\n\n以实现：见 https://example.com/" + "a" * 120 + "\n", 0, None),
-    ("正文缩进代码块豁免行宽", "fix(fuse): 改点东西\n\n以实现：x\n\n    " + "z" * 80 + "\n", 0, None),
-    ("空标签", "fix(fuse): 改点东西\n\n以实现：\n", 1, "空标签"),
-    ("标签后接列表 放行", "fix(fuse): 改点东西\n\n以实现：\n- 要点一\n\n凭什么对：x\n", 0, None),
+    ("非 docs/chore 正文可省", "fix(fuse): 改点东西\n", 0, None),
+    ("正文无固定标签 放行", "fix(fuse): 改点东西\n\n凭什么对：x\n", 0, None),
+    ("正文行超宽", "fix(fuse): 改点东西\n\n说明：" + "中" * 40 + "\n", 1, "正文第 3 行"),
+    ("正文含 URL 的行豁免", "fix(fuse): 改点东西\n\n见 https://example.com/" + "a" * 120 + "\n", 0, None),
+    ("正文缩进代码块豁免行宽", "fix(fuse): 改点东西\n\n补充说明。\n\n    " + "z" * 80 + "\n", 0, None),
+    ("正文后接列表 放行", "fix(fuse): 改点东西\n\n要点：\n- 要点一\n", 0, None),
     # ── 破坏性变更 ──
-    ("! 缺 BREAKING CHANGE", "refactor(fw)!: 规则引擎内建\n\n以实现：x\n", 1, "成对"),
-    ("BREAKING CHANGE 缺 !", "refactor(fw): 规则引擎内建\n\n以实现：x\n\nBREAKING CHANGE: ABI 3→4\n", 1, "成对"),
+    ("! 缺 BREAKING CHANGE", "refactor(fw)!: 规则引擎内建\n\n补充说明。\n", 1, "成对"),
+    ("BREAKING CHANGE 缺 !", "refactor(fw): 规则引擎内建\n\n补充说明。\n\nBREAKING CHANGE: ABI 3→4\n", 1, "成对"),
     ("! 与 footer 成对 放行",
-     "refactor(fw)!: 规则引擎内建\n\n以实现：x\n\nBREAKING CHANGE: ABI 3→4，旧模块须重编译。\n", 0, None),
+     "refactor(fw)!: 规则引擎内建\n\n补充说明。\n\nBREAKING CHANGE: ABI 3→4，旧模块须重编译。\n", 0, None),
     ("trailer 不在正文末尾",
-     "fix(fuse): 改点东西\n\n以实现：x\n\nBREAKING CHANGE: 有\n\nCo-Authored-By: a@b.c\n", 1, "trailer"),
+     "fix(fuse): 改点东西\n\n补充说明。\n\nBREAKING CHANGE: 有\n\nCo-Authored-By: a@b.c\n", 1, "trailer"),
     # ── 跳过与引用 ──
     ("Merge 跳过", "Merge branch master\n", 0, None),
     ("Revert 跳过", 'Revert "fix: 改点东西"\n\nThis reverts commit 0123456789abcdef.\n', 0, None),
     ("fixup! 跳过", "fixup! fix(fuse): 改点东西\n", 0, None),
-    ("引用未入库的本地材料", "fix(fuse): 改点东西\n\n以实现：见 review-findings-20261007.md。\n", 1, "本机材料"),
+    ("引用未入库的本地材料", "fix(fuse): 改点东西\n\n见 review-findings-20261007.md。\n", 1, "本机材料"),
 ]
 
 
@@ -143,9 +141,9 @@ def check_wrap(fails):
     """折行：按显示宽度、保结构、幂等，折完必须能过 lint。"""
     mod = load_module()
     cases = {
-        "中文长段落": "fix(fuse): 甲\n\n以实现：" + "中" * 90 + "\n",
-        "标签+列表混排": "fix(fuse): 甲\n\n以实现：\n- " + "乙" * 50 + "\n- 短的\n",
-        "footer 折行": "fix(fuse)!: 甲\n\n以实现：x\n\nBREAKING CHANGE: " + "丙" * 60 + "\n",
+        "中文长段落": "fix(fuse): 甲\n\n" + "中" * 90 + "\n",
+        "要点+列表混排": "fix(fuse): 甲\n\n要点：\n- " + "乙" * 50 + "\n- 短的\n",
+        "footer 折行": "fix(fuse)!: 甲\n\n补充说明。\n\nBREAKING CHANGE: " + "丙" * 60 + "\n",
     }
     for name, src in cases.items():
         path = write_tmp(src)
@@ -166,16 +164,16 @@ def check_wrap(fails):
             os.unlink(path)
 
     # 结构保持：列表项不被并进上一段；URL 不被拆；缩进代码块原样
-    path = write_tmp("fix(fuse): 甲\n\n以实现：\n- " + "乙" * 50 + "\n- 短的\n")
+    path = write_tmp("fix(fuse): 甲\n\n要点：\n- " + "乙" * 50 + "\n- 短的\n")
     try:
         run_tool("wrap", path)
         out = open(path, encoding="utf-8").read()
-        if "- 短的" not in out or "以实现：\n- " not in out:
+        if "- 短的" not in out or "要点：\n- " not in out:
             fails.append("wrap：列表项结构被破坏（被并成一段）")
     finally:
         os.unlink(path)
     url = "https://example.com/" + "a" * 100
-    path = write_tmp("fix(fuse): 甲\n\n以实现：见 " + url + "\n")
+    path = write_tmp("fix(fuse): 甲\n\n见 " + url + "\n")
     try:
         run_tool("wrap", path)
         if url not in open(path, encoding="utf-8").read():
@@ -183,7 +181,7 @@ def check_wrap(fails):
     finally:
         os.unlink(path)
     code = "    " + "z" * 80
-    path = write_tmp("fix(fuse): 甲\n\n以实现：x\n\n" + code + "\n")
+    path = write_tmp("fix(fuse): 甲\n\n补充说明。\n\n" + code + "\n")
     try:
         run_tool("wrap", path)
         if code not in open(path, encoding="utf-8").read():
@@ -192,7 +190,7 @@ def check_wrap(fails):
         os.unlink(path)
 
     # lint --fix 一步修到合规
-    path = write_tmp("fix(fuse): 甲\n\n以实现：" + "中" * 90 + "\n")
+    path = write_tmp("fix(fuse): 甲\n\n" + "中" * 90 + "\n")
     try:
         p = run_tool("lint", "--fix", path)
         if p.returncode != 0:
@@ -214,14 +212,14 @@ def check_scope_suggest(fails):
     if mod.suggest_scope(["no/such/path.xyz"]) is not None:
         fails.append("suggest_scope 对无法映射的路径应返回 None")
 
-    path = write_tmp("fix(nope): 改点东西\n\n以实现：x\n")
+    path = write_tmp("fix(nope): 改点东西\n\n补充说明。\n")
     try:
         p = run_tool("lint", "--paths", "src/modules/ftp/ftp_mux.c", path)
         if p.returncode != 1 or "建议 scope: ftp" not in p.stdout + p.stderr:
             fails.append("lint：scope 不在词表时未给出建议")
     finally:
         os.unlink(path)
-    path = write_tmp("fix: 改点东西\n\n以实现：x\n")
+    path = write_tmp("fix: 改点东西\n\n补充说明。\n")
     try:
         p = run_tool("lint", "--paths", "src/injector/ns_utils.c", path)
         if p.returncode != 0:
