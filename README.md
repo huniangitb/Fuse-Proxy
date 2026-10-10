@@ -50,6 +50,19 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 
 **规则能力在框架内，不在模块里**：自模块 ABI V4 起，规则决策（REDIRECT/SANDBOX/HIDE/ALLOW/RO）、uid→包名、MONITOR 开关全部由框架自持（`src/daemon/fw_rules.c`、`fw_pkg.c`、`fw_config.c`）——否则「模块缺席」会让规则与监控一起失效。模块只剩**后端存储提供者**一种形态（不实现 FUSE，只提供 `backend_*` 方法）。详见 [docs/modules.md](docs/modules.md)。
 
+## 开发
+
+```bash
+scripts/setup-hooks.sh     # 一次性：装配提交信息钩子与编辑器模板（写进 .git/config）
+```
+
+提交信息规范见 [CONTRIBUTING.md](CONTRIBUTING.md) §5——不合规的提交会被 `.githooks/commit-msg`
+当场拒收。CHANGELOG 由提交历史生成（与校验器共用同一份 conventional 解析）：
+
+```bash
+python3 scripts/commit_msg.py changelog --output CHANGELOG.md
+```
+
 ## 测试
 
 ```bash

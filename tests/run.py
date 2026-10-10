@@ -161,6 +161,13 @@ SUITE_MAP = [
      ("src/daemon/fuse_daemon.c",),
      ("passthrough_probe", "g_pt_probe_pending", "O_NOFOLLOW"),
      "透传探测文件 TOCTOU（B3：O_EXCL|O_NOFOLLOW + pending 原子 test-and-set）"),
+
+    # CONTRIBUTING.md §5 的可执行形式：.githooks/commit-msg 每次提交调用它，
+    # 模板 .gitmessage 与装配脚本同属这套（改任一都跑本套件）
+    (("test_commit_msg_lint.py",),
+     ("scripts/commit_msg.py", ".githooks/", ".gitmessage", "scripts/setup-hooks.sh"),
+     ("HEADER_MAX", "BREAKING CHANGE", "以实现"),
+     "提交信息规范工具（lint + CHANGELOG）"),
 ]
 
 
@@ -208,6 +215,7 @@ LAYERS = {
             "test_inject_method.py",
             "test_inject_tracked_race.py",
             "test_log_ctl_rules.py",
+            "test_commit_msg_lint.py",
         ),
     ),
     "L1": (

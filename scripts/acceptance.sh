@@ -303,6 +303,11 @@ SUM="$OUT/summary.txt"
     echo "               PROBE_VARIANT=old 指向旧源码，或直编旧副本 + --wrap 注入失败）"
     echo "  G8 层级诚实：本次覆盖到哪一层？L2 通过不等于 Android 运行时已验证；"
     echo "               SELinux/Bionic/vold/Zygisk/多用户须 L3-L4，未做就写未做。"
+    if [ "$(git config --get core.hooksPath 2>/dev/null)" != ".githooks" ] ||
+       [ "$(git config --get commit.template 2>/dev/null)" != ".gitmessage" ]; then
+        echo
+        echo "提示（不计门）：本 clone 未装配提交信息钩子/模板——跑 scripts/setup-hooks.sh"
+    fi
 } >"$SUM"
 
 n_fail=0; n_skip=0

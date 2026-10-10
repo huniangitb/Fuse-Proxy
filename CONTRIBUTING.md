@@ -101,17 +101,30 @@ PROBE_VARIANT=old                        # 透传探测
 
 ## 5. 提交规范
 
-**标题回答「做了什么更改」，正文回答「以实现什么 / 修复什么功能」。** 只有标题、没有
-正文的提交，读者只能靠 diff 猜意图——这是本仓库最容易复发的规范债。
+**标题回答「做了什么更改」，正文回答「以实现什么 / 修复什么功能」。** 本节是规则的权威
+出处，`scripts/commit_msg.py lint` 是它**唯一**的可执行形式——改规则要同时改两边，
+`tests/test_commit_msg_lint.py` 会拦住漂移。
+
+每个 clone 装配一次（写进 `.git/config`，不随 clone 传播）：
+
+```bash
+scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmessage
+```
+
+- `.githooks/commit-msg` 在每次提交时校验，不合规**当场拒收**并逐条给出原因
+  （`git commit --no-verify` 可绕过，评审可见，别默认用）。
+- `.gitmessage` 在编辑器里预填骨架。注意 `git commit -m` **不加载模板**——模板只是
+  效率优化，钩子才是约束。
 
 ### 5.1 标题
 
-`<type>(<scope>): <做了什么更改>`
+`<type>(<scope>)!: <做了什么更改>`
 
 - **type**：`feat` / `fix` / `docs` / `refactor` / `perf` / `test` / `build` / `chore`。
 - **scope 从下表选，不得自造**；同一个文件只允许一个 scope，无明确归属可省略。
-- 一句话说清改了什么，**目标 ≤ 50 显示列、硬上限 72**（中文按 2 列计；72 是 GitHub
-  的截断点），句末不加句号。
+- 一句话说清改了什么，**目标 ≤ 50、硬上限 72 显示列**（中文按 2 列计，约 36 个汉字），
+  句末不加句号。口径是**显示宽度**不是字符数：40 个汉字是 40 字符却占 80 列，终端
+  必然折行——按字符数计的校验器（如 commitlint 的默认口径）会把它放行。
 - **不把内部计划/评审编号（`B1`/`C9`/`A26`…）写进标题**——仓库外无人知道它指什么，
   需要追溯就写进正文。
 - 标题里出现 `+` / `；`，说明一个提交塞了多件事，**新提交**应按 §5.3 拆开。
@@ -142,8 +155,9 @@ PROBE_VARIANT=old                        # 透传探测
 2. **凭什么对**：关键取舍与边界。判别用例可以点名，但**测试前后计数、逐条断言清单
    放 `docs/testing.md` 或 PR 描述**。
 
-正文用真换行，**不要写字面 `\n`**（shell 里漏写 `$'…'` 就会这样，GitHub 上会渲染成
-一整行）。示例：
+正文每行 **≤ 72 显示列**（含 URL 的行豁免）——`git log` 缩进 4 列后仍不折行。正文用真
+换行，**不要写字面 `\n`**（shell 里漏写 `$'…'` 就会这样，GitHub 上会渲染成一整行）。
+示例：
 
     fix(fuse): readdir 的 probe 入参补上 <uid>/ 层
 
@@ -155,6 +169,31 @@ PROBE_VARIANT=old                        # 透传探测
 
 - 多个功能拆多个提交，每段**逐段可编译**，被依赖的修复排在前面。不要攒一个大提交。
 - 纯格式化 / 纯机械改动单独成提交，并把哈希加进 `.git-blame-ignore-revs`。
+
+### 5.4 校验清单
+
+`scripts/commit_msg.py lint` 逐条实现下表；任一「拒绝」项命中即退出码 1，提交被拒。
+
+| # | 规则 | 判据 |
+|---|---|---|
+| 1 | 标题 ≤ 72 显示列 | 目标 50，超出仅提示；> 72 拒绝 |
+| 2 | type / scope 取自词表 | scope 只能一个；`B1` 这类内部编号单独报错 |
+| 3 | 标题无句号、无 `+` / `；`、无内部编号 | 三者任一即拒 |
+| 4 | 标题与正文之间空一行 | 否则拒 |
+| 5 | 正文必填且含「以实现：」段 | `docs` / `chore` 免正文 |
+| 6 | 正文每行 ≤ 72 显示列；标签不得为空 | 含 URL 的行豁免 |
+| 7 | `!` 与 `BREAKING CHANGE:` 成对；trailer 在正文末尾且空一行 | 否则拒 |
+| 8 | 不得引用未入库的本地材料 | 黑名单：`.workbuddy-ai`、`review-findings-*`、`review-todo-*`、`.zcode` |
+| — | `Merge` / `Revert "` / `fixup!` / `squash!` | git 生成，整体跳过 |
+
+### 5.5 CHANGELOG（让规范有回报）
+
+CHANGELOG 由提交历史生成，复用同一份 conventional 解析，不必手工整理发布说明：
+
+```bash
+python3 scripts/commit_msg.py changelog                        # 最近 tag..HEAD → stdout
+python3 scripts/commit_msg.py changelog --output CHANGELOG.md  # 已存在则在首个标题后插入
+```
 
 ## 6. 设备操作（生产级隔离）
 
