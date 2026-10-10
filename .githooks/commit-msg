@@ -1,0 +1,7 @@
+#!/bin/sh
+# 提交信息规范校验（CONTRIBUTING.md §5）。git 传入 $1 = 存放提交信息的临时文件。
+# 装配：scripts/setup-hooks.sh（core.hooksPath=.githooks）。绕过的办法：
+#   git commit --no-verify（评审可见，别默认用）
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec python3 "$root/scripts/commit_msg.py" lint "$1"
