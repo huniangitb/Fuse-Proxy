@@ -24,7 +24,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 1. 先读对应文档：架构 `docs/architecture.md`、模块 `docs/modules.md`、配置语法 `docs/config.md`、测试 `docs/testing.md`。
 2. 按归属写代码：纯 libc 无全局依赖的公共工具进 `src/core/nsp_util.c`（禁止各文件私刻副本）；依赖项目全局（`g_real_root`、日志）的进 `src/core/common.c`；跨进程/跨模块常量进 `include/nsp_constants.h`、日志级别与宏进 `include/nsp_log.h`（两者均为唯一出处）；新跨文件函数必须带域前缀（见 `docs/architecture.md` §7）。
 3. 同步测试：改了行为就地补用例，跑下方映射表全绿。**新套件须同时登记进 `tests/run.py` 的 `SUITE_MAP` 与 `LAYERS`**，否则 `tests/test_docs_sync.py` 失败（清单见 `docs/testing.md` §9）。
-4. 提交前过验收门：`scripts/acceptance.sh`（构建 + 文档一致性 + 全量测试 + 报告）。仓库文档与提交信息均中文，Conventional Commits 前缀（`fix:`/`feat:`/`docs:`/`refactor:`/`perf:`）。
+4. 提交前过验收门：`scripts/acceptance.sh`（构建 + 文档一致性 + 全量测试 + 报告）。仓库文档与提交信息均中文，提交前缀与 scope 词表见 `CONTRIBUTING.md` §5（标题写「做了什么更改」，正文写「以实现/修复什么功能」）。
 
 ### 红线（破坏即回滚）
 
