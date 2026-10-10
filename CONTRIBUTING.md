@@ -122,6 +122,7 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 
 - **type**：`feat` / `fix` / `docs` / `refactor` / `perf` / `test` / `build` / `chore`。
 - **scope 从下表选，不得自造**；同一个文件只允许一个 scope，无明确归属可省略。
+  省略或写错时，校验器会按**本次改动的文件**给出建议（如 `src/modules/ftp/…` → `ftp`）。
 - 一句话说清改了什么，**目标 ≤ 50、硬上限 72 显示列**（中文按 2 列计，约 36 个汉字），
   句末不加句号。口径是**显示宽度**不是字符数：40 个汉字是 40 字符却占 80 列，终端
   必然折行——按字符数计的校验器（如 commitlint 的默认口径）会把它放行。
@@ -155,7 +156,8 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 2. **凭什么对**：关键取舍与边界。判别用例可以点名，但**测试前后计数、逐条断言清单
    放 `docs/testing.md` 或 PR 描述**。
 
-正文每行 **≤ 72 显示列**（含 URL 的行豁免）——`git log` 缩进 4 列后仍不折行。正文用真
+正文每行 **≤ 72 显示列**（含 URL 的行与 4 空格缩进的代码块豁免）——`git log` 缩进 4 列
+后仍不折行。正文用真
 换行，**不要写字面 `\n`**（shell 里漏写 `$'…'` 就会这样，GitHub 上会渲染成一整行）。
 示例：
 
@@ -181,7 +183,7 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 | 3 | 标题无句号、无 `+` / `；`、无内部编号 | 三者任一即拒 |
 | 4 | 标题与正文之间空一行 | 否则拒 |
 | 5 | 正文必填且含「以实现：」段 | `docs` / `chore` 免正文 |
-| 6 | 正文每行 ≤ 72 显示列；标签不得为空 | 含 URL 的行豁免 |
+| 6 | 正文每行 ≤ 72 显示列；标签不得为空 | 含 URL 的行与缩进代码块豁免 |
 | 7 | `!` 与 `BREAKING CHANGE:` 成对；trailer 在正文末尾且空一行 | 否则拒 |
 | 8 | 不得引用未入库的本地材料 | 黑名单：`.workbuddy-ai`、`review-findings-*`、`review-todo-*`、`.zcode` |
 | — | `Merge` / `Revert "` / `fixup!` / `squash!` | git 生成，整体跳过 |
@@ -194,6 +196,18 @@ CHANGELOG 由提交历史生成，复用同一份 conventional 解析，不必�
 python3 scripts/commit_msg.py changelog                        # 最近 tag..HEAD → stdout
 python3 scripts/commit_msg.py changelog --output CHANGELOG.md  # 已存在则在首个标题后插入
 ```
+
+### 5.6 正文超宽了怎么办
+
+钩子拒收时不必手工数格子，让工具折：
+
+```bash
+python3 scripts/commit_msg.py lint --fix .git/COMMIT_EDITMSG   # 先折行，再校验
+python3 scripts/commit_msg.py wrap .git/COMMIT_EDITMSG         # 只折行，不校验
+```
+
+`--fix` / `wrap` 只折**正文**（标题超宽是「该重写」而不是「该折行」），并且：列表项保持
+结构、URL 不拆断、4 空格缩进的代码块原样保留、结果**幂等**（再跑一次不会变）。
 
 ## 6. 设备操作（生产级隔离）
 

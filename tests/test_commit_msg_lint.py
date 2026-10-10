@@ -4,7 +4,7 @@
 为什么需要这一套：规则写在 CONTRIBUTING.md §5，可执行形式是
 scripts/commit_msg.py lint，由 .githooks/commit-msg 在每次提交时调用。
 两边漂移（改了规则没改校验器，或反过来）会让规范悄悄失效——本套件钉住
-各条规则的行为，以及三件工件的形态。
+各条规则的行为、正文折行（wrap / lint --fix）与 scope 建议，以及三件工件的形态。
 
 判别性（本仓库最重要的一条）：**长度按显示宽度计，不按字符数计**。
   * 60 个 ASCII 字符的标题 = 60 列   -> 放行
@@ -53,6 +53,7 @@ CASES = [
     ("正文缺以实现段", "fix(fuse): 改点东西\n\n凭什么对：x\n", 1, "以实现"),
     ("正文行超宽", "fix(fuse): 改点东西\n\n以实现：" + "中" * 40 + "\n", 1, "正文第 3 行"),
     ("正文含 URL 的行豁免", "fix(fuse): 改点东西\n\n以实现：见 https://example.com/" + "a" * 120 + "\n", 0, None),
+    ("正文缩进代码块豁免行宽", "fix(fuse): 改点东西\n\n以实现：x\n\n    " + "z" * 80 + "\n", 0, None),
     ("空标签", "fix(fuse): 改点东西\n\n以实现：\n", 1, "空标签"),
     ("标签后接列表 放行", "fix(fuse): 改点东西\n\n以实现：\n- 要点一\n\n凭什么对：x\n", 0, None),
     # ── 破坏性变更 ──
@@ -80,6 +81,17 @@ def lint(text):
         return p.returncode, p.stdout + p.stderr
     finally:
         os.unlink(path)
+
+
+def write_tmp(text):
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def run_tool(*args):
+    return subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True)
 
 
 def load_module():
@@ -127,13 +139,108 @@ def check_changelog(fails):
         fails.append("changelog 子命令端到端失败：rc=%d %s" % (p.returncode, p.stderr[:120]))
 
 
+def check_wrap(fails):
+    """折行：按显示宽度、保结构、幂等，折完必须能过 lint。"""
+    mod = load_module()
+    cases = {
+        "中文长段落": "fix(fuse): 甲\n\n以实现：" + "中" * 90 + "\n",
+        "标签+列表混排": "fix(fuse): 甲\n\n以实现：\n- " + "乙" * 50 + "\n- 短的\n",
+        "footer 折行": "fix(fuse)!: 甲\n\n以实现：x\n\nBREAKING CHANGE: " + "丙" * 60 + "\n",
+    }
+    for name, src in cases.items():
+        path = write_tmp(src)
+        try:
+            if run_tool("wrap", path).returncode != 0:
+                fails.append("wrap %s：退出码非 0" % name)
+            out = open(path, encoding="utf-8").read()
+            widest = max(mod.width(l) for l in out.splitlines())
+            if widest > 72:
+                fails.append("wrap %s：折行后仍有 %d 列" % (name, widest))
+            if run_tool("wrap", "--check", path).returncode != 0:
+                fails.append("wrap %s：不幂等（二次检查仍要改）" % name)
+            if run_tool("lint", path).returncode != 0:
+                fails.append("wrap %s：折行后仍不合规" % name)
+            if not out.startswith(src.split("\n")[0] + "\n\n"):
+                fails.append("wrap %s：标题或标题后的空行被改动" % name)
+        finally:
+            os.unlink(path)
+
+    # 结构保持：列表项不被并进上一段；URL 不被拆；缩进代码块原样
+    path = write_tmp("fix(fuse): 甲\n\n以实现：\n- " + "乙" * 50 + "\n- 短的\n")
+    try:
+        run_tool("wrap", path)
+        out = open(path, encoding="utf-8").read()
+        if "- 短的" not in out or "以实现：\n- " not in out:
+            fails.append("wrap：列表项结构被破坏（被并成一段）")
+    finally:
+        os.unlink(path)
+    url = "https://example.com/" + "a" * 100
+    path = write_tmp("fix(fuse): 甲\n\n以实现：见 " + url + "\n")
+    try:
+        run_tool("wrap", path)
+        if url not in open(path, encoding="utf-8").read():
+            fails.append("wrap：URL 被拆断")
+    finally:
+        os.unlink(path)
+    code = "    " + "z" * 80
+    path = write_tmp("fix(fuse): 甲\n\n以实现：x\n\n" + code + "\n")
+    try:
+        run_tool("wrap", path)
+        if code not in open(path, encoding="utf-8").read():
+            fails.append("wrap：缩进代码块被折行破坏")
+    finally:
+        os.unlink(path)
+
+    # lint --fix 一步修到合规
+    path = write_tmp("fix(fuse): 甲\n\n以实现：" + "中" * 90 + "\n")
+    try:
+        p = run_tool("lint", "--fix", path)
+        if p.returncode != 0:
+            fails.append("lint --fix：未把超宽正文修到合规｜" + (p.stdout + p.stderr)[:120])
+    finally:
+        os.unlink(path)
+
+
+def check_scope_suggest(fails):
+    """scope 建议：按改动路径给出候选，且只提示不判定。"""
+    mod = load_module()
+    for paths, want in ((["src/modules/ftp/ftp_mux.c", "tests/test_ftp.py"], "ftp"),
+                        (["src/injector/ns_utils.c", "src/injector/injector.c"], "injector"),
+                        (["scripts/commit_msg.py"], "scripts"),
+                        (["meson.build"], "build")):
+        got = mod.suggest_scope(paths)
+        if not got or got[0] != want:
+            fails.append("suggest_scope(%s) 期望 %s，实际 %s" % (paths, want, got))
+    if mod.suggest_scope(["no/such/path.xyz"]) is not None:
+        fails.append("suggest_scope 对无法映射的路径应返回 None")
+
+    path = write_tmp("fix(nope): 改点东西\n\n以实现：x\n")
+    try:
+        p = run_tool("lint", "--paths", "src/modules/ftp/ftp_mux.c", path)
+        if p.returncode != 1 or "建议 scope: ftp" not in p.stdout + p.stderr:
+            fails.append("lint：scope 不在词表时未给出建议")
+    finally:
+        os.unlink(path)
+    path = write_tmp("fix: 改点东西\n\n以实现：x\n")
+    try:
+        p = run_tool("lint", "--paths", "src/injector/ns_utils.c", path)
+        if p.returncode != 0:
+            fails.append("lint：scope 省略不应判失败")
+        if "建议 scope: injector" not in p.stderr:
+            fails.append("lint：scope 省略时未给出建议")
+    finally:
+        os.unlink(path)
+
+
 def main():
     print("=" * 64)
-    print("提交信息规范工具（lint + changelog）")
+    print("提交信息规范工具（lint + wrap + changelog）")
     print("=" * 64)
     fails = []
     check_artifacts(fails)
     check_changelog(fails)
+    check_wrap(fails)
+    check_scope_suggest(fails)
 
     for name, text, want_rc, want_sub in CASES:
         rc, out = lint(text)
@@ -149,7 +256,7 @@ def main():
         for f in fails:
             print("  · " + f)
         return 1
-    print("✅ 全部通过：%d 个提交信息用例 + 工件形态 + changelog 契约" % total)
+    print("✅ 全部通过：%d 个提交信息用例 + 工件形态 + 折行契约 + scope 建议 + changelog 契约" % total)
     return 0
 
 
