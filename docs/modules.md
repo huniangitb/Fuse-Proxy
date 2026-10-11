@@ -65,11 +65,46 @@ conf.key_file.order = 7          # 前端显示顺序
 
 由此得到两条能力：
 
-- **新增配置项不必改 C**：控制面按 schema 校验 `FTP_ADD/SET`（键白名单、长度上限、
-  枚举都来自声明），不必重新编译发布。声明文件撤掉即回退编译期默认表。
-- **前端自动渲染**：`MODULE_SCHEMA` 回传 `{file, module, fields:[{key,type,max,
-  sensitive,default,enum,order,desc,desc_map}]}`，前端据此渲染数字框 / 开关 /
-  密码框（带脱敏）/ 下拉，并自动带上 `maxlength`——**不必另维护中文标签与顺序**。
+- **新增配置项不必改 C**：控制面按 schema 校验 `MODULE_CONF_ADD/SET`（键白名单、
+  长度上限、类型、枚举都来自声明），不必重新编译发布。声明文件撤掉即回退编译期
+  默认表；**未声明任何字段的模块不放行写入**（fail-closed）。
+- **前端自动渲染**：`MODULE_CONF_SCHEMA` 回传 `{file, module,
+  fields:[{key,type,max,sensitive,default,enum,order,desc,desc_map}]}`，前端据此
+  渲染数字框 / 开关 / 密码框（带脱敏）/ 下拉，并自动带上 `maxlength`
+  ——**不必另维护中文标签与顺序**。
+
+### 2.3 控制面命令（通用 + FTP 别名）
+
+`MODULE_CONF_*` 按 `module` 参数寻址**任意模块**的配置；`FTP_*` 是向后兼容别名
+（等价 `module=ftp_module`），既有前端/脚本零改动继续可用。
+
+| 通用命令 | 别名 | 参数 | 说明 |
+|---|---|---|---|
+| `MODULE_CONF_SCHEMA` | `MODULE_SCHEMA` | `module`、`lang` | 取该模块的字段契约（前端渲染用） |
+| `MODULE_CONF_LIST` | `FTP_LIST` | `module` | 列出配置里的条目（段名即条目名，跳过 `[GLOBAL]`） |
+| `MODULE_CONF_GET` | `FTP_GET` | `module`、`name` | 读单个条目 |
+| `MODULE_CONF_ADD` | `FTP_ADD` | `module`、`name`、`fields` | 新建/更新条目（幂等：同值 → `duplicate:true` 免写） |
+| `MODULE_CONF_SET` | `FTP_SET` | `module`、`name`、`key`、`value` | 改单字段（空值 = 删键回缺省） |
+| `MODULE_CONF_REMOVE` | `FTP_REMOVE` | `module`、`name` | 删条目 |
+
+约束：
+
+- **`module` 必填校验**：只接受 `[A-Za-z0-9_-]`、长度 <64。模块名直接参与
+  `<CONFIG_DIR>/modules/<名>/<名>.conf` 路径拼接，故 fail-closed 拒绝 `..` 与路径
+  分隔符，防止越出模块目录。缺省为 `ftp_module`（使通用命令与别名行为一致）。
+- **字段一律经 schema 校验**，与 `MODULE_CONF_SET` 共用同一校验函数：未知键、
+  超长、类型不符、枚举越界即整体拒绝，不部分写入。
+- **敏感字段**（`sensitive`）在应答里**键本身不出现**，只给 `has_<键名>` 布尔；
+  写入时按 `password` 归一并清 `pass` 别名。
+
+前端适配：
+
+- 用 `MODULE_CONF_SCHEMA` 拿字段契约（不要硬编码字段名/上限/顺序），按 `order`
+  排序渲染，`type` 决定控件（`int`→数字框并带 `max`、`enum`→下拉、`sensitive`→
+  密码框且只提交不读回、`bool`→开关），`maxlength` 取 `max`，标签取 `desc`
+  （可带 `lang`）。`desc_map` 给全语言切换。
+- 写操作改用 `MODULE_CONF_ADD`（`fields` 对象）与 `MODULE_CONF_SET`；`FTP_*`
+  继续可用，建议新前端直接用通用命令，未来新模块无需改前端。
 
 三条边界（不得越界）：
 
