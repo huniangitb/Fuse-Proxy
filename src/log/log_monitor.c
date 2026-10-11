@@ -1261,6 +1261,15 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         strncmp(line, "LOG_LOGCAT:", 11) == 0) {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, ctx->fd, nullptr);
         AsyncCtx* actx = calloc(1, sizeof(AsyncCtx));
+        if (!actx) {
+            /* OOM：与 LOG_BATCH 分支同一处理——无法移交 async 线程，丢弃该
+               连接（至少不崩溃、不泄漏 fd）。此前缺这一步，OOM 即 NULL
+               解引用崩掉整个日志服务 */
+            LOG_ERR("AsyncCtx 分配失败，丢弃连接 fd=%d", ctx->fd);
+            close(ctx->fd);
+            ctx->fd = -1;
+            return 1;
+        }
         actx->fd = ctx->fd;
         /* async 线程以阻塞方式 read：accept 时该 fd 被设为非阻塞，若保持非阻塞，
            无数据时 read 返回 EAGAIN 会被误判为对端断开而退出，进而拆除连接、反向触发生产者忙等 */
@@ -1656,13 +1665,20 @@ int main(int argc, char* argv[]) {
                 if (client >= 0) {
                     set_nonblock(client);
                     ClientCtx* ctx = calloc(1, sizeof(ClientCtx));
-                    ctx->fd = client;
-                    clock_gettime(CLOCK_MONOTONIC, &ctx->start_time);
-                    ctx->is_streaming = false;
-                    add_active_client(ctx);
-                    ev.events = EPOLLIN | EPOLLET;
-                    ev.data.ptr = ctx;
-                    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, client, &ev);
+                    if (!ctx) {
+                        /* OOM：拒绝该连接，而不是解引用 NULL 崩掉整个日志服务。
+                           本循环还要处理同批次其它事件，故用 else 分支而非 continue */
+                        LOG_ERR("ClientCtx 分配失败，拒绝连接 fd=%d", client);
+                        close(client);
+                    } else {
+                        ctx->fd = client;
+                        clock_gettime(CLOCK_MONOTONIC, &ctx->start_time);
+                        ctx->is_streaming = false;
+                        add_active_client(ctx);
+                        ev.events = EPOLLIN | EPOLLET;
+                        ev.data.ptr = ctx;
+                        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, client, &ev);
+                    }
                 }
             } else if (inotify_fd >= 0 && fd == inotify_fd) {
                 char inotify_buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
