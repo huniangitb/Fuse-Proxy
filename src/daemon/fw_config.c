@@ -533,15 +533,6 @@ void fw_config_shutdown(void) {
     fw_pkg_shutdown();
 }
 
-const NspCfgRec* fw_config_recs(int* count_out) {
-    if (count_out) *count_out = g_rec_count;
-    return g_recs;
-}
-
-uint64_t fw_config_generation(void) {
-    return atomic_load_explicit(&g_gen, memory_order_acquire);
-}
-
 const NspModuleConfig* fw_config_view_acquire(const char* module_name) {
     if (!module_name) return nullptr;
     pthread_mutex_lock(&g_lock);

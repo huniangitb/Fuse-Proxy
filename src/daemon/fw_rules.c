@@ -993,7 +993,7 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
                                         : (is_target ? NSP_VK_TARGET : NSP_VK_NONE);
         /* FTP 规则（`FTP <虚拟前缀> <段名>`）：应用 > 类别 > GLOBAL
        （与 REDIRECT 作用域语义一致）；命中结果由 br_trie_resolve 的 trie
-       下降一次取得（替代 config_ftp_match 每请求 O(N) 线性扫描）；
+       下降一次取得（替代早期的每请求 O(N) 线性扫描）；
        命中后由框架分派给 FTP 后端模块 */
         out->is_ftp = tm.ftp_app[0] || tm.ftp_cat[0] || tm.ftp_global[0];
         if (config_read_end(cfg_gen)) {

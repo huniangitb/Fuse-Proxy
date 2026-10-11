@@ -7,7 +7,6 @@
 #include "nsp_util.h"
 #include "path_vars.h"
 #include "sys_pkg.h"
-#include "inject_target.h"
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <dirent.h>
@@ -711,7 +710,7 @@ static void parse_ftp_rule(AppConfig* cur, char* p_ptr, int line_num, const char
     snprintf(fr->virtual_prefix, sizeof fr->virtual_prefix, "%s", virtual_prefix);
     snprintf(fr->backend_name, sizeof fr->backend_name, "%s", v2);
     /* 同时入 trie：resolve 热路径经 trie 下降一次取得 FTP 命中
-       （替代 config_ftp_match 每请求 O(N) 线性扫描）；
+       （替代早期的每请求 O(N) 线性扫描）；
        FTP 前缀为静态字面段（无通配/变量），与线性匹配语义一致 */
     if (cur->trie_root) trie_insert_ftp(cur->trie_root, virtual_prefix, v2);
 }
@@ -750,26 +749,6 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         LOG_WRN("不支持的规则 \"%s\" (行 %d, 文件 %s)", tok, line_num, file_path);
 }
 
-/* FTP 规则最长前缀优先匹配：sub_path 命中 FTP 规则时输出后端段名 */
-bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_out, size_t sz) {
-    if (!cfg || !sub_path || cfg->ftp_count <= 0) return false;
-    FtpRule* best = NULL;
-    size_t best_len = 0;
-    for (int i = 0; i < cfg->ftp_count; i++) {
-        const char* p = cfg->ftp_rules[i].virtual_prefix;
-        size_t plen = strlen(p);
-        if (plen > best_len && strncmp(p, sub_path, plen) == 0 &&
-            (sub_path[plen] == '\0' || sub_path[plen] == '/')) {
-            best = &cfg->ftp_rules[i];
-            best_len = plen;
-        }
-    }
-    if (best && backend_out && sz) {
-        strncpy(backend_out, best->backend_name, sz - 1);
-        backend_out[sz - 1] = '\0';
-    }
-    return best != NULL;
-}
 /* 类别段（[USER_APPS[:uid]] / [SYSTEM_APPS]）段头归一：
  * - USER_APPS：uid 原样（无 :uid 则 -1，跨用户 fallback）；
  * - SYSTEM_APPS：对所有 uid 系统应用生效，user_id 恒 -1，带 :uid 归一并告警；

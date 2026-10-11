@@ -226,10 +226,3 @@ void ftp_conf_free(FtpServerList* list) {
     list->cap = 0;
 }
 
-FtpServerCfg* ftp_conf_find(FtpServerList* list, const char* name) {
-    if (!list || !name) return NULL;
-    for (int i = 0; i < list->count; i++) {
-        if (strcmp(list->servers[i].name, name) == 0) return &list->servers[i];
-    }
-    return NULL;
-}
