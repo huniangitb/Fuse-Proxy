@@ -53,27 +53,36 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 ```ini
 [conf]
 conf.host.type = string          # string / int / bool / path
-conf.host.max = 255              # 字节上限（缺省不限制）
+conf.host.maxlen = 255           # 字节上限（string/path 用；缺省不限制）
+conf.host.required = true        # 新建条目时必填（控制面强制，不只是前端提示）
 conf.host.desc = 服务器地址       # 中文标签（默认语言）
 conf.host.desc.en = Host         # 指定语言标签
 conf.port.type = int
-conf.port.range = 1:65535
-conf.port.default = 21           # 缺省值（LIST/GET 回填生效值）
+conf.port.range = 1:65535        # int 值域闭区间（min:max）
+conf.port.default = 21           # 缺省值（LIST/GET 回填生效值并记入 derived）
+conf.port.default.proto.sftp = 22  # 条件缺省：依赖字段 proto=sftp 时缺省 22
 conf.proto.enum = ftp|sftp       # 可选值（竖线分隔），越界即拒
-conf.host.required = true        # 新建条目时必填
 conf.password.sensitive = true   # 敏感：只写不读，仅回 has_password
 conf.key_file.order = 7          # 前端显示顺序
 ```
 
+- `default.<依赖字段>.<取值>` 声明**条件缺省**（缺省随另一字段取值而变），命中时覆盖
+  `default`。依赖字段自身也可缺省（取其 `default`），且与两者在文件里的书写顺序无关。
+  它必须与模块自己的推导一致——这是同一发布物内的两处声明（例：`ftp_module` 的
+  `port` 在 `proto=sftp` 时缺省 22，与 `ftp_conf.c` 的 `ftp_conf_parse_end` 同口径）。
+- `max` 是旧写法（按已声明的 `type` 解释：`string/path` = 字节上限、`int` = 值域上界），
+  新声明请用 `maxlen` / `range`——两者不混用，前端按 `type` 取对应键。
+
 由此得到两条能力：
 
 - **新增配置项不必改 C**：控制面按 schema 校验 `MODULE_CONF_ADD/SET`（键白名单、
-  长度上限、类型、枚举都来自声明），不必重新编译发布。声明文件撤掉即回退编译期
+  长度上限、类型、值域、枚举都来自声明），不必重新编译发布。声明文件撤掉即回退编译期
   默认表；**未声明任何字段的模块不放行写入**（fail-closed）。
 - **前端自动渲染**：`MODULE_CONF_SCHEMA` 回传 `{file, module,
-  fields:[{key,type,max,sensitive,default,enum,order,desc,desc_map}]}`，前端据此
-  渲染数字框 / 开关 / 密码框（带脱敏）/ 下拉，并自动带上 `maxlength`
-  ——**不必另维护中文标签与顺序**。
+  fields:[{key, type, maxlen|min+max, required, sensitive, default, default_if?,
+  enum?, order, desc, desc_map}]}`，前端据此渲染数字框 / 开关 / 密码框（带脱敏）/
+  下拉，并自动带上 `maxlength`——**不必另维护中文标签与顺序**。`default` 按 `type`
+  给 JSON 型别（`int`→数字、`bool`→布尔、其余→字符串），与 LIST/GET 里的实际值同型。
 
 ### 2.3 控制面命令（通用 + FTP 别名）
 
@@ -82,11 +91,11 @@ conf.key_file.order = 7          # 前端显示顺序
 
 | 通用命令 | 别名 | 参数 | 说明 |
 |---|---|---|---|
-| `MODULE_CONF_SCHEMA` | `MODULE_SCHEMA` | `module`、`lang` | 取该模块的字段契约（前端渲染用） |
-| `MODULE_CONF_LIST` | `FTP_LIST` | `module` | 列出配置里的条目（段名即条目名，跳过 `[GLOBAL]`） |
-| `MODULE_CONF_GET` | `FTP_GET` | `module`、`name` | 读单个条目 |
-| `MODULE_CONF_ADD` | `FTP_ADD` | `module`、`name`、`fields` | 新建/更新条目（幂等：同值 → `duplicate:true` 免写） |
-| `MODULE_CONF_SET` | `FTP_SET` | `module`、`name`、`key`、`value` | 改单字段（空值 = 删键回缺省） |
+| `MODULE_CONF_SCHEMA` | `MODULE_SCHEMA` | `module`、`lang` | 取该模块的字段契约（前端渲染用，含 `default_if` 条件缺省） |
+| `MODULE_CONF_LIST` | `FTP_LIST` | `module` | 列出配置里的条目（段名即条目名，跳过 `[GLOBAL]`；每条含 `derived`） |
+| `MODULE_CONF_GET` | `FTP_GET` | `module`、`name` | 读单个条目（含 `derived`） |
+| `MODULE_CONF_ADD` | `FTP_ADD` | `module`、`name`、`fields` | 新建/更新条目（空值 = 不写该键；新建须给齐 `required`；幂等：同值 → `duplicate:true` 免写） |
+| `MODULE_CONF_SET` | `FTP_SET` | `module`、`name`、`key`、`value` | 改单字段（空值/纯空白 = 删键回缺省，`int` 同样可删） |
 | `MODULE_CONF_REMOVE` | `FTP_REMOVE` | `module`、`name` | 删条目 |
 
 约束：
@@ -95,18 +104,38 @@ conf.key_file.order = 7          # 前端显示顺序
   `<CONFIG_DIR>/modules/<名>/<名>.conf` 路径拼接，故 fail-closed 拒绝 `..` 与路径
   分隔符，防止越出模块目录。缺省为 `ftp_module`（使通用命令与别名行为一致）。
 - **字段一律经 schema 校验**，与 `MODULE_CONF_SET` 共用同一校验函数：未知键、
-  超长、类型不符、枚举越界即整体拒绝，不部分写入。
+  超长、类型不符、值域越界、枚举越界即整体拒绝，不部分写入。**`int` 字段写规范十进制**
+  （`"007"` → `7`），ADD 与 SET 同口径——不再按字段名特判 `port`。
+- **空值语义（ADD 与 SET 不同，别记反）**：
+  - `MODULE_CONF_SET` 传空值（含纯空白）= **删键回缺省**。该分支在值校验**之前**，
+    故 `int` 字段同样删得掉（否则会被判「须为整数」而永远删不掉，缺省也就永远回不去）。
+  - `MODULE_CONF_ADD` 传空值 = **不写该键**（走模块缺省），不落 `key = ` 空行——模块
+    读侧对空值多判非法而**整段作废**。要清掉已有的键请用 SET，不要用 ADD 传空。
+- **`required` 由控制面强制**：新建条目缺 `required` 字段即拒。模块侧对缺必填字段的段
+  整段作废，落一个「看不见的坏段」不如当场拒绝。
+- **条目回读形状**：`{name, <各字段生效值>, has_<敏感字段>, derived:[…]}`。`derived`
+  列出**文件里没有、值来自 schema 缺省**的键（含条件缺省），前端据此区分「已显式配置」
+  与「缺省生效」。字段有键则原样回读（含空值/越界值——那是文件的真实内容，前端凭
+  `min`/`max` 自行标记，控制面不替模块「修正」值）。
 - **敏感字段**（`sensitive`）在应答里**键本身不出现**，只给 `has_<键名>` 布尔；
   写入时按 `password` 归一并清 `pass` 别名。
+- **散字段形态仍兼容但已通用化**：`{"cmd":"MODULE_CONF_ADD","name":N,"host":…,"port":…}`
+  按 schema **逐字段拾取**（不再硬编码 5 个字段名），声明了的新字段（`proto`/`key_file`
+  …）照样能写。请求信封自带的键（`cmd`/`module`/`name`/`lang`/`key`/`value`/`fields`）
+  不参与拾取——模块若真有同名字段，用 `fields` 对象给值。
 
 前端适配：
 
 - 用 `MODULE_CONF_SCHEMA` 拿字段契约（不要硬编码字段名/上限/顺序），按 `order`
-  排序渲染，`type` 决定控件（`int`→数字框并带 `max`、`enum`→下拉、`sensitive`→
-  密码框且只提交不读回、`bool`→开关），`maxlength` 取 `max`，标签取 `desc`
-  （可带 `lang`）。`desc_map` 给全语言切换。
+  排序渲染，`type` 决定控件（`int`→数字框并带 `min`/`max`、`enum`→下拉、`sensitive`→
+  密码框且只提交不读回、`bool`→开关），`maxlength` 取 `maxlen`，标签取 `desc`
+  （可带 `lang`）。`desc_map` 给全语言切换，`default_if` 给条件缺省的 placeholder。
 - 写操作改用 `MODULE_CONF_ADD`（`fields` 对象）与 `MODULE_CONF_SET`；`FTP_*`
   继续可用，建议新前端直接用通用命令，未来新模块无需改前端。
+- **整体回写必须按 `derived` 过滤**：只提交不在 `derived` 里的键（或只提交用户改动过的
+  字段）。把缺省值一并写回会把「缺省生效」物化成显式键——例如 `proto=sftp` 的段被写上
+  `port = 22`，此后再改 `proto=ftp` 仍连 22 端口。这是「读回再整体回写」写坏 SFTP
+  配置的根因。
 
 三条边界（不得越界）：
 
