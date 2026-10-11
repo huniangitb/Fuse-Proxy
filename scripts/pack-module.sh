@@ -6,7 +6,8 @@
 #   1. 从 Android 交叉构建目录同步最新二进制到模块骨架目录
 #   2. 同步模块 .rules 规则类型注册文件与 conf 配置
 #   3. 设置可执行权限（0755）
-#   4. 自动写入版本号到 module.prop（默认 2.0，-v 可覆盖）
+#   4. 自动写入版本号到 module.prop（非发布模式一律写当前仓库提交哈希；
+#      --release 发布模式用 -v 指定的版本号，默认 2.0）
 #   5. 打包为模块 zip（保留可执行权限位，无系统 zip 依赖）
 #   6. 打包后自动验证（文件数/关键文件/权限位）
 #
@@ -20,7 +21,8 @@
 #   -r, --rules-dir <dir>    模块 .rules 注册文件源目录（默认 $REPO/src/modules）
 #   -c, --conf-dir <dir>     conf 配置源目录（默认 $REPO/conf）
 #   -o, --out <file>         输出 zip 路径（默认 /home/bdy/ftp/upload/Namespace-Proxy-<git校验码>.zip）
-#   -v, --version <str>      版本号（默认 2.0；打包时自动写入 module.prop）
+#   -v, --version <str>      版本号（仅发布模式生效，默认 2.0；非发布模式
+#                            version 一律写当前仓库提交哈希，-v 被忽略）
 #   -s, --symbols-dir <dir>  unstripped 符号构建目录（默认 $REPO/build_android_sym；
 #                            存在则额外产出 <输出名>-symbols.zip，供崩溃 addr2line 归因）
 #   --skip-symbols           跳过符号包（即使符号目录存在也不打包）
@@ -45,7 +47,8 @@ BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build_android}"
 RULES_DIR="${RULES_DIR:-$REPO_DIR/src/modules}"
 CONF_DIR_SRC="${CONF_DIR_SRC:-$REPO_DIR/conf}"
 OUT_ZIP="${OUT_ZIP:-}"               # 输出 zip 路径（未指定时自动生成）
-MODULE_VERSION="${MODULE_VERSION:-2.0}"  # 模块版本号：自动写入 module.prop
+[[ -n "${MODULE_VERSION:-}" ]] && MODULE_VERSION_SET=1  # 环境变量显式给了 MODULE_VERSION 也视为显式指定
+MODULE_VERSION="${MODULE_VERSION:-2.0}"  # 模块版本号：发布模式写入 module.prop；非发布模式强制用提交哈希
 RELEASE_MODE="${RELEASE_MODE:-0}"    # 发布模式（--release）：输出名用版本号；默认用 git 提交校验码
 SYMBOLS_DIR="${SYMBOLS_DIR:-$REPO_DIR/build_android_sym}"  # unstripped 符号构建目录
 SKIP_SYMBOLS="${SKIP_SYMBOLS:-0}"    # --skip-symbols 置 1 跳过符号包
@@ -62,7 +65,7 @@ while [[ $# -gt 0 ]]; do
         -r|--rules-dir)  RULES_DIR="$2";  shift 2 ;;
         -c|--conf-dir)   CONF_DIR_SRC="$2"; shift 2 ;;
         -o|--out)        OUT_ZIP="$2";    shift 2 ;;
-        -v|--version)    MODULE_VERSION="$2"; shift 2 ;;
+        -v|--version)    MODULE_VERSION="$2"; MODULE_VERSION_SET=1; shift 2 ;;
         -s|--symbols-dir) SYMBOLS_DIR="$2";   shift 2 ;;
         --skip-symbols)  SKIP_SYMBOLS=1;      shift ;;
         --release)       RELEASE_MODE=1; shift ;;
@@ -71,6 +74,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 非发布模式：module.prop 的 version 一律写当前仓库提交哈希（-v 被忽略）
+if [[ "$RELEASE_MODE" != "1" ]]; then
+    GIT_SHA="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    [[ -n "${MODULE_VERSION_SET:-}" && "$MODULE_VERSION" != "$GIT_SHA" ]] && \
+        echo "警告: 非发布模式下 -v/$MODULE_VERSION 被忽略，version 使用提交哈希" >&2
+    MODULE_VERSION="$GIT_SHA"
+fi
+
 # 输出名：显式 -o 优先；未指定时——
 #   发布模式（--release）：Namespace-Proxy-<版本号>.zip
 #   默认（非发布）：Namespace-Proxy-<git 提交校验码>.zip（git rev-parse --short HEAD）
@@ -78,8 +89,7 @@ if [[ -z "$OUT_ZIP" ]]; then
     if [[ "$RELEASE_MODE" == "1" ]]; then
         OUT_ZIP="/home/bdy/ftp/upload/Namespace-Proxy-$MODULE_VERSION.zip"
     else
-        GIT_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-        OUT_ZIP="/home/bdy/ftp/upload/Namespace-Proxy-$GIT_SHA.zip"
+        OUT_ZIP="/home/bdy/ftp/upload/Namespace-Proxy-$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown).zip"
     fi
 fi
 
