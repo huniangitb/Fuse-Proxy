@@ -23,6 +23,10 @@
   6. 退出码契约：docs/testing.md 写出的 77/78/127 与 run.py 的常量一致。
   7. 已删标识符不得以「现行机制」的口吻出现在文档里（canary / NSP_CAP_* /
      module_dispatch_resolve 等 V3/V4 删除物）——这是审计里占比最大的一类错误。
+  8. 受检文档齐全：DOCS 列出的每份文档都必须存在。
+  9. 源码树覆盖：每个 src/**/*.c 与 include/*.h 都必须被某条 SUITE_MAP 路径谓词
+     命中（或登记进 SOURCE_COVER_EXEMPT 并写明理由）。否则改它只会跑恒跑基线，
+     对应套件不会被选中——那是一片没有任何断言的绿色。
 
 退出码遵循 tests/run.py 约定：0 通过、1 失败。本套件无环境依赖，不会 gap。
 """
@@ -157,8 +161,11 @@ def load_runner():
 # ── 1. 套件台账闭合 ────────────────────────────────────────────────────────
 def check_suite_ledger(run):
     global checked
+    # tests/ 下的每个 .py 都是套件，唯独两个例外：run.py 是统一入口本身；
+    # `_*.py` 预留为共享助手模块（见结构评审：抽 tests/_harness.py 收口样板）。
+    # 此前只 glob `test_*.py`，`stress_fuse.py` 因此完全逃过台账检查。
     disk = {f for f in os.listdir(TESTS)
-            if f.startswith("test_") and f.endswith(".py")}
+            if f.endswith(".py") and f != "run.py" and not f.startswith("_")}
     mapped = set(run.all_suites())
     on_demand = set(run.ON_DEMAND)
 
@@ -362,6 +369,52 @@ def check_docs_exist():
     checked += 1
 
 
+# ── 9. 源码树覆盖：改任何源文件都必须能选中一个有目标的套件 ────────────────
+# run.py 按「路径谓词 or 符号谓词」选套件；两者都不命中的文件改了就只跑恒跑
+# 基线——那是一片没有任何断言的绿色。实测（2026-10-11）13 个 src/**/*.c 与
+# 24 个 include/*.h 处于这种状态，其中 include/nsp_module.h（模块 ABI 唯一入口）
+# 改动不跑 test_module_abi.py、src/core/path_trie.c（规则匹配核心）改动不跑
+# test_rules.py。本组把「源码 → 套件」的台账也闭合掉。
+#
+# 豁免表：必须写明理由，且理由只能是「由恒跑基线套件覆盖」这类**可核对的**事实，
+# 不接受「暂时没写」——那正是本检查要拦的东西。
+SOURCE_COVER_EXEMPT = {
+    "src/daemon/fuse_thread_naming.c":
+        "仅截持 pthread_create 改线程名（无行为断言可写）；恒跑基线 "
+        "test_functional.py 每次起 daemon 都在验证该截持不破坏建线程",
+}
+
+
+def check_source_coverage(run):
+    global checked
+    pats = [p for _suites, pp, _syms, _desc in run.SUITE_MAP for p in pp]
+    # 覆盖对象：全部 src/**/*.c（行为所在）与 include/*.h（跨文件契约所在）。
+    # 不含 src/**/*.h：那些是子系统私有头，与其 .c 同生共死；逐条登记只会
+    # 随拆分 TU 增长成噪声，而真正要堵的是「改了核心源码却只跑基线」。
+    targets = []
+    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "src")):
+        for f in files:
+            if f.endswith(".c"):
+                targets.append(os.path.relpath(os.path.join(dirpath, f), ROOT))
+    targets += ["include/" + f for f in os.listdir(os.path.join(ROOT, "include"))
+                if f.endswith(".h")]
+
+    for rel in sorted(targets):
+        if rel in SOURCE_COVER_EXEMPT:
+            continue
+        if any(p in rel for p in pats):
+            continue
+        fail(f"[覆盖] {rel} 不在任何 SUITE_MAP 路径谓词里：改动它只会跑恒跑基线，"
+             f"对应套件不会被选中。加进合适的条目，或登记进 SOURCE_COVER_EXEMPT"
+             f" 并写明理由")
+    for rel, why in SOURCE_COVER_EXEMPT.items():
+        if not os.path.exists(os.path.join(ROOT, rel)):
+            fail(f"[覆盖] SOURCE_COVER_EXEMPT 里的 {rel} 已不存在（豁免过期，请删）")
+        elif not why.strip():
+            fail(f"[覆盖] SOURCE_COVER_EXEMPT 的 {rel} 缺理由")
+    checked += 1
+
+
 def main():
     print("═" * 64)
     print("文档 / 测试台账一致性（L0 契约，无环境依赖）")
@@ -376,6 +429,7 @@ def main():
     check_doc_paths()
     check_exit_codes(run)
     check_removed_idents()
+    check_source_coverage(run)
 
     print(f"\n已跑检查组：{checked}")
     print(f"套件台账：SUITE_MAP {len(mapped)} 个 + ON_DEMAND {len(run.ON_DEMAND)} 个")

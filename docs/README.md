@@ -52,13 +52,15 @@
 
 `tests/test_docs_sync.py`（L0 层，恒跑）校验这些可证伪的点：
 
-1. 套件台账闭合：`tests/test_*.py` ⊆ `SUITE_MAP` ∪ `ON_DEMAND`，且登记的文件存在
+1. 套件台账闭合：`tests/*.py`（`run.py` 与 `_*.py` 助手除外）⊆ `SUITE_MAP` ∪ `ON_DEMAND`，且登记的文件存在
 2. 分层完整：`SUITE_MAP` 里每个套件恰好属于一层
 3. Tier 自洽：并行白名单与独占 Tier 不指向未知套件、互不重叠
 4. 版本号：文档写出的 ABI/API 版本等于 `include/nsp_module.h` 的实际值
 5. 路径引用：文档里的 `src/…`、`tests/…` 等路径真实存在
 6. 退出码：`testing.md` 写出的 77/78/127 与 `run.py` 常量一致
 7. 已删标识符不以「现行机制」口吻出现（V3/V4 删除物）
+8. 源码树覆盖：每个 `src/**/*.c` 与 `include/*.h` 都被某条 `SUITE_MAP` 路径谓词命中
+   （或登记进 `SOURCE_COVER_EXEMPT` 并写明理由）——否则改它只会跑恒跑基线
 
 第 7 条有意只做**行级**判断。成段的历史记录用显式区域标记圈起来，整段豁免：
 

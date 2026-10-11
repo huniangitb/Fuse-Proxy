@@ -67,7 +67,13 @@ SUITE_MAP = [
       # 判别用例在 test_module_circuit.py §7b/7c（谎报 got/wrote 的后端模块）
       "test_module_circuit.py"),
      ("src/daemon/fw_rules.c", "src/daemon/fw_rules.h", "src/config/config_parser.c",
-      "src/daemon/fuse_daemon.c"),
+      "include/config_parser.h", "src/daemon/fuse_daemon.c",
+      # Trie 是规则匹配的加速结构（architecture.md §7：改 Trie 或线性通道须保持
+      # 二者优先级一致）；fast_search 提供规则扫描用的 fast_strstr；config_publisher
+      # 是 App-rules 的发布侧，test_config_snapshot.py 直编它
+      "src/core/path_trie.c", "include/path_trie.h",
+      "src/core/fast_search.c", "include/fast_search.h",
+      "src/injector/config_publisher.c", "include/config_publisher.h"),
      ("fw_rules_resolve", "config_build_from_view", "parse_config_line",
       "fw_data_mediation_required", "fw_backing_mediation_required_for"),
      "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
@@ -89,10 +95,13 @@ SUITE_MAP = [
      ("backend_rc_is_business",),
      "ftp_mux.c 或 backend_rc_is_business"),
 
-    (("test_path_vars.py",), ("src/config/path_vars.c",), (), "src/config/path_vars.c"),
+    (("test_path_vars.py",),
+     ("src/config/path_vars.c", "include/path_vars.h"), (), "src/config/path_vars.c"),
 
     (("test_inject_method.py", "test_global_replace.py", "test_inject_tracked_race.py"),
-     ("src/injector/inject_target.c",),
+     ("src/injector/inject_target.c", "include/inject_target.h",
+      # global_replace_ctl 是 test_global_replace.py 的被测驱动（仅 GNU 构建）
+      "src/injector/global_replace_ctl.c"),
      ("inject-method",),
      "injector 目标判定 / 注入方法 / 追踪表并发遍历"),
 
@@ -110,7 +119,12 @@ SUITE_MAP = [
 
     (("test_modules.py", "test_module_circuit.py", "test_module_abi.py",
       "test_backend_lifecycle.py", "test_fw_config_view.py"),
-     ("src/module/",), ("memfd_create", "module_backend_", "module_fault_poison"),
+     ("src/module/", "include/module_loader.h", "include/module_guard.h",
+      "include/fault_fence.h",
+      # 模块 ABI 的唯一入口：改它必须跑布局契约套件。此前它不在任何路径谓词里
+      # ——改 ABI 头只跑基线 3 套，test_module_abi.py 根本不会执行
+      "include/nsp_module.h"),
+     ("memfd_create", "module_backend_", "module_fault_poison"),
      "src/module/（加载器/内存副本加载/围栏/熔断/ABI）"),
 
     (("test_decision_enforce.py",), (),
@@ -123,7 +137,10 @@ SUITE_MAP = [
 
     (("test_log_pipeline.py",),
      ("src/log/", "src/core/nsp_comm.c", "include/nsp_comm.h", "include/nsp_log.h",
-      "src/core/common.c", "src/core/nsp_util.c", "include/nsp_util.h"),
+      "src/core/common.c", "include/common.h", "src/core/nsp_util.c", "include/nsp_util.h",
+      # 启动水印（nsp_log_build_info）与崩溃留档都写进日志环，故归日志链路
+      "src/core/build_info.c", "include/build_info.h",
+      "src/core/crash_dump.c", "include/crash_dump.h"),
      ("vfs_log_io", "monitor_on", "persist_stage", "drain_async", "log_internal",
       "fw_config_monitor_for", "nsp_log_level_name", "nsp_log_level_parse",
       "nsp_getline_capped", "nsp_snprintf_dyn", "nsp_format_dynamic"),
@@ -136,7 +153,12 @@ SUITE_MAP = [
       # C11：配置目录事件按 ev->name 分流（uid.map / sys_pkgs.cache 不触发规则重载）
       "test_cfg_reload_split.py"),
      ("src/daemon/fw_config.c", "src/daemon/fw_config.h", "src/daemon/fw_pkg.c",
-      "src/daemon/fw_pkg.h"),
+      "src/daemon/fw_pkg.h",
+      # uid→包名的三级输入：uid.map（uid_map）、系统包缓存（sys_pkg）、
+      # pid→包名快取（fast_pid）——test_monitor_layers.py 直编它们
+      "src/core/uid_map.c", "include/uid_map.h",
+      "src/core/sys_pkg.c", "include/sys_pkg.h",
+      "src/core/fast_pid.c", "include/fast_pid.h"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),
      "监控开关三层合并 / uid→包名（框架权威）"),
 
@@ -151,12 +173,12 @@ SUITE_MAP = [
      "配置目录 watch 对账（App-rules 子目录热更新）"),
 
     (("test_rule_file_lock.py", "test_log_ctl_rules.py", "test_rule_server.py"),
-     ("src/core/nsp_rule_file.c", "src/core/nsp_rule_file.h"),
+     ("src/core/nsp_rule_file.c", "src/core/nsp_rule_file.h", "include/nsp_rule_file.h"),
      ("nsp_rule_file_edit", "nsp_rule_file_app_active_path"),
      "规则文件编辑（nsp_rule_file：并发/持久性/停用态路径）"),
 
     (("test_a26_misc.py",),
-     ("src/core/nsp_ini_store.c", "src/modules/ftp/ftp_conf.c"),
+     ("src/core/nsp_ini_store.c", "include/nsp_ini_store.h", "src/modules/ftp/ftp_conf.c"),
      ("nsp_ini_save", "ftp_conf_load", "strip_comment"),
      "A26 杂项（ftp_conf `#`/port 校验 + nsp_ini_store 落盘持久性）"),
 
@@ -179,6 +201,15 @@ SUITE_MAP = [
 # 什么程度」，即验收时的递进顺序。docs/testing.md 的分层清单由此生成式对账，
 # 一致性与完整性由 tests/test_docs_sync.py 强制：
 #   * SUITE_MAP 里的每个套件必须恰好属于一层（漏登记 → 分层验收跑不到它）；
+    # 跨进程/跨模块常量的唯一出处（include/nsp_constants.h）与模块配置视图
+    # （include/nsp_cfg_view.h）都是「一改影响所有进程与模块 ABI」的文件，
+    # 没有单一归属套件，故给覆盖面最广的一组；命中即多跑几套，漏跑才是灾难
+    (("test_functional.py", "test_rules.py", "test_module_abi.py",
+      "test_log_pipeline.py", "test_config_snapshot.py"),
+     ("include/nsp_constants.h", "include/nsp_cfg_view.h"),
+     (),
+     "跨进程常量 / 模块配置视图（影响所有进程与模块 ABI）"),
+
 #   * 每层里的套件必须真实存在且在 SUITE_MAP 里。
 #
 # L0 静态/契约：不挂载、不联网、不起 daemon。多为「直编实际源码 + --wrap 桩/ASan」
@@ -253,8 +284,9 @@ LAYERS = {
 # `--all` 也不跑（否则每次验收都要等它们）。显式写名字才跑：
 #   python3 tests/run.py test_ftp_stress.py
 # 登记在此是为了让 tests/test_docs_sync.py 能区分「有意按需」与「新套件漏登记」——
-# 不在 SUITE_MAP 又不在这里的 tests/test_*.py 一律判为漏登记（此前 test_ftp_stress.py
-# 就这样长期游离在 --all 之外，没人看得出是故意还是忘了）。
+# 不在 SUITE_MAP 又不在这里的 tests/*.py（run.py 自身除外）一律判为漏登记
+# （此前 test_ftp_stress.py 长期游离在 --all 之外，没人看得出是故意还是忘了；
+#  `stress_fuse.py` 则因为台账只 glob `test_*.py` 而完全逃过检查）。
 ON_DEMAND = frozenset({
     "test_ftp_stress.py",     # FTP 吞吐/长稳压力，需 vsftpd，分钟级
 })
@@ -272,6 +304,7 @@ def changed_paths(base):
         line = line.strip()
         if line:
             tracked.add(line)
+    "stress_fuse.py",         # FUSE 综合压测，分钟级，断言指标而非正确性
     untracked = set()
     for line in git("ls-files", "--others", "--exclude-standard").splitlines():
         line = line.strip()
