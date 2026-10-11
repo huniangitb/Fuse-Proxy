@@ -746,25 +746,28 @@ def check(proc, sock_name, conf_dir):
         f.write(
             '[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射\n'
             '[conf]\n'
-            'conf.host.type = string\nconf.host.max = 255\nconf.host.desc = 服务器地址\n'
-            'conf.port.type = int\nconf.port.max = 5\nconf.port.default = 21\n'
+            'conf.host.type = string\nconf.host.maxlen = 255\n'
+            'conf.host.required = true\nconf.host.desc = 服务器地址\n'
+            'conf.port.type = int\nconf.port.range = 1:65535\nconf.port.default = 21\n'
+            'conf.port.default.proto.sftp = 22\n'
             'conf.user.type = string\nconf.user.max = 63\nconf.user.default = anonymous\n'
             'conf.password.type = string\nconf.password.max = 127\n'
             'conf.password.sensitive = true\n'
             'conf.remote_dir.type = string\nconf.remote_dir.max = 511\n'
             'conf.remote_dir.default = /\n'
-            'conf.proto.type = string\nconf.proto.enum = ftp|sftp\n'
-            'conf.key_file.type = path\nconf.key_file.max = 511\n'
-            'conf.key_file.desc = SSH 私钥\nconf.key_file.desc.en = SSH key\n')
+            'conf.proto.type = string\nconf.proto.enum = ftp|sftp\nconf.proto.default = ftp\n'
+            'conf.key_file.type = path\nconf.key_file.maxlen = 511\n'
+            'conf.key_file.desc = SSH 私钥\nconf.key_file.desc.en = SSH key\n'
+            'conf.host_key_check.type = bool\nconf.host_key_check.default = true\n')
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_SCHEMA"})
-    expect("MODULE_SCHEMA 声明后扩到 7 字段（默认 5 + SFTP 2）", r.get("status") == "ok"
-           and len(r["data"]["fields"]) == 7, r)
+    expect("MODULE_SCHEMA 声明后扩到 8 字段（默认 5 + SFTP 3）", r.get("status") == "ok"
+           and len(r["data"]["fields"]) == 8, r)
     keys = [f["key"] for f in r["data"]["fields"]] if r.get("status") == "ok" else []
     expect("schema 含 SFTP 的 key_file/proto", "key_file" in keys and "proto" in keys, keys)
     # 形状：前端据此自动渲染（类型/上限/敏感/缺省/可选值/顺序/标签）
     kf = next((f for f in r["data"]["fields"] if f["key"] == "key_file"), None)
-    expect("schema 带 type/max/desc", kf and kf["type"] == "path" and kf["max"] == 511
-           and kf["desc"] == "SSH 私钥", kf)
+    expect("schema 带 type/maxlen/desc/required", kf and kf["type"] == "path" and kf["maxlen"] == 511
+           and kf["desc"] == "SSH 私钥" and kf["required"] is False, kf)
     pr = next((f for f in r["data"]["fields"] if f["key"] == "proto"), None)
     expect("schema 带 enum", pr and pr.get("enum") == ["ftp", "sftp"], pr)
     pw = next((f for f in r["data"]["fields"] if f["key"] == "password"), None)
@@ -773,6 +776,24 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name,
                  {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id"})
     expect("声明后 key_file 被接受", r.get("status") == "ok", r)
+    # ---- 契约形状（前端零兜底渲染的前提）----
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "ftp_module"})
+    fs = {f["key"]: f for f in r["data"]["fields"]}
+    # string/path 给 maxlen（长度语义），int 给 min/max 值域，二者不混用
+    expect("string 字段给 maxlen、不给 min/max",
+           "maxlen" in fs["host"] and "min" not in fs["host"] and "max" not in fs["host"], fs.get("host"))
+    expect("int 字段给值域 min/max、不给 maxlen",
+           fs["port"].get("min") == 1 and fs["port"].get("max") == 65535
+           and "maxlen" not in fs["port"], fs.get("port"))
+    expect("bool 字段不给 maxlen 且 default 为 JSON 布尔",
+           "maxlen" not in fs["host_key_check"]
+           and fs["host_key_check"]["default"] is True, fs.get("host_key_check"))
+    expect("required 标记存在", fs["host"]["required"] is True, fs.get("host"))
+    # 值域越界须按 schema 拒（不是固定 1~65535 兜底）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "name": "云盘",
+                                   "key": "port", "value": "99999"})
+    expect("int 值域越界被拒（按 schema 值域）", r.get("status") == "error", r)
+
     # 枚举越界仍拒（schema 校验生效，不是放行一切）
     r = send_cmd(proc, sock_name,
                  {"cmd": "FTP_SET", "name": "云盘", "key": "proto", "value": "scp"})
@@ -780,16 +801,126 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name,
                  {"cmd": "FTP_SET", "name": "云盘", "key": "proto", "value": "sftp"})
     expect("schema 枚举内值接受", r.get("status") == "ok", r)
+
+    # ---- E3：空值删键必须先于类型校验（int 字段否则永远删不掉） ----
+    # 此时 云盘 的 proto=sftp、port 是显式 2121
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "port", "value": ""})
+    expect("E3 SET 空值删 int 字段（port）", r.get("status") == "ok"
+           and r["data"]["changed"] is True, r)
+    ftp_text = open(ftp_path, encoding="utf-8").read()
+    expect("E3 port 键已从文件删除", "port = " not in ftp_text, ftp_text)
+    # 纯空白与空串同义：旧实现会把键写成空值，模块读侧对空值整段作废
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "user", "value": "   "})
+    expect("E3 SET 纯空白 = 删键", r.get("status") == "ok" and r["data"]["changed"] is True, r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "云盘"})
+    expect("E3 删键后回缺省（user=anonymous）",
+           r.get("status") == "ok" and r["data"]["user"] == "anonymous", r)
+
+    # ---- E4：port 缺省须认 proto（与模块侧推导同口径） ----
+    # 判别点：旧实现把 port 缺省硬编码成 21，sftp 段回读得 21，前端整体回写即把
+    #         sftp 段写成 port=21（模块连 21 端口，SFTP 配置被写坏）。
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "云盘"})
+    expect("E4 删键后 port 回条件缺省 22（proto=sftp）",
+           r.get("status") == "ok" and r["data"]["port"] == 22, r.get("data"))
+    expect("E4 derived 标出 port 未显式配置（前端可只回写显式键）",
+           "port" in r["data"].get("derived", []), r["data"].get("derived"))
+    # 新建 sftp 段（不给 port）→ 22；默认 proto=ftp 的段 → 21
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "sftp盘", "fields": {"host": "10.1.1.1",
+                                                                "proto": "sftp"}})
+    expect("E4 ADD sftp 段", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "sftp盘"})
+    expect("E4 sftp 段未配 port → 22（旧实现报 21）",
+           r.get("status") == "ok" and r["data"]["port"] == 22
+           and "port" in r["data"].get("derived", []), r.get("data"))
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "ftp盘", "fields": {"host": "10.1.1.2"}})
+    expect("E4 ADD ftp 段", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "ftp盘"})
+    expect("E4 未配 proto → 缺省 ftp，port 21",
+           r["data"]["port"] == 21 and r["data"]["proto"] == "ftp", r.get("data"))
+    # 显式 port 优先于条件缺省
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "sftp2222", "fields": {"host": "h",
+                                                                  "proto": "sftp",
+                                                                  "port": "2222"}})
+    expect("E4 ADD 显式 port", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "sftp2222"})
+    expect("E4 显式 port 优先于条件缺省",
+           r["data"]["port"] == 2222 and "port" not in r["data"].get("derived", []), r.get("data"))
+    # 手写段（依赖字段写在后面）同样按文件内容推导，与书写顺序无关
+    with open(ftp_path, "a", encoding="utf-8") as f:
+        f.write("\n[手写盘]\nhost = h\nuser = u\nproto = sftp\n")
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "手写盘"})
+    expect("E4 手写 sftp 段（proto 在末尾）port → 22",
+           r.get("status") == "ok" and r["data"]["port"] == 22, r.get("data"))
+    # schema 把条件缺省一并交给前端（placeholder 与 GET 同口径）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "ftp_module"})
+    fs2 = {f["key"]: f for f in r["data"]["fields"]}
+    expect("E4 default_if 暴露条件缺省",
+           fs2["port"].get("default_if") == {"key": "proto", "value": "sftp", "default": 22},
+           fs2.get("port"))
+    expect("default 按类型给 JSON 型别（int → 数字）",
+           isinstance(fs2["port"]["default"], int) and fs2["port"]["default"] == 21
+           and fs2["host"]["default"] == "", fs2.get("port"))
+
+    # ---- E5：ADD 空值 = 不写该键（不落 `key = ` 空行，模块读侧对空值整段作废） ----
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "空值盘", "host": "10.2.2.2", "user": "",
+                                   "remote_dir": "   ", "password": ""})
+    expect("E5 ADD 带空值字段仍成功", r.get("status") == "ok", r)
+    ftp_text = open(ftp_path, encoding="utf-8").read()
+    seg = ftp_text.split("[空值盘]")[1].split("\n[")[0] if "[空值盘]" in ftp_text else ""
+    expect("E5 空值字段未落盘（无 user/remote_dir/password 空行）",
+           "host = 10.2.2.2" in seg and "user" not in seg
+           and "remote_dir" not in seg and "password" not in seg, seg)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "空值盘"})
+    expect("E5 空值字段走缺省",
+           r["data"]["user"] == "anonymous" and r["data"]["remote_dir"] == "/"
+           and r["data"]["has_password"] is False, r.get("data"))
+    # 空值不等于"未声明字段"：未知键即使给空值也必须拒（fail-closed 先解析键名）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "空值盘", "fields": {"bogus": ""}})
+    expect("未知键给空值仍被拒（空值不豁免键名校验）", r.get("status") == "error", r)
+
+    # ---- 散字段形态按 schema 拾取（旧实现硬编码 5 个字段名，proto/key_file 静默丢弃）----
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "散字段盘", "host": "h2", "proto": "sftp",
+                                   "key_file": "/k/id"})
+    expect("散字段形态可写 schema 新增字段", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "散字段盘"})
+    expect("散字段写入的 proto/key_file 生效（旧实现丢弃）",
+           r["data"]["proto"] == "sftp" and r["data"]["key_file"] == "/k/id", r.get("data"))
+
+    # ---- required 由控制面强制（schema 的 required 不只是前端提示）----
+    # 判别点：旧实现放行 → 落一个无 host 的段，模块侧整段作废（"配了却不生效"）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "缺host盘", "fields": {"port": "21"}})
+    expect("新建条目缺 required 字段被拒", r.get("status") == "error", r)
+    expect("被拒条目未落盘", "[缺host盘]" not in open(ftp_path, encoding="utf-8").read())
     # ---- MODULE_CONF_* 通用入口（按 module 寻址任意模块） ----
     # 造第二个"模块"：无 [conf] 声明 → 无字段可写（安全默认：未声明不放行任何键）
     other_dir = os.path.join(conf_dir, "modules", "other_mod")
     os.makedirs(other_dir, exist_ok=True)
     with open(os.path.join(other_dir, "other_mod.rules"), "w", encoding="utf-8") as f:
         f.write('[conf]\nconf.token.type = string\nconf.token.max = 64\n'
-                'conf.token.desc = 令牌\n')
+                'conf.token.desc = 令牌\n'
+                'conf.limit.type = int\nconf.limit.range = 1:9\n'
+                'conf.limit.desc = 限额\n')
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "other_mod"})
     expect("MODULE_CONF_SCHEMA 跨模块",
-           r.get("status") == "ok" and [f["key"] for f in r["data"]["fields"]] == ["token"], r)
+           r.get("status") == "ok" and [f["key"] for f in r["data"]["fields"]] == ["token", "limit"],
+           r)
+    # int 字段一律写规范十进制——旧实现只对 port 一个字段名特判，"007" 会原样落盘
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "other_mod",
+                                   "name": "B", "fields": {"token": "t", "limit": "007"}})
+    expect("other_mod ADD（含 int 字段）", r.get("status") == "ok", r)
+    other_conf = open(os.path.join(other_dir, "other_mod.conf"), encoding="utf-8").read()
+    expect("int 字段写规范十进制（007 → 7，不再按字段名特判）",
+           "limit = 7" in other_conf, other_conf)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "other_mod",
+                                   "name": "C", "fields": {"token": "t", "limit": "99"}})
+    expect("非 port 的 int 字段同样按 schema 值域拒越界", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "other_mod",
                                   "name": "A", "host": "x"})
     expect("MODULE_CONF_ADD 按 schema 过滤字段（host 非该模块字段）",
@@ -814,7 +945,8 @@ def check(proc, sock_name, conf_dir):
                                   "name": "A", "host": "x"})
     expect("无字段声明的模块拒绝写入", r.get("status") == "error", r)
     # 清理本块在 ftp_module 里建的段，避免影响后续既有用例的条目计数
-    send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": "通用盘"})
+    for _n in ("通用盘", "sftp盘", "ftp盘", "sftp2222", "手写盘", "空值盘", "散字段盘"):
+        send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": _n})
 
     # 反向确认：撤掉 [conf] 段（回到旧形态）后，key_file 必须**重新被拒**——
     # 证明上面的"接受"确实来自声明，而不是别的路径（如默认表被放宽）。
