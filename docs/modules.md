@@ -57,8 +57,10 @@ conf.host.max = 255              # 字节上限（缺省不限制）
 conf.host.desc = 服务器地址       # 中文标签（默认语言）
 conf.host.desc.en = Host         # 指定语言标签
 conf.port.type = int
+conf.port.range = 1:65535
 conf.port.default = 21           # 缺省值（LIST/GET 回填生效值）
 conf.proto.enum = ftp|sftp       # 可选值（竖线分隔），越界即拒
+conf.host.required = true        # 新建条目时必填
 conf.password.sensitive = true   # 敏感：只写不读，仅回 has_password
 conf.key_file.order = 7          # 前端显示顺序
 ```

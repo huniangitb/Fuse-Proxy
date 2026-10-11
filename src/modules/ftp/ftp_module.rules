@@ -15,45 +15,63 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 
 # ── 模块配置 schema（<模块名>.conf 的字段声明）────────────────────────────
 # 与上面同一个解析器：[conf] 段 + `conf.<字段>.<属性>=值` 属性行。
-#   属性：max（字节上限）/ type / sensitive / default / enum / order
+#   属性：maxlen（字节上限）/ range（int 值域）/ required / type / sensitive
+#         / default / default.<依赖字段>.<取值>（条件缺省）/ enum / order
 #         / desc / desc.<lang>（多语言标签）
 # 作用：控制面按 schema 校验 FTP_ADD/SET 的字段，并把
-#   {key,label,type,max,sensitive,default,enum,order} 经 MODULE_SCHEMA
+#   {key,desc,type,maxlen|min+max,sensitive,required,default,default_if?,enum,order} 经
+#   MODULE_CONF_SCHEMA
 #   交给前端自动渲染（数字框 / 开关 / 密码框带脱敏 / 下拉 / maxlength）。
+#   default.<依赖字段>.<取值> 声明「缺省随另一字段取值而变」（如 port 在 sftp 下 22），
+#   必须与模块自己的推导一致——同一发布物内的两处声明。
 # 未声明 [conf] 段时回退编译期默认表（FTP 现有字段），旧包仍可用。
 # ⚠ schema 只服务控制面校验与前端渲染，**不改变归属**：框架依旧把原始行原样
 #   下发、模块自己解析（docs/modules.md §6.1.1）。
 
 [conf]
+# type      = string / int / bool / path
+# maxlen    = string/path 的字节上限（前端 maxlength）
+# range     = int 的取值闭区间，如 1:65535（前端范围校验）
+# default   = 缺省值（bool 用 true/false；LIST/GET 回填生效值并记入 derived）
+# default.<依赖字段>.<取值> = 条件缺省：依赖字段生效值等于 <取值> 时用它（如 default.proto.sftp = 22）
+# enum      = 可选值（仅非 bool 用；bool 由 type 决定，取值 on/off/true/false）
+# required  = 新建条目时必填
+# sensitive = true → 只写不读，应答仅回 has_<键名>
+# order     = 前端渲染顺序（小的在前）
+# desc / desc.<lang> = 中文标签 / 指定语言标签
+
 conf.host.type = string
-conf.host.max = 255
+conf.host.maxlen = 255
+conf.host.required = true
 conf.host.order = 1
 conf.host.desc = 服务器地址
 conf.host.desc.en = Host
 
 conf.port.type = int
-conf.port.max = 5
+conf.port.range = 1:65535
 conf.port.default = 21
+# 条件缺省：proto=sftp 时缺省 22（与模块侧 ftp_conf_parse_end 的推导同口径）
+conf.port.default.proto.sftp = 22
 conf.port.order = 2
 conf.port.desc = 端口
 conf.port.desc.en = Port
 
 conf.user.type = string
-conf.user.max = 63
+conf.user.maxlen = 63
 conf.user.default = anonymous
 conf.user.order = 3
 conf.user.desc = 用户名
 conf.user.desc.en = User
 
 conf.password.type = string
-conf.password.max = 127
+conf.password.maxlen = 127
 conf.password.sensitive = true
 conf.password.order = 4
 conf.password.desc = 密码
 conf.password.desc.en = Password
 
 conf.remote_dir.type = string
-conf.remote_dir.max = 511
+conf.remote_dir.maxlen = 511
 conf.remote_dir.default = /
 conf.remote_dir.order = 5
 conf.remote_dir.desc = 远程根目录
@@ -62,7 +80,7 @@ conf.remote_dir.desc.en = Remote directory
 # ---- SFTP（proto=sftp）字段：解析侧早已支持，此前控制面白名单里没有，
 #      两处漂移（同一语法两份实现）。schema 化后只此一处声明。 ----
 conf.proto.type = string
-conf.proto.max = 7
+conf.proto.maxlen = 7
 conf.proto.default = ftp
 conf.proto.enum = ftp|sftp
 conf.proto.order = 6
@@ -70,27 +88,26 @@ conf.proto.desc = 协议
 conf.proto.desc.en = Protocol
 
 conf.key_file.type = path
-conf.key_file.max = 511
+conf.key_file.maxlen = 511
 conf.key_file.order = 7
 conf.key_file.desc = SSH 私钥文件
 conf.key_file.desc.en = SSH private key
 
 conf.key_pass.type = string
-conf.key_pass.max = 127
+conf.key_pass.maxlen = 127
 conf.key_pass.sensitive = true
 conf.key_pass.order = 8
 conf.key_pass.desc = 私钥口令
 conf.key_pass.desc.en = Key passphrase
 
 conf.known_hosts.type = path
-conf.known_hosts.max = 511
+conf.known_hosts.maxlen = 511
 conf.known_hosts.order = 9
 conf.known_hosts.desc = known_hosts 路径
 conf.known_hosts.desc.en = known_hosts path
 
 conf.host_key_check.type = bool
 conf.host_key_check.default = true
-conf.host_key_check.enum = on|off
 conf.host_key_check.order = 10
 conf.host_key_check.desc = 主机密钥校验
 conf.host_key_check.desc.en = Host key check
