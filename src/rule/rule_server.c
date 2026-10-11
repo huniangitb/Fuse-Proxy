@@ -436,6 +436,9 @@ static void rule_types_parse_line(char* line, const char* module, bool builtin) 
    段内无 '=' 的行或段外行按旧行格式处理；文件尾刷新未结束的段。 */
 
 /* conf 段属性收集状态 */
+#define MODCONF_MAX_FIELDS 16
+#define MODCONF_MAX_ENUM 4
+
 typedef struct {
     char type[64];
     bool active; /* 是否处于 [TYPE] 段内 */
@@ -448,7 +451,48 @@ typedef struct {
     DescEntry descs[MAX_DESC_LANGS];
     int desc_count;
     char langbuf[8]; /* desc 语言缓冲（函数级作用域防悬垂） */
+    /* ---- [conf] 段专用：conf.<字段>.<属性> 累积槽（不参与规则类型） ---- */
+    char cf_key[32];     /* 当前 conf.<字段>（空 = 未进入某字段） */
+    char cf_type[8];
+    size_t cf_max;
+    bool cf_sensitive;
+    char cf_defval[64];
+    char cf_enum[MODCONF_MAX_ENUM][24];
+    int cf_enum_count;
+    int cf_order;
+    DescEntry cf_descs[MAX_DESC_LANGS];
+    int cf_desc_count;
 } ConfSection;
+
+/* [conf] 段（模块配置 schema）解析：定义在 FTP 配置段之前，此处前向声明供
+   conf_section_apply_key / conf_section_flush 在前面调用 */
+static void modconf_apply(ConfSection* cs, const char* rest, const char* val);
+static void modconf_field_commit(ConfSection* cs);
+static void modconf_flush(ConfSection* cs, const char* module);
+
+
+typedef struct {
+    char key[32];                    /* 字段名（INI 键名） */
+    char type[8];                    /* string / int / bool / path */
+    size_t max;                      /* 字节上限（0 = 不限制） */
+    bool sensitive;                  /* 敏感：只写不读，LIST/GET 仅回 has_<key> */
+    char defval[64];                 /* 缺省值（LIST/GET 回填生效值） */
+    char enumvals[MODCONF_MAX_ENUM][24];
+    int enum_count;
+    int order;                       /* 前端显示顺序（0 = 未指定，按声明序） */
+    DescEntry descs[MAX_DESC_LANGS]; /* 多语言标签（desc= → zh，desc.en= → en） */
+    int desc_count;
+} ModConfField;
+
+typedef struct {
+    char module[64];               /* 所属模块名 */
+    ModConfField fields[MODCONF_MAX_FIELDS];
+    int count;
+    bool loaded;                   /* 已由 [conf] 段填入（否则用默认表） */
+} ModConfSchema;
+
+static ModConfSchema g_modconf = {0};
+
 
 static void conf_section_reset(ConfSection* cs) {
     cs->active = false;
@@ -461,6 +505,15 @@ static void conf_section_reset(ConfSection* cs) {
     cs->global_only = false;
     cs->global_only_set = false;
     cs->desc_count = 0;
+    /* [conf] 段槽位一并复位（逐字段赋值，与上面同风格；勿改整体 memset） */
+    cs->cf_key[0] = '\0';
+    cs->cf_type[0] = '\0';
+    cs->cf_max = 0;
+    cs->cf_sensitive = false;
+    cs->cf_defval[0] = '\0';
+    cs->cf_enum_count = 0;
+    cs->cf_order = 0;
+    cs->cf_desc_count = 0;
 }
 
 /* 合并属性到已存在的类型（内置或他模块注册的同名类型）：
@@ -499,6 +552,12 @@ static void rule_types_merge(RuleType idx, RuleFmt fmt, bool fmt_set, int argc_m
 
 /* 段结束时把收集的属性注册进类型表（同名内建类型改为合并补充） */
 static void conf_section_flush(ConfSection* cs, const char* module, bool builtin) {
+    /* [conf] 段不是规则类型：它是模块配置 schema，转交 schema 解析，不进类型表 */
+    if (cs->active && strcasecmp(cs->type, "conf") == 0) {
+        modconf_flush(cs, module);
+        conf_section_reset(cs);
+        return;
+    }
     if (cs->active && cs->type[0]) {
         RuleType existing = rule_type_of(cs->type);
         if (existing == RT_UNKNOWN) {
@@ -515,6 +574,11 @@ static void conf_section_flush(ConfSection* cs, const char* module, bool builtin
 
 /* 解析 conf 键值属性（format/argc/global-only/desc[.lang]），写入段状态 */
 static void conf_section_apply_key(ConfSection* cs, const char* key, const char* val) {
+    /* [conf] 段的 conf.<字段>.<属性> 键：交给 schema 解析器，不走规则类型属性 */
+    if (strncasecmp(key, "conf.", 5) == 0) {
+        modconf_apply(cs, key + 5, val);
+        return;
+    }
     if (strcasecmp(key, "format") == 0) {
         if (strcasecmp(val, "pair") == 0)
             cs->fmt = RFT_PAIR;
@@ -608,6 +672,8 @@ static void rule_types_parse_one_line(char* line, ConfSection* cs, const char* m
         while (*p && *p != ']' && ti < sizeof(cs->type) - 1) cs->type[ti++] = *p++;
         cs->type[ti] = '\0';
         cs->active = (ti > 0);
+        /* [conf] 段即 schema 的完整定义：进入时清空，避免与默认表/上一段叠加 */
+        if (cs->active && strcasecmp(cs->type, "conf") == 0) g_modconf.count = 0;
         return;
     }
     char* eq = strchr(p, '=');
@@ -713,7 +779,11 @@ static void rule_types_refresh(void) {
         if (unchanged) return; /* 全部未变：跳过全量扫描 */
     }
 
-    /* 慢路径：全量重建类型表与缓存 */
+    /* 慢路径：全量重建类型表与缓存。
+       schema 一并失效：若模块撤掉了 [conf] 段，必须回退默认表，绝不沿用上一次
+       扫描残留的字段声明（否则删声明后旧字段仍可写，声明就不再是唯一来源）。 */
+    g_modconf.count = 0;
+    g_modconf.loaded = false;
     g_rule_type_count = 0;
     rule_types_init();
     g_module_cache_count = 0;
@@ -2199,6 +2269,188 @@ static void handle_quit(int fd, json_object* req) {
     reply_ok(fd, "QUIT", NULL);
 }
 
+/* ==================== 模块配置 schema（<模块名>.conf 的字段声明） ====================
+ * 目的：把「模块配置有哪些字段、各字段的类型/上限/是否敏感/缺省/可选值/显示顺序」
+ * 从 C 代码搬到模块自带的声明文件（`<模块名>.rules` 的 `[conf]` 段），与 .rules 的
+ * 规则类型声明**同一解析器、同一扫描路径**，于是新增一个配置项不必改 C、不必
+ * 重新编译发布——模块自带的声明文件即契约。
+ *
+ * 边界（重要，不得越界）：
+ *   - schema **只服务控制面校验与前端渲染**，不改变配置读取归属：框架依旧把
+ *     原始行原样下发给模块、模块自己解析（docs/modules.md §6.1.1）。
+ *   - 敏感字段（`sensitive`）沿用并**升级**既有「密码只写不读」：此前只有
+ *     password 一个键享受特判，现按 schema 判定，新增敏感字段自动脱敏。
+ *   - 未声明 [conf] 段时回退编译期默认表（见 modconf_load_defaults），旧包照旧。
+ */
+
+
+/* 取字段（按 key 精确匹配；未命中返回 NULL） */
+static const ModConfField* modconf_find(const ModConfSchema* sc, const char* key) {
+    if (!sc || !key) return NULL;
+    for (int i = 0; i < sc->count; i++)
+        if (strcasecmp(sc->fields[i].key, key) == 0) return &sc->fields[i];
+    return NULL;
+}
+
+/* 值是否命中该字段的可选值集合（enum 未声明时恒真） */
+static bool modconf_enum_hit(const ModConfField* f, const char* val) {
+    if (f->enum_count <= 0) return true;
+    for (int i = 0; i < f->enum_count; i++)
+        if (strcasecmp(f->enumvals[i], val) == 0) return true;
+    return false;
+}
+
+/* 按请求语言取标签：命中对应 lang 槽 → 回退 zh → 再回退键名本身。
+   MODULE_SCHEMA 用它输出 desc（前端直接显示，无需自维护中文标签）。 */
+static const char* modconf_label(const ModConfField* f, const char* lang) {
+    if (lang && lang[0]) {
+        for (int i = 0; i < f->desc_count; i++)
+            if (strcasecmp(f->descs[i].lang, lang) == 0) return f->descs[i].text;
+    }
+    for (int i = 0; i < f->desc_count; i++)
+        if (strcasecmp(f->descs[i].lang, "zh") == 0) return f->descs[i].text;
+    return f->key;
+}
+
+#define FTP_NAME_MAX 63
+#define FTP_HOST_MAX 255
+#define FTP_USER_MAX 63
+#define FTP_PASS_MAX 127
+#define FTP_RDIR_MAX 511
+
+/* 编译期默认表：与旧 FTP_* 白名单逐字等价，仅在模块未声明 [conf] 段时使用 */
+static void modconf_load_defaults(ModConfSchema* sc) {
+    sc->count = 0;
+    sc->loaded = false;
+    /* name(host/user≤63、pass≤127、remote_dir≤511、host≤255) 与旧常量一致 */
+    struct {
+        const char* key;
+        const char* type;
+        size_t max;
+        bool sensitive;
+        const char* def;
+    } d[] = {
+        {"host", "string", FTP_HOST_MAX, false, NULL},
+        {"port", "int", 5, false, "21"},
+        {"user", "string", FTP_USER_MAX, false, "anonymous"},
+        {"password", "string", FTP_PASS_MAX, true, NULL},
+        {"remote_dir", "string", FTP_RDIR_MAX, false, "/"},
+    };
+    for (size_t i = 0; i < sizeof(d) / sizeof(d[0]); i++) {
+        ModConfField* f = &sc->fields[sc->count++];
+        memset(f, 0, sizeof *f);
+        snprintf(f->key, sizeof f->key, "%s", d[i].key);
+        snprintf(f->type, sizeof f->type, "%s", d[i].type);
+        f->max = d[i].max;
+        f->sensitive = d[i].sensitive;
+        if (d[i].def) snprintf(f->defval, sizeof f->defval, "%s", d[i].def);
+        f->order = (int)i + 1;
+    }
+}
+
+/* 累积 `conf.<字段>.<属性>`：同名字段继续累积，换字段先把上一个落表（CS 无 realloc，
+   用固定数组 + 溢出即忽略并告警，避免动态分配失败路径） */
+static void modconf_apply(ConfSection* cs, const char* rest, const char* val) {
+    /* rest = "<字段>.<属性>"，切出字段名与属性名 */
+    const char* dot = strchr(rest, '.');
+    if (!dot) return;
+    size_t klen = (size_t)(dot - rest);
+    if (klen == 0 || klen >= sizeof(cs->cf_key)) return;
+    if (cs->cf_key[0] && strncasecmp(cs->cf_key, rest, klen) != 0) modconf_field_commit(cs);
+    if (!cs->cf_key[0]) {
+        memcpy(cs->cf_key, rest, klen);
+        cs->cf_key[klen] = '\0';
+    }
+    const char* attr = dot + 1;
+    if (strcasecmp(attr, "type") == 0) {
+        snprintf(cs->cf_type, sizeof cs->cf_type, "%s", val);
+    } else if (strcasecmp(attr, "max") == 0) {
+        long v = atol(val);
+        cs->cf_max = v > 0 ? (size_t)v : 0;
+    } else if (strcasecmp(attr, "sensitive") == 0) {
+        cs->cf_sensitive = (strcasecmp(val, "true") == 0 || strcasecmp(val, "on") == 0 ||
+                            strcmp(val, "1") == 0);
+    } else if (strcasecmp(attr, "default") == 0) {
+        snprintf(cs->cf_defval, sizeof cs->cf_defval, "%s", val);
+    } else if (strcasecmp(attr, "enum") == 0) {
+        /* 竖线分隔：enum = ftp|sftp */
+        cs->cf_enum_count = 0;
+        const char* p = val;
+        while (*p && cs->cf_enum_count < MODCONF_MAX_ENUM) {
+            const char* e = strchr(p, '|');
+            size_t n = e ? (size_t)(e - p) : strlen(p);
+            if (n >= sizeof(cs->cf_enum[0])) n = sizeof(cs->cf_enum[0]) - 1;
+            memcpy(cs->cf_enum[cs->cf_enum_count], p, n);
+            cs->cf_enum[cs->cf_enum_count][n] = '\0';
+            cs->cf_enum_count++;
+            if (!e) break;
+            p = e + 1;
+        }
+    } else if (strcasecmp(attr, "order") == 0) {
+        cs->cf_order = atoi(val);
+    } else if (strncasecmp(attr, "desc", 4) == 0) {
+        const char* lang = "zh";
+        const char* d = attr + 4;
+        if (*d == '.') lang = d + 1;
+        if (cs->cf_desc_count < MAX_DESC_LANGS) {
+            snprintf(cs->cf_descs[cs->cf_desc_count].lang, 8, "%s", lang);
+            snprintf(cs->cf_descs[cs->cf_desc_count].text, 160, "%s", val);
+            cs->cf_desc_count++;
+        }
+    }
+    /* 未知属性忽略（向前兼容） */
+}
+
+/* 把一个累完整的字段落进全局 schema 表 */
+static void modconf_field_commit(ConfSection* cs) {
+    if (!cs->cf_key[0]) return;
+    if (g_modconf.count >= MODCONF_MAX_FIELDS) {
+        LOG("模块配置 schema 字段超上限 %d，忽略 %s", MODCONF_MAX_FIELDS, cs->cf_key);
+        cs->cf_key[0] = '\0';
+        return;
+    }
+    ModConfField* f = &g_modconf.fields[g_modconf.count++];
+    memset(f, 0, sizeof *f);
+    snprintf(f->key, sizeof f->key, "%s", cs->cf_key);
+    snprintf(f->type, sizeof f->type, "%s", cs->cf_type[0] ? cs->cf_type : "string");
+    f->max = cs->cf_max;
+    f->sensitive = cs->cf_sensitive;
+    snprintf(f->defval, sizeof f->defval, "%s", cs->cf_defval);
+    memcpy(f->enumvals, cs->cf_enum, sizeof cs->cf_enum);
+    f->enum_count = cs->cf_enum_count;
+    f->order = cs->cf_order;
+    memcpy(f->descs, cs->cf_descs, sizeof cs->cf_descs);
+    f->desc_count = cs->cf_desc_count;
+    /* 复位全部累积槽：不复位会让 type/max/sensitive/default/enum/desc 串到下一个
+       字段（表现：key_file 继承 proto 的 enum、password 的 sensitive 等） */
+    cs->cf_key[0] = '\0';
+    cs->cf_type[0] = '\0';
+    cs->cf_max = 0;
+    cs->cf_sensitive = false;
+    cs->cf_defval[0] = '\0';
+    cs->cf_enum_count = 0;
+    cs->cf_order = 0;
+    cs->cf_desc_count = 0;
+}
+
+/* [conf] 段结束：提交最后一个字段并标记已加载 */
+static void modconf_flush(ConfSection* cs, const char* module) {
+    modconf_field_commit(cs);
+    snprintf(g_modconf.module, sizeof g_modconf.module, "%s", module);
+    g_modconf.loaded = (g_modconf.count > 0);
+}
+
+#define FTP_MODULE_NAME "ftp_module"
+
+/* 取当前生效 schema：未由 [conf] 段加载过则给编译期默认表（旧包行为不变） */
+static const ModConfSchema* modconf_get(void) {
+    if (!g_modconf.loaded) {
+        modconf_load_defaults(&g_modconf);
+        snprintf(g_modconf.module, sizeof g_modconf.module, "%s", FTP_MODULE_NAME);
+    }
+    return &g_modconf;
+}
+
 /* ==================== FTP 服务器账号管理（模块配置文件） ====================
  * 基于 nsp_ini_store 抽象（rule_server 私有静态库，已退出模块 ABI——见
  * nsp_ini_store.h）：注释保留的行级读写 + 临时文件 rename 原子落盘；框架侧
@@ -2213,17 +2465,11 @@ static void handle_quit(int fd, json_object* req) {
  * remote_dir≤511；port 1~65535（缺省 21）；user 缺省 anonymous、
  * remote_dir 缺省 /（LIST/GET 回填生效值，与模块行为一致）。 */
 
-#define FTP_NAME_MAX 63
-#define FTP_HOST_MAX 255
-#define FTP_USER_MAX 63
-#define FTP_PASS_MAX 127
-#define FTP_RDIR_MAX 511
 
 /* 模块配置文件名 = 模块名（框架按 <modules_dir>/<名>/<名>.conf 读取）。
    模块目录取自 g_config_dir（rule_server 的配置根，可经 --config-dir 覆盖），
    与 LIST_MODULES 的目录推导同一口径——**不得**用编译期 MODULES_DIR 宏，
    否则覆盖了配置根的部署会写到一个框架根本不读的位置。 */
-#define FTP_MODULE_NAME "ftp_module"
 
 static void ftp_conf_path(char* out, size_t sz) {
     snprintf(out, sz, "%s/modules/" FTP_MODULE_NAME "/" FTP_MODULE_NAME ".conf", g_config_dir);
@@ -2273,28 +2519,88 @@ static bool ftp_valid_field(const char* v, size_t max) {
     return true;
 }
 
-/* 单服务器 JSON（生效值 + has_password，绝不回传密码明文） */
+/* 单服务器 JSON：按模块配置 schema 输出**全部**字段的生效值。
+ * 敏感字段（schema 的 sensitive）绝不回传明文，只给 has_<key> 布尔——
+ * 此前仅 password 一个键享受特判，现按 schema 判定，新增敏感字段自动脱敏。 */
 static json_object* build_ftp_server_json(NspIniStore* s, const char* name) {
-    char host[FTP_HOST_MAX + 1] = {0};
-    char port_s[32] = {0};
-    char user[FTP_USER_MAX + 1] = {0};
-    char rdir[FTP_RDIR_MAX + 1] = {0};
-    nsp_ini_get(s, name, "host", host, sizeof host);
-    nsp_ini_get(s, name, "port", port_s, sizeof port_s);
-    nsp_ini_get(s, name, "user", user, sizeof user);
-    nsp_ini_get(s, name, "remote_dir", rdir, sizeof rdir);
-    bool has_pass = (nsp_ini_get(s, name, "password", NULL, 0) == 0 ||
-                     nsp_ini_get(s, name, "pass", NULL, 0) == 0);
-    int port = atoi(port_s);
-    if (port <= 0 || port > 65535) port = 21;
+    const ModConfSchema* sc = modconf_get();
     json_object* o = json_object_new_object();
     json_object_object_add(o, "name", json_object_new_string(name));
-    json_object_object_add(o, "host", json_object_new_string(host));
-    json_object_object_add(o, "port", json_object_new_int(port));
-    json_object_object_add(o, "user", json_object_new_string(user[0] ? user : "anonymous"));
-    json_object_object_add(o, "remote_dir", json_object_new_string(rdir[0] ? rdir : "/"));
-    json_object_object_add(o, "has_password", json_object_new_boolean(has_pass));
+    char val[FTP_RDIR_MAX + 1];
+    for (int i = 0; i < sc->count; i++) {
+        const ModConfField* f = &sc->fields[i];
+        val[0] = '\0';
+        /* pass 是 password 的历史别名：两处都查，与写入侧归一一致 */
+        bool hit = (nsp_ini_get(s, name, f->key, val, sizeof val) == 0);
+        if (!hit && strcasecmp(f->key, "password") == 0)
+            hit = (nsp_ini_get(s, name, "pass", val, sizeof val) == 0);
+        if (f->sensitive) {
+            /* 保持既有契约：敏感字段的**键本身不出现**（不是回空串），只给
+               has_<key> 布尔。前端据此判断"是否已设置"，且永远不会拿到明文。 */
+            char hk[40];
+            snprintf(hk, sizeof hk, "has_%s", f->key);
+            json_object_object_add(o, hk, json_object_new_boolean(hit));
+            continue;
+        }
+        /* 缺值先套缺省（若有），再按类型转换——否则 port 的缺省 21 会被输出成
+           字符串 "21"，与已存储时的整数口径不一致（前端无法统一渲染数字框） */
+        if (!hit || !val[0]) {
+            if (f->defval[0]) snprintf(val, sizeof val, "%s", f->defval);
+            else val[0] = '\0';
+        }
+        if (strcasecmp(f->type, "int") == 0) {
+            int v = atoi(val);
+            if (strcasecmp(f->key, "port") == 0 && (v <= 0 || v > 65535)) v = 21;
+            json_object_object_add(o, f->key, json_object_new_int(v));
+        } else if (strcasecmp(f->type, "bool") == 0) {
+            json_object_object_add(
+                o, f->key,
+                json_object_new_boolean(!(strcasecmp(val, "off") == 0 ||
+                                          strcasecmp(val, "false") == 0 || strcmp(val, "0") == 0)));
+        } else {
+            json_object_object_add(o, f->key, json_object_new_string(val));
+        }
+    }
     return o;
+}
+
+/* MODULE_SCHEMA：把模块配置的字段契约交给前端（自动渲染表单）。
+ * 形状：{file, module, fields:[{key,type,max,sensitive,default,enum,order,
+ * desc,desc_map}]}。只读，与 FTP_LIST 同级（非高危）。 */
+static void handle_module_schema(int fd, json_object* req) {
+    const ModConfSchema* sc = modconf_get();
+    char path[PATH_MAX];
+    ftp_conf_path(path, sizeof(path));
+    json_object* data = json_object_new_object();
+    json_object_object_add(data, "file", json_object_new_string(path));
+    json_object_object_add(data, "module", json_object_new_string(sc->module));
+    json_object* arr = json_object_new_array();
+    for (int i = 0; i < sc->count; i++) {
+        const ModConfField* f = &sc->fields[i];
+        json_object* o = json_object_new_object();
+        json_object_object_add(o, "key", json_object_new_string(f->key));
+        json_object_object_add(o, "type", json_object_new_string(f->type));
+        json_object_object_add(o, "max", json_object_new_int((int)f->max));
+        json_object_object_add(o, "sensitive", json_object_new_boolean(f->sensitive));
+        json_object_object_add(o, "default", json_object_new_string(f->defval));
+        if (f->enum_count > 0) {
+            json_object* ev = json_object_new_array();
+            for (int k = 0; k < f->enum_count; k++)
+                json_object_array_add(ev, json_object_new_string(f->enumvals[k]));
+            json_object_object_add(o, "enum", ev);
+        }
+        json_object_object_add(o, "order", json_object_new_int(f->order));
+        const char* lang = json_object_get_string(json_object_object_get(req, "lang"));
+        json_object_object_add(o, "desc",
+                               json_object_new_string(modconf_label(f, lang ? lang : "zh")));
+        json_object* dm = json_object_new_object();
+        for (int k = 0; k < f->desc_count; k++)
+            json_object_object_add(dm, f->descs[k].lang, json_object_new_string(f->descs[k].text));
+        json_object_object_add(o, "desc_map", dm);
+        json_object_array_add(arr, o);
+    }
+    json_object_object_add(data, "fields", arr);
+    reply_ok(fd, "MODULE_SCHEMA", data);
 }
 
 static void handle_ftp_list(int fd, json_object* req) {
@@ -2469,21 +2775,23 @@ static void handle_ftp_set(int fd, json_object* req) {
         reply_error(fd, "FTP_SET", "缺少或非法参数: name/key");
         return;
     }
-    char norm_key[16];
-    if (strcasecmp(key, "host") == 0)
-        snprintf(norm_key, sizeof norm_key, "host");
-    else if (strcasecmp(key, "port") == 0)
-        snprintf(norm_key, sizeof norm_key, "port");
-    else if (strcasecmp(key, "user") == 0)
-        snprintf(norm_key, sizeof norm_key, "user");
-    else if (strcasecmp(key, "password") == 0 || strcasecmp(key, "pass") == 0)
-        snprintf(norm_key, sizeof norm_key, "password");
-    else if (strcasecmp(key, "remote_dir") == 0)
-        snprintf(norm_key, sizeof norm_key, "remote_dir");
-    else {
-        reply_error(fd, "FTP_SET", "未知字段: %s（限 host/port/user/password/remote_dir）", key);
+    /* 字段白名单不再硬编码：查模块配置 schema（[conf] 段声明，未声明走默认表）。
+       `pass` 仍归一为 `password`（别名），schema 里只声明其一。 */
+    const ModConfSchema* sc = modconf_get();
+    const ModConfField* f = NULL;
+    const char* lookup_key = (strcasecmp(key, "pass") == 0) ? "password" : key;
+    f = modconf_find(sc, lookup_key);
+    if (!f) {
+        char known[256] = {0};
+        for (int i = 0; i < sc->count; i++) {
+            if (i) strncat(known, "/", sizeof(known) - strlen(known) - 1);
+            strncat(known, sc->fields[i].key, sizeof(known) - strlen(known) - 1);
+        }
+        reply_error(fd, "FTP_SET", "未知字段: %s（限 %s）", key, known);
         return;
     }
+    char norm_key[32];
+    snprintf(norm_key, sizeof norm_key, "%s", f->key);
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
     if (ftp_conf_ensure_dir() != 0) {
@@ -2523,16 +2831,21 @@ static void handle_ftp_set(int fd, json_object* req) {
             changed = true;
         }
     } else {
-        size_t max = FTP_RDIR_MAX;
-        if (strcmp(norm_key, "host") == 0)
-            max = FTP_HOST_MAX;
-        else if (strcmp(norm_key, "user") == 0)
-            max = FTP_USER_MAX;
-        else if (strcmp(norm_key, "password") == 0)
-            max = FTP_PASS_MAX;
+        /* 上限与可选值取自 schema，不再按字段名硬编码 */
+        size_t max = f->max ? f->max : FTP_RDIR_MAX;
         if (!ftp_valid_field(value, max)) {
             nsp_ini_close(s);
             reply_error(fd, "FTP_SET", "字段值非法或超长");
+            return;
+        }
+        if (f->enum_count > 0 && !modconf_enum_hit(f, value)) {
+            char opts[128] = {0};
+            for (int i = 0; i < f->enum_count; i++) {
+                if (i) strncat(opts, "|", sizeof(opts) - strlen(opts) - 1);
+                strncat(opts, f->enumvals[i], sizeof(opts) - strlen(opts) - 1);
+            }
+            nsp_ini_close(s);
+            reply_error(fd, "FTP_SET", "字段值不在可选范围内: %s（限 %s）", value, opts);
             return;
         }
         char tbuf[FTP_RDIR_MAX + 1];
@@ -2686,6 +2999,8 @@ static void dispatch(int fd, json_object* req, uid_t peer_uid) {
         handle_toggle(fd, req, false);
     else if (strcasecmp(cmd, "SET") == 0)
         handle_set(fd, req);
+    else if (strcasecmp(cmd, "MODULE_SCHEMA") == 0)
+        handle_module_schema(fd, req);
     else if (strcasecmp(cmd, "FTP_LIST") == 0)
         handle_ftp_list(fd, req);
     else if (strcasecmp(cmd, "FTP_GET") == 0)
