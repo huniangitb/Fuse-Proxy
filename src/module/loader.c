@@ -385,8 +385,8 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
                 "[MOD_ERR] module=%s op=init reason=init 崩溃被围栏恢复 detail=拒绝加载并落盘 ban",
                 name);
             module_ban_record(name, so_mtime(so_path), "init crash");
-            /* init 崩溃时模块可能已创建自有线程（如 ftp_module 的 ftp.conf
-               监视线程）——那是它唯一的停止途径，故仍须经围栏调 exit，否则
+            /* init 崩溃时模块可能已创建自有线程（任何模块都可在 init 内起
+               后台线程）——exit 是它唯一的停止途径，故仍须经围栏调 exit，否则
                dlclose 解除映射后残留线程踩空即带崩框架。exit 自身崩溃则无法
                确认线程已停，保持 .so 映射不 dlclose（同置毒路径策略）。 */
             bool can_unload = true;
@@ -439,7 +439,7 @@ static int module_prepare(const char* name, void** h_out, NspModuleInfo* info_ou
 }
 
 /* init 已成功的模块被拒绝时的统一善后：模块可能已持有自有线程（如
-   ftp_module 的 ftp.conf 监视线程），exit 必须调且必须过围栏（用未绑定槽位
+   任何模块都可在 init 内起后台线程），exit 必须调且必须过围栏（用未绑定槽位
    归因——正式槽位尚未分配，不能占用在册模块的槽位）。**任何"init 过了但
    最终没 commit"的路径都必须走这里**：直接 dlclose 会解除映射而留下仍在运行
    的模块线程，执行失效代码即带崩整个 daemon（档头 §热加载注释与置毒路径
@@ -1043,7 +1043,7 @@ int module_fault_poison(int slot, const char* reason) {
     }
 
     /* exit 必须调（经围栏）才能 dlclose：模块可能持有**仍在运行的 pthread**
-       （如 ftp_module 的 ftp.conf 监视线程），而 exit 是模块停掉它们的唯一
+       （任何模块都可在 init 内起后台线程），而 exit 是模块停掉它们的唯一
        途径（约定由模块在 exit 内 join）。dlclose 解除镜像映射后，残留线程
        继续执行失效代码即 SIGSEGV——且该线程不在任何围栏窗口内（非框架发起
        的调用），归因失败 → 走原崩溃处理器 dump + re-raise → 整个 daemon

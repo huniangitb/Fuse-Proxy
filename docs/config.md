@@ -7,9 +7,13 @@
 | 用途 | 路径 |
 |------|------|
 | 主规则文件 | `<CONFIG_DIR>/injector.conf` |
-| 远程存储服务器（FTP/SFTP） | `<CONFIG_DIR>/ftp.conf`（语法见 `modules.md` §7.1） |
+| 远程存储服务器（FTP/SFTP） | `<CONFIG_DIR>/modules/ftp_module/ftp_module.conf`（语法见 `modules.md` §7.1） |
 | 应用规则（uid 0） | `<CONFIG_DIR>/App-rules/<pkg>.conf` |
 | 应用规则（其他用户） | `<CONFIG_DIR>/App-rules-<uid>/<pkg>.conf` |
+
+**模块自有配置在模块目录下**（`<CONFIG_DIR>/modules/<模块名>/<模块名>.conf`）：
+配置的**读取**由框架完成，读后经扁平视图下发给模块——模块不读文件、不跑 inotify
+（见 `modules.md` §6.1.1）。写到别处不会被读取；模块会 loud 报出它期望的确切路径。
 
 `CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/nsp_constants.h`，`common.h` 以别名暴露）。目录名约定：**uid 0 用 `App-rules`，uid 非 0 用 `App-rules-<uid>`**（由 `nsp_app_rule_dir` 合成）。主文件先加载，再扫描各 `App-rules*/` 目录；一个 `<pkg>.conf` 对应一个应用；目录缺失时仅 injector 会创建（只读加载方不 mkdir）。
 

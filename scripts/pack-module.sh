@@ -156,12 +156,26 @@ for d in "$MODULE_DIR"/bin/modules/*/; do
 done
 
 echo "== 同步 conf 配置 ..."
-for f in injector.conf ftp.conf; do
+for f in injector.conf; do
     if [[ -f "$CONF_DIR_SRC/$f" ]]; then
         cp -f "$CONF_DIR_SRC/$f" "$MODULE_DIR/conf/$f"
         echo "   - $f"
     fi
 done
+# 模块自有配置：<CONFIG_DIR>/modules/<模块名>/<模块名>.conf —— 框架读取后经
+# 扁平视图下发给模块（模块不读文件、不跑 inotify，见 docs/modules.md §6.1.1）。
+# 源码树里的 conf/modules/ 与设备上的 <CONFIG_DIR>/modules/ 同构，故整棵照搬。
+if [[ -d "$CONF_DIR_SRC/modules" ]]; then
+    mkdir -p "$MODULE_DIR/conf/modules"
+    cp -a "$CONF_DIR_SRC/modules/." "$MODULE_DIR/conf/modules/"
+    echo "   - modules/（模块自有配置）"
+fi
+# 旧版 <CONFIG_DIR>/ftp.conf 已不再是读取路径：留在骨架里会让人以为它生效。
+# 只删本脚本上一版会写出的那个位置，用户自建的其它文件不动。
+if [[ -f "$MODULE_DIR/conf/ftp.conf" ]]; then
+    rm -f "$MODULE_DIR/conf/ftp.conf"
+    echo "   - 移除陈旧 conf/ftp.conf（已迁到 conf/modules/ftp_module/ftp_module.conf）"
+fi
 
 # ===================== 2.2 同步 Zygisk 模块（双 ABI，必须齐全） =====================
 # injector 收到首次 IPC 通知即转被动模式停止周期扫描，缺 32 位会让跑在

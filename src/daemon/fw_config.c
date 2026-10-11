@@ -167,9 +167,21 @@ static ModuleSub* get_or_create_sub(const char* name) {
     return nullptr;
 }
 
-/* 记录是否需要下发给该订阅：结构记录（段头/文件归属）恒需要（规则要靠它们
-   解释作用域）；规则记录按订阅的类型名过滤。订阅为空 = 申请全部。 */
-static bool rec_wanted(const ModuleSub* s, const NspCfgRec* r) {
+/* 记录是否需要下发给该订阅。三类规则：
+   - 结构记录（段头 / App-rules 文件归属）恒需要（规则要靠它们解释作用域）；
+   - 规则记录按订阅的类型名过滤（订阅为空 = 申请全部）；
+   - **模块自有配置记录按 owner 过滤**：MODULE_FILE 标记「以下属于哪个模块」，
+     只有同名模块收得到（模块间配置隔离与规则隔离同等要求）。订阅只作用于 RULE，
+     模块必须能拿回自己的配置，否则「模块不读文件」这条 ABI 约定无从落地。
+   owner 由调用方跨记录维持（记录顺序即语义顺序）。 */
+static bool rec_wanted(const ModuleSub* s, const NspCfgRec* r, const char** owner) {
+    if (r->kind == NSP_CFG_REC_MODULE_FILE) {
+        *owner = r->text;
+        return *owner && strcmp(*owner, s->name) == 0;
+    }
+    if (r->kind == NSP_CFG_REC_MODULE_LINE)
+        return *owner && strcmp(*owner, s->name) == 0;
+    *owner = nullptr; /* 非模块配置记录：owner 段结束 */
     if (r->kind != NSP_CFG_REC_RULE) return true;
     if (s->type_count == 0) return true;
     if (!r->type) return false;
@@ -195,9 +207,10 @@ static void view_free(ConfigView* v) {
 /* 用当前主视图新建一份自包含快照（记录与字符串均深拷贝）。OOM 返回 NULL
    （调用方置空视图，绝不交出半成品/已释放指针）。订阅为空 = 不过滤。 */
 static ConfigView* view_create(const ModuleSub* s) {
+    const char* owner = nullptr;
     int n = 0;
     for (int i = 0; i < g_rec_count; i++) {
-        if (rec_wanted(s, &g_recs[i])) n++;
+        if (rec_wanted(s, &g_recs[i], &owner)) n++;
     }
     ConfigView* v = calloc(1, sizeof *v);
     if (!v) return nullptr;
@@ -211,8 +224,9 @@ static ConfigView* view_create(const ModuleSub* s) {
         return nullptr;
     }
     int k = 0;
+    owner = nullptr; /* 第二遍必须重置：owner 是顺序状态，两遍要逐字一致 */
     for (int i = 0; i < g_rec_count; i++) {
-        if (!rec_wanted(s, &g_recs[i])) continue;
+        if (!rec_wanted(s, &g_recs[i], &owner)) continue;
         NspCfgRec r = g_recs[i];
         r.file = rec_dup(g_recs[i].file);
         r.type = rec_dup(g_recs[i].type);
@@ -347,14 +361,30 @@ static void reload_sys_pkg_only(void) {
     sys_pkg_refresh();
 }
 
-/* 监听规则文件所在目录 + 各 App-rules* 子目录（沿用原模块内 watch 重建/归并模式） */
+/* 模块目录 watch 对账。模块目录**可能不存在**（部署里没有模块），此时无 watch
+   可挂但不算「未就位」——否则定时兜底会每 10s 白做一次全量重载。 */
+static bool mod_watch_sync(int ifd, CfgDirWatch* ws, int* n) {
+    const char* d = config_modules_dir();
+    if (!d || access(d, F_OK) != 0) {
+        *n = 0;
+        return true;
+    }
+    return cfg_watch_sync_subdirs(ifd, d, ws, n);
+}
+
+/* 监听规则文件所在目录 + 各 App-rules* 子目录 + 模块目录（各 <模块名>/ 子目录，
+   模块自有配置 <模块名>.conf 就在其中——模块自己不再跑 inotify，热重载靠这里） */
 static void* config_monitor_thread(void* arg) {
     (void)arg;
     int inotify_fd = -1;
     int wd = -1;
+    int wd_mod = -1; /* 模块目录顶层：只看子目录增删，用于重挂各模块目录的 watch */
     CfgDirWatch appw[CFG_WATCH_MAX];
     int appn = 0;
     bool appw_ok = false;
+    CfgDirWatch modw[CFG_WATCH_MAX];
+    int modn = 0;
+    bool modw_ok = false;
     time_t last_fallback = 0;
     while (!g_stop && !g_log_shutdown) {
         if (inotify_fd < 0) {
@@ -364,8 +394,16 @@ static void* config_monitor_thread(void* arg) {
                 continue;
             }
             appn = 0; /* 新 fd：旧 watch 全部作废，重新对账 */
+            modn = 0;
             wd = -1;
+            wd_mod = -1;
             appw_ok = false;
+            modw_ok = false;
+        }
+        if (wd_mod < 0) {
+            wd_mod = inotify_add_watch(inotify_fd, config_modules_dir(), NSP_CFG_WATCH_MASK);
+            /* 模块目录不存在不是错误（无模块部署）：保持 -1，靠 modw 对账与
+               定时兜底；不因此关掉整个监听 fd（规则文件仍要监听） */
         }
         if (wd < 0) {
             char dir[PATH_MAX];
@@ -388,24 +426,26 @@ static void* config_monitor_thread(void* arg) {
             }
         }
         if (!appw_ok) appw_ok = cfg_watch_sync(inotify_fd, CONFIG_DIR, appw, &appn);
+        if (!modw_ok) modw_ok = mod_watch_sync(inotify_fd, modw, &modn);
         struct pollfd pfds[2] = {{.fd = inotify_fd, .events = POLLIN},
                                  {.fd = g_wake[0], .events = POLLIN}};
         int pr = poll(pfds, 2, 5000);
         if (pr >= 0 && pfds[1].revents) break; /* 关闭唤醒：立即退出，不等超时 */
         if (pr < 0) {
             if (errno == EINTR) continue;
-            inotify_rm_watch(inotify_fd, wd);
+            if (wd >= 0) inotify_rm_watch(inotify_fd, wd);
             close(inotify_fd);
             inotify_fd = -1;
             continue;
         }
         if (pr == 0) {
-            /* 超时：App-rules watch 未就位时重试对账；仍不齐则定时重扫兜底
-               （节流到 10s，避免 watch 超限时持续整份重载 + 下发模块） */
-            if (!appw_ok) {
+            /* 超时：App-rules / 模块目录 watch 未就位时重试对账；仍不齐则定时重扫
+               兜底（节流到 10s，避免 watch 超限时持续整份重载 + 下发模块） */
+            if (!appw_ok || !modw_ok) {
                 appw_ok = cfg_watch_sync(inotify_fd, CONFIG_DIR, appw, &appn);
+                modw_ok = mod_watch_sync(inotify_fd, modw, &modn);
                 time_t now = time(nullptr);
-                if (!appw_ok && now - last_fallback >= 10) {
+                if ((!appw_ok || !modw_ok) && now - last_fallback >= 10) {
                     last_fallback = now;
                     reload_once(false); /* 定时兜底重扫：无并发的非规则事件 */
                 }
@@ -416,7 +456,7 @@ static void* config_monitor_thread(void* arg) {
         ssize_t len = read(inotify_fd, buf, sizeof(buf));
         if (len < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
-            inotify_rm_watch(inotify_fd, wd);
+            if (wd >= 0) inotify_rm_watch(inotify_fd, wd);
             close(inotify_fd);
             inotify_fd = -1;
             continue;
@@ -424,6 +464,7 @@ static void* config_monitor_thread(void* arg) {
         if (len == 0) continue;
         int inval_wd = -1;
         bool top_change = false;
+        bool mod_top_change = false;
         bool ev_rules = false, ev_pkg = false, ev_sys = false;
         for (char* p = buf; p < buf + len;) {
             struct inotify_event* ev = (struct inotify_event*)p;
@@ -442,8 +483,13 @@ static void* config_monitor_thread(void* arg) {
                     ev_rules = true;
                     break;
                 }
+            } else if (ev->wd == wd_mod) {
+                /* 模块目录顶层：模块可能被增删 → 重新对账各模块目录的 watch；
+                   模块目录名即模块名，配置随之增删，保守走全量重载 */
+                mod_top_change = true;
+                ev_rules = true;
             } else {
-                /* App-rules 子目录内的事件即规则文件变更；队列溢出 / IN_IGNORED
+                /* App-rules / 模块目录内的事件即配置变更；队列溢出 / IN_IGNORED
                    （wd 对不上）也落这里——保守按规则处理 */
                 ev_rules = true;
             }
@@ -460,14 +506,21 @@ static void* config_monitor_thread(void* arg) {
         else if (ev_sys)
             reload_sys_pkg_only();
         if (inval_wd == wd) wd = -1;
+        if (inval_wd == wd_mod) wd_mod = -1;
         for (int i = 0; i < appn; i++)
             if (appw[i].wd == inval_wd) appw[i].wd = -1;
+        for (int i = 0; i < modn; i++)
+            if (modw[i].wd == inval_wd) modw[i].wd = -1;
         if (top_change) appw_ok = cfg_watch_sync(inotify_fd, CONFIG_DIR, appw, &appn);
+        if (mod_top_change || !modw_ok) modw_ok = mod_watch_sync(inotify_fd, modw, &modn);
     }
     if (inotify_fd >= 0) {
         if (wd >= 0) inotify_rm_watch(inotify_fd, wd);
+        if (wd_mod >= 0) inotify_rm_watch(inotify_fd, wd_mod);
         for (int i = 0; i < appn; i++)
             if (appw[i].wd >= 0) inotify_rm_watch(inotify_fd, appw[i].wd);
+        for (int i = 0; i < modn; i++)
+            if (modw[i].wd >= 0) inotify_rm_watch(inotify_fd, modw[i].wd);
         close(inotify_fd);
     }
     return nullptr;

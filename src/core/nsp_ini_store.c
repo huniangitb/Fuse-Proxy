@@ -371,7 +371,8 @@ static void ini_fsync_dir(const char* path) {
 
 /* 跨进程串行化「读-改-写」：flock 于文件所在目录（目录 fd 上 flock 合法，
    无需额外锁文件）。rule_server 的多个请求线程/多个控制连接可能同时改
-   ftp.conf，两个写者各读同一份再各自写回会吃掉对方修改。取锁失败 fail-open
+   模块配置（如 ftp_module.conf），两个写者各读同一份再各自写回会吃掉对方修改。
+   取锁失败 fail-open
    （绝不因锁不可用而拒绝编辑），与 nsp_rule_file.c 一致。
    注意本函数只保护 save 自身；上层若做 read-modify-write，需在调用方持有
    同目录 flock（rule_server 侧已由其规则文件锁覆盖同一目录）。 */
@@ -414,7 +415,7 @@ int nsp_ini_save(const NspIniStore* s) {
         ini_unlock_dir(lock_fd);
         return -1;
     }
-    /* 0600：经本接口落盘的文件可能含明文密码（如 ftp.conf），与读侧
+    /* 0600：经本接口落盘的文件可能含明文密码（如 ftp_module.conf），与读侧
        "密码只写不读"的脱敏姿态一致；已存在文件的旧权限一并收紧 */
     fchmod(fileno(fp), S_IRUSR | S_IWUSR);
     for (size_t i = 0; i < s->count; i++) {

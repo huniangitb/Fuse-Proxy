@@ -20,7 +20,9 @@ FTP_ROOT = "/home/bdy/ftp"                     # vsftpd anon_root（chroot 根�
 FTP_UPLOAD = f"{FTP_ROOT}/upload"              # 匿名可写区（777），ftp.conf remote_dir=/upload
 FTP_UPLOAD2 = f"{FTP_ROOT}/upload2"            # 第二个 server 的可写区（A13 跨 server rename）
 MODDIR   = "/tmp/fuse_ftp_test/modules"
-CONF_FTP = "/tmp/Namespace-Proxy/ftp.conf"   # 与规则配置同目录（ftp_module init 经 get_rules_path 推导）
+# 模块自有配置：框架读 <modules-dir>/<模块名>/<模块名>.conf 后经视图下发
+# （模块不读文件、不跑 inotify——见 docs/modules.md §6.1.1）
+CONF_FTP = f"{MODDIR}/ftp_module/ftp_module.conf"
 CONF     = "/tmp/Namespace-Proxy/injector.conf"
 SERVER   = "云盘"
 SERVER2  = "备份"

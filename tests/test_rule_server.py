@@ -638,11 +638,14 @@ def check(proc, sock_name, conf_dir):
     expect("压力后 HIDE 规则数 ≤ 51（去重）", hide_cnt <= 51, f"HIDE={hide_cnt}")
     expect("压力后 HIDE 文件未丢失内容", hide_cnt > 0, f"HIDE={hide_cnt}")
 
-    # ---- FTP 服务器账号管理（ftp.conf，基于公共 nsp_ini_store） ----
-    # 初始无 ftp.conf：空表
+    # ---- FTP 服务器账号管理（模块配置文件，基于公共 nsp_ini_store） ----
+    # 落点 = 框架读取的同一路径 <config-dir>/modules/ftp_module/ftp_module.conf
+    # （模块不读文件、不跑 inotify——见 docs/modules.md §6.1.1）
+    ftp_path = os.path.join(conf_dir, "modules", "ftp_module", "ftp_module.conf")
+    # 初始无配置文件：空表
     r = send_cmd(proc, sock_name, {"cmd": "FTP_LIST"})
     expect("FTP_LIST 空表", r.get("status") == "ok" and r["data"]["servers"] == []
-           and r["data"]["file"].endswith("ftp.conf"), r)
+           and r["data"]["file"].endswith("ftp_module.conf"), r)
     # 新建中文段名服务器
     r = send_cmd(proc, sock_name, {"cmd": "FTP_ADD", "name": "云盘", "host": "192.168.1.100",
                                    "port": 21, "user": "myuser", "password": "mypass",
@@ -686,7 +689,7 @@ def check(proc, sock_name, conf_dir):
                                    "remote_dir": "/"})
     expect("FTP_ADD 换密码落盘", r.get("status") == "ok" and r["data"]["changed"] is True
            and r["data"]["duplicate"] is False, r)
-    ftp_text = open(os.path.join(conf_dir, "ftp.conf"), encoding="utf-8").read()
+    ftp_text = open(ftp_path, encoding="utf-8").read()
     expect("FTP_ADD 新密码已写入", "password = newpass" in ftp_text
            and "password = mypass" not in ftp_text, ftp_text)
     # 含 # 的值拒绝（读侧以 # 为注释起点，放行会被截断）
@@ -696,7 +699,7 @@ def check(proc, sock_name, conf_dir):
     expect("FTP_SET host含#拒绝", r.get("status") == "error", r)
     # 落盘权限 0600（明文密码）
     import stat as _stat
-    mode = _stat.S_IMODE(os.stat(os.path.join(conf_dir, "ftp.conf")).st_mode)
+    mode = _stat.S_IMODE(os.stat(ftp_path).st_mode)
     expect("ftp.conf 权限 0600", mode == 0o600, oct(mode))
     # pass 别名归一 password
     r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "公共盘", "key": "pass", "value": "anonpass"})
@@ -727,7 +730,7 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": "不存在"})
     expect("FTP_REMOVE 不存在拒绝", r.get("status") == "error", r)
     # 文件级验证：注释保留、可被 ftp_conf 语义解析
-    ftp_text = open(os.path.join(conf_dir, "ftp.conf"), encoding="utf-8").read()
+    ftp_text = open(ftp_path, encoding="utf-8").read()
     expect("ftp.conf 含两段", "[云盘]" in ftp_text and "[公共盘]" in ftp_text, ftp_text)
     expect("ftp.conf 密码落盘（轮换后）", "password = newpass" in ftp_text, ftp_text)
     # REMOVE

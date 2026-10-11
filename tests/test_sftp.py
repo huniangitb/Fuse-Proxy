@@ -31,14 +31,17 @@ BASE       = "/tmp/fuse_sftp_test"
 REMOTE     = f"{BASE}/remote"          # sftp-server 暴露的真实目录（remote_dir）
 SSH_DIR    = f"{BASE}/ssh"
 CONF_DIR   = f"{BASE}/conf"
-CONF_FTP   = f"{CONF_DIR}/ftp.conf"
+MODDIR     = f"{BASE}/modules"
+# 模块自有配置：框架读 <modules-dir>/<模块名>/<模块名>.conf 后经视图下发
+# （模块不读文件、不跑 inotify——见 docs/modules.md §6.1.1）。
+# 驱动段（不经 FUSE）仍用 ftp_conf_load 直接读同一份文件，故两段共用此路径。
+CONF_FTP   = f"{MODDIR}/ftp_module/ftp_module.conf"
 SERVER     = "SFTP盘"
 VP         = f"/{SERVER}"
 PORT       = 2222
 REPO       = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MNT        = f"{BASE}/mnt"
 STORAGE    = f"{BASE}/storage"
-MODDIR     = f"{BASE}/modules"
 CONF       = f"{CONF_DIR}/injector.conf"
 DAEMON     = os.environ.get("FUSE_DAEMON") or f"{REPO}/build_gnu/fuse_daemon"
 FTP_MOD_SO = os.environ.get("FTP_MODULE_SO") or f"{REPO}/build_gnu/ftp_module.so"
@@ -103,6 +106,7 @@ LogLevel ERROR
         proc.terminate(); skip("ssh-keyscan 未取到主机密钥")
     Path(f"{SSH_DIR}/known_hosts").write_text(ks.stdout)
 
+    os.makedirs(os.path.dirname(CONF_FTP), exist_ok=True)
     with open(CONF_FTP, "w") as fh:
         fh.write(f"""[{SERVER}]
 proto = sftp

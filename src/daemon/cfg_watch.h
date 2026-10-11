@@ -36,4 +36,9 @@ typedef struct {
    调用方须以定时重扫兜底。已删目录的内核 watch 自动失效，此处只做表内清理。 */
 bool cfg_watch_sync(int ifd, const char* base_dir, CfgDirWatch* ws, int* n);
 
+/* 同上，但对账 base_dir 下**全部**子目录（不做目录名过滤）。
+   模块配置目录用：`<modules_dir>/<模块名>/` 下同时放 `<模块名>.so` 与
+   `<模块名>.conf`，目录名没有可判的前缀，全部挂上即可。 */
+bool cfg_watch_sync_subdirs(int ifd, const char* base_dir, CfgDirWatch* ws, int* n);
+
 #endif /* NSP_CFG_WATCH_H */

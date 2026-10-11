@@ -16,12 +16,22 @@
  */
 #include <stdint.h>
 
-/* 记录种类。顺序即语义顺序：主文件记录在前，App-rules 记录在后。 */
+/* 记录种类。顺序即语义顺序：主文件记录在前，App-rules 记录在后，
+   模块配置文件记录最后。 */
 typedef enum {
     NSP_CFG_REC_SECTION = 0,  /* 段头：[名称] 可选 ON/OFF；text=段名（不含方括号与 :uid） */
     NSP_CFG_REC_RULE,         /* 规则行：text=已去注释/首尾空白的行文本，type=首 token */
     NSP_CFG_REC_APP_FILE,     /* 进入 App-rules 文件：text=包名，uid=归属用户 */
     NSP_CFG_REC_APP_DISABLED, /* 停用标记（<pkg>.conf.disabled 且无 .conf）：text=包名 */
+    /* ---- 模块配置文件（<modules_dir>/<模块名>/<模块名>.conf）----
+       模块**不读文件、不跑 inotify**，其自有配置同样经框架读取后下发：
+       MODULE_FILE 标记「以下记录属于哪个模块」，随后的 MODULE_LINE 是已由框架
+       读出（去 \r\n、去首尾空白，注释与键值语义留给模块）的原始行。
+       这两类记录**按 owner 过滤**：只下发给同名模块，其他模块看不到——
+       模块间配置隔离与规则隔离同等要求。订阅（subscribe_rules）只作用于
+       RULE 记录，不影响本模块拿回自己的配置。 */
+    NSP_CFG_REC_MODULE_FILE, /* 进入模块配置文件：text=模块名（须与目录名/.so 名一致） */
+    NSP_CFG_REC_MODULE_LINE, /* 模块配置文件的一行：text=行文本（未做注释/键值解析） */
 } NspCfgRecKind;
 
 typedef struct {
@@ -42,6 +52,9 @@ typedef struct {
     int count;
 } NspModuleConfig;
 
-#define NSP_CFG_VIEW_VERSION 1u
+/* 视图协议版本。2 = 追加 MODULE_FILE / MODULE_LINE（模块配置文件下发）。
+   版本 1 的旧模块看到未知 kind 会自行忽略（`default: break`），故为向后兼容的
+   追加；但**依赖下发拿到自有配置**的模块必须按 2 实现，否则拿不到配置。 */
+#define NSP_CFG_VIEW_VERSION 2u
 
 #endif /* NSP_CFG_VIEW_H */

@@ -310,7 +310,7 @@ static int g_backend_cap = 0;   /* 指针数组容量 */
 /* 后端数组全局锁 + 热重载标志：
    - g_backend_glock：保护 g_backend_count/cap 与 g_backends 数组的增删扫描
      （find/add/clear/retry_all），杜绝热重载清表与在途查找的数组撕裂
-   - g_backend_clearing：ftp.conf 热重载（ftp_backend_clear）期间置位，
+   - g_backend_clearing：模块配置热重载（ftp_backend_clear）期间置位，
      find 立即拒绝新调用，保证 clear 之后不会有新操作触碰已清理的后端 */
 static pthread_mutex_t g_backend_glock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic bool g_backend_clearing = false;

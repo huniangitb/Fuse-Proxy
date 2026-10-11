@@ -213,9 +213,12 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 ### 6.1.1 配置读取归属（V4）
 
-**读取完全由框架完成**：框架读 `injector.conf` 与 `App-rules*`，完成行级词法
+**读取完全由框架完成**：框架读 `injector.conf`、`App-rules*`，以及各模块的
+自有配置 `<modules_dir>/<模块名>/<模块名>.conf`，完成行级词法
 （去注释/首尾空白）与段头识别（`[段]` / `ON|OFF` / `:uid`），产出扁平记录视图
-（`NspCfgRec`：段头、规则行、App-rules 文件归属）。**模块不读文件、不跑 inotify。**
+（`NspCfgRec`：段头、规则行、App-rules 文件归属、**模块配置文件标记与行**）。
+**模块不读文件、不跑 inotify**——包括它自己的配置：`ftp.conf` 的读取与热重载
+都由框架负责，模块只在 `set_config_listener` 回调里消费下发的行。
 
 模块侧流程：
 
@@ -229,6 +232,17 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
 
 `NspModuleConfig.generation` 在每次重载递增，模块可据此跳过无变化的重建。
 段头与 App-rules 归属记录**恒下发**（规则要靠它们解释作用域），过滤只作用于规则行。
+
+**模块自有配置的记录与过滤**（视图版本 2 追加）：
+
+- `NSP_CFG_REC_MODULE_FILE`：`text` = 模块名，`file` = 该模块配置文件的**确切
+  路径**。**无条件下发**——文件不存在时也发，故模块总能报出它期望的路径而不是
+  猜一个。随后的 `NSP_CFG_REC_MODULE_LINE` 是框架读出的原始行（只去 `\r\n` 与
+  首尾空白，**不剥注释、不切键值**：注释边界与键值语法是模块的配置语法）。
+- 这两类记录**按 owner 过滤**：只下发给同名模块，其他模块看不到（配置隔离与
+  规则隔离同等要求）。`subscribe_rules` 只作用于 RULE 记录，不影响模块拿回自己的配置。
+- 配置内容逐字未变时模块可自行跳过重建（如 `ftp_module` 按行取指纹）——他人配置
+  变化同样会触发回调，无谓重建会波及在途句柄。
 
 > 注意：`uid.map`（uid→包名）与 `sys_pkgs.cache`（系统应用表）**框架与模块各自读取**
 > （它们不是规则配置而是数据表，故不经视图下发）：框架侧用于日志标签与 `MONITOR`
@@ -293,7 +307,7 @@ aarch64-linux-android35-clang -shared -fPIC -std=c23 \
 
 ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 `log`/`get_real_root` 字段，`NspModuleOps` 也删除了字段——**不是**仅尾部兼容扩展，故必须递增 ABI 版本并要求 V1 模块重编译（`NspResolveResult` 由 V1 的 16596 字节降到 V2 的 8336 字节）；V3 把 `NspResolveResult` 换成声明式的 `NspPathDecision`（结构降到约 4.2KB）并要求 V1/V2 重编译。校验拒绝发生在 `dlopen` 之后（见 §3），旧模块的构造器与 `RTLD_NOW` 符号解析会先于 ABI 检查执行。V4 属同类的**不兼容变更**（删 `NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`），故递增到 4 并拒绝 V1/V2/V3。V5 同理（`backend_readdir` 加 `offset` 分页 + 超长名跳过语义），递增到 5 并拒绝 V1/V2/V3/V4——V4 模块无分页，大目录静默丢尾。
 
-**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。模块版本区分按 `.so` 文件 mtime 秒粒度（`st.st_mtime`）：同秒内替换不放行 ban、不触发重载，需 `touch` 续秒或等下次变化。**ban 记录还带框架 ABI 维度**（行末第 5 字段 = 落 ban 时的 `NSP_MODULE_ABI_VERSION`）：框架 ABI 与记录不同（或记录为无该字段的旧格式）即视为 stale 丢弃并放行——否则「旧框架因 ABI 不匹配落 ban → 用户升级框架到新 ABI」后，模块 mtime 未变、旧 ban 永久命中，**新框架明明支持该模块却再也加载不回来**（升级框架通常不会重装/触碰 `.so`）。`LIST_MODULES` 应答与 `ftp.conf` 服务器表、FTP 后端表同理动态化。`ftp.conf` 失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
+**注册表容量（V5）**：加载器注册表动态翻倍（初容 16，硬上限 1024，由 fh 槽位 10 位编码决定），无 16 上限静默拒载；静态快照数组（槽位原子快照/围栏/guard）按硬上限分配；无锁扫描只扫到高水位（`g_backend_hwm`，单调只增）。模块版本区分按 `.so` 文件 mtime 秒粒度（`st.st_mtime`）：同秒内替换不放行 ban、不触发重载，需 `touch` 续秒或等下次变化。**ban 记录还带框架 ABI 维度**（行末第 5 字段 = 落 ban 时的 `NSP_MODULE_ABI_VERSION`）：框架 ABI 与记录不同（或记录为无该字段的旧格式）即视为 stale 丢弃并放行——否则「旧框架因 ABI 不匹配落 ban → 用户升级框架到新 ABI」后，模块 mtime 未变、旧 ban 永久命中，**新框架明明支持该模块却再也加载不回来**（升级框架通常不会重装/触碰 `.so`）。`LIST_MODULES` 应答与模块配置里的服务器表、FTP 后端表同理动态化。模块配置失败闭合：段名≥64 字节或任一字段（`host`/`user`/`pass`/`remote_dir`）超长即整段作废，绝不带截断值连接；目录 `mtime` 回查的父级 `LIST` URL 组装失败亦直接返回失败，不拿截断 URL 列错目录。
 
 ## 7. 参考实现
 
@@ -304,11 +318,11 @@ ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 
 
 **FTP 控制面并发模型（`src/modules/ftp/ftp_mux.c`）**：`getattr`/`readdir`/`DELE`/`MKD`/`RMD`/`RNFR`/空文件 `STOR`/`TRUNCATE` 等控制操作交给每后端一个 `CURLM` 句柄，由**一个 epoll 事件线程**驱动（`curl_multi_socket_action` + `CURLMOPT_SOCKET/TIMERFUNCTION` 接入 epoll；提交线程只入队 + eventfd 唤醒，绝不触碰 multi——libcurl 多接口非线程安全）。收益：控制连接在 multi 的连接缓存里长期复用（免重复 USER/PASS 登录），多个 FUSE 线程的控制操作并行在飞（同服务器并发控制连接上限 `CURLMOPT_MAX_HOST_CONNECTIONS`，默认 4），且**业务失败不再重建连接**——旧实现在任何失败（含 550 不存在）都 `curl_easy_cleanup` 重建共享句柄，让下一次操作白付一次 TCP + 登录往返。数据面（读下载线程 / 写流式上传）仍用每文件独立句柄 + 阻塞 `curl_easy_perform`：它们本就互不竞争，且背压模型是「缓冲满即中止传输」（`write_cb` 返回 0 → `CURLE_WRITE_ERROR`），与事件循环驱动不兼容。回归用例 `test_ftp_parallel.py`（并发正确性 / 连接数 / 延迟收敛 / 热重载竞态）。
 
-FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。规则由内建引擎解释并置 `is_ftp`，框架据此把该路径分派给后端模块（不再有 `FTP_<段名>` 变量注册机制）。**协议（FTP/SFTP）由 `ftp.conf` 的 `proto` 决定，框架侧零改动**（规则类型、`is_ftp` 分派、模块 ABI 都不变）。
+FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。规则由内建引擎解释并置 `is_ftp`，框架据此把该路径分派给后端模块（不再有 `FTP_<段名>` 变量注册机制）。**协议（FTP/SFTP）由模块配置的 `proto` 决定，框架侧零改动**（规则类型、`is_ftp` 分派、模块 ABI 都不变）。
 
 ### 7.1 SFTP（`proto = sftp`）
 
-SFTP 复用同一个模块与同一套线程/缓存/句柄/熔断基础设施，由 libcurl 的 SSH 后端（libssh2）承载；`ftp.conf` 段增加：
+SFTP 复用同一个模块与同一套线程/缓存/句柄/熔断基础设施，由 libcurl 的 SSH 后端（libssh2）承载；模块配置段增加：
 
 ```ini
 [备份]

@@ -39,7 +39,7 @@ static bool set_str_checked(char* dst, size_t sz, const char* v) {
     return true;
 }
 
-#define FTP_CONF_LINE_MAX 1024
+/* FTP_CONF_LINE_MAX 的权威定义在 ftp_conf.h（视图形态也要用它判定超长行） */
 
 /* 新段槽位：动态翻倍（初容 FTP_CONF_MAX_SERVERS），OOM 返回 NULL
    （调用方将后续键值静默丢弃——整段失效但不断解析；OOM 极罕见）。 */
@@ -64,138 +64,148 @@ static FtpServerCfg* ftp_conf_new_server(FtpServerList* out) {
     return cur;
 }
 
-int ftp_conf_load(const char* path, FtpServerList* out) {
+/* ================= 行级状态机（文件形态与配置下发视图共用） =================
+ * 模块**不读文件、不跑 inotify**（nsp_module.h / docs/modules.md §6.1.1）：ftp.conf
+ * 由框架读出后经扁平视图下发（NSP_CFG_REC_MODULE_LINE），本模块把下发的行喂进
+ * 同一个状态机。两种形态（自己 fopen 读 / 框架喂行）共用这一份解析，避免出现
+ * 「文件形态」与「下发形态」两份语义——本仓库 A26 就是同源缺陷被修了两次。 */
+
+void ftp_conf_parse_begin(FtpConfParse* st, FtpServerList* out, const char* path) {
+    memset(st, 0, sizeof *st);
+    st->out = out;
+    st->path = path;
     memset(out, 0, sizeof *out);
-    FILE* fp = fopen(path, "r");
-    if (!fp) return -1;
+}
 
-    char* line = nullptr;
-    size_t line_cap = 0;
-    char cur_section[128] = {0};
-    bool cur_section_bad = false; /* 段名超长：整段跳过（不建 server，不消费键） */
-    FtpServerCfg* cur = NULL;
-    int lineno = 0;
+/* 读层已丢弃的超长行（> NSP_CONFIG_LINE_MAX，永远到不了 parse_line）：
+   与 parse_line 内的超长判定同策——整段 fail-closed。 */
+void ftp_conf_parse_overlong(FtpConfParse* st) {
+    LOG_WRN("%s 第 %d 行超长（>%d 字节），整行跳过", st->path ? st->path : "模块配置",
+            st->lineno, FTP_CONF_LINE_MAX);
+    /* 超长值行被整行丢弃：字段会静默回默认（fail-open 缝隙），故整段作废
+       fail-closed。长注释行亦毒化段落——可接受，配合本日志可查。 */
+    if (st->cur) st->cur->bad = true;
+}
 
-    /* 有界动态行读取：超长行整行丢弃（长行永不裂成“段头碎片 + 键值碎片”） */
-    for (;;) {
-        int r = nsp_getline_capped(fp, &line, &line_cap, FTP_CONF_LINE_MAX, NULL);
-        if (r == 0) break;
-        lineno++;
-        if (r == -2) {
-            LOG_WRN("ftp.conf %s 第 %d 行超长（>%d 字节），整行跳过", path, lineno,
-                    FTP_CONF_LINE_MAX);
-            /* 超长值行被整行丢弃：字段会静默回默认（fail-open 缝隙），故整段作废
-               fail-closed。长注释行亦毒化段落——可接受，配合本日志可查。 */
-            if (cur) cur->bad = true;
-            continue; /* 超长整行跳过（段声明亦不生效） */
-        }
-        if (r < 0) break;
-        strip_comment(line);
-        char* s = nsp_str_trim(line);
-        if (!s[0]) continue;
-
-        if (s[0] == '[') {
-            char* close = strchr(s, ']');
-            if (!close) continue;
-            *close = '\0';
-            const char* sec = nsp_str_trim(s + 1);
-            /* 段名超长（≥64，含中文段名按字节计）：整段跳过，不建 server。
-               截断段名会造成虚拟前缀碰撞（/云盘… 截成 /云盘），失败闭合。 */
-            if (strlen(sec) >= sizeof(((FtpServerCfg*)0)->name)) {
-                cur_section[0] = '\0';
-                cur_section_bad = true;
-                cur = NULL;
-                continue;
-            }
-            if (!set_str_checked(cur_section, sizeof cur_section, sec)) {
-                cur_section[0] = '\0';
-                cur_section_bad = true;
-                cur = NULL;
-                continue;
-            }
-            cur_section_bad = false;
-            if (strcmp(cur_section, "GLOBAL") == 0) {
-                cur = NULL;
-                continue;
-            }
-            cur = ftp_conf_new_server(out);
-            if (cur) {
-                /* 段名长度已校验，必成功；失败亦标 bad（纵深防御） */
-                if (!set_str_checked(cur->name, sizeof cur->name, cur_section))
-                    cur->bad = true;
-            }
-            continue;
-        }
-
-        char* eq = strchr(s, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char* key = nsp_str_trim(s);
-        char* val = nsp_str_trim(eq + 1);
-        if (!key[0]) continue;
-
-        if (!cur || cur_section_bad) {
-            /* [GLOBAL] 段键（虚拟前缀 = /段名，不再有 mount_base 语义）；
-               超长段名后的键一律丢弃（cur==NULL 已保证） */
-            continue;
-        }
-
-        if (strcmp(key, "host") == 0) {
-            if (!set_str_checked(cur->host, sizeof cur->host, val)) cur->bad = true;
-        } else if (strcmp(key, "port") == 0) {
-            /* 端口范围校验：此前 atoi 直取，0/负数/超 65535/非数字（atoi→0）
-               全被照收，最终以 "ftp://host:0/" 形式交给 libcurl，报错信息
-               完全指不到配置行。非法值整段作废（同字段超长的失败闭合姿态），
-               并 loud 告警指出段名与原始值。 */
-            char* endp = NULL;
-            long v = strtol(val, &endp, 10);
-            if (endp == val || *nsp_str_trim(endp) != '\0' || v < 1 || v > 65535) {
-                LOG_WRN("ftp.conf [%s] port 非法（\"%s\"，须 1..65535），整段作废", cur->name, val);
-                cur->bad = true;
-            } else {
-                cur->port = (int)v;
-            }
-        } else if (strcmp(key, "user") == 0) {
-            if (!set_str_checked(cur->user, sizeof cur->user, val)) cur->bad = true;
-        } else if (strcmp(key, "password") == 0 || strcmp(key, "pass") == 0) {
-            if (!set_str_checked(cur->pass, sizeof cur->pass, val)) cur->bad = true;
-        } else if (strcmp(key, "remote_dir") == 0) {
-            if (!set_str_checked(cur->remote_dir, sizeof cur->remote_dir, val)) cur->bad = true;
-        } else if (strcmp(key, "proto") == 0 || strcmp(key, "protocol") == 0) {
-            /* 协议：ftp（默认）/ sftp。拼错即整段作废——静默回退 ftp 会让
-               用户以为连的是 SFTP，实际把账号密码发到明文 FTP 上 */
-            if (strcasecmp(val, "ftp") == 0) {
-                cur->sftp = false;
-            } else if (strcasecmp(val, "sftp") == 0) {
-                cur->sftp = true;
-            } else {
-                LOG_WRN("ftp.conf [%s] proto 非法（\"%s\"，须 ftp|sftp），整段作废", cur->name, val);
-                cur->bad = true;
-            }
-        } else if (strcmp(key, "key_file") == 0 || strcmp(key, "identity_file") == 0) {
-            if (!set_str_checked(cur->key_file, sizeof cur->key_file, val)) cur->bad = true;
-        } else if (strcmp(key, "key_pass") == 0 || strcmp(key, "key_passphrase") == 0) {
-            if (!set_str_checked(cur->key_pass, sizeof cur->key_pass, val)) cur->bad = true;
-        } else if (strcmp(key, "known_hosts") == 0) {
-            if (!set_str_checked(cur->known_hosts, sizeof cur->known_hosts, val)) cur->bad = true;
-        } else if (strcmp(key, "host_key_check") == 0) {
-            /* 三态解析：只认明确的开关词，其余整段作废（同 port 的失败闭合姿态） */
-            if (strcasecmp(val, "on") == 0 || strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0) {
-                cur->host_key_check = true;
-            } else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "false") == 0 ||
-                       strcmp(val, "0") == 0) {
-                cur->host_key_check = false;
-            } else {
-                LOG_WRN("ftp.conf [%s] host_key_check 非法（\"%s\"，须 on|off），整段作废",
-                        cur->name, val);
-                cur->bad = true;
-            }
-        }
-        /* 其他键忽略（passive/encoding 等预留） */
+/* 喂入一行（未去注释、未去首尾空白，与文件形态的原始行同形）。
+   入参为**只读**（视图字符串归框架所有，模块不得改写），故先复制进本地缓冲
+   再原地处理——strip_comment / 键值切分都要写缓冲区。 */
+void ftp_conf_parse_line(FtpConfParse* st, const char* line) {
+    st->lineno++;
+    size_t len = strlen(line);
+    if (len >= FTP_CONF_LINE_MAX) {
+        ftp_conf_parse_overlong(st);
+        return;
     }
-    free(line);
-    fclose(fp);
+    char buf[FTP_CONF_LINE_MAX];
+    memcpy(buf, line, len + 1);
+    strip_comment(buf);
+    char* s = nsp_str_trim(buf);
+    if (!s[0]) return;
 
+    if (s[0] == '[') {
+        char* close = strchr(s, ']');
+        if (!close) return;
+        *close = '\0';
+        const char* sec = nsp_str_trim(s + 1);
+        /* 段名超长（≥64，含中文段名按字节计）：整段跳过，不建 server。
+           截断段名会造成虚拟前缀碰撞（/云盘… 截成 /云盘），失败闭合。 */
+        if (strlen(sec) >= sizeof(st->cur_section)) {
+            st->cur_section[0] = '\0';
+            st->cur_section_bad = true;
+            st->cur = NULL;
+            return;
+        }
+        if (!set_str_checked(st->cur_section, sizeof st->cur_section, sec)) {
+            st->cur_section[0] = '\0';
+            st->cur_section_bad = true;
+            st->cur = NULL;
+            return;
+        }
+        st->cur_section_bad = false;
+        if (strcmp(st->cur_section, "GLOBAL") == 0) {
+            st->cur = NULL;
+            return;
+        }
+        st->cur = ftp_conf_new_server(st->out);
+        if (st->cur) {
+            /* 段名长度已校验，必成功；失败亦标 bad（纵深防御） */
+            if (!set_str_checked(st->cur->name, sizeof st->cur->name, st->cur_section))
+                st->cur->bad = true;
+        }
+        return;
+    }
+
+    char* eq = strchr(s, '=');
+    if (!eq) return;
+    *eq = '\0';
+    char* key = nsp_str_trim(s);
+    char* val = nsp_str_trim(eq + 1);
+    if (!key[0]) return;
+
+    FtpServerCfg* cur = st->cur;
+    if (!cur || st->cur_section_bad) {
+        /* [GLOBAL] 段键（虚拟前缀 = /段名，不再有 mount_base 语义）；
+           超长段名后的键一律丢弃（cur==NULL 已保证） */
+        return;
+    }
+
+    if (strcmp(key, "host") == 0) {
+        if (!set_str_checked(cur->host, sizeof cur->host, val)) cur->bad = true;
+    } else if (strcmp(key, "port") == 0) {
+        /* 端口范围校验：此前 atoi 直取，0/负数/超 65535/非数字（atoi→0）
+           全被照收，最终以 "ftp://host:0/" 形式交给 libcurl，报错信息
+           完全指不到配置行。非法值整段作废（同字段超长的失败闭合姿态），
+           并 loud 告警指出段名与原始值。 */
+        char* endp = NULL;
+        long v = strtol(val, &endp, 10);
+        if (endp == val || *nsp_str_trim(endp) != '\0' || v < 1 || v > 65535) {
+            LOG_WRN("模块配置 [%s] port 非法（\"%s\"，须 1..65535），整段作废", cur->name, val);
+            cur->bad = true;
+        } else {
+            cur->port = (int)v;
+        }
+    } else if (strcmp(key, "user") == 0) {
+        if (!set_str_checked(cur->user, sizeof cur->user, val)) cur->bad = true;
+    } else if (strcmp(key, "password") == 0 || strcmp(key, "pass") == 0) {
+        if (!set_str_checked(cur->pass, sizeof cur->pass, val)) cur->bad = true;
+    } else if (strcmp(key, "remote_dir") == 0) {
+        if (!set_str_checked(cur->remote_dir, sizeof cur->remote_dir, val)) cur->bad = true;
+    } else if (strcmp(key, "proto") == 0 || strcmp(key, "protocol") == 0) {
+        /* 协议：ftp（默认）/ sftp。拼错即整段作废——静默回退 ftp 会让
+           用户以为连的是 SFTP，实际把账号密码发到明文 FTP 上 */
+        if (strcasecmp(val, "ftp") == 0) {
+            cur->sftp = false;
+        } else if (strcasecmp(val, "sftp") == 0) {
+            cur->sftp = true;
+        } else {
+            LOG_WRN("模块配置 [%s] proto 非法（\"%s\"，须 ftp|sftp），整段作废", cur->name, val);
+            cur->bad = true;
+        }
+    } else if (strcmp(key, "key_file") == 0 || strcmp(key, "identity_file") == 0) {
+        if (!set_str_checked(cur->key_file, sizeof cur->key_file, val)) cur->bad = true;
+    } else if (strcmp(key, "key_pass") == 0 || strcmp(key, "key_passphrase") == 0) {
+        if (!set_str_checked(cur->key_pass, sizeof cur->key_pass, val)) cur->bad = true;
+    } else if (strcmp(key, "known_hosts") == 0) {
+        if (!set_str_checked(cur->known_hosts, sizeof cur->known_hosts, val)) cur->bad = true;
+    } else if (strcmp(key, "host_key_check") == 0) {
+        /* 三态解析：只认明确的开关词，其余整段作废（同 port 的失败闭合姿态） */
+        if (strcasecmp(val, "on") == 0 || strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+            cur->host_key_check = true;
+        } else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "false") == 0 ||
+                   strcmp(val, "0") == 0) {
+            cur->host_key_check = false;
+        } else {
+            LOG_WRN("模块配置 [%s] host_key_check 非法（\"%s\"，须 on|off），整段作废",
+                    cur->name, val);
+            cur->bad = true;
+        }
+    }
+    /* 其他键忽略（passive/encoding 等预留） */
+}
+
+int ftp_conf_parse_end(FtpConfParse* st) {
+    FtpServerList* out = st->out;
     /* 未显式配置端口：按协议补默认（ftp 21 / sftp 22）。放在段作废过滤之前，
        与配置项书写顺序无关（proto 可出现在 port 之后） */
     for (int i = 0; i < out->count; i++)
@@ -206,7 +216,7 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
     int n = 0;
     for (int i = 0; i < out->count; i++) {
         if (out->servers[i].bad) {
-            LOG_WRN("ftp.conf [%s] 字段超长，整段作废", out->servers[i].name);
+            LOG_WRN("模块配置 [%s] 字段超长，整段作废", out->servers[i].name);
             continue;
         }
         if (out->servers[i].host[0]) {
@@ -216,6 +226,31 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
     }
     out->count = n;
     return out->count > 0 ? 0 : -1;
+}
+
+int ftp_conf_load(const char* path, FtpServerList* out) {
+    FtpConfParse st;
+    ftp_conf_parse_begin(&st, out, path);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    char* line = nullptr;
+    size_t line_cap = 0;
+    /* 有界动态行读取：超长行整行丢弃（长行永不裂成“段头碎片 + 键值碎片”） */
+    for (;;) {
+        int r = nsp_getline_capped(fp, &line, &line_cap, FTP_CONF_LINE_MAX, NULL);
+        if (r == 0) break;
+        if (r == -2) {
+            st.lineno++;
+            ftp_conf_parse_overlong(&st);
+            continue; /* 超长整行跳过（段声明亦不生效） */
+        }
+        if (r < 0) break;
+        ftp_conf_parse_line(&st, line);
+    }
+    free(line);
+    fclose(fp);
+    return ftp_conf_parse_end(&st);
 }
 
 void ftp_conf_free(FtpServerList* list) {

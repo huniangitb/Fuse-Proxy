@@ -4,18 +4,12 @@
 #include "ftp_conf.h"
 #include "ftp_backend.h"
 #include "nsp_module.h"
-#include "nsp_util.h" /* nsp_set_thread_name（线程语义化命名） */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <limits.h>
 #include <unistd.h>
-#include <libgen.h>
-#include <curl/curl.h> /* curl_global_init */
-#include <pthread.h>
-#include <poll.h>
-#include <sys/inotify.h>
+#include <curl/curl.h>
 
 /*
  * ftp_module.so — FTP 存储后端模块（由 fuse_daemon dlopen 加载）
@@ -24,22 +18,21 @@
  * 本模块只提供"目标功能（FTP）的操作方法"（backend_*），框架在路径命中
  * （backend_match）时调用，最终执行仍由框架的 FUSE 回调驱动。
  *
- * 功能：解析 ftp.conf（与规则配置同目录），注册每个 [服务器] 段的虚拟前缀：
+ * 功能：按框架下发的配置注册每个 [服务器] 段的虚拟前缀：
  *   虚拟前缀 = /<段名>（如 /云盘）——FUSE 剥离 /0/ 后的原始路径直接命中，
  *   无需 REDIRECT 规则或变量。
- * 支持 ftp.conf 热加载（inotify 监听，变更后重建后端前缀表）；
- * FTP 服务器不可用时由后台线程每 1 分钟重连探活。
  *
- * ftp.conf 位置：与 --rules= 参数同目录（Android 为 /data/Namespace-Proxy/ftp.conf）
+ * **配置来源（不读文件、不跑 inotify）**：配置的读取完全在框架侧——框架读
+ *   <modules_dir>/ftp_module/ftp_module.conf（模块目录约定，见 docs/modules.md
+ *   §6.1.1）后经扁平视图下发（NSP_CFG_REC_MODULE_FILE / MODULE_LINE，按 owner
+ *   过滤只发给本模块）。本模块在 init 内注册 set_config_listener，框架在 init
+ *   返回后立即回调一次，之后每次热重载再回调；回调内用视图重建后端前缀表。
+ *   ftp.conf 变更因此由框架的 inotify 感知，模块自身不再持有任何监听线程。
+ *
+ * FTP 服务器不可用时由后台线程每 1 分钟重连探活。
  */
 
-/* 后端数量无上限（ftp_backend 指针数组 + 加载器注册表均动态扩充） */
-
-static char g_ftp_conf_path[PATH_MAX] = CONFIG_DIR "/ftp.conf";
-
-/* ftp.conf 热加载监控线程 */
-static pthread_t g_hotload_tid = 0;
-static volatile sig_atomic_t g_hotload_stop = 0;
+#define FTP_MODULE_NAME "ftp_module"
 
 /* 运行期能力探测：本 libcurl 是否编入了 SFTP。
    编译期无法从 curl 头判断——CURL_VERSION_LIBSSH2 这个特性位在 curl 8.x 已
@@ -56,95 +49,103 @@ static bool curl_supports_sftp(void) {
 
 static bool g_curl_has_sftp = false; /* init 内探测一次（curl_global_init 之后） */
 
-/* 重新解析 ftp.conf 并重建后端前缀表（init 与热加载共用） */
-static void reload_ftp_conf(void) {
+/* 本模块配置内容的指纹（FNV-1a）：注入器规则等**他人**配置变化也会触发下发，
+   指纹相同则跳过重建——后端表重建会释放既有后端对象，无谓重建会波及在途句柄。 */
+static uint64_t g_cfg_fp = 0;
+static bool g_cfg_seen = false;
+
+/* 把一条 server 注册进后端表；能力/前置条件不满足则跳过该段（返回 false 表示跳过） */
+static bool ftp_module_register_server(const FtpServerCfg* s) {
+    if (s->sftp && !g_curl_has_sftp) {
+        LOG_ERR("ftp_module: [%s] proto=sftp，但本 libcurl 未编入 SFTP（缺 libssh2），"
+                "该段跳过", s->name);
+        return false;
+    }
+    if (s->sftp && s->host_key_check) {
+        /* 主机密钥校验开启却没有可读的 known_hosts：必然连不上，且 libcurl
+           的报错（unknown host / failed verification）指不到配置。启动时
+           loud 提示一次，给出补文件的命令与关闭开关——不是错误（文件可能
+           稍后补齐），故 WRN。 */
+        const char* kh = s->known_hosts[0] ? s->known_hosts : NSP_CONFIG_DIR "/known_hosts";
+        if (access(kh, R_OK) != 0)
+            LOG_WRN("ftp_module: [%s] host_key_check 开启但 %s 不可读（%s）——"
+                    "主机密钥校验会失败；可执行 ssh-keyscan -p %d %s >> %s，"
+                    "或在该段设 host_key_check = off",
+                    s->name, kh, strerror(errno), s->port, s->host, kh);
+    }
+    if (ftp_backend_add(s) != 0) return false;
+    LOG("ftp_module: 注册后端 /%s → %s://%s:%d%s (server=%s)", s->name,
+        s->sftp ? "sftp" : "ftp", s->host, s->port, s->remote_dir, s->name);
+    return true;
+}
+
+/* 由框架下发的视图重建后端前缀表（init 的首份推送与每次热重载共用）。
+   视图只读且仅在回调期间有效（字符串归框架所有），故这里只读不留存。 */
+static void ftp_module_apply_config(const NspModuleConfig* cfg) {
+    if (!cfg) return;
     FtpServerList list;
-    if (ftp_conf_load(g_ftp_conf_path, &list) != 0) {
-        LOG_WRN("ftp_module: ftp.conf 加载失败（%s），保留原后端", g_ftp_conf_path);
+    FtpConfParse st;
+    ftp_conf_parse_begin(&st, &list, NULL);
+
+    /* 第一遍：只对本模块的配置行取指纹，并记下框架给出的配置路径（标记无条件
+       下发，文件缺失时也有确切路径可报）。他人记录（规则/段头/别的模块配置）
+       变化与后端表无关，不该触发重建。 */
+    const char* owner = NULL;
+    bool have = false;
+    uint64_t fp = 1469598103934665603ULL;
+    for (int i = 0; i < cfg->count; i++) {
+        const NspCfgRec* r = &cfg->recs[i];
+        if (r->kind == NSP_CFG_REC_MODULE_FILE) {
+            owner = r->text;
+            if (owner && strcmp(owner, FTP_MODULE_NAME) == 0) st.path = r->file;
+            continue;
+        }
+        if (r->kind != NSP_CFG_REC_MODULE_LINE) continue;
+        if (!owner || strcmp(owner, FTP_MODULE_NAME) != 0) continue;
+        have = true;
+        for (const char* p = r->text; p && *p; p++)
+            fp = (fp ^ (unsigned char)*p) * 1099511628211ULL;
+        fp = (fp ^ '\n') * 1099511628211ULL;
+    }
+    if (g_cfg_seen && have && fp == g_cfg_fp) return; /* 逐字未变：不重建 */
+    g_cfg_fp = fp;
+    g_cfg_seen = have;
+
+    if (!have) {
+        /* 无自有配置（文件缺失/内容为空）：与「配置为空」同义，清空后端表并
+           loud 告警——静默保留旧后端会让用户以为配置还生效。路径取自框架下发的
+           标记（无条件下发），故提示是确切路径而非猜测。 */
+        LOG_WRN("ftp_module: 未收到本模块的配置（%s）；无可用 server",
+                st.path ? st.path
+                        : "<modules_dir>/" FTP_MODULE_NAME "/" FTP_MODULE_NAME ".conf");
+        ftp_backend_clear();
         return;
     }
+
+    /* 第二遍：喂进与 ftp_conf_load 同一份行级状态机（语义只有一处实现） */
+    owner = NULL;
+    for (int i = 0; i < cfg->count; i++) {
+        const NspCfgRec* r = &cfg->recs[i];
+        if (r->kind == NSP_CFG_REC_MODULE_FILE) {
+            owner = r->text;
+            continue;
+        }
+        if (r->kind != NSP_CFG_REC_MODULE_LINE) continue;
+        if (!owner || strcmp(owner, FTP_MODULE_NAME) != 0) continue;
+        ftp_conf_parse_line(&st, r->text ? r->text : "");
+    }
+    ftp_conf_parse_end(&st);
+
     ftp_backend_clear();
     /* 后端表已动态化（加载器注册表 + FTP 后端指针数组均无 16 上限），
        有多少 server 注册多少；单段 add 失败（OOM）仅跳过该段 */
-    for (int i = 0; i < list.count; i++) {
-        if (list.servers[i].sftp && !g_curl_has_sftp) {
-            LOG_ERR("ftp_module: [%s] proto=sftp，但本 libcurl 未编入 SFTP（缺 libssh2），"
-                    "该段跳过", list.servers[i].name);
-            continue;
-        }
-        if (list.servers[i].sftp && list.servers[i].host_key_check) {
-            /* 主机密钥校验开启却没有可读的 known_hosts：必然连不上，且 libcurl
-               的报错（unknown host / failed verification）指不到配置。启动时
-               loud 提示一次，给出补文件的命令与关闭开关——不是错误（文件可能
-               稍后补齐），故 WRN。 */
-            const char* kh = list.servers[i].known_hosts[0] ? list.servers[i].known_hosts
-                                                            : CONFIG_DIR "/known_hosts";
-            if (access(kh, R_OK) != 0)
-                LOG_WRN("ftp_module: [%s] host_key_check 开启但 %s 不可读（%s）——"
-                        "主机密钥校验会失败；可执行 ssh-keyscan -p %d %s >> %s，"
-                        "或在该段设 host_key_check = off",
-                        list.servers[i].name, kh, strerror(errno), list.servers[i].port,
-                        list.servers[i].host, kh);
-        }
-        if (ftp_backend_add(&list.servers[i]) != 0) continue;
-        LOG("ftp_module: 注册后端 /%s → %s://%s:%d%s (server=%s)", list.servers[i].name,
-            list.servers[i].sftp ? "sftp" : "ftp", list.servers[i].host, list.servers[i].port,
-            list.servers[i].remote_dir, list.servers[i].name);
-    }
+    for (int i = 0; i < list.count; i++) ftp_module_register_server(&list.servers[i]);
     ftp_conf_free(&list);
     if (ftp_backend_count() == 0)
-        LOG_WRN("ftp_module: 无可用 server，请检查 ftp.conf");
+        LOG_WRN("ftp_module: 无可用 server，请检查 %s",
+                st.path ? st.path : "<modules_dir>/" FTP_MODULE_NAME "/" FTP_MODULE_NAME ".conf");
     else
         LOG("ftp_module: 后端就绪，共 %d 个", ftp_backend_count());
-}
-
-/* ftp.conf 热加载监控线程：inotify 监听目录，变更后重建后端前缀表 */
-static void* ftp_conf_watch_thread(void* arg) {
-    (void)arg;
-    nsp_set_thread_name("nsp_ftpcfg");
-    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (fd < 0) {
-        LOG_WRN("ftp_module: inotify_init1 失败 (%s)", strerror(errno));
-        return NULL;
-    }
-    char dir[PATH_MAX], fname[128];
-    strncpy(dir, g_ftp_conf_path, sizeof dir - 1);
-    dir[sizeof dir - 1] = '\0';
-    char* slash = strrchr(dir, '/');
-    if (slash) {
-        strncpy(fname, slash + 1, sizeof fname - 1);
-        fname[sizeof fname - 1] = '\0';
-        *slash = '\0';
-    } else {
-        strncpy(fname, dir, sizeof fname - 1);
-        fname[sizeof fname - 1] = '\0';
-        strncpy(dir, "/", sizeof dir - 1);
-    }
-    int wd = inotify_add_watch(fd, dir, IN_CLOSE_WRITE | IN_MODIFY | IN_MOVED_TO);
-    if (wd < 0) {
-        LOG_WRN("ftp_module: inotify_add_watch(%s) 失败 (%s)", dir, strerror(errno));
-        close(fd);
-        return NULL;
-    }
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    char buf[4096];
-    while (!g_hotload_stop) {
-        int r = poll(&pfd, 1, 1000);
-        if (r <= 0) continue;
-        ssize_t n = read(fd, buf, sizeof buf);
-        if (n <= 0) continue;
-        for (size_t off = 0; off + sizeof(struct inotify_event) <= (size_t)n;) {
-            struct inotify_event* ev = (struct inotify_event*)(buf + off);
-            if (ev->len > 0 && strcmp(ev->name, fname) == 0) {
-                LOG("ftp_module: 检测到 ftp.conf 变更，热重载");
-                reload_ftp_conf();
-                break;
-            }
-            off += sizeof(struct inotify_event) + ev->len;
-        }
-    }
-    close(fd);
-    return NULL;
 }
 
 static int ftp_module_init(const NspFrameworkApi* api) {
@@ -162,38 +163,24 @@ static int ftp_module_init(const NspFrameworkApi* api) {
     g_curl_has_sftp = curl_supports_sftp();
     LOG("ftp_module: libcurl %s（SFTP %s）", curl_version(),
         g_curl_has_sftp ? "可用" : "不可用：未编入 libssh2，proto=sftp 段会被跳过");
-    /* ftp.conf 与规则配置同目录：--rules=<dir>/injector.conf → <dir>/ftp.conf */
-    if (api && api->get_rules_path) {
-        const char* rp = api->get_rules_path();
-        if (rp && rp[0]) {
-            char dir[PATH_MAX];
-            snprintf(dir, sizeof dir, "%s", rp);
-            char* slash = strrchr(dir, '/');
-            if (slash) {
-                *slash = '\0';
-                if (dir[0]) snprintf(g_ftp_conf_path, sizeof g_ftp_conf_path, "%s/ftp.conf", dir);
-            }
-        }
-    }
 
-    reload_ftp_conf();
-
-    /* 启动 ftp.conf 热加载监控线程 */
-    g_hotload_stop = 0;
-    if (pthread_create(&g_hotload_tid, NULL, ftp_conf_watch_thread, NULL) != 0) {
-        LOG_WRN("ftp_module: 启动 ftp.conf 监控线程失败");
-        g_hotload_tid = 0;
+    /* 配置读取归属：模块不读文件、不跑 inotify。订阅 FTP 规则类型（本模块是
+       FTP 后端，规则命中由框架分派；订阅同时把其它类型的规则挡在视图外），
+       注册监听拿自己的配置——框架在 init 返回后立即回调一次完成首份装载。 */
+    static const char* const sub_types[] = {"FTP"};
+    if (api->subscribe_rules) api->subscribe_rules(sub_types, 1);
+    if (!api->set_config_listener) {
+        LOG_ERR("ftp_module: 框架未提供配置下发接口（api_version 过低），拒绝加载");
+        return -1;
     }
+    api->set_config_listener(ftp_module_apply_config);
     /* 持久化会话自动处理重连（ftp_session_ensure + NOOP 保活），无需 retry 线程 */
     return 0;
 }
 
 static void ftp_module_exit(void) {
-    g_hotload_stop = 1;
-    if (g_hotload_tid) {
-        pthread_join(g_hotload_tid, NULL);
-        g_hotload_tid = 0;
-    }
+    /* 无自有线程/监听可停（配置监听由框架持有，热重载会 dlclose 本 .so 之前
+       先调本函数）。后端表与句柄在此释放。 */
     ftp_backend_clear();
     /* 不调 curl_global_cleanup：理由见 ftp_module_init 顶部注释（热重载
        dlclose 场景下清理全局状态会让仍在映射的实例踩空） */
@@ -214,7 +201,7 @@ static const NspModuleOps ftp_module_ops = {
 const NspModuleInfo nsp_module_info = {
     .magic = NSP_MODULE_MAGIC,
     .abi_version = NSP_MODULE_ABI_VERSION,
-    .name = "ftp_module",
+    .name = FTP_MODULE_NAME,
     .version = "2.0-test",
     .init = ftp_module_init,
     .exit = ftp_module_exit,

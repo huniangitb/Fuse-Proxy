@@ -124,7 +124,8 @@ src/
 ├── modules/              # 热插拔模块（.so）——V4 起只有后端形态
 │   └── ftp/              # FTP 存储后端（纯方法模块，无 FUSE 实现）
 │       ├── ftp_module.c  #   模块 ABI 入口（NspModuleInfo / init / ops）
-│       ├── ftp_conf.c    #   ftp.conf 解析（server 段、port 校验、# 注释边界）
+│       ├── ftp_conf.c    #   模块配置解析（server 段、port 校验、# 注释边界）
+│       │                 #   行级状态机：文件形态与配置下发视图共用一份语义
 │       ├── ftp_mux.c     #   控制面 epoll + curl_multi 复用器（连接复用/并发）
 │       └── ftp_backend_libcurl.c  #   路径映射 + 读写（数据面每文件独立句柄）
 ├── injector/             # 注入器（injector/inject_target/mount_manager/ns_utils/
