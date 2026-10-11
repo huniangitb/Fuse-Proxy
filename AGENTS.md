@@ -39,7 +39,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 **一条命令**：`python3 tests/run.py` —— 自动按「本次改动的文件 + 改动行里的符号」匹配下表，依次执行选中的套件并汇总退出码。`--list` 只看会跑哪些、`--all` 忽略映射跑全量（不含 `ON_DEMAND` 按需套件）、`--layer L0|L1|L2` 只跑某验收层、`--base <ref>` 换对比基线（默认 `HEAD`，即暂存+未暂存+未跟踪）、尾部直接给脚本名则跳过自动匹配、`--strict` 为验收模式（跳过项计为失败）。`--jobs N` 并行加速：仅 `PARALLEL_SAFE` 白名单内的无共享状态套件进线程池（挂载类恒串行，`test_rule_server.py` 因全局 `pkill log_monitor` 副作用被排除），其余仍串行；`--jobs 1` 亦会跑 Tier0（不再整组漏跑）。
 
-下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`；**一致性已由 `tests/test_docs_sync.py` 机器校验**（套件台账闭合、每套件恰好属一层、拼错名字当场失败），不再靠人工两边同步。各脚本仍可单独直接跑。
+下表的可执行形式是 `tests/run.py` 的 `SUITE_MAP`；**一致性已由 `tests/test_docs_sync.py` 机器校验**（套件台账闭合、每套件恰好属一层、拼错名字当场失败、**每个 `src/**/*.c` 与 `include/*.h` 都被某条路径谓词命中**），不再靠人工两边同步。各脚本仍可单独直接跑。
 
 **退出码约定、分层（L0–L4）、验收门、ASan 复跑、隔离跑、环境坑的权威出处是 `docs/testing.md`**——下面只留一句摘要：`0` 通过、`1` 失败、`77` 整套跳过、`78` 部分子组跳过、`127` 套件不存在（计为失败）；**跳过不计通过**，验收须用 `--strict`。完整验收门跑 `scripts/acceptance.sh`。
 
@@ -75,7 +75,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 | `src/daemon/fw_config.c`（含规则文件/App-rules 的 inotify 监听线程——热重载触发路径本身） | `test_monitor_layers.py`、`test_cfg_watch.py`、`test_rules.py`（重载语义端到端）、`test_cfg_reload_split.py`（**C11 事件分流判别**：直编 `fw_config.c` 并注册自己的 reload 钩子计数，依次改写 `uid.map` / 规则文件 / `sys_pkgs.cache`——旧实现三者都触发全量重载（实测 uid.map 一次改写触发 2 次），新实现只有规则文件触发；`FW_CONFIG_SRC=` 可指向旧源码复现失败）、`test_fw_config_view.py`（**下发视图并发重载判别**：直编 `fw_config.c` + 依赖，驱动复刻模块真实访问模式——先缓存 `cfg->recs/generation` 再触发真实重载（改写规则文件 → inotify → `reload_once`）——旧实现解锁后交出 `&s->cfg` 借用指针、`reload_once` 原地 free 数组，故缓存指针被改写且为已释放数组（ASan 报 heap-use-after-free）；新实现为不可变 + 引用计数快照，`release` 前指针/代际/内容恒定。`ASAN=1` 追加内存安全验证；`FW_CONFIG_SRC=` 可指向旧语义源码复现失败） |
 | `src/daemon/cfg_watch.c`（App-rules* 子目录 watch 对账） | `test_cfg_watch.py`（7：只对 `App-rules[-<uid>]` 挂 watch、普通子目录不挂；子目录内 tmp+rename 能产生可读事件（旧实现完全不监听这些目录→应用级规则改了不生效）；目录消失摘表、基目录不可读返回 false 走兜底重扫） |
 | 框架侧规则解析：uid→包名（`fw_pkg.c`）、MONITOR 三层合并（`fw_config_monitor_for`）、沙盒/ALLOW 解析（`fw_rules.c`） | `test_monitor_layers.py`（20：uid→包名与 MONITOR 合并 11 项；**沙盒解析契约 9 项**——`SANDBOX ON` 时 Download/Pictures/Documents 等共享目录一并重定向进本应用沙盒、自己的 data/obb 与 `/Android` 下非 data/obb 不重定向、`ALLOW` 落回真实路径。本机 uid<10000 恒走 system 分支测不到这些，故自编译实际源码 + 合成 uid，不经 Meson）、`test_cfg_watch.py`（`fw_config.c` 改动同时跑配置目录 watch 套件） |
-| 通用回归 | `test_functional.py`（73，IO/SQLite/并发/rmdir 标准语义/**rename flags**/**跨设备 rename**）、`test_crash_log.py` |
+| 通用回归 | `test_functional.py`（73，IO/SQLite/并发/rmdir 标准语义/**rename flags**/**跨设备 rename**）、`test_crash_log.py`、`test_docs_sync.py`（文档/台账一致性，恒跑） |
 | 提交信息规范（`scripts/commit_msg.py`、`.gitmessage`、`.githooks/`） | `test_commit_msg_lint.py`（**CJK 显示宽度判别**：60 个 ASCII 字符 = 60 列放行、30 个汉字 = 60 列放行，而 40 个汉字是 40 字符却占 80 列必须拒绝——按字符数计的校验器（commitlint 的默认口径）会放行第三种，本仓库实测 25% 的正文行超宽即由此而来。另含 `!`↔`BREAKING CHANGE:` 成对、正文可选（无固定标签）、正文行宽 URL 豁免、Merge/Revert/fixup! 跳过、未入库本地引用黑名单、`.gitmessage` 提示行必须全是 `#` 注释（漏了会被提交进正文）） |
 | 压力（按需） | `stress_fuse.py`、`test_ftp_stress.py` |
 

@@ -256,13 +256,27 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 
 1. 写在 `tests/test_<名>.py`，遵守 §2 退出码约定（环境不具备 → 77/78，别返回 0）。
 2. 登记进 `tests/run.py` 的 `SUITE_MAP`：给出路径子串与符号名，让改动能自动命中。
-   压力/基准类改登记进 `ON_DEMAND`。
+   压力/基准类改登记进 `ON_DEMAND`（台账扫的是 `tests/*.py`，只有 `run.py` 与
+   `_*.py` 助手模块例外）。
 3. 登记进 `LAYERS` 的某一层（L0/L1/L2）。
 4. 并行白名单 `PARALLEL_SAFE` **默认不加**；要加须逐条核对 §3.1 判据。
 5. 在 `../AGENTS.md` 映射表对应行补一句**判别性设计**：这个用例在旧实现上为什么失败。
 6. 跑 `python3 tests/test_docs_sync.py` 确认台账闭合。
 
 漏掉第 2/3 步时 `test_docs_sync.py` 会当场失败并指出缺哪一项，不必靠记性。
+
+### 9.1 加新源文件同理：`src/**/*.c` 与 `include/*.h` 必须能被选中
+
+`run.py` 按「路径谓词 or 符号谓词」选套件，两者都不命中的文件**改了只跑恒跑基线**
+——那是一片没有任何断言的绿色（实测过 `include/nsp_module.h` 改动不跑
+`test_module_abi.py`、`src/core/path_trie.c` 改动不跑 `test_rules.py`）。故
+`test_docs_sync.py` 第 8 组检查要求：
+
+- 新增/既有的每个 `src/**/*.c` 与 `include/*.h`，都要落进某条 `SUITE_MAP` 的
+  路径谓词里；
+- 确无专属套件的（如 `src/daemon/fuse_thread_naming.c`），登记进
+  `test_docs_sync.py` 的 `SOURCE_COVER_EXEMPT` 并写明**可核对**的理由——
+  不接受「暂时没写」。
 
 ## 10. 相关文档
 
