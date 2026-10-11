@@ -41,6 +41,7 @@ static int g_log_wrn = 0;
    本驱动显式包含）。实现住 src/，本驱动不链接，故落同名桩。
    g_log_wrn 计数供断言「非法值 loud 告警」。 */
 #include "nsp_log.h"
+#include "nsp_util.h" /* nsp_log_gate：§D 日志限频门 */
 LogLevel g_min_log_level = LOG_INFO;
 void log_internal(LogLevel level, const char* format, ...);
 void log_internal(LogLevel level, const char* format, ...) {
@@ -279,10 +280,55 @@ static void test_ftp_conf_sftp(void) {
     ftp_conf_free(&list);
 }
 
+/* ====== §D nsp_util.c：同原因日志限频门（backing 放弃挂接的抑制手段）=======
+   判别点：vfs_backing_setup 是每个 dentry 查找都走的回调，热点子树（媒体扫描器
+   遍历规则根）会把同一行刷满 sys.log。门必须"首次立即放行 + 期间只计数 + 到点补
+   一行并交回被抑制条数"，且时钟回拨不得放行。旧行为（无门、逐条落日志）下
+   第 2、3 条断言即失败。 */
+static void test_log_gate(void) {
+    printf("── D. 日志限频门 nsp_log_gate ──\n");
+    unsigned n = 12345;
+    NspLogGate g = {0};
+
+    CHECK(nsp_log_gate(NULL, "p", 3600, &n) && n == 0, "空门放行（防御，不崩）");
+
+    NspLogGate g0 = {0};
+    CHECK(nsp_log_gate(&g0, "p", 0, &n) && nsp_log_gate(&g0, "p", 0, &n) &&
+              nsp_log_gate(&g0, "p", -1, &n),
+          "quiet_sec<=0 视为不限频（恒放行）");
+
+    CHECK(nsp_log_gate(&g, "/0/MM1TT", 3600, &n) && n == 0, "首次立即放行且抑制数为 0");
+    bool second = nsp_log_gate(&g, "/0/MM1TT/sub", 3600, &n);
+    CHECK(!second, "同原因立即重复被抑制（返回 false）");
+    for (int i = 0; i < 5; i++) (void)nsp_log_gate(&g, "/0/MM1TT/x", 3600, &n);
+    CHECK(g.suppressed == 6, "被抑制条数逐条累计（suppressed=%u）", g.suppressed);
+    CHECK(strcmp(g.sample, "/0/MM1TT/x") == 0, "样本刷新为最近一条（sample=%s）", g.sample);
+
+    g.last = time(NULL) - 3601; /* 模拟到点（不必真睡一小时） */
+    CHECK(nsp_log_gate(&g, "/0/MM1TT/y", 3600, &n) && n == 6 && g.suppressed == 0,
+          "到点放行一次并交回被抑制条数（n=%u）", n);
+
+    g.last = time(NULL) + 7200; /* 时钟回拨：宁可多抑制，不可刷屏 */
+    CHECK(!nsp_log_gate(&g, "/0/MM1TT/z", 3600, &n), "时钟回拨不放行");
+
+    char big[NSP_LOG_GATE_SAMPLE_MAX + 64];
+    memset(big, 'a', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    NspLogGate g2 = {0};
+    (void)nsp_log_gate(&g2, big, 3600, &n);
+    CHECK(strlen(g2.sample) == NSP_LOG_GATE_SAMPLE_MAX - 1,
+          "超长样本截断到 %d 且 NUL 结尾（len=%zu）", NSP_LOG_GATE_SAMPLE_MAX - 1,
+          strlen(g2.sample));
+
+    NspLogGate g3 = {0};
+    CHECK(nsp_log_gate(&g3, "p", 3600, NULL), "out_suppressed 可传 NULL");
+}
+
 int main(void) {
     test_ftp_conf_hash();
     test_ftp_conf_sftp();
     test_ini_save();
+    test_log_gate();
     printf("SUMMARY pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -60,6 +60,22 @@ void nsp_log_line_sanitize(const char* in, char* out, size_t out_sz) {
     out[w] = '\0';
 }
 
+bool nsp_log_gate(NspLogGate* st, const char* sample, int quiet_sec, unsigned* out_suppressed) {
+    if (out_suppressed) *out_suppressed = 0;
+    if (!st) return true;
+    time_t now = time(nullptr);
+    if (quiet_sec > 0 && st->last != 0 && now - st->last < (time_t)quiet_sec) {
+        st->suppressed++;
+        if (sample) snprintf(st->sample, sizeof st->sample, "%s", sample);
+        return false;
+    }
+    if (out_suppressed) *out_suppressed = st->suppressed;
+    st->suppressed = 0;
+    st->last = now;
+    if (sample) snprintf(st->sample, sizeof st->sample, "%s", sample);
+    return true;
+}
+
 bool nsp_send_all(int fd, const char* buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);

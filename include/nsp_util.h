@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 
 /* 去首尾空白（含 \r\n）：原地修改并返回首字符指针（ftp_conf trim 与
  * config_parser clean_path_string 的公共前半段） */
@@ -28,6 +29,26 @@ char* nsp_str_trim(char* s);
  * 等级行（如 `garbage\n3:伪造` → 一条伪造的 ERROR 行）。凡把外部输入拼进日志
  * 的地方都先经此出口（与路径合成走 common_* 同一红线精神：唯一出处）。 */
 void nsp_log_line_sanitize(const char* in, char* out, size_t out_sz);
+
+/* 同原因日志限频门（纯 libc、无全局状态；**非线程安全**——多线程调用方须自行
+ * 用一把锁把同一 st 的调用包住，见 fuse_daemon.c 的 backing 放弃挂接日志）。
+ *
+ * 语义：首次调用立即放行；其后 quiet_sec 秒内的调用只累计条数并把 sample 刷成
+ * 最新样本，返回 false；到点后放行一次，*out_suppressed 给出这期间被抑制的条数
+ * （供聚合行渲染"另有 N 次"）并归零。quiet_sec <= 0 视为不限频（恒放行）。
+ * 时钟回拨也按"未到点"处理——宁可多抑制，不可刷屏。
+ *
+ * 动机：有些日志挂在**每次查找/每个请求**都会走的路径上，陈述的却是"稳定事实"
+ * 而非瞬时事件（如"此路径需规则仲裁，故不挂接 backing"），逐条上报没有信息增量
+ * 却能把日志文件刷满；按时间聚合既保住首次的可排查性，又给出量级。 */
+#define NSP_LOG_GATE_SAMPLE_MAX 256
+typedef struct {
+    time_t last;                          /* 上次放行时刻（0 = 尚未放行过） */
+    unsigned suppressed;                  /* 自上次放行以来被抑制的条数 */
+    char sample[NSP_LOG_GATE_SAMPLE_MAX]; /* 最近一条被抑制的样本（聚合行给出路径） */
+} NspLogGate;
+
+bool nsp_log_gate(NspLogGate* st, const char* sample, int quiet_sec, unsigned* out_suppressed);
 
 /* 全量发送循环（MSG_NOSIGNAL，内部重试 EINTR）：替代各处手写 while(send)。
  * 全部发出返回 true；出错或对端关闭返回 false（调用方自行决定是否关闭 fd）。 */

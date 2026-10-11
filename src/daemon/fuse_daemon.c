@@ -46,6 +46,7 @@
 #include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
 #include "fd_close_queue.h"
 #include "nsp_comm.h"
+#include "nsp_util.h" /* nsp_log_gate：高频稳定事实的日志限频门 */
 #include "crash_dump.h"
 #include "fault_fence.h"
 #include "module_guard.h"
@@ -2569,6 +2570,43 @@ static bool is_fuse_bpf_supported(void) {
 #endif
 
 #ifdef TARGET_ANDROID
+/* 放弃挂接的原因日志：vfs_backing_setup 是**每个 dentry 查找**都会走的回调
+   （内核不缓存"这个路径没挂上 backing"的结论，下一次查找再来问），于是热点子树
+   （媒体扫描器遍历规则根下所有条目）会把同一行刷成日志洪水——线上实测
+   /0/MM1TT 一条路径就能占满 sys.log。
+   「此路径需规则仲裁」是**稳定事实**而非瞬时事件，逐条上报没有信息增量，故按
+   原因限频：首次立即报（带真实路径），其后每小时最多补一行，带这段时间被抑制的
+   条数与最近一条路径样本。
+   注意：LOG_DBG 在 log_internal 里**不受级别过滤**（前身 LOG_MON 要求监控日志
+   恒可见，见该函数注释），所以限频是这里唯一的抑制手段，别指望 --log-level。 */
+enum { BACKING_DECLINE_RULE = 0, BACKING_DECLINE_GLOBAL_DATAOBB, BACKING_DECLINE_N };
+static const char* const g_backing_decline_what[BACKING_DECLINE_N] = {
+    "规则需仲裁，放弃挂接",
+    "全局 data/obb 由 daemon 全权仲裁，不挂接",
+};
+/* nsp_log_gate 非线程安全：FUSE 多 worker 并发进 vfs_backing_setup，故加锁。
+   该分支本就回退全量 mediation（内核不再走 backing），一把短锁的代价可忽略。 */
+static pthread_mutex_t g_backing_decline_mu = PTHREAD_MUTEX_INITIALIZER;
+static NspLogGate g_backing_decline_gate[BACKING_DECLINE_N];
+#define BACKING_DECLINE_QUIET_SEC 3600
+
+static void backing_decline_log(int reason, const char* path) {
+    unsigned quiet = 0;
+    char sample[NSP_LOG_GATE_SAMPLE_MAX];
+    pthread_mutex_lock(&g_backing_decline_mu);
+    bool emit = nsp_log_gate(&g_backing_decline_gate[reason], path, BACKING_DECLINE_QUIET_SEC,
+                             &quiet);
+    snprintf(sample, sizeof sample, "%s", g_backing_decline_gate[reason].sample);
+    pthread_mutex_unlock(&g_backing_decline_mu);
+    if (!emit) return;
+    if (quiet > 0)
+        LOG_DBG("FUSE backing: %s（自上次上报以来另有 %u 次，最近 %s）",
+                g_backing_decline_what[reason], quiet, sample);
+    else
+        LOG_DBG("FUSE backing: %s %s（同原因已限频，其后每小时最多一行）",
+                g_backing_decline_what[reason], path);
+}
+
 /* backing 直通挂接（内核 bpf_setup 上行回调）：只挂 backing fd，不挂系统 BPF
    策略程序——后者按调用方独立裁决且 verdict 最终（daemon 零感知），线上实例：
    空规则下 root 按名 stat 他包 data 目录被它以 ENOENT 拒绝（直接访问 backing
@@ -2591,17 +2629,17 @@ static int vfs_backing_setup(const char* path, struct fuse_entry_param* e) {
         if (strstr(path, "/Android/data") != NULL ||
             strstr(path, "/Android/obb") != NULL) {
             /* 全局实例 data/obb 永不挂接：见函数头 DAC 注释。 */
-            LOG_DBG("FUSE backing: 全局 data/obb 由 daemon 全权仲裁，不挂接 %s", path);
+            backing_decline_log(BACKING_DECLINE_GLOBAL_DATAOBB, path);
             return -ENOENT;
         }
         /* 全局非 data/obb：按路径门裁决（无关路径保留加速）。 */
         if (fw_backing_mediation_required_for(path)) {
-            LOG_DBG("FUSE backing: 规则需仲裁，放弃挂接 %s", path);
+            backing_decline_log(BACKING_DECLINE_RULE, path);
             return -ENOENT;
         }
     } else if (fw_backing_mediation_required_for(path)) {
         /* 媒体实例：调用方单一，仅规则需仲裁此路径时 declined。 */
-        LOG_DBG("FUSE backing: 规则需仲裁，放弃挂接 %s", path);
+        backing_decline_log(BACKING_DECLINE_RULE, path);
         return -ENOENT;
     }
 
