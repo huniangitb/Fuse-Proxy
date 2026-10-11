@@ -12,3 +12,85 @@ format = pair
 argc = 2
 desc = 存储映射：<虚拟前缀>|<段名>
 desc.en = Storage mapping: <virtual prefix>|<section>
+
+# ── 模块配置 schema（<模块名>.conf 的字段声明）────────────────────────────
+# 与上面同一个解析器：[conf] 段 + `conf.<字段>.<属性>=值` 属性行。
+#   属性：max（字节上限）/ type / sensitive / default / enum / order
+#         / desc / desc.<lang>（多语言标签）
+# 作用：控制面按 schema 校验 FTP_ADD/SET 的字段，并把
+#   {key,label,type,max,sensitive,default,enum,order} 经 MODULE_SCHEMA
+#   交给前端自动渲染（数字框 / 开关 / 密码框带脱敏 / 下拉 / maxlength）。
+# 未声明 [conf] 段时回退编译期默认表（FTP 现有字段），旧包仍可用。
+# ⚠ schema 只服务控制面校验与前端渲染，**不改变归属**：框架依旧把原始行原样
+#   下发、模块自己解析（docs/modules.md §6.1.1）。
+
+[conf]
+conf.host.type = string
+conf.host.max = 255
+conf.host.order = 1
+conf.host.desc = 服务器地址
+conf.host.desc.en = Host
+
+conf.port.type = int
+conf.port.max = 5
+conf.port.default = 21
+conf.port.order = 2
+conf.port.desc = 端口
+conf.port.desc.en = Port
+
+conf.user.type = string
+conf.user.max = 63
+conf.user.default = anonymous
+conf.user.order = 3
+conf.user.desc = 用户名
+conf.user.desc.en = User
+
+conf.password.type = string
+conf.password.max = 127
+conf.password.sensitive = true
+conf.password.order = 4
+conf.password.desc = 密码
+conf.password.desc.en = Password
+
+conf.remote_dir.type = string
+conf.remote_dir.max = 511
+conf.remote_dir.default = /
+conf.remote_dir.order = 5
+conf.remote_dir.desc = 远程根目录
+conf.remote_dir.desc.en = Remote directory
+
+# ---- SFTP（proto=sftp）字段：解析侧早已支持，此前控制面白名单里没有，
+#      两处漂移（同一语法两份实现）。schema 化后只此一处声明。 ----
+conf.proto.type = string
+conf.proto.max = 7
+conf.proto.default = ftp
+conf.proto.enum = ftp|sftp
+conf.proto.order = 6
+conf.proto.desc = 协议
+conf.proto.desc.en = Protocol
+
+conf.key_file.type = path
+conf.key_file.max = 511
+conf.key_file.order = 7
+conf.key_file.desc = SSH 私钥文件
+conf.key_file.desc.en = SSH private key
+
+conf.key_pass.type = string
+conf.key_pass.max = 127
+conf.key_pass.sensitive = true
+conf.key_pass.order = 8
+conf.key_pass.desc = 私钥口令
+conf.key_pass.desc.en = Key passphrase
+
+conf.known_hosts.type = path
+conf.known_hosts.max = 511
+conf.known_hosts.order = 9
+conf.known_hosts.desc = known_hosts 路径
+conf.known_hosts.desc.en = known_hosts path
+
+conf.host_key_check.type = bool
+conf.host_key_check.default = true
+conf.host_key_check.enum = on|off
+conf.host_key_check.order = 10
+conf.host_key_check.desc = 主机密钥校验
+conf.host_key_check.desc.en = Host key check

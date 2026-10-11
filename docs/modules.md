@@ -14,8 +14,10 @@
 
 ```
 <MODULES_DIR>/<模块名>/<模块名>.so      # 模块本体（dlopen 进 fuse_daemon）
-<MODULES_DIR>/<模块名>/<模块名>.rules   # 可选：规则类型注册（rule_server 读取）
-```
+<MODULES_DIR>/<模块名>/<模块名>.rules   # 可选：模块声明（rule_server 读取）
+                                        #   [TYPE] 段 = 规则类型注册
+                                        #   [conf] 段 = 模块配置 schema（见 §2.2）
+<MODULES_DIR>/<模块名>/<模块名>.conf    # 可选：模块自有配置（框架读取后下发）
 
 - Android：`/data/Namespace-Proxy/modules`；GNU：`/var/fuse-proxy/modules`（`--modules-dir=` 可覆盖）。
 - 模块名仅含 `[a-z0-9_-]`，**目录名 = 模块名 = `.so` 文件名 = `NspModuleInfo.name`**，不一致拒绝加载。
@@ -43,6 +45,42 @@ desc.en = Storage mapping: <virtual prefix>|<section>
 - rule_server 带目录/文件 mtime 缓存，未变化时零扫描复用类型表；`.rules` 增删改即热更新，无需重启。
 - `argc_min/argc_max` 用于 ADD 参数校验，`global_only` 限制作用域，`desc` 按请求 `lang` 回传（默认中文，未知语言回退 zh）并附 `desc_map` 全语言映射。
 - **内置类型随 rule_server 二进制内嵌**（`rule_server.c` 的 `BUILTIN_RULE_TYPES`，即原 `basic_rules.rules` 的内容）：HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT/SKIP_SYSTEM_APPS 的 format/argc/global-only/多语言 desc 都在那里声明，走**与模块 `.rules` 完全相同的解析器**——规则引擎已内建进框架，模块目录里不再有 `basic_rules.rules`，若改成在 C 里裸注册类型名，内建类型的 `desc` 会全空（前端按 desc 渲染类型说明）。改内建类型说明即改该处。未注册的类型前端无法 ADD/REMOVE/ENABLE/DISABLE；无 `.rules` 的模块正常加载，仅跳过类型注册。
+### 2.2 模块配置 schema（`.rules` 的 `[conf]` 段）
+
+模块用同一个 `.rules` 文件的 `[conf]` 段声明**自己配置文件的字段契约**，语法与
+`[TYPE]` 段同一解析器（`conf.<字段>.<属性>=值`）：
+
+```ini
+[conf]
+conf.host.type = string          # string / int / bool / path
+conf.host.max = 255              # 字节上限（缺省不限制）
+conf.host.desc = 服务器地址       # 中文标签（默认语言）
+conf.host.desc.en = Host         # 指定语言标签
+conf.port.type = int
+conf.port.default = 21           # 缺省值（LIST/GET 回填生效值）
+conf.proto.enum = ftp|sftp       # 可选值（竖线分隔），越界即拒
+conf.password.sensitive = true   # 敏感：只写不读，仅回 has_password
+conf.key_file.order = 7          # 前端显示顺序
+```
+
+由此得到两条能力：
+
+- **新增配置项不必改 C**：控制面按 schema 校验 `FTP_ADD/SET`（键白名单、长度上限、
+  枚举都来自声明），不必重新编译发布。声明文件撤掉即回退编译期默认表。
+- **前端自动渲染**：`MODULE_SCHEMA` 回传 `{file, module, fields:[{key,type,max,
+  sensitive,default,enum,order,desc,desc_map}]}`，前端据此渲染数字框 / 开关 /
+  密码框（带脱敏）/ 下拉，并自动带上 `maxlength`——**不必另维护中文标签与顺序**。
+
+三条边界（不得越界）：
+
+1. schema **只服务控制面校验与前端渲染**，不改变配置读取归属：框架依旧把原始行
+   原样下发、模块自己解析（§6.1.1）。别让 schema 变成「框架替模块解析配置」。
+2. 敏感字段沿用并升级既有「密码只写不读」：此前只有 `password` 一个键享受特判，
+   现按 `sensitive` 判定，新增敏感字段自动脱敏；敏感字段的**键本身不出现在应答里**，
+   只给 `has_<key>` 布尔。
+3. schema 随 `.rules` 的 mtime 缓存一同失效重建：**撤掉 `[conf]` 段即回退默认表**，
+   绝不沿用上次扫描残留的字段声明（声明始终是唯一来源）。
+
 - **`log_ctl` 与 `rule_server` 的类型集合刻意不同**：`rule_server` 是权威控制面，内置类型内嵌 + 读取 `.rules` 合并模块动态类型；`log_ctl` 的 `set-rule`/`remove-rule` 只认内置类型（HIDE/RO/REDIRECT/ALLOW/MONITOR/SANDBOX/GLOBAL_INJECT，不含 SKIP_SYSTEM_APPS），不扫描模块目录。两者对同一内置类型的编辑语义一致（行级实现共享，见 §6.1）。
 
 ## 3. 模块 ABI（`include/nsp_module.h`）

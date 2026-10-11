@@ -111,6 +111,12 @@ def main():
     with open(os.path.join(mod_dir, "ftp_module.rules"), "w", encoding="utf-8") as f:
         f.write('[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射：<虚拟前缀>|<段名>\ndesc.en = FTP storage mapping: <virtual prefix>|<section>\n')
 
+    # ---- 模块配置 schema 判别点 ----
+    # 上面这份 .rules **没有 [conf] 段**：此时控制面须回退编译期默认表
+    # （5 个字段，只有 FTP 的 host/port/user/password/remote_dir），
+    # 于是 key_file 这类 SFTP 字段会被拒——正是"新增键要改 C"的旧形态。
+    # 下面先记录默认表形态，再改写 .rules 加入 [conf] 段，同一个键必须转为接受。
+
     # 预置第二用户（uid=10）空间：App-rules-10/ 目录 + 一个已停用应用
     user10_dir = os.path.join(conf_dir, "App-rules-10")
     os.makedirs(user10_dir, exist_ok=True)
@@ -723,6 +729,64 @@ def check(proc, sock_name, conf_dir):
     expect("FTP_ADD 非法端口拒绝", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "云盘", "key": "bogus", "value": "x"})
     expect("FTP_SET 未知字段拒绝", r.get("status") == "error", r)
+
+    # ---- 模块配置 schema：声明驱动 vs 硬编码白名单（判别性） ----
+    # 现状：本测试布的 .rules 无 [conf] 段 → 走编译期默认表，
+    #   SFTP 的 key_file 虽被模块解析侧支持，却因不在白名单而被拒（漂移形态）。
+    r = send_cmd(proc, sock_name,
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id"})
+    expect("无 [conf] 段时 key_file 被拒（默认表）", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_SCHEMA"})
+    expect("MODULE_SCHEMA 默认表仅 5 字段",
+           r.get("status") == "ok" and len(r["data"]["fields"]) == 5, r)
+    # 改写 .rules 加入 [conf] 段声明（含 SFTP 字段 + 枚举 + 敏感），
+    # rule_server 每次命令前扫描，故下一次命令即生效，无需重启。
+    rules_path = os.path.join(conf_dir, "modules", "ftp_module", "ftp_module.rules")
+    with open(rules_path, "w", encoding="utf-8") as f:
+        f.write(
+            '[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射\n'
+            '[conf]\n'
+            'conf.host.type = string\nconf.host.max = 255\nconf.host.desc = 服务器地址\n'
+            'conf.port.type = int\nconf.port.max = 5\nconf.port.default = 21\n'
+            'conf.user.type = string\nconf.user.max = 63\nconf.user.default = anonymous\n'
+            'conf.password.type = string\nconf.password.max = 127\n'
+            'conf.password.sensitive = true\n'
+            'conf.remote_dir.type = string\nconf.remote_dir.max = 511\n'
+            'conf.remote_dir.default = /\n'
+            'conf.proto.type = string\nconf.proto.enum = ftp|sftp\n'
+            'conf.key_file.type = path\nconf.key_file.max = 511\n'
+            'conf.key_file.desc = SSH 私钥\nconf.key_file.desc.en = SSH key\n')
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_SCHEMA"})
+    expect("MODULE_SCHEMA 声明后扩到 7 字段（默认 5 + SFTP 2）", r.get("status") == "ok"
+           and len(r["data"]["fields"]) == 7, r)
+    keys = [f["key"] for f in r["data"]["fields"]] if r.get("status") == "ok" else []
+    expect("schema 含 SFTP 的 key_file/proto", "key_file" in keys and "proto" in keys, keys)
+    # 形状：前端据此自动渲染（类型/上限/敏感/缺省/可选值/顺序/标签）
+    kf = next((f for f in r["data"]["fields"] if f["key"] == "key_file"), None)
+    expect("schema 带 type/max/desc", kf and kf["type"] == "path" and kf["max"] == 511
+           and kf["desc"] == "SSH 私钥", kf)
+    pr = next((f for f in r["data"]["fields"] if f["key"] == "proto"), None)
+    expect("schema 带 enum", pr and pr.get("enum") == ["ftp", "sftp"], pr)
+    pw = next((f for f in r["data"]["fields"] if f["key"] == "password"), None)
+    expect("schema 敏感字段标 sensitive", pw and pw["sensitive"] is True, pw)
+    # 同一个键现在被接受 —— 判别点：不改 C、不重启，仅靠模块声明
+    r = send_cmd(proc, sock_name,
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id"})
+    expect("声明后 key_file 被接受", r.get("status") == "ok", r)
+    # 枚举越界仍拒（schema 校验生效，不是放行一切）
+    r = send_cmd(proc, sock_name,
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "proto", "value": "scp"})
+    expect("schema 枚举外值被拒", r.get("status") == "error", r)
+    r = send_cmd(proc, sock_name,
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "proto", "value": "sftp"})
+    expect("schema 枚举内值接受", r.get("status") == "ok", r)
+    # 反向确认：撤掉 [conf] 段（回到旧形态）后，key_file 必须**重新被拒**——
+    # 证明上面的"接受"确实来自声明，而不是别的路径（如默认表被放宽）。
+    with open(rules_path, "w", encoding="utf-8") as f:
+        f.write('[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射\n')
+    r = send_cmd(proc, sock_name,
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id2"})
+    expect("撤掉 [conf] 后 key_file 重新被拒", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "不存在", "key": "host", "value": "x"})
     expect("FTP_SET 不存在拒绝", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "不存在"})
