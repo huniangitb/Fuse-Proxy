@@ -780,6 +780,42 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name,
                  {"cmd": "FTP_SET", "name": "云盘", "key": "proto", "value": "sftp"})
     expect("schema 枚举内值接受", r.get("status") == "ok", r)
+    # ---- MODULE_CONF_* 通用入口（按 module 寻址任意模块） ----
+    # 造第二个"模块"：无 [conf] 声明 → 无字段可写（安全默认：未声明不放行任何键）
+    other_dir = os.path.join(conf_dir, "modules", "other_mod")
+    os.makedirs(other_dir, exist_ok=True)
+    with open(os.path.join(other_dir, "other_mod.rules"), "w", encoding="utf-8") as f:
+        f.write('[conf]\nconf.token.type = string\nconf.token.max = 64\n'
+                'conf.token.desc = 令牌\n')
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "other_mod"})
+    expect("MODULE_CONF_SCHEMA 跨模块",
+           r.get("status") == "ok" and [f["key"] for f in r["data"]["fields"]] == ["token"], r)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "other_mod",
+                                  "name": "A", "host": "x"})
+    expect("MODULE_CONF_ADD 按 schema 过滤字段（host 非该模块字段）",
+           r.get("status") == "error", r)
+    # ftp_module 走通用命令：等价于 FTP_ADD（别名行为一致）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "通用盘", "host": "10.9.9.9", "port": 21})
+    expect("MODULE_CONF_ADD module=ftp_module 等价 FTP_ADD", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "通用盘"})
+    expect("FTP_* 别名读到通用入口写入的段",
+           r.get("status") == "ok" and r["data"]["host"] == "10.9.9.9", r)
+    # 目录穿越必须被拒（module 直接参与路径拼接）
+    for bad in ("../../etc", "a/b", ".."):
+        r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_LIST", "module": bad})
+        expect(f"module={bad} 拒绝（防目录穿越）", r.get("status") == "error", r)
+    # 未声明 schema 的模块：任何键都不放行（fail-closed）
+    nos_dir = os.path.join(conf_dir, "modules", "nos_mod")
+    os.makedirs(nos_dir, exist_ok=True)
+    with open(os.path.join(nos_dir, "nos_mod.rules"), "w", encoding="utf-8") as f:
+        f.write('[conf]\n')
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "nos_mod",
+                                  "name": "A", "host": "x"})
+    expect("无字段声明的模块拒绝写入", r.get("status") == "error", r)
+    # 清理本块在 ftp_module 里建的段，避免影响后续既有用例的条目计数
+    send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": "通用盘"})
+
     # 反向确认：撤掉 [conf] 段（回到旧形态）后，key_file 必须**重新被拒**——
     # 证明上面的"接受"确实来自声明，而不是别的路径（如默认表被放宽）。
     with open(rules_path, "w", encoding="utf-8") as f:
