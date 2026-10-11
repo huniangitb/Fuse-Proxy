@@ -7,6 +7,7 @@
 | 用途 | 路径 |
 |------|------|
 | 主规则文件 | `<CONFIG_DIR>/injector.conf` |
+| 远程存储服务器（FTP/SFTP） | `<CONFIG_DIR>/ftp.conf`（语法见 `modules.md` §7.1） |
 | 应用规则（uid 0） | `<CONFIG_DIR>/App-rules/<pkg>.conf` |
 | 应用规则（其他用户） | `<CONFIG_DIR>/App-rules-<uid>/<pkg>.conf` |
 

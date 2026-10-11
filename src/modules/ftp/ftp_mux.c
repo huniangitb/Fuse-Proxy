@@ -100,10 +100,30 @@ CURL* ftp_easy_new(const FtpServerCfg* cfg) {
        改低速率判定——持续 30s 低于 1KB/s 才算卡死，数据在流动就不超时 */
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 30L);
-    curl_easy_setopt(c, CURLOPT_FTP_RESPONSE_TIMEOUT, 30L);
-    curl_easy_setopt(c, CURLOPT_FTP_SKIP_PASV_IP, 1L);
-    curl_easy_setopt(c, CURLOPT_USE_SSL, CURLUSESSL_NONE);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
+    if (cfg->sftp) {
+        /* SSH 认证：ANY 覆盖 密码 / 公钥 / ssh-agent（Android 上 agent 通常
+           不可用，但留 ANY 无害——没有可用方式时由服务器拒绝）。
+           公钥文件**刻意不设**：libcurl 在 CURLOPT_SSH_PUBLIC_KEYFILE 为空时
+           让 libssh2 从私钥文件里提取公钥（curl vssh.c: "let the SSH library
+           extract the public key from the private key file"，传 NULL 即此意），
+           避免强制用户再摆一份 .pub。 */
+        curl_easy_setopt(c, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_ANY);
+        if (cfg->key_file[0])
+            curl_easy_setopt(c, CURLOPT_SSH_PRIVATE_KEYFILE, cfg->key_file);
+        if (cfg->key_pass[0]) curl_easy_setopt(c, CURLOPT_KEYPASSWD, cfg->key_pass);
+        /* 主机密钥校验：不设 SSH_KNOWNHOSTS 等于不校验（libcurl 语义），
+           故 host_key_check=on 时**必须**给出文件路径——空则落到配置目录默认
+           落点。文件不存在时 libssh2 报 unknown host → CURLE_PEER_FAILED_
+           VERIFICATION，属业务失败（不熔断），错误可见。 */
+        if (cfg->host_key_check)
+            curl_easy_setopt(c, CURLOPT_SSH_KNOWNHOSTS,
+                             cfg->known_hosts[0] ? cfg->known_hosts : CONFIG_DIR "/known_hosts");
+    } else {
+        curl_easy_setopt(c, CURLOPT_FTP_RESPONSE_TIMEOUT, 30L);
+        curl_easy_setopt(c, CURLOPT_FTP_SKIP_PASV_IP, 1L);
+        curl_easy_setopt(c, CURLOPT_USE_SSL, CURLUSESSL_NONE);
+    }
     return c;
 }
 

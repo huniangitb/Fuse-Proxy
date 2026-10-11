@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp（proto / host_key_check 解析） */
 #include <ctype.h>
 
 /* 去首尾空白经 nsp_util 公共库复用（nsp_str_trim），禁私刻 trim 副本 */
@@ -52,7 +53,10 @@ static FtpServerCfg* ftp_conf_new_server(FtpServerList* out) {
     }
     FtpServerCfg* cur = &out->servers[out->count];
     memset(cur, 0, sizeof *cur);
-    cur->port = 21;
+    /* port 0 = 未显式配置：载入结束时按 proto 补默认（ftp 21 / sftp 22），
+       故配置项顺序无关（proto 写在 port 之后也正确） */
+    cur->port = 0;
+    cur->host_key_check = true; /* 主机密钥校验默认开启（fail-closed） */
     cur->bad = false;
     if (!set_str_checked(cur->remote_dir, sizeof cur->remote_dir, "/")) cur->bad = true;
     if (!set_str_checked(cur->user, sizeof cur->user, "anonymous")) cur->bad = true;
@@ -157,11 +161,45 @@ int ftp_conf_load(const char* path, FtpServerList* out) {
             if (!set_str_checked(cur->pass, sizeof cur->pass, val)) cur->bad = true;
         } else if (strcmp(key, "remote_dir") == 0) {
             if (!set_str_checked(cur->remote_dir, sizeof cur->remote_dir, val)) cur->bad = true;
+        } else if (strcmp(key, "proto") == 0 || strcmp(key, "protocol") == 0) {
+            /* 协议：ftp（默认）/ sftp。拼错即整段作废——静默回退 ftp 会让
+               用户以为连的是 SFTP，实际把账号密码发到明文 FTP 上 */
+            if (strcasecmp(val, "ftp") == 0) {
+                cur->sftp = false;
+            } else if (strcasecmp(val, "sftp") == 0) {
+                cur->sftp = true;
+            } else {
+                LOG_WRN("ftp.conf [%s] proto 非法（\"%s\"，须 ftp|sftp），整段作废", cur->name, val);
+                cur->bad = true;
+            }
+        } else if (strcmp(key, "key_file") == 0 || strcmp(key, "identity_file") == 0) {
+            if (!set_str_checked(cur->key_file, sizeof cur->key_file, val)) cur->bad = true;
+        } else if (strcmp(key, "key_pass") == 0 || strcmp(key, "key_passphrase") == 0) {
+            if (!set_str_checked(cur->key_pass, sizeof cur->key_pass, val)) cur->bad = true;
+        } else if (strcmp(key, "known_hosts") == 0) {
+            if (!set_str_checked(cur->known_hosts, sizeof cur->known_hosts, val)) cur->bad = true;
+        } else if (strcmp(key, "host_key_check") == 0) {
+            /* 三态解析：只认明确的开关词，其余整段作废（同 port 的失败闭合姿态） */
+            if (strcasecmp(val, "on") == 0 || strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+                cur->host_key_check = true;
+            } else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "false") == 0 ||
+                       strcmp(val, "0") == 0) {
+                cur->host_key_check = false;
+            } else {
+                LOG_WRN("ftp.conf [%s] host_key_check 非法（\"%s\"，须 on|off），整段作废",
+                        cur->name, val);
+                cur->bad = true;
+            }
         }
         /* 其他键忽略（passive/encoding 等预留） */
     }
     free(line);
     fclose(fp);
+
+    /* 未显式配置端口：按协议补默认（ftp 21 / sftp 22）。放在段作废过滤之前，
+       与配置项书写顺序无关（proto 可出现在 port 之后） */
+    for (int i = 0; i < out->count; i++)
+        if (out->servers[i].port == 0) out->servers[i].port = out->servers[i].sftp ? 22 : 21;
 
     /* 清理无效段：无 host 的段无效；任一字段超长（bad）整段作废——
        绝不带着截断的 host/remote_dir 去连接或映射错地方 */

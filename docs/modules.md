@@ -300,11 +300,37 @@ ABI 从 1 到 2 的变更属于第一类：`NspFrameworkApi` 删除了中间的 
 | 模块 | 源码 | 说明 |
 |------|------|------|
 | 规则引擎（**非模块**） | `src/daemon/fw_rules.c` | V4 起规则决策内建进 fuse_daemon：Trie + 线性通道 / sandbox / 虚拟目录 / uid→AppConfig 缓存；配置由 `fw_config` 换入，引擎的派生缓存在发布临界区（旧读者排空、新读者封锁）内经 `config_set_publish_invalidate_hook` 作废（见 §6.1.1）。**它不是可插拔模块**——规则语义属于框架 |
-| `ftp_module.so` | `src/modules/ftp/` | FTP 后端（libcurl，**不依赖 libfuse3**）：`ftp_mux.c` 是控制面「epoll + curl_multi」复用器（见下），`ftp_backend_libcurl.c` 是路径映射与读写实现（含 `backend_flush` 两阶段收尾与弱网重试）；写路径为本地临时文件缓存 + 流式 STOR/APPE 上传 |
+| `ftp_module.so` | `src/modules/ftp/` | 远程存储后端（FTP 与 SFTP，libcurl，**不依赖 libfuse3**）：`ftp_mux.c` 是控制面「epoll + curl_multi」复用器（见下），`ftp_backend_libcurl.c` 是路径映射与读写实现（含协议分派、`backend_flush` 两阶段收尾与弱网重试）；写路径为本地临时文件缓存 + 流式 STOR/APPE（SFTP 下同为 `CURLOPT_UPLOAD`+`APPEND`）上传 |
 
 **FTP 控制面并发模型（`src/modules/ftp/ftp_mux.c`）**：`getattr`/`readdir`/`DELE`/`MKD`/`RMD`/`RNFR`/空文件 `STOR`/`TRUNCATE` 等控制操作交给每后端一个 `CURLM` 句柄，由**一个 epoll 事件线程**驱动（`curl_multi_socket_action` + `CURLMOPT_SOCKET/TIMERFUNCTION` 接入 epoll；提交线程只入队 + eventfd 唤醒，绝不触碰 multi——libcurl 多接口非线程安全）。收益：控制连接在 multi 的连接缓存里长期复用（免重复 USER/PASS 登录），多个 FUSE 线程的控制操作并行在飞（同服务器并发控制连接上限 `CURLMOPT_MAX_HOST_CONNECTIONS`，默认 4），且**业务失败不再重建连接**——旧实现在任何失败（含 550 不存在）都 `curl_easy_cleanup` 重建共享句柄，让下一次操作白付一次 TCP + 登录往返。数据面（读下载线程 / 写流式上传）仍用每文件独立句柄 + 阻塞 `curl_easy_perform`：它们本就互不竞争，且背压模型是「缓冲满即中止传输」（`write_cb` 返回 0 → `CURLE_WRITE_ERROR`），与事件循环驱动不兼容。回归用例 `test_ftp_parallel.py`（并发正确性 / 连接数 / 延迟收敛 / 热重载竞态）。
 
-FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。规则由内建引擎解释并置 `is_ftp`，框架据此把该路径分派给 FTP 后端模块（不再有 `FTP_<段名>` 变量注册机制）。
+FTP 映射由 `injector.conf` 的 `FTP <虚拟前缀> <段名>` 规则决定（如 `FTP /云盘 云盘`），作用域按规则所在段——`[GLOBAL]` 全局、`[应用包名]` 仅该应用，与 REDIRECT 一致。规则由内建引擎解释并置 `is_ftp`，框架据此把该路径分派给后端模块（不再有 `FTP_<段名>` 变量注册机制）。**协议（FTP/SFTP）由 `ftp.conf` 的 `proto` 决定，框架侧零改动**（规则类型、`is_ftp` 分派、模块 ABI 都不变）。
+
+### 7.1 SFTP（`proto = sftp`）
+
+SFTP 复用同一个模块与同一套线程/缓存/句柄/熔断基础设施，由 libcurl 的 SSH 后端（libssh2）承载；`ftp.conf` 段增加：
+
+```ini
+[备份]
+proto = sftp              # ftp（默认）| sftp；非法值整段作废
+host = nas.local
+port = 22                 # 未显式配置时按 proto 补默认（ftp 21 / sftp 22）
+user = backup
+key_file = /data/Namespace-Proxy/keys/backup.key   # 空 = 密码 / ssh-agent
+key_pass = <私钥口令>      # 可选
+known_hosts = /data/Namespace-Proxy/known_hosts    # 空 = <CONFIG_DIR>/known_hosts
+host_key_check = on       # 默认 on：主机密钥不匹配即拒连（fail-closed）
+remote_dir = /srv/backup
+```
+
+协议分派只落在六处（其余代码协议无关）：URL scheme（`ftp://`/`sftp://`）、失败分类（见下）、`getattr` 探针顺序、LIST 时间口径、quote 命令字（`DELE/MKD/RMD` ↔ `rm/mkdir/rmdir`、`RNFR/RNTO` ↔ 单条 `rename`）、`ftp_easy_new` 的 SSH 选项。四条**与 FTP 不同、改错就出错**的语义：
+
+1. **`CURLINFO_RESPONSE_CODE` 在 SFTP 下恒为 0**（libcurl 只给 FTP/SMTP 填 `info.httpcode`）。照抄 FTP 的 `resp==0 ⇒ 后端不可达` 判据会把每个业务失败（不存在/无权限/认证失败）都计进熔断窗口 → 应用探测若干缺失路径（`os.path.exists`）就把健康后端置静默、完好文件被误报 EIO。故 `res_is_unavailable()` 按协议分支：SFTP 只把连接/协议层 `CURLE` 计入。
+2. **目录探针必须排在文件探针之前**：OpenSSH 的 sftp-server 允许以只读方式 `open` 一个目录，libcurl 的下载路径对目录同样返回 `CURLE_OK`，文件探针会把目录报成 `S_IFREG`（size=目录自身大小）。判据是「URL 加尾斜杠 + `NOBODY` + `FILETIME`」：`NOBODY` 让 readdir 短路（不真列目录），存在的唯一证据是 GETINFO 那次 stat 的 `FILETIME`（不存在 → 保持 -1）。**不能**给目录探针加 `NOBODY` 后依赖 `CURLE_OK`——那样不存在的路径也会被当成目录。
+3. **空文件大小**：libssh2 对 0 字节文件把 `CONTENT_LENGTH` 报成 -1（`sftp_download_stat` 在 `filesize==0` 时置未知）。那是「0 字节」不是「未知」，必须归一为 0，否则空文件 `st_size=-1`。
+4. **quote 命令的参数是远程路径本身**，libcurl 不会像 FTP 那样先 CWD 到 URL 目录；且参数由客户端 `Curl_get_pathname` 解析，含空白必须加引号（引号内 `\`/`"` 转义）。路径还要先做百分号解码——POSTQUOTE 串不是 URL，带 `%20` 的命令会让服务器去找字面量名字。失败 errno 细化见 `ftp_quote_errno()`（libcurl 把 SFTP quote 失败一律折叠成 `CURLE_QUOTE_ERROR`，只能用 `CURLOPT_ERRORBUFFER` 的文案保守细化，认不出就退回 FTP 的历史粗口径）。
+
+构建：GNU 上 `-Dsftp=auto`（默认）在系统 libcurl 无 SFTP 时自动改用子模块 curl 并编入 libssh2；Android 的 NDK 不带 libssh2/密码学库，需 `scripts/build-libssh2-android.sh` 产出预构建后 `-Dsftp=enabled -Dlibssh2_dir=<根>`。**`-Dsftp=disabled` 与历史构建逐字节一致**（不引入任何新依赖）。运行期还有一道能力自检：`curl_version_info()->protocols` 里没有 `sftp` 时，`proto=sftp` 的段整段跳过并 loud 报错（fail-closed，绝不静默退回明文 FTP）。
 
 内建引擎的关键语义（修改时必须保持）：appear_missing/read_only 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`fw_rules_resolve`/`fw_rules_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
 

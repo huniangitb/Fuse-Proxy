@@ -30,7 +30,8 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 |---|---|---|
 | libfuse3 | 系统库优先，缺失回退编译 `subprojects/libfuse` | 默认编译子模块 |
 | json-c | 系统库优先，缺失回退编译 `subprojects/json-c` | 默认编译子模块 |
-| libcurl（ftp_module，≥8.21.0） | 系统库优先，缺失回退编译 `subprojects/curl`（仅 FTP+HTTP、无 SSL 最小集） | 默认编译子模块 |
+| libcurl（ftp_module，≥8.21.0） | 系统库优先，缺失回退编译 `subprojects/curl`（仅 FTP/HTTP/SFTP、无 TLS 最小集） | 默认编译子模块 |
+| libssh2 + 密码学库（仅 SFTP，可选） | 系统 pkg-config `libssh2`（`-Dsftp=auto` 自动启用） | 需外部预构建：`scripts/build-libssh2-android.sh` + `-Dsftp=enabled -Dlibssh2_dir=`（NDK 不带 libssh2/OpenSSL） |
 
 子模块均为上游 pin 版，`git submodule update --init --recursive` 即可补齐。强制指定来源见 `meson_options.txt`（如 `-Dlibfuse_source=system`、`-Dandroid_curl=prebuilt`）。
 
@@ -44,7 +45,7 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 | `injector` | `bin/`（仅 Android 安装） | 挂载命名空间注入守护进程。GNU 下也编一份但不 install，供 `tests/test_inject_mount_env.py` 用 |
 | `rule_server` | `bin/` | 规则控制服务（JSON 行协议动态改规则） |
 | `log_monitor` / `log_ctl` | `bin/` | 日志收集服务 / 查询流式输出 CLI |
-| `ftp_module.so` | `bin/modules/ftp_module/` | FTP 存储后端模块（热插拔；当前唯一模块，见下） |
+| `ftp_module.so` | `bin/modules/ftp_module/` | 远程存储后端模块（FTP + SFTP，热插拔；当前唯一模块，见下） |
 | `src/zygisk/{arm64-v8a,armeabi-v7a}.so` | `zygisk/` | Zygisk 应用创建通知模块（仅 Android，双 ABI） |
 | `global_replace_ctl` | 不 install | 全局替换挂载测试驱动（仅 GNU，供 `tests/test_global_replace.py`） |
 

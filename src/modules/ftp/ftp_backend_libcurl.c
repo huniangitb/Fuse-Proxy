@@ -205,26 +205,61 @@ static int ftp_stat_cache_lookup(FtpBackend* bk, const char* path, int* err_out,
 
 /* ============ 失败分类：熔断计数的唯一判定入口 ============
    熔断的意义是发现「后端不可达」（断网/服务挂了）从而快速失败、停止无谓
-   等待——不是惩罚应用的正常业务请求。故仅两类计入：
-     ① resp==0：服务器从未给出应答（connect 失败/DNS 失败/超时/连接重置）
-     ② resp==421：服务器主动声明暂不可用
-   其余**服务器已应答**的情形（550 路径缺失/访问拒绝、530 认证失败、450 无
-   匹配……）都是「后端活着」的证据：业务结果，一律不计入（避免误杀）。
-   热重载/下线归位（CURLE_ABORTED_BY_CALLBACK，resp 恒为 0）同样豁免。
+   等待——不是惩罚应用的正常业务请求。故只把「连接/协议层失败」计入，
+   「服务器已明确应答的业务结果」一律豁免（避免误杀）。
+
+   - FTP：看响应码。① resp==0（服务器从未应答：connect/DNS/超时/重置）
+     ② resp==421（服务器声明暂不可用）才计入；550 路径缺失、530 认证失败、
+     450 无匹配……都是「后端活着」的证据，属业务结果。
+   - SFTP：**CURLINFO_RESPONSE_CODE 恒为 0**——libcurl 只给 FTP/SMTP 等填
+     info.httpcode，SSH 后端（libssh2.c）全文不填。照抄 FTP 的 resp==0 判据
+     会把每个业务失败都当断网 → 应用探测若干缺失路径就把健康后端熔断 + 弃
+     连接。故 SFTP 改按 CURLE 码分类：明确列举的业务码不计入，其余计入。
+   热重载/下线归位（CURLE_ABORTED_BY_CALLBACK）两种协议都豁免。
    调用方须在 curl_easy_cleanup 之前取到 CURLINFO_RESPONSE_CODE 传入。 */
-static bool res_is_unavailable(CURLcode res, long resp) {
+static bool res_is_unavailable(const FtpServerCfg* cfg, CURLcode res, long resp) {
     if (res == CURLE_OK) return false;
     if (res == CURLE_ABORTED_BY_CALLBACK) return false;
+    if (cfg->sftp) {
+        switch (res) {
+        /* 服务器已应答/明确拒绝：业务失败（对应 FTP 的 550/530/450） */
+        case CURLE_REMOTE_FILE_NOT_FOUND:    /* SSH_FX_NO_SUCH_FILE/NO_SUCH_PATH */
+        case CURLE_REMOTE_ACCESS_DENIED:     /* PERMISSION_DENIED/WRITE_PROTECT */
+        case CURLE_REMOTE_FILE_EXISTS:       /* FILE_ALREADY_EXISTS */
+        case CURLE_REMOTE_DISK_FULL:         /* NO_SPACE_ON_FILESYSTEM/QUOTA */
+        case CURLE_QUOTE_ERROR:              /* 命令被拒（如 rmdir 非空） */
+        case CURLE_LOGIN_DENIED:             /* 认证失败：重试无用 */
+        case CURLE_PEER_FAILED_VERIFICATION: /* 主机密钥不匹配：重试无用 */
+            return false;
+        default:
+            /* COULDNT_CONNECT/RESOLVE_HOST/OPERATION_TIMEDOUT/SSH 协议层失败
+               ……视为不可达：宁可快速失败，也不让每次操作空转等超时 */
+            return true;
+        }
+    }
     return resp == 0 || resp == 421;
 }
 
-/* 「路径不存在」业务判定：服务器明确应答 550（不可用/不存在），或 curl 已
-   映射为 not-found。注意 550 在不同命令上对应的 CURLE 码不同（RETR/SIZE →
+/* 「路径不存在」业务判定。FTP：服务器明确应答 550（不可用/不存在），或 curl
+   已映射为 not-found。注意 550 在不同命令上对应的 CURLE 码不同（RETR/SIZE →
    CURLE_REMOTE_FILE_NOT_FOUND，CWD/LIST → CURLE_REMOTE_ACCESS_DENIED），故
    必须看响应码、不能只看 CURLE——历史 bug：目录探针返回 9 未被识别，缺失
-   路径被误计入熔断、负缓存填充条件从不生效。 */
-static bool res_is_not_found(CURLcode res, long resp) {
+   路径被误计入熔断、负缓存填充条件从不生效。
+   SFTP：无响应码可用，只看 CURLE_REMOTE_FILE_NOT_FOUND（libssh2 把
+   SSH_FX_NO_SUCH_FILE/NO_SUCH_PATH 映射到它）。 */
+static bool res_is_not_found(const FtpServerCfg* cfg, CURLcode res, long resp) {
+    if (cfg->sftp) return res == CURLE_REMOTE_FILE_NOT_FOUND;
     return resp == 550 || res == CURLE_REMOTE_FILE_NOT_FOUND;
+}
+
+/* 文件探针成功判据（getattr 第一段）：
+   - FTP：NOBODY+FILETIME 走 SIZE/MDTM，服务器以 213/350 应答才算命中；
+   - SFTP：NOBODY 走 open+stat，CURLE_OK 即文件存在（目录在此 open 失败）。
+   两者都要求 res==CURLE_OK。 */
+static bool res_file_probe_ok(const FtpServerCfg* cfg, CURLcode res, long resp) {
+    if (res != CURLE_OK) return false;
+    if (cfg->sftp) return true;
+    return resp == 213 || resp == 350;
 }
 
 /* 熔断阈值：滑动窗口内失败达此值进入静默。8 次可在容忍正常偶发失败（连接
@@ -611,8 +646,9 @@ static void build_url(const FtpBackend* bk, const char* path, char* url, size_t 
     char* enc = curl_easy_escape(NULL, rel, 0);
     char* url_heap = NULL;
     int un;
+    const char* scheme = bk->cfg.sftp ? "sftp" : "ftp";
     if (enc) {
-        // 将 %2F 还原为 /（FTP 路径中的 / 是目录分隔符，不应编码）
+        // 将 %2F 还原为 /（路径中的 / 是目录分隔符，不应编码）
         char* s = enc;
         char* d = enc;
         while (*s) {
@@ -624,11 +660,11 @@ static void build_url(const FtpBackend* bk, const char* path, char* url, size_t 
             }
         }
         *d = '\0';
-        un = nsp_snprintf_dyn(url, sz, &url_heap, 65536, "ftp://%s:%d%s", bk->cfg.host,
+        un = nsp_snprintf_dyn(url, sz, &url_heap, 65536, "%s://%s:%d%s", scheme, bk->cfg.host,
                               bk->cfg.port, enc);
         curl_free(enc);
     } else {
-        un = nsp_snprintf_dyn(url, sz, &url_heap, 65536, "ftp://%s:%d%s", bk->cfg.host,
+        un = nsp_snprintf_dyn(url, sz, &url_heap, 65536, "%s://%s:%d%s", scheme, bk->cfg.host,
                               bk->cfg.port, rel);
     }
     free(rel_heap);
@@ -795,7 +831,7 @@ static void* ftp_dl_thread(void* arg);
    FTP 协议规定服务器 LIST 时间为 GMT/UTC（vsftpd 默认 use_localtime=NO
    即输出 GMT），故用 timegm 按 UTC 解释，避免本地时区偏移。
    返回 0 成功、-1 解析失败（保持调用方默认 mtime）。 */
-static int ftp_parse_list_time(const char* line, const char* nl, time_t* out) {
+static int ftp_parse_list_time(const char* line, const char* nl, bool utc, time_t* out) {
     /* 跳过前 5 列（权限/链接/属主/组/大小） */
     const char* p = line;
     int col = 0;
@@ -871,7 +907,11 @@ static int ftp_parse_list_time(const char* line, const char* nl, time_t* out) {
         if (yr < 1970 || yr > 2100) return -1;
         tmv.tm_year = (int)yr - 1900;
     }
-    time_t mt = timegm(&tmv);
+    /* 时区口径按协议区分：FTP 的 LIST 时间按 RFC 3659/vsftpd 默认是 GMT，
+       用 timegm 按 UTC 解释；SFTP 的长条目（longname）由**服务器**用
+       OpenSSH sftp-server 的 localtime 格式化，只能按本地时间解释——用
+       timegm 会整体偏移一个时区（服务器与设备同区时 mktime 才正确）。 */
+    time_t mt = utc ? timegm(&tmv) : mktime(&tmv);
     if (mt < 0) return -1;
     *out = mt;
     return 0;
@@ -1022,7 +1062,7 @@ static int ftp_dir_mtime(FtpBackend* bk, const char* path, time_t* out) {
         if (ne > nm && *(ne - 1) == '\r') ne--;
         size_t nlen = (size_t)(ne - nm);
         if (nlen == strlen(target) && memcmp(nm, target, nlen) == 0) {
-            if (ftp_parse_list_time(line, nl, out) == 0) {
+            if (ftp_parse_list_time(line, nl, true, out) == 0) {
                 rc = 0;
                 /* 写入 TTL 缓存：后续 getattr 直接命中，免父目录 LIST。
                    键超长不缓存（不写截断键，防键碰撞污染），本次结果照常返回。 */
@@ -1072,6 +1112,84 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     build_url(bk, path, url, sizeof url);
     if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
 
+    /* ================= SFTP：目录探针必须在文件探针之前 =================
+       OpenSSH 的 sftp-server 允许以只读方式 open 一个**目录**（POSIX open(2)
+       对目录成功），libcurl 的 SFTP 下载路径因此在目录上同样返回 CURLE_OK——
+       文件探针会把目录报成 S_IFREG（实测 size=目录自身大小 60）。FTP 没有这个
+       问题：SIZE 对目录必然失败。
+       目录判据：URL 加尾斜杠 + NOBODY + FILETIME：
+         · NOBODY 让 readdir 状态直接短路（不会真去列目录，省一次 LIST）；
+         · 「存在与否」的唯一证据是 GETINFO 里那次 stat 的 FILETIME——目录存在
+           → stat 成功 → filetime ≥ 0；不存在/是文件 → stat 失败 → 保持 -1
+           （curl 的 info.filetime 初值即 -1，见 getinfo.c）。
+       代价：目录 1 次往返（比 FTP 的父 LIST 解析更省），文件 2 次。 */
+    if (bk->cfg.sftp) {
+        char dir_url[2048];
+        if (strlen(url) + 2 > sizeof dir_url) return -ENAMETOOLONG;
+        snprintf(dir_url, sizeof dir_url, "%s/", url);
+        CURL* dc = ftp_easy_new(&bk->cfg);
+        if (!dc) return -EIO;
+        curl_easy_setopt(dc, CURLOPT_URL, dir_url);
+        curl_easy_setopt(dc, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(dc, CURLOPT_FILETIME, 1L);
+        CURLcode dres = backend_perform(bk, dc);
+        long dft = -1;
+        /* 只取 FILETIME：SFTP 下 CURLINFO_RESPONSE_CODE 恒为 0（无响应码语义），
+           存在性判据见上方注释——不看它，也不拿它做失败分类 */
+        curl_easy_getinfo(dc, CURLINFO_FILETIME, &dft);
+        curl_easy_cleanup(dc);
+        if (dres == CURLE_OK && dft >= 0) {
+            st->st_mode = S_IFDIR | 0755;
+            st->st_nlink = 2;
+            st->st_mtime = (time_t)dft;
+            ftp_stat_cache_fill(bk, path, 0, true, 0, st->st_mtime);
+            mark_success(bk);
+            return 0;
+        }
+        /* 不是目录 → 按文件探针判定。失败分类只认文件探针：目录探针在「文件」
+           上的失败（readdir 打不开文件）不代表后端不可达，不计数。 */
+        struct WriteBuf wb = {0};
+        wb.auto_grow = true;
+        long resp_code = 0, ft = -1;
+        curl_off_t cl = 0;
+        CURL* fc = ftp_easy_new(&bk->cfg);
+        if (!fc) return -EIO;
+        curl_easy_setopt(fc, CURLOPT_URL, url);
+        curl_easy_setopt(fc, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(fc, CURLOPT_FILETIME, 1L);
+        curl_easy_setopt(fc, CURLOPT_HEADER, 0L);
+        curl_easy_setopt(fc, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(fc, CURLOPT_WRITEDATA, &wb);
+        CURLcode res = backend_perform(bk, fc);
+        curl_easy_getinfo(fc, CURLINFO_RESPONSE_CODE, &resp_code);
+        bool okf = (res == CURLE_OK);
+        if (okf) {
+            curl_easy_getinfo(fc, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
+            curl_easy_getinfo(fc, CURLINFO_FILETIME, &ft);
+        }
+        curl_easy_cleanup(fc);
+        free(wb.buf);
+        if (okf) {
+            /* libssh2 对**0 字节文件**把大小报成未知（CONTENT_LENGTH=-1，见 curl
+               libssh2.c sftp_download_stat：filesize==0 → pgrsSetDownloadSize(-1)）。
+               那是「0 字节」而非「大小未知」，归一为 0，否则空文件 stat 出 -1。 */
+            if (cl < 0) cl = 0;
+            st->st_mode = S_IFREG | 0644;
+            st->st_size = (off_t)cl;
+            st->st_nlink = 1;
+            if (ft >= 0) st->st_mtime = (time_t)ft;
+            ftp_stat_cache_fill(bk, path, 0, false, (off_t)cl, ft >= 0 ? (time_t)ft : 0);
+            mark_success(bk);
+            return 0;
+        }
+        reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp_code));
+        if (res_is_not_found(&bk->cfg, res, resp_code)) {
+            ftp_stat_cache_fill(bk, path, -ENOENT, false, 0, 0);
+            return -ENOENT;
+        }
+        return -EIO;
+    }
+
     // 先尝试作为文件（SIZE + MDTM）
     struct WriteBuf wb = {0};
     wb.auto_grow = true;
@@ -1093,13 +1211,19 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
        不会再有并发传输覆盖其状态（如 cl=0）。响应码无论成败都取——
        失败分类（res_is_unavailable/res_is_not_found）依赖它 */
     curl_easy_getinfo(fc, CURLINFO_RESPONSE_CODE, &resp_code);
-    if (res == CURLE_OK && (resp_code == 213 || resp_code == 350)) {
+    bool file_ok = res_file_probe_ok(&bk->cfg, res, resp_code);
+    if (file_ok) {
         curl_easy_getinfo(fc, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
         curl_easy_getinfo(fc, CURLINFO_FILETIME, &ft);
     }
     curl_easy_cleanup(fc);
-    if (res == CURLE_OK && (resp_code == 213 || resp_code == 350)) {
+    if (file_ok) {
         // 文件存在
+        /* SFTP：libssh2 对**0 字节文件**把大小报成未知（CONTENT_LENGTH 返回
+           -1，见 curl libssh2.c 的 sftp_download_stat：filesize==0 时
+           Curl_pgrsSetDownloadSize(data,-1)）。那是「0 字节」而不是「大小
+           未知」，归一为 0，否则空文件 stat 出 st_size=-1。 */
+        if (bk->cfg.sftp && cl < 0) cl = 0;
         st->st_mode = S_IFREG | 0644;
         st->st_size = (off_t)cl;
         st->st_nlink = 1;
@@ -1133,19 +1257,33 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     curl_easy_setopt(dc, CURLOPT_URL, dir_url);
     curl_easy_setopt(dc, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(dc, CURLOPT_WRITEDATA, &dir_wb);
+    /* SFTP 有真正的目录 stat：同一次请求里 FILETIME 会先 stat 再列目录，
+       省掉 FTP 那套「父目录 LIST 解析」的额外往返。
+       注意此处**不能**加 NOBODY：SFTP 的 readdir 在 no_body 时直接短路返回
+       CURLE_OK（不 open 目录），不存在的路径也会被当成目录——真缺陷。
+       故仍走完整 LIST，用 open 失败来判定「不存在」。 */
+    if (bk->cfg.sftp) curl_easy_setopt(dc, CURLOPT_FILETIME, 1L);
 
     res = backend_perform(bk, dc);
     long dir_resp = 0;
+    long dir_ft = -1;
     curl_easy_getinfo(dc, CURLINFO_RESPONSE_CODE, &dir_resp); /* 须在 cleanup 前取 */
+    if (bk->cfg.sftp) curl_easy_getinfo(dc, CURLINFO_FILETIME, &dir_ft);
     curl_easy_cleanup(dc);
     if (res == CURLE_OK) {
         // LIST 成功即视为目录（空目录返回 0 字节，不能用 len>0 判断）
         st->st_mode = S_IFDIR | 0755;
         st->st_nlink = 2;
-        /* 同步服务器目录时间：FTP 无目录 MDTM 标准命令（vsftpd 不支持），
-           通过父目录 LIST 解析目标目录行的时间列；解析失败保持默认 */
+        /* 同步服务器目录时间。SFTP：上面那次 stat 的 FILETIME 就是目录 mtime；
+           FTP：无目录 MDTM 标准命令（vsftpd 不支持），通过父目录 LIST 解析
+           目标目录行的时间列；解析失败保持默认 */
         time_t dmtime = 0;
-        if (ftp_dir_mtime(bk, path, &dmtime) == 0 && dmtime > 0) st->st_mtime = dmtime;
+        if (bk->cfg.sftp) {
+            if (dir_ft > 0) dmtime = (time_t)dir_ft;
+        } else if (ftp_dir_mtime(bk, path, &dmtime) == 0 && dmtime > 0) {
+            /* 已取到 FTP 目录时间（见下） */
+        }
+        if (dmtime > 0) st->st_mtime = dmtime;
         free(dir_wb.buf);
         ftp_stat_cache_fill(bk, path, 0, true, 0, st->st_mtime);
         mark_success(bk); /* 操作成功：清零熔断计数（此前目录成功不清零，
@@ -1157,9 +1295,10 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     // 都不是
     /* 两探针各自分类：任一「后端不可达」（无应答/421/归位码豁免见
        res_is_unavailable）才重建连接 + 计熔断；服务器应答过的业务失败不计 */
-    reset_curl(bk, res_is_unavailable(file_res, file_resp) ||
-                       res_is_unavailable(res, dir_resp));
-    if (res_is_not_found(file_res, file_resp) && res_is_not_found(res, dir_resp)) {
+    reset_curl(bk, res_is_unavailable(&bk->cfg, file_res, file_resp) ||
+                       res_is_unavailable(&bk->cfg, res, dir_resp));
+    if (res_is_not_found(&bk->cfg, file_res, file_resp) &&
+        res_is_not_found(&bk->cfg, res, dir_resp)) {
         /* 双探针均应答 550：确实不存在——正常业务结果，返回 ENOENT 并入负缓存
            （exists 检查高频，TTL 内免 2~3 次网络往返；写操作成功后整表失效，
            不会命中写后旧 ENOENT） */
@@ -1264,8 +1403,8 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
         /* 分类见 res_is_unavailable/res_is_not_found：服务器应答 550 是
            「目录不存在」的正常业务结果（ENOENT、不计熔断）；后端不可达
            如实报 EIO——谎报 ENOENT 会让应用以为目录消失了（误杀） */
-        reset_curl(bk, res_is_unavailable(res, resp));
-        return res_is_not_found(res, resp) ? -ENOENT : -EIO;
+        reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
+        return res_is_not_found(&bk->cfg, res, resp) ? -ENOENT : -EIO;
     }
 
     // 解析 LIST 输出 → 新缓存数组（动态翻倍，上限 FTP_LIST_CACHE_MAX）
@@ -1348,7 +1487,7 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
                         arr[count].is_dir = (line[0] == 'd');
                         arr[count].size = size_str[0] ? (off_t)atoll(size_str) : 0;
                         arr[count].mtime = 0;
-                        if (ftp_parse_list_time(line, nl, &arr[count].mtime) != 0)
+                        if (ftp_parse_list_time(line, nl, !bk->cfg.sftp, &arr[count].mtime) != 0)
                             arr[count].mtime = 0;
                         count++;
                     }
@@ -1683,7 +1822,7 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
     if (res != CURLE_OK) {
         /* 创建失败：服务器应答过的（550 已存在/无权限等）是业务失败，不计
            熔断不重建；仅后端不可达计入（分类见 res_is_unavailable） */
-        reset_curl(bk, res_is_unavailable(res, resp));
+        reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
         return -EIO;
     }
     ftp_stat_cache_clear(bk); /* 空文件已创建：整表失效 */
@@ -2006,7 +2145,7 @@ static int ftp_stream_chunk(FtpBackendFile* f, const char* data, size_t len, boo
     f->write_curl = NULL;
     /* 分类见 res_is_unavailable：仅后端不可达计熔断——STOR 550（配额/权限
        等服务器已应答）是业务失败，不计（避免误杀） */
-    if (res_is_unavailable(res, resp)) mark_failure(f->bk);
+    if (res_is_unavailable(&f->bk->cfg, res, resp)) mark_failure(f->bk);
     return -EIO;
 }
 
@@ -2352,23 +2491,117 @@ static void ftp_parent_url(const char* url, char* parent, size_t sz) {
     }
 }
 
-/* curlftpfs 方式：POSTQUOTE + 父目录 URL + 仅文件名，NOBODY 避免数据连接 */
-static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int ok_code) {
+/* 把 URL 里的百分号编码还原进调用方缓冲；放不下返回 -1（fail-closed）。
+   为什么必须还原：POSTQUOTE 命令串**不是 URL**，libcurl 原样发给服务器——
+   带 %20/%E4 的命令会让服务器去找**字面量**名字，含空格/中文的路径全部失配
+   （历史行为：FTP 的 DELE/MKD/RMD/RNFR 一直如此，SFTP 侧同样）。 */
+static int ftp_url_unescape(const char* s, char* out, size_t sz) {
+    int olen = 0;
+    char* dec = curl_easy_unescape(NULL, s, 0, &olen);
+    if (!dec) return -1;
+    if ((size_t)olen >= sz) {
+        curl_free(dec);
+        return -1;
+    }
+    memcpy(out, dec, (size_t)olen + 1);
+    curl_free(dec);
+    return 0;
+}
+
+/* 组装 quote 命令的路径参数：
+   - FTP：原样（服务器把命令行的剩余部分整体当路径，空格合法）；
+   - SFTP：libcurl 在**客户端**用 Curl_get_pathname 解析，空白会截断路径，
+     故必须加引号；引号内 \\ 与 " 需转义（该函数只接受 \\ " ' 三种转义，
+     其它 \x 直接判语法错误 → 命令失败）。
+   放不下返回 -1（fail-closed：绝不发截断路径去操作错误的对象）。 */
+static int ftp_quote_arg(const FtpServerCfg* cfg, const char* raw, char* out, size_t sz) {
+    if (!cfg->sftp) {
+        size_t n = strlen(raw);
+        if (n >= sz) return -1;
+        memcpy(out, raw, n + 1);
+        return 0;
+    }
+    if (sz < 3) return -1;
+    size_t o = 0;
+    out[o++] = '"';
+    for (const char* p = raw; *p; p++) {
+        size_t need = (*p == '"' || *p == '\\') ? 2u : 1u;
+        if (o + need + 2 > sz) return -1; /* 预留收尾引号 + NUL */
+        if (need == 2u) out[o++] = '\\';
+        out[o++] = *p;
+    }
+    out[o++] = '"';
+    out[o] = '\0';
+    return 0;
+}
+
+/* curlftpfs 方式：POSTQUOTE + 父目录 URL + 仅文件名，NOBODY 避免数据连接。
+   命令字按协议映射：FTP 的 DELE/MKD/RMD ↔ SFTP 的 rm/mkdir/rmdir（libcurl 在
+   客户端把 sftp(1) 风格命令翻译成 SFTP 协议包）。 */
+enum { FTP_Q_DELE = 0, FTP_Q_MKD, FTP_Q_RMD };
+
+/* quote 命令失败的 errno 映射。
+   坏消息：libcurl 的 SFTP quote（rm/mkdir/rmdir/rename）**一律**把失败折叠成
+   CURLE_QUOTE_ERROR（curl libssh2.c 的 ssh_state_sftp_quote_mkdir/rmdir/unlink/
+   rename 全部 return CURLE_QUOTE_ERROR），CURLE 码不携带 SFTP 错误码，故无法像
+   下载路径那样靠 CURLE 精确区分。
+   可用信号只剩 CURLOPT_ERRORBUFFER 里 libcurl 拼的错误串（由 libssh2 的
+   sftp_libssh2_strerror() 生成）。实测（OpenSSH sftp-server + libssh2 1.11.1）：
+     · rm/rmdir 目标不存在 → "No such file or directory"（→ ENOENT，真收益：
+       批量删除/存在性探测依赖 ENOENT，粗口径只会给 EPERM/ENOTEMPTY）；
+     · mkdir 无权限      → "Permission denied"（→ EPERM）；
+     · mkdir 已存在 / rmdir 非空 → 服务器只回 SSH_FX_FAILURE，libssh2 文案是
+       **通用**的 "Operation failed"，无法细分 → 落回下面的粗口径（rmdir 给
+       ENOTEMPTY，恰好正确；mkdir 给 EPERM，与 FTP 历史口径一致）。
+   "already exists"/"not empty" 两支保留给会回具体错误码的其它服务器实现。
+   字符串不是 ABI：未来 libssh2 改文案只会让映射退化回粗口径，不会更糟。
+   FTP 保持历史口径（服务器只回 550，无从细分）。 */
+static int ftp_quote_errno(int op, const char* errbuf, int ok_code) {
+    if (errbuf && errbuf[0]) {
+        if (strstr(errbuf, "No such file")) return -ENOENT;
+        if (strstr(errbuf, "already exists")) return -EEXIST;
+        if (strstr(errbuf, "not empty")) return -ENOTEMPTY;
+        if (strstr(errbuf, "Permission denied") || strstr(errbuf, "Write protect"))
+            return -EPERM;
+    }
+    return ok_code ? -ok_code : -EPERM;
+}
+
+static int ftp_quote_cmd(FtpBackend* bk, const char* path, int op, int ok_code) {
     if (!bk) return -ENOENT;
     if (backend_ready(bk) != 0) return -EIO;
-    char url[2048], parent[2048], cmd[4096];
+    char url[2048], parent[2048], cmd[4096], raw[2048], arg[4096];
     build_url(bk, path, url, sizeof url);
     if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
     ftp_parent_url(url, parent, sizeof parent);
-    snprintf(cmd, sizeof cmd, fmt, ftp_filename(url));
+    /* SFTP 的 quote 参数就是远程路径本身：libcurl **不会**像 FTP 那样先 CWD 到
+       URL 所在目录（ftp_parent_url 只用于让请求 URL 合法）——传 basename 会落到
+       SSH 家目录下（实测 mkdir/rm 全部 CURLE_QUOTE_ERROR）。故 SFTP 传完整远程
+       路径，FTP 保持 curlftpfs 的「父目录 URL + basename」方式。 */
+    char rpath[2048];
+    const char* src = ftp_filename(url);
+    if (bk->cfg.sftp) {
+        ftp_remote_path(url, rpath, sizeof rpath);
+        src = rpath;
+    }
+    if (ftp_url_unescape(src, raw, sizeof raw) != 0) return -ENAMETOOLONG;
+    if (ftp_quote_arg(&bk->cfg, raw, arg, sizeof arg) != 0) return -ENAMETOOLONG;
+    const char* fmt;
+    if (bk->cfg.sftp)
+        fmt = (op == FTP_Q_DELE) ? "rm %s" : (op == FTP_Q_MKD) ? "mkdir %s" : "rmdir %s";
+    else
+        fmt = (op == FTP_Q_DELE) ? "DELE %s" : (op == FTP_Q_MKD) ? "MKD %s" : "RMD %s";
+    if (snprintf(cmd, sizeof cmd, fmt, arg) >= (int)sizeof cmd) return -ENAMETOOLONG;
     struct curl_slist* slist = curl_slist_append(NULL, cmd);
     struct WriteBuf wb = {0};
     wb.auto_grow = true;
+    char errbuf[CURL_ERROR_SIZE] = {0}; /* quote 失败的唯一可细分信号（见 ftp_quote_errno） */
     CURL* c = ftp_easy_new(&bk->cfg);
     if (!c) {
         curl_slist_free_all(slist);
         return -EIO;
     }
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, errbuf);
     curl_easy_setopt(c, CURLOPT_POSTQUOTE, slist);
     curl_easy_setopt(c, CURLOPT_URL, parent);
     curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
@@ -2383,10 +2616,12 @@ static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int 
     /* 失败：按 ok_code 映射预期错误（rmdir 非空目录 → -ENOTEMPTY），
        未指定（unlink/mkdir）则统一 -EPERM（curlftpfs 方式） */
     if (res != CURLE_OK) {
-        /* 服务器应答过的（550 路径不存在/非空等）是业务失败：不计熔断不
+        /* 服务器应答过的（路径不存在/非空/无权限）是业务失败：不计熔断不
            重建；仅后端不可达计入（分类见 res_is_unavailable） */
-        reset_curl(bk, res_is_unavailable(res, resp));
-        return ok_code ? -ok_code : -EPERM;
+        reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
+        LOG_DBG("ftp_module: quote op=%d 失败 res=%d resp=%ld err=%s", op, (int)res, resp,
+                errbuf[0] ? errbuf : "<empty>");
+        return ftp_quote_errno(op, errbuf, ok_code);
     }
     ftp_stat_cache_clear(bk); /* DELE/MKD/RMD 成功：整表失效 */
     ftp_list_cache_clear(bk); /* 条目增删：LIST 缓存失效 */
@@ -2394,16 +2629,16 @@ static int ftp_quote_cmd(FtpBackend* bk, const char* path, const char* fmt, int 
 }
 
 int ftp_backend_unlink(const char* path) {
-    return ftp_quote_cmd(ftp_backend_find(path), path, "DELE %s", 0);
+    return ftp_quote_cmd(ftp_backend_find(path), path, FTP_Q_DELE, 0);
 }
 
 int ftp_backend_mkdir(const char* path, mode_t mode) {
     (void)mode;
-    return ftp_quote_cmd(ftp_backend_find(path), path, "MKD %s", 0);
+    return ftp_quote_cmd(ftp_backend_find(path), path, FTP_Q_MKD, 0);
 }
 
 int ftp_backend_rmdir(const char* path) {
-    return ftp_quote_cmd(ftp_backend_find(path), path, "RMD %s", ENOTEMPTY);
+    return ftp_quote_cmd(ftp_backend_find(path), path, FTP_Q_RMD, ENOTEMPTY);
 }
 
 int ftp_backend_rename(const char* from, const char* to) {
@@ -2418,7 +2653,7 @@ int ftp_backend_rename(const char* from, const char* to) {
        真实语义一致（不是同一存储，无法原地改名）。 */
     if (ftp_backend_find(to) != bk) return -EXDEV;
     char from_url[2048], to_url[2048], from_path[2048], to_path[2048], parent[2048], cmd1[4096],
-        cmd2[4096];
+        cmd2[4096], arg1[2048], arg2[2048];
     build_url(bk, from, from_url, sizeof from_url);
     build_url(bk, to, to_url, sizeof to_url);
     if (from_url[0] == '\0' || to_url[0] == '\0')
@@ -2428,11 +2663,32 @@ int ftp_backend_rename(const char* from, const char* to) {
     ftp_remote_path(from_url, from_path, sizeof from_path);
     ftp_remote_path(to_url, to_path, sizeof to_path);
     ftp_parent_url(from_url, parent, sizeof parent);
-    snprintf(cmd1, sizeof cmd1, "RNFR %s", from_path);
-    snprintf(cmd2, sizeof cmd2, "RNTO %s", to_path);
+    /* 先还原百分号编码（理由见 ftp_url_unescape），再按协议组装命令：
+       FTP 是 RNFR/RNTO 两条；SFTP 是 rename <src> <dst> 一条，且两个参数由
+       libcurl 在客户端解析，含空白的路径必须加引号（见 ftp_quote_arg）。 */
+    if (ftp_url_unescape(from_path, arg1, sizeof arg1) != 0 ||
+        ftp_url_unescape(to_path, arg2, sizeof arg2) != 0)
+        return -ENAMETOOLONG;
     struct curl_slist* slist = NULL;
-    slist = curl_slist_append(slist, cmd1);
-    slist = curl_slist_append(slist, cmd2);
+    if (bk->cfg.sftp) {
+        char q1[4096], q2[4096];
+        if (ftp_quote_arg(&bk->cfg, arg1, q1, sizeof q1) != 0 ||
+            ftp_quote_arg(&bk->cfg, arg2, q2, sizeof q2) != 0)
+            return -ENAMETOOLONG;
+        if (snprintf(cmd1, sizeof cmd1, "rename %s %s", q1, q2) >= (int)sizeof cmd1)
+            return -ENAMETOOLONG;
+        slist = curl_slist_append(slist, cmd1);
+    } else {
+        char q1[4096], q2[4096];
+        if (ftp_quote_arg(&bk->cfg, arg1, q1, sizeof q1) != 0 ||
+            ftp_quote_arg(&bk->cfg, arg2, q2, sizeof q2) != 0)
+            return -ENAMETOOLONG;
+        if (snprintf(cmd1, sizeof cmd1, "RNFR %s", q1) >= (int)sizeof cmd1 ||
+            snprintf(cmd2, sizeof cmd2, "RNTO %s", q2) >= (int)sizeof cmd2)
+            return -ENAMETOOLONG;
+        slist = curl_slist_append(slist, cmd1);
+        slist = curl_slist_append(slist, cmd2);
+    }
     CURL* c = ftp_easy_new(&bk->cfg);
     if (!c) {
         curl_slist_free_all(slist);
@@ -2449,7 +2705,7 @@ int ftp_backend_rename(const char* from, const char* to) {
     if (res != CURLE_OK) {
         /* 服务器应答过的（550 目标已存在/RNFR 无效等）是业务失败：不计
            熔断不重建；仅后端不可达计入（分类见 res_is_unavailable） */
-        reset_curl(bk, res_is_unavailable(res, resp));
+        reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
         return -EIO;
     }
     ftp_stat_cache_clear(bk); /* RNFR/RNTO 成功：整表失效（from/to 均可能被缓存） */
@@ -2488,7 +2744,7 @@ int ftp_backend_truncate(const char* path, off_t size) {
         if (res != CURLE_OK) {
             /* 服务器应答过的（550 等）是业务失败：不计熔断不重建；仅后端
                不可达计入（分类见 res_is_unavailable） */
-            reset_curl(bk, res_is_unavailable(res, resp));
+            reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
             return -EIO;
         }
         ftp_stat_cache_clear(bk); /* STOR 空文件截断成功：整表失效 */

@@ -35,6 +35,8 @@ scripts/acceptance.sh                 # 完整验收门（构建 + 测试 + 文�
 | `fusermount3`、`/dev/fuse` | 真实挂载 | L1 整层 skip |
 | Python `sqlite3` | `test_functional` 的 DB 用例 | 子组 skip |
 | 本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写） | `test_ftp.py`、`test_ftp_parallel.py` | 整套 skip |
+| `sshd` + `sftp-server`（套件自起于 127.0.0.1:2222，非 root、仅公钥认证） | `test_sftp.py` | 整套 skip |
+| libcurl 编入 libssh2（`-Dsftp=enabled`，GNU 上系统库通常已含） | `test_sftp.py` | 整套 skip（驱动报 rc=3） |
 | `cc`（本机编译器） | L0 的「直编实际源码 + `--wrap` 桩」类套件 | 整套 skip |
 
 非默认产物路径用环境变量覆盖：`FUSE_DAEMON`、`FTP_MODULE_SO`、`GLOBAL_REPLACE_CTL`、
@@ -91,7 +93,7 @@ scripts/acceptance.sh                 # 完整验收门（构建 + 测试 + 文�
 | 层 | 范围 | 环境要求 |
 |---|---|---|
 | **L0** 静态/契约 | 不挂载、不联网、不起 daemon。多为「直编实际源码 + `--wrap` 桩/ASan」的判别性用例 | 只需 `cc` |
-| **L1** GNU 真实 FUSE | 起真 daemon、真挂载；部分需 vsftpd 或系统 `log_monitor` | `/dev/fuse`、`fusermount3` |
+| **L1** GNU 真实后端/FUSE | 起真 daemon、真挂载；部分需 vsftpd、本机 sshd 或系统 `log_monitor` | `/dev/fuse`、`fusermount3`（`test_sftp` 只需 sshd） |
 | **L2** Android 拓扑仿真 | rootless `unshare` 沙箱内仿真安卓挂载拓扑 | userns 可用 |
 | **L3** 真实 Android 内核/权限 | SELinux / Bionic / vold / FUSE-BPF / Zygisk 双 ABI / 多用户 | emulator/AVD 或真机（**本机无，未做**） |
 | **L4** 设备最终验收 | 仅授权后经 `scripts/adb-sh.sh` | 真机 + 显式授权 |
