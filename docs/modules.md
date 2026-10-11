@@ -95,8 +95,13 @@ conf.key_file.order = 7          # 前端显示顺序
 | `MODULE_CONF_LIST` | `FTP_LIST` | `module` | 列出配置里的条目（段名即条目名，跳过 `[GLOBAL]`；每条含 `derived`） |
 | `MODULE_CONF_GET` | `FTP_GET` | `module`、`name` | 读单个条目（含 `derived`） |
 | `MODULE_CONF_ADD` | `FTP_ADD` | `module`、`name`、`fields` | 新建/更新条目（空值 = 不写该键；新建须给齐 `required`；幂等：同值 → `duplicate:true` 免写） |
-| `MODULE_CONF_SET` | `FTP_SET` | `module`、`name`、`key`、`value` | 改单字段（空值/纯空白 = 删键回缺省，`int` 同样可删） |
+| `MODULE_CONF_SET` | `FTP_SET` | `module`、`name`，加 `key`+`value` **或** `fields` | 改字段：空值/纯空白 = 删键回缺省（`int` 同样可删）；`fields` 形态可**一次请求内既写字段又删键**，原子落盘 |
 | `MODULE_CONF_REMOVE` | `FTP_REMOVE` | `module`、`name` | 删条目 |
+
+**应答信封（rule_server 全部命令，含规则 `ADD`/`SET`/`REMOVE`/…）**：统一回
+`{status, command, data|error, timestamp}`，其中 `command` **必须等于本次请求的 `cmd`**
+（不是相近命令的名字——`SET` 曾因内部转发而复用 `ADD` 的应答串，客户端只校验 `status`
+才没暴露；契约上按「同名回显」判）。
 
 约束：
 
@@ -111,6 +116,13 @@ conf.key_file.order = 7          # 前端显示顺序
     故 `int` 字段同样删得掉（否则会被判「须为整数」而永远删不掉，缺省也就永远回不去）。
   - `MODULE_CONF_ADD` 传空值 = **不写该键**（走模块缺省），不落 `key = ` 空行——模块
     读侧对空值多判非法而**整段作废**。要清掉已有的键请用 SET，不要用 ADD 传空。
+- **`MODULE_CONF_SET` 支持 `fields` 形态（一次请求既写又删）**：
+  `{"cmd":"MODULE_CONF_SET","name":N,"fields":{"host":"h","user":"","port":""}}`
+  —— 非空值写、空值删，正是**表单整体保存**需要的语义（改了的写、清空的删），
+  不必拆成 N 个请求，也不会有「先写后删」的中途状态：全部先解析校验，再统一落盘
+  一次；任何一个键非法即整条请求拒绝，文件逐字不动。应答
+  `{file, name, keys:[本次写入的键], deleted:[本次删除的键], changed}`；单字段形态
+  另回 `key`（既有前端契约不变）。`fields` 为空对象 → 明确拒绝（不静默回 `ok`）。
 - **`required` 由控制面强制**：新建条目缺 `required` 字段即拒。模块侧对缺必填字段的段
   整段作废，落一个「看不见的坏段」不如当场拒绝。
 - **条目回读形状**：`{name, <各字段生效值>, has_<敏感字段>, derived:[…]}`。`derived`
@@ -136,6 +148,9 @@ conf.key_file.order = 7          # 前端显示顺序
   字段）。把缺省值一并写回会把「缺省生效」物化成显式键——例如 `proto=sftp` 的段被写上
   `port = 22`，此后再改 `proto=ftp` 仍连 22 端口。这是「读回再整体回写」写坏 SFTP
   配置的根因。
+- **表单保存用一次 `MODULE_CONF_SET` + `fields`**：用户清空的字段传空串（= 删键），
+  改动的传新值；新建条目走 `MODULE_CONF_ADD`（`fields`，空值 = 不写）。这样一次请求
+  就表达了「写哪些 + 删哪些」，落盘一次完成。
 
 三条边界（不得越界）：
 
