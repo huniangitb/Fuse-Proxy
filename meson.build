@@ -612,7 +612,10 @@ shared_library('ftp_module',
   install_dir: install_bin_dir + '/modules/ftp_module'
 )
 
-# 模块规则类型注册文件：rule_server 扫描合并动态规则类型（格式见 nsp_module.h）
+# 模块声明文件：rule_server 扫描合并
+#   - [TYPE] 段：动态规则类型（格式见 nsp_module.h）
+#   - [conf]  段：模块配置 schema（MODCONF_* 字段契约，供控制面校验与前端渲染）
+# 两者同文件，打包/安装只需同步这一个（scripts/pack-module.sh 同理）。
 install_data('src/modules/ftp/ftp_module.rules',
   install_dir: install_bin_dir + '/modules/ftp_module'
 )

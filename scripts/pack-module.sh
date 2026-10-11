@@ -127,6 +127,8 @@ echo "== 同步 .rules 规则类型注册文件 ..."
 # 模块目录映射：<源目录>|<模块目录>。源目录名与模块目录名可能不同
 # （ftp_module.rules 位于 src/modules/ftp/）；规则能力已内建（V4），
 # 只剩后端模块自带 .rules。第 2.1 步的白名单与这里同源，避免两处漂移。
+# 该文件同时承载模块配置 schema（[conf] 段），故只需同步这一份——
+# 新增模块配置项改声明文件即可，不必改 C 或动打包脚本。
 MODULE_PAIRS=("ftp|ftp_module")
 for pair in "${MODULE_PAIRS[@]}"; do
     src_mod="${pair%%|*}"
