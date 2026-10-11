@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# 为 Android 交叉编译 SFTP 依赖：mbedTLS + libssh2（静态，arm64-v8a）。
+#
+# 为什么需要它：NDK 既不带 libssh2 也不带 OpenSSL/mbedTLS，而 libcurl 的 SFTP
+# 后端（libssh2）需要一个密码学库。本脚本产出「预构建根」供 meson 消费：
+#
+#   scripts/build-libssh2-android.sh [输出目录]      # 默认 $HOME/.cache/fuse-proxy-android/sftp
+#   （输出目录须在**项目源码树之外**：meson 的 cmake 子项目会忽略源码树内、
+#     子项目外的 include 路径，curl 会以「libssh2.h not found」失败）
+#   scripts/android-build.sh build_android -Dsftp=enabled \
+#       -Dlibssh2_dir="$PWD/.deps/android-libssh2"
+#
+# 产出布局（meson 的 -Dlibssh2_dir 约定）：
+#   <根>/include/libssh2*.h
+#   <根>/lib/libssh2.a  +  libmbedtls.a / libmbedx509.a / libmbedcrypto.a
+# meson 侧把 libssh2.a 交给 curl 的 cmake（-DLIBSSH2_LIBRARY），并把 lib/ 下
+# 已知名（mbedtls/mbedx509/mbedcrypto/ssl/crypto/...）的库一并静态链接进
+# ftp_module.so。
+#
+# 版本：mbedTLS 3.6.2（LTS）+ libssh2 1.11.1（两者搭配已在 NDK r29 / API 29 实测）。
+# 源码获取：优先用 ANDROID_SFTP_SRC=<目录>（内含 mbedtls/ 与 libssh2/ 子目录，
+# 便于离线/复用），否则 git clone 到临时目录（mbedTLS 需 --recurse-submodules）。
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+OUT_ARG="${1:-$HOME/.cache/fuse-proxy-android/sftp}"
+mkdir -p "$(dirname "$OUT_ARG")"
+OUT="$(cd "$(dirname "$OUT_ARG")" && pwd)/$(basename "$OUT_ARG")"
+# 预构建**不能落在项目源码树内**：meson 的 cmake 子项目转换会把「根项目内、子项目
+# 外」的 include 路径判为不可用并静默忽略，症状是 curl 编译到 libssh2.h 才报
+# file not found（错误指不到真因）。meson.build 侧也有同样的守卫。
+case "$OUT/" in
+  "$ROOT"/*)
+    echo "error: 输出目录不能位于项目源码树内（$OUT）。" >&2
+    echo "       meson 的 cmake 子项目会忽略源码树内、子项目外的 include 路径。" >&2
+    exit 1;;
+esac
+API="${ANDROID_API:-29}"
+MBEDTLS_TAG="${MBEDTLS_TAG:-v3.6.2}"
+LIBSSH2_TAG="${LIBSSH2_TAG:-libssh2-1.11.1}"
+
+echo "==> [1/4] 搜索 NDK"
+NDK=""
+for cand in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
+  if [ -n "$cand" ] && [ -d "$cand/toolchains/llvm/prebuilt/linux-x86_64/bin" ]; then
+    NDK="$cand"; break
+  fi
+done
+if [ -z "$NDK" ]; then
+  for base in "$HOME/android-ndk" "$HOME/Android/Sdk/ndk" \
+              /opt/android-sdk/ndk /opt/android-sdk \
+              /usr/local/android-sdk/ndk /usr/local/android-sdk; do
+    [ -d "$base" ] || continue
+    for d in $(ls -1d "$base"/*/ 2>/dev/null | sort -V); do
+      if [ -d "${d}toolchains/llvm/prebuilt/linux-x86_64/bin" ]; then NDK="$d"; fi
+    done
+    [ -n "$NDK" ] && break
+    if [ -d "$base/toolchains/llvm/prebuilt/linux-x86_64/bin" ]; then NDK="$base"; break; fi
+  done
+fi
+[ -n "$NDK" ] || { echo "error: 未找到 Android NDK，请设置 ANDROID_NDK_HOME" >&2; exit 1; }
+NDK="$(cd "$NDK" && pwd)"
+TC="$NDK/build/cmake/android.toolchain.cmake"
+[ -f "$TC" ] || { echo "error: $TC 不存在" >&2; exit 1; }
+echo "    NDK：$NDK（API $API，ABI arm64-v8a）"
+
+echo "==> [2/4] 准备源码"
+WORK=""
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
+trap cleanup EXIT
+if [ -n "${ANDROID_SFTP_SRC:-}" ]; then
+  SRC="$(cd "$ANDROID_SFTP_SRC" && pwd)"
+  [ -d "$SRC/mbedtls" ] && [ -d "$SRC/libssh2" ] || {
+    echo "error: ANDROID_SFTP_SRC=$SRC 下需有 mbedtls/ 与 libssh2/ 两个目录" >&2; exit 1; }
+  echo "    复用 $SRC"
+else
+  WORK="$(mktemp -d)"
+  SRC="$WORK"
+  echo "    clone mbedTLS $MBEDTLS_TAG（含子模块）+ libssh2 $LIBSSH2_TAG → $WORK"
+  git clone -q --depth 1 --recurse-submodules --shallow-submodules \
+      --branch "$MBEDTLS_TAG" https://github.com/Mbed-TLS/mbedtls.git "$SRC/mbedtls"
+  git clone -q --depth 1 --branch "$LIBSSH2_TAG" \
+      https://github.com/libssh2/libssh2.git "$SRC/libssh2"
+fi
+
+echo "==> [3/4] 交叉编译 mbedTLS（静态）"
+cmake -S "$SRC/mbedtls" -B "$SRC/mbedtls/build" \
+  -DCMAKE_TOOLCHAIN_FILE="$TC" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+  -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF \
+  -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+  -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$SRC/mbedtls/build" -j"$(nproc)" >/dev/null
+
+echo "==> [4/4] 交叉编译 libssh2（CRYPTO_BACKEND=mbedTLS）"
+cmake -S "$SRC/libssh2" -B "$SRC/libssh2/build" \
+  -DCMAKE_TOOLCHAIN_FILE="$TC" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+  -DCRYPTO_BACKEND=mbedTLS \
+  -DMBEDTLS_INCLUDE_DIR="$SRC/mbedtls/include" \
+  -DMBEDTLS_LIBRARY="$SRC/mbedtls/build/library/libmbedtls.a" \
+  -DMBEDX509_LIBRARY="$SRC/mbedtls/build/library/libmbedx509.a" \
+  -DMBEDCRYPTO_LIBRARY="$SRC/mbedtls/build/library/libmbedcrypto.a" \
+  -DBUILD_SHARED_LIBS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF \
+  -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$SRC/libssh2/build" -j"$(nproc)" >/dev/null
+
+rm -rf "$OUT"
+mkdir -p "$OUT/include" "$OUT/lib"
+cp "$SRC"/libssh2/include/*.h "$OUT/include/"
+cp "$SRC"/libssh2/build/src/libssh2.a "$OUT/lib/"
+cp "$SRC"/mbedtls/build/library/libmbedtls.a \
+   "$SRC"/mbedtls/build/library/libmbedx509.a \
+   "$SRC"/mbedtls/build/library/libmbedcrypto.a "$OUT/lib/"
+
+echo
+echo "==> 完成：$OUT"
+ls -la "$OUT/lib"
+echo
+echo "接着用（二选一）："
+echo "  scripts/android-build.sh build_android -Dsftp=enabled -Dlibssh2_dir=\"$OUT\""
+echo "  meson setup build_android --cross-file android-aarch64.ini \\"
+echo "      -Dsftp=enabled -Dlibssh2_dir=\"$OUT\" -Dandroid_ndk_root=\"$NDK\""

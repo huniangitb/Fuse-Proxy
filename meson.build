@@ -436,16 +436,17 @@ ftp_module_sources = [
     'src/modules/ftp/ftp_backend_libcurl.c',
 ]
 
-# ftp_module：FTP 存储后端模块（BACKEND 类型，dlopen 共享库，无 FUSE 实现）。
+# ftp_module：远程存储后端模块（FTP / SFTP，dlopen 共享库，无 FUSE 实现）。
 # libcurl（8.21.0+）默认经子模块自动构建，无需手动指定：
 #   - gnu：系统 pkg-config（版本门槛 >=8.21.0）优先，缺失回退 cmake 子模块
-#    （pin curl-8_22_0，门槛天然满足）；
+#    （pin curl-8_22_0，门槛天然满足）；系统库**不含 SFTP** 时也回退子模块
+#    以便把 libssh2 编进去（见下方 -Dsftp）；
 #   - android(subproject，默认)：cmake 子模块随主项目交叉编译（静态库，
-#     仅 FTP+HTTP、无 SSL 及可选外部依赖，CURL::libcurl 别名透传头文件）；
+#     仅 FTP/HTTP/SFTP、无 TLS 及可选外部依赖，CURL::libcurl 别名透传头文件）；
 #   - android(prebuilt)：-Dandroid_curl=prebuilt 切回 -Dcurl_dir 预构建。
-# 最小构建集与 ftp 代码用法对齐（只用明文 FTP，CURLOPT_USE_SSL=CURLUSESSL_NONE；
-# 认证/代理/MIME/NETRC 保持默认，禁掉的均为未引用协议与特性——误禁会在
-# 编译期以 CURLE_NOT_BUILT_IN 相关符号缺失暴露，而非静默降级）。
+# 最小构建集与 ftp 代码用法对齐（FTP 用明文 FTP，CURLOPT_USE_SSL=CURLUSESSL_NONE；
+# SFTP 经 libssh2；认证/代理/MIME/NETRC 保持默认，禁掉的均为未引用协议与特性
+# ——误禁会在编译期以 CURLE_NOT_BUILT_IN 相关符号缺失暴露，而非静默降级）。
 curl_cmake_opts = ['-DBUILD_SHARED_LIBS=OFF', '-DBUILD_STATIC_LIBS=ON',
   '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
   '-DBUILD_CURL_EXE=OFF', '-DBUILD_TESTING=OFF',
@@ -453,7 +454,7 @@ curl_cmake_opts = ['-DBUILD_SHARED_LIBS=OFF', '-DBUILD_STATIC_LIBS=ON',
   '-DCURL_ENABLE_SSL=OFF',
   '-DCURL_ZLIB=OFF', '-DCURL_BROTLI=OFF', '-DCURL_ZSTD=OFF',
   '-DUSE_NGHTTP2=OFF', '-DUSE_LIBIDN2=OFF',
-  '-DCURL_USE_LIBPSL=OFF', '-DCURL_USE_LIBSSH2=OFF',
+  '-DCURL_USE_LIBPSL=OFF',
   '-DCURL_DISABLE_DICT=ON', '-DCURL_DISABLE_FILE=ON',
   '-DCURL_DISABLE_GOPHER=ON', '-DCURL_DISABLE_IMAP=ON',
   '-DCURL_DISABLE_LDAP=ON', '-DCURL_DISABLE_MQTT=ON',
@@ -464,18 +465,100 @@ curl_cmake_opts = ['-DBUILD_SHARED_LIBS=OFF', '-DBUILD_STATIC_LIBS=ON',
   '-DCURL_DISABLE_ALTSVC=ON', '-DCURL_DISABLE_HEADERS_API=ON',
   '-DCURL_DISABLE_HSTS=ON']
 
+# ================= SFTP（proto=sftp）依赖：libssh2 =================
+# SFTP 由 libcurl 的 SSH 后端（libssh2）提供；libssh2 自己需要一个密码学库。
+# 本仓库不替用户决定密码学库，只消费「已构建好的 libssh2」：
+#   - gnu：pkg-config libssh2（发行版包，链接其密码学库）；
+#   - android：-Dlibssh2_dir=<根>（含 include/libssh2.h 与 lib/），
+#     NDK 既不带 libssh2 也不带 OpenSSL/mbedTLS，必须外部交叉编译。
+#     lib/ 下除 libssh2.a 外还须放其密码学库（mbedtls/mbedx509/mbedcrypto 或
+#     ssl/crypto 等），meson 按已知名探测并随模块一起静态链接。
+# -Dsftp：auto（默认，能拿到就启用、拿不到退回仅 FTP）/ enabled（硬要求）/
+#         disabled（与历史行为一致，不引入任何新依赖）。
+sftp_opt = get_option('sftp')
+sftp_enabled = false
+libssh2_cmake_opts = []
+libssh2_link_deps = []
+
+if target_os == 'gnu'
+  _l2 = dependency('libssh2', required: false)
+  if _l2.found()
+    libssh2_link_deps = [_l2]
+  endif
+else
+  _l2root = get_option('libssh2_dir')
+  if _l2root != ''
+    # 约束：libssh2 预构建**不能放在项目源码树内**。meson 的 cmake 子项目转换会把
+    # 「在根项目里、但不在子项目里」的 include 路径判为不可用并静默忽略
+    # （cmake/interpreter.py 的 rel_path），症状是 curl 编译到 libssh2.h 才报
+    # file not found——错误信息指不到真正原因。这里提前给出可操作的错误。
+    # （构建目录内是允许的，故只拒绝「源码树内且构建树外」。）
+    if _l2root.startswith(meson.project_source_root()) and \
+       not _l2root.startswith(meson.project_build_root())
+      error('libssh2_dir（' + _l2root + '）位于项目源码树内：meson 的 cmake 子项目会忽略源码树内、子项目外的 include 路径，curl 会以「libssh2.h not found」失败。请把预构建放到源码树之外（如 $HOME/.cache/fuse-proxy-android/sftp，见 scripts/build-libssh2-android.sh）')
+    endif
+    # 直接给 curl 的 FindLibssh2 绝对路径，绕开 pkg-config（交叉构建下不可用）
+    libssh2_cmake_opts = ['-DLIBSSH2_INCLUDE_DIR=' + _l2root + '/include',
+                          '-DLIBSSH2_LIBRARY=' + _l2root + '/lib/libssh2.a']
+    libssh2_link_deps = [cc.find_library('ssh2', dirs: [_l2root + '/lib'],
+                                         static: true, required: true)]
+    foreach _n : ['mbedtls', 'mbedx509', 'mbedcrypto', 'ssl', 'crypto', 'gcrypt', 'wolfssl']
+      _d = cc.find_library(_n, dirs: [_l2root + '/lib'], static: true, required: false)
+      if _d.found()
+        libssh2_link_deps += _d
+      endif
+    endforeach
+  endif
+endif
+libssh2_available = (libssh2_link_deps.length() > 0)
+
+# 把 libssh2 编进 libcurl 的 cmake 选项（未启用时显式关掉，保持最小构建集）
+if libssh2_available
+  curl_sftp_opts = ['-DCURL_USE_LIBSSH2=ON'] + libssh2_cmake_opts
+else
+  curl_sftp_opts = ['-DCURL_USE_LIBSSH2=OFF']
+endif
+
 if target_os == 'gnu'
   ftp_curl_dep = dependency('libcurl', version: '>=8.21.0', required: false)
-  if ftp_curl_dep.found()
-    message('libcurl: 使用系统 pkg-config')
+  system_curl_has_sftp = false
+  if ftp_curl_dep.found() and not meson.is_cross_build()
+    # 运行期探测系统 libcurl 是否含 sftp：curl 8.x 已删除 CURL_VERSION_LIBSSH2
+    # 特性位，编译期无从判断，只能查 version_info 的协议表（本机可执行）。
+    _sftp_probe = cc.run('''
+#include <curl/curl.h>
+#include <string.h>
+int main(void) {
+  curl_version_info_data *v = curl_version_info(CURLVERSION_NOW);
+  for(const char * const *p = v->protocols; p && *p; p++)
+    if(strcmp(*p, "sftp") == 0) return 0;
+  return 1;
+}''', dependencies: ftp_curl_dep, name: 'libcurl-sftp-probe')
+    system_curl_has_sftp = (_sftp_probe.returncode() == 0)
+  endif
+  _use_system_curl = ftp_curl_dep.found()
+  if sftp_opt != 'disabled' and _use_system_curl and not system_curl_has_sftp
+    # 系统库不含 SFTP：若 libssh2 可得则改走子模块把它编进去（否则维持系统库）
+    if libssh2_available
+      message('libcurl: 系统库无 SFTP，改用项目内子模块 subprojects/curl + libssh2')
+      _use_system_curl = false
+    endif
+  endif
+  if _use_system_curl
+    message('libcurl: 使用系统 pkg-config' + (system_curl_has_sftp ? '（含 SFTP）' : ''))
+    sftp_enabled = system_curl_has_sftp
   else
+    if not libssh2_available and sftp_opt == 'enabled'
+      error('sftp=enabled 需要 libssh2：GNU 下请安装 libssh2 开发包（pkg-config libssh2）')
+    endif
     # GNU + curl 子模块：经 cmake 随主项目编译（静态库，见上；取实 target
     # libcurl_static——cmake ALIAS 不在 meson target 列表，见构建验证）
     message('libcurl: 使用项目内子模块 subprojects/curl（cmake 编译）')
     curl_cmake = import('cmake')
     curl_sp = curl_cmake.subproject('curl',
-      cmake_options: curl_cmake_opts, required: true)
+      cmake_options: curl_cmake_opts + curl_sftp_opts, required: true)
     ftp_curl_dep = curl_sp.dependency('libcurl_static')
+    sftp_enabled = libssh2_available
   endif
   ftp_curl_inc = []
 else
@@ -495,22 +578,34 @@ else
         'CURLINFO_CONTENT_LENGTH_DOWNLOAD_T', include_directories: ftp_curl_inc)
       error('预构建 libcurl（' + curl_root + '）头文件缺少 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T，请确认使用 curl >= 8.21.0')
     endif
-    message('libcurl: 使用预构建静态库 ' + curl_root)
+    message('libcurl: 使用预构建静态库 ' + curl_root + '（SFTP 取决于该库是否编入 libssh2，运行时自检）')
+    sftp_enabled = (sftp_opt != 'disabled') # 无法在配置期探测预构建库，交由运行时
   else
+    if not libssh2_available and sftp_opt == 'enabled'
+      error('sftp=enabled 需要 -Dlibssh2_dir=<含 include/ 与 lib/ 的 libssh2 预构建根>（NDK 不带 libssh2 与密码学库）')
+    endif
     message('libcurl: 使用项目内子模块 subprojects/curl（cmake 交叉编译）')
     curl_cmake = import('cmake')
     curl_sp = curl_cmake.subproject('curl',
-      cmake_options: curl_cmake_opts + ['-DANDROID_NDK=' + _ndk_root],
+      cmake_options: curl_cmake_opts + curl_sftp_opts + ['-DANDROID_NDK=' + _ndk_root],
       required: true)
     ftp_curl_dep = curl_sp.dependency('libcurl_static')
     ftp_curl_inc = []
+    sftp_enabled = libssh2_available
   endif
+endif
+
+if sftp_enabled
+  message('SFTP: 已启用（libcurl 编入 libssh2）')
+elif sftp_opt != 'disabled'
+  warning('SFTP 未启用：未找到 libssh2（GNU 装 libssh2 开发包；Android 传 -Dlibssh2_dir=）。' +
+          '模块仍会构建，但 proto=sftp 的段在运行时会按 fail-closed 跳过。')
 endif
 
 shared_library('ftp_module',
   ftp_module_sources,
   include_directories: [all_inc_dirs, ftp_curl_inc],
-  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), nsp_util_dep],
+  dependencies: [dependency('threads'), ftp_curl_dep, cc.find_library('dl', required: false), nsp_util_dep] + libssh2_link_deps,
   c_args: ['-DNSP_MODULE_BUILD'],  # 模块独立 ABI：仅模块激活 nsp_module.h 运行时段
   name_prefix: '',
   install: true,

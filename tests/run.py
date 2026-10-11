@@ -73,12 +73,15 @@ SUITE_MAP = [
      "内建规则引擎(fw_rules) / fuse_daemon.c / config_parser.c"),
 
     (("test_ftp.py", "test_ftp_read_restart.py", "test_ftp_truncate_list.py",
-      "test_ftp_upload_lock.py"),
+      "test_ftp_upload_lock.py", "test_sftp.py"),
      ("src/modules/ftp/",),
      ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read",
       "ftp_backend_truncate", "ftp_list_cache_clear", "ftp_backend_upload",
       # fsync 与 FLUSH 共用后端收尾（vfs_fsync 不再是空操作）→ 改这些行必须跑 ftp
-      "vfs_backend_finish_data", "vfs_fsync", "backend_flush"),
+      "vfs_backend_finish_data", "vfs_fsync", "backend_flush",
+      # SFTP（proto=sftp）协议分派：改动这些必须跑 test_sftp.py
+      "res_is_unavailable", "res_is_not_found", "res_file_probe_ok", "ftp_quote_errno",
+      "ftp_quote_arg", "ftp_url_unescape", "curl_supports_sftp", "ftp_easy_new"),
      "src/modules/ftp/ 或框架后端分派"),
 
     (("test_ftp_parallel.py",),
@@ -219,7 +222,8 @@ LAYERS = {
         ),
     ),
     "L1": (
-        "GNU 真实 FUSE（串行，需 /dev/fuse + fusermount3）",
+        "GNU 真实后端/FUSE（串行；FUSE 类需 /dev/fuse + fusermount3，"
+        "test_sftp 需本机 sshd 于 127.0.0.1:2222）",
         (
             "test_functional.py",
             "test_rules.py",
@@ -231,6 +235,7 @@ LAYERS = {
             "test_backend_lifecycle.py",
             "test_ftp.py",
             "test_ftp_parallel.py",
+            "test_sftp.py",
             "test_log_pipeline.py",
             "test_rule_server.py",
         ),

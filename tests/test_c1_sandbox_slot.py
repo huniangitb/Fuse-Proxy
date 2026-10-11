@@ -50,6 +50,13 @@ SOURCES = [
 ]
 CONFIG_DIR_PAT = re.compile(
     r'^#define\s+(?:NSP_CONFIG_DIR|CONFIG_DIR)\s+"/var/fuse-proxy"\s*$', re.M)
+# 存储根也必须私有化：沙盒落点是 <NSP_STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox，
+# 只补 CONFIG_DIR 的话落点仍指向**共享绝对路径** /var/fuse-proxy/storage/...——
+# ① 本套件会往共享配置树里写目录；② 在 --jobs 下与同样用 sandbox.conf 夹具的套件
+# （test_monitor_layers 等）并发时，对方先建好该落点 → access() 命中 → 本套件
+# 一次 mkdir_recursive_p 都不调 → mkdir_total=0 假失败（隔离跑实测复现）。
+STORAGE_BASE_PAT = re.compile(
+    r'^#define\s+NSP_STORAGE_BASE\s+"/var/fuse-proxy/storage"\s*$', re.M)
 
 FIXTURE = os.path.join(ROOT, "tests", "fixtures", "monitor_layers")
 
@@ -104,12 +111,16 @@ def main():
             text = fh.read()
         patched, n = CONFIG_DIR_PAT.subn(
             lambda m: m.group(0).replace('"/var/fuse-proxy"', f'"{cfgdir}"'), text)
+        patched, n2 = STORAGE_BASE_PAT.subn(
+            lambda m: m.group(0).replace('"/var/fuse-proxy/storage"',
+                                         f'"{tmpdir}/storage"'), patched)
+        n += n2
         if n:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(patched)
             hits += n
     if hits == 0:
-        log("跳过：未定位 GNU 配置根常量")
+        log("跳过：未定位 GNU 配置根/存储根常量")
         return SKIP_RC
 
     exe = os.path.join(tmpdir, "c1_test")

@@ -197,8 +197,91 @@ static void test_ini_save(void) {
     CHECK((st.st_mode & 0777) == 0600, "落盘权限 0600（实际 %03o）", st.st_mode & 0777);
 }
 
+/* ===================== §A3 ftp_conf：SFTP 字段（proto/key/known_hosts） =====================
+   proto=sftp 引入了协议、私钥、known_hosts 与主机密钥校验四个新字段。这里只测
+   **解析与失败闭合**（真正的 SFTP 连通性由 tests/test_sftp.py 打真 sshd 覆盖）：
+   - proto 非法（拼错）必须整段作废——静默退回 ftp 会把账号密码发到明文 FTP；
+   - 端口未显式配置时按 proto 补默认（ftp 21 / sftp 22），且与配置项书写顺序无关；
+   - host_key_check 只认 on/off/true/false/1/0，其余整段作废；默认 on（fail-closed）；
+   - key_file/known_hosts 超长整段作废（同 host/remote_dir 的失败闭合姿态）。 */
+static void test_ftp_conf_sftp(void) {
+    printf("── A3. ftp.conf SFTP 字段（proto/端口默认/主机密钥校验）──\n");
+    char tmpl[] = "/tmp/a26_sftp_XXXXXX";
+    char* dir = mkdtemp(tmpl);
+    if (!dir) {
+        CHECK(false, "mkdtemp 失败");
+        return;
+    }
+    char body[2048];
+    FtpServerList list;
+    int rc;
+
+    /* 1. proto=sftp 且未写 port → 默认 22；host_key_check 默认 on */
+    snprintf(body, sizeof body,
+             "[备份]\nproto = sftp\nhost = nas.local\nuser = b\n"
+             "key_file = /data/Namespace-Proxy/keys/b.key\n");
+    rc = ftp_conf_load(write_tmp(dir, "s1.conf", body), &list);
+    CHECK(rc == 0 && list.count == 1, "proto=sftp 段加载成功（count=%d）", list.count);
+    if (rc == 0 && list.count == 1) {
+        CHECK(list.servers[0].sftp, "sftp 标记置位");
+        CHECK(list.servers[0].port == 22, "未写 port → sftp 默认 22（实际 %d）",
+              list.servers[0].port);
+        CHECK(list.servers[0].host_key_check, "host_key_check 默认 on（fail-closed）");
+        CHECK(strcmp(list.servers[0].key_file, "/data/Namespace-Proxy/keys/b.key") == 0,
+              "key_file 解析（实际 \"%s\"）", list.servers[0].key_file);
+    }
+    ftp_conf_free(&list);
+
+    /* 2. proto=ftp 且未写 port → 默认 21（旧行为不变） */
+    snprintf(body, sizeof body, "[盘]\nproto = ftp\nhost = h\n");
+    rc = ftp_conf_load(write_tmp(dir, "s2.conf", body), &list);
+    CHECK(rc == 0 && list.count == 1 && !list.servers[0].sftp && list.servers[0].port == 21,
+          "proto=ftp → port 默认 21（sftp=%d port=%d）",
+          rc == 0 && list.count == 1 ? (int)list.servers[0].sftp : -1,
+          rc == 0 && list.count == 1 ? list.servers[0].port : -1);
+    ftp_conf_free(&list);
+
+    /* 3. 显式 port 优先，且与 proto 的书写顺序无关 */
+    snprintf(body, sizeof body, "[备份]\nport = 2222\nhost = h\nproto = sftp\n");
+    rc = ftp_conf_load(write_tmp(dir, "s3.conf", body), &list);
+    CHECK(rc == 0 && list.count == 1 && list.servers[0].port == 2222 && list.servers[0].sftp,
+          "显式 port 优先且与顺序无关（port=%d sftp=%d）",
+          rc == 0 && list.count == 1 ? list.servers[0].port : -1,
+          rc == 0 && list.count == 1 ? (int)list.servers[0].sftp : -1);
+    ftp_conf_free(&list);
+
+    /* 4. proto 拼错 → 整段作废（绝不静默退回明文 ftp） */
+    snprintf(body, sizeof body, "[错]\nproto = scp\nhost = h\n");
+    rc = ftp_conf_load(write_tmp(dir, "s4.conf", body), &list);
+    CHECK(rc != 0 && list.count == 0, "proto=scp 整段作废（count=%d rc=%d）", list.count, rc);
+    ftp_conf_free(&list);
+
+    /* 5. host_key_check 三态：on/off 生效，垃圾值整段作废 */
+    snprintf(body, sizeof body,
+             "[关]\nproto = sftp\nhost = h\nhost_key_check = off\n");
+    rc = ftp_conf_load(write_tmp(dir, "s5.conf", body), &list);
+    CHECK(rc == 0 && list.count == 1 && !list.servers[0].host_key_check,
+          "host_key_check=off 生效");
+    ftp_conf_free(&list);
+
+    snprintf(body, sizeof body, "[垃圾]\nproto = sftp\nhost = h\nhost_key_check = maybe\n");
+    rc = ftp_conf_load(write_tmp(dir, "s6.conf", body), &list);
+    CHECK(rc != 0 && list.count == 0, "host_key_check=maybe 整段作废（count=%d）", list.count);
+    ftp_conf_free(&list);
+
+    /* 6. key_file 超长（≥512）→ 整段作废（不截断路径去连错文件） */
+    char big[600];
+    memset(big, 'k', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+    snprintf(body, sizeof body, "[超长]\nproto = sftp\nhost = h\nkey_file = %s\n", big);
+    rc = ftp_conf_load(write_tmp(dir, "s7.conf", body), &list);
+    CHECK(rc != 0 && list.count == 0, "key_file 超长整段作废（count=%d）", list.count);
+    ftp_conf_free(&list);
+}
+
 int main(void) {
     test_ftp_conf_hash();
+    test_ftp_conf_sftp();
     test_ini_save();
     printf("SUMMARY pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

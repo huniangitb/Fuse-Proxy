@@ -12,6 +12,10 @@ option('android_curl', type: 'combo', choices: ['subproject', 'prebuilt'], value
        description: 'Android 下 libcurl 来源：subproject=项目内子模块经 cmake 随主项目交叉编译（默认）；prebuilt=经 curl_dir 传入预构建静态库')
 option('android_ndk_root', type: 'string', value: '',
        description: 'Android NDK 根目录（cmake 子项目的 Android 平台检测用；scripts/android-build.sh 自动传入，手动配置时可填，留空则从编译器路径反推）')
+option('sftp', type: 'combo', choices: ['auto', 'enabled', 'disabled'], value: 'auto',
+       description: 'SFTP 后端（proto=sftp）：auto=能拿到带 libssh2 的 libcurl 就启用、否则退回仅 FTP；enabled=硬要求（拿不到直接失败）；disabled=与历史行为一致（不引入任何新依赖）')
+option('libssh2_dir', type: 'string', value: '',
+       description: '预构建 libssh2 根（含 include/libssh2.h 与 lib/），Android 交叉编译 SFTP 时用；lib/ 下除 libssh2.a 还须放其密码学库（mbedtls/mbedx509/mbedcrypto 或 ssl/crypto 等）。**须位于项目源码树之外**（meson 的 cmake 子项目会忽略源码树内、子项目外的 include 路径），如 $HOME/.cache/fuse-proxy-android/sftp')
 option('target_os', type: 'combo', choices: ['android', 'gnu'], value: 'android',
        description: 'Target OS: android=Android NDK with passthrough, gnu=GNU/Linux with mainline libfuse3')
 option('libfuse_source', type: 'combo', choices: ['auto', 'system', 'custom', 'subproject'], value: 'auto',

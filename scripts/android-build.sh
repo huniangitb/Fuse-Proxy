@@ -60,13 +60,26 @@ echo "    API：$API"
 echo "==> [2/4] 初始化子模块（libfuse/json-c/curl）"
 git submodule update --init --recursive subprojects/libfuse subprojects/json-c subprojects/curl
 
+# 可选 SFTP：NDK 既不带 libssh2 也不带密码学库，故需外部预构建（见
+# scripts/build-libssh2-android.sh）。ANDROID_SFTP=1 时自动准备依赖目录并把
+# -Dsftp=enabled -Dlibssh2_dir= 交给 meson；默认不动（仅 FTP，零额外依赖）。
+SFTP_ARGS=()
+if [ "${ANDROID_SFTP:-0}" = "1" ]; then
+  SFTP_DIR="${ANDROID_SFTP_DIR:-$PWD/.deps/android-libssh2}"
+  if [ ! -d "$SFTP_DIR/lib" ]; then
+    echo "==> ANDROID_SFTP=1：先构建 libssh2/mbedTLS 预构建（$SFTP_DIR）"
+    scripts/build-libssh2-android.sh "$SFTP_DIR"
+  fi
+  SFTP_ARGS=(-Dsftp=enabled -Dlibssh2_dir="$SFTP_DIR")
+fi
+
 echo "==> [3/4] meson 配置（${BUILD_DIR}）"
 export PATH="$BIN:$PATH"
 export ANDROID_NDK_ROOT="$NDK"
 if [ -f "${BUILD_DIR}/build.ninja" ]; then
-  meson setup --reconfigure "${BUILD_DIR}" -Dandroid_ndk_root="$NDK" "$@"
+  meson setup --reconfigure "${BUILD_DIR}" -Dandroid_ndk_root="$NDK" ${SFTP_ARGS[@]+"${SFTP_ARGS[@]}"} "$@"
 else
-  meson setup "${BUILD_DIR}" --cross-file android-aarch64.ini -Dandroid_ndk_root="$NDK" "$@"
+  meson setup "${BUILD_DIR}" --cross-file android-aarch64.ini -Dandroid_ndk_root="$NDK" ${SFTP_ARGS[@]+"${SFTP_ARGS[@]}"} "$@"
 fi
 
 echo "==> [4/4] 编译"

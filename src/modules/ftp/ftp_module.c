@@ -41,6 +41,21 @@ static char g_ftp_conf_path[PATH_MAX] = CONFIG_DIR "/ftp.conf";
 static pthread_t g_hotload_tid = 0;
 static volatile sig_atomic_t g_hotload_stop = 0;
 
+/* 运行期能力探测：本 libcurl 是否编入了 SFTP。
+   编译期无法从 curl 头判断——CURL_VERSION_LIBSSH2 这个特性位在 curl 8.x 已
+   删除（8.22 头文件里不存在），故查 curl_version_info()->protocols 里有没有
+   "sftp"。没有时 proto=sftp 的段**整段跳过**（fail-closed）：静默退回明文
+   ftp 会把账号密码发到错误的协议上，比连不上更糟。 */
+static bool curl_supports_sftp(void) {
+    curl_version_info_data* vi = curl_version_info(CURLVERSION_NOW);
+    if (!vi || !vi->protocols) return false;
+    for (const char* const* p = vi->protocols; *p; p++)
+        if (strcmp(*p, "sftp") == 0) return true;
+    return false;
+}
+
+static bool g_curl_has_sftp = false; /* init 内探测一次（curl_global_init 之后） */
+
 /* 重新解析 ftp.conf 并重建后端前缀表（init 与热加载共用） */
 static void reload_ftp_conf(void) {
     FtpServerList list;
@@ -52,10 +67,29 @@ static void reload_ftp_conf(void) {
     /* 后端表已动态化（加载器注册表 + FTP 后端指针数组均无 16 上限），
        有多少 server 注册多少；单段 add 失败（OOM）仅跳过该段 */
     for (int i = 0; i < list.count; i++) {
+        if (list.servers[i].sftp && !g_curl_has_sftp) {
+            LOG_ERR("ftp_module: [%s] proto=sftp，但本 libcurl 未编入 SFTP（缺 libssh2），"
+                    "该段跳过", list.servers[i].name);
+            continue;
+        }
+        if (list.servers[i].sftp && list.servers[i].host_key_check) {
+            /* 主机密钥校验开启却没有可读的 known_hosts：必然连不上，且 libcurl
+               的报错（unknown host / failed verification）指不到配置。启动时
+               loud 提示一次，给出补文件的命令与关闭开关——不是错误（文件可能
+               稍后补齐），故 WRN。 */
+            const char* kh = list.servers[i].known_hosts[0] ? list.servers[i].known_hosts
+                                                            : CONFIG_DIR "/known_hosts";
+            if (access(kh, R_OK) != 0)
+                LOG_WRN("ftp_module: [%s] host_key_check 开启但 %s 不可读（%s）——"
+                        "主机密钥校验会失败；可执行 ssh-keyscan -p %d %s >> %s，"
+                        "或在该段设 host_key_check = off",
+                        list.servers[i].name, kh, strerror(errno), list.servers[i].port,
+                        list.servers[i].host, kh);
+        }
         if (ftp_backend_add(&list.servers[i]) != 0) continue;
-        LOG("ftp_module: 注册后端 /%s → FTP %s:%d%s (server=%s)", list.servers[i].name,
-            list.servers[i].host, list.servers[i].port, list.servers[i].remote_dir,
-            list.servers[i].name);
+        LOG("ftp_module: 注册后端 /%s → %s://%s:%d%s (server=%s)", list.servers[i].name,
+            list.servers[i].sftp ? "sftp" : "ftp", list.servers[i].host, list.servers[i].port,
+            list.servers[i].remote_dir, list.servers[i].name);
     }
     ftp_conf_free(&list);
     if (ftp_backend_count() == 0)
@@ -124,6 +158,10 @@ static int ftp_module_init(const NspFrameworkApi* api) {
        残留句柄）还在用，就会踩释放后的映射/状态。进程退出时由 libcurl 的
        析构器统一回收，不泄漏。 */
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    /* 能力探测须在 curl_global_init 之后（version_info 依赖全局初始化） */
+    g_curl_has_sftp = curl_supports_sftp();
+    LOG("ftp_module: libcurl %s（SFTP %s）", curl_version(),
+        g_curl_has_sftp ? "可用" : "不可用：未编入 libssh2，proto=sftp 段会被跳过");
     /* ftp.conf 与规则配置同目录：--rules=<dir>/injector.conf → <dir>/ftp.conf */
     if (api && api->get_rules_path) {
         const char* rp = api->get_rules_path();
