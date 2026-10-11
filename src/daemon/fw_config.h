@@ -29,10 +29,6 @@
 int fw_config_init(const char* rules_path);
 void fw_config_shutdown(void);
 
-/* 当前主视图（框架持有，仅在下次重载前有效）。count_out 可 NULL。 */
-const NspCfgRec* fw_config_recs(int* count_out);
-uint64_t fw_config_generation(void);
-
 /* 按模块订阅过滤出的视图（记录与字符串均为快照私有副本）。
    **取用即持引用**：acquire 返回的视图在 release 之前始终有效，不受并发重载
    影响（旧实现返回指向订阅表的借用指针，解锁后即可能被重载线程释放 → UAF）。

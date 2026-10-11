@@ -60,7 +60,4 @@ int ftp_conf_load(const char* path, FtpServerList* out);
 /* 释放 ftp_conf_load 产出的堆数组（NULL/空表安全） */
 void ftp_conf_free(FtpServerList* list);
 
-/* 按段名查找 server；找到返回指针，否则 NULL */
-FtpServerCfg* ftp_conf_find(FtpServerList* list, const char* name);
-
 #endif /* FTP_CONF_H */

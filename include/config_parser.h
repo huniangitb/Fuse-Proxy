@@ -121,9 +121,8 @@ uint64_t config_publish_begin(void);
 void config_drain_readers(uint64_t old_gen);
 void config_publish_end(uint64_t old_gen);
 
-/* FTP 规则匹配（供规则模块 resolve 用）：sub_path 命中 FTP 规则虚拟前缀
-   （最长前缀优先）时输出 FTP 段名（ftp.conf [段名]），返回 true */
-bool config_ftp_match(const AppConfig* cfg, const char* sub_path, char* backend_out, size_t sz);
+/* FTP 规则命中由 trie 在 resolve 热路径一次下降取得（最长前缀优先），
+   不再有每请求 O(N) 线性扫描的独立匹配入口 */
 void scan_active_users();
 /* 应用规则目录创建权限开关：仅 injector 应开启（true）；fuse_daemon（经
    内建规则引擎）、log_ctl 等只读加载方保持默认 false，加载配置时

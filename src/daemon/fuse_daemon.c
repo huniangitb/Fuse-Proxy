@@ -103,9 +103,6 @@ static void vfs_defer_close(int fd) { fdq_defer(&g_pending_closes, fd); }
 
 static void vfs_flush_pending_closes(void) { fdq_flush(&g_pending_closes); }
 
-static char g_lower_dir[PATH_MAX] = {0};
-static char g_upper_dir[PATH_MAX] = {0};
-
 static int recursive_rmdir(const char* path);
 static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid);
 /* FSYNC 与 FLUSH 共用的后端数据收尾（定义在 vfs_inval_path 之后） */
@@ -2751,10 +2748,6 @@ int main(int argc, char* argv[]) {
             strncpy(g_real_root, argv[i] + 7, PATH_MAX - 1);
         } else if (strncmp(argv[i], "--rules=", 8) == 0) {
             strncpy(rules_path, argv[i] + 8, PATH_MAX - 1);
-        } else if (strncmp(argv[i], "--lower=", 8) == 0) {
-            strncpy(g_lower_dir, argv[i] + 8, PATH_MAX - 1);
-        } else if (strncmp(argv[i], "--upper=", 8) == 0) {
-            strncpy(g_upper_dir, argv[i] + 8, PATH_MAX - 1);
         } else if (strncmp(argv[i], "--ready-fd=", 11) == 0) {
             g_ready_fd = atoi(argv[i] + 11);
         } else if (strncmp(argv[i], "--global-root-fd=", 17) == 0) {
