@@ -1,4 +1,8 @@
-build
+# Meson 构建目录。必须带 `*`：`build` 只匹配名为 build 的路径组件，
+# 而本仓库的构建目录是 build_gnu/ build_android/ build_asan2/ …——它们此前
+# 仅靠 Meson 自动写入的 <builddir>/.gitignore（内容为 `*`）才不显示。
+# 该文件一旦缺失或换目录名，git status 立刻多出上千条未跟踪项。
+build*/
 .cache
 .spec-workflow
 .claude
