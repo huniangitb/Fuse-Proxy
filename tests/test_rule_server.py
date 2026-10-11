@@ -882,6 +882,16 @@ def check(proc, sock_name, conf_dir):
             expect("B2 非受信任 uid 的 STOP 被拒", ra.get("status") == "error", ra)
             ra = send_cmd(aproc, auth_sock, {"cmd": "EXPORT_LOGS"})
             expect("B2 非受信任 uid 的 EXPORT_LOGS 被拒", ra.get("status") == "error", ra)
+            # SERVICE 的 start/stop/restart 与 STOP 同等能力（停/起 injector、
+            # fuse_daemon、log_monitor），必须同样受限。判别点：旧实现只看顶层
+            # cmd，`SERVICE stop` 会真的停服并回 status=ok。
+            for action in ("start", "stop", "restart"):
+                ra = send_cmd(aproc, auth_sock, {"cmd": "SERVICE", "action": action})
+                expect(f"B2 非受信任 uid 的 SERVICE {action} 被拒",
+                       ra.get("status") == "error", ra)
+            # status 是只读查询：必须保持开放，否则管理器 App 看不到服务状态
+            ra = send_cmd(aproc, auth_sock, {"cmd": "SERVICE", "action": "status"})
+            expect("B2 SERVICE status 仍放行（只读查询）", ra.get("status") == "ok", ra)
             ra = send_cmd(aproc, auth_sock, {"cmd": "PING"})
             expect("B2 非高危命令仍放行（PING）", ra.get("status") == "ok", ra)
             expect("B2 拒绝后服务存活（命令未生效）", aproc.poll() is None, aproc.poll())

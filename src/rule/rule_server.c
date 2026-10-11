@@ -2623,11 +2623,28 @@ static bool peer_is_privileged(uid_t uid) {
     return false;
 }
 
-/* 高危命令：能停服（STOP/QUIT）或把全机访问日志导出到落点（EXPORT_LOGS）。
- * 其余命令（查询/规则编辑）保持开放——控制面可用性优先，且它们不越权。 */
-static bool cmd_is_privileged(const char* cmd) {
-    return strcasecmp(cmd, "STOP") == 0 || strcasecmp(cmd, "QUIT") == 0 ||
-           strcasecmp(cmd, "EXPORT_LOGS") == 0;
+/* 高危命令：能停服（STOP/QUIT）、把全机访问日志导出到落点（EXPORT_LOGS），
+ * 或经 SERVICE 启停常驻服务（start/stop/restart 与 STOP 同等能力——都会
+ * 杀/拉起 injector、fuse_daemon、log_monitor）。
+ * 其余命令（查询/规则编辑、SERVICE status）保持开放——控制面可用性优先，
+ * 且它们不越权。
+ *
+ * 注意 SERVICE 必须在这里按 action 判定：它是最外层 cmd，若只看顶层 cmd，
+ * `{"cmd":"SERVICE","action":"stop"}` 会绕过 STOP 的白名单检查直接停服
+ * （SERVICE 与 STOP 的差别只是命令名）。 */
+static bool cmd_is_privileged(json_object* req) {
+    const char* cmd = json_object_get_string(json_object_object_get(req, "cmd"));
+    if (!cmd) return false;
+    if (strcasecmp(cmd, "STOP") == 0 || strcasecmp(cmd, "QUIT") == 0 ||
+        strcasecmp(cmd, "EXPORT_LOGS") == 0)
+        return true;
+    if (strcasecmp(cmd, "SERVICE") == 0) {
+        const char* action = json_object_get_string(json_object_object_get(req, "action"));
+        /* 缺 action 等价 status（见 handle_service），保持开放 */
+        if (!action || strcasecmp(action, "status") == 0) return false;
+        return true;
+    }
+    return false;
 }
 
 /* ==================== 命令分发 ==================== */
@@ -2637,8 +2654,9 @@ static void dispatch(int fd, json_object* req, uid_t peer_uid) {
         reply_error(fd, "?", "缺少 cmd 字段");
         return;
     }
-    /* 高危命令（停服 / 导出全机日志）仅 root 或白名单 uid 可执行（B2：对端鉴权） */
-    if (cmd_is_privileged(cmd) && !peer_is_privileged(peer_uid)) {
+    /* 高危命令（停服 / 启停服务 / 导出全机日志）仅 root 或白名单 uid 可执行
+       （B2：对端鉴权） */
+    if (cmd_is_privileged(req) && !peer_is_privileged(peer_uid)) {
         char clean[128];
         nsp_log_line_sanitize(cmd, clean, sizeof clean);
         LOG_WRN("拒绝高危命令 %s：对端 uid=%u 不在白名单（仅 root / NSP_TRUSTED_UIDS）", clean,
