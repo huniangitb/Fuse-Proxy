@@ -16,7 +16,7 @@
 #include "ftp_conf.h"
 #include "nsp_module.h"
 
-/* 注册/清理后端（ftp_module.c 解析 ftp.conf 后调用）。
+/* 注册/清理后端（ftp_module.c 消费框架下发的模块配置后调用）。
    虚拟前缀 = "/" + cfg->name（如 /云盘）：FUSE 剥离 /0/ 后的原始路径
    （/云盘/xxx）直接命中，无需 REDIRECT 规则或变量。 */
 int ftp_backend_add(const FtpServerCfg* cfg);

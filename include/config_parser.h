@@ -13,11 +13,11 @@ typedef struct {
     bool is_allow;           // true=ALLOW 规则, false=REDIRECT 规则
 } RedirectRule;
 
-/* FTP 后端规则：`FTP <虚拟前缀> <段名>`（段名 = ftp.conf [段名]）。
+/* FTP 后端规则：`FTP <虚拟前缀> <段名>`（段名 = 模块配置里的 [段名]）。
    规则所在段决定作用域：GLOBAL 段=全局，应用段=仅该应用。 */
 typedef struct {
     char virtual_prefix[MAX_PATH_LEN];  /* 虚拟前缀（不含 user_id，如 /云盘） */
-    char backend_name[64];              /* FTP 段名（ftp.conf [段名]） */
+    char backend_name[64];              /* FTP 段名（模块配置里的 [段名]） */
 } FtpRule;
 
 typedef struct {
@@ -78,11 +78,17 @@ typedef struct {
  * 视图为只读：config_build_from_view 内部复制行文本后再解析，不修改入参。 */
 #include "nsp_cfg_view.h"
 
-/* 读主文件 + App-rules* 目录为扁平视图（读文件；框架/单进程消费者调用）。
+/* 读主文件 + App-rules* 目录 + 各模块自有配置（<modules_dir>/<名>/<名>.conf）
+   为扁平视图（读文件；框架/单进程消费者调用）。
    返回记录数（>=0）；视图与其中字符串经 config_free_view 释放。
    主文件缺失不致命：仍返回 App-rules 记录（与逐文件解析行为一致）。 */
 int config_read_view(const char* main_path, NspCfgRec** out_recs, int* out_count);
 void config_free_view(NspCfgRec* recs, int count);
+/* 模块目录覆盖（--modules-dir= 与加载器同一取值；NULL/空 = 默认 MODULES_DIR）。
+   模块自有配置的位置由此派生，故必须在首次 config_read_view 之前设置。 */
+void config_set_modules_dir(const char* dir);
+/* 当前生效的模块目录（fw_config 据此挂模块配置文件的 inotify watch） */
+const char* config_modules_dir(void);
 /* 由扁平视图重建配置并 COW 发布（不读文件系统；模块消费框架下发的视图）。
    视图仅 RULE 记录被逐行复制后解析，其余记录按值读取。
    调用方须持 config_lock_write。 */

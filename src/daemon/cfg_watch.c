@@ -10,7 +10,12 @@
 
 #include "nsp_util.h" /* nsp_is_app_rules_dirname（App-rules 目录名判定唯一出处） */
 
-bool cfg_watch_sync(int ifd, const char* base_dir, CfgDirWatch* ws, int* n) {
+/* 对账核心：filter 为 NULL 表示「全部子目录」（模块配置目录用——<modules_dir>/<名>/
+   下同时放 <名>.so 与 <名>.conf，没有可用的名字前缀可判）；否则按目录名判定
+   （App-rules* 用）。两种调用共用同一段对账逻辑，避免复制出第二份
+   （复制几份就漏几处——本仓库 A 系列缺陷的共同形态）。 */
+static bool watch_sync(int ifd, const char* base_dir, CfgDirWatch* ws, int* n,
+                       bool (*filter)(const char*)) {
     bool ok = true;
     bool seen[CFG_WATCH_MAX] = {false};
     DIR* d = opendir(base_dir);
@@ -18,7 +23,7 @@ bool cfg_watch_sync(int ifd, const char* base_dir, CfgDirWatch* ws, int* n) {
     struct dirent* de;
     while ((de = readdir(d)) != nullptr) {
         if (de->d_name[0] == '.') continue;
-        if (!nsp_is_app_rules_dirname(de->d_name)) continue;
+        if (filter && !filter(de->d_name)) continue;
         char full[PATH_MAX];
         if (snprintf(full, sizeof full, "%s/%s", base_dir, de->d_name) >= (int)sizeof full)
             continue;
@@ -65,4 +70,12 @@ bool cfg_watch_sync(int ifd, const char* base_dir, CfgDirWatch* ws, int* n) {
     }
     *n = keep;
     return ok;
+}
+
+bool cfg_watch_sync(int ifd, const char* base_dir, CfgDirWatch* ws, int* n) {
+    return watch_sync(ifd, base_dir, ws, n, nsp_is_app_rules_dirname);
+}
+
+bool cfg_watch_sync_subdirs(int ifd, const char* base_dir, CfgDirWatch* ws, int* n) {
+    return watch_sync(ifd, base_dir, ws, n, nullptr);
 }

@@ -107,7 +107,12 @@ SUITE_MAP = [
 
     (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py",
       "test_ns_global_replace_rollback.py"),
-     ("src/injector/ns_utils.c", "src/injector/ns_global_replace.c", "src/injector/injector.c"),
+     ("src/injector/ns_utils.c", "include/ns_utils.h", "src/injector/ns_global_replace.c",
+      "src/injector/injector.c", "include/injector.h",
+      # mountinfo 扫描原语（C7 收口）与卸载序列同源；mount_manager 是注入挂载的
+      # 执行体；ipc_server 随 injector 进程生命周期起停（zygisk 通知入口）
+      "src/injector/ns_mountinfo.c", "src/injector/mount_manager.c",
+      "include/mount_manager.h", "src/injector/ipc_server.c", "include/ipc_server.h"),
      ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
 
@@ -169,8 +174,17 @@ SUITE_MAP = [
 
     (("test_cfg_watch.py",),
      ("src/daemon/cfg_watch.c", "src/daemon/cfg_watch.h"),
-     ("cfg_watch_sync",),
-     "配置目录 watch 对账（App-rules 子目录热更新）"),
+     ("cfg_watch_sync", "cfg_watch_sync_subdirs"),
+     "配置目录 watch 对账（App-rules / 模块目录子目录热更新）"),
+
+    # 配置下发归属（视图版本 2）：框架读 <modules_dir>/<名>/<名>.conf 后按 owner
+    # 过滤下发给同名模块——模块不读文件、不跑 inotify（含它自己的配置）。
+    # 判别性：去掉 config_read_view 的 view_scan_module_confs 即旧实现，本套件必失败
+    (("test_module_cfg_push.py",),
+     ("include/nsp_cfg_view.h",),
+     ("NSP_CFG_REC_MODULE_FILE", "NSP_CFG_REC_MODULE_LINE", "config_set_modules_dir",
+      "config_modules_dir", "view_scan_module_confs"),
+     "模块配置下发（框架读 → 按 owner 过滤 → 模块消费）"),
 
     (("test_rule_file_lock.py", "test_log_ctl_rules.py", "test_rule_server.py"),
      ("src/core/nsp_rule_file.c", "src/core/nsp_rule_file.h", "include/nsp_rule_file.h"),
@@ -187,6 +201,15 @@ SUITE_MAP = [
      ("passthrough_probe", "g_pt_probe_pending", "O_NOFOLLOW"),
      "透传探测文件 TOCTOU（B3：O_EXCL|O_NOFOLLOW + pending 原子 test-and-set）"),
 
+    # 跨进程/跨模块常量的唯一出处（include/nsp_constants.h）与模块配置视图
+    # （include/nsp_cfg_view.h）都是「一改影响所有进程与模块 ABI」的文件，
+    # 没有单一归属套件，故给覆盖面最广的一组；命中即多跑几套，漏跑才是灾难
+    (("test_functional.py", "test_rules.py", "test_module_abi.py",
+      "test_log_pipeline.py", "test_config_snapshot.py"),
+     ("include/nsp_constants.h", "include/nsp_cfg_view.h"),
+     (),
+     "跨进程常量 / 模块配置视图（影响所有进程与模块 ABI）"),
+
     # CONTRIBUTING.md §5 的可执行形式：.githooks/commit-msg 每次提交调用它，
     # 模板 .gitmessage 与装配脚本同属这套（改任一都跑本套件）
     (("test_commit_msg_lint.py",),
@@ -201,15 +224,6 @@ SUITE_MAP = [
 # 什么程度」，即验收时的递进顺序。docs/testing.md 的分层清单由此生成式对账，
 # 一致性与完整性由 tests/test_docs_sync.py 强制：
 #   * SUITE_MAP 里的每个套件必须恰好属于一层（漏登记 → 分层验收跑不到它）；
-    # 跨进程/跨模块常量的唯一出处（include/nsp_constants.h）与模块配置视图
-    # （include/nsp_cfg_view.h）都是「一改影响所有进程与模块 ABI」的文件，
-    # 没有单一归属套件，故给覆盖面最广的一组；命中即多跑几套，漏跑才是灾难
-    (("test_functional.py", "test_rules.py", "test_module_abi.py",
-      "test_log_pipeline.py", "test_config_snapshot.py"),
-     ("include/nsp_constants.h", "include/nsp_cfg_view.h"),
-     (),
-     "跨进程常量 / 模块配置视图（影响所有进程与模块 ABI）"),
-
 #   * 每层里的套件必须真实存在且在 SUITE_MAP 里。
 #
 # L0 静态/契约：不挂载、不联网、不起 daemon。多为「直编实际源码 + --wrap 桩/ASan」
@@ -231,6 +245,7 @@ LAYERS = {
             "test_pending_close.py",
             "test_cfg_watch.py",
             "test_cfg_reload_split.py",
+            "test_module_cfg_push.py",
             "test_fw_config_view.py",
             "test_rule_file_lock.py",
             "test_module_abi.py",
@@ -289,6 +304,7 @@ LAYERS = {
 #  `stress_fuse.py` 则因为台账只 glob `test_*.py` 而完全逃过检查）。
 ON_DEMAND = frozenset({
     "test_ftp_stress.py",     # FTP 吞吐/长稳压力，需 vsftpd，分钟级
+    "stress_fuse.py",         # FUSE 综合压测，分钟级，断言指标而非正确性
 })
 
 
@@ -304,7 +320,6 @@ def changed_paths(base):
         line = line.strip()
         if line:
             tracked.add(line)
-    "stress_fuse.py",         # FUSE 综合压测，分钟级，断言指标而非正确性
     untracked = set()
     for line in git("ls-files", "--others", "--exclude-standard").splitlines():
         line = line.strip()
@@ -445,6 +460,7 @@ PARALLEL_SAFE = frozenset({
     "test_ftp_truncate_list.py",  # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_ftp_upload_lock.py",    # cc 直编 FTP 后端 + 桩 mux/curl，无网络/端口/FUSE
     "test_fw_config_view.py",     # cc 直编 fw_config.c + 依赖，TemporaryDirectory，无挂载
+    "test_module_cfg_push.py",    # cc 直编 config_parser.c/fw_config.c + 依赖，TemporaryDirectory
     "test_inject_tracked_race.py",  # cc 直编 inject_target.c + ASan + --wrap 桩 kill，无挂载/特权
     "test_a26_misc.py",           # cc 直编 ftp_conf.c/nsp_ini_store.c，/tmp mkdtemp，无挂载/网络
     "test_pt_probe_toctou.py",    # cc 直编驱动 + --wrap 桩 open/unlink，cwd 临时目录，无挂载/特权

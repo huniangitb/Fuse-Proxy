@@ -11,8 +11,8 @@
  *   REMOVE                        按 (类型, 索引) 删除规则
  *   ENABLE / DISABLE              启用/停用规则（# 注释切换，解析器自动跳过）
  *   SET                           设置开关（MONITOR/SANDBOX/GLOBAL_INJECT/INJECT_ENABLE）
- *   FTP_LIST / FTP_GET              查询 ftp.conf 服务器账号（密码脱敏，只回 has_password）
- *   FTP_ADD / FTP_SET / FTP_REMOVE  增改删 ftp.conf 服务器段（原子落盘，
+ *   FTP_LIST / FTP_GET              查询模块配置里的服务器账号（密码脱敏，只回 has_password）
+ *   FTP_ADD / FTP_SET / FTP_REMOVE  增改删模块配置里的服务器段（原子落盘，
  *                                   ftp_module 经 inotify 自动热重载）
  *   RELOAD                        向 injector 发送 SIGHUP 触发配置重载
  *   STOP                          向 injector 发送 SIGTERM 停止注入服务
@@ -1989,7 +1989,7 @@ static void handle_status(int fd, json_object* req) {
 
    落点为何**不在**共享存储（review-findings §A7-0 / §A7-4）：
    1. io.log 记录全部应用的文件访问路径，投递到 /sdcard 等于对所有有存储权限的
-      应用公开，与本栈既有脱敏姿态（ftp.conf 密码只写不读、nsp_ini_save 收紧
+      应用公开，与本栈既有脱敏姿态（模块配置密码只写不读、nsp_ini_save 收紧
       0600）方向相反；
    2. /sdcard 由本 FUSE 承载、任意应用可写，且旧实现的文件名只含 time(NULL)
       完全可预测，root 身份的 tar/chmod 会跟随应用预置的软链覆盖 injector.conf
@@ -2199,11 +2199,13 @@ static void handle_quit(int fd, json_object* req) {
     reply_ok(fd, "QUIT", NULL);
 }
 
-/* ==================== FTP 服务器账号管理（ftp.conf） ====================
+/* ==================== FTP 服务器账号管理（模块配置文件） ====================
  * 基于 nsp_ini_store 抽象（rule_server 私有静态库，已退出模块 ABI——见
- * nsp_ini_store.h）：注释保留的行级读写 + 临时文件 rename 原子落盘；ftp_module 经 inotify
- * 监听目录自动热重载，无需 RELOAD。
- * 安全：password 只写不读——LIST/GET 仅回 has_password 布尔；ftp.conf
+ * nsp_ini_store.h）：注释保留的行级读写 + 临时文件 rename 原子落盘；框架侧
+ * fw_config 监听模块目录自动热重载并下发（模块不读文件、不跑 inotify），无需 RELOAD。
+ * 落点即框架读取的**同一路径**：`<CONFIG_DIR>/modules/<模块名>/<模块名>.conf`
+ * （见 docs/modules.md §6.1.1）——写到这里才会被下发，写到别处等于没配。
+ * 安全：password 只写不读——LIST/GET 仅回 has_password 布尔；该文件
  * 本身明文落盘（与模块解析现状一致），文档中明确提示。
  * 段名允许中文（如 [云盘]，不用 valid_pkg），仅禁 \n\r[]（nsp_ini_valid_section）；
  * [GLOBAL] 段非服务器（ftp_conf 跳过），控制面拒绝写入该名。
@@ -2217,8 +2219,22 @@ static void handle_quit(int fd, json_object* req) {
 #define FTP_PASS_MAX 127
 #define FTP_RDIR_MAX 511
 
+/* 模块配置文件名 = 模块名（框架按 <modules_dir>/<名>/<名>.conf 读取）。
+   模块目录取自 g_config_dir（rule_server 的配置根，可经 --config-dir 覆盖），
+   与 LIST_MODULES 的目录推导同一口径——**不得**用编译期 MODULES_DIR 宏，
+   否则覆盖了配置根的部署会写到一个框架根本不读的位置。 */
+#define FTP_MODULE_NAME "ftp_module"
+
 static void ftp_conf_path(char* out, size_t sz) {
-    snprintf(out, sz, "%s/ftp.conf", g_config_dir);
+    snprintf(out, sz, "%s/modules/" FTP_MODULE_NAME "/" FTP_MODULE_NAME ".conf", g_config_dir);
+}
+
+/* 写前确保模块目录存在（模块可能尚未部署，首次 FTP_ADD 时目录还不存在）。
+   目录 0755：里面只有 .so 与 .conf，无敏感目录遍历面。 */
+static int ftp_conf_ensure_dir(void) {
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/modules/" FTP_MODULE_NAME, g_config_dir);
+    return mkdir_recursive(dir);
 }
 
 /* 去首尾空白拷入定长缓冲；超长返回 -1 */
@@ -2357,6 +2373,10 @@ static void handle_ftp_add(int fd, json_object* req) {
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
+    if (ftp_conf_ensure_dir() != 0) {
+        reply_error(fd, "FTP_ADD", "无法创建模块配置目录");
+        return;
+    }
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_ADD", "内存不足");
@@ -2391,7 +2411,7 @@ static void handle_ftp_add(int fd, json_object* req) {
             (nsp_ini_get(s, trimmed, "remote_dir", cur, sizeof cur) == 0 && strcmp(cur, rdir) == 0);
     }
     if (same && password && password[0]) {
-        /* 密码可明文比对（ftp.conf 本就明文存储）：值不同即视为变更，
+        /* 密码可明文比对（模块配置本就明文存储）：值不同即视为变更，
            否则轮换密码会被误判 duplicate 静默吞掉 */
         same = (nsp_ini_get(s, trimmed, "password", cur, sizeof cur) == 0 &&
                 strcmp(cur, password) == 0);
@@ -2466,6 +2486,10 @@ static void handle_ftp_set(int fd, json_object* req) {
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
+    if (ftp_conf_ensure_dir() != 0) {
+        reply_error(fd, "FTP_SET", "无法创建模块配置目录");
+        return;
+    }
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_SET", "内存不足");
@@ -2543,6 +2567,10 @@ static void handle_ftp_remove(int fd, json_object* req) {
     }
     char path[PATH_MAX];
     ftp_conf_path(path, sizeof(path));
+    if (ftp_conf_ensure_dir() != 0) {
+        reply_error(fd, "FTP_REMOVE", "无法创建模块配置目录");
+        return;
+    }
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
         reply_error(fd, "FTP_REMOVE", "内存不足");

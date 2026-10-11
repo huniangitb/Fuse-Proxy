@@ -40,6 +40,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include "common.h"
+#include "config_parser.h" /* config_set_modules_dir：模块自有配置的读取归属 */
 #include "fw_config.h"
 #include "fw_pkg.h"
 #include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
@@ -2842,6 +2843,9 @@ int main(int argc, char* argv[]) {
     /* 模块守卫（校验+熔断+MOD_ERR 日志限流）：须在模块系统初始化前
        就绪——模块加载/init 调用可能立即触发错误上报 */
     module_guard_init();
+    /* 模块目录必须先告知配置读取侧：模块自有配置（<modules_dir>/<名>/<名>.conf）
+       由框架读取后经视图下发，路径与加载器同一取值（--modules-dir= 可覆盖） */
+    config_set_modules_dir(g_modules_dir_arg[0] ? g_modules_dir_arg : NULL);
     /* 内建规则引擎先就绪：它把派生缓存作废注册进配置发布临界区（此后每次发布自动作废） */
     fw_rules_init(rules_path, g_disable_sandbox);
     /* 热插拔模块系统：扫描模块目录并启动监控线程（只剩后端模块形态） */

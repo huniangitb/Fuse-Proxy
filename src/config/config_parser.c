@@ -1138,6 +1138,98 @@ static void view_scan_app_rules(ViewAcc* va) {
     }
 }
 
+/* ================= 模块配置文件（配置读取归属：框架读、模块不读） =================
+ * 模块**不读文件、不跑 inotify**（见 nsp_module.h 的 NspFrameworkApi 注释与
+ * docs/modules.md §6.1.1）：它自己的配置同样由框架读入后经扁平视图下发。
+ * 约定位置与模块目录一致（目录名 = 模块名 = .so 名）：
+ *     <modules_dir>/<模块名>/<模块名>.conf
+ * 故框架无需任何模块专属知识——不存在硬编码的「哪个模块读哪个文件名」映射。
+ *
+ * 行文本只做「去 \r\n + 去首尾空白」下发，**不剥注释、不切键值**：注释边界与
+ * 键值语法是模块的配置语法（如 FTP 模块配置的 `#` 只在行首/空白后起注释），框架
+ * 越俎代庖会让模块语义随框架 lexer 漂移。 */
+
+static char g_modules_dir[PATH_MAX] = MODULES_DIR;
+
+/* 单轮扫描的模块配置上限（与 cfg_watch.c 的 CFG_WATCH_MAX 同量级）。
+   超限只影响本轮下发并 loud 告警，不是静默丢弃。 */
+#define CFG_MODULE_CONF_MAX 64
+
+void config_set_modules_dir(const char* dir) {
+    snprintf(g_modules_dir, sizeof g_modules_dir, "%s", (dir && dir[0]) ? dir : MODULES_DIR);
+}
+
+const char* config_modules_dir(void) {
+    return g_modules_dir;
+}
+
+static int cmp_name_asc(const void* a, const void* b) {
+    return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+/* 追加某模块配置文件的全部行；无文件即无自有配置（多数模块不需要，非错误）。
+   **标记无条件下发**（含期望路径）：文件缺失时模块也能从标记里拿到自己该有的
+   路径，从而给出确切诊断，而不是猜一个路径或静默无后端。 */
+static void view_scan_one_module_conf(ViewAcc* va, const char* mod_name) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/%s/%s.conf", g_modules_dir, mod_name, mod_name) >=
+        (int)sizeof path)
+        return;
+    view_push(va, NSP_CFG_REC_MODULE_FILE, 0, -1, 0, path, nullptr, mod_name);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return;
+    char* line = nullptr;
+    size_t line_cap = 0;
+    int line_num = 0;
+    for (;;) {
+        int r = nsp_getline_capped(fp, &line, &line_cap, NSP_CONFIG_LINE_MAX, NULL);
+        if (r == 0) break;
+        line_num++;
+        if (r == -2) {
+            LOG_WRN("模块配置 %s 第 %d 行超长（>%d 字节），整行跳过", path, line_num,
+                    NSP_CONFIG_LINE_MAX);
+            continue;
+        }
+        if (r < 0) break;
+        char* p = clean_path_string(line);
+        if (!p || !p[0]) continue;
+        view_push(va, NSP_CFG_REC_MODULE_LINE, 0, -1, line_num, path, nullptr, p);
+    }
+    free(line);
+    fclose(fp);
+}
+
+/* 扫描 <modules_dir>/<名>/<名>.conf。按目录名排序：readdir 顺序任意，而视图要
+   参与 recs_identical 的逐字比对——顺序抖动会被判成「配置变了」，白推一轮。 */
+static void view_scan_module_confs(ViewAcc* va) {
+    DIR* d = opendir(g_modules_dir);
+    if (!d) return;
+    char* names[CFG_MODULE_CONF_MAX];
+    int n = 0;
+    struct dirent* de;
+    while ((de = readdir(d)) != nullptr) {
+        if (de->d_name[0] == '.') continue;
+        if (n >= CFG_MODULE_CONF_MAX) {
+            LOG_WRN("模块目录 %s 子目录数超上限 %d，其余模块的配置本轮不下发",
+                    g_modules_dir, CFG_MODULE_CONF_MAX);
+            break;
+        }
+        char sub[PATH_MAX];
+        if (snprintf(sub, sizeof sub, "%s/%s", g_modules_dir, de->d_name) >= (int)sizeof sub)
+            continue;
+        struct stat st;
+        if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        names[n] = strdup(de->d_name);
+        if (names[n]) n++;
+    }
+    closedir(d);
+    if (n > 1) qsort(names, (size_t)n, sizeof names[0], cmp_name_asc);
+    for (int i = 0; i < n; i++) {
+        view_scan_one_module_conf(va, names[i]);
+        free(names[i]);
+    }
+}
+
 int config_read_view(const char* main_path, NspCfgRec** out_recs, int* out_count) {
     if (out_recs) *out_recs = nullptr;
     if (out_count) *out_count = 0;
@@ -1160,6 +1252,8 @@ int config_read_view(const char* main_path, NspCfgRec** out_recs, int* out_count
     ViewAcc va = {.recs = nullptr, .count = 0, .cap = 0};
     view_scan_main_file(&va, main_path);
     view_scan_app_rules(&va);
+    /* 模块自有配置最后追加：owner 标记随记录顺序生效（fw_config 按 owner 过滤） */
+    view_scan_module_confs(&va);
     if (out_recs) *out_recs = va.recs;
     if (out_count) *out_count = va.count;
     return va.count;
