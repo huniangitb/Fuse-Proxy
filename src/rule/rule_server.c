@@ -1433,11 +1433,13 @@ static int build_rule_line(RuleType t, const char* value, char* line, size_t sz)
     return 0;
 }
 
-/* ADD：动态新增规则。
+/* ADD / SET：动态新增或改写规则。两者写路径完全相同（按段内去重 upsert），
+   差别只在**应答里的 command 名**——故 cmd 由调用方传入，不得在此写死，
+   否则 `SET` 的应答会自称 `ADD`（契约错位；客户端只校验 status 才没暴露）。
    scope=GLOBAL 时写入 injector.conf 的 [GLOBAL] 段；
    scope=APP 时写入 App-rules/<pkg>.conf（uid>0 时 App-rules-<uid>/）。
    type=INJECT_ENABLE 仅 APP 有效，改写 injector.conf 的 [pkg:uid] ON/OFF 头。 */
-static void handle_add(int fd, json_object* req) {
+static void handle_add(int fd, json_object* req, const char* cmd) {
     const char* pkg = json_object_get_string(json_object_object_get(req, "pkg"));
     const char* type_s = json_object_get_string(json_object_object_get(req, "type"));
     const char* value = json_object_get_string(json_object_object_get(req, "value"));
@@ -1445,15 +1447,15 @@ static void handle_add(int fd, json_object* req) {
     if (uid < 0) uid = 0;
 
     if (!pkg || !type_s) {
-        reply_error(fd, "ADD", "缺少参数: pkg/type");
+        reply_error(fd, cmd, "缺少参数: pkg/type");
         return;
     }
     if (!valid_uid(uid)) {
-        reply_error(fd, "ADD", "非法 uid: %d", uid);
+        reply_error(fd, cmd, "非法 uid: %d", uid);
         return;
     }
     if (value && !valid_value(value)) {
-        reply_error(fd, "ADD", "规则值包含非法字符或过长");
+        reply_error(fd, cmd, "规则值包含非法字符或过长");
         return;
     }
     bool is_global = (strcasecmp(pkg, "GLOBAL") == 0);
@@ -1468,11 +1470,11 @@ static void handle_add(int fd, json_object* req) {
        类别段无分文件：启停请直接编辑主文件段头 ON/OFF。 */
     if (strcasecmp(type_s, "INJECT_ENABLE") == 0) {
         if (is_global || is_category) {
-            reply_error(fd, "ADD", "INJECT_ENABLE 仅适用于应用作用域");
+            reply_error(fd, cmd, "INJECT_ENABLE 仅适用于应用作用域");
             return;
         }
         if (!valid_pkg(pkg)) {
-            reply_error(fd, "ADD", "非法包名: %s", pkg);
+            reply_error(fd, cmd, "非法包名: %s", pkg);
             return;
         }
         bool on = (value && strcasecmp(value, "ON") == 0);
@@ -1485,18 +1487,18 @@ static void handle_add(int fd, json_object* req) {
         if (on) {
             if (disabled_exists && !active_exists) {
                 if (rename(dis_path, path) != 0) {
-                    reply_error(fd, "ADD", "启用应用规则失败: %s", strerror(errno));
+                    reply_error(fd, cmd, "启用应用规则失败: %s", strerror(errno));
                     return;
                 }
             } else if (!active_exists) {
                 /* 无任何规则文件：创建空配置文件（应用已配置但无规则） */
                 if (nsp_mkdir_p(dir, 0755) != 0) {
-                    reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
+                    reply_error(fd, cmd, "无法创建目录 %s: %s", dir, strerror(errno));
                     return;
                 }
                 FILE* fp = fopen(path, "w");
                 if (!fp) {
-                    reply_error(fd, "ADD", "创建 %s 失败: %s", path, strerror(errno));
+                    reply_error(fd, cmd, "创建 %s 失败: %s", path, strerror(errno));
                     return;
                 }
                 fclose(fp);
@@ -1504,15 +1506,15 @@ static void handle_add(int fd, json_object* req) {
         } else {
             if (active_exists) {
                 if (nsp_mkdir_p(dir, 0755) != 0) {
-                    reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
+                    reply_error(fd, cmd, "无法创建目录 %s: %s", dir, strerror(errno));
                     return;
                 }
                 if (rename(path, dis_path) != 0) {
-                    reply_error(fd, "ADD", "停用应用规则失败: %s", strerror(errno));
+                    reply_error(fd, cmd, "停用应用规则失败: %s", strerror(errno));
                     return;
                 }
             } else if (!disabled_exists) {
-                reply_error(fd, "ADD", "应用 %s 无规则文件可停用", pkg);
+                reply_error(fd, cmd, "应用 %s 无规则文件可停用", pkg);
                 return;
             }
         }
@@ -1520,25 +1522,25 @@ static void handle_add(int fd, json_object* req) {
         json_object_object_add(data, "dir", json_object_new_string(dir));
         json_object_object_add(data, "file", json_object_new_string(on ? path : dis_path));
         json_object_object_add(data, "enabled", json_object_new_boolean(on));
-        reply_ok(fd, "ADD", data);
+        reply_ok(fd, cmd, data);
         return;
     }
 
     /* 普通规则 / 开关 */
     RuleType t = rule_type_of(type_s);
     if (t == RT_UNKNOWN) {
-        reply_error(fd, "ADD", "未知规则类型: %s", type_s);
+        reply_error(fd, cmd, "未知规则类型: %s", type_s);
         return;
     }
     /* 全局专属类型（GLOBAL_INJECT/SKIP_SYSTEM_APPS）：仅 [GLOBAL] 段可用
        （类别段同样拒绝，is_category 非全局） */
     if (!is_global && g_rule_types[t].global_only) {
-        reply_error(fd, "ADD", "规则类型 %s 仅可在全局规则中使用，不能配置到应用 %s", type_s, pkg);
+        reply_error(fd, cmd, "规则类型 %s 仅可在全局规则中使用，不能配置到应用 %s", type_s, pkg);
         return;
     }
     char line[MAX_LINE];
     if (build_rule_line(t, value, line, sizeof(line)) != 0) {
-        reply_error(fd, "ADD", "规则值不合法: %s", value ? value : "(null)");
+        reply_error(fd, cmd, "规则值不合法: %s", value ? value : "(null)");
         return;
     }
 
@@ -1559,35 +1561,35 @@ static void handle_add(int fd, json_object* req) {
         char conf[PATH_MAX];
         main_conf_path(conf, sizeof(conf));
         if (nsp_mkdir_p(g_config_dir, 0755) != 0) {
-            reply_error(fd, "ADD", "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
+            reply_error(fd, cmd, "无法创建配置目录 %s: %s", g_config_dir, strerror(errno));
             return;
         }
         bool changed = false;
         int rc = nsp_rule_file_upsert_in_section(conf, sec_name, sec_match, is_switch_type(t),
                                                  rule_type_name(t), line, &changed);
         if (rc != NSP_RULE_FILE_OK) {
-            reply_error(fd, "ADD", "写入 %s 失败: %s", conf, strerror(errno));
+            reply_error(fd, cmd, "写入 %s 失败: %s", conf, strerror(errno));
             return;
         }
         json_object* data = json_object_new_object();
         json_object_object_add(data, "file", json_object_new_string(conf));
         json_object_object_add(data, "line", json_object_new_string(line));
         json_object_object_add(data, "changed", json_object_new_boolean(changed));
-        reply_ok(fd, "ADD", data);
+        reply_ok(fd, cmd, data);
         return;
     }
 
     /* APP 作用域：追加到 App-rules/<pkg>.conf（uid>0 时 App-rules-<uid>/）。
        停用状态下路由到 <pkg>.conf.disabled——保持停用，不新建残缺 .conf 丢规则 */
     if (!valid_pkg(pkg)) {
-        reply_error(fd, "ADD", "非法包名: %s", pkg);
+        reply_error(fd, cmd, "非法包名: %s", pkg);
         return;
     }
     char dir[PATH_MAX], path[PATH_MAX];
     nsp_app_rule_dir(g_config_dir, uid, dir, sizeof(dir));
     nsp_rule_file_app_active_path(g_config_dir, uid, pkg, path, sizeof(path));
     if (nsp_mkdir_p(dir, 0755) != 0) {
-        reply_error(fd, "ADD", "无法创建目录 %s: %s", dir, strerror(errno));
+        reply_error(fd, cmd, "无法创建目录 %s: %s", dir, strerror(errno));
         return;
     }
     {
@@ -1596,14 +1598,14 @@ static void handle_add(int fd, json_object* req) {
         int rc =
             nsp_rule_file_upsert_line(path, is_switch_type(t), rule_type_name(t), line, &changed);
         if (rc != NSP_RULE_FILE_OK) {
-            reply_error(fd, "ADD", "写入 %s 失败: %s", path, strerror(errno));
+            reply_error(fd, cmd, "写入 %s 失败: %s", path, strerror(errno));
             return;
         }
         json_object* data = json_object_new_object();
         json_object_object_add(data, "file", json_object_new_string(path));
         json_object_object_add(data, "line", json_object_new_string(line));
         json_object_object_add(data, "changed", json_object_new_boolean(changed));
-        reply_ok(fd, "ADD", data);
+        reply_ok(fd, cmd, data);
     }
 }
 
@@ -1749,7 +1751,7 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
 /* SET：设置开关（MONITOR/SANDBOX/GLOBAL_INJECT）或应用注入开关，
    复用 ADD 的写入逻辑 */
 static void handle_set(int fd, json_object* req) {
-    handle_add(fd, req);
+    handle_add(fd, req, "SET");
 }
 
 /* 向 injector 发送信号（SIGHUP 重载 / SIGTERM 停止） */
@@ -2909,23 +2911,39 @@ static bool modconf_is_envelope_key(const char* key) {
     return false;
 }
 
-/* 收集一个待写字段：先解析键名（未知键 fail-closed，**空值也不例外**——未声明即
- * 不可写），再去首尾空白：为空 → 不写该键（返回 0）；按 schema 校验通过 → 落进
- * out_key/out_val（返回 1）；非法 → 返回 -1 并把原因写进 err。
- * ADD 的两条取值路径（fields 对象 / 散字段）共用，避免两套收集逻辑漂移。 */
+/* 一次请求里收集到的一个字段：写（val）或删（del，值为空时按 SET 语义）。 */
+typedef struct {
+    char key[32];
+    char val[FTP_RDIR_MAX + 1];
+    bool del;
+} ModConfEntry;
+
+/* 空值语义（ADD 与 SET 唯一的差别，收在一个入参上，免得两套收集逻辑漂移）：
+   ADD 的 fields 是"我给这些值"——空值 = 不写该键（走模块缺省）；
+   SET 是"这些键该是这个状态"——空值 = 删键回缺省。 */
+enum { MODCONF_EMPTY_SKIP = 0, MODCONF_EMPTY_DEL = 1 };
+
+/* 收集一个字段：先解析键名（未知键 fail-closed，**空值也不例外**——未声明即
+ * 不可写），再去首尾空白。返回 0 = 空值且按 SKIP 处理（不写该键，不计入）；
+ * 1 = 落进 out（写或删）；-1 = 非法并把原因写进 err。 */
 static int modconf_collect(const ModConfSchema* sc, const char* key, const char* raw,
-                           char* out_key, size_t out_key_sz, char* out_val, size_t out_val_sz,
-                           char* err, size_t err_sz) {
-    const ModConfField* f = module_conf_resolve(sc, key, out_key, out_key_sz, err, err_sz);
+                           int empty_mode, ModConfEntry* out, char* err, size_t err_sz) {
+    const ModConfField* f = module_conf_resolve(sc, key, out->key, sizeof out->key, err, err_sz);
     if (!f) return -1;
+    out->del = false;
+    out->val[0] = '\0';
     char tv[FTP_RDIR_MAX + 1];
     if (!raw || ftp_trim_copy(raw, tv, sizeof tv) != 0) {
         snprintf(err, err_sz, "字段值非法或超长: %s", key);
         return -1;
     }
-    if (!tv[0]) return 0;
+    if (!tv[0]) {
+        if (empty_mode == MODCONF_EMPTY_SKIP) return 0;
+        out->del = true; /* SET：空值 = 删键回缺省 */
+        return 1;
+    }
     if (!module_conf_validate_value(f, key, tv, err, err_sz)) return -1;
-    modconf_canon_value(f, tv, out_val, out_val_sz);
+    modconf_canon_value(f, tv, out->val, sizeof out->val);
     return 1;
 }
 
@@ -2953,8 +2971,7 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
     }
     /* 收集待写字段：优先 fields 对象，否则按 schema 从散字段里拾取（兼容既有
      * FTP_* 形态）。收集阶段即按 schema 校验，任何一个不合法就整体拒绝（不部分写入）。 */
-    char keys[MODCONF_MAX_FIELDS][32];
-    char vals[MODCONF_MAX_FIELDS][FTP_RDIR_MAX + 1];
+    ModConfEntry ents[MODCONF_MAX_FIELDS];
     int nf = 0;
     char verr[256];
     json_object* fobj = json_object_object_get(req, "fields");
@@ -2964,9 +2981,8 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
                 reply_error(fd, cmd, "字段数超上限 %d", MODCONF_MAX_FIELDS);
                 return;
             }
-            int rc = modconf_collect(sc, fk, json_object_get_string(fv), keys[nf],
-                                     sizeof keys[nf], vals[nf], sizeof vals[nf], verr,
-                                     sizeof verr);
+            int rc = modconf_collect(sc, fk, json_object_get_string(fv), MODCONF_EMPTY_SKIP,
+                                     &ents[nf], verr, sizeof verr);
             if (rc < 0) {
                 reply_error(fd, cmd, "%s", verr);
                 return;
@@ -2980,9 +2996,8 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
             json_object* v = json_object_object_get(req, fk);
             if (!v && strcasecmp(fk, "password") == 0) v = json_object_object_get(req, "pass");
             if (!v) continue;
-            int rc = modconf_collect(sc, fk, json_object_get_string(v), keys[nf],
-                                     sizeof keys[nf], vals[nf], sizeof vals[nf], verr,
-                                     sizeof verr);
+            int rc = modconf_collect(sc, fk, json_object_get_string(v), MODCONF_EMPTY_SKIP,
+                                     &ents[nf], verr, sizeof verr);
             if (rc < 0) {
                 reply_error(fd, cmd, "%s", verr);
                 return;
@@ -3016,7 +3031,7 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
             if (!sc->fields[i].required) continue;
             bool got = false;
             for (int k = 0; k < nf; k++)
-                if (strcasecmp(keys[k], sc->fields[i].key) == 0) got = true;
+                if (strcasecmp(ents[k].key, sc->fields[i].key) == 0) got = true;
             if (!got) {
                 nsp_ini_close(s);
                 reply_error(fd, cmd, "新建条目缺少必填字段: %s", sc->fields[i].key);
@@ -3029,8 +3044,8 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
     bool same = exists;
     char cur[FTP_RDIR_MAX + 1];
     for (int i = 0; same && i < nf; i++) {
-        same = (nsp_ini_get(s, trimmed, keys[i], cur, sizeof cur) == 0 &&
-                strcmp(cur, vals[i]) == 0);
+        same = (nsp_ini_get(s, trimmed, ents[i].key, cur, sizeof cur) == 0 &&
+                strcmp(cur, ents[i].val) == 0);
     }
     json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
@@ -3044,8 +3059,8 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
         return;
     }
     for (int i = 0; i < nf; i++) {
-        if (strcasecmp(keys[i], "password") == 0) nsp_ini_del_key(s, trimmed, "pass");
-        if (nsp_ini_set(s, trimmed, keys[i], vals[i]) != 0) goto ftp_add_fail;
+        if (strcasecmp(ents[i].key, "password") == 0) nsp_ini_del_key(s, trimmed, "pass");
+        if (nsp_ini_set(s, trimmed, ents[i].key, ents[i].val) != 0) goto ftp_add_fail;
     }
     if (nsp_ini_save(s) != 0) goto ftp_add_fail;
     nsp_ini_close(s);
@@ -3058,16 +3073,24 @@ ftp_add_fail:
     reply_error(fd, cmd, "写入 %s 失败", path);
 }
 
-/* MODULE_CONF_SET：修改单个字段（键按模块 [conf] schema，pass 归一 password）。
- * 空值（含纯空白）= 删键回缺省；段不存在报错（新建请用 ADD）。
+/* MODULE_CONF_SET：按模块 [conf] schema 改写一个条目里的字段。
+ * 空值（含纯空白）= 删键回缺省；段不存在报错（新建请用 MODULE_CONF_ADD）。
+ * 值有两种给法，语义等价（与 ADD 的两种形态对称）：
+ *   - 单字段：{"cmd":"MODULE_CONF_SET","module":X,"name":N,"key":K,"value":V}
+ *   - 多字段：{"cmd":"MODULE_CONF_SET","module":X,"name":N,"fields":{键:值,…}}
+ * 多字段形态就是「一次请求内既写字段又删键」——非空值写、空值删，正是表单整体
+ * 保存需要的语义（改了哪些写哪些，清空的删掉），不必拆成 N 个请求，也不会出现
+ * 「先写后删」的中途状态：全部先解析校验，再统一落盘一次（不部分写入）。
  * 注意顺序：**先归一/校验键名，再判空删键，最后才校验值**——删键请求带的是空值，
- * 若先走类型校验，int 字段会被判"须为整数"而永远删不掉（缺省也就永远回不去）。 */
+ * 若先走类型校验，int 字段会被判"须为整数"而永远删不掉（缺省也就永远回不去）。
+ * 应答：{file, name, keys:[本次写入的键], deleted:[本次删除的键], changed}；
+ * 单字段形态另回 `key`（既有前端契约，不改）。 */
 static void module_conf_set(int fd, json_object* req, const char* module, const char* cmd) {
     const char* name = json_object_get_string(json_object_object_get(req, "name"));
     const char* key = json_object_get_string(json_object_object_get(req, "key"));
     const char* value = json_object_get_string(json_object_object_get(req, "value"));
-    if (!name || !ftp_valid_name(name) || !key) {
-        reply_error(fd, cmd, "缺少或非法参数: name/key");
+    if (!name || !ftp_valid_name(name)) {
+        reply_error(fd, cmd, "缺少或非法参数: name");
         return;
     }
     /* 字段白名单不再硬编码：查模块配置 schema（[conf] 段声明，未声明走默认表）。
@@ -3077,24 +3100,41 @@ static void module_conf_set(int fd, json_object* req, const char* module, const 
         reply_error(fd, cmd, "模块未声明配置 schema（无法校验字段）");
         return;
     }
-    char norm_key[32], verr[256];
-    const ModConfField* field =
-        module_conf_resolve(sc, key, norm_key, sizeof norm_key, verr, sizeof verr);
-    if (!field) {
-        reply_error(fd, cmd, "%s", verr);
-        return;
-    }
-    /* 值先去首尾空白：空白串与空串同义（= 删键回缺省）。否则 `value="  "` 会
-       把键写成空值，而模块读侧对空值多判非法、整段作废。 */
-    char tbuf[FTP_RDIR_MAX + 1];
-    if (value && ftp_trim_copy(value, tbuf, sizeof tbuf) != 0) {
-        reply_error(fd, cmd, "字段值非法或超长: %s", key);
-        return;
-    }
-    bool del = (!value || !tbuf[0]);
-    if (!del && !module_conf_validate_value(field, key, tbuf, verr, sizeof verr)) {
-        reply_error(fd, cmd, "%s", verr);
-        return;
+    ModConfEntry ents[MODCONF_MAX_FIELDS];
+    int nf = 0;
+    bool single = false;
+    char verr[256];
+    json_object* fobj = json_object_object_get(req, "fields");
+    if (fobj) {
+        json_object_object_foreach(fobj, fk, fv) {
+            if (nf >= MODCONF_MAX_FIELDS) {
+                reply_error(fd, cmd, "字段数超上限 %d", MODCONF_MAX_FIELDS);
+                return;
+            }
+            int rc = modconf_collect(sc, fk, json_object_get_string(fv), MODCONF_EMPTY_DEL,
+                                     &ents[nf], verr, sizeof verr);
+            if (rc < 0) {
+                reply_error(fd, cmd, "%s", verr);
+                return;
+            }
+            if (rc > 0) nf++; /* 空值在 SET 下是"删键"，同样计入 */
+        }
+        if (nf == 0) {
+            reply_error(fd, cmd, "fields 为空：至少给一个键");
+            return;
+        }
+    } else {
+        if (!key) {
+            reply_error(fd, cmd, "缺少或非法参数: key（或用 fields 一次给多个）");
+            return;
+        }
+        int rc = modconf_collect(sc, key, value, MODCONF_EMPTY_DEL, &ents[nf], verr, sizeof verr);
+        if (rc < 0) {
+            reply_error(fd, cmd, "%s", verr);
+            return;
+        }
+        nf = (rc > 0) ? 1 : 0;
+        single = true;
     }
     char path[PATH_MAX];
     module_conf_path(path, sizeof(path), module);
@@ -3115,34 +3155,43 @@ static void module_conf_set(int fd, json_object* req, const char* module, const 
         return;
     }
     bool changed = false;
-    if (del) {
-        /* 空值 = 删键回缺省；password 一并清 pass 别名 */
-        if (nsp_ini_del_key(s, trimmed, norm_key) == 0) changed = true;
-        if (strcmp(norm_key, "password") == 0 && nsp_ini_del_key(s, trimmed, "pass") == 0)
-            changed = true;
-    } else {
+    json_object* wrote = json_object_new_array();
+    json_object* deleted = json_object_new_array();
+    for (int i = 0; i < nf; i++) {
+        if (ents[i].del) {
+            /* 空值 = 删键回缺省；password 一并清 pass 别名 */
+            if (nsp_ini_del_key(s, trimmed, ents[i].key) == 0) changed = true;
+            if (strcmp(ents[i].key, "password") == 0 &&
+                nsp_ini_del_key(s, trimmed, "pass") == 0)
+                changed = true;
+            json_object_array_add(deleted, json_object_new_string(ents[i].key));
+            continue;
+        }
         /* int 一律写规范十进制（"021" → "21"）；其余类型写去空白后的原值。
            类型/上限/枚举已在上面统一校验过。 */
-        char canon[FTP_RDIR_MAX + 1];
-        modconf_canon_value(field, tbuf, canon, sizeof canon);
         char cur[FTP_RDIR_MAX + 1] = {0};
-        bool cur_hit = (nsp_ini_get(s, trimmed, norm_key, cur, sizeof cur) == 0);
-        if (!cur_hit || strcmp(cur, canon) != 0) {
-            if (strcmp(norm_key, "password") == 0) nsp_ini_del_key(s, trimmed, "pass");
-            if (nsp_ini_set(s, trimmed, norm_key, canon) != 0) goto ftp_set_fail;
+        bool cur_hit = (nsp_ini_get(s, trimmed, ents[i].key, cur, sizeof cur) == 0);
+        if (!cur_hit || strcmp(cur, ents[i].val) != 0) {
+            if (strcmp(ents[i].key, "password") == 0) nsp_ini_del_key(s, trimmed, "pass");
+            if (nsp_ini_set(s, trimmed, ents[i].key, ents[i].val) != 0) goto ftp_set_fail;
             changed = true;
         }
+        json_object_array_add(wrote, json_object_new_string(ents[i].key));
     }
     if (changed && nsp_ini_save(s) != 0) goto ftp_set_fail;
     nsp_ini_close(s);
     json_object* data = json_object_new_object();
     json_object_object_add(data, "file", json_object_new_string(path));
     json_object_object_add(data, "name", json_object_new_string(trimmed));
-    json_object_object_add(data, "key", json_object_new_string(norm_key));
+    if (single) json_object_object_add(data, "key", json_object_new_string(ents[0].key));
+    json_object_object_add(data, "keys", wrote);
+    json_object_object_add(data, "deleted", deleted);
     json_object_object_add(data, "changed", json_object_new_boolean(changed));
     reply_ok(fd, cmd, data);
     return;
 ftp_set_fail:
+    json_object_put(wrote);
+    json_object_put(deleted);
     nsp_ini_close(s);
     reply_error(fd, cmd, "写入 %s 失败", path);
 }
@@ -3369,7 +3418,7 @@ static void dispatch(int fd, json_object* req, uid_t peer_uid) {
     else if (strcasecmp(cmd, "GET") == 0)
         handle_get(fd, req);
     else if (strcasecmp(cmd, "ADD") == 0)
-        handle_add(fd, req);
+        handle_add(fd, req, "ADD");
     else if (strcasecmp(cmd, "REMOVE") == 0)
         handle_remove(fd, req);
     else if (strcasecmp(cmd, "ENABLE") == 0)

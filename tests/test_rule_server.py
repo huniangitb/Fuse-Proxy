@@ -201,6 +201,26 @@ def check(proc, sock_name, conf_dir):
     types = [x["type"] for x in r["data"]["global"]["rules"]]
     expect("LIST contains REDIRECT/RO", "REDIRECT" in types and "RO" in types, types)
 
+    # ---- 应答 command 必须与实际请求一致（契约）----
+    # 判别点：SET 此前直接转发给 handle_add，而 handle_add 把 "ADD" 写死在应答里，
+    #         于是 SET 的应答自称 ADD（客户端只校验 status 才没暴露）。
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "GLOBAL", "type": "HIDE",
+                                   "value": "/sdcard/cmd_probe_a"})
+    expect("ADD 应答 command=ADD", r.get("status") == "ok" and r.get("command") == "ADD", r)
+    r = send_cmd(proc, sock_name, {"cmd": "SET", "pkg": "GLOBAL", "type": "HIDE",
+                                   "value": "/sdcard/cmd_probe_b"})
+    expect("SET 应答 command=SET（旧实现回 ADD）",
+           r.get("status") == "ok" and r.get("command") == "SET", r)
+    r = send_cmd(proc, sock_name, {"cmd": "SET", "pkg": "GLOBAL"})
+    expect("SET 失败应答 command 同样为 SET",
+           r.get("status") == "error" and r.get("command") == "SET", r)
+    # 清掉两条探针规则（此刻 GLOBAL 的 HIDE 只有这两条 + 预置的 /sdcard/secret）
+    for _ in range(2):
+        send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": "GLOBAL", "type": "HIDE", "index": 0})
+    r = send_cmd(proc, sock_name, {"cmd": "GET", "pkg": "GLOBAL"})
+    hides = [x["value"] for x in r["data"]["global"]["rules"] if x["type"] == "HIDE"]
+    expect("探针规则已清理（只剩预置的 /sdcard/secret）", hides == ["/sdcard/secret"], hides)
+
     # ---- ADD 应用规则 ----
     r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "com.example.app", "type": "HIDE", "value": "/sdcard/app_secret"})
     expect("ADD app HIDE", r.get("status") == "ok", r)
@@ -898,6 +918,52 @@ def check(proc, sock_name, conf_dir):
                                    "name": "缺host盘", "fields": {"port": "21"}})
     expect("新建条目缺 required 字段被拒", r.get("status") == "error", r)
     expect("被拒条目未落盘", "[缺host盘]" not in open(ftp_path, encoding="utf-8").read())
+
+    # ---- 一次请求内既写字段又删键（MODULE_CONF_SET 的 fields 形态）----
+    # 判别点：旧实现只认单字段 key/value，一次请求只能写或只能删；表单整体保存
+    #         必须拆成 N 个请求，中途状态还能被并发读到。
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "多字段盘", "fields": {"host": "10.3.3.3",
+                                                                  "proto": "sftp",
+                                                                  "user": "u",
+                                                                  "port": "2222",
+                                                                  "remote_dir": "/d"}})
+    expect("多字段盘 ADD", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                   "name": "多字段盘",
+                                   "fields": {"host": "10.3.3.4", "port": "", "user": "",
+                                              "key_file": "/k/id"}})
+    expect("SET fields 一次写+删（keys/deleted 如实回报）",
+           r.get("status") == "ok" and sorted(r["data"]["keys"]) == ["host", "key_file"]
+           and sorted(r["data"]["deleted"]) == ["port", "user"] and r["data"]["changed"] is True,
+           r)
+    conf_text = open(ftp_path, encoding="utf-8").read()
+    seg = conf_text.split("[多字段盘]")[1].split("\n[")[0] if "[多字段盘]" in conf_text else ""
+    expect("SET fields 落盘：host 更新、key_file 新增、port/user 删除",
+           "host = 10.3.3.4" in seg and "key_file = /k/id" in seg
+           and "port" not in seg and "user" not in seg, seg)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "多字段盘"})
+    expect("SET fields 后生效值（port 回条件缺省 22）",
+           r["data"]["host"] == "10.3.3.4" and r["data"]["port"] == 22
+           and r["data"]["key_file"] == "/k/id" and "port" in r["data"].get("derived", []),
+           r.get("data"))
+    # 全有或全无：一个键非法即整条请求拒绝，文件逐字不动（不部分写入）
+    before = open(ftp_path, encoding="utf-8").read()
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                   "name": "多字段盘", "fields": {"host": "10.9.9.9",
+                                                                  "bogus": "x"}})
+    expect("SET fields 含未知键整体拒绝", r.get("status") == "error", r)
+    expect("被拒请求不改动文件", open(ftp_path, encoding="utf-8").read() == before)
+    # 空 fields 对象：无字段可设，明确拒绝（不静默回 ok）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                   "name": "多字段盘", "fields": {}})
+    expect("SET fields 为空拒绝", r.get("status") == "error", r)
+    # 单字段形态的应答形状保持不变（另回 key），并补出 keys/deleted
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                   "name": "多字段盘", "key": "user", "value": "u2"})
+    expect("单字段形态仍回 key，并给出 keys/deleted",
+           r["data"]["key"] == "user" and r["data"].get("keys") == ["user"]
+           and r["data"].get("deleted") == [], r)
     # ---- MODULE_CONF_* 通用入口（按 module 寻址任意模块） ----
     # 造第二个"模块"：无 [conf] 声明 → 无字段可写（安全默认：未声明不放行任何键）
     other_dir = os.path.join(conf_dir, "modules", "other_mod")
@@ -945,7 +1011,7 @@ def check(proc, sock_name, conf_dir):
                                   "name": "A", "host": "x"})
     expect("无字段声明的模块拒绝写入", r.get("status") == "error", r)
     # 清理本块在 ftp_module 里建的段，避免影响后续既有用例的条目计数
-    for _n in ("通用盘", "sftp盘", "ftp盘", "sftp2222", "手写盘", "空值盘", "散字段盘"):
+    for _n in ("通用盘", "sftp盘", "ftp盘", "sftp2222", "手写盘", "空值盘", "散字段盘", "多字段盘"):
         send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": _n})
 
     # 反向确认：撤掉 [conf] 段（回到旧形态）后，key_file 必须**重新被拒**——
