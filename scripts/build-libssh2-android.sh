@@ -85,10 +85,16 @@ else
 fi
 
 echo "==> [3/4] 交叉编译 mbedTLS（静态）"
+# NDK r30 的 clang 21 对 mbedTLS 3.6.2 的 TLS 1.3 label 表
+# （library/ssl_tls13_keys.c:44，有意 nonstring 的初始化）报
+# -Wunterminated-string-initialization；mbedTLS 默认 MBEDTLS_FATAL_WARNINGS=ON
+# 把它变成 -Werror，交叉编译直接失败。只把这一条降级为告警：其余告警仍按
+# -Werror 处理（-DMBEDTLS_FATAL_WARNINGS=OFF 也能过，但会把第三方告警全放行）。
 cmake -S "$SRC/mbedtls" -B "$SRC/mbedtls/build" \
   -DCMAKE_TOOLCHAIN_FILE="$TC" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
   -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF \
   -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DUSE_STATIC_MBEDTLS_LIBRARY=ON \
+  -DCMAKE_C_FLAGS="-Wno-error=unterminated-string-initialization" \
   -DCMAKE_BUILD_TYPE=Release >/dev/null
 cmake --build "$SRC/mbedtls/build" -j"$(nproc)" >/dev/null
 
