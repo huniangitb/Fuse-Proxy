@@ -14,6 +14,9 @@
 **模块自有配置在模块目录下**（`<CONFIG_DIR>/modules/<模块名>/<模块名>.conf`）：
 配置的**读取**由框架完成，读后经扁平视图下发给模块——模块不读文件、不跑 inotify
 （见 `modules.md` §6.1.1）。写到别处不会被读取；模块会 loud 报出它期望的确切路径。
+随包分发的 `ftp_module.conf` 是**空模板**：没有服务器条目，也没有注释示例——表单由
+`MODULE_CONF_SCHEMA` 渲染、条目由 `MODULE_CONF_ADD/SET` 落盘，文件里的示例反而会被
+解析器/前端当成真条目或已停用规则。
 
 `CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/nsp_constants.h`，`common.h` 以别名暴露）。目录名约定：**uid 0 用 `App-rules`，uid 非 0 用 `App-rules-<uid>`**（由 `nsp_app_rule_dir` 合成）。主文件先加载，再扫描各 `App-rules*/` 目录；一个 `<pkg>.conf` 对应一个应用；目录缺失时仅 injector 会创建（只读加载方不 mkdir）。
 
@@ -135,6 +138,10 @@ MNT_BASE=/mnt/sdcard/$package
 
 - 支持 `*` `?` `[` `]`（POSIX fnmatch），仅虚拟前缀侧可用。`[` `]` 无转义机制，需匹配字面方括号时避免使用。
 - `#` **只能在行首**作整行注释（行首可有空格）。**行内 `#` 不是注释**，会被并入规则。
+- **注释掉的规则行不是「隐形」的**：rule_server 的 `classify_line` 会剥掉行首 `#` 再
+  按已注册类型匹配，`#` 后紧跟规则关键字（如 `# HIDE /sdcard/x`）的行会作为
+  **已停用规则**（`enabled:false`）出现在 `GET` 应答里、由前端列出。所以**不要**把示例
+  规则以注释形式留在配置文件里——随包分发的 `injector.conf` 因此只留开关行。
 
 ```
 HIDE /Android/data/com.foo/*
