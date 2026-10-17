@@ -67,7 +67,12 @@ echo "    NDK：$NDK（API $API，ABI arm64-v8a）"
 
 echo "==> [2/4] 准备源码"
 WORK=""
-cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
+cleanup() {
+  # 必须显式收尾成 0：EXIT trap 最后一条命令的状态会成为脚本退出码，而
+  # `[ -n "$WORK" ] && rm -rf "$WORK"` 在 WORK 为空（ANDROID_SFTP_SRC 复用
+  # 本地源码那条路）时返回 1 → 预构建明明成功，脚本却以 1 退出。
+  if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+}
 trap cleanup EXIT
 if [ -n "${ANDROID_SFTP_SRC:-}" ]; then
   SRC="$(cd "$ANDROID_SFTP_SRC" && pwd)"
