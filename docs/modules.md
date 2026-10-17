@@ -63,8 +63,13 @@ conf.port.default = 21           # 缺省值（LIST/GET 回填生效值并记入
 conf.port.default.proto.sftp = 22  # 条件缺省：依赖字段 proto=sftp 时缺省 22
 conf.proto.enum = ftp|sftp       # 可选值（竖线分隔），越界即拒
 conf.password.sensitive = true   # 敏感：只写不读，仅回 has_password
-conf.key_file.order = 7          # 前端显示顺序
+conf.remote_dir.order = 5        # 前端显示顺序
 ```
+
+- **schema 是「前端可见 + 控制面可写」的字段白名单，不等于模块解析能力的全集**：
+  未声明的键 `MODULE_CONF_ADD/SET` 一律拒（fail-closed），模块仍可解析手工写进文件的
+  同名字段。`ftp_module` 即如此——`key_file` / `key_pass` 不在 schema（本模块场景只用
+  密码认证，前端不渲染私钥/口令输入框），但 `ftp_conf.c` 解析侧保留，供手工配置。
 
 - `default.<依赖字段>.<取值>` 声明**条件缺省**（缺省随另一字段取值而变），命中时覆盖
   `default`。依赖字段自身也可缺省（取其 `default`），且与两者在文件里的书写顺序无关。
@@ -132,7 +137,7 @@ conf.key_file.order = 7          # 前端显示顺序
 - **敏感字段**（`sensitive`）在应答里**键本身不出现**，只给 `has_<键名>` 布尔；
   写入时按 `password` 归一并清 `pass` 别名。
 - **散字段形态仍兼容但已通用化**：`{"cmd":"MODULE_CONF_ADD","name":N,"host":…,"port":…}`
-  按 schema **逐字段拾取**（不再硬编码 5 个字段名），声明了的新字段（`proto`/`key_file`
+  按 schema **逐字段拾取**（不再硬编码 5 个字段名），声明了的新字段（`proto`/`known_hosts`
   …）照样能写。请求信封自带的键（`cmd`/`module`/`name`/`lang`/`key`/`value`/`fields`）
   不参与拾取——模块若真有同名字段，用 `fields` 对象给值。
 
@@ -449,12 +454,17 @@ proto = sftp              # ftp（默认）| sftp；非法值整段作废
 host = nas.local
 port = 22                 # 未显式配置时按 proto 补默认（ftp 21 / sftp 22）
 user = backup
-key_file = /data/Namespace-Proxy/keys/backup.key   # 空 = 密码 / ssh-agent
-key_pass = <私钥口令>      # 可选
+password = <密码>          # 控制面/前端只暴露密码认证（见下）
 known_hosts = /data/Namespace-Proxy/known_hosts    # 空 = <CONFIG_DIR>/known_hosts
 host_key_check = on       # 默认 on：主机密钥不匹配即拒连（fail-closed）
 remote_dir = /srv/backup
 ```
+
+**认证方式只有密码**：`key_file` / `key_pass` 仍由模块解析（手工写进配置文件可用，
+`test_sftp.py` 的公钥段即走这条），但**不在 `[conf]` schema 里**——控制面 `MODULE_CONF_ADD/SET`
+对未声明的键 fail-closed 直接拒，前端也不渲染私钥/口令输入框。`known_hosts` 与
+`host_key_check` 保留：密码认证同样要校验主机密钥，删掉 `known_hosts` 会让这个开关
+永远无从生效（文件不可读 + 开关 on = 连接必失败，模块启动时 loud 提示补文件或关开关）。
 
 协议分派只落在六处（其余代码协议无关）：URL scheme（`ftp://`/`sftp://`）、失败分类（见下）、`getattr` 探针顺序、LIST 时间口径、quote 命令字（`DELE/MKD/RMD` ↔ `rm/mkdir/rmdir`、`RNFR/RNTO` ↔ 单条 `rename`）、`ftp_easy_new` 的 SSH 选项。四条**与 FTP 不同、改错就出错**的语义：
 
