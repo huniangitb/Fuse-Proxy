@@ -752,10 +752,10 @@ def check(proc, sock_name, conf_dir):
 
     # ---- 模块配置 schema：声明驱动 vs 硬编码白名单（判别性） ----
     # 现状：本测试布的 .rules 无 [conf] 段 → 走编译期默认表，
-    #   SFTP 的 key_file 虽被模块解析侧支持，却因不在白名单而被拒（漂移形态）。
+    #   SFTP 的 known_hosts 虽被模块解析侧支持，却因不在白名单而被拒（漂移形态）。
     r = send_cmd(proc, sock_name,
-                 {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id"})
-    expect("无 [conf] 段时 key_file 被拒（默认表）", r.get("status") == "error", r)
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "known_hosts", "value": "/kh"})
+    expect("无 [conf] 段时 known_hosts 被拒（默认表）", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_SCHEMA"})
     expect("MODULE_SCHEMA 默认表仅 5 字段",
            r.get("status") == "ok" and len(r["data"]["fields"]) == 5, r)
@@ -776,26 +776,59 @@ def check(proc, sock_name, conf_dir):
             'conf.remote_dir.type = string\nconf.remote_dir.max = 511\n'
             'conf.remote_dir.default = /\n'
             'conf.proto.type = string\nconf.proto.enum = ftp|sftp\nconf.proto.default = ftp\n'
-            'conf.key_file.type = path\nconf.key_file.maxlen = 511\n'
-            'conf.key_file.desc = SSH 私钥\nconf.key_file.desc.en = SSH key\n'
+            'conf.known_hosts.type = path\nconf.known_hosts.maxlen = 511\n'
+            'conf.known_hosts.desc = known_hosts 路径\n'
+            'conf.known_hosts.desc.en = known_hosts path\n'
             'conf.host_key_check.type = bool\nconf.host_key_check.default = true\n')
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_SCHEMA"})
     expect("MODULE_SCHEMA 声明后扩到 8 字段（默认 5 + SFTP 3）", r.get("status") == "ok"
            and len(r["data"]["fields"]) == 8, r)
     keys = [f["key"] for f in r["data"]["fields"]] if r.get("status") == "ok" else []
-    expect("schema 含 SFTP 的 key_file/proto", "key_file" in keys and "proto" in keys, keys)
+    expect("schema 含 SFTP 的 known_hosts/proto",
+           "known_hosts" in keys and "proto" in keys, keys)
     # 形状：前端据此自动渲染（类型/上限/敏感/缺省/可选值/顺序/标签）
-    kf = next((f for f in r["data"]["fields"] if f["key"] == "key_file"), None)
-    expect("schema 带 type/maxlen/desc/required", kf and kf["type"] == "path" and kf["maxlen"] == 511
-           and kf["desc"] == "SSH 私钥" and kf["required"] is False, kf)
+    kh = next((f for f in r["data"]["fields"] if f["key"] == "known_hosts"), None)
+    expect("schema 带 type/maxlen/desc/required", kh and kh["type"] == "path"
+           and kh["maxlen"] == 511 and kh["desc"] == "known_hosts 路径"
+           and kh["required"] is False, kh)
     pr = next((f for f in r["data"]["fields"] if f["key"] == "proto"), None)
     expect("schema 带 enum", pr and pr.get("enum") == ["ftp", "sftp"], pr)
     pw = next((f for f in r["data"]["fields"] if f["key"] == "password"), None)
     expect("schema 敏感字段标 sensitive", pw and pw["sensitive"] is True, pw)
     # 同一个键现在被接受 —— 判别点：不改 C、不重启，仅靠模块声明
     r = send_cmd(proc, sock_name,
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "known_hosts", "value": "/kh"})
+    expect("声明后 known_hosts 被接受", r.get("status") == "ok", r)
+
+    # ---- 随包分发的 .rules：SSH 密钥认证字段不进 schema（前端只给密码） ----
+    # 判别点：把仓库里真实发布的那份声明装进模块目录。key_file / key_pass 必须
+    #   既不出现在 MODULE_CONF_SCHEMA（前端不渲染私钥/口令输入框），也写不进去
+    #   （控制面 fail-closed）——旧声明里有这两项，下面四条断言会全数失败。
+    shipped = os.path.join(ROOT, "src", "modules", "ftp", "ftp_module.rules")
+    with open(shipped, encoding="utf-8") as f:
+        shipped_text = f.read()
+    with open(rules_path, "w", encoding="utf-8") as f:
+        f.write(shipped_text)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "ftp_module"})
+    real_keys = [f["key"] for f in r["data"]["fields"]] if r.get("status") == "ok" else []
+    expect("随包 .rules：schema 无 key_file/key_pass（前端不渲染私钥输入）",
+           r.get("status") == "ok" and "key_file" not in real_keys
+           and "key_pass" not in real_keys, real_keys)
+    expect("随包 .rules：8 字段且顺序稳定（密码认证）",
+           real_keys == ["host", "port", "user", "password", "remote_dir", "proto",
+                         "known_hosts", "host_key_check"], real_keys)
+    r = send_cmd(proc, sock_name,
                  {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id"})
-    expect("声明后 key_file 被接受", r.get("status") == "ok", r)
+    expect("随包 .rules：SET key_file 被拒（未知字段，fail-closed）",
+           r.get("status") == "error" and "key_file" in (r.get("error") or ""), r)
+    before = open(ftp_path, encoding="utf-8").read()
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "密钥盘",
+                                   "fields": {"host": "h", "key_file": "/k/id"}})
+    expect("随包 .rules：ADD 带 key_file 整条拒绝", r.get("status") == "error", r)
+    expect("随包 .rules：拒绝后文件逐字未变（不部分写入）",
+           open(ftp_path, encoding="utf-8").read() == before
+           and "密钥盘" not in before, "文件被改动")
     # ---- 契约形状（前端零兜底渲染的前提）----
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "ftp_module"})
     fs = {f["key"]: f for f in r["data"]["fields"]}
@@ -903,14 +936,15 @@ def check(proc, sock_name, conf_dir):
                                    "name": "空值盘", "fields": {"bogus": ""}})
     expect("未知键给空值仍被拒（空值不豁免键名校验）", r.get("status") == "error", r)
 
-    # ---- 散字段形态按 schema 拾取（旧实现硬编码 5 个字段名，proto/key_file 静默丢弃）----
+    # ---- 散字段形态按 schema 拾取（旧实现硬编码 5 个字段名，proto/known_hosts 静默丢弃）----
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
                                    "name": "散字段盘", "host": "h2", "proto": "sftp",
-                                   "key_file": "/k/id"})
+                                   "known_hosts": "/kh/known_hosts"})
     expect("散字段形态可写 schema 新增字段", r.get("status") == "ok", r)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "散字段盘"})
-    expect("散字段写入的 proto/key_file 生效（旧实现丢弃）",
-           r["data"]["proto"] == "sftp" and r["data"]["key_file"] == "/k/id", r.get("data"))
+    expect("散字段写入的 proto/known_hosts 生效（旧实现丢弃）",
+           r["data"]["proto"] == "sftp"
+           and r["data"]["known_hosts"] == "/kh/known_hosts", r.get("data"))
 
     # ---- required 由控制面强制（schema 的 required 不只是前端提示）----
     # 判别点：旧实现放行 → 落一个无 host 的段，模块侧整段作废（"配了却不生效"）
@@ -932,21 +966,22 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
                                    "name": "多字段盘",
                                    "fields": {"host": "10.3.3.4", "port": "", "user": "",
-                                              "key_file": "/k/id"}})
+                                              "known_hosts": "/kh/known_hosts"}})
     expect("SET fields 一次写+删（keys/deleted 如实回报）",
-           r.get("status") == "ok" and sorted(r["data"]["keys"]) == ["host", "key_file"]
+           r.get("status") == "ok"
+           and sorted(r["data"]["keys"]) == ["host", "known_hosts"]
            and sorted(r["data"]["deleted"]) == ["port", "user"] and r["data"]["changed"] is True,
            r)
     conf_text = open(ftp_path, encoding="utf-8").read()
     seg = conf_text.split("[多字段盘]")[1].split("\n[")[0] if "[多字段盘]" in conf_text else ""
-    expect("SET fields 落盘：host 更新、key_file 新增、port/user 删除",
-           "host = 10.3.3.4" in seg and "key_file = /k/id" in seg
+    expect("SET fields 落盘：host 更新、known_hosts 新增、port/user 删除",
+           "host = 10.3.3.4" in seg and "known_hosts = /kh/known_hosts" in seg
            and "port" not in seg and "user" not in seg, seg)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "多字段盘"})
     expect("SET fields 后生效值（port 回条件缺省 22）",
            r["data"]["host"] == "10.3.3.4" and r["data"]["port"] == 22
-           and r["data"]["key_file"] == "/k/id" and "port" in r["data"].get("derived", []),
-           r.get("data"))
+           and r["data"]["known_hosts"] == "/kh/known_hosts"
+           and "port" in r["data"].get("derived", []), r.get("data"))
     # 全有或全无：一个键非法即整条请求拒绝，文件逐字不动（不部分写入）
     before = open(ftp_path, encoding="utf-8").read()
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
@@ -1014,13 +1049,13 @@ def check(proc, sock_name, conf_dir):
     for _n in ("通用盘", "sftp盘", "ftp盘", "sftp2222", "手写盘", "空值盘", "散字段盘", "多字段盘"):
         send_cmd(proc, sock_name, {"cmd": "FTP_REMOVE", "name": _n})
 
-    # 反向确认：撤掉 [conf] 段（回到旧形态）后，key_file 必须**重新被拒**——
+    # 反向确认：撤掉 [conf] 段（回到旧形态）后，known_hosts 必须**重新被拒**——
     # 证明上面的"接受"确实来自声明，而不是别的路径（如默认表被放宽）。
     with open(rules_path, "w", encoding="utf-8") as f:
         f.write('[FTP]\nformat = pair\nargc = 2\ndesc = FTP 存储映射\n')
     r = send_cmd(proc, sock_name,
-                 {"cmd": "FTP_SET", "name": "云盘", "key": "key_file", "value": "/k/id2"})
-    expect("撤掉 [conf] 后 key_file 重新被拒", r.get("status") == "error", r)
+                 {"cmd": "FTP_SET", "name": "云盘", "key": "known_hosts", "value": "/kh2"})
+    expect("撤掉 [conf] 后 known_hosts 重新被拒", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_SET", "name": "不存在", "key": "host", "value": "x"})
     expect("FTP_SET 不存在拒绝", r.get("status") == "error", r)
     r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "不存在"})
