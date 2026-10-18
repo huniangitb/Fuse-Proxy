@@ -116,6 +116,9 @@ conf.remote_dir.order = 5        # 前端显示顺序
 - **字段一律经 schema 校验**，与 `MODULE_CONF_SET` 共用同一校验函数：未知键、
   超长、类型不符、值域越界、枚举越界即整体拒绝，不部分写入。**`int` 字段写规范十进制**
   （`"007"` → `7`），ADD 与 SET 同口径——不再按字段名特判 `port`。
+- **模块配置文件单行 ≤ `NSP_CONFIG_LINE_MAX`（2048 字节）**：控制面写盘不得产生
+  超长行；框架读取时遇到超长行即把该模块配置**整份**作废（只下发标记、零行），
+  模块按无可用配置处理并 loud 报出确切路径（语义见 §6.1.1，SFTP 场景见 §7.1）。
 - **空值语义（ADD 与 SET 不同，别记反）**：
   - `MODULE_CONF_SET` 传空值（含纯空白）= **删键回缺省**。该分支在值校验**之前**，
     故 `int` 字段同样删得掉（否则会被判「须为整数」而永远删不掉，缺省也就永远回不去）。
@@ -365,6 +368,12 @@ int (*backend_unlink/mkdir/rmdir/rename/truncate)(...);
   首尾空白，**不剥注释、不切键值**：注释边界与键值语法是模块的配置语法）。
 - 这两类记录**按 owner 过滤**：只下发给同名模块，其他模块看不到（配置隔离与
   规则隔离同等要求）。`subscribe_rules` 只作用于 RULE 记录，不影响模块拿回自己的配置。
+- **超长行 → 该模块配置整份作废**：模块配置任一有效行超过 `NSP_CONFIG_LINE_MAX`
+  （2048 字节）时，框架只下发 `NSP_CFG_REC_MODULE_FILE` 标记、**不下发任何**
+  `NSP_CFG_REC_MODULE_LINE`（文件级 fail-closed）。这与模块直读文件时
+  `ftp_conf_parse_overlong` 的「整段作废」是同一语义：若框架只丢这一行，模块会拿
+  其余行按默认 `proto=ftp`/21 注册，用户以为在连 SFTP、实际以明文 FTP 发送账号
+  密码（违反 §7.1）。模块侧 `have=false` 会清空后端表并 loud 报出确切路径。
 - 配置内容逐字未变时模块可自行跳过重建（如 `ftp_module` 按行取指纹）——他人配置
   变化同样会触发回调，无谓重建会波及在途句柄。
 
@@ -474,6 +483,8 @@ remote_dir = /srv/backup
 4. **quote 命令的参数是远程路径本身**，libcurl 不会像 FTP 那样先 CWD 到 URL 目录；且参数由客户端 `Curl_get_pathname` 解析，含空白必须加引号（引号内 `\`/`"` 转义）。路径还要先做百分号解码——POSTQUOTE 串不是 URL，带 `%20` 的命令会让服务器去找字面量名字。失败 errno 细化见 `ftp_quote_errno()`（libcurl 把 SFTP quote 失败一律折叠成 `CURLE_QUOTE_ERROR`，只能用 `CURLOPT_ERRORBUFFER` 的文案保守细化，认不出就退回 FTP 的历史粗口径）。
 
 构建：GNU 上 `-Dsftp=auto`（默认）在系统 libcurl 无 SFTP 时自动改用子模块 curl 并编入 libssh2；Android 的 NDK 不带 libssh2/密码学库，需 `scripts/build-libssh2-android.sh` 产出预构建后 `-Dsftp=enabled -Dlibssh2_dir=<根>`。**`-Dsftp=disabled` 与历史构建逐字节一致**（不引入任何新依赖）。运行期还有一道能力自检：`curl_version_info()->protocols` 里没有 `sftp` 时，`proto=sftp` 的段整段跳过并 loud 报错（fail-closed，绝不静默退回明文 FTP）。
+
+**超长行同样 fail-closed**：模块配置任一有效行超过 `NSP_CONFIG_LINE_MAX`（2048 字节）时，框架把该模块配置**整份**判为不可用（只下发 `NSP_CFG_REC_MODULE_FILE` 标记、零 `MODULE_LINE`），模块按「无可用配置」清空后端表并 loud 报出路径——绝不因为丢了 `proto = sftp` 一行而按默认 `ftp`/21 静默退回明文 FTP（见 §6.1.1）。
 
 内建引擎的关键语义（修改时必须保持）：appear_missing/read_only 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`fw_rules_resolve`/`fw_rules_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
 

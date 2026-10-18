@@ -1167,15 +1167,33 @@ static int cmp_name_asc(const void* a, const void* b) {
     return strcmp(*(const char* const*)a, *(const char* const*)b);
 }
 
+/* 把视图截回 base 条（释放被撤记录各自 strdup 的字符串，不留泄漏）。 */
+static void view_truncate(ViewAcc* va, int base) {
+    for (int i = base; i < va->count; i++) {
+        free((void*)va->recs[i].file);
+        free((void*)va->recs[i].type);
+        free((void*)va->recs[i].text);
+    }
+    if (va->count > base) va->count = base;
+}
+
 /* 追加某模块配置文件的全部行；无文件即无自有配置（多数模块不需要，非错误）。
    **标记无条件下发**（含期望路径）：文件缺失时模块也能从标记里拿到自己该有的
-   路径，从而给出确切诊断，而不是猜一个路径或静默无后端。 */
+   路径，从而给出确切诊断，而不是猜一个路径或静默无后端。
+
+   超长行（> NSP_CONFIG_LINE_MAX）= **该模块配置整份作废**：只保留标记、不下发
+   任何 MODULE_LINE。模块直读文件时对同一行是整段作废（ftp_conf_parse_overlong
+   → 段 bad），若这里只丢这一行，模块会拿其余行按默认 proto=ftp/21 注册——用户
+   以为在连 SFTP，实际以明文 FTP 发送账号密码（docs/modules.md §7.1）。
+   框架不实现模块的键值/段语义，故以「整份不可用」为两条路径的最小公共语义；
+   模块侧 have=false 会清空后端表并 loud 报出确切路径。 */
 static void view_scan_one_module_conf(ViewAcc* va, const char* mod_name) {
     char path[PATH_MAX];
     if (snprintf(path, sizeof path, "%s/%s/%s.conf", g_modules_dir, mod_name, mod_name) >=
         (int)sizeof path)
         return;
     view_push(va, NSP_CFG_REC_MODULE_FILE, 0, -1, 0, path, nullptr, mod_name);
+    int base = va->count; /* 标记之后的记录起点：超长时整段撤回到这里 */
     FILE* fp = fopen(path, "r");
     if (!fp) return;
     char* line = nullptr;
@@ -1186,9 +1204,10 @@ static void view_scan_one_module_conf(ViewAcc* va, const char* mod_name) {
         if (r == 0) break;
         line_num++;
         if (r == -2) {
-            LOG_WRN("模块配置 %s 第 %d 行超长（>%d 字节），整行跳过", path, line_num,
-                    NSP_CONFIG_LINE_MAX);
-            continue;
+            LOG_WRN("模块配置 %s 第 %d 行超长（>%d 字节）：该模块配置整份作废",
+                    path, line_num, NSP_CONFIG_LINE_MAX);
+            view_truncate(va, base);
+            break;
         }
         if (r < 0) break;
         char* p = clean_path_string(line);
