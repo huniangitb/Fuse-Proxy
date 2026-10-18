@@ -216,6 +216,13 @@ SUITE_MAP = [
      ("scripts/commit_msg.py", ".githooks/", ".gitmessage", "scripts/setup-hooks.sh"),
      ("HEADER_MAX", "BREAKING CHANGE", "LOCAL_REFS"),
      "提交信息规范工具（lint + CHANGELOG）"),
+
+    # 构建脚本的输出目录白名单：脚本末尾对 $OUT 执行 rm -rf，误传 / 或 $HOME
+    # 会整目录删除。用例用假 HOME + PATH 桩（rm/cmake）验证拒绝发生在删除之前。
+    (("test_build_scripts.py",),
+     ("scripts/build-libssh2-android.sh",),
+     (),
+     "构建脚本危险路径白名单（rm -rf 前的 $OUT 校验）"),
 ]
 
 
@@ -265,6 +272,7 @@ LAYERS = {
             "test_inject_tracked_race.py",
             "test_log_ctl_rules.py",
             "test_commit_msg_lint.py",
+            "test_build_scripts.py",
         ),
     ),
     "L1": (
@@ -464,6 +472,7 @@ PARALLEL_SAFE = frozenset({
     "test_inject_tracked_race.py",  # cc 直编 inject_target.c + ASan + --wrap 桩 kill，无挂载/特权
     "test_a26_misc.py",           # cc 直编 ftp_conf.c/nsp_ini_store.c，/tmp mkdtemp，无挂载/网络
     "test_pt_probe_toctou.py",    # cc 直编驱动 + --wrap 桩 open/unlink，cwd 临时目录，无挂载/特权
+    "test_build_scripts.py",      # 假 HOME + PATH 桩跑脚本，TemporaryDirectory，不碰真实路径
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
