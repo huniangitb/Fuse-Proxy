@@ -14,8 +14,20 @@ injector 本体仅 Android 交叉构建，GNU 下经测试驱动 build_gnu/globa
   v3 忽略这两个全局参数——含系统应用在内一律为目标（默认全局挂载）；
   v3 下应用段/类别段头显式 OFF、隔离进程与 zygote 排除仍然生效；
   非法方法值直接拒绝（rc=2），不静默回退 v1。
+
+直编组（只需 cc，不依赖 build_gnu 产物；缺 cc/userns 时计为 gap）：
+  tests/fixtures/ipc_binding.c  → 编入**实际** src/injector/ipc_server.c，
+      校验 IPC 请求的身份绑定（R8）：自报 pid 不是对端进程、包名与
+      /proc/<pid>/cmdline 不符、伪造目标/非目标包名、非 root 对端发 REPORT
+      一律拒绝且 uid.map 原样、零派发；合法身份正对照通过。
+      IPC_SERVER_SRC=<旧副本> 可复验判别性（旧实现四条全 ACK → 必失败）。
+  tests/fixtures/async_reaped.c → 编入**实际** src/injector/ns_utils.c，
+      用真实 fork/pipe/waitpid 覆盖异步挂载完成事件的「结果判定 vs 收尸」矩阵
+      （R9）：failure/EOF + 主循环先收尸（ECHILD）两组必须 retries=1、
+      removed=1，success+ECHILD 不得误重试。NS_UTILS_SRC=<旧副本> 可复验
+      判别性（旧实现两组 0/0 → 必失败）。
 """
-import os, sys, time, subprocess, tempfile
+import os, re, shlex, shutil, sys, time, subprocess, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CTL = os.environ.get("GLOBAL_REPLACE_CTL") or os.path.join(ROOT, "build_gnu", "global_replace_ctl")
@@ -75,10 +87,180 @@ def is_target(conf, method, pkg, uid, pid=4321, ipc=1):
     return 0, None
 
 
+
+# ─────────────────────────── 直编组（R8 / R9） ───────────────────────────
+
+FIXTURES = os.path.join(ROOT, "tests", "fixtures")
+# 两个平台根常量在副本头里定向替换（与 test_config_snapshot / test_cfg_reload_split
+# 同一套路）：NSP_CONFIG_DIR → 临时 conf（uid.map 断言不碰系统配置根）；
+# NSP_ANDROID_EMULATED_ROOT → 临时 emulated 目录（目标分支的
+# access(/storage/emulated) 门在普通主机上不存在，私有化后判别确定）。
+CONFIG_DIR_PAT = re.compile(r'^#define\s+NSP_CONFIG_DIR\s+"/var/fuse-proxy"\s*$', re.M)
+EMU_ROOT_PAT = re.compile(r'^#define\s+NSP_ANDROID_EMULATED_ROOT\s+"/storage/emulated"\s*$', re.M)
+
+
+def prepare_private_include(tmpdir):
+    """复制 include/ 并私有化平台根常量。返回 (include 目录, conf, emulated, 替换数)。"""
+    inc = os.path.join(tmpdir, "include")
+    shutil.copytree(os.path.join(ROOT, "include"), inc)
+    conf = os.path.join(tmpdir, "conf")
+    emu = os.path.join(tmpdir, "emulated")
+    os.makedirs(conf, exist_ok=True)
+    os.makedirs(emu, exist_ok=True)
+    path = os.path.join(inc, "nsp_constants.h")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    text, n1 = CONFIG_DIR_PAT.subn(lambda _m: '#define NSP_CONFIG_DIR "%s"' % conf, text, count=1)
+    text, n2 = EMU_ROOT_PAT.subn(lambda _m: '#define NSP_ANDROID_EMULATED_ROOT "%s"' % emu,
+                                 text, count=1)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return inc, conf, emu, n1 + n2
+
+
+def build_fixture(tmpdir, out_name, fixture, sources):
+    """cc 直编 fixture + 实际源码。返回 (exe, CompletedProcess)。"""
+    cc = shlex.split(os.environ.get("CC", "cc"))
+    exe = os.path.join(tmpdir, out_name)
+    cmd = cc + [
+        "-std=c23", "-O1", "-g", "-D_GNU_SOURCE",
+        "-I", os.path.join(tmpdir, "include"),
+        "-I", os.path.join(ROOT, "src", "injector"),
+        os.path.join(FIXTURES, fixture),
+    ] + list(sources) + ["-o", exe, "-pthread"]
+    return exe, subprocess.run(cmd, capture_output=True, text=True)
+
+
+def record_fixture_output(title, proc):
+    """把夹具自身的 PASS/FAIL 行计入套件计数；无断言输出或非零退出也计失败。"""
+    global PASS, FAIL
+    text = (proc.stdout or "") + (proc.stderr or "")
+    rows = 0
+    fails = 0
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("PASS "):
+            rows += 1
+            PASS += 1
+            log(f"  ✅ {title}: {s[5:]}")
+        elif s.startswith("FAIL "):
+            rows += 1
+            fails += 1
+            FAIL += 1
+            ERRORS.append((f"{title}: {s[5:]}", "夹具输出见上"))
+            log(f"  ❌ {title}: {s[5:]}")
+    if rows == 0:
+        FAIL += 1
+        ERRORS.append((title, f"夹具无断言输出 rc={proc.returncode}"))
+        log(f"  ❌ {title}: 夹具无断言输出（rc={proc.returncode}）")
+        log(text[:1200])
+    elif proc.returncode != 0 and fails == 0:
+        FAIL += 1
+        ERRORS.append((title, f"rc={proc.returncode} 但无 FAIL 行"))
+        log(f"  ❌ {title}: rc={proc.returncode} 但无 FAIL 行")
+
+
+def userns_uid_mapping_ok():
+    """unshare 用户/pid ns + uid 映射到 10123（R8 夹具需要真实 uid >= 10000）。"""
+    unshare = shutil.which("unshare")
+    if not unshare:
+        return False, "缺少 unshare(1)"
+    try:
+        r = subprocess.run([unshare, "--user", "--map-user=10123", "--map-group=10123",
+                            "--pid", "--fork", "--mount-proc", "true"],
+                           capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"unshare 探测失败: {e}"
+    if r.returncode != 0:
+        return False, f"userns/uid 映射不可用（rc={r.returncode}）"
+    return True, ""
+
+
+def direct_compile_group():
+    """直编组：R8（IPC 身份绑定）+ R9（异步挂载结果判定）。返回 (已跑组数, 跳过原因)。"""
+    skips = []
+    ran = 0
+    if not (os.path.isfile(os.path.join(FIXTURES, "ipc_binding.c")) and
+            os.path.isfile(os.path.join(FIXTURES, "async_reaped.c"))):
+        skips.append("缺少 tests/fixtures/{ipc_binding,async_reaped}.c")
+        return ran, skips
+    try:
+        subprocess.run(shlex.split(os.environ.get("CC", "cc")) + ["--version"],
+                       capture_output=True, timeout=20, check=True)
+    except (OSError, subprocess.SubprocessError):
+        skips.append("缺少本机 cc，直编组跳过")
+        return ran, skips
+
+    tmp = tempfile.mkdtemp(prefix="inject_direct_")
+    _inc, _conf, _emu, patched = prepare_private_include(tmp)
+    if patched != 2:
+        fail("直编组：私有化平台根常量", f"仅替换 {patched}/2 处（头文件结构变化？）")
+        return ran, skips
+
+    # ── R8：IPC 请求身份绑定 ──
+    ipc_src = os.environ.get("IPC_SERVER_SRC") or os.path.join(
+        ROOT, "src", "injector", "ipc_server.c")
+    log(f"直编组 R8：被测 ipc_server 源 = {ipc_src}")
+    exe, build = build_fixture(tmp, "ipc_binding", "ipc_binding.c", [
+        ipc_src,
+        os.path.join(ROOT, "src", "injector", "inject_target.c"),
+        os.path.join(ROOT, "src", "core", "uid_map.c"),
+        os.path.join(ROOT, "src", "core", "fast_pid.c"),
+        os.path.join(ROOT, "src", "core", "nsp_util.c"),
+    ])
+    if build.returncode != 0:
+        fail("R8 直编夹具编译", (build.stderr or build.stdout).strip()[:800])
+    else:
+        ok, why = userns_uid_mapping_ok()
+        if not ok:
+            skips.append(f"R8 直编组跳过：{why}")
+        else:
+            try:
+                proc = subprocess.run(
+                    ["unshare", "--user", "--map-user=10123", "--map-group=10123",
+                     "--pid", "--fork", "--mount-proc", exe],
+                    capture_output=True, text=True, timeout=180)
+                ran += 1
+                record_fixture_output("R8 IPC 身份绑定", proc)
+            except subprocess.TimeoutExpired:
+                fail("R8 IPC 身份绑定", "夹具 180s 超时")
+
+    # ── R9：异步挂载完成事件（结果判定与收尸解耦） ──
+    ns_src = os.environ.get("NS_UTILS_SRC") or os.path.join(
+        ROOT, "src", "injector", "ns_utils.c")
+    log(f"直编组 R9：被测 ns_utils 源 = {ns_src}")
+    exe, build = build_fixture(tmp, "async_reaped", "async_reaped.c", [ns_src])
+    if build.returncode != 0:
+        fail("R9 直编夹具编译", (build.stderr or build.stdout).strip()[:800])
+    else:
+        try:
+            proc = subprocess.run([exe], capture_output=True, text=True, timeout=120)
+            ran += 1
+            record_fixture_output("R9 异步挂载收尾", proc)
+        except subprocess.TimeoutExpired:
+            fail("R9 异步挂载收尾", "夹具 120s 超时")
+
+    if FAIL == 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        log(f"直编组失败，保留临时目录以便复现：{tmp}")
+    return ran, skips
+
+
 def main():
-    if not os.path.isfile(CTL):
+    ran_direct, direct_skips = direct_compile_group()
+    ctl_missing = not os.path.isfile(CTL)
+    if ctl_missing:
         log(f"SKIP: 找不到测试驱动 {CTL}（先执行 scripts/build.sh）")
-        return SKIP_RC
+        log("")
+        log(f"结果: {PASS} 通过, {FAIL} 失败")
+        for d, e in ERRORS:
+            log(f"  ❌ {d}: {e}")
+        for s in direct_skips:
+            log(f"  gap: {s}")
+        if FAIL:
+            return 1
+        return SKIP_RC if ran_direct == 0 else 78
 
     tmp = tempfile.mkdtemp(prefix="inject_method_test_")
     # A：GLOBAL_INJECT ON / SKIP_SYSTEM_APPS ON + 应用段显式 OFF
@@ -157,7 +339,12 @@ def main():
     log(f"\n结果: {PASS} 通过, {FAIL} 失败")
     for d, e in ERRORS:
         log(f"  ❌ {d}: {e}")
-    return 1 if FAIL else 0
+    for s in direct_skips:
+        log(f"  gap: {s}")
+    if FAIL:
+        return 1
+    # 直编组被跳过（缺 cc/userns）→ 部分跳过，不计通过
+    return 78 if direct_skips else 0
 
 
 if __name__ == "__main__":

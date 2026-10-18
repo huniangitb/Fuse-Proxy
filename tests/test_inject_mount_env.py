@@ -519,6 +519,15 @@ class Report:
 REP = None
 
 
+def write_config_atomic(path, text):
+    """原子改写配置：临时名**不带** .conf（inotify 处理器按 ".conf" 子串判事件，
+    半成品会触发一次读到半截配置的重载），rename 到 injector.conf 才触发一次。"""
+    tmp = os.path.join(os.path.dirname(path), ".cfg.tmp")
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
 def wait_check(desc, fn, timeout=8.0, interval=0.1):
     """轮询 fn() → (ok, detail)，超时/中断记为失败。"""
     deadline = time.monotonic() + timeout
@@ -1004,20 +1013,24 @@ def inner_main(argv):
                       dev_at(STORAGE_EMU, app2) == g_dev,
                       entry_desc(top_entry(STORAGE_EMU, app2)))
 
-        # ── REQ 注入 / 非目标还原 ──
+        # ── REPORT 注入 / 非目标还原 ──
+        # 沙箱内的假应用是 userns 里的 uid 0（root），语义上对应真机的
+        # zygisk companion（root）代应用上报；而 ipc_server 的 REQ 通道只接受
+        # 「目标应用自身」（非 root，peer_pid == 自报 pid 且 /proc cmdline 与
+        # 包名一致）。故这里走 REPORT 通道——下游挂载/还原逻辑完全相同。
         REP.set_phase("req")
-        # 目标 REQ 与 LIST 轮询合一：规避「挂载出现早于 g_fuse_ready 置位」的窄竞态
-        rep_t = ipc_retry(f"REQ {TARGET_PKG} {app1} 0")
-        REP.check(f"REQ target({TARGET_PKG}) 返回 OK", rep_t is not None and "OK" in rep_t,
+        # 目标 REPORT 与 LIST 轮询合一：规避「挂载出现早于 g_fuse_ready 置位」的窄竞态
+        rep_t = ipc_retry(f"REPORT {TARGET_PKG} {app1} 0")
+        REP.check(f"REPORT target({TARGET_PKG}) 返回 OK", rep_t is not None and "OK" in rep_t,
                   repr(rep_t))
-        rep_n = ipc_retry(f"REQ {NONTARGET_PKG} {app2} 0")
-        REP.check(f"REQ nontarget({NONTARGET_PKG}) 返回 OK",
+        rep_n = ipc_retry(f"REPORT {NONTARGET_PKG} {app2} 0")
+        REP.check(f"REPORT nontarget({NONTARGET_PKG}) 返回 OK",
                   rep_n is not None and "OK" in rep_n, repr(rep_n))
 
         listed_ok = wait_listed(app1, TARGET_PKG, timeout=8)
-        # 目标确认后补一次 REQ，确保 v1 窄竞态下挂载线程重跑（幂等）
+        # 目标确认后补一次 REPORT，确保 v1 窄竞态下挂载线程重跑（幂等）
         if listed_ok and method == "v1" and dev_at(STORAGE_EMU, app1) != g_dev:
-            ipc_retry(f"REQ {TARGET_PKG} {app1} 0")
+            ipc_retry(f"REPORT {TARGET_PKG} {app1} 0")
         try:
             not_listed = app2 not in listed_pids(list_injected())
         except RuntimeError as e:
@@ -1043,6 +1056,27 @@ def inner_main(argv):
                        dev_is(STORAGE_EMU, g_dev, app2))
             check_now("app1（目标）保持项目 FUSE", dev_is(STORAGE_EMU, g_dev, app1))
             check_now("init 视图保持项目 FUSE", dev_is(STORAGE_EMU, g_dev))
+
+        # ── R14：v2 非目标 → 目标（配置 OFF→ON）必须重新接入代理视图 ──
+        # 背景：v2 的「非目标即还原」策略已把 app2 的命名空间 bind 回系统视图，
+        # 故配置从 OFF 改回 ON 时它**不会**自动回到代理视图（只有 v3 才有"始终
+        # 全局挂载"的保证）。旧实现把 v2/v3 一起按"目标自动继承全局替身视图"
+        # 处理、只打一条"无需逐应用挂载"的日志 → 该应用整个生命周期都没有代理
+        # 视图，而 LIST_INJECTED 仍显示已注入。
+        if method == "v2":
+            REP.set_phase("r14_off_on")
+            check_now("R14 前置：app2（非目标）当前为系统视图",
+                      dev_is(STORAGE_EMU, sys_dev, app2))
+            on_cfg = CONFIG_TEXT.replace("[com.test.nontarget] OFF",
+                                         "[com.test.nontarget] ON\nHIDE /NT_HIDE/")
+            write_config_atomic(CONFIG_PATH, on_cfg)
+            wait_check("R14 v2 配置 OFF→ON：app2 重新接入代理视图（全局 FUSE）",
+                       dev_is(STORAGE_EMU, g_dev, app2), timeout=10)
+            # 复原为 OFF：v2 应再次还原（同时让退出清理断言保持原有形态——
+            # app2 自己 ns 里的挂载不会被全局恢复回收，必须由还原路径收回）
+            write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
+            wait_check("R14 v2 配置 ON→OFF：app2 再次还原为系统视图",
+                       dev_is(STORAGE_EMU, sys_dev, app2), timeout=10)
 
         # 文件级 IO（init ns 视角）
         if method == "v1":

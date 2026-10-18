@@ -697,10 +697,25 @@ void audit_tracked_apps() {
                             cmd, pid);
                 }
             } else if (is_target && !has_fuse) {
-                if (inject_is_global_replace()) {
-                    /* 全局替换（v2/v3）：目标应用已由全局替换自动获得代理视图，无需逐应用挂载 */
-                    LOG_DBG("配置审查: %s (PID: %d) 全局替换模式，目标应用无需逐应用挂载。", cmd,
+                if (inject_restore_nontarget()) {
+                    /* v2：非目标应用此前已被 perform_app_restore 还原为系统视图，
+                       配置 OFF→ON 后必须重新执行逐应用挂载，否则该应用整个生命周期
+                       都没有代理视图（列表却显示已注入）。不能像 v3 那样跳过——
+                       v2 的"非目标即还原"策略让"非目标→目标"成为真实的视图迁移。 */
+                    const char* mnt_src = get_active_mnt_src();
+                    if (mnt_src) {
+                        LOG("配置审查(v2): %s (PID: %d) 重新接入代理视图（非目标→目标）", cmd,
                             pid);
+                        perform_app_mount(cmd, pid, uid, mnt_src, "配置审查重新挂载");
+                    } else {
+                        LOG_ERR(
+                                "配置审查(v2): 全局 FUSE 不可用，无法为 %s (PID: %d) 恢复代理视图",
+                                cmd, pid);
+                    }
+                } else if (inject_is_global_replace()) {
+                    /* v3：从不还原非目标应用，全局视图由替换保证，无需逐应用挂载 */
+                    LOG_DBG("配置审查(v3): %s (PID: %d) 全局替换模式，目标应用无需逐应用挂载。",
+                            cmd, pid);
                 } else {
                     const char* mnt_src = get_active_mnt_src();
                     if (mnt_src) {
@@ -744,9 +759,37 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
                        非目标应用仅 v2 主动卸载项目 FUSE 并还原系统视图备份，
                        v3 一律不还原（默认全局挂载，含系统应用） */
                     if (is_target) {
-                        LOG_DBG(
-                            "局部规则审查: 全局替换模式，目标应用 %s (PID: %d) 无需逐应用挂载。",
-                            cmd, pid);
+                        if (inject_restore_nontarget()) {
+                            /* v2：该应用可能刚在配置 OFF 期间被还原（顶层已是系统
+                               视图），此处必须重新执行逐应用挂载，否则 OFF→ON 不生效；
+                               已处于代理视图的应用跳过（幂等）。 */
+                            char target_path[128];
+                            get_target_storage_path(uid, target_path, sizeof target_path);
+                            const char* mnt_src = get_active_mnt_src();
+                            if (is_project_fuse_cached(pid, target_path)) {
+                                LOG_DBG(
+                                    "局部规则审查(v2): %s (PID: %d) 已在代理视图，无需重新挂载",
+                                    cmd, pid);
+                            } else if (mnt_src) {
+                                LOG(
+                                    "局部规则审查(v2): %s (PID: %d) 重新接入代理视图"
+                                    "（非目标→目标）",
+                                    cmd, pid);
+                                perform_app_mount(cmd, pid, uid, mnt_src,
+                                                  "局部规则变动重新挂载");
+                            } else {
+                                LOG_ERR(
+                                    "局部规则审查(v2): 全局 FUSE 不可用，无法为 %s (PID: %d) "
+                                    "恢复代理视图",
+                                    cmd, pid);
+                            }
+                        } else {
+                            /* v3：从不还原非目标应用，全局视图由替换保证 */
+                            LOG_DBG(
+                                "局部规则审查(v3): 全局替换模式，目标应用 %s (PID: %d) 无需逐应用"
+                                "挂载。",
+                                cmd, pid);
+                        }
                     } else if (inject_restore_nontarget()) {
                         perform_app_restore(cmd, pid, uid);
                         LOG_DBG(
