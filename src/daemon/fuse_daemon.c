@@ -1734,7 +1734,11 @@ static void vfs_inval_path(struct fuse* f, const char* path) {
    （FUSE 的 FLUSH 会因 dup/fork 对同一句柄多次触发）。返回 0 或负 errno。 */
 static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path) {
     const NspModuleOps* bops = NULL;
-    if (module_backend_acquire_slot(slot, &bops) != 0) return 0;
+    /* 槽位已被置毒/卸载（快照置空）：数据从未交给后端，**不能**报成功——
+       依赖 fsync 持久化的调用方（SQLite synchronous=FULL、编辑器保存）会
+       误以为已落盘。与同族的 vfs_read/vfs_write 一致返回 -EIO（R10）。
+       vfs_release 的宽容返回 0 保留：release 是幂等销毁、不宣称数据落盘。 */
+    if (module_backend_acquire_slot(slot, &bops) != 0) return -EIO;
     int rc = 0;
     if (bops->backend_flush)
         rc = nsp_fence_backend_flush(slot, "backend_flush", bops->backend_flush,
