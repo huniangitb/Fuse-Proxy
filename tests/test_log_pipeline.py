@@ -22,6 +22,10 @@
    （不得退化成 `atoi`，否则 `INFO` 会被静默当成 0=DEBUG）。
 4. **端到端可达**：fuse_daemon 产生的 IO 日志能经 sock 查询到，
    而不只是躺在落盘文件里（子用例 1 同时覆盖本条）。
+5. **退出路径线程收尾**：SIGTERM 退出时必须在 free `AsyncCtx` 之前 join
+   async 线程（先 shutdown 唤醒阻塞 read）；旧实现先 free 后线程醒来写
+   `notify_fd` → ASan heap-use-after-free。用例 5 直编 log_monitor 源码 + ASan
+   判别，`LOG_MONITOR_SRC=<旧副本>` 必失败。
 
 前置：GNU 产物 `build_gnu/{fuse_daemon,log_monitor,log_ctl}`、
       `fusermount3`、`/dev/fuse`。非默认产物路径用环境变量覆盖：
@@ -655,6 +659,252 @@ def test_query_channel():
 
 
 # ───────────────────────────────────────────────────────────
+# 用例 5：退出路径必须先停/join async 线程再 free（ASan 判别）
+# ───────────────────────────────────────────────────────────
+# 探针直编被测源码（默认仓库当前实现，可经 LOG_MONITOR_SRC 指向旧副本）：
+#   - 在独立线程里跑真实的 log_monitor main（#define main 改名后 include 源码）；
+#   - 连上抽象 socket 发一条 LOG_SYS，让 process_line 建 AsyncCtx 并起 async 线程；
+#   - --wrap=read 把 async 线程拦在 read 里（同时 --wrap=accept 记录被接管的 fd，
+#     --wrap=shutdown 让新实现的「shutdown 唤醒」能放行）；
+#   - 只对 monitor 线程发 SIGTERM → 走真实退出清理；join 该线程后再放行 read。
+# 旧实现：清理里 free(ctx) 后线程才醒来写 ctx->notify_fd → ASan heap-use-after-free
+# （log_monitor.c:993）。新实现：shutdown→join→drain→close→free，无报告。
+EXIT_JOIN_PROBE = r'''
+#define _GNU_SOURCE
+#define main review_unused_monitor_main
+#include "@LOG_MONITOR_SRC@"
+#undef main
+
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
+static int g_target_fd = -1; /* process_line 接管的 async 连接 fd */
+static int g_entered;        /* async 线程已停在 read */
+static int g_release;        /* 探针放行 read（旧实现路径用） */
+static int g_woken;          /* 被测实现调了 shutdown（新实现路径用） */
+static __thread int t_monitor_thread;
+
+ssize_t __real_read(int, void*, size_t);
+ssize_t __wrap_read(int fd, void* buf, size_t n) {
+    int block = 0;
+    pthread_mutex_lock(&g_mu);
+    if (fd == g_target_fd && g_target_fd >= 0 && !t_monitor_thread) {
+        block = 1;
+        g_entered = 1;
+        pthread_cond_broadcast(&g_cv);
+        while (!g_release && !g_woken) pthread_cond_wait(&g_cv, &g_mu);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return block ? 0 : __real_read(fd, buf, n);
+}
+int __real_shutdown(int, int);
+int __wrap_shutdown(int fd, int how) {
+    pthread_mutex_lock(&g_mu);
+    if (fd == g_target_fd && g_target_fd >= 0) {
+        g_woken = 1;
+        pthread_cond_broadcast(&g_cv);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return __real_shutdown(fd, how);
+}
+int __real_accept(int, struct sockaddr*, socklen_t*);
+int __wrap_accept(int fd, struct sockaddr* a, socklen_t* l) {
+    int c = __real_accept(fd, a, l);
+    if (c >= 0) {
+        pthread_mutex_lock(&g_mu);
+        if (fd == g_server_sock) g_target_fd = c;
+        pthread_mutex_unlock(&g_mu);
+    }
+    return c;
+}
+
+static void* monitor_entry(void* arg) {
+    (void)arg;
+    t_monitor_thread = 1;
+    char* argv[] = {(char*)"log_monitor_exit_probe", NULL};
+    review_unused_monitor_main(1, argv);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t mon;
+    if (pthread_create(&mon, NULL, monitor_entry, NULL) != 0) return 2;
+    struct sockaddr_un sa;
+    socklen_t sl = nsp_uds_abstract_addr(&sa, LOG_SOCKET_NAME);
+    int s = -1;
+    for (int i = 0; i < 200; i++) {
+        s = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (s >= 0 && connect(s, (struct sockaddr*)&sa, sl) == 0) break;
+        if (s >= 0) close(s);
+        s = -1;
+        usleep(50000);
+    }
+    if (s < 0) {
+        fprintf(stderr, "PROBE: connect failed\n");
+        return 2;
+    }
+    const char* line = "LOG_SYS:1:probe-exit-join\n";
+    if (write(s, line, strlen(line)) != (ssize_t)strlen(line)) return 2;
+    /* 等 async 线程停在 read，再只对 monitor 线程发 SIGTERM（epoll_wait 必被中断） */
+    pthread_mutex_lock(&g_mu);
+    while (!g_entered) pthread_cond_wait(&g_cv, &g_mu);
+    pthread_mutex_unlock(&g_mu);
+    pthread_kill(mon, SIGTERM);
+    pthread_join(mon, NULL); /* 退出清理已跑完：旧实现此处已 free(ctx) */
+    pthread_mutex_lock(&g_mu);
+    g_release = 1;
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+    usleep(200000);
+    close(s);
+    fprintf(stderr, "PROBE: done\n");
+    return 0;
+}
+'''
+
+# ASan 阳性对照：确认本机 ASan 能编译、且 log_path 落盘机制真的生效
+ASAN_POSITIVE = r'''
+#include <stdlib.h>
+int main(void) {
+    volatile int* p = (volatile int*)malloc(sizeof(int));
+    if (!p) return 2;
+    free((void*)p);
+    return *p;
+}
+'''
+
+# log_monitor 的链接依赖（与 Meson 的 common_sources + nsp_util/nsp_comm 同源）
+LOG_MONITOR_DEPS = [
+    "src/core/common.c",
+    "src/core/build_info.c",
+    "src/core/path_trie.c",
+    "src/config/config_parser.c",
+    "src/config/path_vars.c",
+    "src/core/fast_search.c",
+    "src/core/uid_map.c",
+    "src/core/sys_pkg.c",
+    "src/core/nsp_util.c",
+    "src/core/nsp_comm.c",
+]
+
+LOG_MONITOR_SRC = os.environ.get("LOG_MONITOR_SRC") or os.path.join(
+    ROOT, "src", "log", "log_monitor.c")
+
+ASAN_OPTS = ("detect_leaks=0:print_stacktrace=1:"
+             "allocator_release_to_os_interval_ms=-1")
+
+
+def _cc():
+    return os.environ.get("CC", "cc").split()
+
+
+def _compile_asan(tmpdir, name, sources, extra=()):
+    exe = os.path.join(tmpdir, name)
+    cmd = [*_cc(), "-std=c23", "-w", "-g", "-O0", "-fno-omit-frame-pointer",
+           "-fsanitize=address", "-DTARGET_GNU=1", "-D_GNU_SOURCE",
+           "-DNSP_GIT_HASH=\"probe\"", "-DNSP_BUILD_MODE=\"probe\"",
+           "-DNSP_PROJECT_VERSION=\"0\"",
+           "-I", os.path.join(ROOT, "include"), *sources, *extra,
+           "-o", exe, "-pthread", "-ldl", "-lm"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr, file=sys.stderr)
+        return None
+    return exe
+
+
+def _run_asan(exe, log_prefix, timeout=60):
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = "log_path=%s:%s" % (log_prefix, ASAN_OPTS)
+    env.pop("LSAN_OPTIONS", None)
+    return subprocess.run([exe], capture_output=True, text=True, env=env,
+                          timeout=timeout)
+
+
+def _asan_reports(tmpdir, prefix):
+    out = []
+    for name in os.listdir(tmpdir):
+        if name.startswith(os.path.basename(prefix) + "."):
+            path = os.path.join(tmpdir, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    out.append(fh.read())
+            except OSError:
+                pass
+    return out
+
+
+def test_exit_join():
+    """用例组5：SIGTERM 退出路径必须先 join async 线程再 free（ASan 判别）。
+
+    旧实现退出清理：disconnected=true → drain → close(fd/notify_fd) → free(ctx)，
+    线程仍阻塞在 read；主线程随后 free，线程醒来在已释放对象上写 notify_fd
+    （报告实测 ASan heap-use-after-free log_monitor.c:993）。新实现先 shutdown
+    唤醒、再 join，free 前有「线程已退出」的同步证据。
+
+    判别性：LOG_MONITOR_SRC=<git show HEAD:src/log/log_monitor.c> 跑本用例必失败
+    （ASan 报告 + 非 0 退出）。跳过边界：本机 cc 不支持 -fsanitize=address 时
+    记 gap（不假装通过）。
+    """
+    log("\n━━━ 用例组5: 退出路径 join async 线程（ASan 判别） ━━━")
+    if not os.path.isfile(LOG_MONITOR_SRC):
+        GAPS.append("log_monitor 源码缺失，退出 join 用例跳过")
+        log("  ⏭ 缺少 %s，跳过", LOG_MONITOR_SRC)
+        return
+    with tempfile.TemporaryDirectory(prefix="log_exit_join_") as tmpdir:
+        pos_src = os.path.join(tmpdir, "asan_positive.c")
+        with open(pos_src, "w", encoding="utf-8") as fh:
+            fh.write(ASAN_POSITIVE)
+        pos = _compile_asan(tmpdir, "asan_positive", [pos_src])
+        if pos is None:
+            GAPS.append("本机 cc 不支持 -fsanitize=address，退出 join 用例跳过")
+            log("  ⏭ 本机 cc 不支持 ASan，跳过（该用例的判别力依赖 ASan）")
+            return
+        pos_log = os.path.join(tmpdir, "asanpos")
+        _run_asan(pos, pos_log, timeout=30)
+        reports = _asan_reports(tmpdir, pos_log)
+        if not any("heap-use-after-free" in r for r in reports):
+            fail("5.0 ASan 阳性对照未落盘（落盘机制/环境异常）",
+                 "reports=%d" % len(reports))
+            return
+        ok("5.0 ASan 阳性对照生效（越界探针产生 heap-use-after-free 报告）")
+
+        src = os.path.join(tmpdir, "exit_join_probe.c")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(EXIT_JOIN_PROBE.replace("@LOG_MONITOR_SRC@", LOG_MONITOR_SRC))
+        probe = _compile_asan(
+            tmpdir, "exit_join_probe",
+            [src] + [os.path.join(ROOT, p) for p in LOG_MONITOR_DEPS],
+            extra=["-Wl,--wrap=read", "-Wl,--wrap=shutdown", "-Wl,--wrap=accept"])
+        if probe is None:
+            fail("5.1 退出路径探针编译失败", "见上方编译器输出")
+            return
+        # 抽象 socket 全局唯一：先停掉本套件拉起的实例，探针自己起一份
+        stop_logmon()
+        probe_log = os.path.join(tmpdir, "asanexit")
+        try:
+            r = _run_asan(probe, probe_log, timeout=90)
+        except subprocess.TimeoutExpired:
+            fail("5.2 退出路径探针超时", "线程未被 shutdown/join 唤醒（可能死锁）")
+            return
+        reports = _asan_reports(tmpdir, probe_log)
+        uaf = [x for x in reports if "heap-use-after-free" in x]
+        check("5.2 退出路径无 ASan 报告（free 前已 join 线程）",
+              r.returncode == 0 and not uaf,
+              (uaf[0].splitlines()[1] if uaf else
+               "rc=%d stderr=%s" % (r.returncode,
+                                    (r.stderr or "").strip().splitlines()[-1:])))
+        check("5.3 探针正常跑完（SIGTERM 退出路径可达）",
+              "PROBE: done" in r.stderr, (r.stderr or "").strip()[:200])
+    # 探针进程已退出，抽象 socket 释放；后续用例需要时自行 start_logmon()
+
+# ───────────────────────────────────────────────────────────
 # 主流程
 # ───────────────────────────────────────────────────────────
 def main():
@@ -697,6 +947,7 @@ def main():
             test_level_format()
             test_query_channel()
             test_rule_server_log_injection()
+            test_exit_join()
     finally:
         stop_fuse(None)
         stop_logmon()

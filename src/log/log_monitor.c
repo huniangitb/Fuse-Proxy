@@ -50,6 +50,11 @@ typedef struct AsyncCtx {
     int fd;
     int type; /* 0=undef, 1=IO, 2=SYS, 3=LOGCAT */
     pthread_t tid;
+    /* 线程已创建且未被 join（线程非 detached，收尸责任在 cleanup_async）。
+       free 之前必须 join 出「线程已退出」的同步证据：仅置 disconnected 只让线程
+       在下次循环检查后退出，主线程随即 close/free 会让它醒来在已释放对象上写
+       notify_fd（ASan heap-use-after-free，退出期 SIGTERM 路径可复现）。 */
+    bool thread_started;
     /* 断开标记用原子而非 volatile：async 线程在**最后一批 entries/batch_q 写入之后**
        才置位，主循环回收前置 acquire 读取——release/acquire 配对让那些 volatile
        写对接收方可见。用 volatile 只保证不被优化掉，不保证跨线程可见性，线程
@@ -784,7 +789,20 @@ static void report_drops_once(void) {
              (unsigned)(DROP_REPORT_INTERVAL_MS / 1000));
     push_log(&g_sys_buf, msg, 2, LOG_WARN);
 }
+/* 停 async 线程并等它**真正退出**——free 前的同步证据。
+   ctx->fd 是已接管的对端 socket：shutdown 唤醒阻塞在 read 的线程（否则它永远
+   停在 read 里），线程走完当前缓冲后在循环顶看到 disconnected 退出；join 保证
+   其后的 notify_fd / 环写入都已结束。只看 disconnected 不行：那是线程写的
+   单向标记，主线程在它置位前 free 就是 UAF。 */
+static void async_ctx_stop_thread(AsyncCtx* ctx) {
+    if (!ctx->thread_started) return;
+    if (ctx->fd >= 0) shutdown(ctx->fd, SHUT_RDWR);
+    ctx->disconnected = true;
+    pthread_join(ctx->tid, nullptr);
+    ctx->thread_started = false;
+}
 static void cleanup_async(AsyncCtx* ctx) {
+    async_ctx_stop_thread(ctx);
     AsyncCtx** pp = &g_async_clients;
     while (*pp) {
         if (*pp == ctx) {
@@ -1312,8 +1330,16 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
         g_async_clients = actx;
         struct epoll_event ev = {.events = EPOLLIN, .data.fd = actx->notify_fd};
         epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, actx->notify_fd, &ev);
-        pthread_create(&actx->tid, nullptr, async_log_thread, actx);
-        pthread_detach(actx->tid);
+        if (pthread_create(&actx->tid, nullptr, async_log_thread, actx) != 0) {
+            /* 线程创建失败：actx 留在链表但无消费者，阻塞 fd 泄漏；移除并清理
+               （thread_started 仍为 false，cleanup_async 不会去 join 不存在的线程） */
+            LOG_ERR("async 日志线程创建失败，丢弃连接 fd=%d", actx->fd);
+            epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, actx->notify_fd, nullptr);
+            cleanup_async(actx);
+            ctx->fd = -1;
+            return 1;
+        }
+        actx->thread_started = true;
         ctx->fd = -1;
         return 1;
     } else if (strncmp(line, "LOG_BATCH", 9) == 0 && line[9] == '\0') {
@@ -1372,7 +1398,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
             cleanup_async(actx);
             return 1;
         }
-        pthread_detach(actx->tid);
+        actx->thread_started = true;
         ctx->fd = -1;
         return 1;
     } else if (strncmp(line, "QUERY_IO:", 9) == 0 || strncmp(line, "QUERY_SYS:", 10) == 0 ||
@@ -1577,16 +1603,14 @@ static void handle_client_timeout_tick(int timer_fd) {
     while (*app) {
         AsyncCtx* a = *app;
         if (a->disconnected) {
-            /* async 线程已结束（acquire 读取，见 AsyncCtx::disconnected 注释）：
-               先把环内尚未移交的条目/合并包入库再回收。漏掉这一步，线程末尾
-               写入、但 notify 事件与置位错峰未再触发 epoll 的那批日志会随
-               free 一起静默消失——生产者侧日志"只发不收"的第二个丢失点。 */
-            drain_async(a);
-            *app = a->next;
+            /* async 线程已置位并返回（acquire 读取，见 AsyncCtx::disconnected
+               注释）：cleanup_async 先 join 收尸，再把环内尚未移交的条目/合并包
+               入库后回收。漏掉 drain，线程末尾写入、但 notify 事件与置位错峰
+               未再触发 epoll 的那批日志会随 free 一起静默消失——生产者侧日志
+               "只发不收"的第二个丢失点。cleanup_async 已把 *app 指向下一个，
+               故本层不推进 app。 */
             epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, a->notify_fd, nullptr);
-            if (a->fd >= 0) close(a->fd);
-            if (a->notify_fd >= 0) close(a->notify_fd);
-            free(a);
+            cleanup_async(a);
         } else {
             app = &(*app)->next;
         }
@@ -1780,17 +1804,10 @@ int main(int argc, char* argv[]) {
         curr_free = next_free;
     }
     g_active_clients = nullptr;
-    AsyncCtx* a_curr = g_async_clients;
-    while (a_curr) {
-        AsyncCtx* a_next = a_curr->next;
-        a_curr->disconnected = true;
-        drain_async(a_curr); /* 退出前抢救环内残留（与超时回收同源） */
-        if (a_curr->fd >= 0) close(a_curr->fd);
-        if (a_curr->notify_fd >= 0) close(a_curr->notify_fd);
-        free(a_curr);
-        a_curr = a_next;
-    }
-    g_async_clients = nullptr;
+    /* 逐个 shutdown→join→drain→close→free（cleanup_async 的唯一出口）。
+       join 必须在 drain 之前：线程还活着时 drain 完的环仍可能被它继续写，
+       那些条目会随 free 一起静默丢失。 */
+    while (g_async_clients) cleanup_async(g_async_clients);
     /* 退出前刷盘残余暂存并释放 */
     persist_flush(&g_persist_io);
     persist_flush(&g_persist_sys);
