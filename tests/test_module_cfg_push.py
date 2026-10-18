@@ -11,6 +11,16 @@
 判别性验证：`FW_CONFIG_SRC=<旧实现> python3 tests/test_module_cfg_push.py`
 （旧实现 = 去掉 `config_read_view` 里的 `view_scan_module_confs` 调用）。
 
+超长行整份作废（R4）：模块配置任一有效行超过 `NSP_CONFIG_LINE_MAX` 时，框架必须
+把该模块配置**整份**判为不可用——只下发 `NSP_CFG_REC_MODULE_FILE` 标记、零
+`NSP_CFG_REC_MODULE_LINE`。旧实现只丢这一行（`continue`），于是模块拿其余行按
+默认 `proto=ftp`/21 注册：用户以为在连 SFTP，实际以明文 FTP 发送账号密码。
+第二个探针（本文件内生成）做**差分**：同一份文件分别走 `ftp_conf_load()`（模块
+文件形态）与「视图行喂入 `ftp_conf_parse_line`」（下发形态），两边的返回码与
+服务器表（段名/host/port/proto）必须逐项一致——旧实现 direct servers=0、view
+servers=1（sftp=0/port=21）必失败。正常 `proto=sftp` 段作正对照，防止两条路径
+一起坏成「都解析不出」的假绿。
+
 本套件直编 `src/daemon/fw_config.c` + `src/config/config_parser.c` 及其依赖
 （不经 Meson），驱动见 `tests/fixtures/module_cfg_push_driver.c`。
 
@@ -51,6 +61,121 @@ CONFIG_PARSER_SRC = os.environ.get("CONFIG_PARSER_SRC") or os.path.join(
 CONFIG_DIR_PAT = re.compile(
     r'^#define\s+(?:NSP_CONFIG_DIR|CONFIG_DIR)\s+"/var/fuse-proxy"\s*$', re.M)
 
+# ───────────────────────────────────────────────────────────
+# 超长行 → 整份作废 + 两条解析路径的差分（探针在临时目录生成）
+# ───────────────────────────────────────────────────────────
+OVERLONG_PROBE = r'''
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "config_parser.h"
+#include "ftp_conf.h"
+
+static int g_fail;
+
+static void check(int ok, const char* what) {
+    printf("  %s %s\n", ok ? "PASS" : "FAIL", what);
+    if (!ok) g_fail++;
+}
+
+/* 某模块标记之后的连续 MODULE_LINE 条数（-1 = 无标记） */
+static int module_line_count(const NspCfgRec* recs, int count, const char* mod,
+                             const char** file_out) {
+    for (int i = 0; i < count; i++) {
+        if (recs[i].kind != NSP_CFG_REC_MODULE_FILE || !recs[i].text) continue;
+        if (strcmp(recs[i].text, mod) != 0) continue;
+        if (file_out) *file_out = recs[i].file;
+        int n = 0;
+        for (int j = i + 1; j < count; j++) {
+            if (recs[j].kind == NSP_CFG_REC_MODULE_FILE) break;
+            if (recs[j].kind == NSP_CFG_REC_MODULE_LINE) n++;
+        }
+        return n;
+    }
+    return -1;
+}
+
+/* 与 ftp_module 的 apply_config 同法：把本模块的视图行喂进模块自己的状态机 */
+static int parse_from_view(const NspCfgRec* recs, int count, const char* mod,
+                           FtpServerList* out) {
+    FtpConfParse st;
+    ftp_conf_parse_begin(&st, out, NULL);
+    const char* owner = NULL;
+    for (int i = 0; i < count; i++) {
+        if (recs[i].kind == NSP_CFG_REC_MODULE_FILE) {
+            owner = recs[i].text;
+            continue;
+        }
+        if (recs[i].kind != NSP_CFG_REC_MODULE_LINE) continue;
+        if (!owner || strcmp(owner, mod) != 0) continue;
+        ftp_conf_parse_line(&st, recs[i].text ? recs[i].text : "");
+    }
+    return ftp_conf_parse_end(&st);
+}
+
+static int same_servers(const FtpServerList* a, const FtpServerList* b) {
+    if (a->count != b->count) return 0;
+    for (int i = 0; i < a->count; i++) {
+        const FtpServerCfg* x = &a->servers[i];
+        const FtpServerCfg* y = &b->servers[i];
+        if (strcmp(x->name, y->name) != 0 || strcmp(x->host, y->host) != 0 ||
+            x->port != y->port || x->sftp != y->sftp)
+            return 0;
+    }
+    return 1;
+}
+
+static void diff_case(const char* mod, const char* conf, const NspCfgRec* recs, int count,
+                      int expect_servers) {
+    FtpServerList direct, view;
+    int rc_direct = ftp_conf_load(conf, &direct);
+    int rc_view = parse_from_view(recs, count, mod, &view);
+    printf("    [%s] direct rc=%d servers=%d%s | view rc=%d servers=%d\n", mod, rc_direct,
+           direct.count,
+           direct.count ? (direct.servers[0].sftp ? " sftp" : " ftp") : "", rc_view,
+           view.count);
+    check(rc_direct == rc_view, "差分：直接读文件与视图喂入的返回码一致");
+    check(same_servers(&direct, &view),
+          "差分：两条路径的服务器表逐项一致（段名/host/port/proto）");
+    check(direct.count == expect_servers, "直接读文件得到期望的服务器数（正对照）");
+    ftp_conf_free(&direct);
+    ftp_conf_free(&view);
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) return 2;
+    config_set_modules_dir(argv[2]);
+    NspCfgRec* recs = NULL;
+    int count = 0;
+    config_read_view(argv[1], &recs, &count);
+    if (!recs || count <= 0) {
+        printf("FAIL config_read_view 未产出记录\nRESULT FAIL\n");
+        return 1;
+    }
+    char conf[PATH_MAX];
+    snprintf(conf, sizeof conf, "%s/modOverlong/modOverlong.conf", argv[2]);
+    const char* file = NULL;
+    int lines = module_line_count(recs, count, "modOverlong", &file);
+    check(lines == 0, "超长行：该模块只下发标记、零 MODULE_LINE（整份作废）");
+    check(file && strcmp(file, conf) == 0, "超长行：标记仍下发且 file 是确切路径");
+    diff_case("modOverlong", conf, recs, count, 0);
+
+    snprintf(conf, sizeof conf, "%s/modSftp/modSftp.conf", argv[2]);
+    diff_case("modSftp", conf, recs, count, 1);
+    {
+        FtpServerList l;
+        ftp_conf_load(conf, &l);
+        check(l.count == 1 && l.servers[0].sftp && l.servers[0].port == 22,
+              "正对照：正常 proto=sftp 段解析出 1 个后端且 sftp/22");
+        ftp_conf_free(&l);
+    }
+    config_free_view(recs, count);
+    printf("%s\n", g_fail == 0 ? "RESULT OK" : "RESULT FAIL");
+    return g_fail == 0 ? 0 : 1;
+}
+'''
 
 def prepare_include(tmpdir, config_dir):
     """复制 include/，把 GNU 配置根常量指向临时 fixture 根（与 fw_config_view 同法）。"""
@@ -92,6 +217,33 @@ def compile_binary(tmpdir, inc_dir):
     return exe
 
 
+def compile_overlong_probe(tmpdir, inc_dir):
+    """第二个探针：超长行整份作废 + 文件形态/下发形态差分（直编 ftp_conf.c）。"""
+    src = os.path.join(tmpdir, "module_cfg_overlong_probe.c")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(OVERLONG_PROBE)
+    exe = os.path.join(tmpdir, "module_cfg_overlong_probe")
+    cmd = [
+        *os.environ.get("CC", "cc").split(), "-std=c23", "-DTARGET_GNU=1", "-D_GNU_SOURCE",
+        # ftp_conf.c 经 nsp_module.h 取 LOG_WRN（模块 ABI 形态），与 test_a26_misc 同法
+        "-DNSP_MODULE_BUILD",
+        "-Wall", "-Wno-unused-parameter",
+        "-I", inc_dir, "-I", os.path.join(ROOT, "include"),
+        "-I", os.path.join(ROOT, "src", "daemon"),
+        "-I", os.path.join(ROOT, "src", "modules", "ftp"),
+        src, os.path.join(ROOT, "src", "modules", "ftp", "ftp_conf.c"),
+    ] + [CONFIG_PARSER_SRC if s == "src/config/config_parser.c" else os.path.join(ROOT, s)
+         for s in SOURCES] + [
+        "-o", exe, "-pthread", "-ldl", "-lm",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("超长行探针编译/链接失败:", file=sys.stderr)
+        print(r.stderr, file=sys.stderr)
+        return None
+    return exe
+
+
 def main():
     if not os.path.isfile(DRIVER):
         print("缺少驱动 fixture", file=sys.stderr)
@@ -116,6 +268,17 @@ def main():
             fh.write("# 注释行\nhost = a.example.com\npass = p#ssw0rd\nHIDE /nsp_from_module_conf\n")
         with open(os.path.join(modules, "modB", "modB.conf"), "w", encoding="utf-8") as fh:
             fh.write("host = b.example.com\n")
+        # R4：modOverlong 第 3 行超长（> NSP_CONFIG_LINE_MAX=2048）——框架必须把该
+        # 模块配置整份作废（只下发标记、零 MODULE_LINE）；modSftp 是正常 sftp 段的
+        # 正对照（两路径都必须解析出 1 个后端、sftp/22）。
+        for mod in ("modOverlong", "modSftp"):
+            os.makedirs(os.path.join(modules, mod), exist_ok=True)
+        with open(os.path.join(modules, "modOverlong", "modOverlong.conf"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("[over]\nhost = over.example.com\nproto = sftp" + " " * 2300 + "\n")
+        with open(os.path.join(modules, "modSftp", "modSftp.conf"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("[ok]\nhost = ok.example.com\nproto = sftp\n")
 
         inc_dir = prepare_include(tmpdir, config_dir)
         if inc_dir is None:
@@ -138,6 +301,19 @@ def main():
             print(r.stderr, end="", file=sys.stderr)
         if r.returncode != 0:
             print("配置下发归属测试失败")
+            return 1
+
+        probe = compile_overlong_probe(tmpdir, inc_dir)
+        if probe is None:
+            return 1
+        print("── 超长行整份作废 + 文件形态/下发形态差分 ──")
+        r = subprocess.run([probe, rules, modules], capture_output=True, text=True,
+                           env=dict(os.environ))
+        print(r.stdout, end="")
+        if r.stderr:
+            print(r.stderr, end="", file=sys.stderr)
+        if r.returncode != 0:
+            print("超长行整份作废/差分测试失败")
             return 1
         print("配置下发归属测试通过 ✔")
         return 0
