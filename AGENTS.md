@@ -82,6 +82,40 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 特殊前置：`test_ftp.py` 需本机 vsftpd 匿名服务（127.0.0.1:21，匿名根只读 + `upload/` 可写）；`test_config_snapshot.py`、`test_module_abi.py` 不经 Meson，直接用本机 `cc` 临时编译实际源码（前者另需 json-c），故不依赖 `build_gnu/`；
 
+### 2026-10-18 审计修复的判别性要点
+
+本轮清空 `review-findings-20261018.md` 的 15 条（R1–R15）。新增/扩展用例的判别信号
+（旧实现均为 HEAD `f55b572`；直编类均支持 `*_SRC=` 指向旧源码副本复验）：
+
+- **R1/R2 跨设备 rename**：`test_functional.py` 模块 6b 从实际源码逐字抽取
+  `vfs_rename` 五个函数 + `--wrap=rename` 强制首次 EXDEV。旧实现非空目标 `rc=0`
+  且目标子树消失、预置可预测临时名符号链接时受害者被写；新实现 `ENOTEMPTY`/
+  `EISDIR`、目标逐字节保留、随机临时名 + `O_EXCL|O_NOFOLLOW`。
+- **R10 假 fsync 成功**：`test_module_circuit.py` §0 直编 `vfs_backend_finish_data`，
+  acquire 桩返回 -1；旧 rc=0，新 -EIO。
+- **R3 truncate 句柄一致性**：`test_ftp.py` 3g / `test_sftp.py` FUSE 段——远端
+  100 字节 → open(O_RDWR) → ftruncate(0) → 写 1 字节 → close，远端必须恰好
+  1 字节；`FTP_BACKEND_SRC=` 现编旧后端复验。
+- **R5/R6/R7/R12/R13 rule_server**：`test_rule_server.py` 的 fields 非 object
+  （旧 rc=-11）、`REMOVE ../../outside`（旧 status=ok 且外部文件被改）、schema
+  前缀比较（旧 sensitive 丢失 + 明文回读）、`--wrap=fopen` EACCES（旧整份覆盖）、
+  bool garbage（旧落盘且 GET=true）；`RULE_SERVER=` 可指向旧二进制，
+  `A26_INI_SRC=` 指向旧 `nsp_ini_store.c`。
+- **R8/R9 injector**：`test_inject_method.py` 直编组，`IPC_SERVER_SRC=` /
+  `NS_UTILS_SRC=` 指向旧源码；旧实现四种伪造身份全 ACK 并写 uid.map、
+  ECHILD 两组 retries/removed=0。
+- **R14 v2 OFF→ON**：`test_inject_mount_env.py` v2 段在 rootless unshare 沙箱
+  断言 app2 从系统视图重新接入项目 FUSE、再 OFF 还原；用旧 `inject_target.c`
+  现编 injector 时该断言 10s 超时必失败。
+- **R4 模块配置超长行**：`test_module_cfg_push.py` 断言超长行时该模块零
+  `MODULE_LINE`，并做 `ftp_conf_load(file)` 与视图喂入的差分；
+  `CONFIG_PARSER_SRC=` 指向旧源码复验。
+- **R11 log_monitor 退出 UAF**：`test_log_pipeline.py` 用例 5 直编 log_monitor +
+  ASan + `--wrap=read/shutdown/accept` 跑 SIGTERM 退出路径；`LOG_MONITOR_SRC=`
+  指向旧源码时 ASan 报 heap-use-after-free。
+- **R15 构建脚本**：新增 `tests/test_build_scripts.py`（L0），假 HOME + rm/cmake
+  桩断言危险路径在 rm 之前被拒；`BUILD_SSH2_SCRIPT=` 指向旧脚本必失败。
+
 失败处理：退出码 1 为失败（勿用管道吞退出码）；**跳过（77/78）不算通过**——验收用 `python3 tests/run.py --all --strict` 让 gap 计为失败，并逐条核对跳过原因；残留挂载点（`/tmp/fuse_proxy_test/mnt`、`/tmp/fuse_rules_test/mnt`、`/tmp/fuse_neg_test/mnt`）用 `fusermount3 -u` 清理后重跑；测试规则文件在 `/tmp/Namespace-Proxy/injector.conf`。
 
 **测试自清约定**（写**真实** FTP 树 `upload/`、`upload2/` 的套件适用，那是用户的投递目录，会无界累积）：清扫必须按**宽前缀 / 模式**（`nsp_`、`nsp_par_`、`conc_*.bin`…），**不得**用含 `os.getpid()` 的名字限定——否则只能清自己那份，异常退出（或修好前的历史运行）留下的 `nsp_par_<旧 pid>_*` 永久堆积。写盘位置与清扫位置要**成对**（如 `upload2/` 有写就得有扫）。判定是否残留**用 `find -name`，不要用 `ls | grep '^前缀'`**：本机 `ls` 是 eza、输出带图标前缀，锚定 grep 恒假阴性。判别性验证时探针要选套件**不碰**的名字，否则会伪装成套件缺陷（例：往真实树预置 `pat_1m.bin` 会让匿名 ftp 用户无权覆盖，用例报 EIO）。
