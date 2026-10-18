@@ -10,7 +10,7 @@
 并直接核对 vsftpd 匿名根（/home/bdy/ftp）验证 FTP 服务器实际变化。
 V5 分页回归：700 文件大目录一次列全（旧 512 整批上限会静默丢尾）。
 """
-import subprocess, os, sys, time, shutil, errno, ctypes
+import subprocess, os, sys, time, shutil, errno, ctypes, shlex
 from pathlib import Path
 
 MNT      = "/tmp/fuse_ftp_test/mnt"
@@ -29,10 +29,38 @@ SERVER2  = "备份"
 REPO     = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DAEMON   = os.environ.get("FUSE_DAEMON") or f"{REPO}/build_gnu/fuse_daemon"
 FTP_MOD_SO = os.environ.get("FTP_MODULE_SO") or f"{REPO}/build_gnu/ftp_module.so"
+# 判别性复验（CONTRIBUTING §4 G7）：指向另一份后端源码副本（如
+# git show HEAD:src/modules/ftp/ftp_backend_libcurl.c）时，本套件用它现编一个
+# ftp_module.so 跑同一用例——旧实现必须失败。不设置则用 FTP_MODULE_SO。
+BACKEND_SRC = os.environ.get("FTP_BACKEND_SRC")
 
 PASS = 0; FAIL = 0; ERRS = []
 def ok(d): global PASS; PASS += 1; print(f"  ✅ {d}")
 def fail(d, dt=""): global FAIL; FAIL += 1; print(f"  ❌ {d}: {dt}"); ERRS.append((d, dt))
+
+def build_module_from_source(dst):
+    """按 FTP_BACKEND_SRC 现编 ftp_module.so（其余源文件取当前树）。
+    与 meson 的 ftp_module 目标等价，只把后端源文件换成指定副本——用于
+    在旧实现（git show HEAD:…）上复跑同一用例做判别性验证。"""
+    cc = shlex.split(os.environ.get("CC", "cc"))
+    cmd = cc + ["-std=c23", "-O1", "-g", "-D_GNU_SOURCE", "-DNSP_MODULE_BUILD",
+                "-fPIC", "-shared",
+                "-I", f"{REPO}/include", "-I", f"{REPO}/src/modules/ftp",
+                f"{REPO}/src/modules/ftp/ftp_module.c",
+                f"{REPO}/src/modules/ftp/ftp_conf.c",
+                f"{REPO}/src/modules/ftp/ftp_mux.c",
+                os.path.abspath(BACKEND_SRC),
+                f"{REPO}/src/core/nsp_util.c",
+                "-o", dst, "-pthread", "-lcurl", "-ldl"]
+    # libssh2 只影响 SFTP 段；缺该库的环境仍可编 FTP-only 模块（本套件只用 FTP）
+    last = None
+    for extra in (["-lssh2"], []):
+        last = subprocess.run(cmd + extra, capture_output=True, text=True)
+        if last.returncode == 0:
+            return True
+    print("  按 FTP_BACKEND_SRC 编译 ftp_module.so 失败：", file=sys.stderr)
+    print(last.stderr[-2000:], file=sys.stderr)
+    return False
 
 def setup():
     shutil.rmtree("/tmp/fuse_ftp_test", ignore_errors=True)
@@ -41,7 +69,11 @@ def setup():
     os.makedirs(MNT, exist_ok=True)
     os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
     os.makedirs(f"{MODDIR}/ftp_module", exist_ok=True)
-    if os.path.exists(FTP_MOD_SO):
+    if BACKEND_SRC:
+        if not build_module_from_source(f"{MODDIR}/ftp_module/ftp_module.so"):
+            sys.exit(1)
+        print(f"  [判别性] ftp_module.so 由 FTP_BACKEND_SRC 现编：{BACKEND_SRC}")
+    elif os.path.exists(FTP_MOD_SO):
         shutil.copy(FTP_MOD_SO, f"{MODDIR}/ftp_module/ftp_module.so")
     else:
         print("  ⚠ ftp_module.so 未找到")
@@ -308,6 +340,101 @@ def main():
         # 3f. 点文件不得被丢弃（A15）：本机 vsftpd 默认 `force_dot_files=NO`，
         #     LIST 根本不回点条目，故端到端不可观测——A15 的判别性用例落在
         #     tests/test_ftp_truncate_list.py（直编后端 + 合成 LIST 正文）。
+
+        # 3g. ftruncate 必须同步**已打开写句柄**的本地缓存（R3 判别）
+        #     远端预置 100 字节 → open(O_RDWR) 回灌 → ftruncate(fd,0) → 写 1 字节
+        #     → close。旧实现 backend_truncate 只按路径发空 STOR、不碰句柄的
+        #     tmp_fd：pwrite 落在旧长度缓冲上，close 时按旧 file_end 全量 STOR，
+        #     远端复活成 100 字节（1 字节新内容 + 99 字节旧尾巴）。
+        #     正对照：无打开句柄时 truncate 仍须把远端清空（正常语义不变）。
+        tf = "nsp_r3_trunc_handle.bin"
+        tf2 = "nsp_r3_trunc_handles2.bin"
+        try:
+            tpath = Path(FTP_UPLOAD) / tf
+            tpath.write_bytes(b"0123456789" * 10)   # 100 字节
+            os.chmod(tpath, 0o666)                  # 匿名 ftp 用户要能覆盖
+            fd = os.open(str(m/"0"/SERVER/tf), os.O_RDWR)
+            try:
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, b"x", 0)
+            finally:
+                os.close(fd)
+            got = None
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                try:
+                    got = tpath.read_bytes()
+                except Exception:
+                    got = None
+                if got == b"x":
+                    break
+                time.sleep(0.2)
+            if got == b"x":
+                ok("ftruncate 打开中的写句柄：close 后远端恰好 1 字节")
+            else:
+                shown = repr(got[:24]) if got is not None else "<读失败>"
+                n = len(got) if got is not None else 0
+                fail("ftruncate 打开中的写句柄",
+                     f"远端 {n} 字节 = {shown}（期望 b'x'；"
+                     f"旧实现按旧 file_end 全量 STOR，旧尾部复活）")
+            # 正对照：无打开句柄时 truncate 语义不变（远端清空）
+            (m/"0"/SERVER/tf).write_bytes(b"Z" * 32)
+            os.truncate(m/"0"/SERVER/tf, 0)
+            got2 = None
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                try:
+                    got2 = tpath.read_bytes()
+                except Exception:
+                    got2 = None
+                if got2 == b"":
+                    break
+                time.sleep(0.2)
+            if got2 == b"":
+                ok("无打开句柄时 truncate 仍生效（正对照：远端清空）")
+            else:
+                shown = repr(got2[:24]) if got2 is not None else "<读失败>"
+                n = len(got2) if got2 is not None else 0
+                fail("truncate 正对照", f"远端 {n} 字节 = {shown}（期望空）")
+            # 多个已打开句柄：截断作用于 inode，必须影响**所有**同路径写句柄。
+            # fd1 截断、fd2 写、先关 fd1 再关 fd2——任一旧缓存未归零都会在
+            # 收尾时把旧内容传回远端（只同步「发起截断的那个句柄」不够）。
+            t2 = Path(FTP_UPLOAD) / tf2
+            t2.write_bytes(b"ABCDEFGHIJ" * 10)
+            os.chmod(t2, 0o666)
+            fd1 = os.open(str(m/"0"/SERVER/tf2), os.O_RDWR)
+            fd2 = os.open(str(m/"0"/SERVER/tf2), os.O_RDWR)
+            try:
+                os.ftruncate(fd1, 0)
+                os.pwrite(fd2, b"y", 0)
+            finally:
+                os.close(fd1)
+                os.close(fd2)
+            got3 = None
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                try:
+                    got3 = t2.read_bytes()
+                except Exception:
+                    got3 = None
+                if got3 == b"y":
+                    break
+                time.sleep(0.2)
+            if got3 == b"y":
+                ok("多个已打开写句柄：截断影响全部（远端恰好 1 字节）")
+            else:
+                shown = repr(got3[:24]) if got3 is not None else "<读失败>"
+                n = len(got3) if got3 is not None else 0
+                fail("多句柄 truncate", f"远端 {n} 字节 = {shown}（期望 b'y'）")
+        except Exception as e:
+            fail("ftruncate 打开中的写句柄", str(e))
+        finally:
+            for stale in (tf, tf2):
+                try:
+                    (Path(FTP_UPLOAD) / stale).unlink()
+                except Exception:
+                    pass
+
         # 4. 读回（经 fuse）
         try:
             got = (m/"0"/SERVER/newf).read_text().strip()
