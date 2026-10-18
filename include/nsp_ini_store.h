@@ -33,8 +33,10 @@ typedef struct NspIniStore NspIniStore;
 extern "C" {
 #endif
 
-/* 打开存储：文件不存在视为空存储（路径已记住，set 后 save 即创建）；
- * 仅参数非法/OOM 返回 NULL */
+/* 打开存储：只有文件不存在（ENOENT）视为空存储（路径已记住，set 后 save
+ * 即创建）；参数非法/OOM/读取失败（EACCES/EMFILE/EIO 等，含读到一半失败）
+ * 均返回 NULL 并保留 errno。调用方不得把 NULL 当空存储继续 save——那会用只含
+ * 本次条目的内容覆盖整份文件。 */
 NspIniStore* nsp_ini_open(const char* path);
 void nsp_ini_close(NspIniStore* s);
 const char* nsp_ini_path(const NspIniStore* s);

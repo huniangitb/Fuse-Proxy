@@ -67,6 +67,19 @@ def send_cmd(server, sock_name, cmd_obj, timeout=5.0):
     return json.loads(buf.decode("utf-8"))
 
 
+def send_cmd_soft(server, sock_name, cmd_obj, timeout=5.0):
+    """send_cmd 的容错版：服务崩溃/连接被拒时返回 {"status": "transport-error"}。
+
+    判别性用例（如 R5 的 fields 非 object）在旧实现上会让 rule_server SIGSEGV，
+    直接 send_cmd 会抛异常中断整套测试；软发送把「进程已死」变成一个可断言的
+    失败项，后续正对照仍能继续跑。
+    """
+    try:
+        return send_cmd(server, sock_name, cmd_obj, timeout)
+    except (OSError, socket.timeout, ValueError) as e:
+        return {"status": "transport-error", "error": str(e)}
+
+
 def wait_server_ready(proc, sock_name, timeout=5.0):
     """轮询 PING 直到服务就绪"""
     deadline = time.time() + timeout
@@ -524,6 +537,119 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "UNKNOWN_CMD"})
     expect("未知命令报错", r.get("status") == "error", r)
 
+    # ---- R5：MODULE_CONF_ADD/SET 的 fields 必须校验 JSON 类型 ----
+    # 判别点：旧实现对 fields 只判存在就 json_object_object_foreach（对非 object
+    #   强转解引用），string/array/number 会让 rule_server 直接 SIGSEGV。下面每条
+    #   都用软发送（崩溃时得到 transport-error 而非抛异常），并紧跟 PING 正对照。
+    for bad_fields in ("not-an-object", [1, 2], 123):
+        kind = type(bad_fields).__name__
+        r = send_cmd_soft(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                            "name": "R5盘", "fields": bad_fields})
+        expect(f"R5 ADD fields={kind} 明确拒绝",
+               r.get("status") == "error" and bool(r.get("error")), r)
+        expect("R5 ADD 拒绝后服务存活（PING）",
+               proc.poll() is None
+               and send_cmd_soft(proc, sock_name, {"cmd": "PING"}).get("status") == "ok",
+               proc.poll())
+        r = send_cmd_soft(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                            "name": "云盘", "fields": bad_fields})
+        expect(f"R5 SET fields={kind} 明确拒绝",
+               r.get("status") == "error" and bool(r.get("error")), r)
+        expect("R5 SET 拒绝后服务存活（PING）",
+               proc.poll() is None
+               and send_cmd_soft(proc, sock_name, {"cmd": "PING"}).get("status") == "ok",
+               proc.poll())
+    # fields 为 null = 未提供：ADD 回落到散字段拾取（给 host 即成功）
+    r = send_cmd_soft(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                        "name": "R5盘", "fields": None, "host": "r5.example"})
+    expect("R5 fields=null 按未提供处理（散字段 host 生效）",
+           r.get("status") == "ok" and r["data"]["changed"] is True, r)
+    # 既无 fields 也无散字段：明确报错（不是静默建空段）
+    r = send_cmd_soft(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                        "name": "R5空", "fields": None})
+    expect("R5 fields=null 且无散字段时明确拒绝",
+           r.get("status") == "error" and bool(r.get("error")), r)
+    # SET 同理：null 回落到单字段形态
+    r = send_cmd_soft(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                        "name": "R5盘", "fields": None})
+    expect("R5 SET fields=null 缺 key 时明确拒绝", r.get("status") == "error", r)
+    r = send_cmd_soft(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                        "name": "R5盘", "fields": None,
+                                        "key": "host", "value": "r5b.example"})
+    expect("R5 SET fields=null 回落到单字段形态",
+           r.get("status") == "ok" and r["data"]["changed"] is True, r)
+    # 清理：条目删掉（文件留空不影响后续 FTP_LIST 空表断言）
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_REMOVE", "module": "ftp_module",
+                                   "name": "R5盘"})
+    expect("R5 清理条目", r.get("status") == "ok", r)
+    expect("R5 全程后服务存活",
+           proc.poll() is None
+           and send_cmd(proc, sock_name, {"cmd": "PING"}).get("status") == "ok", proc.poll())
+
+    # ---- R6：REMOVE 的包名校验不得被开关类型短路 ----
+    # 判别点：旧实现对开关类型（MONITOR 等）跳过 valid_pkg，pkg="../../outside"
+    #   经 App-rules/<pkg>.conf 越出配置根，把外部 .conf 的 MONITOR 行删掉。
+    outside_dir = os.path.dirname(conf_dir)
+    outside = os.path.join(outside_dir, "outside.conf")
+    outside_body = "MONITOR ON\nHIDE /outside/keep\n"
+    with open(outside, "w", encoding="utf-8") as f:
+        f.write(outside_body)
+    for bad_pkg in ("../../outside", "..", "a/b", "..%2f"):
+        for t in ("MONITOR", "HIDE"):
+            r = send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": bad_pkg,
+                                           "type": t, "index": 0})
+            expect(f"R6 REMOVE 拒绝非法包名 {bad_pkg!r} type={t}",
+                   r.get("status") == "error", r)
+            expect(f"R6 外部文件逐字节不变 {bad_pkg!r} type={t}",
+                   open(outside, encoding="utf-8").read() == outside_body, "外部文件被改动")
+    # 正对照：合法 App-rules/<pkg> 与停用态 .conf.disabled 的 REMOVE 仍工作
+    r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "com.r6.app", "type": "HIDE",
+                                   "value": "/sdcard/r6_keep"})
+    expect("R6 正对照 ADD", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "SET", "pkg": "com.r6.app",
+                                   "type": "INJECT_ENABLE", "value": "OFF"})
+    expect("R6 正对照停用（路由到 .conf.disabled）", r.get("status") == "ok", r)
+    r6_dis = os.path.join(conf_dir, "App-rules", "com.r6.app.conf.disabled")
+    expect("R6 .conf.disabled 已生成", os.path.exists(r6_dis), r6_dis)
+    r = send_cmd(proc, sock_name, {"cmd": "REMOVE", "pkg": "com.r6.app",
+                                   "type": "HIDE", "index": 0})
+    expect("R6 合法应用（停用态）REMOVE 成功",
+           r.get("status") == "ok" and "r6_keep" in r["data"].get("removed", ""), r)
+    expect("R6 停用态 REMOVE 写回 .conf.disabled 且不新建 .conf",
+           "r6_keep" not in open(r6_dis, encoding="utf-8").read()
+           and not os.path.exists(os.path.join(conf_dir, "App-rules", "com.r6.app.conf")),
+           "路径/内容不符")
+    # 纵深防御：App-rules 被替换成指向配置根外的符号链接时，realpath 边界校验必须
+    # 拒绝（判别点：旧实现顺着链接把根外 .conf 的规则删掉）。
+    sym_root = os.path.join(outside_dir, "sym_conf")
+    sym_outside = os.path.join(outside_dir, "sym_outside")
+    os.makedirs(sym_root, exist_ok=True)
+    os.makedirs(sym_outside, exist_ok=True)
+    sym_victim = os.path.join(sym_outside, "com.sym.app.conf")
+    sym_body = "HIDE /victim/keep\n"
+    with open(sym_victim, "w", encoding="utf-8") as f:
+        f.write(sym_body)
+    os.symlink(sym_outside, os.path.join(sym_root, "App-rules"))
+    sym_sock = f"nsp_rule_sym_{os.getpid()}"
+    sym_proc = subprocess.Popen(
+        [RULE_SERVER, "--foreground", "--config-dir", sym_root, "--socket", sym_sock],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={**os.environ, "NSP_TRUSTED_UIDS": str(os.getuid())})
+    try:
+        wait_server_ready(sym_proc, sym_sock)
+        r = send_cmd_soft(sym_proc, sym_sock, {"cmd": "REMOVE", "pkg": "com.sym.app",
+                                               "type": "HIDE", "index": 0})
+        expect("R6 App-rules 符号链接越出配置根被拒绝",
+               r.get("status") == "error", r)
+        expect("R6 符号链接外目标逐字节不变",
+               open(sym_victim, encoding="utf-8").read() == sym_body, "根外文件被改动")
+    finally:
+        try:
+            sym_proc.send_signal(signal.SIGTERM)
+            sym_proc.wait(timeout=3)
+        except Exception:
+            sym_proc.kill()
+
     # ---- 全局专属类型：仅 GLOBAL 可用，应用作用域必须拒绝 ----
     r = send_cmd(proc, sock_name, {"cmd": "ADD", "pkg": "com.example.app", "type": "GLOBAL_INJECT", "value": "ON"})
     expect("应用作用域拒绝 GLOBAL_INJECT", r.get("status") == "error", r)
@@ -917,6 +1043,60 @@ def check(proc, sock_name, conf_dir):
            isinstance(fs2["port"]["default"], int) and fs2["port"]["default"] == 21
            and fs2["host"]["default"] == "", fs2.get("port"))
 
+    # ---- R13：bool 字段词法校验 + 归一（on/off），GET 与模块解析同口径 ----
+    # 判别点：旧实现 bool 落到通用字符串分支，garbage/2 照收，GET 渲染成 true，
+    #   而模块侧 ftp_conf 会整段作废（前端显示已开启、后端却不存在）。
+    def ftp_text_now():
+        return open(ftp_path, encoding="utf-8").read()
+
+    r13_before = ftp_text_now()
+    for bad in ("garbage", "2", "yes"):
+        r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                       "name": "云盘", "key": "host_key_check",
+                                       "value": bad})
+        expect(f"R13 bool 拒绝非法值 {bad!r}",
+               r.get("status") == "error" and "host_key_check" in (r.get("error") or ""), r)
+        expect(f"R13 拒绝 {bad!r} 后文件逐字未变", ftp_text_now() == r13_before)
+    for val, want, want_bool in (("TRUE", "on", True), ("On", "on", True), ("1", "on", True),
+                                 ("FALSE", "off", False), ("off", "off", False),
+                                 ("0", "off", False)):
+        r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                       "name": "云盘", "key": "host_key_check", "value": val})
+        expect(f"R13 bool 接受 {val!r}", r.get("status") == "ok", r)
+        seg = ftp_text_now().split("[云盘]")[1].split("\n[")[0]
+        expect(f"R13 bool {val!r} 归一落盘为 {want}", f"host_key_check = {want}" in seg, seg)
+        r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "云盘"})
+        expect(f"R13 GET {val!r} → {want_bool}",
+               r.get("status") == "ok" and r["data"]["host_key_check"] is want_bool,
+               r.get("data"))
+        expect(f"R13 显式配置后 {val!r} 不在 derived",
+               "host_key_check" not in r["data"].get("derived", []),
+               r["data"].get("derived"))
+    # ADD 路径同一口径（fields 形态）：非法整体拒绝、合法归一落盘
+    r13_before = ftp_text_now()
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "R13盘",
+                                   "fields": {"host": "h", "host_key_check": "garbage"}})
+    expect("R13 ADD bool 非法值整体拒绝", r.get("status") == "error", r)
+    expect("R13 ADD 拒绝后文件逐字未变", ftp_text_now() == r13_before)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                   "name": "R13盘",
+                                   "fields": {"host": "h", "host_key_check": "true"}})
+    expect("R13 ADD bool 合法值归一落盘",
+           r.get("status") == "ok"
+           and "host_key_check = on" in ftp_text_now().split("[R13盘]")[1].split("\n[")[0], r)
+    # 空值沿用既有「SET=删键回缺省 / ADD=不写」语义（E3/E5），不是词法错误
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SET", "module": "ftp_module",
+                                   "name": "云盘", "key": "host_key_check", "value": ""})
+    expect("R13 bool 空值 = 删键回缺省（既有语义）",
+           r.get("status") == "ok" and r["data"]["changed"] is True, r)
+    r = send_cmd(proc, sock_name, {"cmd": "FTP_GET", "name": "云盘"})
+    expect("R13 删键后回 schema 缺省（host_key_check=true 且标 derived）",
+           r["data"]["host_key_check"] is True
+           and "host_key_check" in r["data"].get("derived", []), r.get("data"))
+    send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_REMOVE", "module": "ftp_module",
+                               "name": "R13盘"})
+
     # ---- E5：ADD 空值 = 不写该键（不落 `key = ` 空行，模块读侧对空值整段作废） ----
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
                                    "name": "空值盘", "host": "10.2.2.2", "user": "",
@@ -1026,6 +1206,52 @@ def check(proc, sock_name, conf_dir):
                                   "name": "A", "host": "x"})
     expect("MODULE_CONF_ADD 按 schema 过滤字段（host 非该模块字段）",
            r.get("status") == "error", r)
+
+    # ---- R7：schema 字段名必须精确比较（前缀不得串字段/吞敏感标记） ----
+    # 判别点：旧实现 strncasecmp(cs->cf_key, rest, klen) 只比新字段名长度，
+    #   token_secret 之后声明 token 会被当成同一字段：token 消失、token_secret
+    #   的 sensitive 被后者覆盖为 false → GET 明文回读。
+    r7_dir = os.path.join(conf_dir, "modules", "schema_mod")
+    os.makedirs(r7_dir, exist_ok=True)
+    with open(os.path.join(r7_dir, "schema_mod.rules"), "w", encoding="utf-8") as f:
+        f.write('[conf]\n'
+                'conf.token_secret.type = string\nconf.token_secret.sensitive = true\n'
+                'conf.token.type = string\nconf.token.sensitive = false\n'
+                'conf.ab.type = string\nconf.ab.sensitive = true\n'
+                'conf.a.type = string\nconf.a.sensitive = false\n')
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "schema_mod"})
+    r7_fields = {f["key"]: f for f in r["data"]["fields"]} if r.get("status") == "ok" else {}
+    expect("R7 交叠字段名全部独立存在",
+           sorted(r7_fields) == ["a", "ab", "token", "token_secret"], sorted(r7_fields))
+    expect("R7 token_secret 保持 sensitive",
+           r7_fields.get("token_secret", {}).get("sensitive") is True,
+           r7_fields.get("token_secret"))
+    expect("R7 token 非 sensitive",
+           r7_fields.get("token", {}).get("sensitive") is False, r7_fields.get("token"))
+    expect("R7 ab 保持 sensitive",
+           r7_fields.get("ab", {}).get("sensitive") is True, r7_fields.get("ab"))
+    expect("R7 a 非 sensitive",
+           r7_fields.get("a", {}).get("sensitive") is False, r7_fields.get("a"))
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "schema_mod",
+                                   "name": "S",
+                                   "fields": {"token_secret": "PRIVATE_TOKEN",
+                                              "token": "PUBLIC_TOKEN",
+                                              "ab": "PRIVATE_AB", "a": "PUBLIC_A"}})
+    expect("R7 交叠字段可同时写入", r.get("status") == "ok", r)
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_GET", "module": "schema_mod",
+                                   "name": "S"})
+    r7_get = r.get("data") or {}
+    expect("R7 敏感字段键本身不出现（只回 has_）",
+           r.get("status") == "ok" and "token_secret" not in r7_get and "ab" not in r7_get
+           and r7_get.get("has_token_secret") is True and r7_get.get("has_ab") is True, r7_get)
+    expect("R7 非敏感字段正常回读",
+           r7_get.get("token") == "PUBLIC_TOKEN" and r7_get.get("a") == "PUBLIC_A", r7_get)
+    expect("R7 GET 响应不含敏感明文",
+           "PRIVATE_TOKEN" not in json.dumps(r) and "PRIVATE_AB" not in json.dumps(r),
+           json.dumps(r, ensure_ascii=False))
+    send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_REMOVE", "module": "schema_mod",
+                               "name": "S"})
+
     # ftp_module 走通用命令：等价于 FTP_ADD（别名行为一致）
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
                                    "name": "通用盘", "host": "10.9.9.9", "port": 21})
@@ -1072,6 +1298,35 @@ def check(proc, sock_name, conf_dir):
     r = send_cmd(proc, sock_name, {"cmd": "FTP_LIST"})
     expect("FTP_REMOVE 后剩一条", len(r["data"]["servers"]) == 1
            and r["data"]["servers"][0]["name"] == "云盘", r)
+
+    # ---- R12：模块配置读失败不得当空存储（否则下一次 ADD 覆盖整份文件） ----
+    # 判别点：旧实现 nsp_ini_open 把 EACCES 也当「空存储」，MODULE_CONF_ADD 随即用
+    #   只含本次条目的内容原子覆盖整份 ftp_module.conf。root 下 chmod 000 仍可读，
+    #   该组跳过计 gap（见 AGENTS A10）；非 root 由本组端到端覆盖，--wrap=fopen 的
+    #   确定性判别在 test_a26_misc.py 的直编组。
+    if os.geteuid() != 0:
+        r12_before = open(ftp_path, "rb").read()
+        os.chmod(ftp_path, 0)
+        try:
+            r = send_cmd_soft(proc, sock_name,
+                              {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                               "name": "读失败盘", "host": "h"})
+            expect("R12 读失败时 ADD 返回错误",
+                   r.get("status") == "error" and "读取" in (r.get("error") or ""), r)
+            r = send_cmd_soft(proc, sock_name, {"cmd": "FTP_LIST"})
+            expect("R12 读失败时 LIST 拒绝（不回空表）", r.get("status") == "error", r)
+        finally:
+            os.chmod(ftp_path, 0o600)
+        expect("R12 读失败时文件逐字节不变", open(ftp_path, "rb").read() == r12_before)
+        # 正对照：恢复可读后同一请求成功
+        r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
+                                       "name": "恢复盘", "host": "h"})
+        expect("R12 恢复可读后 ADD 正常", r.get("status") == "ok", r)
+        send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_REMOVE", "module": "ftp_module",
+                                   "name": "恢复盘"})
+    else:
+        print("  (跳过 R12 读失败用例：以 root 运行，chmod 000 仍可读)")
+        GAPS.append("R12 读失败（root 运行无法用 chmod 制造 EACCES）")
 
     # ---- EXPORT_LOGS：一键导出日志（落点/私有性/打包内容/prune 收敛） ----
     import tarfile as _tarfile
