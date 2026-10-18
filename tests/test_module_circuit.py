@@ -10,6 +10,8 @@ V4 起规则引擎已内建（`src/daemon/fw_rules.c`），模块只剩「后端
 （本地无此目录）→ 假。
 
 覆盖：
+  0. L0 直编契约：槽位失效（acquire 失败）时 fsync/flush 必须返回 -EIO，
+     不得对「数据从未交给后端」报成功
   1. 熔断：后端对 /0/berrN 返回**非 errno 契约**码（窗口内 5 次）→ 立即置毒卸载，
      其健康路径随之失效（行为化证据）
   2. 崩溃围栏：backend_match 触发 SIGSEGV → 围栏 longjmp 恢复，daemon 存活，
@@ -34,7 +36,7 @@ V4 起规则引擎已内建（`src/daemon/fw_rules.c`），模块只剩「后端
 
 前置：build_gnu/ 产物；/dev/fuse；gcc；fusermount3；/var/fuse-proxy/log 可写。
 """
-import subprocess, os, sys, time, shutil, errno
+import subprocess, os, sys, time, shutil, errno, tempfile
 from pathlib import Path
 
 HERE  = Path(__file__).resolve().parent
@@ -226,10 +228,129 @@ def storm(kw, n=9):
         except OSError: pass
         time.sleep(0.12)
 
+# ── §0 L0 直编契约：后端槽位失效时 fsync/flush 不得假成功（R10） ──
+# 直编实际源码的 vfs_backend_finish_data，把 module_backend_acquire_slot
+# 桩成返回 -1（槽位被置毒/卸载后快照置空）；旧实现 return 0（假成功），
+# 新实现必须 -EIO。FUSE_DAEMON_SRC=<旧源码副本> 可复现失败。
+FINISH_DATA_DRIVER = r'''
+#define _GNU_SOURCE
+#define FUSE_USE_VERSION 317
+#include <fuse3/fuse.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include "fw_rules.h"
+#include "module_loader.h"
+#define NSP_FH_HANDLE_MASK ((1ULL << 40) - 1)
+#define LOG_ERR(...) ((void)0)
+#define LOG_WRN(...) ((void)0)
+static struct fuse_context g_ctx;
+struct fuse_context* fuse_get_context(void) { return &g_ctx; }
+#define NSP_FENCE_FAULT (-5000)
+#define NSP_FENCE_BADFN (-5001)
+static bool backend_rc_is_business(int rc) { return rc < 0 && rc >= -4095; }
+int module_backend_acquire_slot(int slot, const NspModuleOps** out) {
+    (void)slot; (void)out; return -1; /* 槽位失效 */
+}
+void module_backend_release_slot(int slot) { (void)slot; }
+int nsp_fence_backend_flush(int a, const char* b, int (*f)(uint64_t), uint64_t c) {
+    (void)a; (void)b; (void)f; (void)c; return 0;
+}
+static void vfs_inval_path(struct fuse* f, const char* p) { (void)f; (void)p; }
+void module_guard_fault(int a, const char* b, const char* c) { (void)a; (void)b; (void)c; }
+void module_guard_error(int a, const char* b, int c, const char* d, const char* e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+}
+__FINISH_FN__
+int main(void) {
+    int rc = vfs_backend_finish_data(0, 1, "/0/probe");
+    printf("unavailable_backend_flush_rc=%d\n", rc);
+    return rc == -EIO ? 0 : 1;
+}
+'''
+
+
+def _extract_one_function(src_text, name):
+    """从实际源码里逐字抽出 static 函数定义（跳过同名前向声明）。"""
+    needle = "static int " + name + "("
+    start = 0
+    while True:
+        i = src_text.find(needle, start)
+        if i < 0:
+            return None
+        brace = src_text.find("{", i)
+        semi = src_text.find(";", i)
+        if brace >= 0 and (semi < 0 or brace < semi):
+            break
+        start = i + 1
+    body = src_text.index("{", i)
+    depth = 1
+    j = body + 1
+    while depth and j < len(src_text):
+        if src_text[j] == "{":
+            depth += 1
+        elif src_text[j] == "}":
+            depth -= 1
+        j += 1
+    return src_text[i:j]
+
+
+def check_finish_data_contract():
+    """R10：槽位失效时 fsync/flush 必须返回 EIO，不得宣称数据已落盘。
+
+    同族的 vfs_read/vfs_write 在同样状态下返回 -EIO；vfs_release 的宽容
+    返回 0 保留（release 是幂等销毁，不宣称数据落盘）。
+    """
+    print("\n── 0. L0 直编契约：槽位失效时 fsync/flush 返回 EIO（R10） ──")
+    src_path = os.environ.get("FUSE_DAEMON_SRC") or str(ROOT / "src/daemon/fuse_daemon.c")
+    try:
+        src_text = Path(src_path).read_text()
+    except OSError as e:
+        fail("R10 读取被测源码", f"{src_path}: {e}")
+        return
+    fn = _extract_one_function(src_text, "vfs_backend_finish_data")
+    if not fn:
+        fail("R10 抽取 vfs_backend_finish_data", f"{src_path} 中未找到定义")
+        return
+    cc = os.environ.get("CC", "cc").split()
+    if not shutil.which(cc[0]):
+        print("  (跳过 R10 直编契约：无 cc)")
+        return
+    stage = tempfile.mkdtemp(prefix="nsp_finish_data.")
+    try:
+        c_path = os.path.join(stage, "finish_probe.c")
+        exe = os.path.join(stage, "finish_probe")
+        Path(c_path).write_text(FINISH_DATA_DRIVER.replace("__FINISH_FN__", fn))
+        cmd = [*cc, "-std=gnu23", "-D_GNU_SOURCE", "-Wall", "-Wextra",
+               "-Wno-unused-parameter",
+               "-I", str(ROOT / "include"), "-I", str(ROOT / "src/daemon"),
+               c_path, "-o", exe]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            fail("R10 直编探针", (r.stderr or r.stdout).strip()[:400])
+            return
+        p = subprocess.run([exe], capture_output=True, text=True, timeout=30)
+        out = (p.stdout + p.stderr).strip()
+        if p.returncode == 0:
+            ok("槽位失效时 fsync/flush 返回 EIO（不再假成功）")
+        else:
+            fail("槽位失效时 fsync/flush 假成功", out[-300:] or f"rc={p.returncode}")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def main():
     global PASS, FAIL
+    check_finish_data_contract()
     setup()
     build_modules()
+
 
     # ── 1. 熔断：后端持续契约违规（非 errno 返回码）→ 窗口内 5 次后置毒 ──
     print("\n── 1. 熔断：契约违规风暴 → 自动卸载 + 后端失效 ──")
