@@ -22,6 +22,7 @@
 #include <sys/resource.h>
 #include <dirent.h>
 #include "config_parser.h"
+#include "fast_pid.h"
 #include "ns_utils.h"
 
 /* LIST_MODULES 应答：扫描模块目录，列出含 <name>.so 的模块（与 fuse_daemon 加载约定一致）。
@@ -256,6 +257,74 @@ void ipc_server_cleanup(int sock_fd) {
         close(sock_fd);
     }
 }
+
+/* ================= 请求身份绑定（R8） =================
+ * 只核对 SO_PEERCRED 的 uid 不足以确认"是谁在替谁说话"：同一个 uid 下的进程
+ * 可以自报**别的 pid**（例如 init）或**别的包名**。一旦采信：
+ *  - 该 uid 的 uid→包名映射被污染，HIDE/RO 规则整体失配；
+ *  - v2 下按伪包判定"非目标"并派发还原，合法应用可能因此失去代理视图。
+ * 故两条通道各有独立的身份模型：
+ *  - REQ：应用自身在 specialize 阶段直连（peer uid == 应用 uid）。必须
+ *    peer_pid == 自报 pid，且 /proc/<pid> 的 uid 与 cmdline 与自报 uid/pkg 一致；
+ *  - REPORT：Zygisk companion（root）代应用上报。pre-specialize 阶段该进程还是
+ *    zygote 的 root 子进程，pid/uid/pkg 是"即将成为目标"的值，天然无法与当前
+ *    身份比对——这是唯一例外，只允许 root 对端，且走独立分支，**不复用**应用
+ *    REQ 的路径，故不会削弱上面的绑定。
+ * 两条通道都在写 uid.map / 切 g_passive_mode / 派发挂载·还原之前完成校验。 */
+
+/* cmdline 首段与包名比对：两侧都剥掉 ":<process>" 后缀（zygote 子进程名与
+   自报包名都可能带后缀）。cmdline 原始缓冲以 NUL 分隔 argv，%s 取到首段。 */
+static bool ipc_pkg_matches_cmdline(const char* cmdline, const char* pkg) {
+    char cmd_base[256];
+    char pkg_base[256];
+    snprintf(cmd_base, sizeof cmd_base, "%s", cmdline);
+    snprintf(pkg_base, sizeof pkg_base, "%s", pkg);
+    char* c = strchr(cmd_base, ':');
+    if (c) *c = '\0';
+    char* p = strchr(pkg_base, ':');
+    if (p) *p = '\0';
+    if (cmd_base[0] == '\0' || pkg_base[0] == '\0') return false;
+    return strcmp(cmd_base, pkg_base) == 0;
+}
+
+/* 非 root 对端（应用自身）的身份绑定。只读 /proc，不改任何状态；失败即拒绝。 */
+static bool ipc_verify_app_identity(pid_t peer_pid, uid_t peer_uid, const char* pkg, int pid,
+                                    int uid) {
+    if (peer_pid <= 0 || peer_uid == (uid_t)-1) {
+        LOG_WRN("IPC: 无法读取对端凭据（SO_PEERCRED），拒绝请求");
+        return false;
+    }
+    if ((uid_t)uid != peer_uid) {
+        LOG_WRN("IPC: 拒绝 uid 不匹配的请求（自报 uid=%d，对端 uid=%u）", uid, (unsigned)peer_uid);
+        return false;
+    }
+    if (peer_pid != (pid_t)pid) {
+        LOG_WRN("IPC: 拒绝 pid 不匹配的请求（自报 pid=%d，对端 pid=%d）", pid, (int)peer_pid);
+        return false;
+    }
+    /* 该 pid 必须确实是自报 uid 的进程：/proc/<pid> 的属主由内核给出，伪造不了 */
+    uid_t real_uid = get_app_uid((pid_t)pid);
+    if (real_uid != peer_uid) {
+        LOG_WRN("IPC: 拒绝 uid 不匹配的请求（自报 uid=%d，/proc/%d uid=%u）", uid, pid,
+                (unsigned)real_uid);
+        return false;
+    }
+    /* 包名必须与进程名一致（或与框架对该 uid 的解析一致——此处取更严格且不依赖
+       uid.map 的 cmdline 口径）。读不到 cmdline 一律按失败处理（fail-closed：
+       宁可拒绝一次合法请求，也不让伪造包名落进 uid.map）。 */
+    char cmdline[256] = {0};
+    if (!proc_get_cmdline((pid_t)pid, cmdline, sizeof cmdline)) {
+        LOG_WRN("IPC: 拒绝无法读取 cmdline 的请求（pid=%d）", pid);
+        return false;
+    }
+    if (!ipc_pkg_matches_cmdline(cmdline, pkg)) {
+        LOG_WRN("IPC: 拒绝包名与进程不符的请求（自报 %s，/proc/%d cmdline=%s）", pkg, pid,
+                cmdline);
+        return false;
+    }
+    return true;
+}
+
 void handle_ipc_client_readable(int client_fd) {
     /* 核心修复：清除 O_NONBLOCK 状态使 Socket 回退至阻塞模式。
      * 唯有如此，内核底层的 SO_RCVTIMEO / SO_SNDTIMEO 500ms 保护逻辑才会真正生效。 */
@@ -275,21 +344,12 @@ void handle_ipc_client_readable(int client_fd) {
     }
     char pkg[256];
     int pid = 0, uid = 0;
-    if (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3 ||
-        sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3) {
-        /* B2：对端鉴权——客户端自报的 pid/uid/pkg 不得直接采信（污染 uid→包名即可
-           让 HIDE/RO 整体失配）。合法发送方只有两类：root（zygisk companion 的
-           REPORT）与**目标应用自身**（模块在应用进程内发 REQ，peer uid 即应用 uid）。
-           故要求对端 uid 为 root 或与自报 uid 相等，否则拒绝。 */
-        uid_t peer_uid = (uid_t)-1;
-        if (nsp_peer_cred(client_fd, NULL, &peer_uid, NULL) != 0) peer_uid = (uid_t)-1;
-        if (peer_uid != 0 && (uid_t)uid != peer_uid) {
-            LOG_WRN("IPC: 拒绝 uid 不匹配的请求（自报 uid=%d，对端 uid=%u）", uid,
-                    (unsigned)peer_uid);
-            send(client_fd, "ERR", 3, MSG_NOSIGNAL);
-            close(client_fd);
-            return;
-        }
+    /* 两个动词 = 两条身份模型不同的通道（见 ipc_verify_app_identity 上方注释）：
+       REPORT 只允许 root companion，REQ 只允许应用自身并通过完整绑定校验。 */
+    bool is_report = (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3);
+    bool is_req = false;
+    if (!is_report) is_req = (sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3);
+    if (is_report || is_req) {
         /* 输入校验：拒绝越界 pid/uid，避免后续 /proc/<pid> 路径被构造用于越权访问 */
         if (pid <= 0 || pid >= 1048576 /* PID_BITMAP_MAX, Android PID 上限 */) {
             LOG_WRN("IPC: 拒绝非法 pid=%d", pid);
@@ -302,6 +362,37 @@ void handle_ipc_client_readable(int client_fd) {
             send(client_fd, "ERR", 3, MSG_NOSIGNAL);
             close(client_fd);
             return;
+        }
+        pid_t peer_pid = -1;
+        uid_t peer_uid = (uid_t)-1;
+        if (nsp_peer_cred(client_fd, &peer_pid, &peer_uid, NULL) != 0) {
+            peer_pid = -1;
+            peer_uid = (uid_t)-1;
+        }
+        if (is_report) {
+            /* root companion 通道：pre-specialize 上报的 pid/uid/pkg 是"即将成为
+               目标"的值，不能要求当前进程身份匹配；root 是唯一合法对端。 */
+            if (peer_uid != 0) {
+                LOG_WRN("IPC: 拒绝非 root 对端的 REPORT（对端 uid=%u）；应用自身请走 REQ",
+                        (unsigned)peer_uid);
+                send(client_fd, "ERR", 3, MSG_NOSIGNAL);
+                close(client_fd);
+                return;
+            }
+        } else {
+            /* 应用自身通道：root 必须走 REPORT（独立通道），非 root 必须通过
+               pid/uid/包名绑定——校验通过前不得写 uid.map、切被动模式或派发。 */
+            if (peer_uid == 0) {
+                LOG_WRN("IPC: 拒绝 root 对端的 REQ（companion 必须走 REPORT 通道）");
+                send(client_fd, "ERR", 3, MSG_NOSIGNAL);
+                close(client_fd);
+                return;
+            }
+            if (!ipc_verify_app_identity(peer_pid, peer_uid, pkg, pid, uid)) {
+                send(client_fd, "ERR", 3, MSG_NOSIGNAL);
+                close(client_fd);
+                return;
+            }
         }
         if (!g_passive_mode) {
             g_passive_mode = true;

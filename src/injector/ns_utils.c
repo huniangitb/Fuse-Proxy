@@ -946,23 +946,32 @@ void handle_async_mount_event(void* ptr) {
     MountTaskCtx* ctx = (MountTaskCtx*)ptr;
     int child_ret = -1;
     ssize_t r = read(ctx->status_pipe_fd, &child_ret, sizeof(child_ret));
+    /* 结果判定与收尸解耦（R9）：子进程先写一整个 int 再 _exit，完成管道里读到
+       完整 status 就是权威结果；waitpid 只负责回收——主循环 reap_zombies
+       （waitpid(-1)）可能已抢先收走该子进程（ECHILD），那**不影响**判定。
+       旧实现在 ECHILD 时走独立分支：即使管道已完整回传非 0 失败码，也只记
+       "结果不可得"就释放任务——不调度重试、不摘追踪、不清理注入标志；被动模式下
+       该应用可能整个生命周期都没有代理视图，列表却仍显示已注入。 */
     int status = 0;
-    /* 返回值必查：主循环 reap_zombies 可能已收走该子进程（ECHILD），此时
-       status 保持初值。r 命中时 child_ret 才是权威判据；r 未命中则必须要求
-       确实取到状态，否则按失败处理（不得把"未知"当成功）。 */
     pid_t w = waitpid(ctx->child_pid, &status, 0);
-    bool know_status = (w == ctx->child_pid);
-    if (r == sizeof(child_ret) && child_ret == 0) {
+    if (w < 0 && errno != ECHILD && errno != EINTR)
+        LOG_WRN("异步挂载 waitpid 失败 pid=%d: %s", ctx->child_pid, strerror(errno));
+    bool have_status = (r == (ssize_t)sizeof(child_ret));
+    if (have_status && child_ret == 0) {
         LOG_DBG("异步挂载成功: App=%s, PID=%d", ctx->pkg_name, ctx->target_pid);
-    } else if (!know_status) {
-        LOG_ERR("异步挂载结果不可得: App=%s, PID=%d, read=%zd（子进程状态已被通用收尸取走）",
-                ctx->pkg_name, ctx->target_pid, r);
-        /* 归入失败路径：见下方既有失败处理 */
-        child_ret = -1;
-        r = -1;
     } else {
-        LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%zd, exit_status=%d", ctx->pkg_name,
-                ctx->target_pid, r, child_ret);
+        /* 失败 / status 缺失(EOF) / 未知：一律按失败收尾（fail-closed——把"未知"
+           当成功会让上层以为挂载已完成）。失败收尾统一走 schedule_retry_mount +
+           remove_tracked，并按目标存活/是否已被其他任务成功挂载做幂等判定，
+           不再与成功分支或收尸结果互斥。 */
+        if (have_status) {
+            LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%d, exit_status=%d", ctx->pkg_name,
+                    ctx->target_pid, child_ret, status);
+        } else {
+            LOG_ERR("异步挂载结果不可得: App=%s, PID=%d, read=%zd（完成管道未回传完整 status，"
+                    "按失败处理）",
+                    ctx->pkg_name, ctx->target_pid, r);
+        }
         /*
          * 只在以下条件满足时才调度重试：
          * 1) 进程仍然存活
@@ -981,15 +990,13 @@ void handle_async_mount_event(void* ptr) {
             /* 加入重试队列并从追踪中移除，确保后续扫描可重新发现并注入 */
             schedule_retry_mount(ctx->pkg_name, ctx->target_pid);
             remove_tracked(ctx->target_pid);
+        } else if (!alive) {
+            LOG_DBG("异步挂载失败，进程已死，不重试: %s(PID:%d)", ctx->pkg_name,
+                    ctx->target_pid);
+            remove_tracked(ctx->target_pid);
         } else {
-            if (!alive) {
-                LOG_DBG("异步挂载失败，进程已死，不重试: %s(PID:%d)", ctx->pkg_name,
-                        ctx->target_pid);
-                remove_tracked(ctx->target_pid);
-            } else {
-                LOG_DBG("异步挂载失败但目标已存在FUSE挂载，不重试: %s(PID:%d)", ctx->pkg_name,
-                        ctx->target_pid);
-            }
+            LOG_DBG("异步挂载失败但目标已存在FUSE挂载，不重试: %s(PID:%d)", ctx->pkg_name,
+                    ctx->target_pid);
         }
     }
     struct CombinedMountArgs* args = (struct CombinedMountArgs*)ctx->mount_args;
