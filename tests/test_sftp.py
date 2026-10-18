@@ -225,6 +225,37 @@ def fuse_phase():
                 fail("FUSE 含空格删除", "远端仍在")
         else:
             fail("FUSE 含空格写入", "远端未见内容")
+        # R3 判别：truncate 必须同步已打开写句柄的本地缓存。
+        # 远端预置 100 字节 → open(O_RDWR) 回灌 → ftruncate(0) → 写 1 字节 →
+        # close。旧实现只按路径发空 STOR、不碰句柄 tmp_fd，close 时按旧
+        # file_end 全量 STOR → 远端复活成 100 字节。旧实现复验：
+        # FTP_MODULE_SO=<用旧后端源码现编的 ftp_module.so>。
+        tf = "nsp_fuse_trunc.bin"
+        tfp = Path(REMOTE) / tf
+        tfp.write_bytes(b"0123456789" * 10)
+        fd = os.open(str(V / tf), os.O_RDWR)
+        try:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, b"x", 0)
+        finally:
+            os.close(fd)
+        got = None
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                got = tfp.read_bytes()
+            except Exception:
+                got = None
+            if got == b"x":
+                break
+            time.sleep(0.2)
+        if got == b"x":
+            ok("FUSE truncate 同步已打开写句柄：远端恰好 1 字节（R3）")
+        else:
+            shown = repr(got[:24]) if got is not None else "<读失败>"
+            n = len(got) if got is not None else 0
+            fail("FUSE truncate 已打开写句柄",
+                 f"远端 {n} 字节 = {shown}（期望 b'x'；旧实现旧尾部复活）")
     finally:
         p.terminate()
         try:

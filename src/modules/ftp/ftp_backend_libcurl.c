@@ -2327,6 +2327,33 @@ static int ftp_backend_upload(FtpBackendFile* f) {
     return rc;
 }
 
+/* 请求流式上传线程停止并 join（追平剩余尾部后退出；乱序/出错时线程已
+   自行退出，join 立即返回）。调用方**不得**持 f_lock。
+   并发收尾（vfs_fsync 与 vfs_flush 同时到达、dup/fork 下多个 close、以及
+   truncate 同步已打开句柄）会同时走到这里：锁内复查 up_started 并把
+   「清标志 + 取 tid」放在同一临界区，保证同一 tid 只被 join 一次——否则
+   后到者对已回收的 tid 再 pthread_join 是 UB（tid 可能被复用，join 到无关
+   线程或永久挂起）。等待期间释放 f_lock，故上传线程仍能推进并广播。 */
+static void ftp_up_stop_and_join(FtpBackendFile* f) {
+    pthread_mutex_lock(&f->f_lock);
+    if (!f->up_started) {
+        pthread_mutex_unlock(&f->f_lock);
+        return;
+    }
+    f->up_stop = true; /* 追平剩余尾部后退出 */
+    pthread_cond_broadcast(&f->up_cond);
+    while (f->up_upto < f->file_end && !f->retransmit && !f->up_error)
+        pthread_cond_wait(&f->up_cond, &f->f_lock);
+    if (!f->up_started) { /* 并发收尾已抢先 join：本线程不再 join 同一 tid */
+        pthread_mutex_unlock(&f->f_lock);
+        return;
+    }
+    f->up_started = false; /* 先清标志再放锁：另一个 join 者立即看到并跳过 */
+    pthread_t tid = f->up_tid;
+    pthread_mutex_unlock(&f->f_lock);
+    pthread_join(tid, NULL);
+}
+
 /* 写模式收尾同步（FLUSH 与 RELEASE 共用）：
    ① 流式上传线程在跑 → 请求追平并 join（乱序/出错时线程已自行退出）；
    ② 仍未追平（乱序改写 / 流式出错 / 线程未起就跑完）→ 全量 STOR 重传覆盖；
@@ -2334,27 +2361,7 @@ static int ftp_backend_upload(FtpBackendFile* f) {
    tmp_fd 保留到 RELEASE：FLUSH 之后仍可从存活的 fd 继续写（dup/fork 场景），
    那些数据由下一次同步（通常是 RELEASE）续传。返回 0 成功，负值 errno 风格。 */
 static int ftp_write_sync(FtpBackendFile* f) {
-    if (f->up_started) {
-        pthread_mutex_lock(&f->f_lock);
-        /* 复查 up_started：两个 FLUSH 并发（vfs_fsync 与 vfs_flush 同时到达，
-           或 dup/fork 下多个 close）时，先到者已 join 并把 up_started 清 false；
-           后到者若不再复查就会对同一 tid 再次 pthread_join → UB（tid 可能已
-           被复用，join 到无关线程或永久挂起）。
-           复查与 up_tid 捕获同临界区：要么本线程拿到 up_started==true 并成为
-           唯一的 join 者，要么直接跳过。 */
-        if (!f->up_started) {
-            pthread_mutex_unlock(&f->f_lock);
-        } else {
-            f->up_stop = true; /* 追平剩余尾部后退出 */
-            pthread_cond_broadcast(&f->up_cond);
-            while (f->up_upto < f->file_end && !f->retransmit && !f->up_error)
-                pthread_cond_wait(&f->up_cond, &f->f_lock);
-            f->up_started = false; /* 先清标志再放锁：另一个 join 者立即看到并跳过 */
-            pthread_t tid = f->up_tid;
-            pthread_mutex_unlock(&f->f_lock);
-            pthread_join(tid, NULL);
-        }
-    }
+    if (f->up_started) ftp_up_stop_and_join(f);
     /* 尾部判定读 up_upto/file_end 等状态：释放 f_lock 前后保持一致快照——
        撕裂读会跳过最后一次全量重传，尾部数据不落远端。故在同一临界区内取快照 */
     pthread_mutex_lock(&f->f_lock);
@@ -2713,46 +2720,137 @@ int ftp_backend_rename(const char* from, const char* to) {
     return 0;
 }
 
-int ftp_backend_truncate(const char* path, off_t size) {
-    (void)path;
-    (void)size;
-    // libcurl 不支持直接 TRUNCATE
-    // 简单实现：下载原始文件，截断后重新上传
-    // 暂时用 STOR 空文件模拟 size=0
-    if (size == 0) {
-        FtpBackend* bk = ftp_backend_find(path);
-        if (!bk) return -ENOENT;
-        if (backend_ready(bk) != 0) return -EIO;
+/* ============ R3：truncate 与已打开写句柄的一致性 ============
 
-        char url[2048];
-        build_url(bk, path, url, sizeof url);
-        if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
+   远端文件被 truncate 时，**同路径已打开的写句柄**的本地缓存（tmp_fd）与
+   流式上传状态必须一起归零。旧实现只按路径发一次空 STOR，完全不碰句柄：
+     ① open(O_RDWR) 回灌后 file_end/up_upto = 旧长度；
+     ② ftruncate 只清远端，tmp_fd 仍是旧长度；
+     ③ 随后的 pwrite 落在旧缓冲上（off < up_upto → retransmit）；
+     ④ close 时按旧 file_end 全量 STOR → 旧尾部复活（文件没被截断）。
+   POSIX 的截断作用于 inode 而非某个 fd，故必须同步**所有**已打开写句柄。
 
-        struct ReadBuf rb = {"", 0, 0};
-        CURL* c = ftp_easy_new(&bk->cfg);
-        if (!c) return -EIO;
-        curl_easy_setopt(c, CURLOPT_URL, url);
-        curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
-        curl_easy_setopt(c, CURLOPT_INFILESIZE, 0L);
-        curl_easy_setopt(c, CURLOPT_READFUNCTION, read_cb);
-        curl_easy_setopt(c, CURLOPT_READDATA, &rb);
+   顺序（不能颠倒）：
+   ① 快照同路径写句柄（表锁内 +1 在途引用）并停住各自的上传线程——在途 APPE
+      必须先落地，否则它会把旧数据追加到本次截断**之后**；
+   ② 远端发空 STOR（截断的唯一协议手段）；
+   ③ 各句柄 ftruncate(tmp_fd,0) 并复位 file_end/up_upto/up_first/uploaded/
+      retransmit/up_error/up_stop。
+   句柄生命周期沿用 ftp_handle_get/put 的 refs 约定：扫描在 g_handles_mutex
+   内完成，join 与网络 I/O 一律在锁外（绝不持表锁做阻塞操作），最后归还引用
+   （release 已置 dead 时由最后一个 put 拆除，故整个过程中 f 不会 UAF）。 */
 
-        CURLcode res = backend_perform(bk, c);
-        long resp = 0;
-        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp); /* 须在 cleanup 前取 */
-        curl_easy_cleanup(c);
-        if (res != CURLE_OK) {
-            /* 服务器应答过的（550 等）是业务失败：不计熔断不重建；仅后端
-               不可达计入（分类见 res_is_unavailable） */
-            reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
-            return -EIO;
-        }
-        ftp_stat_cache_clear(bk); /* STOR 空文件截断成功：整表失效 */
-        ftp_list_cache_clear(bk); /* 目录条目大小随之变化：LIST 缓存一并失效，
-                                     否则后续列举会把旧 size 回灌进 stat 缓存 */
-        return 0;
+struct FtpTruncHandles {
+    FtpBackendFile* h[FTP_HANDLE_MAX];
+    uint64_t id[FTP_HANDLE_MAX];
+    int n;
+};
+
+/* 快照：同后端、同远端 URL 的写模式句柄（含在途引用）。 */
+static void ftp_trunc_collect(FtpBackend* bk, const char* url, struct FtpTruncHandles* t) {
+    t->n = 0;
+    pthread_mutex_lock(&g_handles_mutex);
+    for (int i = 1; i < FTP_HANDLE_MAX; i++) {
+        FtpBackendFile* f = g_handles[i];
+        if (!f || !f->writing || f->tmp_fd < 0) continue;
+        /* 只认同一个后端实例：不同 server 的 URL 可能字面相同（配置重叠），
+           而截断只影响本 server 上的文件 */
+        if (f->bk != bk || strcmp(f->ftp_path, url) != 0) continue;
+        atomic_fetch_add_explicit(&f->refs, 1, memory_order_acq_rel);
+        t->h[t->n] = f;
+        t->id[t->n] = (uint64_t)i;
+        t->n++;
     }
-    return -EIO; // 非零截断暂不支持
+    pthread_mutex_unlock(&g_handles_mutex);
+}
+
+/* ③ 本地缓存与流式状态归零（远端此刻已空）。成功后 uploaded=true：
+   本地与远端一致，收尾（FLUSH/RELEASE）无需再传。最后归还全部在途引用。 */
+static int ftp_trunc_zero_local(struct FtpTruncHandles* t) {
+    int rc = 0;
+    for (int i = 0; i < t->n; i++) {
+        FtpBackendFile* f = t->h[i];
+        pthread_mutex_lock(&f->f_lock);
+        if (f->tmp_fd >= 0 && ftruncate(f->tmp_fd, 0) == 0) {
+            f->file_end = 0;
+            f->up_upto = 0;
+            f->up_first = true;  /* 远端已空：下一块用 STOR 重建（同 open 新建） */
+            f->uploaded = true;  /* 本地已空 == 远端已空 */
+            f->retransmit = false;
+            f->up_error = false;
+            f->up_stop = false;
+        } else {
+            /* 本地缓存截断失败：远端已空而本地仍是旧内容。绝不能标 uploaded
+               （否则收尾零开销早退、旧尾部在下次写时复活），置错误让收尾走
+               全量重传，并把失败如实上报。 */
+            f->uploaded = false;
+            f->up_error = true;
+            rc = -EIO;
+        }
+        pthread_cond_broadcast(&f->up_cond);
+        pthread_mutex_unlock(&f->f_lock);
+        ftp_handle_put(t->id[i], f);
+        t->h[i] = NULL;
+    }
+    t->n = 0;
+    return rc;
+}
+
+/* 未走到 ③ 的出口（远端 STOR 失败等）：只归还引用，不动本地缓存
+   （远端仍是旧内容，本地缓存与之一致）。 */
+static void ftp_trunc_put_all(struct FtpTruncHandles* t) {
+    for (int i = 0; i < t->n; i++) {
+        if (t->h[i]) ftp_handle_put(t->id[i], t->h[i]);
+        t->h[i] = NULL;
+    }
+    t->n = 0;
+}
+
+int ftp_backend_truncate(const char* path, off_t size) {
+    // libcurl 不支持直接 TRUNCATE：size=0 用 STOR 空文件模拟；非零暂不支持
+    if (size != 0) return -EIO; // 非零截断暂不支持
+
+    FtpBackend* bk = ftp_backend_find(path);
+    if (!bk) return -ENOENT;
+    if (backend_ready(bk) != 0) return -EIO;
+
+    char url[2048];
+    build_url(bk, path, url, sizeof url);
+    if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
+
+    /* R3：先停住同路径写句柄的上传线程（在途 APPE 先落地），再清远端，
+       最后把本地缓存一并截断——见上方注释。 */
+    struct FtpTruncHandles th;
+    ftp_trunc_collect(bk, url, &th);
+    for (int i = 0; i < th.n; i++) ftp_up_stop_and_join(th.h[i]);
+
+    struct ReadBuf rb = {"", 0, 0};
+    CURL* c = ftp_easy_new(&bk->cfg);
+    if (!c) {
+        ftp_trunc_put_all(&th);
+        return -EIO;
+    }
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(c, CURLOPT_INFILESIZE, 0L);
+    curl_easy_setopt(c, CURLOPT_READFUNCTION, read_cb);
+    curl_easy_setopt(c, CURLOPT_READDATA, &rb);
+
+    CURLcode res = backend_perform(bk, c);
+    long resp = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp); /* 须在 cleanup 前取 */
+    curl_easy_cleanup(c);
+    if (res != CURLE_OK) {
+        /* 服务器应答过的（550 等）是业务失败：不计熔断不重建；仅后端
+           不可达计入（分类见 res_is_unavailable） */
+        reset_curl(bk, res_is_unavailable(&bk->cfg, res, resp));
+        ftp_trunc_put_all(&th); /* 远端未变：本地缓存保持原样 */
+        return -EIO;
+    }
+    ftp_stat_cache_clear(bk); /* STOR 空文件截断成功：整表失效 */
+    ftp_list_cache_clear(bk); /* 目录条目大小随之变化：LIST 缓存一并失效，
+                                 否则后续列举会把旧 size 回灌进 stat 缓存 */
+    return ftp_trunc_zero_local(&th);
 }
 
 /* ================= 模块注册接口 =================
