@@ -86,7 +86,17 @@ NspIniStore* nsp_ini_open(const char* path) {
         return NULL;
     }
     FILE* fp = fopen(path, "r");
-    if (!fp) return s; /* 文件不存在 = 空存储 */
+    if (!fp) {
+        /* 只有 ENOENT 才是「空存储」；其余（EACCES/EMFILE/ENFILE/EIO…）是
+           **读失败**：若当成空配置继续，调用方随后的 nsp_ini_save 会用只含
+           本次条目的内容原子覆盖整份文件（review R12，与 A10 的 NULL 二义同型）。
+           保留 errno 供调用方报出确切原因。 */
+        if (errno == ENOENT) return s;
+        int saved = errno;
+        nsp_ini_close(s);
+        errno = saved;
+        return NULL;
+    }
     char* line = NULL;
     size_t llen = 0;
     ssize_t n;
@@ -98,10 +108,18 @@ NspIniStore* nsp_ini_open(const char* path) {
             break;
         }
     }
+    /* 读到一半失败（EIO 等）同样是读失败：半份内容不可当成完整配置回写 */
+    int read_errno = ferror(fp) ? (errno ? errno : EIO) : 0;
     free(line);
     fclose(fp);
     if (!ok) {
         nsp_ini_close(s);
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (read_errno) {
+        nsp_ini_close(s);
+        errno = read_errno;
         return NULL;
     }
     return s;

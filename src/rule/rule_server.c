@@ -1621,7 +1621,32 @@ typedef struct {
     NspRuleScope scope;  /* sec_name == NULL 表示整文件 */
 } RuleTarget;
 
-static void resolve_rule_target(const char* pkg, int uid, RuleTarget* t) {
+/* 目标路径必须落在配置根内（defense in depth）：valid_pkg 已禁 `/` 与 `..`，
+   这里再按 realpath 校验一次，防止 App-rules 目录被替换成指向根外的符号链接、
+   或将来校验放宽后重新出现 `../` 拼接。目标文件可能尚不存在，故对父目录取
+   realpath；父目录不存在时没有可穿越的链接，按词法结论放行（保持「未找到」
+   而非「越界」的语义）。 */
+static bool path_within_config_dir(const char* path) {
+    size_t blen = strlen(g_config_dir);
+    if (!path || strncmp(path, g_config_dir, blen) != 0) return false;
+    if (path[blen] != '/' && path[blen] != '\0') return false;
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof dir, "%s", path);
+    if (n < 0 || (size_t)n >= sizeof dir) return false;
+    char* slash = strrchr(dir, '/');
+    if (!slash) return false;
+    *slash = '\0';
+    char real_dir[PATH_MAX], real_base[PATH_MAX];
+    if (!realpath(dir, real_dir)) return true; /* 父目录不存在：无可穿越链接 */
+    if (!realpath(g_config_dir, real_base)) return true;
+    size_t rlen = strlen(real_base);
+    if (strncmp(real_dir, real_base, rlen) != 0) return false;
+    return real_dir[rlen] == '\0' || real_dir[rlen] == '/';
+}
+
+/* 解析目标文件与作用域；返回 false 表示拼接结果越出配置根（拒绝操作）。
+   调用方必须先通过 valid_pkg——这里的 realpath 校验只是纵深防御。 */
+static bool resolve_rule_target(const char* pkg, int uid, RuleTarget* t) {
     memset(t, 0, sizeof *t);
     t->scope.sec_match = NSP_RULE_SEC_EXACT;
     if (!pkg || strcasecmp(pkg, "GLOBAL") == 0) {
@@ -1629,16 +1654,15 @@ static void resolve_rule_target(const char* pkg, int uid, RuleTarget* t) {
         snprintf(t->sec, sizeof(t->sec), "GLOBAL");
         t->scope.sec_name = t->sec;
         t->scope.sec_match = NSP_RULE_SEC_PREFIX;
-        return;
-    }
-    if (nsp_rule_file_is_category_pkg(pkg)) {
+    } else if (nsp_rule_file_is_category_pkg(pkg)) {
         main_conf_path(t->path, sizeof(t->path));
         nsp_rule_file_category_name(pkg, uid, t->sec, sizeof(t->sec));
         t->scope.sec_name = t->sec;
-        return;
+    } else {
+        nsp_rule_file_app_active_path(g_config_dir, uid, pkg, t->path, sizeof(t->path));
+        t->scope.sec_name = NULL;
     }
-    nsp_rule_file_app_active_path(g_config_dir, uid, pkg, t->path, sizeof(t->path));
-    t->scope.sec_name = NULL;
+    return path_within_config_dir(t->path);
 }
 
 /* REMOVE：按 (类型, 索引) 删除规则行（索引与 LIST 输出一致，含已停用行） */
@@ -1665,13 +1689,19 @@ static void handle_remove(int fd, json_object* req) {
         reply_error(fd, "REMOVE", "索引必须 >= 0");
         return;
     }
-    if (!is_switch_type(t) && strcmp(pkg, "GLOBAL") != 0 && !nsp_rule_file_is_category_pkg(pkg) &&
+    /* 包名合法性检查与类型无关：GLOBAL / 类别段是合法特殊值，其余一律走
+       valid_pkg。此前开关类型（MONITOR/SANDBOX/…）短路了这道检查，pkg 可含
+       `../` 经 App-rules/<pkg>.conf 越出配置根删除任意 .conf（review R6）。 */
+    if (strcasecmp(pkg, "GLOBAL") != 0 && !nsp_rule_file_is_category_pkg(pkg) &&
         !valid_pkg(pkg)) {
         reply_error(fd, "REMOVE", "非法包名: %s", pkg);
         return;
     }
     RuleTarget tgt;
-    resolve_rule_target(pkg, uid, &tgt);
+    if (!resolve_rule_target(pkg, uid, &tgt)) {
+        reply_error(fd, "REMOVE", "目标路径越出配置根: %s", pkg);
+        return;
+    }
     /* 索引计入已停用行，且限定在该段内（与 GET 展示索引一致） */
     char removed[MAX_LINE];
     int rc = nsp_rule_file_remove_nth_scoped(tgt.path, &tgt.scope, rule_type_name(t), index, removed,
@@ -1724,7 +1754,10 @@ static void handle_toggle(int fd, json_object* req, bool enable) {
         return;
     }
     RuleTarget tgt;
-    resolve_rule_target(pkg, uid, &tgt);
+    if (!resolve_rule_target(pkg, uid, &tgt)) {
+        reply_error(fd, cmd, "目标路径越出配置根: %s", pkg);
+        return;
+    }
     /* 加锁事务：读-改-写全程持目录 flock，且在**段内**按索引定位（与 GET 一致）。
        此前在调用侧自行「读全文→改一行→覆盖写」既不持锁（并发 ADD 会被旧快照
        覆盖，§A6），索引又是整文件全局序号（会改错类别段的行，§A5）。 */
@@ -2424,7 +2457,12 @@ static void modconf_apply(ConfSection* cs, const char* rest, const char* val) {
     if (!dot) return;
     size_t klen = (size_t)(dot - rest);
     if (klen == 0 || klen >= sizeof(cs->cf_key)) return;
-    if (cs->cf_key[0] && strncasecmp(cs->cf_key, rest, klen) != 0) modconf_field_commit(cs);
+    /* 字段名必须**精确**相等：此前只比较较短的一方（strncasecmp(cs->cf_key,
+       rest, klen)），先声明 token_secret 再声明 token 会被当成同一字段，后者
+       的属性覆盖前者 → 敏感标记丢失、GET 明文回读（review R7）。 */
+    bool same_field = cs->cf_key[0] && strlen(cs->cf_key) == klen &&
+                      strncasecmp(cs->cf_key, rest, klen) == 0;
+    if (cs->cf_key[0] && !same_field) modconf_field_commit(cs);
     if (!cs->cf_key[0]) {
         memcpy(cs->cf_key, rest, klen);
         cs->cf_key[klen] = '\0';
@@ -2503,14 +2541,49 @@ static void modconf_apply(ConfSection* cs, const char* rest, const char* val) {
     /* 未知属性忽略（向前兼容） */
 }
 
+/* 复位全部累积槽：不复位会让 type/max/sensitive/default/enum/desc 串到下一个
+   字段（表现：key_file 继承 proto 的 enum、password 的 sensitive 等）。
+   提交成功与「拒绝提交」两条路径都必须调用，否则被拒字段的属性会污染下一个。 */
+static void modconf_slot_reset(ConfSection* cs) {
+    cs->cf_key[0] = '\0';
+    cs->cf_type[0] = '\0';
+    cs->cf_maxlen = 0;
+    cs->cf_min = 0;
+    cs->cf_max = 0;
+    cs->cf_has_range = false;
+    cs->cf_required = false;
+    cs->cf_sensitive = false;
+    cs->cf_defval[0] = '\0';
+    cs->cf_cond_dep[0] = '\0';
+    cs->cf_cond_val[0] = '\0';
+    cs->cf_cond_defval[0] = '\0';
+    cs->cf_has_cond = false;
+    cs->cf_enum_count = 0;
+    cs->cf_order = 0;
+    cs->cf_desc_count = 0;
+}
+
 /* 把一个累完整的字段落进全局 schema 表 */
 static void modconf_field_commit(ConfSection* cs) {
     if (!cs->cf_key[0]) return;
     ModConfSchema* sc = modconf_for(cs->cf_module);
-    if (!sc) return;
+    if (!sc) {
+        modconf_slot_reset(cs);
+        return;
+    }
+    /* 同一字段名被不连续地声明两次（conf.a.type … conf.b.type … conf.a.maxlen）：
+       显式拒绝后一份，不静默追加第二个同名字段——GET/写入都按名查找，第二个
+       永不生效，且会把前一份属性悄悄覆盖掉（review R7 的脆弱累积语义）。 */
+    for (int i = 0; i < sc->count; i++) {
+        if (strcasecmp(sc->fields[i].key, cs->cf_key) == 0) {
+            LOG("模块配置 schema 字段重复声明，忽略: %s/%s", cs->cf_module, cs->cf_key);
+            modconf_slot_reset(cs);
+            return;
+        }
+    }
     if (sc->count >= MODCONF_MAX_FIELDS) {
         LOG("模块配置 schema 字段超上限 %d，忽略 %s", MODCONF_MAX_FIELDS, cs->cf_key);
-        cs->cf_key[0] = '\0';
+        modconf_slot_reset(cs);
         return;
     }
     ModConfField* f = &sc->fields[sc->count++];
@@ -2533,24 +2606,7 @@ static void modconf_field_commit(ConfSection* cs) {
     f->order = cs->cf_order;
     memcpy(f->descs, cs->cf_descs, sizeof cs->cf_descs);
     f->desc_count = cs->cf_desc_count;
-    /* 复位全部累积槽：不复位会让 type/max/sensitive/default/enum/desc 串到下一个
-       字段（表现：key_file 继承 proto 的 enum、password 的 sensitive 等） */
-    cs->cf_key[0] = '\0';
-    cs->cf_type[0] = '\0';
-    cs->cf_maxlen = 0;
-    cs->cf_min = 0;
-    cs->cf_max = 0;
-    cs->cf_has_range = false;
-    cs->cf_required = false;
-    cs->cf_sensitive = false;
-    cs->cf_defval[0] = '\0';
-    cs->cf_cond_dep[0] = '\0';
-    cs->cf_cond_val[0] = '\0';
-    cs->cf_cond_defval[0] = '\0';
-    cs->cf_has_cond = false;
-    cs->cf_enum_count = 0;
-    cs->cf_order = 0;
-    cs->cf_desc_count = 0;
+    modconf_slot_reset(cs);
 }
 
 /* [conf] 段结束：提交最后一个字段并标记已加载 */
@@ -2608,6 +2664,13 @@ static int module_conf_ensure_dir(const char* module) {
     return mkdir_recursive(dir);
 }
 
+/* nsp_ini_open 返回 NULL 的两种原因（分配失败 / **读失败**，非 ENOENT）都必须
+   拒绝请求：把读失败当空配置继续，随后的 nsp_ini_save 会用只含本次条目的内容
+   覆盖整份配置（review R12）。errno 由 nsp_ini_open 保留，这里直接报因。 */
+static void module_conf_open_error(int fd, const char* cmd, const char* path) {
+    reply_error(fd, cmd, "读取 %s 失败: %s", path, strerror(errno));
+}
+
 /* 写前确保模块目录存在（模块可能尚未部署，首次 FTP_ADD 时目录还不存在）。
    目录 0755：里面只有 .so 与 .conf，无敏感目录遍历面。 */
 /* 去首尾空白拷入定长缓冲；超长返回 -1 */
@@ -2649,9 +2712,27 @@ static bool ftp_valid_field(const char* v, size_t max) {
 static bool modconf_enum_hit(const ModConfField* f, const char* val);
 static bool modconf_enum_hit(const ModConfField* f, const char* val); /* 定义在下方 */
 
-/* bool 取值归一：接受 on/off/true/false/1/0（写入侧同一口径） */
+/* bool 词法解析：只认 on/off/true/false/1/0（大小写不敏感）——与模块侧
+   ftp_conf.c 的 host_key_check 解析同一口径（on/true/1 → true，off/false/0 →
+   false）。返回 false = 非法值：调用方必须整体拒绝，绝不能落盘后让模块整段作废。 */
+static bool modconf_bool_parse(const char* v, bool* out_on) {
+    if (!v) return false;
+    if (strcasecmp(v, "on") == 0 || strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0) {
+        *out_on = true;
+        return true;
+    }
+    if (strcasecmp(v, "off") == 0 || strcasecmp(v, "false") == 0 || strcmp(v, "0") == 0) {
+        *out_on = false;
+        return true;
+    }
+    return false;
+}
+
+/* bool 渲染：合法值按词法解析；历史文件里的非法值按 false 渲染——旧实现
+   「非 off/false/0 即 true」会把 garbage 显示成已开启（review R13）。 */
 static bool modconf_enum_hit_bool(const char* v) {
-    return !(strcasecmp(v, "off") == 0 || strcasecmp(v, "false") == 0 || strcmp(v, "0") == 0);
+    bool on = false;
+    return modconf_bool_parse(v, &on) ? on : false;
 }
 
 /* 解析键名：查 schema 并把**规范化后的键名**（`pass` → `password`）写入 out_key。
@@ -2692,9 +2773,29 @@ static bool module_conf_validate_value(const ModConfField* f, const char* key, c
         }
         return true;
     }
+    if (strcasecmp(f->type, "bool") == 0) {
+        /* bool 必须有词法校验：旧实现落到通用字符串分支，garbage/2 照收，
+           GET 渲染成 true、模块侧却整段作废（review R13）。 */
+        bool on = false;
+        if (!modconf_bool_parse(value, &on)) {
+            snprintf(err, err_sz, "字段值非法（须为 on/off/true/false/1/0）: %s", key);
+            return false;
+        }
+        return true;
+    }
     if (!ftp_valid_field(value, f->maxlen ? f->maxlen : FTP_RDIR_MAX)) {
         snprintf(err, err_sz, "字段值非法或超长: %s", key);
         return false;
+    }
+    if (strcasecmp(f->type, "path") == 0) {
+        /* path 与 string 的差异：值必须非空（空值在上层已按删键/跳过处理）且
+           不含控制字符——制表符等会被原样写进配置行，模块读到的路径与显示不一致。 */
+        for (const char* p = value; *p; p++) {
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f) {
+                snprintf(err, err_sz, "字段值含控制字符: %s", key);
+                return false;
+            }
+        }
     }
     if (f->enum_count > 0 && !modconf_enum_hit(f, value)) {
         char opts[128] = {0};
@@ -2708,11 +2809,19 @@ static bool module_conf_validate_value(const ModConfField* f, const char* key, c
     return true;
 }
 
-/* 值归一：int 写规范十进制（"021" → "21"），其余原样——ADD 与 SET 共用，
-   免得同一个值经两条路径落盘成两种写法。 */
+/* 值归一：int 写规范十进制（"021" → "21"），bool 归一为 on/off（true/1 →
+   on、false/0 → off），其余原样——ADD 与 SET 共用，免得同一个值经两条路径
+   落盘成两种写法；bool 归一后与模块侧 ftp_conf 的解析口径逐字一致。 */
 static void modconf_canon_value(const ModConfField* f, const char* in, char* out, size_t sz) {
-    if (strcasecmp(f->type, "int") == 0) snprintf(out, sz, "%d", atoi(in));
-    else snprintf(out, sz, "%s", in);
+    if (strcasecmp(f->type, "int") == 0) {
+        snprintf(out, sz, "%d", atoi(in));
+    } else if (strcasecmp(f->type, "bool") == 0) {
+        bool on = false;
+        modconf_bool_parse(in, &on);
+        snprintf(out, sz, "%s", on ? "on" : "off");
+    } else {
+        snprintf(out, sz, "%s", in);
+    }
 }
 
 /* 取某字段在某段里的**生效缺省**：命中条件缺省则用它，否则用 defval。
@@ -2857,7 +2966,7 @@ static void module_conf_list(int fd, const char* module, const char* cmd) {
     module_conf_path(path, sizeof(path), module);
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
-        reply_error(fd, cmd, "内存不足");
+        module_conf_open_error(fd, cmd, path);
         return;
     }
     json_object* data = json_object_new_object();
@@ -2885,7 +2994,7 @@ static void module_conf_get(int fd, json_object* req, const char* module, const 
     module_conf_path(path, sizeof(path), module);
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
-        reply_error(fd, cmd, "内存不足");
+        module_conf_open_error(fd, cmd, path);
         return;
     }
     char trimmed[FTP_NAME_MAX + 1];
@@ -2975,6 +3084,14 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
     int nf = 0;
     char verr[256];
     json_object* fobj = json_object_object_get(req, "fields");
+    /* fields 为 null = 未提供（走散字段拾取）；其余非 object 一律整体拒绝：
+       json_object_object_foreach 会对非 object 强转解引用，string/array/number
+       会让 rule_server 直接 SIGSEGV（review R5）。 */
+    if (fobj && json_object_is_type(fobj, json_type_null)) fobj = NULL;
+    if (fobj && !json_object_is_type(fobj, json_type_object)) {
+        reply_error(fd, cmd, "fields 必须是 JSON 对象");
+        return;
+    }
     if (fobj) {
         json_object_object_foreach(fobj, fk, fv) {
             if (nf >= MODCONF_MAX_FIELDS) {
@@ -3015,7 +3132,7 @@ static void module_conf_add(int fd, json_object* req, const char* module, const 
     }
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
-        reply_error(fd, cmd, "内存不足");
+        module_conf_open_error(fd, cmd, path);
         return;
     }
     char trimmed[FTP_NAME_MAX + 1];
@@ -3105,6 +3222,14 @@ static void module_conf_set(int fd, json_object* req, const char* module, const 
     bool single = false;
     char verr[256];
     json_object* fobj = json_object_object_get(req, "fields");
+    /* fields 为 null = 未提供（走散字段拾取）；其余非 object 一律整体拒绝：
+       json_object_object_foreach 会对非 object 强转解引用，string/array/number
+       会让 rule_server 直接 SIGSEGV（review R5）。 */
+    if (fobj && json_object_is_type(fobj, json_type_null)) fobj = NULL;
+    if (fobj && !json_object_is_type(fobj, json_type_object)) {
+        reply_error(fd, cmd, "fields 必须是 JSON 对象");
+        return;
+    }
     if (fobj) {
         json_object_object_foreach(fobj, fk, fv) {
             if (nf >= MODCONF_MAX_FIELDS) {
@@ -3144,7 +3269,7 @@ static void module_conf_set(int fd, json_object* req, const char* module, const 
     }
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
-        reply_error(fd, cmd, "内存不足");
+        module_conf_open_error(fd, cmd, path);
         return;
     }
     char trimmed[FTP_NAME_MAX + 1];
@@ -3210,7 +3335,7 @@ static void module_conf_remove(int fd, json_object* req, const char* module, con
     }
     NspIniStore* s = nsp_ini_open(path);
     if (!s) {
-        reply_error(fd, cmd, "内存不足");
+        module_conf_open_error(fd, cmd, path);
         return;
     }
     char trimmed[FTP_NAME_MAX + 1];
