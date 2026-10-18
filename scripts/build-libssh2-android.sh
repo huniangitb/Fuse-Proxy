@@ -24,17 +24,43 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
-OUT_ARG="${1:-$HOME/.cache/fuse-proxy-android/sftp}"
+# 显式传空串也要能识别：":-" 形式会把空串当未提供而落回默认，危险路径检查就失效
+OUT_ARG="${1-$HOME/.cache/fuse-proxy-android/sftp}"
+
+# ── 输出目录白名单（必须在任何 mkdir / rm -rf 之前）─────────────────────────
+# 脚本末尾会对输出目录执行 rm -rf。rm 只保护 /（--preserve-root），不保护
+# $HOME、用户数据目录或项目根——参数传错一次就是整个目录被删。故先校验再动手：
+#   1) 非空、非 /、非 $HOME、非项目根（规范化后再查一次，防 .. 绕过）；
+#   2) 最后一级含可识别前缀（sftp / fuse-proxy-android），挡住误传 $HOME/xxx；
+#   3) 仍拒绝项目源码树内（meson 的 cmake 子项目会忽略其中的 include 路径）。
+out_reject() {
+  echo "error: 拒绝危险的输出目录：$1" >&2
+  echo "       $2" >&2
+  echo "       本脚本会对输出目录执行 rm -rf；请显式指定专属目录，例如：" >&2
+  echo "       scripts/build-libssh2-android.sh \"\$HOME/.cache/fuse-proxy-android/sftp\"" >&2
+  exit 1
+}
+[ -n "$OUT_ARG" ] || out_reject "(空)" "输出目录不能为空。"
+[ "$OUT_ARG" != "/" ] || out_reject "$OUT_ARG" "不能是根目录。"
+[ "$OUT_ARG" != "$HOME" ] || out_reject "$OUT_ARG" "不能是 HOME 本身。"
+[ "$OUT_ARG" != "$ROOT" ] || out_reject "$OUT_ARG" "不能是项目根。"
+out_base="$(basename "$OUT_ARG")"
+case "$out_base" in
+  *sftp* | *fuse-proxy-android*) : ;;
+  *) out_reject "$OUT_ARG" "最后一级须含 sftp 或 fuse-proxy-android（实际：$out_base）。" ;;
+esac
 mkdir -p "$(dirname "$OUT_ARG")"
 OUT="$(cd "$(dirname "$OUT_ARG")" && pwd)/$(basename "$OUT_ARG")"
+# 规范化后再校验一次：.. 等写法可能把最终路径落回危险位置
+[ "$OUT" != "/" ] || out_reject "$OUT" "规范化后是根目录。"
+[ "$OUT" != "$HOME" ] || out_reject "$OUT" "规范化后是 HOME。"
+[ "$OUT" != "$ROOT" ] || out_reject "$OUT" "规范化后是项目根。"
 # 预构建**不能落在项目源码树内**：meson 的 cmake 子项目转换会把「根项目内、子项目
 # 外」的 include 路径判为不可用并静默忽略，症状是 curl 编译到 libssh2.h 才报
 # file not found（错误指不到真因）。meson.build 侧也有同样的守卫。
 case "$OUT/" in
   "$ROOT"/*)
-    echo "error: 输出目录不能位于项目源码树内（$OUT）。" >&2
-    echo "       meson 的 cmake 子项目会忽略源码树内、子项目外的 include 路径。" >&2
-    exit 1;;
+    out_reject "$OUT" "输出目录不能位于项目源码树内：meson 的 cmake 子项目会忽略源码树内、子项目外的 include 路径。";;
 esac
 API="${ANDROID_API:-29}"
 MBEDTLS_TAG="${MBEDTLS_TAG:-v3.6.2}"
