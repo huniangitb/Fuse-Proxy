@@ -106,7 +106,10 @@ static void vfs_defer_close(int fd) { fdq_defer(&g_pending_closes, fd); }
 static void vfs_flush_pending_closes(void) { fdq_flush(&g_pending_closes); }
 
 static int recursive_rmdir(const char* path);
-static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid);
+/* *created（可为 NULL）只在本次调用**成功创建** dst 时置 true：调用方据此
+   只清理自己创建的临时产物，绝不碰别人的同名对象 */
+static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid,
+                              bool* created);
 /* FSYNC 与 FLUSH 共用的后端数据收尾（定义在 vfs_inval_path 之后） */
 static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path);
 
@@ -1856,10 +1859,12 @@ static int recursive_rmdir(const char* path) {
     return r;
 }
 
-static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid) {
+static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid,
+                              bool* created) {
     struct stat st;
     if (lstat(src, &st) != 0) return -errno;
     if (mkdir(dst, st.st_mode & 07777) != 0) return -errno;
+    if (created) *created = true; /* dst 是本次创建的：失败清理只许碰它 */
     lchown(dst, st.st_uid, st.st_gid);
     DIR* d = opendir(src);
     if (!d) return -errno;
@@ -1878,12 +1883,16 @@ static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t
             break;
         }
         if (S_ISDIR(s_st.st_mode)) {
-            r = recursive_copy_dir(s_path, d_path, uid, gid);
+            r = recursive_copy_dir(s_path, d_path, uid, gid, NULL);
         } else if (S_ISREG(s_st.st_mode)) {
             int fd_src = open(s_path, O_RDONLY | O_CLOEXEC);
             if (fd_src >= 0) {
-                int fd_dst =
-                    open(d_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, s_st.st_mode & 0777);
+                /* 目标位于本次新建的临时树内，正常情况**不存在**：O_EXCL 让
+                   任何预置对象（符号链接/同名文件）以 EEXIST 失败闭合，绝不
+                   跟随链接或覆盖——临时目录可能继承源目录的 0777，攻击者可
+                   在其内预置条目（R2 同族）。 */
+                int fd_dst = open(d_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                                  s_st.st_mode & 0777);
                 if (fd_dst >= 0) {
                     char buf[16384];
                     ssize_t r_len;
@@ -1953,7 +1962,12 @@ static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t
 static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* st) {
     int fd_src = open(src, O_RDONLY | O_CLOEXEC);
     if (fd_src < 0) return -errno;
-    int fd_dst = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st->st_mode & 0777);
+    /* 临时名由 xdev_temp_name 生成（不可预测），但目标父目录可能对普通应用
+       可写：创建必须原子且失败闭合——O_EXCL 拒绝任何既有对象（含符号链接），
+       O_NOFOLLOW 再堵一层；**绝不 O_TRUNC**（旧实现会跟随攻击者预置的同名
+       符号链接，以 root 把源内容写进任意可写文件，R2）。 */
+    int fd_dst =
+        open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, st->st_mode & 0777);
     if (fd_dst < 0) {
         int err = errno;
         close(fd_src);
@@ -1999,6 +2013,24 @@ static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* s
         unlink(dst);
         return copy_err;
     }
+    return 0;
+}
+
+/* 跨设备搬移的临时名：必须与目标**同父目录**（rename(2) 才能原子就位），
+   且不可预测。目标父目录可能对普通应用可写，可预测名（旧实现是
+   "<p_to>.nsp_xdev_<pid>"）等于给攻击者一个预置符号链接/文件的窗口：root
+   daemon 会跟随链接把源内容写进任意可写文件（R2）。
+   这里借 mkstemp 的随机后缀只生成**名字**，占位文件立即删除；真正的创建由
+   mkdir / open(O_EXCL|O_NOFOLLOW) / symlink 原子完成——任何预置对象都会以
+   EEXIST 失败闭合，绝不会被跟随或复用（即使攻击者赢下 unlink→创建之间的
+   竞态，结果也只是本次搬移失败）。返回 0 或负 errno。 */
+static int xdev_temp_name(const char* p_to, char* out, size_t outsz) {
+    int n = snprintf(out, outsz, "%s.nsp_xdev_XXXXXX", p_to);
+    if (n < 0 || (size_t)n >= outsz) return -ENAMETOOLONG;
+    int fd = mkstemp(out); /* 就地写入随机后缀 */
+    if (fd < 0) return -errno;
+    close(fd);
+    if (unlink(out) != 0) return -errno;
     return 0;
 }
 
@@ -2092,21 +2124,25 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     if (err == EXDEV) {
         struct stat st;
         if (lstat(p_from, &st) != 0) return -errno;
-        /* 跨设备搬移：先复制到同父目录下的临时名，成功后再就位。
-           临时名的意义是「失败清理只影响本次产物」——旧实现失败时
-           recursive_rmdir(p_to) 会连既有目标一起销毁，且删源失败时源树可能
-           已被部分删除、目标又被整体销毁，**两边都不完整**（§A2）。 */
+        /* 跨设备搬移：先复制到同父目录下的**不可预测**临时名，成功后再就位。
+           不可预测 + 创建原子（open(O_EXCL|O_NOFOLLOW) / mkdir / symlink 的
+           EEXIST 失败闭合）是安全前提：目标父目录可能对普通应用可写，旧实现
+           的可预测名 "<p_to>.nsp_xdev_<pid>" 允许攻击者预置符号链接，root
+           daemon 会跟随它把源内容写进任意可写文件（R2）。
+           临时名同时保证「失败清理只影响本次产物」。 */
         char tmp_to[PATH_MAX];
-        int tn = snprintf(tmp_to, sizeof(tmp_to), "%s.nsp_xdev_%ld", p_to, (long)getpid());
-        if (tn < 0 || (size_t)tn >= sizeof(tmp_to)) return -ENAMETOOLONG;
+        int trc = xdev_temp_name(p_to, tmp_to, sizeof(tmp_to));
+        if (trc != 0) return trc;
         int copy_res;
         bool src_is_dir = S_ISDIR(st.st_mode);
+        bool tmp_created = false; /* 只清理**本次创建**的残留（R2） */
         if (S_ISREG(st.st_mode))
             copy_res = vfs_rename_copy_file(p_from, tmp_to, &st);
         else if (src_is_dir)
-            copy_res = recursive_copy_dir(p_from, tmp_to, ctx->uid, ctx->gid);
+            copy_res = recursive_copy_dir(p_from, tmp_to, ctx->uid, ctx->gid, &tmp_created);
         else if (S_ISLNK(st.st_mode)) {
-            /* 符号链接搬移：重建链接本身（不跟随目标） */
+            /* 符号链接搬移：重建链接本身（不跟随目标）；symlink 对已存在的
+               名字以 EEXIST 失败闭合 */
             char target[PATH_MAX];
             ssize_t tl = readlink(p_from, target, sizeof(target) - 1);
             if (tl < 0) {
@@ -2114,23 +2150,26 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
             } else {
                 target[tl] = '\0';
                 copy_res = symlink(target, tmp_to) == 0 ? 0 : -errno;
-                if (copy_res == 0) lchown(tmp_to, st.st_uid, st.st_gid);
+                if (copy_res == 0) {
+                    tmp_created = true;
+                    lchown(tmp_to, st.st_uid, st.st_gid);
+                }
             }
         } else {
             copy_res = -EOPNOTSUPP; /* 其余类型不支持跨设备搬移 */
         }
         if (copy_res != 0) {
+            /* 只清理本次创建的临时产物：创建本身失败（EEXIST 等）时
+               tmp_created 为 false，绝不碰别人的同名对象 */
+            if (tmp_created) recursive_rmdir(tmp_to);
             LOG_ERR("跨设备复制失败: %s -> %s (err=%d)", p_from, p_to, copy_res);
             return copy_res;
         }
-        /* 就位：清掉既有目标后 rename（跨设备搬移本就非原子） */
-        struct stat dst_st;
-        if (lstat(p_to, &dst_st) == 0) {
-            if (S_ISDIR(dst_st.st_mode))
-                recursive_rmdir(p_to);
-            else
-                unlink(p_to);
-        }
+        /* 就位：直接 rename(tmp_to, p_to)，目标冲突由 POSIX 裁决
+           （ENOTEMPTY/EISDIR/EEXIST）。**不得预删目标**：旧实现对既有非空
+           目录 recursive_rmdir(p_to) 会把调用方的目标子树整棵删掉再返回成功
+           （R1，数据丢失）；同父目录 rename 本身原子，目标要么原样保留、
+           要么被本次搬移完整替换。 */
         if (rename(tmp_to, p_to) != 0) {
             int e = errno;
             if (src_is_dir)

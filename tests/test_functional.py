@@ -6,6 +6,8 @@ fuse_daemon 完整测试套件
 """
 import subprocess, os, sys, time, threading, multiprocessing, shutil, uuid, json, sqlite3, errno
 import ctypes
+import shlex
+import tempfile
 from pathlib import Path
 
 MNT     = "/tmp/fuse_proxy_test/mnt"
@@ -674,6 +676,120 @@ def test_rename_exdev():
 
 
 # ═══════════════════════════════════════════════════════
+# 模块6b：跨设备 rename 硬化（R1/R2 直编判别）
+# ═══════════════════════════════════════════════════════
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _extract_static_functions(src_text, names):
+    """从实际源码里逐字抽出 static 函数定义（跳过同名前向声明）。
+
+    旧源码没有的函数（如 xdev_temp_name）直接跳过——这样同一驱动既能编
+    新实现，也能编 git show HEAD 的旧副本。
+    """
+    chunks = []
+    for name in names:
+        needle = "static int " + name + "("
+        start = 0
+        found = None
+        while True:
+            i = src_text.find(needle, start)
+            if i < 0:
+                break
+            brace = src_text.find("{", i)
+            semi = src_text.find(";", i)
+            if brace >= 0 and (semi < 0 or brace < semi):
+                found = i
+                break
+            start = i + 1
+        if found is None:
+            continue
+        body = src_text.index("{", found)
+        depth = 1
+        j = body + 1
+        while depth and j < len(src_text):
+            if src_text[j] == "{":
+                depth += 1
+            elif src_text[j] == "}":
+                depth -= 1
+            j += 1
+        chunks.append(src_text[found:j])
+    return "\n\n".join(chunks)
+
+
+def test_rename_exdev_hardening():
+    """R1/R2：跨设备 rename 不得预删非空目标，临时名不可预测且不跟随符号链接。
+
+    判别手段：把实际源码里的 recursive_rmdir / recursive_copy_dir /
+    vfs_rename_copy_file / xdev_temp_name / vfs_rename 逐字抽进
+    tests/fixtures/rename_exdev_driver.c，用 -Wl,--wrap=rename 让第一次
+    rename 返回 EXDEV，强制进入跨设备回退。
+
+      - nonempty：目标是非空目录 → 必须 ENOTEMPTY，目标子树逐字节保留、源树
+        保留。旧实现先 recursive_rmdir(p_to) 再 rename，返回 0 且目标消失。
+      - file_over_dir：文件撞非空目录 → EISDIR，两侧原样。旧实现同样先删目标。
+      - symlink：按旧实现可预测临时名 <p_to>.nsp_xdev_<pid> 预置符号链接指向
+        受害者 → 受害者内容必须不变、目标不得是符号链接。旧实现 open(O_TRUNC)
+        跟随链接把源内容写进受害者，再把链接 rename 到目标（rc=0）。
+      - plain：正对照，不强制 EXDEV 时普通 rename 仍成功。
+
+    FUSE_DAEMON_SRC=<旧源码副本> 可让同一驱动在旧实现上复现失败。
+    """
+    log("\n━━━ 模块6b: 跨设备 rename 硬化（R1/R2 直编判别）━━━")
+    root = Path(__file__).resolve().parent.parent
+    src_path = os.environ.get("FUSE_DAEMON_SRC") or str(root / "src/daemon/fuse_daemon.c")
+    try:
+        src_text = Path(src_path).read_text()
+    except OSError as e:
+        fail("读取被测源码", f"{src_path}: {e}")
+        return
+    try:
+        driver = (FIXTURES / "rename_exdev_driver.c").read_text()
+    except OSError as e:
+        fail("读取判别驱动", str(e))
+        return
+
+    funcs = _extract_static_functions(
+        src_text,
+        ["recursive_rmdir", "recursive_copy_dir", "vfs_rename_copy_file",
+         "xdev_temp_name", "vfs_rename"])
+    if "static int vfs_rename(" not in funcs:
+        fail("抽取 vfs_rename", f"{src_path} 中未找到定义")
+        return
+
+    cc = shlex.split(os.environ.get("CC", "cc"))
+    if not shutil.which(cc[0]):
+        log("  (跳过 R1/R2 直编判别：无 cc)")
+        return
+
+    stage = tempfile.mkdtemp(prefix="nsp_xdev_drv.")
+    try:
+        c_path = os.path.join(stage, "driver.c")
+        exe = os.path.join(stage, "driver")
+        Path(c_path).write_text(driver.replace("/*__NSP_EXTRACTED_FUNCTIONS__*/", funcs))
+        cmd = [*cc, "-std=gnu23", "-D_GNU_SOURCE", "-Wall", "-Wextra",
+               "-Wno-unused-parameter",
+               "-I", str(root / "include"), "-I", str(root / "src/daemon"),
+               c_path, "-Wl,--wrap=rename", "-o", exe]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            fail("直编判别驱动", (r.stderr or r.stdout).strip()[:400])
+            return
+        for case in ("nonempty", "file_over_dir", "symlink", "plain"):
+            case_dir = os.path.join(stage, "case_" + case)
+            os.makedirs(case_dir, exist_ok=True)
+            p = subprocess.run([exe, case, case_dir], capture_output=True,
+                               text=True, timeout=60)
+            out = (p.stdout + p.stderr).strip()
+            if p.returncode == 0 and f"RESULT {case} OK" in out:
+                ok(f"跨设备 rename 契约[{case}]")
+            else:
+                fail(f"跨设备 rename 契约[{case}]", out[-500:] or f"rc={p.returncode}")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════
 def main():
@@ -699,6 +815,7 @@ def main():
         test_rmdir_nonempty_semantics()
         test_rename_flags()
         test_rename_exdev()
+        test_rename_exdev_hardening()
         test_sqlite()
         test_concurrent()
     finally:
