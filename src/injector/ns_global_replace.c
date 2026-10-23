@@ -397,11 +397,15 @@ static int do_global_replace(void* raw) {
         return -1;
     }
     if (root_count == 0) {
-        LOG_WRN("全局替换: 未找到任何 emulated 族根，跳过");
+        /* 「没有族根」不是成功：vold 在用户启动时才建立 /mnt/<族>/<uid>/emulated，
+           injector 可能先于它就绪。旧实现返回 0（成功），调用方此后永不重试——
+           真机上表现为「开机后 v2/v3 不生效」且无任何失败迹象。改返回 1 表示
+           「尚未就绪、需要重试」，由 injector 的周期对账接管。 */
+        LOG_WRN("全局替换: 未找到任何 emulated 族根（vold 尚未建立），稍后重试");
         free(all);
         free(roots);
         free(sub);
-        return 0;
+        return 1;
     }
 
     /* 2. 选择备份族：优先级 user(2) > androidwritable(1) > installer(0) */
@@ -581,6 +585,11 @@ int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* b
     struct GlobalReplaceArgs args = {fuse_src, backup_root, g_global_backup_done};
     int child_err = 0;
     int ret = run_in_mnt_ns_timeout(mnt_ns_pid, do_global_replace, &args, &child_err, 15000);
+    if (ret == 1) {
+        /* 尚未就绪（无族根）：不置 backup_done、不打成错误，交给调用方按退避重试 */
+        LOG_DBG("全局替换: 族根尚未建立，等待重试");
+        return 1;
+    }
     if (ret != 0) {
         LOG_ERR("全局替换失败 (ret=%d, err=%d)", ret, child_err);
     } else {

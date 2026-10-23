@@ -221,6 +221,8 @@ FUSE 回调（如 getattr）
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
 5. 此后该应用对 `/sdcard` 的访问经 FUSE → 内建引擎（`fw_rules`）匹配。
 
+**视图就绪语义（ACK）**：应用在 zygote `preAppSpecialize` 里经 companion 上报并等待 injector 的 ACK，收到后才继续 specialize。因此 ACK **只在目标进程的存储视图就绪后**发出：v1 由挂载线程在 `perform_app_mount_sync` 返回后 ACK，v2 由还原线程在 `perform_app_restore` 完成后 ACK；只有「无需任何视图操作」的分支（v3 全局视图已就绪、非目标且不还原、隔离进程/zygote、进程已死或 FUSE 暂不可用）才立即 ACK。旧实现在派发工作线程**之前**就 ACK，应用可能在代理视图就绪前访问存储（首次启动读到原始目录，或撞上合并挂载的裸挂载点窗口）。
+
 #### 注入方法（`--inject-method=v1|v2|v3`）
 
 上列 1–5 步描述的是**逐应用挂载**，即默认的 v1；injector 另有两种注入方法（`include/injector.h` 的 `g_inject_method`，派生 `inject_is_global_replace()` / `inject_restore_nontarget()`）：
@@ -232,6 +234,7 @@ FUSE 回调（如 getattr）
 | `v3` | 同 v2 的全局替换 | **不还原、不卸载**——所有应用（含系统应用）默认见代理视图 | 忽略 `GLOBAL_INJECT` / `SKIP_SYSTEM_APPS`；应用段/类别段头显式 `OFF`、隔离进程与 zygote 排除照旧生效 |
 
 - `v3` 即「默认全局挂载」：规则命中仍由 FUSE 框架按调用方 uid/pkg 判定，**框架侧零改动**——无规则的应用走默认 ALLOW，只是视图同样经项目 FUSE。
+- **周期对账（v2/v3）**：族根的生命周期由 vold 掌握——用户启动/切换、卷重挂都会新建或重建 `/mnt/<族>/<uid>/emulated`。injector 不再「FUSE 就绪时替换一次就完事」：`maybe_reconcile_global_replace()` 每秒记账，稳态 5s、失败退避 1s→30s 复查 `ns_global_status()`，发现未替换（含新用户族根、被 vold 重挂回系统视图）就重新执行 `ns_global_replace_system`。这条链依赖它的三态返回：**0=已替换；1=尚无族根（未就绪，必须重试，不得当成功）；<0=失败（已回滚）**——旧实现在无族根时返回 0，因此真机开机时若 injector 先于 vold 就绪，v2/v3 会永久不生效。
 - 旧 `--global-replace` 参数已删除，其行为等价于 `--inject-method=v2`。
 - 退出与崩溃恢复路径（`do_cleanup`、FUSE 连续崩溃超限、`force_recover_tracked_mounts`）在 v2/v3 下统一走 `ns_global_restore_system` 还原系统视图，与注入时的替换配对。
 - GNU 侧无法运行 injector，三种方法的判定与审查逻辑经测试驱动 `global_replace_ctl` 覆盖（`tests/test_inject_method.py`、`tests/test_global_replace.py`）。

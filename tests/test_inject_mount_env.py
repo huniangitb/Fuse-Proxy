@@ -999,6 +999,23 @@ def inner_main(argv):
             check_now("/storage 原生子挂载已随替换卸载", unmounted(STG_SUB))
             check_now("替换前启动的 app1 视图被活传播替换为项目 FUSE",
                       dev_is(STORAGE_EMU, g_dev, app1))
+
+            # ── 周期对账：vold 重挂族根后必须重新接管（v2/v3） ──
+            # 真机上用户启动/切换、卷重挂都会把族根重建成系统视图；旧实现只在
+            # 「FUSE 就绪」这一刻替换一次，此后永不复查 → 视图永久退回系统视图，
+            # 且无任何恢复路径。新实现按 5s 稳态间隔对账并重新替换。
+            REP.set_phase("reconcile")
+            mount("nsp_vold_remount", "/mnt/user/0/emulated", "tmpfs", 0, "mode=0755")
+            check_now("模拟 vold 重挂：族根已回到系统视图",
+                      lambda: (dev_at("/mnt/user/0/emulated") != g_dev,
+                               f"根 dev={dev_at('/mnt/user/0/emulated')}，项目 FUSE={g_dev}"))
+
+            def re_replaced():
+                d = dev_at("/mnt/user/0/emulated")
+                return d == g_dev, f"族根 dev={d}，期望 {g_dev}"
+
+            wait_check("周期对账：族根被重新替换回项目 FUSE（旧实现永不复查）",
+                       re_replaced, timeout=20)
         check_now(f"不启动媒体专属 FUSE（{MEDIA_MNT} 未挂载）", unmounted(MEDIA_MNT))
 
         # app2 在就绪/替换【后】启动：覆盖「替换后启动的应用直接见项目 FUSE」

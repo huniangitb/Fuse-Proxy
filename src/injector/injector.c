@@ -52,6 +52,13 @@ static bool g_last_scan_found = false;
    还原存量非目标应用；之后生命周期内不再反复周期检测（新应用
    由 zygisk IPC 通知即时还原） */
 static bool g_global_replace_scanned_once = false;
+/* 全局替换（v2/v3）周期对账状态：见 maybe_reconcile_global_replace() */
+#define GREPL_STEADY_SEC    5
+#define GREPL_RETRY_MIN_SEC 1
+#define GREPL_RETRY_MAX_SEC 30
+static int g_grepl_next_sec;
+static int g_grepl_backoff = GREPL_RETRY_MIN_SEC;
+static bool g_grepl_replaced_once;
 struct GlobalFuseInfo g_global_fuse = {.pid = 1,
                                        .fuse_pid = 0,
                                        .mnt_path = "/mnt/nsp_global",
@@ -306,6 +313,7 @@ typedef struct {
 } FuseReadyCtx;
 
 static void remount_all_tracked(void);
+static void maybe_reconcile_global_replace(void);
 
 void handle_fuse_ready_event(void* ptr) {
     FuseReadyCtx* ctx = (FuseReadyCtx*)ptr;
@@ -359,14 +367,13 @@ void handle_fuse_ready_event(void* ptr) {
             } else {
                 g_fuse_ready = 1;
                 LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
-                /* 全局替换模式：FUSE 就绪后立即将 emulated 族根替换为代理视图 */
+                /* 全局替换模式：FUSE 就绪后立即尝试把 emulated 族根替换为代理视图。
+                   此时 vold 可能尚未建立族根（用户未启动）——replace 返回 1 表示
+                   「尚未就绪」，由周期对账退避重试；旧实现在这种情况下静默成功、
+                   此后永不重试，真机上就是「开机后 v2/v3 不生效」。 */
                 if (inject_is_global_replace()) {
-                    LOG("全局替换模式: 执行 emulated 全局替换 (fuse_src=%s)",
-                        g_global_fuse.mnt_path);
-                    if (ns_global_replace_system(g_global_fuse.pid, g_global_fuse.mnt_path,
-                                                 GLOBAL_BACKUP_ROOT) != 0) {
-                        LOG_ERR("全局替换失败，系统视图可能处于混合状态");
-                    }
+                    g_grepl_next_sec = 0;
+                    maybe_reconcile_global_replace();
                 }
             }
         }
@@ -1303,10 +1310,62 @@ static void retry_pending_mounts(void) {
     }
 }
 
+/* 全局替换（v2/v3）周期对账 ==================================================
+ * 族根的生命周期由 vold 掌握：用户启动/切换、卷重挂、FUSE 崩溃恢复都会新建或重建
+ * /mnt/<族>/<uid>/emulated。旧实现只在「FUSE 就绪」这一刻替换一次：族根还没出现时
+ * 静默成功（见 ns_global_replace.c 的 root_count==0 分支）、此后永不重试——真机上
+ * 表现为「开机后 v2/v3 不生效」；运行中新用户的族根也永远不会被接管。
+ *
+ * 这里每秒记账、按退避节奏对账：
+ *   - 已是 REPLACED：按稳态间隔（5s）复查。花费只是一次 mountinfo 读取；发现被
+ *     vold 重挂成系统视图或出现新用户族根（MIXED）就重新替换。
+ *   - replace 返回 1（尚无族根）：短线退避 1s→2s→…→30s，直到 vold 建立族根。
+ *   - replace 返回 <0（真实失败）：同样退避；替换内部已把动过的族根回滚到备份，
+ *     系统视图不会停在裸挂载点。
+ * 首次成功替换后若又发生了「后续替换成功」，说明出现了新用户/新族根：复位兜底扫描
+ * 标记，让 v2 对该用户的存量应用再审查一次（非目标应用还原）。 */
+static void maybe_reconcile_global_replace(void) {
+    if (!inject_is_global_replace()) return;
+    if (g_global_fuse.disabled || g_global_fuse.pid <= 0 || !g_fuse_ready) return;
+    if (g_grepl_next_sec > 0) {
+        g_grepl_next_sec--;
+        return;
+    }
+    int st = ns_global_status(g_global_fuse.pid, g_global_fuse.mnt_path);
+    if (st == NSP_GLOBAL_STATUS_REPLACED) {
+        g_grepl_next_sec = GREPL_STEADY_SEC;
+        g_grepl_backoff = GREPL_RETRY_MIN_SEC;
+        return;
+    }
+    int ret =
+        ns_global_replace_system(g_global_fuse.pid, g_global_fuse.mnt_path, GLOBAL_BACKUP_ROOT);
+    if (ret == 0) {
+        bool followup = g_grepl_replaced_once; /* 本次不是首次替换 → 出现了新族根 */
+        g_grepl_replaced_once = true;
+        g_grepl_next_sec = GREPL_STEADY_SEC;
+        g_grepl_backoff = GREPL_RETRY_MIN_SEC;
+        if (followup) {
+            LOG("全局替换: 新族根已接管（新用户/重挂），补一次应用审查");
+            g_global_replace_scanned_once = false;
+            seconds_until_next_scan = 0;
+        }
+        return;
+    }
+    int delay = g_grepl_backoff;
+    g_grepl_backoff = (delay * 2 > GREPL_RETRY_MAX_SEC) ? GREPL_RETRY_MAX_SEC : delay * 2;
+    g_grepl_next_sec = delay;
+    if (ret > 0) {
+        LOG_DBG("全局替换对账: 族根尚未建立，%ds 后重试", delay);
+    } else {
+        LOG_ERR("全局替换对账失败，%ds 后重试（系统视图保持原样）", delay);
+    }
+}
+
 static void on_timer_event(int timer_fd) {
     uint64_t expirations;
     if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
         check_and_recover_fuse();
+        maybe_reconcile_global_replace();
         reap_zombies();
         maybe_periodic_scan();
         retry_pending_mounts();
