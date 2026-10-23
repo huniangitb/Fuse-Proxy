@@ -782,7 +782,27 @@ typedef struct {
 static ModuleTypeCache g_module_cache[MAX_CACHED_MODULES];
 static int g_module_cache_count = 0;
 static long long g_modules_dir_mtime_ns = 0;
+/* 上次全量扫描看到的模块目录条目数：目录 mtime 的时间精度不足（同一时钟 tick
+   内 mkdir + 写文件，mtime 比较结果可能与上次相同），只比 mtime 会让快速路径
+   漏掉「新增模块目录」——表现为模块 schema/规则类型偶发缺失（热插拔偶发不生效）。
+   条目数是精确信号，且 opendir+readdir 不需逐文件 stat，代价可忽略。 */
+static int g_modules_dir_entries = -1;
 static bool g_module_cache_valid = false;
+
+/* 统计模块目录条目数（跳过隐藏项）；目录不存在返回 -1 */
+static int rule_modules_dir_entries(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (strchr(de->d_name, '/')) continue;
+        n++;
+    }
+    closedir(d);
+    return n;
+}
 
 /* 取文件/目录 mtime（纳秒）：不存在返回 0 */
 static long long file_mtime_ns(const char* path) {
@@ -799,8 +819,11 @@ static void rule_types_refresh(void) {
 
     long long cur_dir_mtime = file_mtime_ns(modules_dir);
 
-    /* 快速路径：目录 mtime 未变 + 各 .rules 文件 mtime 未变 → 类型表无需重建 */
-    if (g_module_cache_valid && cur_dir_mtime == g_modules_dir_mtime_ns) {
+    /* 快速路径：目录 mtime 未变 + 条目数未变 + 各 .rules 文件 mtime 未变 →
+       类型表无需重建。条目数必须参与判定：mtime 精度不足时新增模块目录不会
+       改变比较结果，只看 mtime 会让热插拔偶发失效（R7b 判别用例守护）。 */
+    if (g_module_cache_valid && cur_dir_mtime == g_modules_dir_mtime_ns &&
+        rule_modules_dir_entries(modules_dir) == g_modules_dir_entries) {
         bool unchanged = true;
         for (int i = 0; i < g_module_cache_count; i++) {
             char rules_path[PATH_MAX];
@@ -832,7 +855,11 @@ static void rule_types_refresh(void) {
     g_modules_dir_mtime_ns = cur_dir_mtime;
     g_module_cache_valid = true;
 
-    if (cur_dir_mtime == 0) return; /* 模块目录不存在 */
+    if (cur_dir_mtime == 0) {
+        g_modules_dir_entries = -1; /* 目录不存在：条目数未知 */
+        return;
+    }
+    g_modules_dir_entries = rule_modules_dir_entries(modules_dir);
     DIR* d = opendir(modules_dir);
     if (!d) return;
     struct dirent* de;
