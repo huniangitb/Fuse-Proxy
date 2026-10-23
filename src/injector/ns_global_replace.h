@@ -80,6 +80,9 @@ void ns_sort_shallowest_first(NsMountEntry* arr, int n);
 int ns_backup_point_state(int pid, const char* path);
 
 /* ---- 全局替换方案导出入口（injector / global_replace_ctl / mount_manager 调用） ---- */
+/* 返回值：0=已替换；1=尚未就绪（命名空间内还没有任何 emulated 族根，vold 可能尚未
+   建立该用户的卷）——调用方应退避重试，**不得当作成功**；<0=失败（已尽力回滚）。
+   injector 的周期对账依赖这三态区分，见 injector.c 的 maybe_reconcile_global_replace()。 */
 int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* backup_root);
 int ns_global_restore_system(int mnt_ns_pid, const char* backup_root);
 int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_root, int user_id);

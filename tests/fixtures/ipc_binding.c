@@ -42,7 +42,9 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -127,6 +129,9 @@ bool sys_pkg_is_system(const char* pkg) {
 
 static _Atomic int g_restore_calls;
 static _Atomic int g_mount_calls;
+/* A1 用例：同步挂载桩 + 放行门（见 run_ack_order_case 的判别设计） */
+static _Atomic int g_sync_mount_calls;
+static char g_ack_gate[PATH_MAX];
 static _Atomic int g_last_restore_pid;
 static _Atomic int g_last_restore_uid;
 static char g_last_restore_pkg[256];
@@ -147,6 +152,21 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
     atomic_fetch_add(&g_mount_calls, 1);
     return 0;
 }
+
+/* 同步挂载桩（ACK 时序用例专用）：可被放行门阻塞，从而让"ACK 必须晚于挂载
+   完成"这一契约可被确定性观测。未设门时立即返回，不影响其它用例。 */
+int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_src) {
+    (void)pkg;
+    (void)pid;
+    (void)uid;
+    (void)mnt_src;
+    atomic_fetch_add(&g_sync_mount_calls, 1);
+    for (int i = 0; i < 200; i++) {
+        if (g_ack_gate[0] == '\0' || access(g_ack_gate, F_OK) == 0) return 0;
+        usleep(10 * 1000);
+    }
+    return 0;
+}
 int perform_app_restore(const char* pkg, int pid, uid_t uid) {
     snprintf(g_last_restore_pkg, sizeof g_last_restore_pkg, "%s", pkg);
     atomic_store(&g_last_restore_pid, pid);
@@ -159,6 +179,13 @@ void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger
     (void)pid;
     (void)uid;
     (void)trigger_source;
+}
+/* 挂载失败重试队列：由 injector.c 提供实现，本直编组只记账（不重试） */
+static _Atomic int g_retry_calls;
+void schedule_retry_mount(const char* pkg, int pid) {
+    (void)pkg;
+    (void)pid;
+    atomic_fetch_add(&g_retry_calls, 1);
 }
 
 /* ns_* 桩：inject_target.c 的 cleanup_app_mounts 引用（本用例不触达） */
@@ -389,6 +416,109 @@ static int run_case(const Case* c) {
     return 0;
 }
 
+/* A1：ACK 必须晚于"视图就绪"（v1 的挂载完成）。
+ *
+ * 判别设计：把同步挂载桩做成"等放行门"，于是挂载是否完成由测试完全掌控。
+ *   - 新实现：挂载线程阻塞在桩里 → 放行门创建前客户端读不到 ACK；
+ *   - 旧实现：ACK 在派发挂载线程之前就已写出 → 放行门创建前客户端必然先收到
+ *     ACK（且同步桩从未被调用，计数为 0）。
+ * 两边都不依赖时序竞速，故可稳定判别。 */
+static int run_ack_order_case(void) {
+    char detail[1200];
+    seed_uid_map();
+    g_passive_mode = 0;
+    atomic_store(&g_sync_mount_calls, 0);
+    atomic_store(&g_mount_calls, 0);
+    g_inject_method = INJECT_METHOD_V1; /* 只有 v1 才逐应用挂载 */
+
+    snprintf(g_ack_gate, sizeof g_ack_gate, "%s/ack_gate", CONFIG_DIR);
+    unlink(g_ack_gate);
+
+    char sock_path[108];
+    snprintf(sock_path, sizeof sock_path, "%s/ipc_ack.sock", CONFIG_DIR);
+    unlink(sock_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un laddr = {.sun_family = AF_UNIX};
+    snprintf(laddr.sun_path, sizeof laddr.sun_path, "%s", sock_path);
+    int rp[2] = {-1, -1};
+    bool ok = true;
+    pid_t child = -1;
+    if (lfd < 0 || bind(lfd, (struct sockaddr*)&laddr, sizeof laddr) != 0 || listen(lfd, 4) != 0 ||
+        pipe(rp) != 0) {
+        snprintf(detail, sizeof detail, "监听 socket/pipe 失败: %s", strerror(errno));
+        report(false, "A1 挂载完成前不得 ACK", detail);
+        if (lfd >= 0) close(lfd);
+        g_inject_method = INJECT_METHOD_V2;
+        return -1;
+    }
+    child = fork();
+    if (child < 0) {
+        snprintf(detail, sizeof detail, "fork 失败: %s", strerror(errno));
+        report(false, "A1 挂载完成前不得 ACK", detail);
+        close(lfd);
+        g_inject_method = INJECT_METHOD_V2;
+        return -1;
+    }
+    if (child == 0) {
+        close(lfd);
+        close(rp[0]);
+        char rp_s[16], req[512];
+        snprintf(rp_s, sizeof rp_s, "%d", rp[1]);
+        snprintf(req, sizeof req, "REQ com.real.target %d %d", (int)getpid(), (int)getuid());
+        char self[PATH_MAX];
+        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (n <= 0) _exit(98);
+        self[n] = '\0';
+        execl(self, "com.real.target", "app", sock_path, req, rp_s, (char*)NULL);
+        _exit(99);
+    }
+    close(rp[1]);
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        snprintf(detail, sizeof detail, "accept 失败: %s", strerror(errno));
+        report(false, "A1 挂载完成前不得 ACK", detail);
+        close(lfd);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        g_inject_method = INJECT_METHOD_V2;
+        return -1;
+    }
+    close(lfd);
+    unlink(sock_path);
+    /* 旧实现内部会 close(cfd)；新实现把它交给挂载线程，同样由线程 close */
+    handle_ipc_client_readable(cfd);
+
+    /* 放行门前：不得收到 ACK（新实现挂载未完成；旧实现此刻已应答） */
+    struct pollfd pfd = {.fd = rp[0], .events = POLLIN};
+    bool early_ack = (poll(&pfd, 1, 300) > 0);
+
+    /* 放行挂载：桩返回后线程才发 ACK */
+    int gfd = open(g_ack_gate, O_CREAT | O_WRONLY, 0600);
+    if (gfd >= 0) close(gfd);
+
+    char ack[32] = {0};
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 3000) > 0) {
+        ssize_t an = read(rp[0], ack, sizeof ack - 1);
+        if (an > 0) ack[an] = '\0';
+    }
+    close(rp[0]);
+    unlink(g_ack_gate);
+    g_ack_gate[0] = '\0';
+
+    int sync_calls = atomic_load(&g_sync_mount_calls);
+    bool ok_ack = (strcmp(ack, "OK") == 0);
+    ok = ok_ack && !early_ack && sync_calls == 1;
+    snprintf(detail, sizeof detail, "early_ack=%d(期望0) ack=%s(期望OK) sync_mount_calls=%d(期望1)",
+             (int)early_ack, ack[0] ? ack : "(空)", sync_calls);
+    report(ok, "A1 挂载完成前不得 ACK（ACK 后才放行 specialize）", detail);
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    g_inject_method = INJECT_METHOD_V2;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "app") == 0) return app_main(argc, argv);
 
@@ -412,13 +542,14 @@ int main(int argc, char** argv) {
         {"N2 包名与 /proc/<pid>/cmdline 不符 → ERR + 映射原样", "com.real.target", "REQ",
          "com.forged.non_target", 0, false, false, false, NULL},
         /* N3：伪造目标包名（cmdline 是别的应用）：旧实现会把该 pid 标成已注入并污染映射 */
-        {"N3 伪造目标包名 → ERR + 映射原样 + 不标注入", "com.other.app", "REQ",
-         "com.real.target", 0, false, false, false, NULL},
+        {"N3 伪造目标包名 → ERR + 映射原样 + 不标注入", "com.other.app", "REQ", "com.real.target",
+         0, false, false, false, NULL},
         /* N4：REPORT 是 root companion 专用通道，非 root 对端必须拒绝 */
         {"N4 非 root 对端 REPORT → ERR + 映射原样", "com.real.target", "REPORT",
          "com.forged.non_target", 0, false, false, false, NULL},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) run_case(&cases[i]);
+    run_ack_order_case();
 
     printf("\n结果: %d 通过, %d 失败\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

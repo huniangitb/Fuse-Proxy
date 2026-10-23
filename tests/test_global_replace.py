@@ -376,9 +376,35 @@ def mountinfo_snapshot():
         return []
 
 
+def not_ready_case():
+    """场景0：族根尚未出现（vold 还没建立该用户的 emulated 卷）时，replace 必须
+    报告「尚未就绪」而不是静默成功。
+
+    判别性：旧实现 do_global_replace 在 root_count==0 时 return 0，调用方
+    （injector 的 FUSE 就绪回调）记一条错误就再也不管——真机上就是「开机后
+    v2/v3 不生效」。新实现返回 1，injector 的周期对账据此退避重试。"""
+    log("场景0: 族根尚未出现时 replace 不得静默成功")
+    inherited = [
+        e["mount_point"] for e in read_mountinfo()
+        if e["mount_point"].endswith("/emulated")
+        and e["mount_point"].startswith(("/mnt/user/", "/mnt/installer/",
+                                         "/mnt/androidwritable/"))
+    ]
+    if inherited:
+        log(f"  gap: 沙箱内已继承 {len(inherited)} 个 emulated 族根，场景0 不适用")
+        return
+    r = sh(CTL, "replace", str(os.getpid()), FUSE_SRC, BACKUP_ROOT, check=False)
+    if r.returncode != 0:
+        ok(f"无族根时 replace 返回非 0（rc={r.returncode}，调用方据此退避重试）")
+    else:
+        fail("无族根时 replace",
+             f"rc=0 且 stdout={r.stdout.strip()}（旧行为：静默成功 → 永不重试）")
+
+
 def inner_main():
     """rootless 沙箱内执行体：隔离挂载 + 全场景不断言遗漏。"""
     try:
+        not_ready_case()
         setup_view()
         run_tests()
     finally:

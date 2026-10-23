@@ -96,7 +96,21 @@ typedef struct {
     int pid;
     uid_t uid;
     char mnt_src[256];
+    /* 视图就绪后才放行的 ACK 目标 fd（-1 = 无需 ACK：早已在决策分支内应答）。
+       归派发线程所有，线程发完 ACK 即 close。此前 ACK 在派发前就发出，应用会在
+       代理视图就绪前继续 specialize 并访问存储（首次启动读到原始目录，或撞上
+       合并挂载的裸挂载点窗口 ENOENT）。 */
+    int ack_fd;
 } IpcMountArg;
+
+/* 视图就绪语义的唯一出口：挂载/还原线程在真实完成后才应答并交还 fd。
+   对端（zygisk companion）只把 ACK 当作"可以继续 specialize"的信号，
+   所以这里的时序就是应用可见的存储视图时序。 */
+static void ipc_ack_and_close(int fd, bool ok) {
+    if (fd < 0) return;
+    send(fd, ok ? "OK" : "ERR", ok ? 2 : 3, MSG_NOSIGNAL);
+    close(fd);
+}
 
 /* 全局替换模式：非目标应用异步还原线程（卸载项目 FUSE，bind 回系统视图备份）。
    整个还原周期（派发→重试→完成）合并为单条汇总日志，方便调试、减少占用 */
@@ -116,6 +130,8 @@ static void* ipc_restore_thread(void* raw) {
     for (int attempt = 0; attempt < 20; attempt++) {
         if (kill(arg->pid, 0) != 0) {
             log_batch_end();
+            /* 进程已死：无需还原，放行对端（ACK 后 fd 随之关闭） */
+            ipc_ack_and_close(arg->ack_fd, true);
             free(arg);
             return NULL;
         }
@@ -146,6 +162,9 @@ static void* ipc_restore_thread(void* raw) {
         LOG_ERR("IPC还原失败: %s(PID:%d) ret=%d (尝试%d次, %ldms)", arg->pkg, arg->pid, ret,
                 attempts, total_ms);
     }
+    /* 视图已还原到位（或已确认无需还原）后才放行应用：ACK 之前应用不得继续
+       specialize——否则它会在项目 FUSE 视图下读到规则本不该给出的内容。 */
+    ipc_ack_and_close(arg->ack_fd, ret == 0 || ret == 1);
     free(arg);
     return NULL;
 }
@@ -172,6 +191,7 @@ static void* ipc_mount_thread(void* raw) {
     if (inject_is_global_replace()) {
         mark_injected(arg->pid);
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
+        ipc_ack_and_close(arg->ack_fd, true);
         free(arg);
         return NULL;
     }
@@ -184,6 +204,8 @@ static void* ipc_mount_thread(void* raw) {
     if (kill(arg->pid, 0) != 0) {
         LOG_DBG("IPC线程: 进程已死 %s(PID:%d)", arg->pkg, arg->pid);
         remove_tracked(arg->pid);
+        /* 进程已死：无需挂载，放行对端（避免 companion 空等 1s 拖慢冷启动） */
+        ipc_ack_and_close(arg->ack_fd, true);
         free(arg);
         return NULL;
     }
@@ -193,6 +215,7 @@ static void* ipc_mount_thread(void* raw) {
     if (!is_target_app(arg->pkg, arg->uid, arg->pid, true)) {
         LOG_DBG("IPC线程: 配置无匹配 %s(PID:%d)", arg->pkg, arg->pid);
         remove_tracked(arg->pid);
+        ipc_ack_and_close(arg->ack_fd, true);
         free(arg);
         return NULL;
     }
@@ -202,24 +225,35 @@ static void* ipc_mount_thread(void* raw) {
     if (!mnt_src) {
         LOG_ERR("IPC线程: 全局 FUSE 不可用，无法为 %s(PID:%d) 挂载", arg->pkg, arg->pid);
         remove_tracked(arg->pid);
+        /* FUSE 可能正在崩溃重建：交给重试队列，本次先放行（应用可稍后重新访问） */
+        schedule_retry_mount(arg->pkg, arg->pid);
+        ipc_ack_and_close(arg->ack_fd, false);
         free(arg);
         return NULL;
     }
 
     int ret = -1;
-    /* 完整 perform_app_mount（含 mountinfo 读取） */
-    ret = perform_app_mount(arg->pkg, arg->pid, arg->uid, NULL, "IPC通知");
+    /* 同步挂载（阻塞到目标命名空间内的挂载真实完成）：ACK 必须是"视图已就绪"
+       的信号。异步版 perform_app_mount 只负责 fork 就返回，完成事件回到主循环，
+       无法与本次 ACK 对齐——那正是"应用先访问、代理视图后到"旧竞态的成因。 */
+    ret = perform_app_mount_sync(arg->pkg, arg->pid, arg->uid, NULL);
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     long elapsed_us =
         (ts_end.tv_sec - ts_start.tv_sec) * 1000000L + (ts_end.tv_nsec - ts_start.tv_nsec) / 1000L;
 
     if (ret == 0) {
-        LOG("IPC挂载完成: %s(PID:%d)%s 耗时: %ldus", arg->pkg, arg->pid, "", elapsed_us);
+        /* 同步版不做异步版的簿记（mark_injected/规则转储），在此补齐 */
+        mark_injected(arg->pid);
+        print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
+        LOG("IPC挂载完成: %s(PID:%d) 耗时: %ldus（已延迟 ACK 到挂载完成）", arg->pkg, arg->pid,
+            elapsed_us);
     } else {
         LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
         remove_tracked(arg->pid);
+        schedule_retry_mount(arg->pkg, arg->pid);
     }
+    ipc_ack_and_close(arg->ack_fd, ret == 0);
     free(arg);
     return NULL;
 }
@@ -402,8 +436,7 @@ void handle_ipc_client_readable(int client_fd) {
            此路径是唯一可靠的清理时机） */
         cleanup_stale_tracked();
         if (is_isolated_uid(uid) || strstr(pkg, "_zygote") != nullptr) {
-            send(client_fd, "OK", 2, MSG_NOSIGNAL);
-            close(client_fd);
+            ipc_ack_and_close(client_fd, true);
             return;
         }
         char clean_pkg[256];
@@ -412,12 +445,17 @@ void handle_ipc_client_readable(int client_fd) {
         char* colon = strchr(clean_pkg, ':');
         if (colon) *colon = '\0';
         if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, clean_pkg);
-        send(client_fd, "OK", 2, MSG_NOSIGNAL);
-        close(client_fd); // 快速释放客户端连接
 
-        /* 核心修复：使用 clean_pkg 而非原始 pkg 进行配置匹配，
+        /* ACK 的语义是"目标进程的存储视图已就绪，可以继续 specialize"。
+           因此只有在确认无需任何视图操作时才在此直接应答；需要挂载（v1）或
+           还原（v2）的路径把 client_fd 交给工作线程，完成后再 ACK。
+           旧实现在派发前就应答，应用会在代理视图就绪前访问存储——首次启动
+           读到原始目录，或撞上合并挂载的裸挂载点窗口（ENOENT）。
+
+           ���意：使用 clean_pkg 而非原始 pkg 进行配置匹配，
            避免带 ':process' 后缀的包名误判为未配置应用 */
-        if (!is_target_app(clean_pkg, uid, pid, true)) {
+        bool is_target = is_target_app(clean_pkg, uid, pid, true);
+        if (!is_target) {
             /* 注入方法 v2：非目标应用需主动卸载项目 FUSE 并还原系统视图
                （IPC 通知是最常见的应用启动路径，必须覆盖，否则非目标应用
                永远停留在项目 FUSE 视图上）；v3 不还原——默认全局挂载 */
@@ -429,20 +467,20 @@ void handle_ipc_client_readable(int client_fd) {
                     arg->pid = pid;
                     arg->uid = uid;
                     arg->mnt_src[0] = '\0';
+                    arg->ack_fd = client_fd; /* 还原完成后由线程 ACK + close */
                     pthread_t tid;
                     if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
                         pthread_detach(tid);
                         /* 派发日志已并入 ipc_restore_thread 的单条汇总，不再单独输出 */
-                    } else {
-                        LOG_ERR("IPC创建还原线程失败: %s(PID:%d)", clean_pkg, pid);
-                        free(arg);
+                        return;
                     }
+                    LOG_ERR("IPC创建还原线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);
+                    free(arg);
                 }
             }
+            ipc_ack_and_close(client_fd, true);
             return;
         }
-        if (access(NSP_ANDROID_EMULATED_ROOT "/", F_OK) != 0) return;
-
         if (inject_is_global_replace()) {
             /* 新挂载方案（全局替换 v2/v3）：全局 FUSE 已挂载 /storage/emulated，
                目标应用自动继承代理视图，无需 injector 逐应用挂载——
@@ -452,10 +490,17 @@ void handle_ipc_client_readable(int client_fd) {
             print_active_rules(clean_pkg, pid, uid, "IPC通知");
             LOG_DBG("全局替换模式: 目标应用 %s(PID:%d) 无需挂载，已由全局 FUSE 提供代理视图",
                     clean_pkg, pid);
+            ipc_ack_and_close(client_fd, true);
+            return;
+        }
+        if (access(NSP_ANDROID_EMULATED_ROOT "/", F_OK) != 0) {
+            /* 目标存储路径在 injector 命名空间不可见（异常态）：不挂载也不拖延，
+               按已就绪放行（与旧行为一致，仅提前到派发前判定） */
+            ipc_ack_and_close(client_fd, true);
             return;
         }
 
-        /* 异步线程挂载：不阻塞主循环，子进程在后台完成 */
+        /* v1：挂载线程完成目标命名空间内的挂载后才 ACK（视图就绪语义） */
         IpcMountArg* arg = malloc(sizeof(IpcMountArg));
         if (arg) {
             strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
@@ -463,15 +508,17 @@ void handle_ipc_client_readable(int client_fd) {
             arg->pid = pid;
             arg->uid = uid;
             arg->mnt_src[0] = '\0';
+            arg->ack_fd = client_fd; /* 挂载完成后由线程 ACK + close */
             pthread_t tid;
             if (pthread_create(&tid, NULL, ipc_mount_thread, arg) == 0) {
                 pthread_detach(tid);
-                LOG_DBG("IPC派发异步挂载线程: %s(PID:%d)", clean_pkg, pid);
-            } else {
-                LOG_ERR("IPC创建挂载线程失败: %s(PID:%d)", clean_pkg, pid);
-                free(arg);
+                LOG_DBG("IPC派发挂载线程（ACK 延迟到挂载完成）: %s(PID:%d)", clean_pkg, pid);
+                return;
             }
+            LOG_ERR("IPC创建挂载线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);
+            free(arg);
         }
+        ipc_ack_and_close(client_fd, true);
         return;
     }
     if (strncmp(buf, "LIST_INJECTED", 13) == 0) {
