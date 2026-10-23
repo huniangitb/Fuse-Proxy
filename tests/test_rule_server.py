@@ -1252,6 +1252,21 @@ def check(proc, sock_name, conf_dir):
     send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_REMOVE", "module": "schema_mod",
                                "name": "S"})
 
+    # ---- R7b: module dir mtime precision must not hide a newly added module ----
+    # 判别点：快速路径只比目录 mtime 时，mkdir+写文件若落在同一时钟 tick 内，
+    # mtime 比较结果与上次相同 -> 不重扫 -> 新模块 schema 偶发缺失（热插拔失效）。
+    # 用例把 modules 目录 mtime 显式拨回创建前的值，稳定复现该窗口：
+    # 旧实现（只看 mtime）-> schema 缺失；新实现（同时比条目数）-> 正常发现。
+    mods_dir = os.path.join(conf_dir, "modules")
+    mt_before = os.stat(mods_dir).st_mtime_ns
+    r7b_dir = os.path.join(mods_dir, "late_mod")
+    os.makedirs(r7b_dir, exist_ok=True)
+    with open(os.path.join(r7b_dir, "late_mod.rules"), "w", encoding="utf-8") as f:
+        f.write("[conf]\nconf.k.type = string\n")
+    os.utime(mods_dir, ns=(mt_before, mt_before))  # 模拟 mtime 未变
+    r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_SCHEMA", "module": "late_mod"})
+    r7b_keys = sorted(f["key"] for f in r["data"]["fields"]) if r.get("status") == "ok" else []
+    expect("R7b 目录 mtime 未变时新增模块 schema 仍被发现", r7b_keys == ["k"], (r, r7b_keys))
     # ftp_module 走通用命令：等价于 FTP_ADD（别名行为一致）
     r = send_cmd(proc, sock_name, {"cmd": "MODULE_CONF_ADD", "module": "ftp_module",
                                    "name": "通用盘", "host": "10.9.9.9", "port": 21})
