@@ -293,6 +293,7 @@ def check(label, cond):
 check("module.prop 存在", "module.prop" in names)
 check("customize.sh 存在", "customize.sh" in names)
 check("service.sh 存在", "service.sh" in names)
+check("sepolicy.rule 存在", "sepolicy.rule" in names)
 check("rule_server 存在", any("bin/rule_server" in n for n in names))
 check("injector 存在", any("bin/injector" in n for n in names))
 check("fuse_daemon 存在", any("bin/fuse_daemon" in n for n in names))
