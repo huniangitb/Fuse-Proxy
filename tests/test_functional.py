@@ -689,19 +689,24 @@ def _extract_static_functions(src_text, names):
     """
     chunks = []
     for name in names:
-        needle = "static int " + name + "("
         start = 0
         found = None
-        while True:
-            i = src_text.find(needle, start)
-            if i < 0:
+        # 抽取目标可能是 static int，也可能是 static bool（如 is_fuse_hidden_name）
+        for prefix in ("static int ", "static bool "):
+            needle = prefix + name + "("
+            start = 0
+            while True:
+                i = src_text.find(needle, start)
+                if i < 0:
+                    break
+                brace = src_text.find("{", i)
+                semi = src_text.find(";", i)
+                if brace >= 0 and (semi < 0 or brace < semi):
+                    found = i
+                    break
+                start = i + 1
+            if found is not None:
                 break
-            brace = src_text.find("{", i)
-            semi = src_text.find(";", i)
-            if brace >= 0 and (semi < 0 or brace < semi):
-                found = i
-                break
-            start = i + 1
         if found is None:
             continue
         body = src_text.index("{", found)
@@ -752,7 +757,7 @@ def test_rename_exdev_hardening():
     funcs = _extract_static_functions(
         src_text,
         ["recursive_rmdir", "recursive_copy_dir", "vfs_rename_copy_file",
-         "xdev_temp_name", "vfs_rename"])
+         "xdev_temp_name", "is_fuse_hidden_name", "vfs_rename"])
     if "static int vfs_rename(" not in funcs:
         fail("抽取 vfs_rename", f"{src_path} 中未找到定义")
         return
@@ -792,6 +797,77 @@ def test_rename_exdev_hardening():
 # ═══════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════
+def test_open_unlink_no_hidden():
+    """打开中删除：本地路径必须「先删名、句柄继续可用」，不得出现 .fuse_hidden。
+
+    判别性：旧实现（libfuse 默认）在文件仍打开时把名字改成
+    .fuse_hidden<nodeid><ctr>，目录里会留下这个"改了名却没删掉"的文件；
+    新实现在本地路径上直接 unlink，隐藏名从头到尾不存在。
+    覆盖普通路径与本地 REDIRECT 路径（两者 backing 都是真实文件系统）。"""
+    log("\n━━━ 模块 9: 打开中删除（本地不产生 .fuse_hidden） ━━━")
+    tag = TEST_ID
+    cases = [
+        ("普通路径", Path(MNT) / "0" / "Download" / f"nsp_openunlink_{tag}.bin"),
+        ("REDIRECT 路径", Path(MNT) / "0" / "网盘" / f"nsp_openunlink_redir_{tag}.bin"),
+    ]
+    realdir = Path(STORAGE) / "0" / "Download"
+    for name, vpath in cases:
+        fd = os.open(vpath, os.O_CREAT | os.O_RDWR, 0o644)
+        os.write(fd, b"A" * 4096)
+        os.fsync(fd)
+        os.unlink(vpath)
+
+        hidden = sorted(p.name for p in realdir.glob(".fuse_hidden*"))
+        if hidden:
+            fail(f"{name}: 删除后不应出现隐藏名", f"实际 {hidden}")
+        else:
+            ok(f"{name}: 删除后目录里没有 .fuse_hidden")
+
+        listed = [n for n in os.listdir(vpath.parent) if n.startswith(".fuse_hidden")]
+        if listed:
+            fail(f"{name}: 目录列举不应看到隐藏名", f"实际 {listed}")
+        else:
+            ok(f"{name}: 目录列举看不到隐藏名")
+
+        try:
+            st = os.fstat(fd)
+            if st.st_size == 4096:
+                ok(f"{name}: 删除后 fstat 仍返回原大小")
+            else:
+                fail(f"{name}: 删除后 fstat 大小异常", f"st_size={st.st_size}")
+        except OSError as e:
+            fail(f"{name}: 删除后 fstat 失败", f"errno={e.errno}")
+
+        os.lseek(fd, 0, os.SEEK_END)
+        os.write(fd, b"B" * 100)
+        os.fsync(fd)
+        try:
+            st2 = os.fstat(fd)
+            if st2.st_size == 4196:
+                ok(f"{name}: 删除后写入仍生效且 fstat 跟着更新")
+            else:
+                fail(f"{name}: 删除后写入后 fstat 未更新", f"st_size={st2.st_size}")
+        except OSError as e:
+            fail(f"{name}: 删除后写入后 fstat 失败", f"errno={e.errno}")
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = os.read(fd, 4096 + 100)
+        if data == b"A" * 4096 + b"B" * 100:
+            ok(f"{name}: 删除后句柄仍可完整读回内容")
+        else:
+            fail(f"{name}: 删除后读回内容不符", f"len={len(data)}")
+        os.close(fd)
+
+        if os.path.exists(vpath):
+            fail(f"{name}: 关闭后路径不应存在")
+        else:
+            ok(f"{name}: 关闭后路径已消失")
+        if any(p.name.startswith(".fuse_hidden") for p in realdir.iterdir()):
+            fail(f"{name}: 关闭后仍有隐藏名残留")
+        else:
+            ok(f"{name}: 关闭后无隐藏名残留")
+
+
 def main():
     global PASS, FAIL, ERRORS
     log("═══ fuse_daemon 完整测试套件 ═══")
@@ -816,6 +892,7 @@ def main():
         test_rename_flags()
         test_rename_exdev()
         test_rename_exdev_hardening()
+        test_open_unlink_no_hidden()
         test_sqlite()
         test_concurrent()
     finally:

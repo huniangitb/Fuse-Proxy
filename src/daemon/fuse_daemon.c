@@ -66,6 +66,93 @@
 bool g_passthrough_enabled = false;
 bool g_disable_sandbox = false; /* 新增：禁用沙盒功能标志 */
 
+/* ================= 本地 open-unlink 的属性快照 =================
+   本地路径的「删除仍打开的文件」由 vfs_rename 直接 unlink（不产生 .fuse_hidden，
+   见 vfs_rename 内注释）。名字消失后，内核仍可能对打开句柄发 GETATTR（fstat）；
+   此时路径已不存在，必须用快照回答，否则 fstat(2) 会拿到 ENOENT——Android 自带
+   FUSE 在同样场景下 fstat 正常（实测 size 仍可读），我们与之对齐。
+   键是 FUSE 侧路径（rename 的 to、后续 getattr/write/release 的 path 都是同一个
+   隐藏名），故不受底层真实路径拼法影响。表很小：隐藏名本就只在 open-unlink 的
+   短窗口内存在；满了覆盖最旧项。 */
+#define HIDDEN_STAT_SLOTS 64
+typedef struct {
+    bool used;
+    unsigned long stamp;
+    char path[PATH_MAX];
+    struct stat st;
+} HiddenStatEntry;
+static HiddenStatEntry g_hidden_stats[HIDDEN_STAT_SLOTS];
+static pthread_mutex_t g_hidden_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long g_hidden_stat_tick;
+
+static void hidden_stat_put(const char* path, const struct stat* st) {
+    if (!path || !st) return;
+    pthread_mutex_lock(&g_hidden_stats_lock);
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < HIDDEN_STAT_SLOTS; i++) {
+        if (g_hidden_stats[i].used && strcmp(g_hidden_stats[i].path, path) == 0) {
+            slot = i;
+            break;
+        }
+        if (!g_hidden_stats[i].used && slot < 0) slot = i;
+        if (g_hidden_stats[i].stamp < g_hidden_stats[oldest].stamp) oldest = i;
+    }
+    if (slot < 0) slot = oldest; /* 满：覆盖最旧（隐藏名只存活到 release） */
+    HiddenStatEntry* e = &g_hidden_stats[slot];
+    e->used = true;
+    e->stamp = ++g_hidden_stat_tick;
+    strncpy(e->path, path, sizeof(e->path) - 1);
+    e->path[sizeof(e->path) - 1] = '\0';
+    e->st = *st;
+    pthread_mutex_unlock(&g_hidden_stats_lock);
+}
+
+static bool hidden_stat_get(const char* path, struct stat* out) {
+    if (!path || !out) return false;
+    bool found = false;
+    pthread_mutex_lock(&g_hidden_stats_lock);
+    for (int i = 0; i < HIDDEN_STAT_SLOTS; i++) {
+        if (g_hidden_stats[i].used && strcmp(g_hidden_stats[i].path, path) == 0) {
+            *out = g_hidden_stats[i].st;
+            g_hidden_stats[i].stamp = ++g_hidden_stat_tick;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_hidden_stats_lock);
+    return found;
+}
+
+/* 删除后仍可写：用本地句柄重新 fstat，刷新**已有**快照（size/mtime 与真实
+   一致）。只更新不新建——普通写入不能凭空注册快照，否则原路径在 unlink 后
+   会被误判为「仍存在」。 */
+static void hidden_stat_refresh(const char* path, int fd) {
+    if (!path || fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0) return;
+    pthread_mutex_lock(&g_hidden_stats_lock);
+    for (int i = 0; i < HIDDEN_STAT_SLOTS; i++) {
+        if (g_hidden_stats[i].used && strcmp(g_hidden_stats[i].path, path) == 0) {
+            g_hidden_stats[i].st = st;
+            g_hidden_stats[i].stamp = ++g_hidden_stat_tick;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_hidden_stats_lock);
+}
+
+static void hidden_stat_remove(const char* path) {
+    if (!path) return;
+    pthread_mutex_lock(&g_hidden_stats_lock);
+    for (int i = 0; i < HIDDEN_STAT_SLOTS; i++) {
+        if (g_hidden_stats[i].used && strcmp(g_hidden_stats[i].path, path) == 0) {
+            g_hidden_stats[i].used = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_hidden_stats_lock);
+}
+
 static int g_ready_fd = -1;
 /* 崩溃触发测试：--crash-test[=segv|abrt|bus]，验证崩溃日志捕获链路 */
 static int g_crash_test = 0; /* 0=无 1=SIGSEGV 2=SIGABRT 3=SIGBUS */
@@ -678,6 +765,15 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
     }
     if (lstat(p, st) == -1) {
         int err = errno;
+        /* open-unlink 后名字已不存在：先查删除时留下的属性快照（内核的 fstat
+           不总带 fh，实测 fi 为 NULL），再退回句柄 fstat。缺了这层，fstat(2)
+           会拿到 ENOENT——Android 自带 FUSE 在同样场景下 fstat 是正常的。 */
+        if (hidden_stat_get(path, st)) {
+            VFS_RETURN(0);
+        }
+        if (fi && fi->fh > 0 && !(fi->fh & NSP_FH_BACKEND_FLAG) && fstat((int)fi->fh, st) == 0) {
+            VFS_RETURN(0);
+        }
         if ((err == ENOENT || err == EACCES) &&
             (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             /* 虚拟目录（无真实底层文件，如 FTP 前缀/重定向祖先）：权限继承
@@ -1657,6 +1753,9 @@ static int vfs_write(const char* path, const char* buf, size_t size, off_t off,
         log_fuse_err("WRITE", path, err);
         return -err;
     }
+    /* 已 unlink 仍打开的本地文件：写入会改变 size/mtime，刷新属性快照，
+       使随后的 fstat 拿到真实值（而不是删除瞬间的旧值）。 */
+    hidden_stat_refresh(path, (int)fi->fh);
     return (int)ret;
 }
 
@@ -1686,6 +1785,8 @@ static int vfs_release(const char* path, struct fuse_file_info* fi) {
         }
         return 0; /* 后端句柄未命中后端：不 close（非 fd），避免崩溃 */
     }
+    /* 本地 open-unlink：最后一个句柄关闭，属性快照使命结束（名字早已删除） */
+    hidden_stat_remove(path);
     close(fi->fh);
     return 0;
 }
@@ -1963,6 +2064,22 @@ static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t
     return r;
 }
 
+/* libfuse 的「删除仍打开的文件」隐藏名：".fuse_hidden" + 16 位十六进制
+   （格式 %08x%08x = nodeid + 全局计数器）。识别它是为了在**本地**路径上
+   绕过隐藏名机制——本地 backing 支持 POSIX 的「先删名、后关句柄」，不需要
+   改名占位；后端路径仍走隐藏名（远端删掉会让下载中的句柄失去数据源）。 */
+static bool is_fuse_hidden_name(const char* name) {
+    static const char prefix[] = ".fuse_hidden";
+    if (!name || strncmp(name, prefix, sizeof(prefix) - 1) != 0) return false;
+    const char* p = name + sizeof(prefix) - 1;
+    int hex = 0;
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+        p++;
+        hex++;
+    }
+    return hex == 16 && *p == '\0';
+}
+
 static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* st) {
     int fd_src = open(src, O_RDONLY | O_CLOEXEC);
     if (fd_src < 0) return -errno;
@@ -2061,6 +2178,31 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
                (ok1 && redir_from) ? r1.real_path : NULL, mon_from);
     vfs_log_io(pkg_to, ctx->uid, "RENAME_TO", sub_to, (ok2 && redir_to) ? r2.real_path : NULL,
                mon_to);
+    /* 本地路径的 open-unlink：libfuse 发现文件仍打开时，会先把它改名成
+       .fuse_hidden<16hex>，等最后一个句柄 RELEASE 后再删。本地 backing 是
+       真实文件系统，unlink 打开中的文件完全合法（已打开的 fd 继续可读），
+       所以直接删源、不产生隐藏名——与 Android 自带 FUSE 的可见行为一致，
+       也不会在目录里留下「被改名却没删掉」的文件。后端路径不做此处理：
+       远端立即删除会让正在下载/上传的句柄失去数据源，仍由隐藏名兜底。 */
+    if (flags == 0 && !r1.is_ftp && !r2.is_ftp) {
+        const char* base = strrchr(sub_to, '/');
+        base = base ? base + 1 : sub_to;
+        if (is_fuse_hidden_name(base)) {
+            /* 先留属性快照再删：删完名字就没了，而内核随后仍可能对打开句柄
+               发 GETATTR（fstat）。快照以 FUSE 侧隐藏名为键，getattr/write/
+               release 收到的 path 都是同一个名字。 */
+            struct stat snap;
+            if (lstat(p_from, &snap) == 0) hidden_stat_put(to, &snap);
+            if (unlink(p_from) == 0) {
+                LOG_DBG("open-unlink 本地直删（不产生隐藏名）: %s", sub_from);
+                return 0;
+            }
+            int err = errno;
+            hidden_stat_remove(to);
+            log_fuse_err("UNLINK_HIDDEN", from, err);
+            return -err;
+        }
+    }
     /* 后端分派：from/to 命中后端时由模块方法重命名（两端须同一后端模块） */
     const NspModuleOps* bf_ops = NULL;
     const NspModuleOps* bt_ops = NULL;
