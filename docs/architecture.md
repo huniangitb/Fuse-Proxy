@@ -221,7 +221,15 @@ FUSE 回调（如 getattr）
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
 5. 此后该应用对 `/sdcard` 的访问经 FUSE → 内建引擎（`fw_rules`）匹配。
 
-**视图就绪语义（ACK）**：应用在 zygote `preAppSpecialize` 里经 companion 上报并等待 injector 的 ACK，收到后才继续 specialize。因此 ACK **只在目标进程的存储视图就绪后**发出：v1 由挂载线程在 `perform_app_mount_sync` 返回后 ACK，v2 由还原线程在 `perform_app_restore` 完成后 ACK；只有「无需任何视图操作」的分支（v3 全局视图已就绪、非目标且不还原、隔离进程/zygote、进程已死或 FUSE 暂不可用）才立即 ACK。旧实现在派发工作线程**之前**就 ACK，应用可能在代理视图就绪前访问存储（首次启动读到原始目录，或撞上合并挂载的裸挂载点窗口）。
+**视图就绪语义（应答三态 OK / DEFER / ERR）**：应用在 zygote `preAppSpecialize` 里经 companion 上报并等待 injector 的应答，收到后才继续 specialize。应答即"应用能否往下跑"的唯一信号：
+
+- `OK`：视图已就绪，或**无需任何视图操作**——v3 全局视图、v2 非目标且已还原、隔离进程/zygote、进程已死、FUSE 暂不可用。
+- `DEFER`：**仅 v1 目标应用**。目标命名空间里 `/storage/emulated` 尚未被 vold 装配（ColorOS 型 ROM 常见，实测 0.6–0.9s），此刻挂载必然失败。injector 不排重试、不报错，模块把进程记为 pending，在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST` 再来一次。
+- `ERR`：挂载/还原失败；应用照常启动但本次无代理视图（injector 已排入重试队列兜底）。
+
+`POST` 到达时 injector 在应用命名空间内带预算（`IPC_POST_READINESS_MS`，1800ms）等 `/storage/emulated` 出现，**挂载完成才回 `OK`**。于是应用的首个 `open()` 就已经看到代理视图——v1 不再有"进程已跑、视图后到"的窗口（此前实测窗口 0–890ms，窗口内写入会失败或被写进真实存储）。
+
+**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时才允许延迟应答；旧模块（不带 proto）走原有"就地挂载（等 1s）+ 异步重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector pre 预算 0（+2s 子进程余量）< companion 等 injector 2.5s < 模块等 companion 3.5s；POST 侧 injector 1800ms（+2s）< companion 6s < 模块 8s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
 
 #### 注入方法（`--inject-method=v1|v2|v3`）
 
@@ -244,9 +252,14 @@ FUSE 回调（如 getattr）
 第 2 步有两条并存的途径。除周期扫描外，Zygisk 模块（`src/zygisk/`）在应用创建时即时上报：
 
 ```
-app 进程  preAppSpecialize ──→ connectCompanion ──→ "REQ <pkg> <pid> <uid>"
-companion（root）           ──→ nsp_ipc_socket   ──→ "REPORT <pkg> <pid> <uid>"
+app 进程  preAppSpecialize ──→ connectCompanion ──→ "REQ <pkg> <pid> <uid> <proto>"
+companion（root）           ──→ nsp_ipc_socket   ──→ "REPORT <pkg> <pid> <uid> <proto>"
 injector  ipc_server.c 解析 ──→ 置 g_passive_mode，转入被动模式
+                            ←── OK / DEFER / ERR
+app 进程  postAppSpecialize ──→ "POST <pkg> <pid> <uid> <proto>"（仅 pre 收到 DEFER 时）
+companion（root）           ──→ "POST ..."（root 通道，与 REPORT 同一身份模型）
+injector  带预算挂载（1800ms）──→ 完成才回 OK
+                            ←── OK / ERR（应用在此阻塞，仍早于 Java 代码）
 ```
 
 injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫描（`maybe_periodic_scan`），此后新应用的发现完全依赖该模块——通知比轮询及时，也免去了持续扫描 `/proc` 的开销。

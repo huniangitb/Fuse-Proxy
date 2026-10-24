@@ -101,15 +101,38 @@ typedef struct {
        代理视图就绪前继续 specialize 并访问存储（首次启动读到原始目录，或撞上
        合并挂载的裸挂载点窗口 ENOENT）。 */
     int ack_fd;
+    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms）：0 = 立即裁决
+       （pre-specialize 快速尝试），>0 = 在其内等待（post-specialize 的 POST）。 */
+    int readiness_ms;
+    /* 未就绪时回 DEFER 而非 ERR：zygisk 会在 post-specialize 带预算重发 POST。
+       只有"新协议（proto>=2）+ v1 目标应用"的 pre 尝试为 true。 */
+    bool defer_on_fail;
 } IpcMountArg;
+
+/* 见 include/ipc_server.h 的契约说明（IPC_POST_READINESS_MS 亦定义在那里）。
+   独立成纯函数是为了让"哪条通道该等多久、失败该回什么"可被直编单测钉死——
+   真机上的 REPORT/POST 通道只允许 root 对端，普通单测进程无法伪造该凭据。 */
+int ipc_plan_readiness(bool is_post, bool is_report, int proto, bool* defer_on_fail) {
+    if (defer_on_fail) *defer_on_fail = false;
+    if (is_post) return IPC_POST_READINESS_MS;
+    if (is_report && proto >= 2) {
+        if (defer_on_fail) *defer_on_fail = true;
+        return 0;
+    }
+    return 1000;
+}
 
 /* 视图就绪语义的唯一出口：挂载/还原线程在真实完成后才应答并交还 fd。
    对端（zygisk companion）只把 ACK 当作"可以继续 specialize"的信号，
    所以这里的时序就是应用可见的存储视图时序。 */
-static void ipc_ack_and_close(int fd, bool ok) {
+static void ipc_reply_and_close(int fd, const char* verb) {
     if (fd < 0) return;
-    send(fd, ok ? "OK" : "ERR", ok ? 2 : 3, MSG_NOSIGNAL);
+    send(fd, verb, strlen(verb), MSG_NOSIGNAL);
     close(fd);
+}
+
+static void ipc_ack_and_close(int fd, bool ok) {
+    ipc_reply_and_close(fd, ok ? "OK" : "ERR");
 }
 
 /* 全局替换模式：非目标应用异步还原线程（卸载项目 FUSE，bind 回系统视图备份）。
@@ -236,7 +259,7 @@ static void* ipc_mount_thread(void* raw) {
     /* 同步挂载（阻塞到目标命名空间内的挂载真实完成）：ACK 必须是"视图已就绪"
        的信号。异步版 perform_app_mount 只负责 fork 就返回，完成事件回到主循环，
        无法与本次 ACK 对齐——那正是"应用先访问、代理视图后到"旧竞态的成因。 */
-    ret = perform_app_mount_sync(arg->pkg, arg->pid, arg->uid, NULL);
+    ret = perform_app_mount_sync(arg->pkg, arg->pid, arg->uid, NULL, arg->readiness_ms);
 
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     long elapsed_us =
@@ -248,6 +271,17 @@ static void* ipc_mount_thread(void* raw) {
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
         LOG("IPC挂载完成: %s(PID:%d) 耗时: %ldus（已延迟 ACK 到挂载完成）", arg->pkg, arg->pid,
             elapsed_us);
+    } else if (arg->defer_on_fail) {
+        /* pre-specialize 的快速尝试：视图尚未就绪（vold 还没把 /storage/emulated
+           装配进应用命名空间）。此时**不**排重试、不报错——zygisk 会在
+           post-specialize（应用 Java 代码执行前）带预算重发 POST，那次才是
+           权威结果。 */
+        LOG_DBG("IPC挂载未就绪，交由 zygisk post-specialize 重试: %s(PID:%d) 耗时: %ldus",
+                arg->pkg, arg->pid, elapsed_us);
+        remove_tracked(arg->pid);
+        ipc_reply_and_close(arg->ack_fd, "DEFER");
+        free(arg);
+        return NULL;
     } else {
         LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
         remove_tracked(arg->pid);
@@ -378,12 +412,33 @@ void handle_ipc_client_readable(int client_fd) {
     }
     char pkg[256];
     int pid = 0, uid = 0;
-    /* 两个动词 = 两条身份模型不同的通道（见 ipc_verify_app_identity 上方注释）：
-       REPORT 只允许 root companion，REQ 只允许应用自身并通过完整绑定校验。 */
-    bool is_report = (sscanf(buf, "REPORT %255s %d %d", pkg, &pid, &uid) == 3);
-    bool is_req = false;
-    if (!is_report) is_req = (sscanf(buf, "REQ %255s %d %d", pkg, &pid, &uid) == 3);
-    if (is_report || is_req) {
+    /* 三个动词 = 三条语义不同的通道（身份模型见 ipc_verify_app_identity 上方注释）：
+       REPORT（root companion，pre-specialize 上报）、POST（root companion，
+       post-specialize 的补挂载请求）、REQ（应用自身直连，历史通道，完整绑定校验）。
+       末尾可选 proto 令牌：>=2 的模块支持"pre 回 DEFER、post 发 POST"的两段式
+       补挂载；不带的旧模块一律走原有"就地挂载 + 异步重试"路径（零回归）。 */
+    int proto = 0;
+    bool is_report = false, is_req = false, is_post = false;
+    int nf = sscanf(buf, "REPORT %255s %d %d %d", pkg, &pid, &uid, &proto);
+    if (nf >= 3) {
+        is_report = true;
+        if (nf < 4) proto = 0;
+    } else {
+        proto = 0;
+        nf = sscanf(buf, "REQ %255s %d %d %d", pkg, &pid, &uid, &proto);
+        if (nf >= 3) {
+            is_req = true;
+            if (nf < 4) proto = 0;
+        } else {
+            proto = 0;
+            nf = sscanf(buf, "POST %255s %d %d %d", pkg, &pid, &uid, &proto);
+            if (nf >= 3) {
+                is_post = true;
+                if (nf < 4) proto = 0;
+            }
+        }
+    }
+    if (is_report || is_req || is_post) {
         /* 输入校验：拒绝越界 pid/uid，避免后续 /proc/<pid> 路径被构造用于越权访问 */
         if (pid <= 0 || pid >= 1048576 /* PID_BITMAP_MAX, Android PID 上限 */) {
             LOG_WRN("IPC: 拒绝非法 pid=%d", pid);
@@ -403,12 +458,13 @@ void handle_ipc_client_readable(int client_fd) {
             peer_pid = -1;
             peer_uid = (uid_t)-1;
         }
-        if (is_report) {
+        if (is_report || is_post) {
             /* root companion 通道：pre-specialize 上报的 pid/uid/pkg 是"即将成为
-               目标"的值，不能要求当前进程身份匹配；root 是唯一合法对端。 */
+               目标"的值，不能要求当前进程身份匹配；root 是唯一合法对端。
+               POST（post-specialize 补挂载）同属该通道，语义与校验完全一致。 */
             if (peer_uid != 0) {
-                LOG_WRN("IPC: 拒绝非 root 对端的 REPORT（对端 uid=%u）；应用自身请走 REQ",
-                        (unsigned)peer_uid);
+                LOG_WRN("IPC: 拒绝非 root 对端的 %s（对端 uid=%u）；应用自身请走 REQ",
+                        is_post ? "POST" : "REPORT", (unsigned)peer_uid);
                 send(client_fd, "ERR", 3, MSG_NOSIGNAL);
                 close(client_fd);
                 return;
@@ -458,8 +514,10 @@ void handle_ipc_client_readable(int client_fd) {
         if (!is_target) {
             /* 注入方法 v2：非目标应用需主动卸载项目 FUSE 并还原系统视图
                （IPC 通知是最常见的应用启动路径，必须覆盖，否则非目标应用
-               永远停留在项目 FUSE 视图上）；v3 不还原——默认全局挂载 */
-            if (inject_restore_nontarget()) {
+               永远停留在项目 FUSE 视图上）；v3 不还原——默认全局挂载。
+               POST 只可能出现在"pre 已判定为目标应用"之后，非目标不应收到；
+               真收到时按已就绪放行，绝不重复做还原。 */
+            if (!is_post && inject_restore_nontarget()) {
                 IpcMountArg* arg = malloc(sizeof(IpcMountArg));
                 if (arg) {
                     strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
@@ -468,6 +526,8 @@ void handle_ipc_client_readable(int client_fd) {
                     arg->uid = uid;
                     arg->mnt_src[0] = '\0';
                     arg->ack_fd = client_fd; /* 还原完成后由线程 ACK + close */
+                    arg->readiness_ms = 0;
+                    arg->defer_on_fail = false;
                     pthread_t tid;
                     if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
                         pthread_detach(tid);
@@ -500,7 +560,15 @@ void handle_ipc_client_readable(int client_fd) {
             return;
         }
 
-        /* v1：挂载线程完成目标命名空间内的挂载后才 ACK（视图就绪语义） */
+        /* v1 就绪预算与失败语义按通道区分：
+           - POST（post-specialize）：应用已被本进程阻塞，就地等到视图出现再挂；
+             失败才排重试（权威路径）。
+           - REPORT + proto>=2（pre-specialize）：只快速试一次（预算 0）——视图已
+             就绪时立刻挂上（保住"首写前就绪"的快路径），未就绪则回 DEFER，让
+             zygisk 在 post-specialize 重发 POST；此路径不排重试、不报错。
+           - 旧模块（无 proto）/ REQ：维持原有"等待 1s + 失败排重试"行为。 */
+        bool defer_on_fail = false;
+        int readiness_ms = ipc_plan_readiness(is_post, is_report, proto, &defer_on_fail);
         IpcMountArg* arg = malloc(sizeof(IpcMountArg));
         if (arg) {
             strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
@@ -509,10 +577,14 @@ void handle_ipc_client_readable(int client_fd) {
             arg->uid = uid;
             arg->mnt_src[0] = '\0';
             arg->ack_fd = client_fd; /* 挂载完成后由线程 ACK + close */
+            arg->readiness_ms = readiness_ms;
+            arg->defer_on_fail = defer_on_fail;
             pthread_t tid;
             if (pthread_create(&tid, NULL, ipc_mount_thread, arg) == 0) {
                 pthread_detach(tid);
-                LOG_DBG("IPC派发挂载线程（ACK 延迟到挂载完成）: %s(PID:%d)", clean_pkg, pid);
+                LOG_DBG("IPC派发挂载线程（%s，readiness=%dms，ACK 延迟到挂载完成）: %s(PID:%d)",
+                        is_post ? "POST" : (defer_on_fail ? "pre/DEFER" : "legacy"), readiness_ms,
+                        clean_pkg, pid);
                 return;
             }
             LOG_ERR("IPC创建挂载线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);

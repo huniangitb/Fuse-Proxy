@@ -43,6 +43,25 @@
    运行时拖进 zygote 子进程。 */
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 
+/* 协议版本：2 = 支持"pre 回 DEFER、post 发 POST"的两段式补挂载。
+   injector 只在收到 >=2 的 proto 时才允许延迟应答；旧模块（不带 proto）走
+   原有的"就地挂载 + 异步重试"路径，故新 injector 与旧模块组合零回归。 */
+#define NSP_ZYGISK_PROTO 2
+
+/* 各段等待上限（都必须有界，任何一段超时都按"放行应用"处理，绝不挂死）。
+   companion 侧等 injector：REQ 只需一次快速尝试，POST 可能要等 vold 把
+   /storage/emulated 装配进应用命名空间（~1s），故给足余量。 */
+/* 逐段放宽，保证"内层先裁决、外层后超时"的严格顺序——否则外层先超时会把
+   injector 正在做的挂载晾在半空（应用已放行、视图稍后才到，等于没修）：
+     injector POST 预算 1800ms + 子进程超时余量 2000ms ≈ 3.8s
+     < companion POST 6s < module POST 8s
+     injector pre 预算 0 + 子进程超时余量 2000ms ≈ 2s
+     < companion REQ 2.5s < module REQ 3.5s */
+#define COMPANION_REQ_TIMEOUT_MS  2500
+#define COMPANION_POST_TIMEOUT_MS 6000
+#define MODULE_REQ_TIMEOUT_MS     3500
+#define MODULE_POST_TIMEOUT_MS    8000
+
 /* 抽象命名空间 UDS 地址填充。等价于项目的 nsp_uds_abstract_addr()
    （src/core/nsp_util.c），含同一处修正：地址长度按**截断后**实际写入的
    内容计算，而非 strlen(name)——名称超长时后者会让长度越过 sun_path 的
@@ -67,54 +86,91 @@ static bool is_user_app(uint32_t uid) {
 
 /* ============================ Companion（root 权限） ============================ */
 
+/* 从 injector 读应答动词（OK/ERR/DEFER），超时或无应答一律回落 "ERR"。
+   应答是短字符串且不带换行，读到即返回。 */
+static void companion_wait_reply(int fd, int timeout_ms, char* out, size_t outsz) {
+    snprintf(out, outsz, "ERR");
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    if (poll(&pfd, 1, timeout_ms) <= 0) return;
+    char buf[16] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    if (strcmp(buf, "OK") == 0 || strcmp(buf, "DEFER") == 0) {
+        snprintf(out, outsz, "%s", buf);
+    }
+}
+
+/* 单条连接上最多处理两个请求（pre 的 REQ → post 的 POST）：应用在
+   post-specialize 已经处于应用沙箱域，**无法**再 connect 到 zygiskd
+   （connectCompanion 会失败），故必须复用 pre-specialize 建立的那条连接。
+   读超时保证"收到 DEFER 却不来 POST"的连接最终被回收。 */
+#define COMPANION_IDLE_TIMEOUT_S 15
+
 static void companion_handler(int client_fd) {
+    struct timeval rtv = {.tv_sec = COMPANION_IDLE_TIMEOUT_S, .tv_usec = 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+
     char buf[1024];
-    ssize_t len = read(client_fd, buf, sizeof(buf) - 1);
-    if (len <= 0) {
-        close(client_fd);
-        return;
-    }
-    buf[len] = '\0';
+    for (;;) {
+        ssize_t len = read(client_fd, buf, sizeof(buf) - 1);
+        if (len <= 0) {
+            close(client_fd);
+            return;
+        }
+        buf[len] = '\0';
 
-    char pkg_name[256];
-    int pid = 0, uid = 0;
-    if (sscanf(buf, "REQ %255s %d %d", pkg_name, &pid, &uid) != 3) {
-        close(client_fd);
-        return;
-    }
+        /* 应用侧两个动词：
+           - REQ ：pre-specialize 上报，injector 决定"就地挂载（OK）"还是
+                   "视图未就绪、等 post 再来（DEFER）"；
+           - POST：post-specialize 补挂载，injector 会阻塞到视图就绪再挂，
+                   然后回 OK/ERR。
+           两者都原样转发（REQ→REPORT、POST→POST），并把 injector 的应答原样
+           回给应用——应答即"应用能否继续往下跑"的唯一信号。 */
+        char verb[8] = {0}, pkg_name[256] = {0}, proto[32] = {0};
+        int pid = 0, uid = 0;
+        int nf = sscanf(buf, "%7s %255s %d %d %31s", verb, pkg_name, &pid, &uid, proto);
+        if (nf < 4) {
+            close(client_fd);
+            return;
+        }
+        bool is_post = (strcmp(verb, "POST") == 0);
+        const char* fwd_verb = is_post ? "POST" : "REPORT";
+        int timeout_ms = is_post ? COMPANION_POST_TIMEOUT_MS : COMPANION_REQ_TIMEOUT_MS;
 
-    /* 转发给 injector。app 进程自身无权连接 injector 的 socket，故经本
-       companion（root）中转。 */
-    int inj_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (inj_fd >= 0) {
-        struct sockaddr_un addr;
-        socklen_t addr_len = uds_abstract_addr(&addr, IPC_SOCKET_NAME);
+        /* 转发给 injector。app 进程自身无权连接 injector 的 socket，故经本
+           companion（root）中转。 */
+        char reply[16];
+        snprintf(reply, sizeof reply, "ERR");
+        int inj_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (inj_fd >= 0) {
+            struct sockaddr_un addr;
+            socklen_t addr_len = uds_abstract_addr(&addr, IPC_SOCKET_NAME);
 
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 500000};
-        setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            struct timeval tv = {.tv_sec = timeout_ms / 1000 + 1, .tv_usec = 0};
+            setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-        if (connect(inj_fd, (struct sockaddr*)&addr, addr_len) == 0) {
-            char report_msg[512];
-            int msg_len =
-                snprintf(report_msg, sizeof(report_msg), "REPORT %s %d %d", pkg_name, pid, uid);
-            if (write(inj_fd, report_msg, msg_len) > 0) {
-                /* 等 injector 的 ACK：确保其已受理再放行应用继续 specialize，
-                   否则应用可能先于挂载完成访问存储。读失败不改变结果（上报
-                   已发出），仅记日志。 */
-                char ack[16];
-                ssize_t ack_len = read(inj_fd, ack, sizeof(ack));
-                if (ack_len > 0) {
-                    LOGD("Companion: 已上报 %s (PID:%d, UID:%d)", pkg_name, pid, uid);
-                } else {
-                    LOGD("Companion: %s 上报后未收到 ACK", pkg_name);
+            if (connect(inj_fd, (struct sockaddr*)&addr, addr_len) == 0) {
+                char report_msg[512];
+                int msg_len = (nf >= 5) ? snprintf(report_msg, sizeof(report_msg), "%s %s %d %d %s",
+                                                   fwd_verb, pkg_name, pid, uid, proto)
+                                        : snprintf(report_msg, sizeof(report_msg), "%s %s %d %d",
+                                                   fwd_verb, pkg_name, pid, uid);
+                if (write(inj_fd, report_msg, msg_len) > 0) {
+                    /* 等 injector 的应答：REQ 等它决定 OK/DEFER；POST 等它把
+                       挂载做完。读失败不改变结果（上报已发出），按 ERR 放行。 */
+                    companion_wait_reply(inj_fd, timeout_ms, reply, sizeof reply);
                 }
             }
+            close(inj_fd);
         }
-        close(inj_fd);
-    }
 
-    write(client_fd, "OK", 2);
+        LOGD("Companion: %s %s (PID:%d, UID:%d) → %s", verb, pkg_name, pid, uid, reply);
+        write(client_fd, reply, strlen(reply));
+        /* 只有 DEFER 才继续留在连接上等 POST；OK/ERR 即本条连接使命结束 */
+        if (strcmp(reply, "DEFER") != 0) break;
+    } /* for (;;) */
     close(client_fd);
 }
 
@@ -138,27 +194,76 @@ class AppReporterModule : public zygisk::ModuleBase {
         }
         const char* final_name = nice_name ? nice_name : "unknown";
 
-        int fd = api->connectCompanion();
+        snprintf(pkg_, sizeof pkg_, "%s", final_name);
+        uid_ = args->uid;
+        pending_ = false;
+
+        companion_fd_ = api->connectCompanion();
+        int fd = companion_fd_;
         if (fd >= 0) {
             char req_buf[512];
-            int req_len =
-                snprintf(req_buf, sizeof(req_buf), "REQ %s %d %d", final_name, getpid(), args->uid);
+            int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %u %d", final_name,
+                                   getpid(), args->uid, NSP_ZYGISK_PROTO);
             if (write(fd, req_buf, req_len) > 0) {
-                /* 等 companion 完成中转（上限 1s）：specialize 阶段阻塞会拖慢
-                   应用冷启动，故设上限而非无限等待。 */
+                /* 等 injector 的判决（上限 2s）：OK = 视图已就绪/无需挂载，
+                   可直接继续；DEFER = 目标 ns 里 /storage/emulated 还没装配
+                   好，post-specialize 再来一次；超时按 OK 处理（fail-open，
+                   绝不因 IPC 异常拖住应用冷启动）。 */
+                char reply[16] = {0};
                 struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-                poll(&pfd, 1, 1000);
-                LOGI("App [%s] (UID:%u) 已上报", final_name, args->uid);
+                if (poll(&pfd, 1, MODULE_REQ_TIMEOUT_MS) > 0) {
+                    ssize_t rn = read(fd, reply, sizeof(reply) - 1);
+                    if (rn > 0) {
+                        reply[rn] = '\0';
+                        pending_ = (strcmp(reply, "DEFER") == 0);
+                    }
+                }
             }
-            close(fd);
+            /* DEFER 时**保留**连接：post-specialize 已处于应用沙箱域，无法再
+               connectCompanion，只能复用这条 pre-specialize 建立的连接。 */
+            if (!pending_) {
+                close(fd);
+                companion_fd_ = -1;
+            }
         }
 
         if (nice_name) {
             env->ReleaseStringUTFChars(args->nice_name, nice_name);
         }
+        LOGI("App [%s] (UID:%u) 上报完成%s", final_name, args->uid,
+             pending_ ? "：视图未就绪，post-specialize 补挂载" : "");
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
+        /* v1 补挂载：pre-specialize 时 injector 回 DEFER 的进程在这里阻塞等待，
+           直到 injector 在**应用命名空间内**把 /storage/emulated 换成项目 FUSE。
+           本回调仍早于应用 Java 代码（Application.onCreate）执行，因此应用的
+           首次写入就能看到代理视图——这正是把"异步重试队列"搬到 zygisk 的目的。
+           只在 pending_ 时发起 IPC：未命中配置的应用、v2/v3（全局替换）以及
+           injector 不在线的情况都不会多一次往返，也不会被阻塞。 */
+        if (pending_) {
+            pending_ = false;
+            int fd = companion_fd_;
+            companion_fd_ = -1;
+            if (fd >= 0) {
+                char req_buf[512];
+                int req_len = snprintf(req_buf, sizeof(req_buf), "POST %s %d %u %d", pkg_, getpid(),
+                                       uid_, NSP_ZYGISK_PROTO);
+                if (write(fd, req_buf, req_len) > 0) {
+                    char reply[16] = {0};
+                    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+                    if (poll(&pfd, 1, MODULE_POST_TIMEOUT_MS) > 0) {
+                        ssize_t rn = read(fd, reply, sizeof(reply) - 1);
+                        if (rn > 0) reply[rn] = '\0';
+                    }
+                    LOGI("App [%s] (PID:%d) 补挂载结果: %s", pkg_, getpid(),
+                         reply[0] ? reply : "无应答");
+                }
+                close(fd);
+            } else {
+                LOGI("App [%s] 补挂载失败: 无可用 companion 连接", pkg_);
+            }
+        }
         /* 上报已完成，卸载自身以保持应用进程纯净 */
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
@@ -166,6 +271,14 @@ class AppReporterModule : public zygisk::ModuleBase {
   private:
     zygisk::Api* api = nullptr;
     JNIEnv* env = nullptr;
+    /* 跨 pre/post 的进程级状态：pkg/uid 用于 POST 报文，pending_ 标记"pre 收到
+       DEFER、需要 post 补挂载"。 */
+    char pkg_[256] = {0};
+    uint32_t uid_ = 0;
+    bool pending_ = false;
+    /* pre-specialize 建立、在 DEFER 时保留到 post-specialize 的 companion 连接。
+       post 阶段已降权进应用沙箱域，无法再 connect 到 zygiskd，只能复用。 */
+    int companion_fd_ = -1;
 };
 
 REGISTER_ZYGISK_MODULE(AppReporterModule)

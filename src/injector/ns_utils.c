@@ -574,8 +574,11 @@ struct CombinedMountArgs {
     const char* backup;
     char (*preserve_paths)[256];
     int preserve_count;
-    pid_t target_pid;    /* 就绪等待期间的存活检查目标 */
-    bool readiness_gate; /* 进程生命周期首次注入：挂载前先等 /storage/emulated 出现 */
+    pid_t target_pid; /* 就绪等待期间的存活检查目标 */
+    /* 挂载前等待目标 ns 内 /storage/emulated 出现的预算（ms），0 = 只查一次、
+       缺失即裁决失败。IPC 的 pre-specialize 尝试传 0（未就绪就回 DEFER，由
+       zygisk 在 post-specialize 带真实预算重发 POST）；异步路径首次注入传 1000。 */
+    int readiness_ms;
 };
 
 /* 就绪门控记录（父进程侧）：同一 pid 仅首次注入执行存在性等待，后续
@@ -634,28 +637,36 @@ static int do_combined_mount(void* raw_args) {
        待 vold 完成装配：100ms 步进、总上限 ~1s，期间进程死亡立即放弃；
        超时返回 ENOENT 交由重试队列按指数退避接管。全程不主动创建目录，
        且失败发生在任何卸载之前，应用原生视图零污染 */
-    if (args->readiness_gate && access(target, F_OK) != 0) {
+    /* 存在性判定必须在任何卸载之前：目标缺失时若继续走卸载流程，会把应用留在
+       "裸"状态（连 /storage/emulated 都没有）。预算由调用方给定：
+         - 0（IPC pre-specialize 快速尝试）：只查一次，缺失立即 ENOENT，由 zygisk
+           在 post-specialize 重发 POST；
+         - >0（POST / 异步首次注入）：100ms 步进等待 vold 装配完成。 */
+    if (access(target, F_OK) != 0) {
         bool ready = false;
-        for (int attempt = 0; attempt < 10; attempt++) {
+        int waited = 0;
+        while (waited < args->readiness_ms) {
             if (kill(args->target_pid, 0) != 0) {
                 log_ns_error("[ns_error] [%s] 等待 %s 出现期间目标进程退出\n", pkg, target);
                 log_internal(LOG_WARN, "[ns_error] [%s] 等待 %s 出现期间目标进程退出", pkg, target);
                 return ESRCH;
             }
             usleep(100 * 1000);
+            waited += 100;
             if (access(target, F_OK) == 0) {
                 ready = true;
                 break;
             }
         }
         if (!ready) {
-            log_ns_error("[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列\n", pkg,
-                         target);
-            log_internal(LOG_WARN, "[ns_error] [%s] %s 在应用命名空间持续缺失(~1s)，交由重试队列",
-                         pkg, target);
+            log_ns_error("[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列\n",
+                         pkg, target, args->readiness_ms);
+            log_internal(LOG_WARN,
+                         "[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列", pkg,
+                         target, args->readiness_ms);
             return ENOENT;
         }
-        LOG_DBG("[%s] %s 已就绪（等待后出现），继续合并挂载", pkg, target);
+        LOG_DBG("[%s] %s 已就绪（等待 %dms 后出现），继续合并挂载", pkg, target, waited);
     }
     size_t tlen = strlen(target); /* preserve 恢复段用它剥前缀（见下方 rel 解析） */
     char backup_mounts[128][NS_MOUNT_PATH_MAX];
@@ -806,22 +817,30 @@ static int do_combined_mount(void* raw_args) {
     return 0;
 }
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target,
-                      const char* backup, char preserve_paths[][256], int preserve_count) {
+                      const char* backup, char preserve_paths[][256], int preserve_count,
+                      int readiness_ms) {
     /* 父进程命名空间先行 mkdir backup：确保目标目录在宿主存在——
        子进程 do_combined_mount 的 mkdir 在目标应用命名空间执行，
        若 /data/Namespace-Proxy 在该命名空间不可见会连带 mount 目标失败 */
     if (backup && backup[0]) {
         mkdir_recursive(backup);
     }
-    bool gate = !ns_readiness_done(pid);
-    if (gate) ns_readiness_mark(pid);
-    struct CombinedMountArgs args = {pkg, source, target, backup, preserve_paths, preserve_count,
-                                     pid, gate};
+    struct CombinedMountArgs args;
+    memset(&args, 0, sizeof args);
+    args.pkg = pkg;
+    args.source = source;
+    args.target = target;
+    args.backup = backup;
+    args.preserve_paths = preserve_paths;
+    args.preserve_count = preserve_count;
+    args.target_pid = pid;
+    args.readiness_ms = readiness_ms > 0 ? readiness_ms : 0;
     int child_err = 0;
-    /* 门控最坏等待 ~1s（就绪性检查在子进程内）：默认 500ms 预算会在等待中
-       SIGKILL 子进程，此处放宽到 2s——健康路径门控仅一次 access(<µs) 无感，
-       仅 ColorOS 型缺失场景才真正消耗预算 */
-    int ret = run_in_mnt_ns_timeout(pid, do_combined_mount, &args, &child_err, 2000);
+    /* 子进程预算 = 就绪等待 + 2s 余量：等待发生在子进程内，超时会被 SIGKILL，
+       预算必须留够（旧实现固定 2s 对应 1s 门控）。健康路径只有一次 access，
+       不消耗预算。 */
+    int budget_ms = (args.readiness_ms > 0 ? args.readiness_ms : 0) + 2000;
+    int ret = run_in_mnt_ns_timeout(pid, do_combined_mount, &args, &child_err, budget_ms);
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
 }
@@ -871,7 +890,7 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
     args->preserve_count = 0;
     /* 全局注入为纯追加 bind，无卸载前置流程，无需就绪门控 */
     args->target_pid = pid;
-    args->readiness_gate = false;
+    args->readiness_ms = 0;
     int ret = run_in_mnt_ns_async(pid, pkg, do_global_mount, args, args);
     if (ret < 0) {
         free((void*)args->source);
@@ -883,7 +902,7 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
 
 /* 同步版全局挂载：挂载完成才返回，用于 IPC 线程 */
 int ns_global_mount(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs args = {pkg, source, target, NULL, NULL, 0, pid, false};
+    struct CombinedMountArgs args = {pkg, source, target, NULL, NULL, 0, pid, 0};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_global_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -907,8 +926,8 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     /* 就绪门控标记在父进程侧（fork COW 子进程写不回传）：无论本次成败，
        进过一次即视为已完成首次判断，同 pid 后续注入/重试跳过等待 */
     args->target_pid = pid;
-    args->readiness_gate = !ns_readiness_done(pid);
-    if (args->readiness_gate) ns_readiness_mark(pid);
+    args->readiness_ms = ns_readiness_done(pid) ? 0 : 1000;
+    if (args->readiness_ms > 0) ns_readiness_mark(pid);
     int ret = run_in_mnt_ns_async(pid, pkg, do_combined_mount, args, args);
     if (ret < 0) {
         free((void*)args->pkg);

@@ -180,19 +180,22 @@ static void reset_case(const char* fail_source, const char* family_root) {
     g_family_root = family_root;
 }
 
-static int run_combined(void) {
+static int run_combined_with(const char* target, int readiness_ms) {
     struct CombinedMountArgs args = {
         .pkg = "com.test.target",
         .source = "/mnt/nsp_global",
-        .target = "/storage/emulated",
+        .target = target,
         .backup = "/var/fuse-proxy/backup/storage",
         .preserve_paths = nullptr,
         .preserve_count = 0,
         .target_pid = 1,
-        .readiness_gate = false,
+        .readiness_ms = readiness_ms,
     };
     return do_combined_mount(&args);
 }
+
+/* 常规用例：目标视图已存在（宿主上 /storage/emulated 真实存在）、预算 0 */
+static int run_combined(void) { return run_combined_with("/storage/emulated", 0); }
 
 int main(void) {
     printf("── do_combined_mount 合并挂载失败回滚（失败注入） ──\n");
@@ -234,6 +237,19 @@ int main(void) {
     check("C2 成功路径只挂载一次（无回滚）", g_mount_calls == 1,
           g_mount_calls == 1 ? "" : "成功路径出现了多余挂载");
     check("C3 无回滚日志", !log_has("已回滚") && !log_has("回滚未成功"), "");
+
+    /* D. 目标视图未就绪（readiness_ms=0）→ 必须在**任何卸载之前**就返回 ENOENT：
+          v1 两段式补挂载把"未就绪"当作 DEFER 的信号，若这里先把应用卸载成裸状态
+          再失败，应用会在等到 POST 之前就失去 /storage/emulated。 */
+    reset_case(nullptr, nullptr);
+    errno = 0;
+    rc = run_combined_with("/nonexistent/nsp_emulated", 0);
+    check("D1 目标缺失 + 预算0 → 立即 ENOENT", rc == ENOENT,
+          rc == ENOENT ? "" : "未按未就绪返回 ENOENT");
+    check("D2 目标缺失时零挂载调用（判定早于卸载/挂载）", g_mount_calls == 0,
+          g_mount_calls == 0 ? "" : "目标缺失仍发起了挂载");
+    check("D3 日志报告缺失而非回滚", log_has("缺失") && !log_has("已回滚"),
+          log_has("缺失") ? "" : "缺少缺失日志");
 
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
     return g_fail;
