@@ -183,6 +183,18 @@ make-hide-fixture)
     chmod 644 "$_d/secret.txt"
     echo "FIXTURE_READY"
     ;;
+unlink-fixture)
+    need_root
+    # 历史残留夹具：libfuse 的隐藏名文件直接落在磁盘上，应用列举必须看不到
+    # （本地路径已改为直删；该夹具验证 readdir 过滤，文件本身不得被删）。
+    _d=/data/media/0/nsp_verify/unlink
+    mkdir -p "$_d" || die "创建 unlink 夹具目录失败"
+    printf 'NSP_LEGACY_HIDDEN
+' > "$_d/.fuse_hidden0000000000000001" || die "写隐藏名夹具失败"
+    chmod 755 /data/media/0/nsp_verify "$_d"
+    chmod 644 "$_d/.fuse_hidden0000000000000001"
+    echo "UNLINK_FIXTURE_READY"
+    ;;
 reload-config)
     need_root
     [ -f "$STAGE/injector.conf" ] || die "缺少 staging/injector.conf"

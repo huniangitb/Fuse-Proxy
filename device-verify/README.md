@@ -125,7 +125,7 @@ v1 的补挂载已从 injector 的异步重试队列搬到 Zygisk：`preAppSpeci
 | F | 1/2/3 | 1 / 0 / 2 ms | 无（首写前已就绪） | 0 |
 
 **结论：窗口消失。** 三轮冷启动里探针的**第一次**写入就已经看到代理视图（`fuse=1`），
-`a` 族全部落沙盒、`b` 族全部 `ENOENT`、真实 Download 零文件；功能断言 98/98 全绿。
+`a` 族全部落沙盒、`b` 族全部 `ENOENT`、真实 Download 零文件；功能断言 99/99 全绿。
 设备侧日志可见完整两段式：`Companion: REQ ... → DEFER` → injector「挂载未就绪，交由
 zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 
@@ -133,7 +133,7 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 但这次是**阻塞在应用代码之前**）；生产配置无规则时不会产生 `DEFER`（实测生产应用全部
 `→ OK`，零 DEFER），v2/v3 与非目标应用同理。
 
-## 断言（57 项功能 + 11 项 open-unlink + 30 项竞态）
+## 断言（57 项功能 + 12 项 open-unlink + 30 项竞态）
 
 - 注入就绪：5 个功能探针 + hide 阶段 B 各一条，耗时 ≤ 12s。
 - FTP / SFTP：探针 write/read/list/canary 成功；宿主后端文件存在且内容为 `NSP_PROBE:<pkg>:<ts>`；
@@ -144,7 +144,8 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
   阶段 B 列举不含。
 - plain：真实外部目录 `Android/data/nsp.probe.plain/files/plain.txt` 存在。
 - unlink（打开中删除）：delete/hidden_open/fstat/read/hidden_closed/exists_closed 六步成功；
-  删除瞬间与关闭后目录里都**没有** `.fuse_hidden`；真实存储无残留文件（宿主再扫一遍设备侧）。
+  删除瞬间与关闭后目录里都**没有** `.fuse_hidden`；宿主预置的历史隐藏名夹具仍物理存在
+  （证明是 readdir 过滤而非删除），设备侧扫描无新增残留。
 - 竞态（每轮 10 项 × 3 轮）：探针收尾、有采样、采到就绪后写入；就绪后写入全部成功/全部落沙盒/
   真实 Download 无文件/HIDE 生效；就绪前写入未落沙盒、未写真实 HIDE 目录；`fuse` 标志单调。
   「就绪前侧漏」默认只告警（`--strict-race` 计失败）。
@@ -152,8 +153,8 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 
 ## 本次验收结果（2026-10-24，OPD2404 / Android 16 / KernelSU）
 
-- `python3 device-verify/host/run-verify.py --serial 64a4bad0 --skip-build` → **98/98 通过，退出码 0**
-  （57 项功能 + 11 项 open-unlink + 30 项竞态；竞态侧漏为告警，见上节实测表）。
+- `python3 device-verify/host/run-verify.py --serial 64a4bad0 --skip-build` → **99/99 通过，退出码 0**
+  （57 项功能 + 12 项 open-unlink + 30 项竞态；竞态侧漏为告警，见上节实测表）。
 - 两段式补挂载后探针在应用 Java 代码前即就绪（unlink 探针实测 ready=22ms），不再依赖 1s 重试队列。
 - FTP/SFTP 后端落盘内容一致；真实存储零侧漏。SANDBOX 真实共享目录零写入、沙盒内容正确。
   HIDE 两阶段 ENOENT 且真实夹具仍在；plain 对照正常；生产配置未变、服务已恢复。
