@@ -475,6 +475,12 @@ remote_dir = /srv/backup
 `host_key_check` 保留：密码认证同样要校验主机密钥，删掉 `known_hosts` 会让这个开关
 永远无从生效（文件不可读 + 开关 on = 连接必失败，模块启动时 loud 提示补文件或关开关）。
 
+**Android 的公钥认证必须给 `<key_file>.pub`**：Android 侧 libssh2 以 mbedTLS 为后端，既不解
+析 OpenSSH 新格式私钥，也不会像 OpenSSL/gcrypt 后端那样从私钥里提取公钥；只给私钥时服务器
+一律回认证失败。模块在 `ftp_easy_new` 中检测同目录 `<key_file>.pub` 可读即自动设置
+`CURLOPT_SSH_PUBLIC_KEYFILE`（缺失则保持旧行为，GNU/OpenSSL 后端仍可自行提取），故手工配置
+`key_file` 时请使用 PEM 私钥并同时放好 `.pub`。真机验证流程见 `device-verify/README.md`。
+
 协议分派只落在六处（其余代码协议无关）：URL scheme（`ftp://`/`sftp://`）、失败分类（见下）、`getattr` 探针顺序、LIST 时间口径、quote 命令字（`DELE/MKD/RMD` ↔ `rm/mkdir/rmdir`、`RNFR/RNTO` ↔ 单条 `rename`）、`ftp_easy_new` 的 SSH 选项。四条**与 FTP 不同、改错就出错**的语义：
 
 1. **`CURLINFO_RESPONSE_CODE` 在 SFTP 下恒为 0**（libcurl 只给 FTP/SMTP 填 `info.httpcode`）。照抄 FTP 的 `resp==0 ⇒ 后端不可达` 判据会把每个业务失败（不存在/无权限/认证失败）都计进熔断窗口 → 应用探测若干缺失路径（`os.path.exists`）就把健康后端置静默、完好文件被误报 EIO。故 `res_is_unavailable()` 按协议分支：SFTP 只把连接/协议层 `CURLE` 计入。
