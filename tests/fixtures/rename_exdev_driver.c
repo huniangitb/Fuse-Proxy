@@ -57,6 +57,23 @@
 /* ---- 日志：驱动里不落盘，只保留调用点 ---- */
 #define LOG_ERR(...) ((void)0)
 #define LOG_WRN(...) ((void)0)
+#define LOG_DBG(...) ((void)0)
+
+/* vfs_rename 内的本地 open-unlink 快照钩子：本驱动不涉及打开中删除，空实现 */
+static void hidden_stat_put(const char* path, const struct stat* st) {
+    (void)path;
+    (void)st;
+}
+static void hidden_stat_remove(const char* path) { (void)path; }
+static bool hidden_stat_get(const char* path, struct stat* st) {
+    (void)path;
+    (void)st;
+    return false;
+}
+static void hidden_stat_refresh(const char* path, int fd) {
+    (void)path;
+    (void)fd;
+}
 static void log_fuse_err(const char* a, const char* b, int c) {
     (void)a;
     (void)b;
