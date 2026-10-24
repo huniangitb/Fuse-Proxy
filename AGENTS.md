@@ -210,6 +210,8 @@ scripts/acceptance.sh                     # 跑完整验收门并落报告
 
 真机视为生产：一切设备命令经 `scripts/adb-sh.sh` 执行（会话强制 PATH 垫片 + source `adb-safe.sh` + `set -u` + 变更/生产路径文本预检），禁止裸 `adb shell` 做变更。隔离主体是 Linux 原生机制（内核强制，非约定）：测试 I/O 一律 `su shell` 降级执行——实测 uid=gid=groups=2000（1078 等危险组已脱）、CapEff=0，`assert_downgraded()` 每次先验，root 只建/卸挂载（/dev/fuse 0600，只能 root 开）且 `need_root()` 留痕；backing 只用 `SAFE_ROOT` 合成 fixture（生产 backing 永不进测试挂载，需真实下层行为时 cp -a 快照到沙盒）。纵深为 shell 层：设备侧脚本 source harness 即自动影子危险命令（rm/umount/mv/cp/dd/tee/chcon/chmod/chown/restorecon/setenforce/kill），绕过须 `command`/绝对路径（评审可见）；umount 循环卸直到消失、失败即 die 且错误禁止重定向吞掉；`set -u` 常开。SELinux 现状：测试树自动落 `shell_data_file`，root 段尚无专用受限域（ksu 域基本不受限，需 policy 新域——列为二期，不在这次范围内）。
 
+**真机全链路功能验证**（v1 逐应用挂载 + 隔离配置根 + 探针 APK，覆盖 FTP/SFTP/REDIRECT/SANDBOX/HIDE/侧漏，并用不等待就绪的 `race` 探针量化 v1 的未覆盖窗口与侧漏）见 `device-verify/README.md`，入口 `device-verify/host/run-verify.py`：验证二进制编译期配置根固定 `/data/local/tmp/nsp_verify/config`，生产 `/data/Namespace-Proxy` 只读并在前后比对 sha256；设备写操作只经 vetted 的 `device/verify-device.sh`（安装 APK / `adb reverse` / 只读查询用 adb 原语），异常路径在 finally 恢复生产服务。
+
 ## 架构要点
 
 - **v1 视图就绪语义（两段式，2026-10 起）**：Zygisk 模块在 `preAppSpecialize` 上报后等 injector 判决——`OK`（已就绪/无需挂载）、`DEFER`（v1 目标应用，但应用 ns 里 `/storage/emulated` 还没被 vold 装配，实测 0.6–0.9s）、`ERR`。收到 `DEFER` 时模块**保留**该 companion 连接（post 阶段已降权进应用沙箱域，无法再 `connectCompanion`），在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST`；injector 在应用命名空间内带 1800ms 预算等视图出现再挂、挂完才回 `OK`，于是应用首写即见代理视图（实测窗口 0–2ms，此前 0–890ms 且窗口内会侧漏）。旧"ACK + 异步重试队列"退化为兜底。协议带 `proto` 握手：旧模块（无 proto）走原路径，v2/v3 与非目标应用永不产生 `DEFER`/`POST`；所有等待有上限且失败即放行（fail-open），不挂死冷启动。

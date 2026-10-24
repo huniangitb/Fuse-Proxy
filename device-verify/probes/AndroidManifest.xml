@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NSP 设备验证探针 APK 的模板 manifest。
+
+  package 固定为 nsp.probe；构建脚本对每个场景用 aapt2 link 的
+  rename-manifest-package 选项（见 build-probes.sh）生成 5 个 APK。
+  因此 application/activity 的 android:name 必须写全限定类名
+  （不能写 ".ProbeApp"），否则重命名后类名会被拼成错误包名。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="nsp.probe"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk
+        android:minSdkVersion="31"
+        android:targetSdkVersion="36" />
+
+    <application
+        android:name="nsp.probe.ProbeApp"
+        android:debuggable="true"
+        android:allowBackup="false"
+        android:label="NSP Probe"
+        android:supportsRtl="true">
+
+        <activity
+            android:name="nsp.probe.ProbeActivity"
+            android:exported="true"
+            android:label="NSP Probe">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
