@@ -23,6 +23,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -109,8 +110,18 @@ CURL* ftp_easy_new(const FtpServerCfg* cfg) {
            extract the public key from the private key file"，传 NULL 即此意），
            避免强制用户再摆一份 .pub。 */
         curl_easy_setopt(c, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_ANY);
-        if (cfg->key_file[0])
+        if (cfg->key_file[0]) {
             curl_easy_setopt(c, CURLOPT_SSH_PRIVATE_KEYFILE, cfg->key_file);
+            /* mbedTLS 后端的 libssh2 不会从私钥里提取公钥（只有 OpenSSL/gcrypt
+               后端支持 CURLOPT_SSH_PUBLIC_KEYFILE 为空时的自动提取），不显式
+               给公钥文件会得到 "Authentication failure"。约定同目录
+               <key_file>.pub 存在即自动提供；不存在保持旧行为（OpenSSL 后端
+               仍可自行提取），不改变 GNU 既有语义。 */
+            char pub_key[1024];
+            int pn = snprintf(pub_key, sizeof pub_key, "%s.pub", cfg->key_file);
+            if (pn > 0 && (size_t)pn < sizeof pub_key && access(pub_key, R_OK) == 0)
+                curl_easy_setopt(c, CURLOPT_SSH_PUBLIC_KEYFILE, pub_key);
+        }
         if (cfg->key_pass[0]) curl_easy_setopt(c, CURLOPT_KEYPASSWD, cfg->key_pass);
         /* 主机密钥校验：不设 SSH_KNOWNHOSTS 等于不校验（libcurl 语义），
            故 host_key_check=on 时**必须**给出文件路径——空则落到配置目录默认
