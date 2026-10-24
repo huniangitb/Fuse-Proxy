@@ -281,11 +281,19 @@ typedef enum {
     NSP_VIS_TOO_LONG, /* 路径过长：跳过该条目（fail-closed） */
 } NspVisibility;
 
+/* 定义在 vfs_rename 附近；此处只需前置声明供可见性单点调用 */
+static bool is_fuse_hidden_name(const char* name);
+
 static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse_path,
                                           const char* name, const char* current_pkg,
                                           int path_user_id, uid_t uid, char* item_sub_out,
                                           size_t sub_sz, char* item_fuse_out, size_t fuse_sz) {
     if (path_contains_invalid_chars(name)) return NSP_VIS_SKIP;
+    /* libfuse 的 open-unlink 隐藏名（.fuse_hidden + 16 位十六进制）是内部实现
+       产物：应用扫描目录时一律不可见。本地路径已改为直删（不再产生），此过滤
+       覆盖后端路径（仍用隐藏名兜底）与历史残留文件——即使磁盘上还留着，
+       文件管理器刷新也不会再看到。 */
+    if (is_fuse_hidden_name(name)) return NSP_VIS_SKIP;
     char norm_base[2048], norm_fuse_base[2048];
     /* base 先剥尾部 '/'（与 getattr/child_ino 同一合成语义）：非规范 sub_path
        （如 "/Android/data/"）会拼出 "//name"，与 getattr 规范形式的哈希不一致 */
