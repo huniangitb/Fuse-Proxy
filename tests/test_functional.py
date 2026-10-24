@@ -811,13 +811,18 @@ def test_open_unlink_no_hidden():
         ("REDIRECT 路径", Path(MNT) / "0" / "网盘" / f"nsp_openunlink_redir_{tag}.bin"),
     ]
     realdir = Path(STORAGE) / "0" / "Download"
+    # 历史残留：磁盘上直接放一个 libfuse 隐藏名文件，列举必须看不到它
+    # （本地路径已改为直删，不会产生新隐藏名；此用例覆盖旧残留与后端路径的
+    #  readdir 过滤）。
+    legacy = realdir / ".fuse_hidden0000000000000001"
+    legacy.write_bytes(b"legacy")
     for name, vpath in cases:
         fd = os.open(vpath, os.O_CREAT | os.O_RDWR, 0o644)
         os.write(fd, b"A" * 4096)
         os.fsync(fd)
         os.unlink(vpath)
 
-        hidden = sorted(p.name for p in realdir.glob(".fuse_hidden*"))
+        hidden = sorted(p.name for p in realdir.glob(".fuse_hidden*") if p.name != legacy.name)
         if hidden:
             fail(f"{name}: 删除后不应出现隐藏名", f"实际 {hidden}")
         else:
@@ -827,7 +832,7 @@ def test_open_unlink_no_hidden():
         if listed:
             fail(f"{name}: 目录列举不应看到隐藏名", f"实际 {listed}")
         else:
-            ok(f"{name}: 目录列举看不到隐藏名")
+            ok(f"{name}: 目录列举看不到隐藏名（含历史残留夹具）")
 
         try:
             st = os.fstat(fd)
@@ -862,10 +867,17 @@ def test_open_unlink_no_hidden():
             fail(f"{name}: 关闭后路径不应存在")
         else:
             ok(f"{name}: 关闭后路径已消失")
-        if any(p.name.startswith(".fuse_hidden") for p in realdir.iterdir()):
+        if any(p.name.startswith(".fuse_hidden") and p.name != legacy.name for p in realdir.iterdir()):
             fail(f"{name}: 关闭后仍有隐藏名残留")
         else:
             ok(f"{name}: 关闭后无隐藏名残留")
+    # 过滤只影响列举，不清删真实文件：历史残留仍在磁盘上（由用户自行清理或
+    # 后续维护），但应用扫描不到。
+    if legacy.exists():
+        ok("历史隐藏名文件仍在磁盘（过滤而非删除）")
+    else:
+        fail("历史隐藏名文件被误删", str(legacy))
+    legacy.unlink(missing_ok=True)
 
 
 def main():
