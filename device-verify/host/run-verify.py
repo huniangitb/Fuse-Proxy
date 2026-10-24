@@ -650,6 +650,7 @@ def main():
         stage_files(adb, ftp, sftp, "A")
         adb.sh_root("clean-fixtures")
         adb.sh_root("make-hide-fixture")
+        adb.sh_root("unlink-fixture")
         prepared = True
         for case in CASES + (RACE,):
             apk = DIST / "apks" / ("nsp.probe.%s.apk" % case)
@@ -864,9 +865,17 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
         checker.check("unlink 探针 %s 成功" % step, step_ok(phase_a, "unlink", step))
     exists, size = device_file(adb, REAL_ROOT + "/nsp_verify/unlink/nsp_probe_unlink.txt")
     checker.check("unlink 删除后真实文件不存在", not exists, "exists=%s size=%s" % (exists, size))
+    # 历史残留夹具：物理上存在，但列举/扫描必须看不到（readdir 过滤）
+    # 用 shell 的 test -e（经 FUSE 的 getattr）而不是 check-file：后者走 adb-sh
+    # 的文本预检，路径里的 "hidden" 含 "dd" 会被误判成变更动词。
+    legacy_out = adb.shell(
+        "test -e /sdcard/nsp_verify/unlink/.fuse_hidden0000000000000001 "
+        "&& echo present || echo absent").stdout.strip()
+    checker.check("unlink 历史隐藏名夹具仍在磁盘（过滤而非删除）", legacy_out == "present", legacy_out)
     hidden_out = adb.shell(
-        "find /sdcard/nsp_verify/unlink -name '.fuse_hidden*' 2>/dev/null | wc -l").stdout.strip()
-    checker.check("unlink 设备侧无 .fuse_hidden 残留", hidden_out == "0", hidden_out)
+        "find /sdcard/nsp_verify/unlink -name '.fuse_hidden*' "
+        "! -name '.fuse_hidden0000000000000001' 2>/dev/null | wc -l").stdout.strip()
+    checker.check("unlink 设备侧无新增 .fuse_hidden 残留", hidden_out == "0", hidden_out)
 
     # ---- hide：两阶段（阶段 A 夹具可见；阶段 B 热重载 HIDE 后 stat/写均 ENOENT）
     checker.check("hide 阶段 A 夹具可见且内容正确", step_ok(phase_a, "hide", "phase_a"))
