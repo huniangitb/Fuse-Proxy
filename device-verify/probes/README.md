@@ -19,7 +19,7 @@ device-verify/probes/build-probes.sh
 
 | 文件 | 说明 |
 |---|---|
-| `device-verify/dist/apks/nsp.probe.{ftp,sftp,hide,iso,plain,race}.apk` | 6 个场景 APK |
+| `device-verify/dist/apks/nsp.probe.{ftp,sftp,hide,iso,plain,unlink,race}.apk` | 7 个场景 APK |
 | `device-verify/dist/apks/BUILD-CHECK.txt` | 自检摘要（包名/minSdk/签名/zip/dex 契约） |
 | `device-verify/dist/keys/debug.keystore` | 首次运行生成、之后复用（alias `androiddebugkey`，口令 `android`） |
 
@@ -40,7 +40,7 @@ adb logcat -d -s NSP_PROBE:I
 每行格式：
 
 ```
-case=<ftp|sftp|hide|iso|plain>|step=<name>|ok=<0|1>|detail=<...>
+case=<ftp|sftp|hide|iso|plain|unlink>|step=<name>|ok=<0|1>|detail=<...>
 ```
 
 `detail` 内不会出现 `'|'`（会被替换成 `'/'`），可含空格与逗号。
@@ -60,6 +60,7 @@ case=<ftp|sftp|hide|iso|plain>|step=<name>|ok=<0|1>|detail=<...>
 | hide | `phase_a` 或（`phase_b` + `write_denied`）, `list`, `done` |
 | iso | `download`, `pictures`, `done` |
 | plain | `write`, `read`, `done` |
+| unlink | `delete`, `hidden_open`, `fstat`, `read`, `hidden_closed`, `exists_closed`, `done` |
 | race | `attempt`×N, `summary`, `done`（**无 ready**：不等就绪，见下） |
 
 关键语义：
@@ -79,6 +80,11 @@ case=<ftp|sftp|hide|iso|plain>|step=<name>|ok=<0|1>|detail=<...>
   `Download/nsp_probe_sandbox.txt` 与 `Pictures/nsp_probe_sandbox.jpg`，写入含
   包名+时间戳的内容并读回；detail 带实际绝对路径。
 - `plain`：写 `/sdcard/Android/data/<pkg>/files/plain.txt` 并读回。
+- `unlink`：在 `/sdcard/nsp_verify/unlink/` 写 `nsp_probe_unlink.txt` 并保持读句柄，
+  删除后立即列举目录（`hidden_open`，期望 `.fuse_hidden` 计数为 0）、用
+  `getChannel().size()` 做 fstat、从原句柄读回内容；关闭后再次列举（`hidden_closed`）
+  并确认路径消失（`exists_closed`）。该探针只配一条无关 HIDE 以保证被 v1 注入，
+  被测目录本身无任何规则。
 - `race`：**刻意不等待就绪**，`onCreate` 起每 ~20ms 尝试写两个判别路径并记录
   `i`（序号）、`ms`（相对 `onCreate` 的毫秒）、`fuse`（当时 `/storage/emulated` 是否已是
   `fuse_daemon`）、`a`（写 `/sdcard/Download/nsp_race_a<i>.txt` 的结果，该包配 `SANDBOX ON`）、

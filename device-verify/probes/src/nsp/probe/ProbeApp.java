@@ -23,7 +23,7 @@ import java.util.Arrays;
  * FUSE 视图已按 v1 注入本进程，探针因此看到的就是模块最终暴露给应用的存储视图。
  *
  * <p>每条结果是一行 logcat（tag = {@code NSP_PROBE}）：
- * <pre>case=&lt;ftp|sftp|hide|iso|plain&gt;|step=&lt;name&gt;|ok=&lt;0|1&gt;|detail=&lt;...&gt;</pre>
+ * <pre>case=&lt;ftp|sftp|hide|iso|plain|unlink&gt;|step=&lt;name&gt;|ok=&lt;0|1&gt;|detail=&lt;...&gt;</pre>
  * {@code detail} 内不会出现 {@code '|'}（会被替换成 {@code '/'}），可含空格与逗号。
  * 最后一行 {@code step=done} 表示探针执行完毕，宿主可据此结束等待。
  *
@@ -77,6 +77,8 @@ public final class ProbeApp extends Application {
                     steps = runHideCase();
                 } else if ("iso".equals(caseName)) {
                     steps = runIsoCase();
+                } else if ("unlink".equals(caseName)) {
+                    steps = runUnlinkCase();
                 } else {
                     steps = runPlainCase();
                 }
@@ -306,6 +308,91 @@ public final class ProbeApp extends Application {
         steps++;
 
         return steps;
+    }
+
+    // ------------------------------------------------------------------ unlink
+
+    /**
+     * 打开中删除：本地路径不得留下 .fuse_hidden。
+     *
+     * <p>与文件管理器「压缩后删除原文件」同一形态：先写文件并保持读句柄，
+     * 再删除名字。FUSE 默认实现会把名字改成 .fuse_hidden 等最后一个句柄关闭，
+     * 本地 backing 完全支持「先删名、后关句柄」，因此应立刻消失。
+     * 同时验证删除后仍可 fstat（getChannel().size()）与读取。
+     */
+    private int runUnlinkCase() {
+        int steps = 0;
+        File dir = new File("/sdcard/nsp_verify/unlink");
+        dir.mkdirs(); // 忽略返回值
+        File file = new File(dir, "nsp_probe_unlink.txt");
+        String content = "NSP_PROBE_UNLINK:" + pkg + ":" + System.currentTimeMillis();
+        byte[] expected = content.getBytes(StandardCharsets.UTF_8);
+        FileInputStream in = null;
+        try {
+            try (FileOutputStream out = new FileOutputStream(file)) {
+                out.write(expected);
+                out.getFD().sync();
+            }
+            in = new FileInputStream(file);
+            boolean deleted = file.delete();
+            emit("delete", deleted,
+                    "path=" + file.getAbsolutePath() + " exists=" + file.exists());
+            steps++;
+
+            int hiddenOpen = countHidden(dir);
+            emit("hidden_open", hiddenOpen == 0, "hidden=" + hiddenOpen);
+            steps++;
+
+            long size = -1;
+            String fstatDetail;
+            try {
+                size = in.getChannel().size();
+                fstatDetail = "size=" + size + " expected=" + expected.length;
+            } catch (Throwable t) {
+                fstatDetail = "error=" + describe(t);
+            }
+            emit("fstat", size == expected.length, fstatDetail);
+            steps++;
+
+            byte[] actual = new byte[expected.length];
+            int off = 0;
+            int n;
+            while (off < actual.length && (n = in.read(actual, off, actual.length - off)) > 0) {
+                off += n;
+            }
+            boolean match = off == expected.length && Arrays.equals(expected, actual);
+            emit("read", match, "bytes=" + off + " match=" + (match ? 1 : 0));
+            steps++;
+        } catch (Throwable t) {
+            emit("exception", false, describe(t));
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (IOException ignored) {
+                    // 关闭失败已由后续 hidden_closed 计数暴露
+                }
+            }
+        }
+        int hiddenClosed = countHidden(dir);
+        emit("hidden_closed", hiddenClosed == 0, "hidden=" + hiddenClosed);
+        steps++;
+        emit("exists_closed", !file.exists(), "exists=" + file.exists());
+        steps++;
+        return steps;
+    }
+
+    private static int countHidden(File dir) {
+        int n = 0;
+        String[] names = dir.list();
+        if (names != null) {
+            for (String name : names) {
+                if (name.startsWith(".fuse_hidden")) {
+                    n++;
+                }
+            }
+        }
+        return n;
     }
 
     // --------------------------------------------------------------------- race
@@ -579,7 +666,8 @@ public final class ProbeApp extends Application {
 
     private static String normalizeCase(String name) {
         if ("ftp".equals(name) || "sftp".equals(name) || "hide".equals(name)
-                || "iso".equals(name) || "plain".equals(name) || "race".equals(name)) {
+                || "iso".equals(name) || "plain".equals(name) || "race".equals(name)
+                || "unlink".equals(name)) {
             return name;
         }
         return "plain";

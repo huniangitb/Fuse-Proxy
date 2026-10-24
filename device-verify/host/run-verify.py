@@ -53,7 +53,7 @@ STAGE = VR + "/staging"
 DEV_SCRIPT_REMOTE = "/data/local/tmp/nsp_verify.sh"
 
 PROBE_ACT = "nsp.probe.ProbeActivity"
-CASES = ("ftp", "sftp", "iso", "plain", "hide")
+CASES = ("ftp", "sftp", "iso", "plain", "hide", "unlink")
 # 竞态探针：刻意不等待 FUSE 就绪，用于测量 v1「补挂载」与「应用首写」的先后。
 # 单独成组：它没有 ready 步，断言口径与其余 5 个功能探针不同。
 RACE = "race"
@@ -355,8 +355,17 @@ def render_injector_conf(phase):
     ]
     if phase == "B":
         # 必须落在 [nsp.probe.hide] 段内：追加到列表末尾会漂到后面的段里，
-        # 让 hide 探针拿不到 HIDE 规则（实测阶段 B 全部断言失败）。
+        # 让 hide 探针拿不到 HIDE 规则（实测阶段 B 全部断言失败）。新增段
+        # 一律放在本 if 之后，别插进基础列表尾部。
         lines.append("HIDE /nsp_verify/hide")
+    lines += [
+        "",
+        # 打开中删除：本探针只配一条无关 HIDE（保证被 v1 注入），实际测的是
+        # /sdcard/nsp_verify/unlink 下**没有任何规则**的本地路径——与文件管理器
+        # 「压缩后删除原文件」同一形态：不应留下 .fuse_hidden。
+        "[nsp.probe.unlink]",
+        "HIDE /nsp_verify/unlink_noop",
+    ]
     lines += [
         "",
         # 竞态探针：a 族写 Download（SANDBOX ON ⇒ 挂载后落本应用沙盒），
@@ -850,6 +859,15 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
     exists, size = device_file(adb, REAL_ROOT + "/Android/data/%s/files/plain.txt" % pkg("plain"))
     checker.check("plain 文件在真实外部目录可读", exists, "exists=%s size=%s" % (exists, size))
 
+    # ---- unlink：打开中删除（本地路径直删，不产生 .fuse_hidden）
+    for step in ("delete", "hidden_open", "fstat", "read", "hidden_closed", "exists_closed"):
+        checker.check("unlink 探针 %s 成功" % step, step_ok(phase_a, "unlink", step))
+    exists, size = device_file(adb, REAL_ROOT + "/nsp_verify/unlink/nsp_probe_unlink.txt")
+    checker.check("unlink 删除后真实文件不存在", not exists, "exists=%s size=%s" % (exists, size))
+    hidden_out = adb.shell(
+        "find /sdcard/nsp_verify/unlink -name '.fuse_hidden*' 2>/dev/null | wc -l").stdout.strip()
+    checker.check("unlink 设备侧无 .fuse_hidden 残留", hidden_out == "0", hidden_out)
+
     # ---- hide：两阶段（阶段 A 夹具可见；阶段 B 热重载 HIDE 后 stat/写均 ENOENT）
     checker.check("hide 阶段 A 夹具可见且内容正确", step_ok(phase_a, "hide", "phase_a"))
     checker.check("hide 阶段 B stat 返回 ENOENT", step_ok(phase_b, "hide", "phase_b"))
@@ -988,7 +1006,10 @@ def self_test():
     conf_b = render_injector_conf("B")
     ck("phase A 不含 HIDE canary", "canary.txt" not in conf_a)
     ck("phase B 含 HIDE 夹具规则", "HIDE /nsp_verify/hide" in conf_b)
-    ck("五个探针段齐全", all(("[nsp.probe.%s]" % c) in conf_a for c in CASES))
+    ck("探针段齐全", all(("[nsp.probe.%s]" % c) in conf_a for c in CASES))
+    # 阶段 B 的 HIDE 必须落在 [nsp.probe.hide] 段内（新增段插在它后面）
+    ck("phase B HIDE 落在 hide 段内",
+       conf_b.index("HIDE /nsp_verify/hide") < conf_b.index("[nsp.probe.unlink]"))
     ck("竞态探针段含 SANDBOX + HIDE",
        "[nsp.probe.race]" in conf_a and "SANDBOX ON" in conf_a and "HIDE /nsp_race_b" in conf_a)
     ck("FTP 规则存在（前缀须等于模块段名）", "FTP /ftp_probe ftp_probe" in conf_a)

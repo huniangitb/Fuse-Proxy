@@ -11,7 +11,7 @@ PLATFORM_DIR_NAME="android-36"
 DIST_APKS="$DEVICE_VERIFY_DIR/dist/apks"
 OUT="$DIST_APKS/BUILD-CHECK.txt"
 TMP_OUT="$DIST_APKS/.BUILD-CHECK.txt.tmp"
-CASES=(ftp sftp hide iso plain race)
+CASES=(ftp sftp hide iso plain unlink race)
 
 fail_count=0
 pass_count=0
@@ -80,6 +80,10 @@ DEX_LITERALS=(
     "Download/nsp_probe_sandbox.txt"
     "Pictures/nsp_probe_sandbox.jpg"
     "plain.txt"
+    "nsp_probe_unlink"
+    "nsp_verify/unlink"
+    ".fuse_hidden"
+    "hidden_open"
     "nsp_race_a"
     "nsp_race_b"
     "NSP_RACE_A:"
@@ -216,11 +220,12 @@ for c in "${CASES[@]}"; do
 done
 
 line "== probe log contract (runtime, logcat tag NSP_PROBE) =="
-line "line: case=<ftp|sftp|hide|iso|plain|race>|step=<name>|ok=<0|1>|detail=<...>  (detail never contains '|')"
+line "line: case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>  (detail never contains '|')"
 line "ftp/sftp: start, mkdir, write, read, list, canary, done"
 line "hide:     start, phase_a OR (phase_b, write_denied), list, done"
 line "iso:      start, download, pictures, done"
 line "plain:    start, write, read, done"
+line "unlink:   start, delete, hidden_open, fstat, read, hidden_closed, exists_closed, done"
 line "race:     start, attempt×N (i/ms/fuse/a/b), summary, done  -- no FUSE readiness wait by design"
 line "done:     final sentinel (ok=1 on completion, ok=0 after step=exception)"
 line ""
