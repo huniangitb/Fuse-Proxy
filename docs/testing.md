@@ -96,7 +96,7 @@ scripts/acceptance.sh                 # 完整验收门（构建 + 测试 + 文�
 | **L1** GNU 真实后端/FUSE | 起真 daemon、真挂载；部分需 vsftpd、本机 sshd 或系统 `log_monitor` | `/dev/fuse`、`fusermount3`（`test_sftp` 只需 sshd） |
 | **L2** Android 拓扑仿真 | rootless `unshare` 沙箱内仿真安卓挂载拓扑 | userns 可用 |
 | **L3** 真实 Android 内核/权限 | SELinux / Bionic / vold / FUSE-BPF / Zygisk 双 ABI / 多用户 | emulator/AVD 或真机（**本机无，未做**） |
-| **L4** 设备最终验收 | 仅授权后经 `scripts/adb-sh.sh` | 真机 + 显式授权 |
+| **L4** 设备最终验收 | 仅授权后经 `scripts/adb-sh.sh`；全链路功能验证（v1 + 隔离配置根 + 探针 APK）见 `device-verify/README.md` | 真机 + 显式授权 |
 
 **L2 通过 ≠ Android 运行时已验证**。L2 只仿真挂载拓扑，SELinux 标签、Bionic 差异、
 vold 行为、Zygisk 双 ABI 注入、多用户都没覆盖，必须由 L3–L4 兜。写验收结论时
