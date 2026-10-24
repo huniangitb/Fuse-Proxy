@@ -34,7 +34,7 @@ DIST_KEYS="$DEVICE_VERIFY_DIR/dist/keys"
 KEYSTORE="$DIST_KEYS/debug.keystore"
 KS_ALIAS="androiddebugkey"
 KS_PASS="android"
-CASES=(ftp sftp hide iso plain race)
+CASES=(ftp sftp hide iso plain unlink race)
 
 log() { printf '[build-probes] %s\n' "$*"; }
 die() { printf '[build-probes] ERROR: %s\n' "$*" >&2; exit 1; }
