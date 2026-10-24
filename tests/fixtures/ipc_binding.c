@@ -153,19 +153,25 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
     return 0;
 }
 
-/* 同步挂载桩（ACK 时序用例专用）：可被放行门阻塞，从而让"ACK 必须晚于挂载
-   完成"这一契约可被确定性观测。未设门时立即返回，不影响其它用例。 */
-int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_src) {
+/* 同步挂载桩（ACK 时序 / 就绪预算用例专用）：可被放行门阻塞，从而让"ACK 必须
+   晚于挂载完成"这一契约可被确定性观测；返回值可被用例置为非 0（模拟"视图尚未
+   就绪"），用于验证 DEFER 分支。未设门时立即返回，不影响其它用例。 */
+static _Atomic int g_sync_mount_readiness = -1; /* 最近一次收到的就绪预算（ms） */
+static _Atomic int g_sync_mount_result = 0;     /* 桩的返回值（0=成功） */
+
+int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_src,
+                           int readiness_ms) {
     (void)pkg;
     (void)pid;
     (void)uid;
     (void)mnt_src;
     atomic_fetch_add(&g_sync_mount_calls, 1);
+    atomic_store(&g_sync_mount_readiness, readiness_ms);
     for (int i = 0; i < 200; i++) {
-        if (g_ack_gate[0] == '\0' || access(g_ack_gate, F_OK) == 0) return 0;
+        if (g_ack_gate[0] == '\0' || access(g_ack_gate, F_OK) == 0) break;
         usleep(10 * 1000);
     }
-    return 0;
+    return atomic_load(&g_sync_mount_result);
 }
 int perform_app_restore(const char* pkg, int pid, uid_t uid) {
     snprintf(g_last_restore_pkg, sizeof g_last_restore_pkg, "%s", pkg);
@@ -507,16 +513,57 @@ static int run_ack_order_case(void) {
     g_ack_gate[0] = '\0';
 
     int sync_calls = atomic_load(&g_sync_mount_calls);
+    int readiness = atomic_load(&g_sync_mount_readiness);
     bool ok_ack = (strcmp(ack, "OK") == 0);
-    ok = ok_ack && !early_ack && sync_calls == 1;
-    snprintf(detail, sizeof detail, "early_ack=%d(期望0) ack=%s(期望OK) sync_mount_calls=%d(期望1)",
-             (int)early_ack, ack[0] ? ack : "(空)", sync_calls);
+    /* REQ（应用直连的历史通道）必须保持"等待 1s + 挂载完成后 OK"的老行为：
+       这是"新协议不改变既有通道语义"的判别点。 */
+    ok = ok_ack && !early_ack && sync_calls == 1 && readiness == 1000;
+    snprintf(detail, sizeof detail,
+             "early_ack=%d(期望0) ack=%s(期望OK) sync_mount_calls=%d(期望1) "
+             "readiness=%d(期望1000)",
+             (int)early_ack, ack[0] ? ack : "(空)", sync_calls, readiness);
     report(ok, "A1 挂载完成前不得 ACK（ACK 后才放行 specialize）", detail);
 
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     g_inject_method = INJECT_METHOD_V2;
     return 0;
+}
+
+/* A2：v1 就绪预算 / 失败语义决策矩阵（两段式补挂载的核心契约）。
+ *
+ * 真机上的 REPORT/POST 只允许 root companion 对端，普通单测进程无法伪造该
+ * 凭据，故这里直接钉住决策纯函数 ipc_plan_readiness：哪条通道该等多久、失败
+ * 该回 DEFER 还是 ERR。判别点（旧实现根本没有"DEFER"这个概念）：
+ *   - proto>=2 的 pre 尝试必须是"预算 0 + 失败回 DEFER"——否则 zygisk 拿不到
+ *     DEFER，永远不会在 post-specialize 重发 POST，应用首写仍会落在真实视图；
+ *   - POST 必须有非 0 预算且**失败不回 DEFER**——否则会在 post 里再被推迟一次，
+ *     应用将永远等不到代理视图；
+ *   - 旧模块（无 proto）与 REQ 必须保持 1000ms / 不回 DEFER，零回归。 */
+static void run_plan_readiness_cases(void) {
+    struct PlanCase {
+        const char* label;
+        bool is_post;
+        bool is_report;
+        int proto;
+        int want_ms;
+        bool want_defer;
+    } cs[] = {
+        {"A2 pre(REPORT,proto=2) → 预算0 + 失败回 DEFER", false, true, 2, 0, true},
+        {"A2 POST(proto=2) → 预算1800 + 失败排重试", true, false, 2, IPC_POST_READINESS_MS, false},
+        {"A2 旧模块(REPORT,无proto) → 预算1000 + 失败排重试", false, true, 0, 1000, false},
+        {"A2 REQ(应用直连,proto=2) → 预算1000（历史行为不变）", false, false, 2, 1000, false},
+        {"A2 POST(无proto) → 预算1800", true, false, 0, IPC_POST_READINESS_MS, false},
+    };
+    char detail[400];
+    for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        bool defer = false;
+        int ms = ipc_plan_readiness(cs[i].is_post, cs[i].is_report, cs[i].proto, &defer);
+        bool ok = (ms == cs[i].want_ms) && (defer == cs[i].want_defer);
+        snprintf(detail, sizeof detail, "ms=%d(期望%d) defer=%d(期望%d)", ms, cs[i].want_ms,
+                 (int)defer, (int)cs[i].want_defer);
+        report(ok, cs[i].label, detail);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -550,6 +597,7 @@ int main(int argc, char** argv) {
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) run_case(&cases[i]);
     run_ack_order_case();
+    run_plan_readiness_cases();
 
     printf("\n结果: %d 通过, %d 失败\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

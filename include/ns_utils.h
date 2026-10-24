@@ -34,9 +34,12 @@ int ns_make_shared(int pid, const char* target);
 int ns_find_native_submounts(int pid, const char* base_path,
                               char mount_points[][256], int max_count);
 
-/* 阻塞式合并挂载（作为向下兼容） */
+/* 阻塞式合并挂载（作为向下兼容）。
+   readiness_ms：挂载前等待目标 ns 内 /storage/emulated 出现的预算（0 = 只查一次、
+   缺失立即返回 ENOENT，且判定发生在任何卸载之前）。IPC 的 pre-specialize 尝试
+   传 0（未就绪即回 DEFER，由 zygisk 在 post-specialize 带真实预算重发 POST）。 */
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
-                      char preserve_paths[][256], int preserve_count);
+                      char preserve_paths[][256], int preserve_count, int readiness_ms);
 
 /* 核心优化：高并发非阻塞异步合并挂载 */
 int ns_combined_mount_async(int pid, const char* pkg, const char* source, const char* target, const char* backup,

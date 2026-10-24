@@ -409,7 +409,8 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
  * 同步版应用挂载：阻塞等待挂载完成，返回真实结果。
  * 由 IPC 线程调用，不涉及异步 fork / 重试队列。
  */
-int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_src) {
+int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_src,
+                           int readiness_ms) {
     if (kill(pid, 0) != 0) {
         LOG_DBG("目标进程已退出，跳过同步挂载: %s(PID:%d)", pkg, pid);
         invalidate_mount_cache(pid);
@@ -489,7 +490,7 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
     }
     /* 同步合并挂载 */
     if (ns_combined_mount(pid, pkg, mnt_src, target_path, backup_path, preserve_paths,
-                          preserve_count) == 0) {
+                          preserve_count, readiness_ms) == 0) {
         invalidate_mount_cache(pid);
         return 0;
     } else {
