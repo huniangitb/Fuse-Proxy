@@ -62,6 +62,18 @@ int __wrap_mkdir_recursive_p(const char* path, mode_t mode) {
     return __real_mkdir_recursive_p(path, mode);
 }
 
+/* 存储根一级条目守卫引入的父目录补建出口（common.c 的 common_mkdir_within_storage）：
+   沙盒落点经它调用 mkdir_recursive_p，而两者同在 common.c（同 TU 直调不会被
+   --wrap 改写）——故两个出口都要观察，否则新实现一次 mkdir 都记录不到（假失败）。
+   旧实现（br_ensure_sandbox_dir 里直接 mkdir_recursive_p）仍由上面的 wrap 命中。 */
+int __real_common_mkdir_within_storage(const char* path, mode_t mode);
+int __wrap_common_mkdir_within_storage(const char* path, mode_t mode) {
+    g_mkdir_total++;
+    if (g_slot_depth > 0) g_mkdir_in_slot++;
+    if (path) snprintf(g_mkdir_last, sizeof g_mkdir_last, "%s", path);
+    return __real_common_mkdir_within_storage(path, mode);
+}
+
 uint64_t __real_config_read_begin(void);
 uint64_t __wrap_config_read_begin(void) {
     g_slot_depth++;

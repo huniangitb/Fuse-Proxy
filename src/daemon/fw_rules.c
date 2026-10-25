@@ -432,23 +432,18 @@ static int br_strip_and_sanitize(const char* path, int* path_user_id_out, char* 
                                  size_t sub_path_size) {
     if (!path) return -ENOENT;
     const char* sub_path_orig = path;
-    /* 仅当完整 user_id 目录（/数字 或 /数字/...）才剥离数字前缀——与框架
-       vfs_readdir 的 uid_dir 判定一致。若数字后不是 '/' 或结尾（如 /1_abc.txt、
-       /12_34 这类普通文件/目录名），不得剥离：否则 sub_path 被截成 "/"，
-       规则判定（hidden/redirect_target）基于错误路径，沙盒+应用上下文中
-       数字前缀条目会被误过滤（用户报告：数字 x_ 前缀文件/文件夹不显示，
-       字母前缀正常） */
-    if (path[0] == '/' && isdigit((unsigned char)path[1])) {
-        /* 数字序列后必须是结尾或 '/' 才是完整 user_id 目录（/0、/10、
-           /100/...）；普通数字前缀文件名（/1_abc.txt、/12_34）不剥离 */
-        const char* d = path + 1;
-        while (isdigit((unsigned char)*d)) d++;
-        if (*d == '\0' || *d == '/') {
-            if (path_user_id_out) *path_user_id_out = atoi(path + 1);
-            const char* slash = strchr(path + 1, '/');
-            sub_path_orig = slash ? slash : "/";
-        }
-    }
+    /* 用户层剥离与框架路由共用 common_parse_user_layer（唯一实现）：仅当完整
+       user_id 目录（/数字 或 /数字/...）才剥离——与框架 vfs_readdir 的 uid_dir
+       判定一致。若数字后不是 '/' 或结尾（如 /1_abc.txt、/12_34 这类普通文件/
+       目录名），不得剥离：否则 sub_path 被截成 "/"，规则判定（hidden/
+       redirect_target）基于错误路径，沙盒+应用上下文中数字前缀条目会被误过滤
+       （用户报告：数字 x_ 前缀文件/文件夹不显示，字母前缀正常）。
+       返回 -1 = 数字串溢出 int（atoi 别名会让 /4294967296/x 落到 /0/x）：
+       fail-closed，按不存在处理。 */
+    int uid_parsed = -1;
+    int pr = common_parse_user_layer(path, &uid_parsed, &sub_path_orig);
+    if (pr < 0) return -ENOENT;
+    if (pr > 0 && path_user_id_out) *path_user_id_out = uid_parsed;
     if (path_contains_invalid_chars(sub_path_orig)) {
         path_sanitize(sub_path_out, sub_path_size, sub_path_orig);
         if (sub_path_out[0] == '\0') return -ENOENT;
@@ -602,7 +597,10 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
    已算出的真实路径：后续 open/mkdir 以真实 errno 裁决。 */
 static void br_ensure_sandbox_dir(const char* dir) {
     if (!dir || !dir[0]) return;
-    if (access(dir, F_OK) != 0) mkdir_recursive_p(dir, 0775);
+    /* 落点经守卫出口补建：effective_uid 来自路径解析（无存在性校验的历史形态），
+       若一级组件缺失不得替应用在存储根下 materialize 出目录（见 common.h）。
+       非存储根落点（自定义 REDIRECT 目标）照旧递归创建。 */
+    if (access(dir, F_OK) != 0) common_mkdir_within_storage(dir, 0775);
 }
 
 static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf,

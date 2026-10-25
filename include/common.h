@@ -111,4 +111,25 @@ void init_timezone();
 bool path_contains_invalid_chars(const char* path);
 void path_sanitize(char* out, size_t size, const char* path);
 
+/* ---- 存储根一级条目守卫（历史缺陷：/data/media 顶层反复出现纯数字垃圾目录）----
+ * 一级条目 = <有效存储根>/<单个组件>（用户存储根 0/10/… 与 obb），由 vold 掌管，
+ * 系统视图里对普通应用不可写。框架的 FUSE 以 root 执行 mkdir/open(O_CREAT)/
+ * rename：一旦放行，任意被注入的应用都能替 root 在 /data/media 顶层造出条目。
+ * 实测形态即「应用请求 /<数字>/… → 框架把数字当 user_id → 递归补建父目录时把
+ * <STORAGE_BASE>/<数字> 造出来」，此后该垃圾目录被当成真实用户目录反复使用。
+ * 三个出口统一在此（禁止各回调私刻判定）：
+ *   common_storage_base        —— 有效存储根（g_real_root 优先，否则 STORAGE_BASE）；
+ *   common_is_storage_root_entry —— real_path 是否恰为一级条目（其后无 '/'）；
+ *   common_mkdir_within_storage  —— 建父目录的唯一出口：**永不创建**一级组件，
+ *                                   一级组件缺失即失败（errno=ENOENT），非存储根
+ *                                   路径（FTP 目标等）沿用 mkdir_recursive_p 语义。 */
+void common_storage_base(char* out, size_t sz);
+bool common_is_storage_root_entry(const char* real_path);
+int common_mkdir_within_storage(const char* dir, mode_t mode);
+
+/* FUSE 路径 <uid>/ 用户层解析（fw_parse_path 与 br_strip_and_sanitize 的唯一实现）：
+   1=命中（*user_id / *sub_path 有效）、0=无用户层（*sub_path 指回原路径）、
+   -1=非法（数字串溢出 int 的 atoi 别名，调用方须 fail-closed 返回 ENOENT）。 */
+int common_parse_user_layer(const char* path, int* user_id, const char** sub_path);
+
 #endif

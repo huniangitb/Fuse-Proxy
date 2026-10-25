@@ -65,7 +65,11 @@ def build_module_from_source(dst):
 def setup():
     shutil.rmtree("/tmp/fuse_ftp_test", ignore_errors=True)
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
-    os.makedirs(f"{STORAGE}/0", exist_ok=True)
+    # 多用户夹具：真实存储根下每个存在的用户都有 <root>/<uid>（vold 建立）；
+    # 框架的「不存在的用户存储根」守卫据此判读，故 /1、/2 用例必须预建用户根
+    # （否则 /1/云盘 按不存在处理——那是正确语义，不是缺陷）。
+    for _uid in ("0", "1", "2"):
+        os.makedirs(f"{STORAGE}/{_uid}", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
     os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
     os.makedirs(f"{MODDIR}/ftp_module", exist_ok=True)

@@ -219,21 +219,16 @@ static void log_fuse_err(const char* op, const char* path, int err_code) {
     }
 }
 
-/* 框架最小路径解析（无规则模块时的直通回退）：剥离 /0/ user_id 前缀 + 非法字符清理 */
+/* 框架最小路径解析（无规则模块时的直通回退）：剥离 /0/ user_id 前缀 + 非法字符清理。
+   用户层解析与规则引擎共用 common_parse_user_layer（唯一实现；数字串溢出 int 时
+   该函数返回 -1——atoi 溢出会把 /4294967296/x 别名成 /0/x，必须 fail-closed）。 */
 static int fw_parse_path(const char* path, int* user_id_out, char* sub_path_out, size_t sz) {
     if (!path) return -ENOENT;
+    int uid = -1;
     const char* sub = path;
-    if (path[0] == '/' && path[1] >= '0' && path[1] <= '9') {
-        /* 数字序列后是结尾或 '/' 才是完整 user_id 目录（/0、/10/...）；
-           普通数字前缀文件名（/1_abc.txt）不剥离（与规则层判定一致） */
-        const char* d = path + 1;
-        while (*d >= '0' && *d <= '9') d++;
-        if (*d == '\0' || *d == '/') {
-            if (user_id_out) *user_id_out = atoi(path + 1);
-            const char* slash = strchr(path + 1, '/');
-            sub = slash ? slash : "/";
-        }
-    }
+    int pr = common_parse_user_layer(path, &uid, &sub);
+    if (pr < 0) return -ENOENT; /* 非法用户层：按不存在处理 */
+    if (pr > 0 && user_id_out) *user_id_out = uid;
     if (path_contains_invalid_chars(sub)) {
         path_sanitize(sub_path_out, sz, sub);
         if (sub_path_out[0] == '\0') return -ENOENT;
@@ -411,6 +406,97 @@ static inline int vfs_check_read_only(const NspPathDecision* d, uid_t uid) {
     return (uid != 0 && d->read_only) ? -EROFS : 0;
 }
 
+/* ================= 存储根一级条目守卫（框架单点） =================
+ * 背景（历史缺陷）：/data/media（= /storage/emulated）顶层反复出现纯数字垃圾
+ * 目录，用户只能在 /data/media 下删除。链路是「应用请求 /<数字>/… → 框架把
+ * 第一个全数字段当 user_id（fw_parse_path/br_strip_and_sanitize 均无存在性
+ * 校验）→ real_path=<STORAGE_BASE>/<数字>/… → 创建路径的父目录补建以 root
+ * 把 <STORAGE_BASE>/<数字> 造出来」，此后它就被当成真实用户目录反复使用。
+ * 存储根一级条目（用户存储根 0/10/…、obb）由 vold 掌管，FUSE 视图不承载该
+ * 命名空间的管理，两个判定都在此 fail-closed：
+ *   ① 路径带 <uid>/ 层而 <STORAGE_BASE>/<uid> 不是目录 → -ENOENT（**读写一律**）；
+ *   ② real_path 恰为存储根一级条目：变更（创建/删除/改名/元数据）→ -EPERM，
+ *      读（列出/stat 既有条目）照旧放行。
+ * ①为什么连读也拦：规则引擎的虚拟目录合成会把 /<数字> 合成为“已存在目录”
+ * （NSP_VK_ANCESTOR，根级 REDIRECT 规则下必现），应用据此下探 /<数字>/… 并在
+ * CREATE/MKDIR/RENAME/SYMLINK 的父目录补建里把 <STORAGE_BASE>/<数字> 造出来
+ * ——这正是线上「顶层反复出现纯数字垃圾目录」的主链路（根级 REDIRECT + 数字名
+ * 请求 = 100% 复现）。读侧返回 ENOENT 后内核不再认为该名字存在，下探不会发生。
+ * 成本：正例用户（0/999…）首次 lstat 后入 16 槽缓存，稳态零系统调用；负例每次
+ * lstat（只发生在垃圾/攻击路径上）。
+ * root 调用者同样拒绝：这不是 DAC，而是结构性约束；需要管理一级条目时走真实
+ * 路径 /data/media/<uid>。两个判定都只在此处，各回调不得私刻（与 hidden/ro
+ * 单点同一红线）。拒绝日志按原因 1 小时限频（nsp_log_gate 非线程安全，多 worker
+ * 用短锁包住）。 */
+#define VFS_USER_ROOT_CACHE_MAX 16
+static _Atomic int g_vfs_user_ok[VFS_USER_ROOT_CACHE_MAX];
+static _Atomic int g_vfs_user_ok_n;
+
+/* 用户存储根存在性：正例入小表缓存（设备上用户数极少，命中后零开销）；负例每次
+   复查，避免把「模块运行期新建的用户」永久误判为不存在。 */
+static bool vfs_user_root_exists(int user_id) {
+    int n = atomic_load_explicit(&g_vfs_user_ok_n, memory_order_relaxed);
+    if (n > VFS_USER_ROOT_CACHE_MAX) n = VFS_USER_ROOT_CACHE_MAX;
+    for (int i = 0; i < n; i++) {
+        if (atomic_load_explicit(&g_vfs_user_ok[i], memory_order_relaxed) == user_id) return true;
+    }
+    char uroot[PATH_MAX];
+    common_storage_root(user_id, uroot, sizeof uroot);
+    if (uroot[0] == '\0') return false;
+    struct stat st;
+    if (lstat(uroot, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    int slot = atomic_load_explicit(&g_vfs_user_ok_n, memory_order_relaxed);
+    while (slot >= 0 && slot < VFS_USER_ROOT_CACHE_MAX &&
+           !atomic_compare_exchange_weak_explicit(&g_vfs_user_ok_n, &slot, slot + 1,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+    }
+    if (slot >= 0 && slot < VFS_USER_ROOT_CACHE_MAX)
+        atomic_store_explicit(&g_vfs_user_ok[slot], user_id, memory_order_relaxed);
+    return true;
+}
+
+enum { SRG_UNKNOWN_USER = 0, SRG_ROOT_ENTRY = 1, SRG_N };
+static const char* const g_srg_reason[SRG_N] = {"不存在的用户存储根", "变更存储根一级条目"};
+static NspLogGate g_srg_gate[SRG_N];
+static pthread_mutex_t g_srg_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void storage_root_guard_log(int reason, const char* path, const char* real, const char* pkg,
+                                   uid_t uid, pid_t pid) {
+    unsigned suppressed = 0;
+    pthread_mutex_lock(&g_srg_mu);
+    bool emit = nsp_log_gate(&g_srg_gate[reason], path ? path : "?", 3600, &suppressed);
+    pthread_mutex_unlock(&g_srg_mu);
+    if (!emit) return;
+    if (suppressed)
+        LOG_WRN("[STORAGE_ROOT_GUARD] 拒绝%s（另有 %u 次同因被抑制）: path=%s real=%s "
+                "pkg=%s(uid=%u,pid=%d)",
+                g_srg_reason[reason], suppressed, path ? path : "?", real ? real : "?",
+                pkg ? pkg : "unknown", (unsigned)uid, (int)pid);
+    else
+        LOG_WRN("[STORAGE_ROOT_GUARD] 拒绝%s: path=%s real=%s pkg=%s(uid=%u,pid=%d)",
+                g_srg_reason[reason], path ? path : "?", real ? real : "?", pkg ? pkg : "unknown",
+                (unsigned)uid, (int)pid);
+}
+
+/* 返回 0 放行，负 errno 拒绝：① 不存在的用户存储根 → -ENOENT（**读写都拦**，
+   见函数头注释的主链路说明）；② 变更存储根一级条目 → -EPERM（读放行）。
+   op 只对②有意义；带写 flags 的 open 由 vfs_open 显式按 MUTATE 再调一次。 */
+static int vfs_storage_root_guard(const struct fuse_context* ctx, const char* path_val,
+                                  const char* current_pkg, int user_id, const char* real_path,
+                                  VfsOpKind op) {
+    if (user_id >= 0 && !vfs_user_root_exists(user_id)) {
+        storage_root_guard_log(SRG_UNKNOWN_USER, path_val, real_path, current_pkg, ctx->uid,
+                               ctx->pid);
+        return -ENOENT;
+    }
+    if (op == VFS_OP_MUTATE && common_is_storage_root_entry(real_path)) {
+        storage_root_guard_log(SRG_ROOT_ENTRY, path_val, real_path, current_pkg, ctx->uid,
+                               ctx->pid);
+        return -EPERM;
+    }
+    return 0;
+}
+
 static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
                     bool* nsp_ok, char* current_pkg, int* user_id, char* sub_path, char* real_path,
                     bool* is_redir, bool* monitor_out, VfsOpKind op) {
@@ -423,9 +509,9 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
     sub_path[0] = '\0';
     real_path[0] = '\0';
     strcpy(current_pkg, "unknown");
-    /* 用户层剥离与虚拟路径归一由框架自算：与模块侧剥离逻辑
-       （br_strip_and_sanitize）逐行等价，故 V3 起不经 ABI 回传——
-       模块只回传它真正能决定的字段 */
+    /* 用户层剥离与虚拟路径归一由框架自算：与规则引擎共用
+       common_parse_user_layer（唯一实现，含数字串溢出 fail-closed），
+       故 V3 起不经 ABI 回传——模块只回传它真正能决定的字段 */
     if (fw_parse_path(path_val, user_id, sub_path, PATH_MAX) != 0) return -ENOENT;
     /* uid→包名与 MONITOR 开关都由框架自算，不取模块返回值：
        - 包名是配置语义的输入（段匹配键、日志标签），模块缺失时也必须有值；
@@ -458,13 +544,13 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
                 return rc;
             }
         }
-        return 0;
+        return vfs_storage_root_guard(ctx, path_val, current_pkg, *user_id, real_path, op);
     }
     /* 框架直通回退（无规则模块 / 模块未命中）：路径决策退回默认真实路径。
        监控开关已在入口由框架定值，此处无需也不得再改写——改写即等于把开关
        重新绑回「模块是否给出有效决策」上。 */
     fw_default_real_path(*user_id, sub_path, real_path, PATH_MAX);
-    return 0;
+    return vfs_storage_root_guard(ctx, path_val, current_pkg, *user_id, real_path, op);
 }
 
 /* 后端返回码是否为契约内的业务结果：POSIX errno 范围内的负值（-1..-4095）。
@@ -1414,7 +1500,11 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
                monitor_on);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
     /* open 归类 VFS_OP_READ（O_RDONLY 打开 RO 路径必须放行），只在 flags 表明
-       要写时走框架只读策略；策略本身仍在 vfs_check_read_only 单点 */
+       要写时才按变更语义处理：
+         - 只读策略走 vfs_check_read_only 单点；
+         - 存储根守卫也要按 MUTATE 再走一次：否则对**已存在的**存储根一级条目
+           （如线上 /data/media 顶层那个 root:root 垃圾文件）可被 open(O_WRONLY/
+           O_TRUNC/O_APPEND) 以 root 身份截断/改写——守卫不能只看路由的 op。 */
     {
         int accmode = fi->flags & O_ACCMODE;
         if (accmode == O_WRONLY || accmode == O_RDWR || (fi->flags & O_CREAT) ||
@@ -1424,6 +1514,9 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
                 log_fuse_err("OPEN_RO_DENIED", path, -ro_rc);
                 VFS_RETURN(ro_rc);
             }
+            int srg_rc = vfs_storage_root_guard(ctx, path, current_pkg, path_user_id, p,
+                                                VFS_OP_MUTATE);
+            if (srg_rc != 0) VFS_RETURN(srg_rc);
         }
     }
     /* 后端分派：open 由模块方法打开，fi->fh 存后端句柄（read/write 经槽位快速分派） */
@@ -1513,7 +1606,8 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
     if (fd == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *p_dir = dirname(p_dup);
-            if (mkdir_recursive_p(p_dir, 0775) == 0)
+            /* 父目录补建走守卫出口：永不创建存储根一级条目（见 common.h） */
+            if (common_mkdir_within_storage(p_dir, 0775) == 0)
                 fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, is_redir ? 0666 : mode);
             free(p_dup);
         }
@@ -1567,7 +1661,9 @@ static int vfs_mkdir(const char* path, mode_t mode) {
     if (ret == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *parent = dirname(p_dup);
-            if (mkdir_recursive_p(parent, 0775) == 0) ret = mkdir(p, is_redir ? 0775 : mode);
+            /* 父目录补建走守卫出口：永不创建存储根一级条目（见 common.h） */
+            if (common_mkdir_within_storage(parent, 0775) == 0)
+                ret = mkdir(p, is_redir ? 0775 : mode);
             free(p_dup);
         }
         if (ret == -1) {
@@ -1932,7 +2028,7 @@ static int vfs_symlink(const char* target, const char* linkpath) {
     if (symlink(target, p) == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *p_dir = dirname(p_dup);
-            if (mkdir_recursive_p(p_dir, 0775) == 0 && symlink(target, p) == 0) {
+            if (common_mkdir_within_storage(p_dir, 0775) == 0 && symlink(target, p) == 0) {
                 free(p_dup);
                 inherit_parent_attributes(p, S_IFLNK);
                 VFS_RETURN(0);
@@ -2265,7 +2361,8 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     char* p_to_dup = strdup(p_to);
     if (!p_to_dup) return -ENOMEM;
     char* p_to_dir = dirname(p_to_dup);
-    int mkdir_res = mkdir_recursive_p(p_to_dir, 0775);
+    /* 目标父目录补建走守卫出口：永不创建存储根一级条目（见 common.h） */
+    int mkdir_res = common_mkdir_within_storage(p_to_dir, 0775);
     int mkdir_err = mkdir_res != 0 ? errno : 0;
     free(p_to_dup); /* p_to_dir 随之失效：此后只许用 p_to 打日志 */
     if (mkdir_res != 0) {
@@ -2978,6 +3075,12 @@ int main(int argc, char* argv[]) {
             continue;
         } else if (strncmp(argv[i], "--root=", 7) == 0) {
             strncpy(g_real_root, argv[i] + 7, PATH_MAX - 1);
+            g_real_root[PATH_MAX - 1] = '\0';
+            /* 归一尾部 '/'：--root=<dir>/ 会让后续每条真实路径都带 '//'，
+               存储根守卫的一级条目判定与 common_mkdir_within_storage 的切片
+               随之错位（守卫静默失效）——在入口一次归一，运行期不再有尾斜杠 */
+            size_t rl = strlen(g_real_root);
+            while (rl > 1 && g_real_root[rl - 1] == '/') g_real_root[--rl] = '\0';
         } else if (strncmp(argv[i], "--rules=", 8) == 0) {
             strncpy(rules_path, argv[i] + 8, PATH_MAX - 1);
         } else if (strncmp(argv[i], "--ready-fd=", 11) == 0) {
