@@ -55,6 +55,7 @@
 
 ### 缺陷修复
 
+- **injector**: v1 DEFER 预探测不再把"未就绪"记成挂载失败（真机表现为"实际挂载成功，但日志一直显示没有成功"：pre 阶段按 WARN/ERROR 落"同步合并挂载失败""交由重试队列"，随后 POST 却成功）；改为负值哨兵 NSP_READINESS_DEFER + 单条 DEBUG 说明，POST/异步/旧通道的权威失败仍 loud，error.log 不再被预期未就绪污染 (86be977)
 - **fuse**: 存储根一级条目守卫——应用请求 `/<大数字>/…` 不再把 `<STORAGE_BASE>/<大数字>` materialize 出来（历史缺陷：/data/media 顶层反复出现纯数字垃圾目录，只能在 /data/media 下删除）；同一守卫堵住应用经 FUSE 删除/改名顶层用户根与 obb (4008fc5)
 - **module**: ban 记录加框架 ABI 维度 (b445f65)
 - **fuse**: backing 仲裁门补 MONITOR 维度 (eb1b6dc)
