@@ -34,10 +34,19 @@ int ns_make_shared(int pid, const char* target);
 int ns_find_native_submounts(int pid, const char* base_path,
                               char mount_points[][256], int max_count);
 
+/* readiness_ms 的负值哨兵：DEFER 预探测。
+   应用场景只有一处——v1 两段式的 pre-specialize 快速尝试（IPC 的 REPORT 通道）：
+   目标 ns 里 /storage/emulated 尚未被 vold 装配时，本次尝试**必然**失败，调用方
+   会回 DEFER 让 zygisk 在 post-specialize 重发 POST。因此缺失不是失败，日志口径
+   必须与真实失败区分（只记 DEBUG，不写 error.log，不宣称"交由重试队列"）。 */
+#define NSP_READINESS_DEFER (-1)
+
 /* 阻塞式合并挂载（作为向下兼容）。
-   readiness_ms：挂载前等待目标 ns 内 /storage/emulated 出现的预算（0 = 只查一次、
-   缺失立即返回 ENOENT，且判定发生在任何卸载之前）。IPC 的 pre-specialize 尝试
-   传 0（未就绪即回 DEFER，由 zygisk 在 post-specialize 带真实预算重发 POST）。 */
+   readiness_ms：挂载前等待目标 ns 内 /storage/emulated 出现的预算——
+     0     = 只查一次，缺失立即返回 ENOENT（判定发生在任何卸载之前）；
+     >0    = 在其内按 100ms 步进等待（POST / 异步首次注入）；
+     NSP_READINESS_DEFER（负值）= DEFER 预探测：不等待，缺失按预期未就绪处理
+           （静默，DEBUG），返回 ENOENT 由调用方回 DEFER。 */
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
                       char preserve_paths[][256], int preserve_count, int readiness_ms);
 

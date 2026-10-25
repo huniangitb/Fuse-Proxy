@@ -25,10 +25,12 @@ void handle_ipc_client_readable(int client_fd);
 /**
  * v1 挂载的就绪预算与失败语义决策（纯函数，便于直编单测）。
  *   - POST（post-specialize 补挂载）：预算 IPC_POST_READINESS_MS，失败才排重试；
- *   - REPORT + proto>=2（pre-specialize 快速尝试）：预算 0（只查一次），
- *     未就绪回 DEFER，由 zygisk 在 post-specialize 重发 POST；
+ *   - REPORT + proto>=2（pre-specialize 快速尝试）：返回 NSP_READINESS_DEFER
+ *     （负值哨兵，见 ns_utils.h）——不等待，且下游把"目标缺失"按预期未就绪处理
+ *     （DEBUG，不写 error.log、不记 WARN/ERROR），未就绪回 DEFER 由 zygisk 在
+ *     post-specialize 重发 POST；
  *   - 旧模块（无 proto）/ REQ（应用直连的历史通道）：预算 1000，维持原行为。
- * 返回 readiness_ms；*defer_on_fail 置位表示失败时应回 DEFER 而非 ERR。
+ * 返回 readiness_ms（可能为负值哨兵）；*defer_on_fail 置位表示失败时应回 DEFER。
  */
 int ipc_plan_readiness(bool is_post, bool is_report, int proto, bool* defer_on_fail);
 
