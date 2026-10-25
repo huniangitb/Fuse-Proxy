@@ -8,7 +8,9 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src, 
 
 /* 同步版：阻塞等待挂载完成，返回真实结果，用于 IPC 线程。
    readiness_ms 见 ns_combined_mount：0 = 目标视图未就绪时立即失败（供 IPC 的
-   pre-specialize 快速尝试），>0 = 在其内等待 /storage/emulated 出现。 */
+   pre-specialize 快速尝试），>0 = 在其内等待 /storage/emulated 出现。
+   负值（NSP_READINESS_DEFER）= DEFER 预探测：未就绪属预期，调用方会回 DEFER 由
+   post-specialize 补挂载，故日志按 DEBUG 说明处理、不记 ERROR。 */
 int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_src,
                            int readiness_ms);
 

@@ -19,9 +19,16 @@ src/injector/ns_utils.c 整体 #include（-DNS_UTILS_SRC=），只把 mount/umou
      返回原始 errno。
   B. 源 bind 失败 + 族根不可用 → 不回滚、loud 报错、返回原始 errno。
   C. 对照：源 bind 成功 → 不触发回滚。
+  D. 目标视图未就绪（readiness_ms=0）→ 在任何卸载之前返回 ENOENT。
+  E. DEFER 预探测（NSP_READINESS_DEFER，v1 的 pre-specialize 快速尝试）：
+     目标缺失属预期未就绪——零 WARN/ERROR、不写 error.log、不宣称"交由重试
+     队列"，只留一条 DEBUG 说明（旧实现按普通失败记 WARN，真机表现为
+     "实际挂载成功，但日志一直显示没有成功"）。
+  F. 对照：同一缺失走权威尝试（readiness_ms=0，POST/旧通道）→ 仍须 loud。
 
 退出码：全部通过 0，任一失败 1。环境变量 NS_UTILS_SRC 可指向另一份源码副本
-（用于验证本用例确能捕获"移除回滚"的旧实现）。
+（用于验证本用例确能捕获旧实现）：指向 HEAD 的 ns_utils.c 时 A1–A4 仍过、E3/E4/E5
+必失败（旧实现没有负值哨兵，缺失一律按失败记 WARN）。
 """
 import os
 import shlex

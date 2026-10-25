@@ -14,8 +14,13 @@
  *      族根视图，日志含「已回滚」，返回原始 errno（不再让应用停留在裸状态）。
  *   B. 源 bind 失败 + 族根不可用 → 不回滚、只报「回滚未成功」，返回原始 errno。
  *   C. 对照：源 bind 成功 → 不触发任何回滚挂载。
+ *   D. 目标视图未就绪（readiness_ms=0）→ 在任何卸载之前返回 ENOENT。
+ *   E. DEFER 预探测（NSP_READINESS_DEFER）→ 缺失属预期：静默（无 WARN/ERROR）、
+ *      不写 error.log、不宣称「交由重试队列」，只留一条 DEBUG 说明。
+ *   F. 对照：同缺失但走权威尝试（readiness_ms=0）→ 仍须 WARN + 「交由重试队列」。
  *
- * 回归价值：移除 ns_utils.c 回滚分支（旧实现只 return err）后 A 必失败。
+ * 回归价值：移除 ns_utils.c 回滚分支（旧实现只 return err）后 A 必失败；把
+ * DEFER 静默分支换回旧的 WARN 口径（HEAD 实现）后 E3/E4 必失败。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -50,6 +55,10 @@ static char g_logbuf[8192];
 /* ns_read_mountinfo_pid 的合成返回：族根挂载点（NULL 表示不提供） */
 static const char* g_family_root;
 
+/* 按级别计数：断言"未就绪不算失败"必须能区分 DEBUG 说明与 WARN/ERROR 报错 */
+static int g_warn_lines;
+static int g_err_lines;
+
 static void record_log(const char* fmt, ...) {
     size_t used = strlen(g_logbuf);
     if (used + 2 >= sizeof g_logbuf) return;
@@ -63,7 +72,8 @@ static bool log_has(const char* needle) { return strstr(g_logbuf, needle) != nul
 
 /* 项目内 log_internal：只做记录，不落盘/不走日志环 */
 void log_internal(LogLevel level, const char* format, ...) {
-    (void)level;
+    if (level >= LOG_WARN) g_warn_lines++;
+    if (level >= LOG_ERROR) g_err_lines++;
     size_t used = strlen(g_logbuf);
     if (used + 2 >= sizeof g_logbuf) return;
     va_list ap;
@@ -176,6 +186,8 @@ static void check(const char* name, bool ok, const char* detail) {
 static void reset_case(const char* fail_source, const char* family_root) {
     g_mount_calls = 0;
     g_logbuf[0] = '\0';
+    g_warn_lines = 0;
+    g_err_lines = 0;
     g_fail_source = fail_source;
     g_family_root = family_root;
 }
@@ -250,6 +262,32 @@ int main(void) {
           g_mount_calls == 0 ? "" : "目标缺失仍发起了挂载");
     check("D3 日志报告缺失而非回滚", log_has("缺失") && !log_has("已回滚"),
           log_has("缺失") ? "" : "缺少缺失日志");
+
+    /* E. DEFER 预探测（readiness_ms = NSP_READINESS_DEFER，v1 两段式的
+          pre-specialize 快速尝试）：目标 ns 尚未被 vold 装配是**预期**状态——
+          调用方会回 DEFER，由 post-specialize 的 POST 补齐。旧实现把它按普通
+          失败记 WARN + error.log，并在日志里宣称"交由重试队列"，真机表现为
+          "实际挂载成功，但日志一直显示没有成功"。此处钉死：静默 + DEBUG 说明。 */
+    reset_case(nullptr, nullptr);
+    errno = 0;
+    rc = run_combined_with("/nonexistent/nsp_emulated", NSP_READINESS_DEFER);
+    check("E1 DEFER 预探测目标缺失 → 立即 ENOENT", rc == ENOENT,
+          rc == ENOENT ? "" : "未按预期未就绪返回 ENOENT");
+    check("E2 未就绪时零挂载调用", g_mount_calls == 0, "目标缺失仍发起了挂载");
+    check("E3 未就绪不记 WARN/ERROR（不是失败）", g_warn_lines == 0 && g_err_lines == 0,
+          "未就绪仍按失败记了 WARN/ERROR");
+    check("E4 不宣称“交由重试队列”、不用失败式措辞",
+          !log_has("重试队列") && !log_has("缺失("), "仍出现旧失败措辞");
+    check("E5 以 DEBUG 说明 DEFER 语义", log_has("DEFER"), "缺少 DEFER 说明");
+
+    /* F. 对照：同一缺失但走权威尝试（POST/旧通道，readiness_ms=0）→ 必须 loud，
+          否则真实故障会被静默（E 的静默只能限 DEFER 通道）。 */
+    reset_case(nullptr, nullptr);
+    errno = 0;
+    rc = run_combined_with("/nonexistent/nsp_emulated", 0);
+    check("F1 权威尝试目标缺失 → ENOENT", rc == ENOENT, "");
+    check("F2 权威尝试仍 loud（至少一条 WARN）", g_warn_lines >= 1, "真实失败被静默了");
+    check("F3 明确交由重试队列", log_has("交由重试队列"), "");
 
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
     return g_fail;

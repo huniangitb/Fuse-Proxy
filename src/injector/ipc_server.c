@@ -101,8 +101,9 @@ typedef struct {
        代理视图就绪前继续 specialize 并访问存储（首次启动读到原始目录，或撞上
        合并挂载的裸挂载点窗口 ENOENT）。 */
     int ack_fd;
-    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms）：0 = 立即裁决
-       （pre-specialize 快速尝试），>0 = 在其内等待（post-specialize 的 POST）。 */
+    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms）：0 = 立即裁决，
+       >0 = 在其内等待（post-specialize 的 POST），NSP_READINESS_DEFER（负值）=
+       pre-specialize 的 DEFER 预探测——缺失属预期，日志只记 DEBUG、不算失败。 */
     int readiness_ms;
     /* 未就绪时回 DEFER 而非 ERR：zygisk 会在 post-specialize 带预算重发 POST。
        只有"新协议（proto>=2）+ v1 目标应用"的 pre 尝试为 true。 */
@@ -117,7 +118,10 @@ int ipc_plan_readiness(bool is_post, bool is_report, int proto, bool* defer_on_f
     if (is_post) return IPC_POST_READINESS_MS;
     if (is_report && proto >= 2) {
         if (defer_on_fail) *defer_on_fail = true;
-        return 0;
+        /* 负值哨兵而不是 0：把"本次缺失属预期未就绪"的语义一并交给下游
+           （ns_combined_mount / mount_manager 据此只记 DEBUG），否则每次应用
+           启动都会先落一条 WARN/ERROR，与实际挂载结果相反。 */
+        return NSP_READINESS_DEFER;
     }
     return 1000;
 }
@@ -582,8 +586,11 @@ void handle_ipc_client_readable(int client_fd) {
             pthread_t tid;
             if (pthread_create(&tid, NULL, ipc_mount_thread, arg) == 0) {
                 pthread_detach(tid);
-                LOG_DBG("IPC派发挂载线程（%s，readiness=%dms，ACK 延迟到挂载完成）: %s(PID:%d)",
-                        is_post ? "POST" : (defer_on_fail ? "pre/DEFER" : "legacy"), readiness_ms,
+                char rd_desc[32];
+                snprintf(rd_desc, sizeof rd_desc,
+                         readiness_ms < 0 ? "DEFER(预探测)" : "%dms", readiness_ms);
+                LOG_DBG("IPC派发挂载线程（%s，readiness=%s，ACK 延迟到挂载完成）: %s(PID:%d)",
+                        is_post ? "POST" : (defer_on_fail ? "pre/DEFER" : "legacy"), rd_desc,
                         clean_pkg, pid);
                 return;
             }

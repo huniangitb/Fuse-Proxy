@@ -225,7 +225,7 @@ FUSE 回调（如 getattr）
 **视图就绪语义（应答三态 OK / DEFER / ERR）**：应用在 zygote `preAppSpecialize` 里经 companion 上报并等待 injector 的应答，收到后才继续 specialize。应答即"应用能否往下跑"的唯一信号：
 
 - `OK`：视图已就绪，或**无需任何视图操作**——v3 全局视图、v2 非目标且已还原、隔离进程/zygote、进程已死、FUSE 暂不可用。
-- `DEFER`：**仅 v1 目标应用**。目标命名空间里 `/storage/emulated` 尚未被 vold 装配（ColorOS 型 ROM 常见，实测 0.6–0.9s），此刻挂载必然失败。injector 不排重试、不报错，模块把进程记为 pending，在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST` 再来一次。
+- `DEFER`：**仅 v1 目标应用**。目标命名空间里 `/storage/emulated` 尚未被 vold 装配（ColorOS 型 ROM 常见，实测 0.6–0.9s），此刻挂载必然失败。injector 不排重试、不报错，模块把进程记为 pending，在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST` 再来一次。该次尝试的"缺失"必须与真实失败分开记：`ipc_plan_readiness` 为 pre 通道返回负值哨兵 `NSP_READINESS_DEFER`，下游 `ns_combined_mount`/`mount_manager` 据此只记一条 DEBUG 说明——**不写错误日志、不记 WARN/ERROR、不宣称"交由重试队列"**。否则每次应用启动都会先落一条与真实结果相反（实际挂载成功）的"挂载失败"，正是历史上最误导排查的噪声源。
 - `ERR`：挂载/还原失败；应用照常启动但本次无代理视图（injector 已排入重试队列兜底）。
 
 `POST` 到达时 injector 在应用命名空间内带预算（`IPC_POST_READINESS_MS`，1800ms）等 `/storage/emulated` 出现，**挂载完成才回 `OK`**。于是应用的首个 `open()` 就已经看到代理视图——v1 不再有"进程已跑、视图后到"的窗口（此前实测窗口 0–890ms，窗口内写入会失败或被写进真实存储）。

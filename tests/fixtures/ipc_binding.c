@@ -64,6 +64,7 @@
 #include "injector.h"
 #include "inject_target.h"
 #include "ipc_server.h"
+#include "ns_utils.h" /* NSP_READINESS_DEFER：pre 通道的负值哨兵 */
 #include "nsp_log.h"
 #include "nsp_util.h"
 #include "uid_map.h"
@@ -535,11 +536,15 @@ static int run_ack_order_case(void) {
  * 真机上的 REPORT/POST 只允许 root companion 对端，普通单测进程无法伪造该
  * 凭据，故这里直接钉住决策纯函数 ipc_plan_readiness：哪条通道该等多久、失败
  * 该回 DEFER 还是 ERR。判别点（旧实现根本没有"DEFER"这个概念）：
- *   - proto>=2 的 pre 尝试必须是"预算 0 + 失败回 DEFER"——否则 zygisk 拿不到
+ *   - proto>=2 的 pre 尝试必须返回 NSP_READINESS_DEFER（负值哨兵：下游据此把
+ *     "目标缺失"按预期未就绪静默处理，不记 WARN/ERROR）+ 失败回 DEFER——否则
+ *     zygisk 拿不到
  *     DEFER，永远不会在 post-specialize 重发 POST，应用首写仍会落在真实视图；
  *   - POST 必须有非 0 预算且**失败不回 DEFER**——否则会在 post 里再被推迟一次，
  *     应用将永远等不到代理视图；
- *   - 旧模块（无 proto）与 REQ 必须保持 1000ms / 不回 DEFER，零回归。 */
+ *   - 旧模块（无 proto）与 REQ 必须保持 1000ms / 不回 DEFER，零回归。
+ * 注：哨兵为负值（-1）而不是 0，是"未就绪≠失败"的语义载体——预算 0 仍会被下游
+ * 当成一次权威尝试（缺失即 loud 报错）。 */
 static void run_plan_readiness_cases(void) {
     struct PlanCase {
         const char* label;
@@ -549,7 +554,8 @@ static void run_plan_readiness_cases(void) {
         int want_ms;
         bool want_defer;
     } cs[] = {
-        {"A2 pre(REPORT,proto=2) → 预算0 + 失败回 DEFER", false, true, 2, 0, true},
+        {"A2 pre(REPORT,proto=2) → 预算 DEFER 哨兵 + 失败回 DEFER", false, true, 2,
+         NSP_READINESS_DEFER, true},
         {"A2 POST(proto=2) → 预算1800 + 失败排重试", true, false, 2, IPC_POST_READINESS_MS, false},
         {"A2 旧模块(REPORT,无proto) → 预算1000 + 失败排重试", false, true, 0, 1000, false},
         {"A2 REQ(应用直连,proto=2) → 预算1000（历史行为不变）", false, false, 2, 1000, false},

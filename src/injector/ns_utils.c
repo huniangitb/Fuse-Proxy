@@ -576,8 +576,10 @@ struct CombinedMountArgs {
     int preserve_count;
     pid_t target_pid; /* 就绪等待期间的存活检查目标 */
     /* 挂载前等待目标 ns 内 /storage/emulated 出现的预算（ms），0 = 只查一次、
-       缺失即裁决失败。IPC 的 pre-specialize 尝试传 0（未就绪就回 DEFER，由
-       zygisk 在 post-specialize 带真实预算重发 POST）；异步路径首次注入传 1000。 */
+       缺失即裁决失败。IPC 的 pre-specialize 尝试传 NSP_READINESS_DEFER（负值，
+       见 ns_utils.h）：不等待，且缺失属预期未就绪——DEBUG 说明、不写 error.log、
+       不声称"交由重试队列"，由 zygisk 在 post-specialize 重发 POST；异步路径
+       首次注入传 1000。 */
     int readiness_ms;
 };
 
@@ -659,6 +661,17 @@ static int do_combined_mount(void* raw_args) {
             }
         }
         if (!ready) {
+            /* DEFER 预探测（readiness_ms < 0）：本次缺失是**预期**状态——调用方会
+               回 DEFER，由 zygisk 在 post-specialize 带预算重发 POST。这里既不记
+               WARN/ERROR（否则每次应用启动都留一条"挂载失败"，与"实际挂载成功"的
+               最终结果相反，正是历史排查中最容易误导人的一行），也不写 error.log、
+               不宣称"交由重试队列"（DEFER 通道不排重试）。loud 报错只属于
+               POST/异步/旧通道的权威尝试。 */
+            if (args->readiness_ms < 0) {
+                LOG_DBG("[%s] %s 未就绪（pre 阶段 DEFER 预探测，交 post-specialize 补挂载）", pkg,
+                        target);
+                return ENOENT;
+            }
             log_ns_error("[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列\n",
                          pkg, target, args->readiness_ms);
             log_internal(LOG_WARN,
@@ -834,12 +847,14 @@ int ns_combined_mount(int pid, const char* pkg, const char* source, const char* 
     args.preserve_paths = preserve_paths;
     args.preserve_count = preserve_count;
     args.target_pid = pid;
-    args.readiness_ms = readiness_ms > 0 ? readiness_ms : 0;
+    /* 保留负值哨兵（NSP_READINESS_DEFER = pre 阶段 DEFER 预探测）：它决定缺失
+       路径的日志口径，不能像预算那样归一成 0。预算另按正值计算。 */
+    args.readiness_ms = readiness_ms;
     int child_err = 0;
     /* 子进程预算 = 就绪等待 + 2s 余量：等待发生在子进程内，超时会被 SIGKILL，
        预算必须留够（旧实现固定 2s 对应 1s 门控）。健康路径只有一次 access，
        不消耗预算。 */
-    int budget_ms = (args.readiness_ms > 0 ? args.readiness_ms : 0) + 2000;
+    int budget_ms = (readiness_ms > 0 ? readiness_ms : 0) + 2000;
     int ret = run_in_mnt_ns_timeout(pid, do_combined_mount, &args, &child_err, budget_ms);
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
