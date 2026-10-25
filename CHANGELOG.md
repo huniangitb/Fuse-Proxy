@@ -55,6 +55,7 @@
 
 ### 缺陷修复
 
+- **fuse**: 存储根一级条目守卫——应用请求 `/<大数字>/…` 不再把 `<STORAGE_BASE>/<大数字>` materialize 出来（历史缺陷：/data/media 顶层反复出现纯数字垃圾目录，只能在 /data/media 下删除）；同一守卫堵住应用经 FUSE 删除/改名顶层用户根与 obb (4008fc5)
 - **module**: ban 记录加框架 ABI 维度 (b445f65)
 - **fuse**: backing 仲裁门补 MONITOR 维度 (eb1b6dc)
 - **ftp**: backend 入口参数校验先于取句柄 (1155a71)
