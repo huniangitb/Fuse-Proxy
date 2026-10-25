@@ -151,6 +151,14 @@ static int mkdir_recursive_p(const char* p, mode_t m) {
     (void)m;
     return 0;
 }
+/* 父目录补建出口（实际实现见 src/core/common.c；vfs_rename 自「存储根一级条目
+   守卫」起改经此出口）：目标父目录恒存在，此桩同样不做任何事。守卫语义本身由
+   test_storage_root_guard.py 覆盖，这里只需让被测 rename 逻辑可编译运行。 */
+int common_mkdir_within_storage(const char* p, mode_t m) {
+    (void)p;
+    (void)m;
+    return 0;
+}
 
 /* ---- --wrap=rename：第一次调用强制 EXDEV，进入跨设备回退 ---- */
 static int g_force_exdev;

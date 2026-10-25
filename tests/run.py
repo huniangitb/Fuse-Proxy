@@ -65,7 +65,10 @@ SUITE_MAP = [
       "test_c1_sandbox_slot.py",
       # 后端 read/write 回传长度钳制（vfs_read/vfs_write）住 fuse_daemon.c，
       # 判别用例在 test_module_circuit.py §7b/7c（谎报 got/wrote 的后端模块）
-      "test_module_circuit.py"),
+      "test_module_circuit.py",
+      # 存储根一级条目守卫（fw_route 单点 + 父目录补建出口）：历史缺陷
+      # 「/data/media 顶层被应用 materialize 出纯数字垃圾目录」
+      "test_storage_root_guard.py"),
      ("src/daemon/fw_rules.c", "src/daemon/fw_rules.h", "src/config/config_parser.c",
       "include/config_parser.h", "src/daemon/fuse_daemon.c",
       # Trie 是规则匹配的加速结构（architecture.md §7：改 Trie 或线性通道须保持
@@ -139,6 +142,13 @@ SUITE_MAP = [
      ("src/rule/", "src/log/log_ctl.c"),
      ("nsp_rule_file",),
      "log_ctl / rule_server 规则编辑"),
+
+    # 存储根一级条目守卫：不变量与两个出海口都在 common.c（路径合成 / 父目录
+    # 补建），改它必须跑判别用例（旧实现把客户端请求 /<大数字>/… materialize 成
+    # <STORAGE_BASE>/<大数字>，线上形态即 /data/media 顶层反复出现纯数字目录）
+    (("test_storage_root_guard.py",),
+     ("src/core/common.c", "include/common.h"), (),
+     "存储根一级条目守卫（common.c 路径合成 + 父目录补建出口）"),
 
     (("test_log_pipeline.py",),
      ("src/log/", "src/core/nsp_comm.c", "include/nsp_comm.h", "include/nsp_log.h",
@@ -283,6 +293,7 @@ LAYERS = {
             "test_rules.py",
             "test_decision_enforce.py",
             "test_negative_timeout.py",
+            "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
             "test_modules.py",
             "test_module_circuit.py",

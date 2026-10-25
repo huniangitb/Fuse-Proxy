@@ -301,7 +301,7 @@ static void inherit_from_parent(const char* real_path) {
    mkdir_recursive 保持历史语义（不继承属性、固定 0755）。
    两者语义确有差异故保留两个入口，但共用本实现——此前各写一份循环，
    且 mkdir_recursive 用 256 字节栈缓冲，超长路径会被静默拒绝。 */
-static int mkdir_p_impl(const char* path, mode_t mode, bool inherit) {
+static int mkdir_p_impl(const char* path, mode_t mode, bool inherit, size_t start) {
     if (!path || !path[0]) return -1;
     char tmp[PATH_MAX];
     /* 放不下即拒绝（同"路径合成不截断"约定）：静默截断后会沿错误路径逐级建目录 */
@@ -313,7 +313,13 @@ static int mkdir_p_impl(const char* path, mode_t mode, bool inherit) {
     size_t len = strlen(tmp);
     if (len == 0) return -1;
     if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
-    for (char* p = tmp + 1; *p; p++) {
+    len = strlen(tmp);
+    if (start < 1) start = 1;
+    if (start > len) start = len;
+    /* start = 第一个允许**本函数创建**的组件的起始下标（之前的组件视为已存在）。
+       start>1 时循环首轮的截断点是更深的路径前缀——一级组件因此永不参与 mkdir；
+       它若真的不存在，首次 mkdir 自然返回 ENOENT（结构性 fail-closed）。 */
+    for (char* p = tmp + start; *p; p++) {
         if (*p == '/') {
             *p = '\0';
             if (access(tmp, F_OK) != 0) {
@@ -337,11 +343,11 @@ static int mkdir_p_impl(const char* path, mode_t mode, bool inherit) {
 }
 
 int mkdir_recursive(const char* dir) {
-    return mkdir_p_impl(dir, 0755, false);
+    return mkdir_p_impl(dir, 0755, false, 1);
 }
 
 int mkdir_recursive_p(const char* path, mode_t mode) {
-    return mkdir_p_impl(path, mode, true);
+    return mkdir_p_impl(path, mode, true, 1);
 }
 /* 核心修复：共享的无效 Unicode/控制字符检测逻辑。
    增加全面的 Null 终止探测防御，绝不发生指针越过结束符 '\0' 的情况，阻断任何越界或野指针异常 */
@@ -652,4 +658,111 @@ int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz) {
     else
         snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/%s", uid, pkg, dirname);
     return 0;
+}
+
+/* ================= 存储根一级条目守卫 =================
+ * 历史缺陷：/data/media（= /storage/emulated）顶层反复出现纯数字垃圾目录，
+ * 只能在 /data/media 下删掉。链路：被注入的应用请求 /<数字>/… → fw_parse_path
+ * 把第一个全数字段当 user_id（没有任何存在性校验）→ 真实路径
+ * <STORAGE_BASE>/<数字>/… → mkdir/open(O_CREAT) 的父目录补建把
+ * <STORAGE_BASE>/<数字> 造出来；守护进程以 root 执行，普通应用借此获得了
+ * 「在存储根造条目」这一本应只有 vold/root 才有的能力。
+ *
+ * 因此把「存储根一级条目」提升为框架级不变量：**FUSE 视图永不创建/删除一级
+ * 条目**（读写既有条目照旧）；「不存在的用户层」读写都按 ENOENT（根级 REDIRECT
+ * 下规则引擎会把 /<数字> 合成为“已存在目录”，读侧不拦应用就会下探并触发出落盘）。
+ * 判定由路由层 fail-closed，三个出口集中在本节，禁止各回调私刻判定（与 fw_route
+ * 的 hidden/ro 单点同一红线）。 */
+
+/* 有效存储根：--root=<测试/注入根> 优先，否则 STORAGE_BASE（与
+   common_default_real_path 同口径）。放不下写空串失败闭合。 */
+void common_storage_base(char* out, size_t sz) {
+    if (!out || sz == 0) return;
+    PATH_SNPRINTF(out, sz, "%s", g_real_root[0] ? g_real_root : STORAGE_BASE);
+    /* 归一尾部 '/'：--root=<dir>/ 这种写法会让 base 以 '/' 结尾，层级判定
+       （real_path[bl] != '/'）与一级组件切片整体错位、守卫静默失效——统一剥掉 */
+    size_t n = strlen(out);
+    while (n > 1 && out[n - 1] == '/') out[--n] = '\0';
+}
+
+/* real_path 是否恰为「存储根一级条目」：<base>/<单个组件>（其后不再有 '/'）。
+   存储根本身、更深层路径、以及不在存储根下的路径（FTP 目标、测试根外重定向）
+   均返回 false——只拦「在存储根下新建/删改一级条目」这一件事。 */
+bool common_is_storage_root_entry(const char* real_path) {
+    if (!real_path || real_path[0] != '/') return false;
+    /* 尾部斜杠归一：real_path 由 <base>/<uid><sub_path> 合成，sub_path 为 "/"
+       时会带尾 '/'（如 /data/media/999/ 指的就是用户根条目本身）——不归一会漏判 */
+    size_t rl = strlen(real_path);
+    while (rl > 1 && real_path[rl - 1] == '/') rl--;
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof base);
+    size_t bl = strlen(base);
+    if (bl == 0 || rl <= bl + 1) return false;
+    if (strncmp(real_path, base, bl) != 0) return false;
+    if (real_path[bl] != '/') return false; /* <base> 本身 或 <base>xxx 同前缀异名 */
+    const char* name = real_path + bl + 1;
+    size_t nl = rl - bl - 1; /* 一级组件长度（已去尾斜杠） */
+    if (nl == 0) return false; /* 存储根本身 */
+    for (size_t i = 0; i < nl; i++) {
+        if (name[i] == '/') return false; /* 更深层：不是一级条目 */
+    }
+    return true;
+}
+
+/* 创建类回调的父目录补建唯一出口（daemon 的 create/mkdir/symlink/rename 与
+   沙盒落点共用）：**绝不创建存储根一级组件**——一级组件缺失即失败
+   （errno=ENOENT，由调用方原样回给内核），避免 mkdir_recursive_p 替普通应用
+   在存储根下 materialize 目录。非存储根路径沿用原语义（FTP 相对目标等）。
+   注意：本函数只保证「不新建一级组件」，已有的一级组件（用户根/obb）下照常
+   递归补建。 */
+int common_mkdir_within_storage(const char* dir, mode_t mode) {
+    if (!dir || dir[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof base);
+    size_t bl = strlen(base);
+    if (bl > 0 && strncmp(dir, base, bl) == 0 && dir[bl] == '/') {
+        const char* name = dir + bl + 1;
+        if (name[0] == '\0') return 0; /* 存储根本身：必然已存在 */
+        const char* slash = strchr(name, '/');
+        if (!slash) {
+            /* 目标**就是**存储根一级组件本身：永不创建（由 vold 掌管） */
+            errno = ENOENT;
+            return -1;
+        }
+        /* 从一级组件之后的第二个组件起递归补建：一级组件只作前缀、不参与
+           mkdir（连 access/mkdir 都不做，顺带堵掉「查与建之间被删→重建」的窄窗口）。
+           它若缺失，首次 mkdir 自然 ENOENT。 */
+        return mkdir_p_impl(dir, mode, true, (size_t)(slash - dir) + 1);
+    }
+    return mkdir_recursive_p(dir, mode);
+}
+
+/* ================= FUSE 路径 <uid>/ 用户层解析（唯一实现） =================
+ * fw_parse_path（框架路由）与 br_strip_and_sanitize（规则引擎）历史上各写一份、
+ * 语义必须逐行一致——现共用本函数。三点约定：
+ *   - 只有「完整 user_id 目录」才剥离：数字序列后是结尾或 '/'（/0、/10/…）；
+ *     数字前缀文件名（/1_abc.txt、/12_34）不剥离（见 vfs_readdir 的 uid_dir 判定）；
+ *   - 数字串超出 int 范围返回 -1（非法用户层）：atoi 溢出是 UB，实测
+ *     /4294967296/x 会被别名成 /0/x——把别人的存储当成本用户，必须 fail-closed；
+ *   - 返回值：1=命中（*user_id 与 *sub_path 有效）、0=无用户层（*sub_path 指回原
+ *     路径）、-1=非法（调用方按 ENOENT 处理）。 */
+int common_parse_user_layer(const char* path, int* user_id, const char** sub_path) {
+    if (user_id) *user_id = -1;
+    if (sub_path) *sub_path = path;
+    if (!path || path[0] != '/' || path[1] < '0' || path[1] > '9') return 0;
+    const char* d = path + 1;
+    long v = 0;
+    while (*d >= '0' && *d <= '9') {
+        int digit = *d - '0';
+        if (v > (INT_MAX - digit) / 10) return -1; /* 超出 int：非法用户层 */
+        v = v * 10 + digit;
+        d++;
+    }
+    if (*d != '\0' && *d != '/') return 0; /* 数字前缀文件名：不剥离 */
+    if (user_id) *user_id = (int)v;
+    if (sub_path) *sub_path = (*d == '/') ? d : "/";
+    return 1;
 }

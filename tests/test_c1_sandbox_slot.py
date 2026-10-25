@@ -131,6 +131,9 @@ def main():
         [os.path.join(ROOT, s) for s in SOURCES] + \
         ["-Wl,--wrap=config_read_begin", "-Wl,--wrap=config_read_end",
          "-Wl,--wrap=mkdir_recursive_p",
+         # 存储根守卫后沙盒补建走 common_mkdir_within_storage（与 mkdir_recursive_p
+         # 同 TU，直调 wrap 不到）——两个出口都要观察，见驱动注释
+         "-Wl,--wrap=common_mkdir_within_storage",
          "-o", exe, "-pthread", "-ldl", "-lm"] + \
         pkg_config("--cflags") + pkg_config("--libs")
     r = subprocess.run(cmd, capture_output=True, text=True)
