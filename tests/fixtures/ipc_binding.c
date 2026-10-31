@@ -64,7 +64,7 @@
 #include "injector.h"
 #include "inject_target.h"
 #include "ipc_server.h"
-#include "ns_utils.h" /* NSP_READINESS_DEFER：pre 通道的负值哨兵 */
+#include "ns_utils.h" /* NSP_READINESS_QUIET：后台通道的负值哨兵 */
 #include "nsp_log.h"
 #include "nsp_util.h"
 #include "uid_map.h"
@@ -194,6 +194,8 @@ void schedule_retry_mount(const char* pkg, int pid) {
     (void)pid;
     atomic_fetch_add(&g_retry_calls, 1);
 }
+/* 挂载成功清账（真实现随 injector.c 编入，本直编组不链接它） */
+void retry_mount_succeeded(int pid) { (void)pid; }
 
 /* ns_* 桩：inject_target.c 的 cleanup_app_mounts 引用（本用例不触达） */
 int ns_bind_mount(int pid, const char* source, const char* target) {
@@ -516,13 +518,15 @@ static int run_ack_order_case(void) {
     int sync_calls = atomic_load(&g_sync_mount_calls);
     int readiness = atomic_load(&g_sync_mount_readiness);
     bool ok_ack = (strcmp(ack, "OK") == 0);
-    /* REQ（应用直连的历史通道）必须保持"等待 1s + 挂载完成后 OK"的老行为：
-       这是"新协议不改变既有通道语义"的判别点。 */
-    ok = ok_ack && !early_ack && sync_calls == 1 && readiness == 1000;
+    /* REQ（应用直连的历史通道）仍是"就地挂载 + 挂载完成后才 ACK"，但就绪预算
+       改成 IPC_MOUNT_READINESS_MS（旧值 1000ms 直接落在应用主线程上，冷启动可
+       感知；新值只覆盖抖动，等不到就 fail-open 交后台重试）。 */
+    ok = ok_ack && !early_ack && sync_calls == 1 && readiness == IPC_MOUNT_READINESS_MS;
     snprintf(detail, sizeof detail,
              "early_ack=%d(期望0) ack=%s(期望OK) sync_mount_calls=%d(期望1) "
-             "readiness=%d(期望1000)",
-             (int)early_ack, ack[0] ? ack : "(空)", sync_calls, readiness);
+             "readiness=%d(期望%d)",
+             (int)early_ack, ack[0] ? ack : "(空)", sync_calls, readiness,
+             IPC_MOUNT_READINESS_MS);
     report(ok, "A1 挂载完成前不得 ACK（ACK 后才放行 specialize）", detail);
 
     kill(child, SIGKILL);
@@ -531,45 +535,50 @@ static int run_ack_order_case(void) {
     return 0;
 }
 
-/* A2：v1 就绪预算 / 失败语义决策矩阵（两段式补挂载的核心契约）。
+/* A2：v1 挂载通道决策矩阵（两段式补挂载的核心契约）。
  *
  * 真机上的 REPORT/POST 只允许 root companion 对端，普通单测进程无法伪造该
- * 凭据，故这里直接钉住决策纯函数 ipc_plan_readiness：哪条通道该等多久、失败
- * 该回 DEFER 还是 ERR。判别点（旧实现根本没有"DEFER"这个概念）：
- *   - proto>=2 的 pre 尝试必须返回 NSP_READINESS_DEFER（负值哨兵：下游据此把
- *     "目标缺失"按预期未就绪静默处理，不记 WARN/ERROR）+ 失败回 DEFER——否则
- *     zygisk 拿不到
- *     DEFER，永远不会在 post-specialize 重发 POST，应用首写仍会落在真实视图；
- *   - POST 必须有非 0 预算且**失败不回 DEFER**——否则会在 post 里再被推迟一次，
- *     应用将永远等不到代理视图；
- *   - 旧模块（无 proto）与 REQ 必须保持 1000ms / 不回 DEFER，零回归。
- * 注：哨兵为负值（-1）而不是 0，是"未就绪≠失败"的语义载体——预算 0 仍会被下游
- * 当成一次权威尝试（缺失即 loud 报错）。 */
+ * 凭据，故这里直接钉住决策纯函数 ipc_plan_channel / ipc_channel_readiness：
+ * 哪条通道该挂、等多久。判别点：
+ *   - proto>=2 的 pre 探测必须是 IPC_CHAN_DEFER 且预算 0——**pre 阶段绝不能挂载**：
+ *     此刻应用还在 zygote 的挂载命名空间里（部分 ROM 该 ns 里就有 /storage/emulated），
+ *     在这里挂载会把项目 FUSE 装进 zygote ns，之后 fork 的每个应用（含非目标）
+ *     都继承它，且 cleanup 只会在应用自己的 ns 里卸载，这份挂载没人能清；
+ *   - POST 必须是 IPC_CHAN_POST（唯一的挂载时机）；
+ *   - 旧模块（无 proto）与 REQ 必须是 IPC_CHAN_LEGACY（就地挂载，语义不变）；
+ *   - 预算必须短（IPC_MOUNT_READINESS_MS <= 500）：这段等待发生在应用主线程里，
+ *     旧值 1800/1000ms 在"视图迟迟不出现"的设备上等于每次冷启动固定变慢。 */
 static void run_plan_readiness_cases(void) {
     struct PlanCase {
         const char* label;
         bool is_post;
         bool is_report;
         int proto;
+        IpcChannel want_chan;
         int want_ms;
-        bool want_defer;
     } cs[] = {
-        {"A2 pre(REPORT,proto=2) → 预算 DEFER 哨兵 + 失败回 DEFER", false, true, 2,
-         NSP_READINESS_DEFER, true},
-        {"A2 POST(proto=2) → 预算1800 + 失败排重试", true, false, 2, IPC_POST_READINESS_MS, false},
-        {"A2 旧模块(REPORT,无proto) → 预算1000 + 失败排重试", false, true, 0, 1000, false},
-        {"A2 REQ(应用直连,proto=2) → 预算1000（历史行为不变）", false, false, 2, 1000, false},
-        {"A2 POST(无proto) → 预算1800", true, false, 0, IPC_POST_READINESS_MS, false},
+        {"A2 pre(REPORT,proto=2) → DEFER 通道（只裁决、不挂载，预算 0）", false, true, 2,
+         IPC_CHAN_DEFER, 0},
+        {"A2 POST(proto=2) → POST 通道（唯一挂载时机）", true, false, 2, IPC_CHAN_POST,
+         IPC_MOUNT_READINESS_MS},
+        {"A2 旧模块(REPORT,无proto) → legacy 通道（就地挂载）", false, true, 0, IPC_CHAN_LEGACY,
+         IPC_MOUNT_READINESS_MS},
+        {"A2 REQ(应用直连,proto=2) → legacy 通道（历史行为不变）", false, false, 2,
+         IPC_CHAN_LEGACY, IPC_MOUNT_READINESS_MS},
+        {"A2 POST(无proto) → POST 通道", true, false, 0, IPC_CHAN_POST, IPC_MOUNT_READINESS_MS},
     };
     char detail[400];
     for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
-        bool defer = false;
-        int ms = ipc_plan_readiness(cs[i].is_post, cs[i].is_report, cs[i].proto, &defer);
-        bool ok = (ms == cs[i].want_ms) && (defer == cs[i].want_defer);
-        snprintf(detail, sizeof detail, "ms=%d(期望%d) defer=%d(期望%d)", ms, cs[i].want_ms,
-                 (int)defer, (int)cs[i].want_defer);
+        IpcChannel ch = ipc_plan_channel(cs[i].is_post, cs[i].is_report, cs[i].proto);
+        int ms = ipc_channel_readiness(ch);
+        bool ok = (ch == cs[i].want_chan) && (ms == cs[i].want_ms);
+        snprintf(detail, sizeof detail, "chan=%d(期望%d) ms=%d(期望%d)", (int)ch,
+                 (int)cs[i].want_chan, ms, cs[i].want_ms);
         report(ok, cs[i].label, detail);
     }
+    /* 主线程预算必须短：冷启动可感知的量级是几百毫秒以上 */
+    report(IPC_MOUNT_READINESS_MS <= 500, "A2 主线程就绪预算 ≤ 500ms（冷启动可感知上限）",
+           "预算过大：应用主线程会被拖慢");
 }
 
 int main(int argc, char** argv) {

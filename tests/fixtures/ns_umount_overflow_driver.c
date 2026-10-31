@@ -71,6 +71,9 @@ void log_internal(LogLevel level, const char* format, ...) {
     va_end(ap);
 }
 
+/* ns_utils.c 的成功回调会清重试记账；本用例不涉及重试队列 */
+void retry_mount_succeeded(int pid) { (void)pid; }
+
 /* ══════════════ fopen / umount2 拦截 ══════════════ */
 
 FILE* __real_fopen(const char* path, const char* mode);

@@ -17,21 +17,35 @@ void ipc_server_cleanup(int sock_fd);
  */
 void handle_ipc_client_readable(int client_fd);
 
-/* v1 就绪等待预算（post-specialize 的 POST 用）：覆盖 ColorOS 型 ROM 上 vold
-   装配应用命名空间 ~1s 的延迟，留 0.8s 余量。zygisk 侧的等待上限比它更长，
-   保证"injector 先裁决、模块后超时"的顺序。 */
-#define IPC_POST_READINESS_MS 1800
+/* v1 挂载的就绪等待预算（POST 与旧模块就地挂载共用）。
+ *
+ * 为什么是 250ms 而不是 1800ms：这段等待发生在**应用主线程**里（zygisk 的
+ * postAppSpecialize 阻塞等 ACK），1800ms 会让"视图迟迟不出现"的设备每次冷启动
+ * 固定多等 1.8s，然后失败、再排重试——真机上被报成"冷启动明显变慢"。实测健康
+ * 设备在 post 阶段视图已经就绪（挂载只要 1~3ms），250ms 足够覆盖抖动；等不到
+ * 就立即 fail-open（应用先用原生视图跑起来），由后台重试队列补挂（静默、有界）。
+ *
+ * zygisk 侧的等待上限比它更长，保证"injector 先裁决、模块后超时"的顺序。 */
+#define IPC_MOUNT_READINESS_MS 250
 
-/**
- * v1 挂载的就绪预算与失败语义决策（纯函数，便于直编单测）。
- *   - POST（post-specialize 补挂载）：预算 IPC_POST_READINESS_MS，失败才排重试；
- *   - REPORT + proto>=2（pre-specialize 快速尝试）：返回 NSP_READINESS_DEFER
- *     （负值哨兵，见 ns_utils.h）——不等待，且下游把"目标缺失"按预期未就绪处理
- *     （DEBUG，不写 error.log、不记 WARN/ERROR），未就绪回 DEFER 由 zygisk 在
- *     post-specialize 重发 POST；
- *   - 旧模块（无 proto）/ REQ（应用直连的历史通道）：预算 1000，维持原行为。
- * 返回 readiness_ms（可能为负值哨兵）；*defer_on_fail 置位表示失败时应回 DEFER。
- */
-int ipc_plan_readiness(bool is_post, bool is_report, int proto, bool* defer_on_fail);
+/* v1 挂载通道（纯函数决策，便于直编单测）：
+ *   IPC_CHAN_DEFER  = pre-specialize 的 REPORT 预探测（proto>=2）：**只裁决不挂载**，
+ *       立即回 DEFER。此刻应用还在 zygote 的挂载命名空间里——部分 ROM 该 ns 里
+ *       就有 /storage/emulated，在这里挂载等于把项目 FUSE 装进 zygote ns，之后
+ *       fork 的每个应用（含非目标）都会继承它，且 cleanup 只会在应用自己的 ns
+ *       里卸载，这份挂载没人能清。应用自己的 ns 要到 post-specialize 才成立。
+ *   IPC_CHAN_POST   = post-specialize 的 POST：唯一的挂载时机，预算
+ *       IPC_MOUNT_READINESS_MS，失败排重试。
+ *   IPC_CHAN_LEGACY = 旧模块（无 proto）的 REPORT 与应用直连的 REQ：就地挂载，
+ *       同预算（旧值 1000ms，冷启动可感知），失败仍排重试，语义不变。 */
+typedef enum {
+    IPC_CHAN_DEFER = 0,
+    IPC_CHAN_POST = 1,
+    IPC_CHAN_LEGACY = 2,
+} IpcChannel;
+
+IpcChannel ipc_plan_channel(bool is_post, bool is_report, int proto);
+/* 该通道的就绪预算（ms，正值）。IPC_CHAN_DEFER 不挂载，返回 0 */
+int ipc_channel_readiness(IpcChannel ch);
 
 #endif

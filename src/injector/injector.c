@@ -11,6 +11,7 @@
 #include "fast_pid.h"
 #include "inject_target.h"
 #include "reaped_managed.h"
+#include "retry_queue.h"
 #include "mount_manager.h"
 #include "ipc_server.h"
 #include "config_publisher.h"
@@ -89,17 +90,11 @@ static int g_pending_first_scan = 0;
 /* FUSE 崩溃恢复后待重挂标记：新 FUSE 就绪时重挂所有追踪应用 */
 static volatile sig_atomic_t g_pending_remount = 0;
 
-/* 挂载失败重试队列：应对 FUSE 重建期间并发挂载的瞬态失败 */
-#define MAX_RETRY_MOUNTS 64
-typedef struct {
-    char cmdline[256];
-    int pid;
-    uid_t uid;
-    int retries;
-    time_t last_attempt;
-} RetryMountEntry;
-static RetryMountEntry g_retry_mounts[MAX_RETRY_MOUNTS];
-static int g_retry_mount_count = 0;
+/* 挂载失败重试记账在 src/injector/retry_queue.c（纯记账、可直编单测）。
+   这里只保留调度：旧实现把"异步派发成功"当成"挂载成功"，条目当场摘掉、
+   失败回调再以 attempts=0 重新入队——退避永不生效、5 次上限永远打不到，
+   于是挂不上的应用以 1Hz 永久反复（每轮一条 error.log + 一次 fork/mountinfo）。
+   现在尝试次数随条目保存（nsp_retry_*），成功才清账，超限 loud 一次后放弃。 */
 
 /* 异步就绪与挂载任务全局描述符注册系统 */
 static int g_fuse_ready_pipe_fd = -1;
@@ -168,21 +163,18 @@ void unregister_async_mount_pipe(int fd) {
 }
 
 void schedule_retry_mount(const char* pkg, int pid) {
-    if (g_retry_mount_count >= MAX_RETRY_MOUNTS) {
+    if (!nsp_retry_schedule(pkg, pid)) {
         LOG_DBG("重试队列已满，丢弃 %s(PID:%d) 的重试", pkg, pid);
         return;
     }
-    for (int i = 0; i < g_retry_mount_count; i++) {
-        if (g_retry_mounts[i].pid == pid) return;
-    }
-    RetryMountEntry* e = &g_retry_mounts[g_retry_mount_count++];
-    strncpy(e->cmdline, pkg, sizeof(e->cmdline) - 1);
-    e->cmdline[sizeof(e->cmdline) - 1] = '\0';
-    e->pid = pid;
-    e->uid = 0;
-    e->retries = 0;
-    e->last_attempt = time(NULL);
-    LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d", pkg, pid, g_retry_mount_count);
+    LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d, 已尝试=%d", pkg, pid, nsp_retry_count(),
+            nsp_retry_attempts_of(pid));
+}
+
+/* 挂载成功后清账（重试队列里该 pid 的尝试计数归零）。由 IPC 挂载线程与异步
+   完成回调在**真正成功**时调用；派发成功不算成功。 */
+void retry_mount_succeeded(int pid) {
+    if (nsp_retry_done(pid)) LOG_DBG("挂载成功，清除 %d 的重试记账", pid);
 }
 
 const char* get_active_mnt_src() {
@@ -381,7 +373,7 @@ void handle_fuse_ready_event(void* ptr) {
             g_pending_first_scan = 0;
             seconds_until_next_scan = 0;
         }
-        if (g_retry_mount_count > 0) {
+        if (nsp_retry_count() > 0) {
             seconds_until_next_scan = 0;
         }
         if (g_pending_remount) {
@@ -1264,49 +1256,34 @@ static void maybe_periodic_scan(void) {
 }
 
 static void retry_pending_mounts(void) {
-    if (g_fuse_ready && g_retry_mount_count > 0) {
-        const char* mnt_src_retry = get_active_mnt_src();
-        if (mnt_src_retry) {
-            int retry_idx = 0;
-            while (retry_idx < g_retry_mount_count) {
-                RetryMountEntry* e = &g_retry_mounts[retry_idx];
-                e->retries++;
-                if (e->retries > 5) {
-                    LOG_DBG("重试耗尽，放弃 %s(PID:%d)", e->cmdline, e->pid);
-                    e->pid = -1;
-                } else if (kill(e->pid, 0) != 0) {
-                    LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e->cmdline, e->pid);
-                    e->pid = -1;
-                } else {
-                    /* 指数退避：第 N 次重试间隔 2^(N-2) 秒 (N>=2) */
-                    if (e->retries > 1) {
-                        time_t now = time(NULL);
-                        int backoff = 1 << (e->retries - 2); /* 1, 2, 4, 8 秒 */
-                        if (now - e->last_attempt < backoff) {
-                            LOG_DBG("重试退避 %s(PID:%d), 第%d次, 已过%lds<%ds", e->cmdline, e->pid,
-                                    e->retries, now - e->last_attempt, backoff);
-                            retry_idx++;
-                            continue;
-                        }
-                    }
-                    uid_t uid = get_app_uid(e->pid);
-                    e->last_attempt = time(NULL);
-                    LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e->cmdline, e->pid, uid,
-                            e->retries);
-                    int ret = perform_app_mount(e->cmdline, e->pid, uid, nullptr, "失败重试");
-                    if (ret == 0) {
-                        LOG_DBG("重试成功/跳过, 移除 %s(PID:%d) 的重试", e->cmdline, e->pid);
-                        e->pid = -1;
-                    }
-                }
-                retry_idx++;
-            }
-            int new_count = 0;
-            for (int i = 0; i < g_retry_mount_count; i++) {
-                if (g_retry_mounts[i].pid > 0) g_retry_mounts[new_count++] = g_retry_mounts[i];
-            }
-            g_retry_mount_count = new_count;
+    if (!g_fuse_ready) return;
+    const char* mnt_src_retry = get_active_mnt_src();
+    if (!mnt_src_retry) return;
+    /* 每 tick 至多取 NSP_RETRY_TICK_BUDGET 条：重试要读 mountinfo + fork，主循环里
+       一次做完几十条会把其它应用的 IPC 应答排到后面（批量冷启动时的抖动来源）。
+       退避与尝试上限都在 retry_queue 内（nsp_retry_next 自带到期判定与计数）。 */
+    enum { NSP_RETRY_TICK_BUDGET = 4 };
+    for (int i = 0; i < NSP_RETRY_TICK_BUDGET; i++) {
+        NspRetryEntry e;
+        int what = nsp_retry_next(&e, time(NULL));
+        if (what == NSP_RETRY_NONE) break;
+        if (what == NSP_RETRY_GIVEUP) {
+            /* 退避耗尽：整个生命周期只 loud 这一次，应用继续用原生视图 */
+            LOG_WRN("挂载重试耗尽，放弃 %s(PID:%d)（已尝试 %d 次，保持原生视图）", e.pkg, e.pid,
+                    e.attempts);
+            continue;
         }
+        if (kill(e.pid, 0) != 0) {
+            LOG_DBG("重试跳过 %s(PID:%d) — 进程已死亡", e.pkg, e.pid);
+            nsp_retry_done(e.pid);
+            continue;
+        }
+        uid_t uid = get_app_uid(e.pid);
+        LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e.pkg, e.pid, uid, e.attempts);
+        /* 结果由 handle_async_mount_event 收尾：成功清账、失败重新入队等下一轮退避。
+           这里**不**按返回值摘条目——异步派发成功不等于挂载成功（旧实现正是在此
+           把条目摘掉，于是每个 tick 都从头再试）。 */
+        perform_app_mount(e.pkg, e.pid, uid, nullptr, "失败重试");
     }
 }
 

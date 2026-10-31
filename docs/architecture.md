@@ -224,13 +224,19 @@ FUSE 回调（如 getattr）
 
 **视图就绪语义（应答三态 OK / DEFER / ERR）**：应用在 zygote `preAppSpecialize` 里经 companion 上报并等待 injector 的应答，收到后才继续 specialize。应答即"应用能否往下跑"的唯一信号：
 
-- `OK`：视图已就绪，或**无需任何视图操作**——v3 全局视图、v2 非目标且已还原、隔离进程/zygote、进程已死、FUSE 暂不可用。
-- `DEFER`：**仅 v1 目标应用**。目标命名空间里 `/storage/emulated` 尚未被 vold 装配（ColorOS 型 ROM 常见，实测 0.6–0.9s），此刻挂载必然失败。injector 不排重试、不报错，模块把进程记为 pending，在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST` 再来一次。该次尝试的"缺失"必须与真实失败分开记：`ipc_plan_readiness` 为 pre 通道返回负值哨兵 `NSP_READINESS_DEFER`，下游 `ns_combined_mount`/`mount_manager` 据此只记一条 DEBUG 说明——**不写错误日志、不记 WARN/ERROR、不宣称"交由重试队列"**。否则每次应用启动都会先落一条与真实结果相反（实际挂载成功）的"挂载失败"，正是历史上最误导排查的噪声源。
-- `ERR`：挂载/还原失败；应用照常启动但本次无代理视图（injector 已排入重试队列兜底）。
+- `OK`：**无需任何视图操作**——v3 全局视图、v2 非目标且已还原、隔离进程/zygote、进程已死、FUSE 暂不可用，或 pre 通道判定非目标。
+- `DEFER`：**仅 v1 目标应用**。pre 通道**只裁决、不挂载**：此刻进程还在 zygote 的挂载命名空间里（部分 ROM 该 ns 里就有 `/storage/emulated`），在这里挂载等于把项目 FUSE 装进 zygote ns——之后 fork 的每个应用（含非目标）都会继承它，且 `cleanup_app_mounts` 只会在应用自己的 ns 里卸载，这份挂载没人能清。应用自己的 ns 要到 `postAppSpecialize` 才成立，那才是唯一该挂载的时机。模块把进程记为 pending，在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST`。
+- `ERR`：主线程短等内没挂上（或 FUSE 暂不可用）；应用照常启动，本次无代理视图，挂载交给后台重试队列（静默、有界）。
 
-`POST` 到达时 injector 在应用命名空间内带预算（`IPC_POST_READINESS_MS`，1800ms）等 `/storage/emulated` 出现，**挂载完成才回 `OK`**。于是应用的首个 `open()` 就已经看到代理视图——v1 不再有"进程已跑、视图后到"的窗口（此前实测窗口 0–890ms，窗口内写入会失败或被写进真实存储）。
+`POST` 到达时 injector 在应用命名空间内做一次**短预算**（`IPC_MOUNT_READINESS_MS`，250ms）尝试，**挂载完成才回 `OK`**——健康设备上这段只有 1~3ms（实测 post 阶段视图已就绪），于是应用首个 `open()` 就看见代理视图；等不到就立即 fail-open 回 `OK`，把补挂载交给后台重试队列。**应用主线程上的预算必须小于"能感知"的量级**：旧值 1800ms 在"视图迟迟不出现"的设备上等于每次冷启动固定多等 1.8s，然后失败、再排重试——真机上报的正是"冷启动明显变慢"。
 
-**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时才允许延迟应答；旧模块（不带 proto）走原有"就地挂载（等 1s）+ 异步重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector pre 预算 0（+2s 子进程余量）< companion 等 injector 2.5s < 模块等 companion 3.5s；POST 侧 injector 1800ms（+2s）< companion 6s < 模块 8s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
+**后台重试必须收敛（真机回归）**：重试记账在 `src/injector/retry_queue.c`。旧实现把"异步派发成功"当成"挂载成功"——派发后立即摘条目，真正的失败由完成回调重新入队（新条目尝试次数归零），退避与 5 次上限因此永远不生效：挂不上的应用以 **1Hz 永久重试**，每轮写一条 错误日志 + WARN + ERROR，并持续 fork/读 mountinfo。现在尝试次数随条目保存：相邻尝试按 1/2/4/8s 退避、同一 pid 最多 `NSP_RETRY_MAX_ATTEMPTS`（6）次，超限 loud 一次后放弃（应用继续用原生视图），成功才清账。后台通道（异步扫描 / 失败重试）的"目标未就绪"用负值哨兵 `NSP_READINESS_QUIET` 只记 DEBUG——错误日志 只留给权威尝试。
+
+**合并挂载的两条硬约束（"某些设备存储全空"的守护）**：
+1. **源预检在卸载之前**：源必须是本命名空间内真实的 FUSE 挂载（`statfs` == `FUSE_SUPER_MAGIC`）。不同 ROM 的 `/mnt` 传播设置可能只把目录传进应用 ns、FUSE 没传进来——此时 bind 照样"成功"，但 `/storage/emulated` 是空的。旧实现先卸载目标再 mount，源不可用就把应用的原生存储拆成空目录；现在预检失败直接返回，目标一点不动。
+2. **传播隔离 + 挂载后校验**：动手前先 `MS_PRIVATE|MS_REC` 把目标子树置私有（共享挂载组上的卸载事件会传播到 zygote/其它应用命名空间，真机表现是"整台设备的 /storage/emulated/0 都空了"）；挂载后再 `statfs` 复核目标确为 FUSE 视图，否则卸载本次挂载并回滚族根视图。
+
+**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时把 pre 通道当作"只裁决"；旧模块（不带 proto）仍走"就地挂载（短预算）+ 后台重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector 挂载预算 250ms（+0.8s 子进程余量）< companion 等 injector 1.5s < 模块等 companion 2s；pre 通道只裁决、往返 <10ms < companion 0.8s < 模块 1.2s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
 
 #### 注入方法（`--inject-method=v1|v2|v3`）
 
@@ -259,7 +265,7 @@ injector  ipc_server.c 解析 ──→ 置 g_passive_mode，转入被动模式
                             ←── OK / DEFER / ERR
 app 进程  postAppSpecialize ──→ "POST <pkg> <pid> <uid> <proto>"（仅 pre 收到 DEFER 时）
 companion（root）           ──→ "POST ..."（root 通道，与 REPORT 同一身份模型）
-injector  带预算挂载（1800ms）──→ 完成才回 OK
+injector  短预算挂载（250ms）──→ 完成才回 OK；等不到就 fail-open 交后台重试
                             ←── OK / ERR（应用在此阻塞，仍早于 Java 代码）
 ```
 

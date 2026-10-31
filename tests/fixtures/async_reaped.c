@@ -53,6 +53,8 @@ void schedule_retry_mount(const char* pkg, int pid) {
     (void)pid;
     g_retries++;
 }
+/* 成功清账的桩：真实现随 injector.c（retry_queue 记账）编入，本直编组不链接它 */
+void retry_mount_succeeded(int pid) { (void)pid; }
 void remove_tracked(int pid) {
     (void)pid;
     g_removed++;

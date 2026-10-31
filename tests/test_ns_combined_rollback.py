@@ -20,15 +20,20 @@ src/injector/ns_utils.c 整体 #include（-DNS_UTILS_SRC=），只把 mount/umou
   B. 源 bind 失败 + 族根不可用 → 不回滚、loud 报错、返回原始 errno。
   C. 对照：源 bind 成功 → 不触发回滚。
   D. 目标视图未就绪（readiness_ms=0）→ 在任何卸载之前返回 ENOENT。
-  E. DEFER 预探测（NSP_READINESS_DEFER，v1 的 pre-specialize 快速尝试）：
-     目标缺失属预期未就绪——零 WARN/ERROR、不写 error.log、不宣称"交由重试
-     队列"，只留一条 DEBUG 说明（旧实现按普通失败记 WARN，真机表现为
-     "实际挂载成功，但日志一直显示没有成功"）。
+  E. 后台通道（NSP_READINESS_QUIET，异步扫描/失败重试）：目标缺失属预期未就绪
+     ——零 WARN/ERROR、不写 error.log、不宣称"交由重试队列"，只留一条 DEBUG 说明
+     （旧实现按普通失败记 WARN，真机表现为每个应用启动都刷一条"挂载失败"）。
   F. 对照：同一缺失走权威尝试（readiness_ms=0，POST/旧通道）→ 仍须 loud。
+  G. 源预检：源在应用命名空间里不是 FUSE 挂载（不同 ROM 的 /mnt 传播只带目录、
+     不带 FUSE）→ **零卸载、零挂载**返回 ENODEV，目标原样保留（旧实现先把原生
+     视图拆掉，再把普通空目录 bind 成 /storage/emulated → 应用存储整个变空）。
+  H. 挂载后校验：目标没有变成 FUSE 视图 → 卸载本次挂载 + 族根回滚 + EIO。
+  I. 传播隔离：MS_PRIVATE 必须发生在第一次卸载之前（否则共享挂载组上的卸载事件
+     会传播到 zygote/其它应用命名空间，真机表现为"整机存储都空了"）。
 
 退出码：全部通过 0，任一失败 1。环境变量 NS_UTILS_SRC 可指向另一份源码副本
-（用于验证本用例确能捕获旧实现）：指向 HEAD 的 ns_utils.c 时 A1–A4 仍过、E3/E4/E5
-必失败（旧实现没有负值哨兵，缺失一律按失败记 WARN）。
+（用于验证本用例确能捕获旧实现）：指向 HEAD 的 ns_utils.c 时 E3/E4/E5（静默口径）、
+G2/G3（源预检）、H1/H2（挂载后校验）、I1（传播隔离）必失败。
 """
 import os
 import shlex
@@ -62,7 +67,7 @@ def main():
             "-ffunction-sections", "-fdata-sections",
             str(DRIVER),
             "-Wl,--gc-sections",
-            "-Wl,--wrap=mount", "-Wl,--wrap=umount2",
+            "-Wl,--wrap=mount", "-Wl,--wrap=umount2", "-Wl,--wrap=statfs",
             "-o", str(exe),
         ]
         build = subprocess.run(cmd, capture_output=True, text=True)
