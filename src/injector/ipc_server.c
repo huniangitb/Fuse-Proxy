@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <time.h>
 #include <sched.h>
 #include <sys/resource.h>
@@ -101,11 +102,31 @@ typedef struct {
        代理视图就绪前继续 specialize 并访问存储（首次启动读到原始目录，或撞上
        合并挂载的裸挂载点窗口 ENOENT）。 */
     int ack_fd;
+    /* 还原线程完成时写入 1 字节的通知管道（-1 = 不通知）。v2 的非目标还原不再
+       把 ACK 挂在还原末尾：主流程做"有界快等"（IPC_RESTORE_INLINE_MS），
+       线程跑完第一轮就写这个字节；超预算则由主流程先 ACK 放行、线程继续在后台
+       做完——**正确性不依赖这次阻塞**（audit_tracked_apps 仍会兜底复查）。 */
+    int done_fd;
     /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms，见 IPC_MOUNT_READINESS_MS）。
        正预算 = 权威尝试：缺失即 loud 失败并排重试（后台通道的静默口径见
        ns_utils.h 的 NSP_READINESS_QUIET）。 */
     int readiness_ms;
 } IpcMountArg;
+
+/* v2 非目标应用还原的"有界快等"预算：正常一遍只有一次 setns + 逐节点卸载/bind
+   （实测数 ms），超预算立即 ACK 放行并让线程在后台做完——把应用冻在 specialize
+   上等还原（旧实现最坏 300ms 重试预算 + 还原本身）正是 v2 冷启动变慢的来源。 */
+#define IPC_RESTORE_INLINE_MS 30
+
+/* 通知主流程"还原线程已完成"（幂等；不持有 arg） */
+static void ipc_restore_signal_done(int* done_fd) {
+    if (*done_fd < 0) return;
+    char b = 1;
+    ssize_t w = write(*done_fd, &b, 1);
+    (void)w;
+    close(*done_fd);
+    *done_fd = -1;
+}
 
 /* 见 include/ipc_server.h 的契约说明（IPC_MOUNT_READINESS_MS 亦定义在那里）。
    独立成纯函数是为了让"哪条通道该挂、等多久、失败回什么"可被直编单测钉死——
@@ -151,7 +172,8 @@ static void* ipc_restore_thread(void* raw) {
     for (int attempt = 0; attempt < 20; attempt++) {
         if (kill(arg->pid, 0) != 0) {
             log_batch_end();
-            /* 进程已死：无需还原，放行对端（ACK 后 fd 随之关闭） */
+            /* 进程已死：无需还原，通知主流程放行（ACK 已由主流程发出时 fd=-1） */
+            ipc_restore_signal_done(&arg->done_fd);
             ipc_ack_and_close(arg->ack_fd, true);
             free(arg);
             return NULL;
@@ -183,8 +205,10 @@ static void* ipc_restore_thread(void* raw) {
         LOG_ERR("IPC还原失败: %s(PID:%d) ret=%d (尝试%d次, %ldms)", arg->pkg, arg->pid, ret,
                 attempts, total_ms);
     }
-    /* 视图已还原到位（或已确认无需还原）后才放行应用：ACK 之前应用不得继续
-       specialize——否则它会在项目 FUSE 视图下读到规则本不该给出的内容。 */
+    /* 先通知主流程：还原已完成（主流程多半早已 ACK 放行——v2 不依赖这次阻塞）。
+       若主流程仍在"有界快等"里，这一字节就是它的放行信号；若主流程已超时放行，
+       这里只剩兜底 ACK（ack_fd=-1 时是空操作）。 */
+    ipc_restore_signal_done(&arg->done_fd);
     ipc_ack_and_close(arg->ack_fd, ret == 0 || ret == 1);
     free(arg);
     return NULL;
@@ -514,6 +538,12 @@ void handle_ipc_client_readable(int client_fd) {
                POST 只可能出现在"pre 已判定为目标应用"之后，非目标不应收到；
                真收到时按已就绪放行，绝不重复做还原。 */
             if (!is_post && inject_restore_nontarget()) {
+                /* 还原与 ACK 解耦：ACK 不再等还原跑完（v2 的正确性不依赖这次阻塞）。
+                   主流程做有界快等（IPC_RESTORE_INLINE_MS）：正常数 ms 内线程就
+                   还原完并写 done 字节（此时 ACK 才发出，隔离优先）；超预算立即
+                   ACK 放行，线程在后台继续（audit_tracked_apps 仍会兜底复查）。 */
+                int done_pipe[2] = {-1, -1};
+                if (pipe2(done_pipe, O_CLOEXEC) != 0) done_pipe[0] = done_pipe[1] = -1;
                 IpcMountArg* arg = malloc(sizeof(IpcMountArg));
                 if (arg) {
                     strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
@@ -521,16 +551,36 @@ void handle_ipc_client_readable(int client_fd) {
                     arg->pid = pid;
                     arg->uid = uid;
                     arg->mnt_src[0] = '\0';
-                    arg->ack_fd = client_fd; /* 还原完成后由线程 ACK + close */
+                    arg->ack_fd = -1; /* ACK 由本流程发（线程只通知完成） */
+                    arg->done_fd = done_pipe[1];
                     arg->readiness_ms = 0;
                     pthread_t tid;
                     if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
                         pthread_detach(tid);
-                        /* 派发日志已并入 ipc_restore_thread 的单条汇总，不再单独输出 */
+                        bool inline_done = false;
+                        if (done_pipe[0] >= 0) {
+                            struct pollfd pfd = {.fd = done_pipe[0], .events = POLLIN};
+                            inline_done = (poll(&pfd, 1, IPC_RESTORE_INLINE_MS) > 0);
+                            close(done_pipe[0]);
+                        }
+                        if (inline_done) {
+                            LOG_DBG("IPC还原与放行: %s(PID:%d) 在 %dms 内完成（隔离优先）", clean_pkg,
+                                    pid, IPC_RESTORE_INLINE_MS);
+                        } else {
+                            LOG("IPC还原转后台: %s(PID:%d) 超过 %dms 未完成，先放行（不阻塞冷启动）",
+                                clean_pkg, pid, IPC_RESTORE_INLINE_MS);
+                        }
+                        ipc_ack_and_close(client_fd, true);
                         return;
                     }
                     LOG_ERR("IPC创建还原线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);
+                    arg->done_fd = -1;
+                    if (done_pipe[0] >= 0) close(done_pipe[0]);
+                    if (done_pipe[1] >= 0) close(done_pipe[1]);
                     free(arg);
+                } else {
+                    if (done_pipe[0] >= 0) close(done_pipe[0]);
+                    if (done_pipe[1] >= 0) close(done_pipe[1]);
                 }
             }
             ipc_ack_and_close(client_fd, true);
@@ -585,6 +635,7 @@ void handle_ipc_client_readable(int client_fd) {
             arg->uid = uid;
             arg->mnt_src[0] = '\0';
             arg->ack_fd = client_fd; /* 挂载完成后由线程 ACK + close */
+            arg->done_fd = -1;       /* 挂载线程不参与还原完成通知 */
             arg->readiness_ms = readiness_ms;
             pthread_t tid;
             if (pthread_create(&tid, NULL, ipc_mount_thread, arg) == 0) {

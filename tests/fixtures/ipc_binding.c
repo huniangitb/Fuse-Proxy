@@ -174,11 +174,18 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
     }
     return atomic_load(&g_sync_mount_result);
 }
+/* A3 用例：还原桩的"放行门"（门未创建时桩一直等待，模拟还原较慢/注入器繁忙） */
+static char g_restore_gate[PATH_MAX];
+
 int perform_app_restore(const char* pkg, int pid, uid_t uid) {
     snprintf(g_last_restore_pkg, sizeof g_last_restore_pkg, "%s", pkg);
     atomic_store(&g_last_restore_pid, pid);
     atomic_store(&g_last_restore_uid, (int)uid);
     atomic_fetch_add(&g_restore_calls, 1);
+    for (int i = 0; i < 300; i++) {
+        if (g_restore_gate[0] == '\0' || access(g_restore_gate, F_OK) == 0) break;
+        usleep(10 * 1000);
+    }
     return 0;
 }
 void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger_source) {
@@ -581,6 +588,98 @@ static void run_plan_readiness_cases(void) {
            "预算过大：应用主线程会被拖慢");
 }
 
+/* A3：v2 非目标应用还原**不得**把应用冻在 specialize 上（v2 不依赖 zygisk 阻塞）。
+ *
+ * 判别设计：还原桩挂在"放行门"上（门未创建时桩最长等 3s）。
+ *   - 新实现：ACK 与还原解耦（有界快等 IPC_RESTORE_INLINE_MS），门未开也先 ACK；
+ *     开门后后台线程跑完（restore_calls ≥ 1）。
+ *   - 旧实现：ACK 挂在还原线程末尾 → 门未开时客户端 300ms 内读不到 ACK（必失败）。
+ */
+static int run_v2_nonblocking_restore_case(void) {
+    char detail[800];
+    seed_uid_map();
+    g_passive_mode = 0;
+    atomic_store(&g_restore_calls, 0);
+    g_inject_method = INJECT_METHOD_V2;
+    char sock_path[108];
+    snprintf(sock_path, sizeof sock_path, "%s/ipc2.sock", CONFIG_DIR);
+    unlink(sock_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un laddr = {.sun_family = AF_UNIX};
+    snprintf(laddr.sun_path, sizeof laddr.sun_path, "%s", sock_path);
+    int rp[2] = {-1, -1};
+    if (lfd < 0 || bind(lfd, (struct sockaddr*)&laddr, sizeof laddr) != 0 ||
+        listen(lfd, 4) != 0 || pipe(rp) != 0) {
+        snprintf(detail, sizeof detail, "监听 socket/pipe 失败: %s", strerror(errno));
+        report(false, "A3 v2 非目标还原不阻塞 ACK（先放行、后台完成）", detail);
+        if (lfd >= 0) close(lfd);
+        g_inject_method = INJECT_METHOD_V1;
+        return -1;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(lfd);
+        close(rp[0]);
+        char rp_s[16], req[512];
+        snprintf(rp_s, sizeof rp_s, "%d", rp[1]);
+        snprintf(req, sizeof req, "REQ com.other.app %d %d", (int)getpid(), (int)getuid());
+        char self[PATH_MAX];
+        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (n <= 0) _exit(98);
+        self[n] = '\0';
+        execl(self, "com.other.app", "app", sock_path, req, rp_s, (char*)NULL);
+        _exit(99);
+    }
+    close(rp[1]);
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) {
+        snprintf(detail, sizeof detail, "accept 失败: %s", strerror(errno));
+        report(false, "A3 v2 非目标还原不阻塞 ACK（先放行、后台完成）", detail);
+        close(lfd);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        g_inject_method = INJECT_METHOD_V1;
+        return -1;
+    }
+    close(lfd);
+    unlink(sock_path);
+    snprintf(g_restore_gate, sizeof g_restore_gate, "%s/restore.gate", CONFIG_DIR);
+    unlink(g_restore_gate);
+    handle_ipc_client_readable(cfd);
+    /* 门未开：ACK 必须在 300ms 内到达（新实现立即放行；旧实现被还原阻塞，读不到） */
+    struct pollfd pfd = {.fd = rp[0], .events = POLLIN};
+    bool acked_while_blocked = (poll(&pfd, 1, 300) > 0);
+    char ack[32] = {0};
+    if (acked_while_blocked) {
+        ssize_t an = read(rp[0], ack, sizeof ack - 1);
+        if (an > 0) ack[an] = '\0';
+    }
+    /* 开门：后台还原线程继续跑完 */
+    int gfd = open(g_restore_gate, O_CREAT | O_WRONLY, 0600);
+    if (gfd >= 0) close(gfd);
+    bool restored = false;
+    for (int i = 0; i < 200; i++) {
+        if (atomic_load(&g_restore_calls) > 0) {
+            restored = true;
+            break;
+        }
+        usleep(10 * 1000);
+    }
+    close(rp[0]);
+    unlink(g_restore_gate);
+    g_restore_gate[0] = '\0';
+    bool ok_ack = (strcmp(ack, "OK") == 0);
+    snprintf(detail, sizeof detail,
+             "acked_while_restore_blocked=%d(期望1) ack=%s(期望OK) restore_after_gate=%d(期望>=1)",
+             (int)acked_while_blocked, ack[0] ? ack : "(空)", (int)restored);
+    report(acked_while_blocked && ok_ack && restored,
+           "A3 v2 非目标还原不阻塞 ACK（先放行、后台完成）", detail);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    g_inject_method = INJECT_METHOD_V1;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "app") == 0) return app_main(argc, argv);
 
@@ -612,6 +711,7 @@ int main(int argc, char** argv) {
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) run_case(&cases[i]);
     run_ack_order_case();
+    run_v2_nonblocking_restore_case();
     run_plan_readiness_cases();
 
     printf("\n结果: %d 通过, %d 失败\n", g_pass, g_fail);
