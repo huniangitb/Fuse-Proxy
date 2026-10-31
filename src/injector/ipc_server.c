@@ -107,6 +107,11 @@ typedef struct {
        线程跑完第一轮就写这个字节；超预算则由主流程先 ACK 放行、线程继续在后台
        做完——**正确性不依赖这次阻塞**（audit_tracked_apps 仍会兜底复查）。 */
     int done_fd;
+    /* 还原线程的等待预算（ms）：命中"顶层还不是项目 FUSE"时按 10ms 步进重试，
+       直到该预算耗尽。pre 阶段派发的后台兜底给足 1200ms（此时共享传播/volad
+       装配可能还没完成，但线程是后台的，不占应用时间）；inline/POST 路径给 300ms
+       （那时视图通常已就绪，一次命中）。 */
+    int wait_ms;
     /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms，见 IPC_MOUNT_READINESS_MS）。
        正预算 = 权威尝试：缺失即 loud 失败并排重试（后台通道的静默口径见
        ns_utils.h 的 NSP_READINESS_QUIET）。 */
@@ -166,7 +171,8 @@ static void* ipc_restore_thread(void* raw); /* 定义在后（见下） */
 /* 派发一次 v2 非目标还原（异步线程）。done_pipe_out 非 NULL 时返回一个读端，
    主流程可 poll 它做有界快等（legacy 通道）；传 NULL 表示完全后台（post 通知路径），
    此时不创建管道，ACK 也不经线程。返回 false 表示未能派发（调用方按已就绪放行）。 */
-static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_pipe_out) {
+static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_pipe_out,
+                               int wait_ms) {
     int done_pipe[2] = {-1, -1};
     if (done_pipe_out) {
         *done_pipe_out = -1;
@@ -184,6 +190,7 @@ static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_
     arg->uid = uid;
     arg->ack_fd = -1; /* ACK 由调用方发（线程只通知完成） */
     arg->done_fd = done_pipe[1];
+    arg->wait_ms = wait_ms;
     pthread_t tid;
     if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
         pthread_detach(tid);
@@ -216,7 +223,8 @@ static void* ipc_restore_thread(void* raw) {
     /* 整个挂载周期（含重试）的日志打包发送：begin 后 sender 累积日志，
        pop 后一次性打包发送给 log_monitor（不丢日志、减少发送次数） */
     log_batch_begin();
-    for (int attempt = 0; attempt < 20; attempt++) {
+    int budget_ms = arg->wait_ms > 0 ? arg->wait_ms : 300;
+    for (;;) {
         if (kill(arg->pid, 0) != 0) {
             log_batch_end();
             /* 进程已死：无需还原，通知主流程放行（ACK 已由主流程发出时 fd=-1） */
@@ -230,8 +238,8 @@ static void* ipc_restore_thread(void* raw) {
         if (ret != 1) break; /* 0=成功 或 -1=失败：结束重试 */
         clock_gettime(CLOCK_MONOTONIC, &tn);
         long elapsed_ms = (tn.tv_sec - t0.tv_sec) * 1000 + (tn.tv_nsec - t0.tv_nsec) / 1000000;
-        if (elapsed_ms >= 300) break; /* 总预算 300ms 耗尽 */
-        usleep(10000);                /* 10ms 间隔，配合 300ms 总预算 */
+        if (elapsed_ms >= budget_ms) break; /* 预算耗尽（见 wait_ms） */
+        usleep(10000);                     /* 10ms 间隔采样 */
     }
     log_batch_end();
     /* 还原成功（或已还原跳过）后标记追踪，生命周期内不再反复检测该应用；
@@ -591,13 +599,20 @@ void handle_ipc_client_readable(int client_fd) {
             if (inject_restore_nontarget()) {
                 IpcRestorePlan plan = ipc_plan_restore(is_post, is_report, proto);
                 if (plan == IPC_RESTORE_ON_POST) {
-                    LOG_DBG("IPC还原计划: %s(PID:%d) 交 post-specialize 通知（视图就绪后再还原）",
-                            clean_pkg, pid);
+                    /* 双保险：① 立刻派发一次**后台**还原线程（10ms 步进、最多 1.2s），
+                       视图一出现就还原——这条不依赖任何模块通知，是正确性底线；
+                       ② 同时回 DEFER，让模块在 post-specialize 再通知一次：POST 到达
+                       时再派发一次，通常一次命中（~5ms），把窗口压到最小。
+                       两条路重复执行时，后到的那条只会命中"顶层非项目 FUSE→跳过"。 */
+                    bool dispatched =
+                        ipc_restore_dispatch(clean_pkg, pid, uid, nullptr, 1200);
+                    LOG_DBG("IPC还原计划: %s(PID:%d) 后台还原%s；同时回 DEFER 等 post 通知加速",
+                            clean_pkg, pid, dispatched ? "已派发" : "派发失败");
                     ipc_reply_and_close(client_fd, "DEFER");
                     return;
                 }
                 if (plan == IPC_RESTORE_NOW) {
-                    bool dispatched = ipc_restore_dispatch(clean_pkg, pid, uid, nullptr);
+                    bool dispatched = ipc_restore_dispatch(clean_pkg, pid, uid, nullptr, 300);
                     LOG_DBG("IPC还原（post 通知）: %s(PID:%d) %s", clean_pkg, pid,
                             dispatched ? "已派发，立即放行（不等还原）"
                                        : "派发失败，按已就绪放行");
@@ -606,7 +621,7 @@ void handle_ipc_client_readable(int client_fd) {
                 }
                 /* legacy：就地派发 + 有界快等；超预算先放行、线程后台做完 */
                 int done_fd = -1;
-                if (ipc_restore_dispatch(clean_pkg, pid, uid, &done_fd)) {
+                if (ipc_restore_dispatch(clean_pkg, pid, uid, &done_fd, 300)) {
                     bool inline_done = false;
                     if (done_fd >= 0) {
                         struct pollfd pfd = {.fd = done_fd, .events = POLLIN};
