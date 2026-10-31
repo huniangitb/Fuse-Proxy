@@ -29,6 +29,7 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -162,6 +163,17 @@ void unregister_async_mount_pipe(int fd) {
     pthread_mutex_unlock(&g_async_mount_mutex);
 }
 
+/* 重试唤醒 eventfd：入队后立刻叫醒主循环跑一轮 retry_pending_mounts，
+   而不是等 1s timer 的下一次 tick（视图迟到时最长差近 1s，直接体现为
+   "代理视图比应用晚到"的观感延迟）。已由 injector_setup_epoll 注册进 epoll。 */
+static int g_retry_wake_fd = -1;
+static void retry_wake_main_loop(void) {
+    if (g_retry_wake_fd < 0) return;
+    uint64_t one = 1;
+    ssize_t w = write(g_retry_wake_fd, &one, sizeof one); /* eventfd 写是原子的，可跨线程 */
+    (void)w;
+}
+
 void schedule_retry_mount(const char* pkg, int pid) {
     if (!nsp_retry_schedule(pkg, pid)) {
         LOG_DBG("重试队列已满，丢弃 %s(PID:%d) 的重试", pkg, pid);
@@ -169,6 +181,7 @@ void schedule_retry_mount(const char* pkg, int pid) {
     }
     LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d, 已尝试=%d", pkg, pid, nsp_retry_count(),
             nsp_retry_attempts_of(pid));
+    retry_wake_main_loop();
 }
 
 /* 挂载成功后清账（重试队列里该 pid 的尝试计数归零）。由 IPC 挂载线程与异步
@@ -1069,6 +1082,10 @@ typedef struct {
     int sig_fd;
     int timer_fd;
     int ipc_sock;
+    /* 重试唤醒 eventfd：入队重试时立刻叫醒主循环跑一轮，而不是等 1s timer 的
+       下一次 tick（挂载失败后视图迟到的那段最长可差近 1s，直接体现为
+       "代理视图比应用晚到"的观感延迟） */
+    int retry_fd;
 } InjectorFds;
 
 static void parse_cli_args(int argc, char* argv[], bool* start_passive_out) {
@@ -1157,6 +1174,14 @@ static void injector_setup_epoll(InjectorFds* fds) {
     timerfd_settime(timer_fd, 0, &ts, nullptr);
     struct epoll_event ev_timer = {.events = EPOLLIN, .data.fd = timer_fd};
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev_timer);
+    int retry_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (retry_fd < 0) {
+        PERROR("无法创建 eventfd");
+        exit(1);
+    }
+    struct epoll_event ev_retry = {.events = EPOLLIN, .data.fd = retry_fd};
+    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, retry_fd, &ev_retry);
+    g_retry_wake_fd = retry_fd;
     int ipc_sock = ipc_server_init();
     if (ipc_sock < 0) {
         PERROR("无法初始化 IPC 服务");
@@ -1167,6 +1192,7 @@ static void injector_setup_epoll(InjectorFds* fds) {
     fds->sig_fd = sig_fd;
     fds->timer_fd = timer_fd;
     fds->ipc_sock = ipc_sock;
+    fds->retry_fd = retry_fd;
 }
 
 static void injector_start_fuses(bool start_passive) {
@@ -1453,6 +1479,12 @@ static void injector_event_loop(const InjectorFds* fds) {
                 on_signal_event(fds->sig_fd);
             } else if (fd == fds->timer_fd) {
                 on_timer_event(fds->timer_fd);
+            } else if (fd == fds->retry_fd) {
+                /* 重试入队时被唤醒：立刻跑一轮（首轮 backoff=0），不再等下一次 1s tick */
+                uint64_t drained;
+                while (read(fds->retry_fd, &drained, sizeof drained) == sizeof drained) {
+                }
+                retry_pending_mounts();
             } else if (fd == g_inotify_fd) {
                 on_inotify_event();
             } else if (fd == fds->ipc_sock) {
