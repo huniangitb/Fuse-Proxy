@@ -55,6 +55,9 @@
 
 ### 缺陷修复
 
+- **injector**: v1 两段式改为 pre 只裁决 + POST 短预算（1800→250ms）——pre 阶段进程还在 zygote 的挂载 ns 里，就地挂载会把项目 FUSE 装进 zygote ns、之后 fork 的每个应用都继承它且没人能清；POST 短等即 fail-open 交后台重试，避免"视图迟迟不出现"的设备每次冷启动固定多等 1.8s（真机报的"冷启动明显变慢"） (85b8077)
+- **injector**: 挂载失败重试收敛（新增 src/injector/retry_queue.c）——尝试次数随条目保存：1/2/4/8s 退避、上限 6 次、超限 loud 一次后放弃、成功才清账；旧实现"异步派发即出队 + 失败回调以次数 0 重新入队"让退避与上限永远不生效，挂不上的应用以 1Hz 永久重试并逐轮刷错误日志（真机报的"错误越来越多"）。后台通道的未就绪只记 DEBUG（负值哨兵 NSP_READINESS_QUIET） (85b8077)
+- **injector**: 合并挂载加三道守护——源预检（statfs 为 FUSE 才动手，失败保持原生视图）、动手前 MS_PRIVATE 隔离传播（共享挂载组上的卸载会传播到 zygote/其它应用 ns）、挂载后 statfs 复核并回滚；回滚按调用方传入的 uid 找族根。防"某些设备 /storage/emulated/0 整个为空" (85b8077)
 - **injector**: v1 DEFER 预探测不再把"未就绪"记成挂载失败（真机表现为"实际挂载成功，但日志一直显示没有成功"：pre 阶段按 WARN/ERROR 落"同步合并挂载失败""交由重试队列"，随后 POST 却成功）；改为负值哨兵 NSP_READINESS_DEFER + 单条 DEBUG 说明，POST/异步/旧通道的权威失败仍 loud，error.log 不再被预期未就绪污染 (86be977)
 - **fuse**: 存储根一级条目守卫——应用请求 `/<大数字>/…` 不再把 `<STORAGE_BASE>/<大数字>` materialize 出来（历史缺陷：/data/media 顶层反复出现纯数字垃圾目录，只能在 /data/media 下删除）；同一守卫堵住应用经 FUSE 删除/改名顶层用户根与 obb (4008fc5)
 - **module**: ban 记录加框架 ABI 维度 (b445f65)
