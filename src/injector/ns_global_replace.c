@@ -373,6 +373,18 @@ static int do_global_replace(void* raw) {
         }
     }
     LOG_DBG("全局替换: fuse_src=%s dev=%s", fuse_src, src_dev[0] ? src_dev : "(未挂载)");
+    /* 源必须是本命名空间内真实的挂载点。旧实现只打一行 DEBUG 就继续：源是普通目录
+       （FUSE 未起/传播未到位/daemon 崩溃后残留）时，下面的 bind 会把空目录装进
+       族根——所有应用的 /storage/emulated/0 立刻变空，且状态检测因 src_dev 为空
+       无法判 REPLACED，周期对账每 5s 重复替换（每次都先卸后 bind）。按「未就绪」
+       返回 1（与"无族根"同口径），让对账退避，族根一点不动。 */
+    if (src_dev[0] == '\0') {
+        LOG_WRN("全局替换: 源 %s 在本命名空间不是挂载（FUSE 未就绪），放弃本次替换", fuse_src);
+        free(all);
+        free(roots);
+        free(sub);
+        return 1;
+    }
 
     /* 1. 枚举全部族根（触顶即拒绝：固定缓冲静默截断会导致部分族根不备份/
        不替换仍报成功——真机多用户 × 三族可达 1900+ mountinfo 行） */
@@ -876,6 +888,7 @@ int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_ro
 
 /* 查询全局替换状态（读 /proc/<pid>/mountinfo，无需进入命名空间） */
 int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
+    if (!fuse_src || fuse_src[0] == '\0') return NSP_GLOBAL_STATUS_UNKNOWN;
     NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     if (!all) return NSP_GLOBAL_STATUS_UNKNOWN;
     int n = ns_read_mountinfo_pid(mnt_ns_pid, all, NS_MOUNTINFO_MAX);
@@ -892,14 +905,21 @@ int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
             break;
         }
     }
+    if (src_dev[0] == '\0') {
+        /* 源不在本命名空间的挂载表里：无法判定族根是否为**当前**项目视图
+           （FUSE 崩溃重建后族根仍带旧 dev 与 fuse_daemon fstype，靠 fstype 兜底
+           会把死视图误判成 REPLACED，对账永远跳过——应用一直挂在失效超块上）。
+           返回 UNKNOWN 让对账按「未就绪」退避；源回来后会按 dev 重新替换。 */
+        free(all);
+        return NSP_GLOBAL_STATUS_UNKNOWN;
+    }
     int total = 0, replaced = 0;
     for (int i = 0; i < n; i++) {
         if (!ns_is_family_root(all[i].mount_point)) continue;
         total++;
-        bool is_proxy = (src_dev[0] && strcmp(all[i].dev, src_dev) == 0);
-        if (!is_proxy && fast_strstr(all[i].fstype, "fuse_daemon") != nullptr)
-            is_proxy = true; /* 兜底：fstype 含 fuse_daemon 视为项目视图 */
-        if (is_proxy) replaced++;
+        /* 只认 dev 相等：bind 与源共享 superblock，dev 就是"当前源"的指纹；
+           不再用 fstype 兜底（陈旧 bind 同样带 fuse_daemon 字样） */
+        if (strcmp(all[i].dev, src_dev) == 0) replaced++;
     }
     free(all);
     if (total == 0) return NSP_GLOBAL_STATUS_UNKNOWN;

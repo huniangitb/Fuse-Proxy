@@ -159,6 +159,31 @@ def run_tests():
     # 排除项在初始/替换后都应保持直通
     pass_dev_before = mount_dev(pid, "/mnt/pass_through/0/emulated")
 
+    # 1b. 源不是挂载点（FUSE 未起/传播未到位/daemon 崩溃残留）时必须**拒绝替换**：
+    #     旧实现只打一行 DEBUG 就继续 bind——空目录被装进族根，全机 /storage/emulated/0
+    #     立刻变空，且状态检测拿不到 src_dev，周期对账每 5s 重复替换（先卸后 bind）。
+    log("场景1b: 源不是挂载点时拒绝替换（防空目录装进族根）")
+    roots_before = {f"/mnt/{fam}/{uid}/emulated": mount_dev(pid, f"/mnt/{fam}/{uid}/emulated")
+                    for fam in FAMILIES for uid in USERS}
+    sh("umount", FUSE_SRC)  # 路径仍在，但已不是挂载点
+    st_down = ctl_status(pid)
+    if st_down == "unknown":
+        ok("源未挂载时 status == unknown（不再把陈旧 bind 误判为 replaced）")
+    else:
+        fail("源未挂载 status", f"期望 unknown 实际 {st_down}")
+    r_down = sh(CTL, "replace", str(pid), FUSE_SRC, BACKUP_ROOT, check=False)
+    if r_down.returncode != 0:
+        ok("源未挂载时 replace 拒绝（返回非 0，交对账退避）")
+    else:
+        fail("源未挂载 replace", f"返回 0（会把空目录 bind 进族根）: {r_down.stdout.strip()}")
+    roots_after = {f"/mnt/{fam}/{uid}/emulated": mount_dev(pid, f"/mnt/{fam}/{uid}/emulated")
+                   for fam in FAMILIES for uid in USERS}
+    if roots_before == roots_after:
+        ok("族根未被卸载/替换（dev 全不变，应用视图不受影响）")
+    else:
+        fail("族根被动过", f"before={roots_before} after={roots_after}")
+    mount_tmpfs(FUSE_SRC)  # 恢复源，继续后续场景
+
     # 2. replace：备份一个族 + 三族全部替换
     log("场景2: 全局替换 (replace)")
     r = sh(CTL, "replace", str(pid), FUSE_SRC, BACKUP_ROOT, check=False)
