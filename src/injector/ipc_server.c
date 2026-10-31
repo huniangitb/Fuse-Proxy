@@ -141,6 +141,13 @@ int ipc_channel_readiness(IpcChannel ch) {
     return (ch == IPC_CHAN_DEFER) ? 0 : IPC_MOUNT_READINESS_MS;
 }
 
+/* 见 include/ipc_server.h：v2 非目标还原的时序（事件驱动优先，不靠轮询猜时间） */
+IpcRestorePlan ipc_plan_restore(bool is_post, bool is_report, int proto) {
+    if (is_post) return IPC_RESTORE_NOW;
+    if (is_report && proto >= 2) return IPC_RESTORE_ON_POST;
+    return IPC_RESTORE_INLINE;
+}
+
 /* 视图就绪语义的唯一出口：挂载/还原线程在真实完成后才应答并交还 fd。
    对端（zygisk companion）只把 ACK 当作"可以继续 specialize"的信号，
    所以这里的时序就是应用可见的存储视图时序。 */
@@ -152,6 +159,46 @@ static void ipc_reply_and_close(int fd, const char* verb) {
 
 static void ipc_ack_and_close(int fd, bool ok) {
     ipc_reply_and_close(fd, ok ? "OK" : "ERR");
+}
+
+static void* ipc_restore_thread(void* raw); /* 定义在后（见下） */
+
+/* 派发一次 v2 非目标还原（异步线程）。done_pipe_out 非 NULL 时返回一个读端，
+   主流程可 poll 它做有界快等（legacy 通道）；传 NULL 表示完全后台（post 通知路径），
+   此时不创建管道，ACK 也不经线程。返回 false 表示未能派发（调用方按已就绪放行）。 */
+static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_pipe_out) {
+    int done_pipe[2] = {-1, -1};
+    if (done_pipe_out) {
+        *done_pipe_out = -1;
+        if (pipe2(done_pipe, O_CLOEXEC) != 0) done_pipe[0] = done_pipe[1] = -1;
+    }
+    IpcMountArg* arg = malloc(sizeof(IpcMountArg));
+    if (!arg) {
+        if (done_pipe[0] >= 0) close(done_pipe[0]);
+        if (done_pipe[1] >= 0) close(done_pipe[1]);
+        return false;
+    }
+    memset(arg, 0, sizeof(*arg));
+    strncpy(arg->pkg, pkg, sizeof(arg->pkg) - 1);
+    arg->pid = pid;
+    arg->uid = uid;
+    arg->ack_fd = -1; /* ACK 由调用方发（线程只通知完成） */
+    arg->done_fd = done_pipe[1];
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
+        pthread_detach(tid);
+        if (done_pipe_out) {
+            *done_pipe_out = done_pipe[0];
+        } else if (done_pipe[0] >= 0) {
+            close(done_pipe[0]);
+        }
+        return true;
+    }
+    arg->done_fd = -1;
+    if (done_pipe[0] >= 0) close(done_pipe[0]);
+    if (done_pipe[1] >= 0) close(done_pipe[1]);
+    free(arg);
+    return false;
 }
 
 /* 全局替换模式：非目标应用异步还原线程（卸载项目 FUSE，bind 回系统视图备份）。
@@ -523,65 +570,60 @@ void handle_ipc_client_readable(int client_fd) {
         if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, clean_pkg);
 
         /* ACK 的语义是"目标进程的存储视图已就绪，可以继续 specialize"。
-           因此只有在确认无需任何视图操作时才在此直接应答；需要挂载（v1）或
-           还原（v2）的路径把 client_fd 交给工作线程，完成后再 ACK。
-           旧实现在派发前就应答，应用会在代理视图就绪前访问存储——首次启动
-           读到原始目录，或撞上合并挂载的裸挂载点窗口（ENOENT）。
+           需要挂载（v1）的路径把 client_fd 交给挂载线程、挂完才 ACK（POST 短预算，
+           超时 fail-open）；v2 非目标还原走事件驱动（见下方分支），ACK 最多等
+           IPC_RESTORE_INLINE_MS。旧实现在派发前无条件应答，应用会在代理视图就绪前
+           读到原始目录——那种"提前应答"只对不需要视图操作的路径成立。
 
-           ���意：使用 clean_pkg 而非原始 pkg 进行配置匹配，
+           注意：使用 clean_pkg 而非原始 pkg 进行配置匹配，
            避免带 ':process' 后缀的包名误判为未配置应用 */
         bool is_target = is_target_app(clean_pkg, uid, pid, true);
         if (!is_target) {
-            /* 注入方法 v2：非目标应用需主动卸载项目 FUSE 并还原系统视图
-               （IPC 通知是最常见的应用启动路径，必须覆盖，否则非目标应用
-               永远停留在项目 FUSE 视图上）；v3 不还原——默认全局挂载。
-               POST 只可能出现在"pre 已判定为目标应用"之后，非目标不应收到；
-               真收到时按已就绪放行，绝不重复做还原。 */
-            if (!is_post && inject_restore_nontarget()) {
-                /* 还原与 ACK 解耦：ACK 不再等还原跑完（v2 的正确性不依赖这次阻塞）。
-                   主流程做有界快等（IPC_RESTORE_INLINE_MS）：正常数 ms 内线程就
-                   还原完并写 done 字节（此时 ACK 才发出，隔离优先）；超预算立即
-                   ACK 放行，线程在后台继续（audit_tracked_apps 仍会兜底复查）。 */
-                int done_pipe[2] = {-1, -1};
-                if (pipe2(done_pipe, O_CLOEXEC) != 0) done_pipe[0] = done_pipe[1] = -1;
-                IpcMountArg* arg = malloc(sizeof(IpcMountArg));
-                if (arg) {
-                    strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
-                    arg->pkg[sizeof(arg->pkg) - 1] = '\0';
-                    arg->pid = pid;
-                    arg->uid = uid;
-                    arg->mnt_src[0] = '\0';
-                    arg->ack_fd = -1; /* ACK 由本流程发（线程只通知完成） */
-                    arg->done_fd = done_pipe[1];
-                    arg->readiness_ms = 0;
-                    pthread_t tid;
-                    if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
-                        pthread_detach(tid);
-                        bool inline_done = false;
-                        if (done_pipe[0] >= 0) {
-                            struct pollfd pfd = {.fd = done_pipe[0], .events = POLLIN};
-                            inline_done = (poll(&pfd, 1, IPC_RESTORE_INLINE_MS) > 0);
-                            close(done_pipe[0]);
-                        }
-                        if (inline_done) {
-                            LOG_DBG("IPC还原与放行: %s(PID:%d) 在 %dms 内完成（隔离优先）", clean_pkg,
-                                    pid, IPC_RESTORE_INLINE_MS);
-                        } else {
-                            LOG("IPC还原转后台: %s(PID:%d) 超过 %dms 未完成，先放行（不阻塞冷启动）",
-                                clean_pkg, pid, IPC_RESTORE_INLINE_MS);
-                        }
-                        ipc_ack_and_close(client_fd, true);
-                        return;
-                    }
-                    LOG_ERR("IPC创建还原线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);
-                    arg->done_fd = -1;
-                    if (done_pipe[0] >= 0) close(done_pipe[0]);
-                    if (done_pipe[1] >= 0) close(done_pipe[1]);
-                    free(arg);
-                } else {
-                    if (done_pipe[0] >= 0) close(done_pipe[0]);
-                    if (done_pipe[1] >= 0) close(done_pipe[1]);
+            /* 注入方法 v2：非目标应用要卸载项目 FUSE 并还原系统视图；v3 不还原
+               （默认全局挂载）。时序按「事件驱动优先」排：
+                 - 新协议（REPORT+proto>=2）的 pre 阶段**不还原、不轮询**：此刻应用
+                   ns 里还没有项目视图，还原只会命中「顶层非项目 FUSE→跳过」（旧实现
+                   靠 10ms 步进轮询猜时间，实测 46–60ms 才落地）。直接回 DEFER，
+                   让模块在 post-specialize（视图已就绪、仍早于 Java 代码）再通知；
+                 - post 通知到达即**异步**还原 + 立刻 ACK（不阻塞、不等待）；
+                 - 旧模块（无 proto）/ REQ 没有 post 通知可用，退化为「就地派发 +
+                   有界快等」（IPC_RESTORE_INLINE_MS），超时先放行、后台继续。 */
+            if (inject_restore_nontarget()) {
+                IpcRestorePlan plan = ipc_plan_restore(is_post, is_report, proto);
+                if (plan == IPC_RESTORE_ON_POST) {
+                    LOG_DBG("IPC还原计划: %s(PID:%d) 交 post-specialize 通知（视图就绪后再还原）",
+                            clean_pkg, pid);
+                    ipc_reply_and_close(client_fd, "DEFER");
+                    return;
                 }
+                if (plan == IPC_RESTORE_NOW) {
+                    bool dispatched = ipc_restore_dispatch(clean_pkg, pid, uid, nullptr);
+                    LOG_DBG("IPC还原（post 通知）: %s(PID:%d) %s", clean_pkg, pid,
+                            dispatched ? "已派发，立即放行（不等还原）"
+                                       : "派发失败，按已就绪放行");
+                    ipc_ack_and_close(client_fd, true);
+                    return;
+                }
+                /* legacy：就地派发 + 有界快等；超预算先放行、线程后台做完 */
+                int done_fd = -1;
+                if (ipc_restore_dispatch(clean_pkg, pid, uid, &done_fd)) {
+                    bool inline_done = false;
+                    if (done_fd >= 0) {
+                        struct pollfd pfd = {.fd = done_fd, .events = POLLIN};
+                        inline_done = (poll(&pfd, 1, IPC_RESTORE_INLINE_MS) > 0);
+                        close(done_fd);
+                    }
+                    if (inline_done) {
+                        LOG_DBG("IPC还原与放行（legacy）: %s(PID:%d) 在 %dms 内完成", clean_pkg, pid,
+                                IPC_RESTORE_INLINE_MS);
+                    } else {
+                        LOG("IPC还原转后台（legacy）: %s(PID:%d) 超过 %dms 未完成，先放行", clean_pkg,
+                            pid, IPC_RESTORE_INLINE_MS);
+                    }
+                    ipc_ack_and_close(client_fd, true);
+                    return;
+                }
+                LOG_ERR("IPC创建还原线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);
             }
             ipc_ack_and_close(client_fd, true);
             return;

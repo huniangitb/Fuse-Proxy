@@ -48,4 +48,25 @@ IpcChannel ipc_plan_channel(bool is_post, bool is_report, int proto);
 /* 该通道的就绪预算（ms，正值）。IPC_CHAN_DEFER 不挂载，返回 0 */
 int ipc_channel_readiness(IpcChannel ch);
 
+/* v2 非目标应用还原的时序决策（纯函数，便于直编单测）。
+ *
+ * 关键事实：pre-specialize 时应用命名空间里**还没有**项目视图——还原只会命中
+ * "顶层非项目 FUSE → 跳过"，靠 10ms 步进轮询去猜时间（旧实现）既慢又不可靠。
+ * 应用自己的 ns 由 vold 在 specialize 期间装配，模块在 post-specialize（仍早于
+ * 应用 Java 代码）掌握这个时刻：因此新协议下 pre 阶段**不还原、不轮询**，直接回
+ * DEFER 让模块在 post 再通知一次，injector 收到 POST 立刻异步还原并立即 ACK。
+ *
+ *   IPC_RESTORE_ON_POST = pre 阶段（REPORT+proto>=2）：回 DEFER，等 post 通知
+ *   IPC_RESTORE_NOW     = post 阶段：立刻派发还原，ACK 不等它（不阻塞）
+ *   IPC_RESTORE_INLINE  = 旧模块（无 proto）/ REQ：没有 post 通知可用，只能就地
+ *                         派发 + 有界快等（IPC_RESTORE_INLINE_MS）
+ */
+typedef enum {
+    IPC_RESTORE_ON_POST = 0,
+    IPC_RESTORE_NOW = 1,
+    IPC_RESTORE_INLINE = 2,
+} IpcRestorePlan;
+
+IpcRestorePlan ipc_plan_restore(bool is_post, bool is_report, int proto);
+
 #endif

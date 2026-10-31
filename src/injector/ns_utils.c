@@ -647,14 +647,17 @@ static int do_combined_mount(void* raw_args) {
     if (access(target, F_OK) != 0) {
         bool ready = false;
         int waited = 0;
+        /* 5ms 步进（旧实现 100ms）：视图一出现就立刻挂载，避免最多 ~100ms 的
+           采样滞后——这段等待落在应用主线程（POST）上，粒度直接就是冷启动延迟。
+           单次预算 250ms 最多 50 次 access()，代价可忽略。 */
         while (waited < args->readiness_ms) {
             if (kill(args->target_pid, 0) != 0) {
                 log_ns_error("[ns_error] [%s] 等待 %s 出现期间目标进程退出\n", pkg, target);
                 log_internal(LOG_WARN, "[ns_error] [%s] 等待 %s 出现期间目标进程退出", pkg, target);
                 return ESRCH;
             }
-            usleep(100 * 1000);
-            waited += 100;
+            usleep(5 * 1000);
+            waited += 5;
             if (access(target, F_OK) == 0) {
                 ready = true;
                 break;

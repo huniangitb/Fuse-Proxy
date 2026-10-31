@@ -586,6 +586,33 @@ static void run_plan_readiness_cases(void) {
     /* 主线程预算必须短：冷启动可感知的量级是几百毫秒以上 */
     report(IPC_MOUNT_READINESS_MS <= 500, "A2 主线程就绪预算 ≤ 500ms（冷启动可感知上限）",
            "预算过大：应用主线程会被拖慢");
+
+    /* A2b：v2 非目标还原的时序（事件驱动优先，不靠 10ms 轮询猜时间）。
+       新协议 pre 阶段不还原、不轮询——此刻应用 ns 里还没有项目视图（还原只会
+       命中「顶层非项目 FUSE→跳过」，旧实现实测要 46–60ms 才落地）；直接回
+       DEFER 让模块在 post-specialize 再通知，收到 POST 立刻异步还原并立即 ACK。
+       旧模块（无 proto）/ REQ 没有 post 通知可用，退化为「就地派发 + 有界快等」。 */
+    struct RestoreCase {
+        const char* label;
+        bool is_post;
+        bool is_report;
+        int proto;
+        IpcRestorePlan want;
+    } rs[] = {
+        {"A2b pre(REPORT,proto=2) → 交 post 通知（回 DEFER，不轮询）", false, true, 2,
+         IPC_RESTORE_ON_POST},
+        {"A2b POST(proto=2) → 立刻异步还原 + 立即放行", true, false, 2, IPC_RESTORE_NOW},
+        {"A2b POST(无proto) → 同样立刻还原", true, false, 0, IPC_RESTORE_NOW},
+        {"A2b 旧模块(REPORT,无proto) → 就地派发 + 有界快等", false, true, 0,
+         IPC_RESTORE_INLINE},
+        {"A2b REQ(应用直连) → 就地派发 + 有界快等", false, false, 2, IPC_RESTORE_INLINE},
+    };
+    for (size_t i = 0; i < sizeof rs / sizeof rs[0]; i++) {
+        IpcRestorePlan got = ipc_plan_restore(rs[i].is_post, rs[i].is_report, rs[i].proto);
+        char rd[200];
+        snprintf(rd, sizeof rd, "plan=%d(期望%d)", (int)got, (int)rs[i].want);
+        report(got == rs[i].want, rs[i].label, rd);
+    }
 }
 
 /* A3：v2 非目标应用还原**不得**把应用冻在 specialize 上（v2 不依赖 zygisk 阻塞）。
