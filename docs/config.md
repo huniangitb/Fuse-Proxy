@@ -53,6 +53,7 @@
 | `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON**。zygisk 模块**不**再按 uid 硬编码过滤：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，是否注入完全由本开关裁决——写成 OFF 时系统应用（如 uid 1000 的 Settings）才会被注入/还原 |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节）；其中 `-o negative_timeout[=N]` 会被单点剥离（恒为 libfuse 默认 0.0，非 0 负缓存以 ino=0 回包会触发内核 nodeid=0 崩溃） |
 | `SANDBOX_DIR` | 全局段 | 沙盒落点目录名（覆盖默认 `sandbox`） |
+| `ALLOW_CROSS_APP_DATA` | 全局段 | 跨应用隔离放宽开关，默认 **OFF**（=隔离生效：`/Android/data|obb/<他包>` 既**不可列举也不可打开**）。写 `ON` 恢复旧行为（只过滤列举、不限制打开），是跨应用隔离的**唯一逃生阀**，见 §4.1 |
 
 `MONITOR` / `SANDBOX` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记），不存在"继承全局后再覆盖"的中间态。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
 
@@ -69,7 +70,16 @@
 | 放行 | `ALLOW <path>` | 显式放行：等价"重定向回自身真实存储"（parse 生成 `?<path>` 内部前缀） |
 | 重定向 | `REDIRECT <vpath> <target>` | 应用访问 `<vpath>` 实际落到 `<target>` |
 
-> 内置隐藏：`CONFIG_DIR` 下所有访问无条件返回 ENOENT；应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用（跨应用隔离，仅作用于列举）。
+> 内置隐藏：`CONFIG_DIR` 下所有访问无条件返回 ENOENT；应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用（跨应用隔离，**列举与打开同口径**，见 §4.1）。
+
+### 4.1 跨应用隔离
+
+生效范围只有 `Android/data` 与 `Android/obb`（`media`/`obj` 不在其中——历史就没有隔离，扩范围会改变既有行为）。隔离与 `HIDE` **同口径**：`resolve`（getattr/open）与 `probe`（readdir 条目过滤）走同一个隐藏判定出口，所以「看不见 = 打不开」；旧实现只在列举侧过滤，任何按名打开的命令都能读到内容。
+
+- **放行**：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局放行。
+- **与 `SANDBOX ON` 的关系**：沙盒生效的调用方被豁免——它的 `Android/data|obb` 访问本就会被 `SANDBOX` 重定向进**自己的**沙盒镜像（读不到他包内容），判成 ENOENT 只会让镜像路径整体不可用；列举侧仍按隔离过滤（保持既有行为）。
+- **边界（共享 uid）**：`uid.map` 是「uid → 单个包名」，若两个非系统应用共享 uid（旧 `sharedUserId`，API 29 起废弃），A 进程访问 `/Android/data/B` 会被判成「他包」而返回 ENOENT。这类设备很少见，逃生阀同上（写 `ALLOW_CROSS_APP_DATA ON`；或用 `ALLOW /Android/data/B` 类规则——规则放行的是**路径**，与调用方身份无关）。
+- **代价**：隔离开启时 `Android/data|obb` 子树不做 backing 直通（该子树必须由 daemon 按调用方裁决），即这部分 I/O 回到全量仲裁路径；`ALLOW_CROSS_APP_DATA ON` 后恢复按规则细分的 backing 直通。
 
 > **`REDIRECT <vpath> <target>` 的 `<vpath>` 会遮蔽同名的真实条目**：该名字在列举里由虚拟目录提供（内容取 `<target>`），底层若存在同名文件/目录则不再单独列出——否则会出现「列表里是真实目录、`stat` 却落到重定向目标」的不一致；虚拟前缀的父目录在底层缺失时也会被合成为目录。`<target>`（真实目标）**不受影响**，仍是普通路径，照常列举与访问。
 

@@ -323,6 +323,34 @@ void all_apps_prune(void) {
     pthread_mutex_unlock(&g_all_apps_mutex);
 }
 
+/* 全量应用注册表的 pid 快照：语义同 tracked_snapshot（锁内复制、锁外做重活）。
+   返回 malloc 数组，空表返回 NULL 且 *n_out=0；分配失败返回 NULL 且 *n_out=-1。 */
+static int* all_apps_snapshot(int* n_out) {
+    int* out = nullptr;
+    int n = 0, cap = 0;
+    pthread_mutex_lock(&g_all_apps_mutex);
+    for (int i = 0; i < ALL_APPS_HASH_SIZE; i++) {
+        for (AllAppEntry* e = g_all_apps_hash[i]; e; e = e->next) {
+            if (n >= cap) {
+                int ncap = cap > 0 ? cap * 2 : 16;
+                int* grown = realloc(out, (size_t)ncap * sizeof *grown);
+                if (!grown) {
+                    pthread_mutex_unlock(&g_all_apps_mutex);
+                    free(out);
+                    *n_out = -1;
+                    return nullptr;
+                }
+                out = grown;
+                cap = ncap;
+            }
+            out[n++] = e->pid;
+        }
+    }
+    pthread_mutex_unlock(&g_all_apps_mutex);
+    *n_out = n;
+    return out;
+}
+
 /* 释放全部节点（进程退出清理） */
 void all_apps_cleanup(void) {
     pthread_mutex_lock(&g_all_apps_mutex);
@@ -607,6 +635,9 @@ void cleanup_app_mounts(int pid, const char* target_path, const char* backup_pat
     }
     /* 卸载/还原即解除注入状态（显式标志清除，列表不再误报） */
     unmark_injected(pid);
+    /* 挂载状态缓存同步失效：cleanup 之后 is_project_fuse_cached 仍返回旧的
+       「已挂载」快照时，热对账会认为无需重新挂载 → 配置改回来也不生效 */
+    invalidate_app_mount_cache(pid);
 }
 
 void force_recover_tracked_mounts() {
@@ -841,6 +872,91 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
             perform_app_mount(cmd, pid, uid, mnt_src, "缓存快速响应规则变化");
             LOG("缓存响应: %s (PID: %d) 规则启用，立即挂载", cmd, pid);
         }
+    }
+}
+
+/* ================= 配置热对账（v1 逐应用挂载的实时生效路径） =================
+   用户报障：「不能实时生效 比如打开以后可修改配置必须得杀进程，V1挂载模式下，
+   injector 需要改进。」旧实现只在 reload_config_rules_diff 判出「应用段
+   inject_enable 翻转 / 全局开关变化」时才动挂载：规则内容变化、类别段与
+   App-rules 子文件的增删都被判成 changed_count==0 → handle_pending_reload
+   什么都不做；而被动模式（真机必有 zygisk 上报）停掉周期扫描后，运行中的应用
+   也从未被登记，即使想动挂载也找不到 pid。
+
+   本函数在**每次**配置重载后对运行中应用做一次全量对账：
+     期望视图 want = is_target_app() && app_has_active_rules()
+   （后者与 perform_app_mount 的「无规则冲突 → 保留原生视图」语义对齐，故
+   「删掉最后一条规则」也会被正确收回，这正是「删了规则还得杀进程」的现场）
+     want 且实测无 → perform_app_mount（热挂载）
+     !want 且实测有 → cleanup_app_mounts（热卸载并还原原生族根视图）
+   候选集 = 追踪表快照 ∪ 全量应用注册表快照（后者由 IPC 通知路径填充，是唯一
+   能覆盖「已在运行、之后才被配成目标」的来源）。逐 pid 幂等：已就绪不动；
+   单条动作有界、失败只记日志，绝不中断主循环。v2/v3 不走本函数（全局替换 +
+   还原策略，见 audit_tracked_apps / audit_and_remount_specific_apps）。 */
+void audit_running_apps(void) {
+    all_apps_prune();
+    int tn = 0;
+    int* tracked = tracked_snapshot(&tn);
+    if (tn < 0) {
+        free(tracked);
+        return; /* 内存不足：放弃本轮，下次重载再对账 */
+    }
+    int rn = 0;
+    int* known = all_apps_snapshot(&rn);
+    size_t cap = (size_t)(tn > 0 ? tn : 0) + (size_t)(rn > 0 ? rn : 0);
+    int* pids = cap > 0 ? malloc(cap * sizeof *pids) : nullptr;
+    size_t n = 0;
+    if (pids) {
+        for (int k = 0; k < tn; k++) pids[n++] = tracked[k];
+        for (int k = 0; k < rn; k++) {
+            bool dup = false;
+            for (size_t j = 0; j < n; j++) {
+                if (pids[j] == known[k]) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) pids[n++] = known[k];
+        }
+    }
+    free(tracked);
+    free(known);
+    if (!pids) return;
+
+    const char* mnt_src = get_active_mnt_src();
+    int mounted = 0, unmounted = 0;
+    for (size_t k = 0; k < n; k++) {
+        int pid = pids[k];
+        char cmd[256] = {0};
+        if (!proc_get_cmdline(pid, cmd, sizeof(cmd))) continue; /* 死进程由 prune 清账 */
+        uid_t uid = get_app_uid(pid);
+        bool want = is_target_app(cmd, uid, pid, false) && app_has_active_rules(cmd, uid);
+        char target_path[128];
+        get_target_storage_path(uid, target_path, sizeof(target_path));
+        /* 先丢陈旧快照再探测：本函数紧跟在挂载/卸载动作之后做判定，缓存命中
+           会让「刚卸掉」仍被判成已挂载（反之亦然），热挂载/热卸载就永远对不上 */
+        invalidate_app_mount_cache(pid);
+        bool has_fuse = is_project_fuse_cached(pid, target_path);
+        if (want && !has_fuse) {
+            if (!mnt_src) {
+                LOG_DBG("配置热对账: 全局 FUSE 未就绪，跳过 %s(PID:%d) 的热挂载", cmd, pid);
+                continue;
+            }
+            if (perform_app_mount(cmd, pid, uid, mnt_src, "配置热对账挂载") == 0) mounted++;
+        } else if (!want && has_fuse) {
+            char backup_path[PATH_MAX];
+            snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+            cleanup_app_mounts(pid, target_path, backup_path, uid);
+            unmounted++;
+        }
+    }
+    free(pids);
+    /* 一条汇总日志，不逐条刷屏（真实设备上候选可达数十个） */
+    if (mounted > 0 || unmounted > 0) {
+        LOG("配置热对账: 运行中应用热挂载 %d 个、热卸载 %d 个（候选 %zu 个）", mounted,
+            unmounted, n);
+    } else {
+        LOG_DBG("配置热对账: 运行中应用视图均无需变更（候选 %zu 个）", n);
     }
 }
 

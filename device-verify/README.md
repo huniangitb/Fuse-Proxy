@@ -69,7 +69,7 @@ case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>
 | `nsp.probe.iso` | ready, download, pictures | SANDBOX ON：写 Download/Pictures，应落沙盒、真实共享目录零写入 |
 | `nsp.probe.hide` | ready, phase_a / phase_b+write_denied, list | 阶段 A 真实夹具可见可读；阶段 B（换配置重启）stat/写均 ENOENT、列举不含 hide |
 | `nsp.probe.plain` | ready, write, read | 对照组：普通外部目录读写不受影响 |
-| `nsp.probe.unlink` | ready, delete, hidden_open, fstat, read, hidden_closed, exists_closed | 打开中删除：写文件并保持读句柄 → 删除 → 目录里不得出现 `.fuse_hidden`；删除后 fstat/读仍可用；关闭后路径消失、无隐藏名残留 |
+| `nsp.probe.unlink` | ready, delete, hidden_open, fstat, read, hidden_closed, exists_closed, hidden_legacy | 打开中删除：写文件并保持读句柄 → 删除 → 目录里不得**新增** `.fuse_hidden`；删除后 fstat/读仍可用；关闭后路径消失；宿主预置的历史隐藏名夹具必须**看得见**（不做列举过滤，保留取证能力） |
 | `nsp.probe.race` | attempt×N, summary | **不等待就绪**：立即反复写两个判别路径，量出 v1 的未覆盖窗口与侧漏 |
 
 `ready` 步表示探针在 `Application.onCreate` 内轮询到本进程 `/storage/emulated` 的挂载源已变为
@@ -143,9 +143,9 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 - HIDE：阶段 A 夹具内容匹配；阶段 B stat 与写均 ENOENT；真实夹具仍在；阶段 A 列举含 `hide`、
   阶段 B 列举不含。
 - plain：真实外部目录 `Android/data/nsp.probe.plain/files/plain.txt` 存在。
-- unlink（打开中删除）：delete/hidden_open/fstat/read/hidden_closed/exists_closed 六步成功；
-  删除瞬间与关闭后目录里都**没有** `.fuse_hidden`；宿主预置的历史隐藏名夹具仍物理存在
-  （证明是 readdir 过滤而非删除），设备侧扫描无新增残留。
+- unlink（打开中删除）：delete/hidden_open/fstat/read/hidden_closed/exists_closed/hidden_legacy
+  七步成功；删除瞬间与关闭后目录里都**没有新增** `.fuse_hidden`；宿主预置的历史隐藏名夹具
+  仍物理存在且**列举可见**（本层不做过滤、不自动清理，便于取证），设备侧扫描无新增残留。
 - 竞态（每轮 10 项 × 3 轮）：探针收尾、有采样、采到就绪后写入；就绪后写入全部成功/全部落沙盒/
   真实 Download 无文件/HIDE 生效；就绪前写入未落沙盒、未写真实 HIDE 目录；`fuse` 标志单调。
   「就绪前侧漏」默认只告警（`--strict-race` 计失败）。

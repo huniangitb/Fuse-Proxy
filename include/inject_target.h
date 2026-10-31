@@ -40,6 +40,10 @@ void all_apps_prune(void);
 void all_apps_cleanup(void);
 void audit_tracked_apps();
 void audit_and_remount_specific_apps(ChangedPkg* changed, int count);
+/* 配置热对账（v1）：每次配置重载后对运行中应用逐 pid 比对「期望视图 vs 实测视图」，
+   热挂载缺失的、热卸载多余的。覆盖 reload_config_rules_diff 判不出差异的变更
+   （规则内容变化、类别段与 App-rules 子文件增删）。 */
+void audit_running_apps(void);
 void force_recover_tracked_mounts();
 void handle_list_injected(int client_fd);
 /* 

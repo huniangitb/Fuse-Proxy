@@ -79,6 +79,10 @@ static void log_fuse_err(const char* a, const char* b, int c) {
     (void)b;
     (void)c;
 }
+/* open-unlink 直删的观测口（框架侧限速日志，见 fuse_daemon.c 的同名函数）：
+   本驱动不考观测行为，与 log_fuse_err 同样桩掉——桩存在时旧源码副本
+   （没有该函数）与新源码都能编过，判别性不受影响 */
+static void log_open_unlink_direct(const char* path) { (void)path; }
 
 /* ---- FUSE 上下文与路由：驱动直调 vfs_rename，路由恒直通 ---- */
 static struct fuse_context g_ctx;

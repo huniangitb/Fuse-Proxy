@@ -6,6 +6,7 @@ from pathlib import Path
 MNT="/tmp/fuse_rules_test/mnt"; STORAGE="/tmp/fuse_rules_test/storage"
 MODDIR="/tmp/fuse_rules_test/modules"
 CONF="/tmp/Namespace-Proxy/injector.conf"
+ROOT=os.path.abspath(os.path.join(os.path.dirname(__file__),".."))
 DAEMON=os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
 PASS=0; FAIL=0; ERRS=[]
@@ -91,6 +92,130 @@ def run(conf,checks,label=""):
                     ok(name) if got==want else fail(name,f"got='{got}'")
             except Exception as e: fail(name,str(e))
     finally: stop(p)
+
+# ═══════ 跨应用隔离（直编真源码的驱动段） ═══════
+# 旧实现只在 probe（readdir 条目过滤）判跨应用隔离，resolve（getattr/open）
+# 放过——于是任何"按名打开"的命令都能读到 /Android/data/<他包>/ 的内容
+# （用户报障：特殊命令可访问他包 Android/data）。本段把真实 fw_rules.c 直编
+# 成驱动（同 test_backing_gate 配方，不发 FUSE），用 uid.map 夹具把 10123
+# 映射成 com.demo.app，逐路径比对 resolve/probe/backing 三项裁决——因为宿主机
+# 调用者 uid=1000（fw_pkg 对 uid<10000 一律返回 system）无法在真 FUSE 上
+# 造出"应用调用者"。
+ISO_DIR="/tmp/fuse_rules_iso"
+ISO_DRIVER=os.path.join(ROOT,"tests","fixtures","cross_app_isolation_driver.c")
+ISO_SOURCES=["src/daemon/fw_rules.c","src/daemon/fw_pkg.c","src/config/config_parser.c",
+             "src/config/path_vars.c","src/core/path_trie.c","src/core/nsp_util.c",
+             "src/core/nsp_comm.c","src/core/common.c","src/core/sys_pkg.c",
+             "src/core/uid_map.c","src/core/fast_pid.c","src/injector/config_publisher.c"]
+
+def isolation_section():
+    """跨应用隔离：resolve 与 probe 必须同口径（看不见 = 打不开）"""
+    import re, shlex
+    log("\n── 27.跨应用隔离：resolve/probe 同口径（直编真 fw_rules.c） ──")
+    cc=shlex.split(os.environ.get("CC","cc"))
+    if shutil.which(cc[0]) is None:
+        log("跳过：缺少 C 编译器（本段不计通过）"); return
+    pc=subprocess.run(["pkg-config","--libs","json-c"],capture_output=True,text=True)
+    if pc.returncode!=0:
+        log("跳过：缺少 json-c（本段不计通过）"); return
+    shutil.rmtree(ISO_DIR,ignore_errors=True)
+    cfg=os.path.join(ISO_DIR,"cfg"); os.makedirs(cfg)
+    dst_inc=os.path.join(ISO_DIR,"include"); shutil.copytree(os.path.join(ROOT,"include"),dst_inc)
+    # CONFIG_DIR 指向临时配置根：uid.map 即本段夹具（框架只读，不写）
+    pat=re.compile(r'^#define\s+(?:NSP_CONFIG_DIR|CONFIG_DIR)\s+"/var/fuse-proxy"\s*$',re.M)
+    hits=0
+    for name in sorted(os.listdir(dst_inc)):
+        if not name.endswith(".h"): continue
+        fp=os.path.join(dst_inc,name)
+        text=open(fp,encoding="utf-8").read()
+        new,n=pat.subn(lambda m: m.group(0).replace('"/var/fuse-proxy"','"%s"'%cfg),text)
+        if n:
+            open(fp,"w",encoding="utf-8").write(new); hits+=n
+    if not hits:
+        log("跳过：未定位 GNU 配置根常量（本段不计通过）"); return
+    exe=os.path.join(ISO_DIR,"iso_drv")
+    cmd=cc+["-std=c23","-DTARGET_GNU=1","-D_GNU_SOURCE","-Wall","-Wno-unused-parameter",
+            "-I",dst_inc,"-I",os.path.join(ROOT,"include"),
+            "-I",os.path.join(ROOT,"src","daemon"),ISO_DRIVER]+ \
+        [os.path.join(ROOT,s) for s in ISO_SOURCES]+["-o",exe,"-pthread","-ldl","-lm"]+ \
+        subprocess.run(["pkg-config","--cflags","--libs","json-c"],
+                       capture_output=True,text=True).stdout.split()
+    r=subprocess.run(cmd,capture_output=True,text=True)
+    if r.returncode!=0:
+        fail("隔离驱动编译",r.stderr.strip()[-400:]); return
+    conf_path=os.path.join(cfg,"injector.conf"); map_path=os.path.join(cfg,"uid.map")
+    BASE="[GLOBAL]\nMONITOR OFF\n"
+    ALLOW="[GLOBAL]\nMONITOR OFF\nALLOW_CROSS_APP_DATA ON\n"
+
+    def drive(conf,uid,paths,uid_map=None,argv0=None):
+        open(conf_path,"w",encoding="utf-8").write(conf)
+        if os.path.exists(map_path): os.unlink(map_path)
+        if uid_map is not None:
+            open(map_path,"w",encoding="utf-8").write(uid_map)
+        args=[argv0 or exe,conf_path,str(uid)]+list(paths)
+        rr=subprocess.run(args,executable=exe,capture_output=True,text=True)
+        if rr.returncode!=0:
+            fail("隔离驱动执行",rr.stderr.strip()[-300:]); return None,{}
+        glob=None; out={}
+        for line in rr.stdout.strip().splitlines():
+            if line.startswith("global="): glob=int(line.split("=",1)[1]); continue
+            parts=line.split()
+            out[parts[0]]=dict(p.split("=",1) for p in parts[1:])
+        return glob,out
+
+    def expect(desc,got,want):
+        if got==want: ok(f"{desc} → {want}")
+        else: fail(desc,f"期望 {want}，实测 {got}")
+
+    def case(desc,conf,uid,checks,uid_map=None,argv0=None,global_want=None):
+        glob,got=drive(conf,uid,[c[0] for c in checks],uid_map=uid_map,argv0=argv0)
+        if glob is None: return
+        if global_want is not None: expect(f"{desc}｜全局仲裁门",glob,global_want)
+        for path,want in checks:
+            fields=got.get(path)
+            if fields is None: fail(f"{desc}｜{path}","驱动未输出该路径"); continue
+            sub={k:int(fields[k]) for k in want}
+            expect(f"{desc}｜{path}",sub,want)
+
+    own="10123 com.demo.app\n10500 com.plain.app\n"
+    # (1) 默认隔离开启：他包 data/obb 既不可列举也不可打开；自身放行
+    case("默认隔离",BASE,10123,[
+        ("/0/Android/data/com.other.app/files/x",{"resolve":1,"probe":1,"backing":1}),
+        ("/0/Android/data/com.other.app",{"resolve":1,"probe":1}),
+        ("/0/Android/obb/com.other.app/x",{"resolve":1,"probe":1,"backing":1}),
+        ("/0/Android/data/com.demo.app/files/x",{"resolve":0,"probe":0}),
+        ("/0/Android/obb/com.demo.app/x",{"resolve":0,"probe":0}),
+        # media/obj 不在隔离范围（历史只隔离 data/obb，放宽会改变用户既有行为）
+        ("/0/Android/media/com.other.app/x",{"resolve":0,"probe":0,"backing":0}),
+        # 骨架与直接父：本身不隐藏，但 backing 必须仲裁（readdir 要按调用方过滤）
+        ("/0/Android/data",{"resolve":0,"probe":0,"backing":1}),
+        ("/0/Android",{"backing":1}),
+        ("/0/Download/hi.txt",{"resolve":0,"probe":0,"backing":0}),
+    ],uid_map=own,global_want=1)
+    # (2) ALLOW_CROSS_APP_DATA ON：恢复旧行为（放行=不隔离），backing 门一并放开
+    case("允许跨应用",ALLOW,10123,[
+        ("/0/Android/data/com.other.app/files/x",{"resolve":0,"probe":0,"backing":0}),
+        ("/0/Android/data/com.other.app",{"backing":0}),
+        ("/0/Android/data",{"backing":0}),
+    ],uid_map=own,global_want=0)
+    # (3) 身份不可解析（root/system）不隔离，但仍交 daemon 仲裁（DAC/规则照旧）
+    case("root 不隔离",BASE,0,[
+        ("/0/Android/data/com.other.app/files/x",{"resolve":0,"probe":0,"backing":1}),
+    ],uid_map=own,global_want=1)
+    # (4) SANDBOX ON 的调用方不放行隔离——其 data/obb 访问本就被重定向进
+    #     **自己的**沙盒镜像（读不到他包内容），故 resolve 放行、列举照旧过滤
+    #     （沙盒语义优先；test_monitor_layers 守护镜像路径可用）
+    case("沙盒豁免隔离",BASE+"[com.demo.app]\nSANDBOX ON\n",10123,[
+        ("/0/Android/data/com.other.app/f",{"resolve":0,"probe":1}),
+        ("/0/Download/q.txt",{"resolve":0,"probe":0}),
+    ],uid_map=own,global_want=1)
+    # (5) 多开/隔离进程后缀（<pkg>:push，走 /proc 回退）：基础包名比较不得把
+    #     自己的包判成他包（否则应用连自己的 data 都打不开）
+    case("进程后缀",BASE,10123,[
+        ("/0/Android/data/com.demo.app/files/x",{"resolve":0,"probe":0}),
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map=None,argv0="com.demo.app:push")
+    shutil.rmtree(ISO_DIR,ignore_errors=True)
 
 def main():
     global PASS,FAIL
@@ -397,6 +522,9 @@ REDIRECT /rv/ /Download/{LONG_B}""", [
         ("A18-3:超长变量值被拒绝，引用它的 REDIRECT 不放大", "0/vv/probe.txt", "NOT_EXISTS"),
         ("A18-4:超长 REDIRECT 目标被拒绝（截断目标未命中）", "0/rv/probe.txt", "NOT_EXISTS"),
     ], "26.A18 超长规则路径 fail-closed（不截断）")
+
+    # ── 27. 跨应用隔离（resolve 与列举同口径）──
+    isolation_section()
 
     # cleanup
     subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)

@@ -53,7 +53,8 @@
    /storage/emulated 装配进应用命名空间（~1s），故给足余量。 */
 /* 逐段放宽，保证"内层先裁决、外层后超时"的严格顺序——否则外层先超时会把
    injector 正在做的挂载晾在半空（应用已放行、视图稍后才到，等于没修）：
-     injector POST 预算 250ms + 子进程余量 800ms ≈ 1.05s
+     injector POST 就地快试 20ms + 子进程余量 800ms ≈ 0.82s
+     （拿不到就 fail-open ACK + 后台毫秒快重试，绝不在这里等存储视图）
      < companion POST 1.5s < module POST 2s
      pre 通道 injector 只裁决、**不挂载**（立即回 DEFER），实际往返 < 10ms
      < companion REQ 0.8s < module REQ 1.2s

@@ -798,7 +798,10 @@ def test_rename_exdev_hardening():
 # 主流程
 # ═══════════════════════════════════════════════════════
 def test_open_unlink_no_hidden():
-    """打开中删除：本地路径必须「先删名、句柄继续可用」，不得出现 .fuse_hidden。
+    """打开中删除：本地路径必须「先删名、句柄继续可用」，不得**新增** .fuse_hidden。
+
+    注意（用户新要求）：已存在的隐藏名不再隐藏、也不再清理——列举可见、
+    可 getattr/open、留在磁盘上（本用例末尾自建夹具即用于断言这一点）。
 
     判别性：旧实现（libfuse 默认）在文件仍打开时把名字改成
     .fuse_hidden<nodeid><ctr>，目录里会留下这个"改了名却没删掉"的文件；
@@ -811,9 +814,12 @@ def test_open_unlink_no_hidden():
         ("REDIRECT 路径", Path(MNT) / "0" / "网盘" / f"nsp_openunlink_redir_{tag}.bin"),
     ]
     realdir = Path(STORAGE) / "0" / "Download"
-    # 历史残留：磁盘上直接放一个 libfuse 隐藏名文件，列举必须看不到它
-    # （本地路径已改为直删，不会产生新隐藏名；此用例覆盖旧残留与后端路径的
-    #  readdir 过滤）。
+    # 历史残留：磁盘上直接放一个 libfuse 隐藏名文件。本地路径已改为直删，不会
+    # 产生新隐藏名；但这个文件可能来自「旧版本 daemon」或「下层 FUSE」
+    # （设备上 /data/media 由 MediaProvider 的 FUSE 提供时，我们在下层 unlink
+    # 会让下层 libfuse 把名字改成 .fuse_hidden 等 RELEASE 再删——正是用户报的
+    # 「本体 + 一个 .fusexx」）。按用户要求：隐藏名不再隐藏、也不再清理，
+    # 列举里看得见、磁盘上留着，便于取证与手工回收。
     legacy = realdir / ".fuse_hidden0000000000000001"
     legacy.write_bytes(b"legacy")
     for name, vpath in cases:
@@ -829,10 +835,12 @@ def test_open_unlink_no_hidden():
             ok(f"{name}: 删除后目录里没有 .fuse_hidden")
 
         listed = [n for n in os.listdir(vpath.parent) if n.startswith(".fuse_hidden")]
-        if listed:
-            fail(f"{name}: 目录列举不应看到隐藏名", f"实际 {listed}")
+        if listed == [legacy.name]:
+            ok(f"{name}: 目录列举看得到隐藏名（只剩历史残留夹具，未新增）")
+        elif legacy.name not in listed:
+            fail(f"{name}: 历史残留夹具在列举里不可见（不该再隐藏）", f"实际 {listed}")
         else:
-            ok(f"{name}: 目录列举看不到隐藏名（含历史残留夹具）")
+            fail(f"{name}: 目录列举出现本次操作新产生的隐藏名", f"实际 {listed}")
 
         try:
             st = os.fstat(fd)
@@ -871,13 +879,131 @@ def test_open_unlink_no_hidden():
             fail(f"{name}: 关闭后仍有隐藏名残留")
         else:
             ok(f"{name}: 关闭后无隐藏名残留")
-    # 过滤只影响列举，不清删真实文件：历史残留仍在磁盘上（由用户自行清理或
-    # 后续维护），但应用扫描不到。
+    # 隐藏名按普通条目对待：列举不会删它，磁盘上留着（取证可见）。用例自己收尾。
     if legacy.exists():
-        ok("历史隐藏名文件仍在磁盘（过滤而非删除）")
+        ok("历史隐藏名文件列举后仍在磁盘（不再隐蔽清理，可取证）")
+        legacy.unlink(missing_ok=True)
     else:
-        fail("历史隐藏名文件被误删", str(legacy))
-    legacy.unlink(missing_ok=True)
+        fail("历史隐藏名文件被列举清理掉了（不该再自动删除）", str(legacy))
+
+
+def test_open_unlink_recreate_no_hidden():
+    """打开中删除 + 同名重建：真实目标目录在操作瞬间与关闭后都不得出现隐藏名。
+
+    判别性：旧实现（libfuse 默认 hide 语义，6367d2d 之前）在「文件仍打开时
+    unlink」会把名字改成 .fuse_hidden<16hex> 等 RELEASE 再删，于是真实目录
+    出现「本体 + 一个 .fusexx」；新实现（vfs_rename 识别隐藏名后直删源文件）
+    在 unlink 瞬间真实目录就没有隐藏名。末尾再验证「旧版本/下层 FUSE 遗留的
+    隐藏名」恢复为**普通条目**：列举可见、磁盘上保留、不被自动清理（取证可见；
+    旧实现把它隐藏起来，故这条断言在旧实现上失败）。
+
+    全程用 os.listdir / Path.iterdir 直接读真实目录（不经 FUSE）做断言。"""
+    log("\n━━━ 模块 9b: 打开中删除 + 同名重建（真实目录零隐藏名） ━━━")
+    tag = TEST_ID
+    realdir = Path(STORAGE) / "0" / "Download"
+    vdir = Path(MNT) / "0" / "网盘"
+    name = f"nsp_recreate_{tag}.bin"
+    vpath = vdir / name
+
+    def hidden_real():
+        return sorted(p.name for p in realdir.iterdir() if p.name.startswith(".fuse_hidden"))
+
+    try:
+        os.unlink(vpath)
+    except FileNotFoundError:
+        pass
+
+    # ① 打开 + 写入并保持句柄 → unlink：真实目录必须立刻干净
+    old = os.open(vpath, os.O_CREAT | os.O_RDWR, 0o644)
+    os.write(old, b"OLD" * 100)
+    os.fsync(old)
+    os.unlink(vpath)
+    h = hidden_real()
+    if h:
+        fail("9b unlink 瞬间真实目录出现隐藏名", str(h))
+    else:
+        ok("9b unlink 瞬间真实目录没有 .fuse_hidden")
+    if (realdir / name).exists():
+        fail("9b 删除后本体仍在真实目录")
+    else:
+        ok("9b 删除后真实目录没有本体")
+
+    # ② 同名重建（O_CREAT|O_TRUNC）：本体回来，隐藏名仍不允许出现
+    new = os.open(vpath, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+    os.write(new, b"NEW" * 50)
+    os.fsync(new)
+    h = hidden_real()
+    if h:
+        fail("9b 同名重建后真实目录仍有隐藏名", str(h))
+    else:
+        ok("9b 同名重建后真实目录无隐藏名")
+    if (realdir / name).exists():
+        ok("9b 同名重建后真实目录只有本体")
+    else:
+        fail("9b 同名重建后真实目录缺本体")
+
+    # ③ 旧句柄（指向已删除的旧 inode）仍可写、仍读回旧内容
+    os.lseek(old, 0, os.SEEK_END)
+    os.write(old, b"X" * 10)
+    os.fsync(old)
+    os.lseek(old, 0, os.SEEK_SET)
+    old_data = os.read(old, 4096)
+    if old_data == b"OLD" * 100 + b"X" * 10:
+        ok("9b 旧句柄在重建后仍可读写（inode 由 fd 保活）")
+    else:
+        fail("9b 旧句柄内容异常", f"len={len(old_data)}")
+    h = hidden_real()
+    if h:
+        fail("9b 旧句柄读写期间真实目录出现隐藏名", str(h))
+    else:
+        ok("9b 旧句柄读写期间真实目录无隐藏名")
+    os.close(old)
+
+    # ④ 关闭旧句柄：本层不产生隐藏名，新本体不受影响
+    h = hidden_real()
+    if h:
+        fail("9b 关闭旧句柄后真实目录出现隐藏名", str(h))
+    else:
+        ok("9b 关闭旧句柄后真实目录无隐藏名")
+    if (realdir / name).exists():
+        ok("9b 关闭旧句柄后新本体仍在")
+    else:
+        fail("9b 关闭旧句柄后新本体消失")
+
+    os.lseek(new, 0, os.SEEK_SET)
+    new_data = os.read(new, 4096)
+    os.close(new)
+    if new_data == b"NEW" * 50:
+        ok("9b 新句柄内容独立（未被旧句柄写入污染）")
+    else:
+        fail("9b 新句柄内容异常", f"len={len(new_data)}")
+
+    # ⑤ 遗留隐藏名（旧版本 daemon / 下层 FUSE 生成）：按普通条目可见、保留在磁盘
+    #   （本层不产生新隐藏名，但也不再隐藏/清理已存在的——保留取证能力）
+    stale = realdir / ".fuse_hidden0000000000000002"
+    stale.write_bytes(b"stale")
+    listed = sorted(n for n in os.listdir(vdir) if n.startswith(".fuse_hidden"))
+    if stale.name in listed:
+        ok("9b 遗留隐藏名在目录列举中可见（不再对应用隐藏）")
+    else:
+        fail("9b 遗留隐藏名在目录列举中不可见（不该再隐藏）", str(listed))
+    st = None
+    try:
+        st = os.stat(vdir / stale.name)
+    except OSError as e:
+        fail("9b 遗留隐藏名无法 getattr（应按普通条目可 stat）", f"errno={e.errno}")
+    if st is not None and st.st_size == len(b"stale"):
+        ok("9b 遗留隐藏名可正常 stat/open（普通条目语义）")
+    if stale.exists():
+        ok("9b 遗留隐藏名仍保留在真实目录（未被自动清理）")
+        stale.unlink(missing_ok=True)
+    else:
+        fail("9b 遗留隐藏名被自动清理了（不该再删除）", str(stale))
+    h = hidden_real()
+    if h:
+        fail("9b 用例结束时真实目录仍有隐藏名", str(h))
+    else:
+        ok("9b 用例结束时真实目录零隐藏名（仅剩本用例自建夹具）")
 
 
 def main():
@@ -905,6 +1031,7 @@ def main():
         test_rename_exdev()
         test_rename_exdev_hardening()
         test_open_unlink_no_hidden()
+        test_open_unlink_recreate_no_hidden()
         test_sqlite()
         test_concurrent()
     finally:

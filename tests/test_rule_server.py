@@ -1430,6 +1430,17 @@ def check(proc, sock_name, conf_dir):
     import glob as _glob
     bin_dir = os.path.dirname(os.path.abspath(RULE_SERVER))
     has_log_monitor = os.path.exists(os.path.join(bin_dir, "log_monitor"))
+    # 启停段之前先记下已在运行的 daemon pid：SERVICE start/restart 会把 bin 目录下
+    # 的 injector / fuse_daemon / log_monitor 作为子进程拉起，而 rule_server 退出时
+    # 不回收它们（生产语义：守护进程独立于控制端存活）。测试必须只回收自己拉起的
+    # 那几个，否则宿主会残留 injector --passive —— 它会监听配置目录，后续套件改写
+    # 规则时被它响应，产生与本改动无关的假失败。
+    pre_daemon_pids = {}
+    _pre = send_cmd(proc, sock_name, {"cmd": "SERVICE", "action": "status"})
+    for _name in ("injector", "fuse_daemon", "log_monitor"):
+        _st = ((_pre.get("data") or {}).get(_name) or {})
+        if _st.get("alive") and int(_st.get("pid") or 0) > 0:
+            pre_daemon_pids[_name] = int(_st["pid"])
     if has_log_monitor:
         # 先确保干净：杀掉可能残留的测试 log_monitor（仅匹配本测试进程树）
         try:
@@ -1465,6 +1476,35 @@ def check(proc, sock_name, conf_dir):
             subprocess.run(["pkill", "-9", "-x", "log_monitor"], capture_output=True)
         except Exception:
             pass
+        # 回收本段拉起的 daemon：只杀「段前不在跑」或 pid 变了的那些，避免误杀
+        # 宿主既有实例；rule_server 退出不回收子进程，留着会污染后续套件。
+        _post = send_cmd(proc, sock_name, {"cmd": "SERVICE", "action": "status"})
+        reclaimed = []
+        for _name in ("injector", "fuse_daemon", "log_monitor"):
+            _st = ((_post.get("data") or {}).get(_name) or {})
+            _pid = int(_st.get("pid") or 0)
+            if not _st.get("alive") or _pid <= 0 or pre_daemon_pids.get(_name) == _pid:
+                continue
+            try:
+                os.kill(_pid, signal.SIGTERM)
+                reclaimed.append("%s(%d)" % (_name, _pid))
+            except ProcessLookupError:
+                continue
+            except Exception:
+                continue
+        if reclaimed:
+            time.sleep(0.5)
+            for _name in ("injector", "fuse_daemon", "log_monitor"):
+                _st = ((_post.get("data") or {}).get(_name) or {})
+                _pid = int(_st.get("pid") or 0)
+                if _pid <= 0 or pre_daemon_pids.get(_name) == _pid:
+                    continue
+                if os.path.exists("/proc/%d" % _pid):
+                    try:
+                        os.kill(_pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+            print("  (回收本段拉起的 daemon: %s)" % ", ".join(reclaimed))
     else:
         print("  (跳过 SERVICE 启停控制：bin 目录无 log_monitor)")
         GAPS.append("SERVICE 启停控制（bin 目录无 log_monitor）")

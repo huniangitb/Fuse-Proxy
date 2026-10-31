@@ -108,24 +108,63 @@ static void dump_maps_and_offsets(int fd, void* const* bt, int nframes) {
     while (line && *line) {
         char* nl = strchr(line, '\n');
         if (nl) *nl = '\0';
-        unsigned long start = 0, end = 0;
+        unsigned long start = 0, end = 0, foff = 0;
         char perms[8] = {0};
         char path[256] = {0};
-        if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255s", &start, &end, perms, path) >= 3 &&
+        if (sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*u %255s", &start, &end, perms, &foff,
+                   path) >= 3 &&
             perms[2] == 'x') {
             /* 可执行段：打印基址，并对落在该段的 backtrace 帧计算偏移 */
             safe_printf(fd, "  base 0x%lx %s\n", start, path[0] ? path : "(anon)");
             for (int i = 0; i < nframes; i++) {
                 uintptr_t pc = (uintptr_t)bt[i];
+                /* offset 必须是 file offset + 段内偏移：同一 .so 常有多段可执行
+                   映射，只用段内偏移给 addr2line 会指到别处符号上 */
                 if (pc >= start && pc < end)
                     safe_printf(fd, "    #%02d pc 0x%lx -> offset +0x%lx in %s\n", i,
-                                (unsigned long)pc, (unsigned long)(pc - start),
+                                (unsigned long)pc, (unsigned long)(foff + (pc - start)),
                                 path[0] ? path : "(anon)");
             }
         }
         line = nl ? nl + 1 : NULL;
     }
     safe_printf(fd, "End memory map\n");
+}
+/* 现场帧归属：把任意地址直接解析到 /proc/self/maps 里的映射（路径 + 符号偏移）。
+   崩溃现场最先要回答的问题是"这一帧在谁的代码里"——fuse_daemon 自己、系统
+   libfuse3.so、还是某个模块 .so。旧输出只有绝对地址（ASLR 后不可直接读）和
+   Memory map 段落里的逐帧 pc-start，而 pc-start 对"同一库的第二个映射段"并非
+   符号偏移（少了该段自身的 file offset），且要人肉对着整个映射表找。
+   这里压成一行，取 addr2line 需要的真偏移（file off + 段内偏移）：
+     PC owner: /system/lib64/libfuse3.so +0x19452 (map 0x7f..-0x7f.., file off 0x19000)
+   全部 open/read/sscanf/write（信号安全，无内存分配）。 */
+static void dump_addr_owner(int fd, const char* label, uintptr_t addr) {
+    int mfd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (mfd < 0) return;
+    char maps[16384];
+    ssize_t total = 0, got;
+    while ((got = read(mfd, maps + total, sizeof(maps) - 1 - total)) > 0) total += got;
+    close(mfd);
+    if (total <= 0) return;
+    maps[total] = '\0';
+    char* line = maps;
+    while (line && *line) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        unsigned long start = 0, end = 0, foff = 0;
+        char perms[8] = {0};
+        char path[256] = {0};
+        /* 字段序：start-end perms file_offset dev inode path */
+        int n = sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*u %255s", &start, &end, perms, &foff, path);
+        if (n >= 4 && addr >= start && addr < end) {
+            safe_printf(fd, "%s: %s +0x%lx (map 0x%lx-0x%lx, file off 0x%lx)\n", label,
+                        path[0] ? path : "(anon/none)", (unsigned long)(foff + (addr - start)),
+                        (unsigned long)start, (unsigned long)end, (unsigned long)foff);
+            return;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    safe_printf(fd, "%s: 0x%lx 未落在任何映射段\n", label, (unsigned long)addr);
 }
 
 /* crash_handler：崩溃转储原处理器。
@@ -191,12 +230,18 @@ void crash_handler(int sig, siginfo_t* info, void* ctx) {
     safe_printf(out_fd, "Program counter: 0x%lx\n", uc->uc_mcontext.pc);
     safe_printf(out_fd, "Stack pointer: 0x%lx\n", uc->uc_mcontext.sp);
     safe_printf(out_fd, "Link register: 0x%lx\n", uc->uc_mcontext.regs[30]);
+    /* 归属行必须排在 backtrace 之前：崩溃在 FORTIFY/abort 路径时，backtrace()
+       自己也可能再触发 abort（信号已复位为 DFL，第二次即死），届时全场只剩
+       已写出的这几行——"PC 落在哪个 .so"是唯一能定性的线索。 */
+    dump_addr_owner(out_fd, "PC owner", (uintptr_t)uc->uc_mcontext.pc);
+    dump_addr_owner(out_fd, "LR owner", (uintptr_t)uc->uc_mcontext.regs[30]);
 #elif defined(__x86_64__)
     ucontext_t* uc = (ucontext_t*)ctx;
     safe_printf(out_fd, "Program counter: 0x%llx\n",
                 (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
     safe_printf(out_fd, "Stack pointer: 0x%llx\n",
                 (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
+    dump_addr_owner(out_fd, "PC owner", (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
 #endif
     /* 统一调用本地安全的 backtrace 接口 */
     void* bt[CRASH_BT_MAX];

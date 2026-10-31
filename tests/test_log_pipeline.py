@@ -26,6 +26,11 @@
    async 线程（先 shutdown 唤醒阻塞 read）；旧实现先 free 后线程醒来写
    `notify_fd` → ASan heap-use-after-free。用例 5 直编 log_monitor 源码 + ASan
    判别，`LOG_MONITOR_SRC=<旧副本>` 必失败。
+6. **per-事件 DEBUG 不得刷屏**：fuse_daemon 的「打开中删除」直删分支（真机
+   20:05:18 一秒 633 行 `open-unlink 本地直删`）必须限速成「首条打全路径 +
+   每 1024 条一条（只报目录 + 累计计数）」。用例 6 把观测口
+   `log_open_unlink_direct` 从 `src/daemon/fuse_daemon.c` 抽出来直编、用桩
+   `LOG_DBG` 数行数：2200 次调用只许 3 行。`FUSE_DAEMON_SRC=<旧副本>` 必失败。
 
 前置：GNU 产物 `build_gnu/{fuse_daemon,log_monitor,log_ctl}`、
       `fusermount3`、`/dev/fuse`。非默认产物路径用环境变量覆盖：
@@ -905,6 +910,187 @@ def test_exit_join():
     # 探针进程已退出，抽象 socket 释放；后续用例需要时自行 start_logmon()
 
 # ───────────────────────────────────────────────────────────
+# 用例组6：per-事件 DEBUG 限速（open-unlink 本地直删）
+# ───────────────────────────────────────────────────────────
+DAEMON_SRC = os.environ.get("FUSE_DAEMON_SRC") or os.path.join(
+    ROOT, "src", "daemon", "fuse_daemon.c")
+
+# 限速函数的观测口：真机 20:05:18 一秒 633 行（com.taobao.idlefish 批量删
+# lockfile），把 sys.log 里有用的行全冲掉。这里把它从 fuse_daemon.c 里抽出来
+# 直编，用桩 LOG_DBG 数行数——不需要 /dev/fuse、不需要把 injector 开到 DEBUG，
+# 也不受沙箱时间线影响。
+OPEN_UNLINK_PROBE = r"""
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+
+static int g_lines;
+
+/* 桩：只数行数 + 原样打印，等价于 LOG_DBG 在 DEBUG 级别下的落盘行为 */
+#define LOG_DBG(fmt, ...) do { g_lines++; printf(fmt "\n", ##__VA_ARGS__); } while (0)
+
+@FUNC@
+
+#ifndef CALLS
+#define CALLS 2200
+#endif
+
+int main(void) {
+    char p[4096];
+    for (int i = 0; i < CALLS; i++) {
+        snprintf(p, sizeof(p),
+                 "/storage/emulated/0/Android/data/com.demo/files/lock%d.bin", i);
+        log_open_unlink_direct(p);
+    }
+    printf("LINES=%d\n", g_lines);
+    return 0;
+}
+"""
+
+# 阳性对照：未限速的实现（= 旧行为）。探针必须对它报出 CALLS 行——证明这套
+# 直编机制对「回归到每事件一条」是敏感的，而不是恒绿的。
+OPEN_UNLINK_NAIVE = r"""
+#include <stdio.h>
+
+static int g_lines;
+#define LOG_DBG(fmt, ...) do { g_lines++; printf(fmt "\n", ##__VA_ARGS__); } while (0)
+
+static void log_open_unlink_direct(const char* path) {
+    LOG_DBG("open-unlink 本地直删（不产生隐藏名）: %s", path);
+}
+
+int main(void) {
+    char p[4096];
+    for (int i = 0; i < 2200; i++) {
+        snprintf(p, sizeof(p),
+                 "/storage/emulated/0/Android/data/com.demo/files/lock%d.bin", i);
+        log_open_unlink_direct(p);
+    }
+    printf("LINES=%d\n", g_lines);
+    return 0;
+}
+"""
+
+
+def _extract_c_function(text, name):
+    """按花括号配平从 C 源里抽一个函数定义（签名可跨行）。抽不到返回 None。"""
+    m = re.search(r"^[ \t]*(?:static\s+)?[A-Za-z_][\w \t\*]*\b" + re.escape(name) +
+                  r"\s*\(", text, re.M)
+    if not m:
+        return None
+    i = text.find("{", m.end())
+    if i < 0:
+        return None
+    depth = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    break
+                i += 1
+        elif c == "/" and text.startswith("/*", i):
+            i = text.find("*/", i)
+            if i < 0:
+                return None
+            i += 2
+            continue
+        elif c == "/" and text.startswith("//", i):
+            nl = text.find("\n", i)
+            if nl < 0:
+                return None
+            i = nl + 1
+            continue
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[m.start():i + 1]
+        i += 1
+    return None
+
+
+def _build_and_run_open_unlink(tmpdir, tag, body, calls=2200):
+    src = os.path.join(tmpdir, tag + ".c")
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    exe = os.path.join(tmpdir, tag)
+    # -D_GNU_SOURCE：被测函数用 PATH_MAX（真实构建里由 meson 定义）
+    r = subprocess.run([*_cc(), "-std=c23", "-w", "-O0", "-D_GNU_SOURCE",
+                        f"-DCALLS={calls}", src, "-o", exe],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, r.stderr
+    run = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+    if run.returncode != 0:
+        return None, run.stderr
+    return run.stdout, ""
+
+
+def test_open_unlink_throttle():
+    """用例组6：open-unlink 本地直删的 DEBUG 必须限速（旧实现每事件一条）。
+
+    真机现场：com.taobao.idlefish 批量删 lockfile，20:05:18 一秒 633 行
+    ``open-unlink 本地直删（不产生隐藏名）: <path>``。修复后首条打全路径、
+    此后每 1024 条一条（只报目录 + 累计计数）。
+
+    判别性：``FUSE_DAEMON_SRC=<git show HEAD:src/daemon/fuse_daemon.c>`` 跑本
+    用例必失败——旧实现里没有 log_open_unlink_direct 这个观测口，抽取直接失败；
+    即便有人把函数补上却不限速，探针会数到 2200 行（阈值 ≤4）。阳性对照
+    （未限速实现）在同一套直编机制下必须报 2200 行，证明探针不是恒绿的。
+    """
+    log("\n━━━ 用例组6: open-unlink DEBUG 限速（L0 直编契约） ━━━")
+    if not os.path.isfile(DAEMON_SRC):
+        GAPS.append("fuse_daemon 源码缺失，open-unlink 限速用例跳过")
+        log("  ⏭ 缺少 %s，跳过", DAEMON_SRC)
+        return
+    with open(DAEMON_SRC, encoding="utf-8", errors="replace") as fh:
+        daemon_src = fh.read()
+    func = _extract_c_function(daemon_src, "log_open_unlink_direct")
+    if func is None:
+        fail("6.0 fuse_daemon.c 里有 open-unlink 直删的唯一观测出口",
+             "旧实现没有 log_open_unlink_direct：每 unlink 一条 LOG_DBG")
+        return
+    ok("6.0 fuse_daemon.c 里有 open-unlink 直删的唯一观测出口")
+    with tempfile.TemporaryDirectory(prefix="log_open_unlink_") as tmpdir:
+        naive, err = _build_and_run_open_unlink(tmpdir, "naive", OPEN_UNLINK_NAIVE)
+        if naive is None:
+            fail("6.1 阳性对照探针编译/运行失败", (err or "").strip()[:300])
+            return
+        m = re.search(r"LINES=(\d+)", naive)
+        naive_lines = int(m.group(1)) if m else -1
+        check("6.1 阳性对照（未限速实现）报出每事件一条——探针对回归敏感",
+              naive_lines == 2200, f"LINES={naive_lines}（期望 2200）")
+
+        body = OPEN_UNLINK_PROBE.replace("@FUNC@", func)
+        out, err = _build_and_run_open_unlink(tmpdir, "throttle", body)
+        if out is None:
+            fail("6.2 限速探针编译/运行失败", (err or "").strip()[:300])
+            return
+        m = re.search(r"LINES=(\d+)", out)
+        lines = int(m.group(1)) if m else -1
+        want = 1 + 2200 // 1024
+        check("6.2 2200 次「打开中删除」只产生首条 + 每 1024 条一条",
+              lines == want, f"LINES={lines}（期望 {want}；旧实现 2200）")
+        printed = [l for l in out.splitlines() if "open-unlink" in l]
+        check("6.3 首条打全路径（现场能看出是哪个文件）",
+              bool(printed) and "files/lock0.bin" in printed[0],
+              printed[0] if printed else "无输出")
+        check("6.4 折叠行只报目录 + 累计计数（不重复打文件名）",
+              len(printed) >= 2 and "累计 1024 次" in printed[1]
+              and printed[1].rstrip().endswith("files/")
+              and "lock1024.bin" not in printed[1],
+              printed[1] if len(printed) >= 2 else "无折叠行")
+
+
+# ───────────────────────────────────────────────────────────
 # 主流程
 # ───────────────────────────────────────────────────────────
 def main():
@@ -939,6 +1125,8 @@ def main():
         time.sleep(0.5)
 
     try:
+        # 用例组6 纯直编，不依赖 log_monitor（放在最前：监控起不来也要跑）
+        test_open_unlink_throttle()
         if not start_logmon():
             fail("log_monitor 启动失败", "见 /tmp/log_pipeline_monitor.out")
         else:

@@ -93,6 +93,14 @@ static void record_log(const char* fmt, ...) {
 
 static bool log_has(const char* needle) { return strstr(g_logbuf, needle) != nullptr; }
 
+/* 统计日志里某标记出现的次数（限速用例要数行数，不能只看"有没有"） */
+static int count_occurrences(const char* hay, const char* needle) {
+    int n = 0;
+    size_t nlen = strlen(needle);
+    for (const char* p = hay; (p = strstr(p, needle)) != nullptr; p += nlen) n++;
+    return n;
+}
+
 /* 项目内 log_internal：只做记录，不落盘/不走日志环 */
 void log_internal(LogLevel level, const char* format, ...) {
     if (level >= LOG_WARN) g_warn_lines++;
@@ -253,7 +261,9 @@ static int run_combined_with(const char* target, int readiness_ms) {
         .backup = "/var/fuse-proxy/backup/storage",
         .preserve_paths = nullptr,
         .preserve_count = 0,
-        .target_pid = 1,
+        /* 存活检查用自己：就绪门控在 readiness>0 时会 kill(pid,0) 探活，
+           pid 1 在非 root 下返回 EPERM（会被判成"目标已退出"） */
+        .target_pid = getpid(),
         .app_uid = 10123,
         .readiness_ms = readiness_ms,
     };
@@ -349,6 +359,23 @@ int main(void) {
     check("F2 权威尝试仍 loud（至少一条 WARN）", g_warn_lines >= 1, "真实失败被静默了");
     check("F3 明确交由重试队列", log_has("交由重试队列"), "");
 
+    /* F4/F5. 就地快试预算（POST 的 20ms）：等不到是**常态**——真机 vold 把
+           /storage/emulated 装进应用命名空间要 135–150ms。这一档的缺失只能记
+           DEBUG：若按权威尝试 loud，真机每次冷启动都会往 error.log 写一条
+           "缺失(20ms 内未出现)"（旧 250ms 预算下已有 31 条这种噪声；改成 20ms
+           后 202/322 次挂载都会命中）。 */
+    reset_case(nullptr, nullptr);
+    errno = 0;
+    rc = run_combined_with(missing, 20);
+    check("F4 就地快试预算（20ms）目标缺失 → 仍 ENOENT（交后台重试）", rc == ENOENT,
+          rc == ENOENT ? "" : "未按未就绪返回 ENOENT");
+    check("F5 就地快试未就绪不写 WARN/ERROR（不污染 error.log）",
+          g_warn_lines == 0 && g_err_lines == 0,
+          "20ms 快试的预期未就绪被记成了失败");
+    check("F6 就地快试不用失败式措辞、且说明是快试",
+          !log_has("重试队列") && !log_has("缺失(") && log_has("就地快试"),
+          "措辞与权威尝试未区分");
+
     /* G. 源预检：源在本命名空间不是 FUSE 挂载（不同 ROM 的 /mnt 传播设置可能只
           把目录传进来、FUSE 没传进来）→ 必须**在卸载之前**放弃：旧实现会先把
           原生视图拆掉，再把空目录 bind 成 /storage/emulated（"假成功空挂载"），
@@ -383,6 +410,61 @@ int main(void) {
           g_private_calls == 1 ? "" : "缺少传播隔离（卸载/挂载事件会传播出去）");
     check("I2 私有化发生在第一次卸载之前", g_private_seq == 0,
           g_private_seq == 0 ? "" : "私有化晚于卸载");
+
+    /* J. 分段计时（[ns计]）：定位"135ms 花在哪"的唯一手段，但绝不许自己变成
+          刷屏源。真机 20:05:18 一秒 633 行的 unlink DEBUG 已经把 sys.log 冲掉了
+          一次，同类事故不能再犯。判别点：
+            - 共享页（MAP_SHARED）被子进程填满 → 父进程能读到各段耗时；
+            - 总耗时 < 20ms 的"健康挂载"只按 1/1024 采样；
+            - 总耗时 ≥ 20ms 的慢挂载必打一条，且带段名与合计；
+            - 每秒硬上限 20 条，其余折叠并计数。旧实现没有任何分段计时 → J1-J4 全失败。 */
+    reset_case(nullptr, "/mnt/user/0/emulated");
+    struct NsMountSeg seg;
+    memset(&seg, 0, sizeof seg);
+    struct CombinedMountArgs jargs = {
+        .pkg = "com.test.target",
+        .source = "/mnt/nsp_global",
+        .target = target,
+        .backup = "/var/fuse-proxy/backup/storage",
+        .preserve_paths = nullptr,
+        .preserve_count = 0,
+        .target_pid = 1,
+        .app_uid = 10123,
+        .readiness_ms = 0,
+        .seg = &seg,
+    };
+    int jrc = do_combined_mount(&jargs);
+    int64_t jsum = 0;
+    for (int i = 0; i < NSP_SEG_COUNT; i++) jsum += seg.us[i];
+    check("J1 成功路径填充分段计时（合计 > 0，父进程可读子进程写的共享页）", jrc == 0 && jsum > 0,
+          jrc == 0 ? "分段耗时全为 0：共享页没被写" : "挂载未成功");
+
+    /* J2：快速挂载只按 1/1024 采样（1100 次 <20ms 的挂载最多 2 行） */
+    reset_case(nullptr, nullptr);
+    struct NsMountSeg fast;
+    memset(&fast, 0, sizeof fast);
+    for (int i = 0; i < 1100; i++) ns_seg_log("com.test.fast", &fast, 0);
+    int fast_lines = count_occurrences(g_logbuf, "[ns计]");
+    check("J2 健康挂载（<20ms）按 1/1024 采样：1100 次 ≤ 2 行", fast_lines <= 2,
+          "分段计时变成了刷屏源");
+
+    /* J3：慢挂载必打一条，且带段名与合计 */
+    reset_case(nullptr, nullptr);
+    struct NsMountSeg slow;
+    memset(&slow, 0, sizeof slow);
+    slow.us[NSP_SEG_READY] = 30 * 1000; /* 30ms 花在就绪门控上 */
+    ns_seg_log("com.test.slow", &slow, 31 * 1000);
+    check("J3 慢挂载（≥20ms）必打一条且含段名/合计/段外",
+          log_has("[ns计]") && log_has("就绪=30ms") && log_has("合计=30ms") && log_has("段外=1ms"),
+          "慢挂载没有分段日志");
+
+    /* J4：每秒硬上限（20 条），其余折叠并计数 */
+    reset_case(nullptr, nullptr);
+    for (int i = 0; i < 100; i++) ns_seg_log("com.test.storm", &slow, 31 * 1000);
+    int storm_lines = count_occurrences(g_logbuf, "[ns计]");
+    check("J4 每秒最多 20 条分段日志（其余折叠并计数）",
+          storm_lines <= NSP_SEG_MAX_PER_SEC && log_has("折叠="),
+          "分段日志没有每秒上限");
 
     rmdir(target);
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");

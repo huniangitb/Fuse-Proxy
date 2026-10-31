@@ -50,7 +50,12 @@ TERM→KILL 升级、宿主 mountinfo 前后比对、按 cmdline 标记甄别残
    视图、v3 不还原；v1 目标逐应用挂载且保留原生子挂载、非目标不动；
 5. 文件级 IO：系统标记/项目标记互斥可见（init ns 经 ``/storage/emulated``）；
 6. SIGTERM 退出清理：族根/应用视图回到系统视图、``/mnt/nsp_global`` 卸载、
-   备份点卸载、目标应用逐应用挂载回收、injector 与 fuse_daemon 全部退出。
+   备份点卸载、目标应用逐应用挂载回收、injector 与 fuse_daemon 全部退出；
+7. 日志风暴（真机现场取证）：连续 50 次写 ``injector.conf`` 只允许 ≤2 次真实
+   重载（旧实现 = 每个 inotify 事件一次），重载日志必须带来源/触发文件/合并
+   事件数，且风暴期间 IPC 仍被及时处理。（per-事件 DEBUG 的限速回归在
+   ``test_log_pipeline.py`` 的 L0 直编契约里做，那里不需要真 FUSE、也不必把
+   injector 开到 DEBUG。）
 
 运行
 ----
@@ -72,6 +77,7 @@ import errno as errno_mod
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -93,6 +99,10 @@ METHODS = ("v1", "v2", "v3")
 
 TARGET_PKG = "com.test.target"
 NONTARGET_PKG = "com.test.nontarget"
+# R15 配置热生效用例：该应用整个生命周期里没有任何规则，随后仅由配置变更
+# （injector.conf 段 / App-rules 子文件）把它变成目标，全程不重启进程
+LIVE_PKG = "com.test.live"
+APP_RULES_DIR = "/var/fuse-proxy/App-rules"
 
 CONFIG_PATH = "/var/fuse-proxy/injector.conf"
 GLOBAL_MNT = "/mnt/nsp_global"
@@ -112,7 +122,7 @@ BACKUP_TOP = "/var/fuse-proxy/backup/global_emulated/user_0/emulated"
 
 # 残留进程甄别标记（沙箱进程一旦漏杀，必然带其一；宿主自身不带）
 HOST_MARKERS = ("--inject-method=", "--ready-fd=", "--workdir",
-                TARGET_PKG, NONTARGET_PKG)
+                TARGET_PKG, NONTARGET_PKG, LIVE_PKG)
 
 # 配置：GLOBAL_INJECT OFF → v1 不拉媒体 FUSE；目标段带实质规则（否则 v1
 # perform_app_mount 走「无规则保留原生视图」跳过且不 mark_injected）
@@ -595,6 +605,69 @@ def file_missing(path):
     return f
 
 
+def ns_read_text(pid, path):
+    """读「应用命名空间视角」的文件：/proc/<pid>/root 会解析该进程的挂载表，
+    故同一路径在不同 ns 里指向不同文件（sys_marker 与 proj_marker 就靠这个区分）。"""
+    return read_text(f"/proc/{pid}/root{path}")
+
+
+def file_in_ns_has(pid, path, text):
+    def f():
+        data = ns_read_text(pid, path)
+        return data == text, f"/proc/{pid}/root{path} = {data!r} 期望 {text!r}"
+    return f
+
+
+def file_in_ns_missing(pid, path):
+    def f():
+        exists = os.path.exists(f"/proc/{pid}/root{path}")
+        return (not exists), f"/proc/{pid}/root{path} " + ("意外存在" if exists else "不存在(预期)")
+    return f
+
+
+def write_app_rule_file(path, text):
+    """原子写 App-rules/<pkg>.conf（模拟管理器落盘单个应用规则文件）。
+    临时名不结束于 .conf：避免读取方把半成品当成规则文件解析。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+# ── 沙箱日志取证（重载风暴 / 日志风暴断言用） ─────────────────────────
+# 沙箱把 /var/fuse-proxy/log 绑定到宿主 <workdir>/chan/log，故这里读到的就是
+# 现场那份 sys.log。日志由多个进程（injector / fuse_daemon）追加写，断言一律
+# 走「先记偏移 → 事后只数增量」，绝不对历史内容下结论。
+SYS_LOG = "/var/fuse-proxy/log/sys.log"
+
+
+def log_offset(path=SYS_LOG):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def log_since(off, path=SYS_LOG):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(off)
+            return fh.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def count_in(text, needle):
+    return sum(1 for line in text.splitlines() if needle in line)
+
+
+def lines_with(text, needle):
+    return [line for line in text.splitlines() if needle in line]
+
+
 # ── 沙箱构建 ──────────────────────────────────────────────────────────
 
 def rbind_tree(src, dst, readonly=True):
@@ -794,6 +867,11 @@ def start_log_monitor():
 
 
 def start_injector(method):
+    # 刻意保持默认日志级别（INFO）：本套件的断言全部基于挂载拓扑与 INFO 级
+    # 「配置重载 #」行。打开 DEBUG 会让 fuse_daemon/injector 的子进程多写日志，
+    # 改变异步挂载子进程的时间线（完成管道偶发 EOF → 「结果不可得」），把一个
+    # 与本套件无关的既有竞态放大成假失败。per-事件 DEBUG 的限速回归因此放在
+    # test_log_pipeline.py 的 L0 直编契约（用例 6），那里不需要真 FUSE。
     r = subprocess.run([INJECTOR, f"--inject-method={method}", "--passive"],
                        capture_output=True, timeout=15)
     if r.returncode != 0:
@@ -1094,6 +1172,148 @@ def inner_main(argv):
             write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
             wait_check("R14 v2 配置 ON→OFF：app2 再次还原为系统视图",
                        dev_is(STORAGE_EMU, sys_dev, app2), timeout=10)
+
+        # ── R15：v1 配置热生效（运行中应用热卸载 / 热挂载，无需杀进程） ──
+        # 用户报障（原话）：「不能实时生效 比如打开以后可修改配置必须得杀进程，
+        # V1挂载模式下，injector需要改进。」旧实现的两个缺口：
+        #   ① src/config/config_parser.c:1416 的 diff 只比较「应用段 inject_enable
+        #      翻转 / 全局开关」；规则内容、类别段与 App-rules 子文件的增删一律
+        #      changed_count==0 → src/injector/injector.c:1459-1463 什么都不做 →
+        #      视图永远停在旧状态（典型症状：删掉规则后仍停在代理视图，只能杀进程）；
+        #   ② 被动模式（真机必有 zygisk 上报）下 src/injector/injector.c:1251 关掉
+        #      周期扫描，全量应用缓存 all_apps 永不填充，IPC 非目标路径也不登记 →
+        #      「应用已经在跑、之后才被配成目标」永远找不到 pid。
+        # 判别链（全程不重启任何进程，只靠 injector 的 inotify → 重载 → 对账）：
+        #   (a) 规则内容变化（段仍 ON，删掉唯一规则）→ 立即热卸载还原原生视图；
+        #   (a2) 反向：规则恢复 → 立即热挂载（热挂载方向）；
+        #   (b) 原本完全不是目标（无配置段）→ 新配置使其成为目标 → 立即挂上；
+        #   (c) 目标 → 非目标（删段）→ 立即热卸载；
+        #   (d) 管理器真实落盘方式 App-rules/<pkg>.conf 子文件：新建/删除同样生效。
+        if method == "v1":
+            REP.set_phase("r15_cfg_live")
+            check_now("R15 前置：app1（目标，带 HIDE 规则）当前为代理视图",
+                      dev_is(STORAGE_EMU, g_dev, app1))
+            # (a) 「无活跃规则的目标应用」按 perform_app_mount 的语义应回到原生视图
+            no_rule_cfg = CONFIG_TEXT.replace("HIDE /HIDE_ME/\n", "")
+            write_config_atomic(CONFIG_PATH, no_rule_cfg)
+            wait_check("R15(a) 规则内容清空（段仍 ON）：运行中应用立即热卸载还原原生视图",
+                       dev_is(STORAGE_EMU, sys_dev, app1), timeout=8)
+            check_now("R15(a) 应用 ns 内原生系统标记 sys_marker 恢复可见",
+                      file_in_ns_has(app1, SYS_MARK, "system-view"))
+            check_now("R15(a) 应用 ns 内项目标记 proj_marker 已不可见",
+                      file_in_ns_missing(app1, PROJ_MARK))
+
+            # (a2) 反向热挂载：同一条运行中进程，规则回来就重新挂上
+            write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
+            wait_check("R15(a2) 规则恢复：运行中应用立即重新挂载（热挂载方向）",
+                       dev_is(STORAGE_EMU, g_dev, app1), timeout=8)
+
+            # (b)(c) 原本连配置段都没有的应用：先成为目标、再被删段
+            app3 = spawn_app(LIVE_PKG)
+            app_pids.append(app3)
+            REP.check(f"R15 前置：{LIVE_PKG}（无任何规则）视图 = 系统视图",
+                      dev_at(STORAGE_EMU, app3) == sys_dev,
+                      entry_desc(top_entry(STORAGE_EMU, app3)))
+            rep_l = ipc_retry(f"REPORT {LIVE_PKG} {app3} 0")
+            REP.check(f"R15 前置：REPORT {LIVE_PKG}（非目标）返回 OK",
+                      rep_l is not None and "OK" in rep_l, repr(rep_l))
+            check_now(f"R15 前置：{LIVE_PKG} 不在 LIST_INJECTED",
+                      lambda: (app3 not in listed_pids(list_injected()), ""))
+
+            live_on = CONFIG_TEXT + f"\n[{LIVE_PKG}] ON\nHIDE /HIDE_ME/\n"
+            write_config_atomic(CONFIG_PATH, live_on)
+            wait_check("R15(b) 非目标 → 目标：运行中应用立即热挂载（未重启）",
+                       dev_is(STORAGE_EMU, g_dev, app3), timeout=8)
+            wait_check("R15(b) 应用 ns 内可见项目视图标记 proj_marker（真 FUSE 视图）",
+                       file_in_ns_has(app3, PROJ_MARK, "project-view"), timeout=6)
+            check_now("R15(b) 应用 ns 内系统标记 sys_marker 已被代理视图替换",
+                      file_in_ns_missing(app3, SYS_MARK))
+            wait_listed(app3, LIVE_PKG, timeout=8)
+
+            write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
+            wait_check("R15(c) 目标 → 非目标（删段）：运行中应用立即热卸载（未重启）",
+                       dev_is(STORAGE_EMU, sys_dev, app3), timeout=8)
+            check_now("R15(c) 应用 ns 内原生系统标记 sys_marker 恢复可见",
+                      file_in_ns_has(app3, SYS_MARK, "system-view"))
+            wait_check("R15(c) 应用 ns 内原生子挂载 0/Android/data 一并回收",
+                       dev_is(STG_SUB, sys_data_dev, app3), timeout=6)
+            check_now(f"R15(c) 热卸载后 {LIVE_PKG} 从 LIST_INJECTED 消失",
+                      lambda: (app3 not in listed_pids(list_injected()), ""))
+
+            # (d) App-rules 子文件（管理器按应用落盘的常见形式）
+            rule_file = os.path.join(APP_RULES_DIR, LIVE_PKG + ".conf")
+            write_app_rule_file(rule_file, "HIDE /HIDE_ME/\n")
+            wait_check("R15(d) App-rules 子文件新增：运行中应用热挂载",
+                       dev_is(STORAGE_EMU, g_dev, app3), timeout=8)
+            os.unlink(rule_file)
+            wait_check("R15(d) App-rules 子文件删除：运行中应用热卸载",
+                       dev_is(STORAGE_EMU, sys_dev, app3), timeout=8)
+
+        # ── R16：配置重载风暴的去抖/合并 + 风暴期 IPC 及时性 ──
+        # 真机现场（sys.log 20:13:00）：一秒 54 条「配置广播: 0 订阅者, JSON
+        # 大小 72469 字节」= 每秒 54 次**全量重载**。重载全程在 injector 单线程
+        # 事件循环里（reload_config_rules_diff 全量解析 + setup_inotify_watches
+        # 重加全部 watch + config_publisher_broadcast 72KB + audit_running_apps
+        # 扫 /proc），而 v1 的 POST 挂载请求也在同一循环里排队 → 挂载请求被饿住，
+        # 现场表现就是「挂载超时」。旧实现对每个 inotify 事件立刻重载一次，且
+        # 不留任何重载日志，现场连「谁在写 .conf」都查不出来。
+        # 判别：连续 50 次写入只允许 ≤2 次真实重载（旧实现 = 50 次），且重载日志
+        # 必须带触发源 + 合并事件数。
+        if method == "v1":
+            REP.set_phase("r16_reload_storm")
+            # 先等上一阶段的尾账落地：R15(d) 的 App-rules 子文件「写 + 删」各自排了
+            # 一个 200ms 去抖窗口，窗口到期的那次重载会落进本用例的统计窗口，把
+            # 「风暴被合并成 1 次」误判成 3 次。等 > 最大推迟（1000ms）+ 余量后
+            # 再取偏移，之后窗口里出现的重载就只可能由本轮风暴触发。
+            time.sleep(1.5)
+            off = log_offset()
+            lat_ms = []
+            storm_n = 50
+            for i in range(storm_n):
+                # 语义等价、内容不同的连续写入：真实模拟管理器反复落盘
+                write_config_atomic(CONFIG_PATH, CONFIG_TEXT + f"# storm {i}\n")
+                if i % 5 == 0:
+                    t0 = time.monotonic()
+                    ipc_session("LIST_INJECTED")
+                    lat_ms.append((time.monotonic() - t0) * 1000.0)
+            wait_check("R16 风暴的去抖窗口到期后确实执行了重载（合并不能变成丢弃）",
+                       lambda: (count_in(log_since(off), "配置重载 #") >= 1,
+                                f"重载 {count_in(log_since(off), '配置重载 #')} 次"),
+                       timeout=6)
+            storm_txt = log_since(off)
+            reload_lines = lines_with(storm_txt, "配置重载 #")
+            n_reload = len(reload_lines)
+            REP.check(f"R16 连续 {storm_n} 次配置写入只触发 ≤2 次真实重载（旧实现 = 每事件一次）",
+                      n_reload <= 2,
+                      f"重载 {n_reload} 次（阈值 ≤2）；行样本 "
+                      f"{[l.rsplit('] ', 1)[-1] for l in reload_lines][:4]}")
+            REP.check("R16 每条重载都留下「来源/触发文件/合并事件」三元组",
+                      bool(reload_lines)
+                      and all("来源=" in l and "触发=" in l and "合并事件=" in l
+                              for l in reload_lines),
+                      f"{n_reload} 条：{[l.rsplit('] ', 1)[-1] for l in reload_lines]}")
+            last_reload = reload_lines[-1] if reload_lines else ""
+            REP.check("R16 重载日志标明来源/触发文件/合并事件数（现场取证入口）",
+                      "来源=inotify" in last_reload and "触发=injector.conf" in last_reload
+                      and "合并事件=" in last_reload, repr(last_reload))
+            merged = 0
+            m_ev = re.search(r"合并事件=(\d+)", last_reload)
+            if m_ev:
+                merged = int(m_ev.group(1))
+            REP.check("R16 合并事件计数覆盖整轮风暴（事件被折叠而非丢弃）",
+                      merged >= storm_n // 2, f"合并事件={merged}（风暴 {storm_n} 次写入）")
+            REP.check("R16 风暴期间 IPC 仍被及时处理（主循环不被重载独占）",
+                      max(lat_ms) <= 500.0,
+                      f"{len(lat_ms)} 次 LIST_INJECTED 最大 {max(lat_ms):.1f}ms、"
+                      f"平均 {sum(lat_ms) / len(lat_ms):.1f}ms")
+            # 去抖绝不能吃掉「最后一次事件」：风暴后紧跟一次语义变更，必须生效
+            write_config_atomic(CONFIG_PATH,
+                                CONFIG_TEXT + f"\n[{LIVE_PKG}] ON\nHIDE /HIDE_ME/\n")
+            wait_check("R16 风暴后最后一次配置变更仍生效（去抖不丢尾事件）",
+                       dev_is(STORAGE_EMU, g_dev, app3), timeout=8)
+            write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
+            wait_check("R16 复原配置：应用回到系统视图", dev_is(STORAGE_EMU, sys_dev, app3),
+                       timeout=8)
 
         # 文件级 IO（init ns 视角）
         if method == "v1":

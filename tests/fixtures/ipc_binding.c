@@ -138,6 +138,13 @@ static _Atomic int g_last_restore_uid;
 static char g_last_restore_pkg[256];
 
 const char* get_active_mnt_src(void) { return "/mock/fuse"; }
+/* 配置热对账（audit_running_apps）新增依赖的桩：本用例不触达这两条路径 */
+void invalidate_app_mount_cache(int pid) { (void)pid; }
+bool app_has_active_rules(const char* pkg, uid_t uid) {
+    (void)pkg;
+    (void)uid;
+    return true;
+}
 bool is_project_fuse_cached(int pid, const char* target_path) {
     (void)pid;
     (void)target_path;
@@ -553,8 +560,13 @@ static int run_ack_order_case(void) {
  *     都继承它，且 cleanup 只会在应用自己的 ns 里卸载，这份挂载没人能清；
  *   - POST 必须是 IPC_CHAN_POST（唯一的挂载时机）；
  *   - 旧模块（无 proto）与 REQ 必须是 IPC_CHAN_LEGACY（就地挂载，语义不变）；
- *   - 预算必须短（IPC_MOUNT_READINESS_MS <= 500）：这段等待发生在应用主线程里，
- *     旧值 1800/1000ms 在"视图迟迟不出现"的设备上等于每次冷启动固定变慢。 */
+ *   - 预算必须短：这段等待发生在应用主线程里，旧值 1800/1000ms 在"视图迟迟不出现"
+ *     的设备上等于每次冷启动固定变慢。
+ *   - **POST 预算必须远小于 legacy**（IPC_MOUNT_INLINE_MS=20 vs 250）：真机 322 次
+ *     挂载里 202 次 >100ms、59 次 >250ms，而 vold 把 /storage/emulated 装配进应用 ns
+ *     的实测窗口是 ~135–150ms——POST 阶段视图通常还没出现，等满 250ms 只是替 vold
+ *     数秒表，18% 的请求被它打爆且应用仍然拿到原生视图。POST 未就绪就该 fail-open
+ *     交后台快重试（20ms 起），而不是把应用冻在 specialize 上。 */
 static void run_plan_readiness_cases(void) {
     struct PlanCase {
         const char* label;
@@ -566,13 +578,13 @@ static void run_plan_readiness_cases(void) {
     } cs[] = {
         {"A2 pre(REPORT,proto=2) → DEFER 通道（只裁决、不挂载，预算 0）", false, true, 2,
          IPC_CHAN_DEFER, 0},
-        {"A2 POST(proto=2) → POST 通道（唯一挂载时机）", true, false, 2, IPC_CHAN_POST,
-         IPC_MOUNT_READINESS_MS},
+        {"A2 POST(proto=2) → POST 通道（唯一挂载时机，预算 20ms 不可感知）", true, false, 2,
+         IPC_CHAN_POST, IPC_MOUNT_INLINE_MS},
         {"A2 旧模块(REPORT,无proto) → legacy 通道（就地挂载）", false, true, 0, IPC_CHAN_LEGACY,
          IPC_MOUNT_READINESS_MS},
         {"A2 REQ(应用直连,proto=2) → legacy 通道（历史行为不变）", false, false, 2,
          IPC_CHAN_LEGACY, IPC_MOUNT_READINESS_MS},
-        {"A2 POST(无proto) → POST 通道", true, false, 0, IPC_CHAN_POST, IPC_MOUNT_READINESS_MS},
+        {"A2 POST(无proto) → POST 通道", true, false, 0, IPC_CHAN_POST, IPC_MOUNT_INLINE_MS},
     };
     char detail[400];
     for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
@@ -586,6 +598,11 @@ static void run_plan_readiness_cases(void) {
     /* 主线程预算必须短：冷启动可感知的量级是几百毫秒以上 */
     report(IPC_MOUNT_READINESS_MS <= 500, "A2 主线程就绪预算 ≤ 500ms（冷启动可感知上限）",
            "预算过大：应用主线程会被拖慢");
+    /* POST 通道（有 post 通知可依赖）必须用远小于 legacy 的预算：真机视图 ~140ms
+       才出现，等满 legacy 预算等于白等，且 18% 会直接打爆。 */
+    report(IPC_MOUNT_INLINE_MS <= 50 && IPC_MOUNT_INLINE_MS < IPC_MOUNT_READINESS_MS,
+           "A2 POST 预算 ≤ 50ms 且小于 legacy 预算（不可感知 + fail-open 交后台重试）",
+           "POST 预算过大：应用主线程白等且仍拿不到视图");
 
     /* A2b：v2 非目标还原的时序（事件驱动优先，不靠 10ms 轮询猜时间）。
        新协议 pre 阶段不还原、不轮询——此刻应用 ns 里还没有项目视图（还原只会

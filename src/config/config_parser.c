@@ -731,6 +731,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_global_switch_rule(cur, &cur->global_inject, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "SKIP_SYSTEM_APPS") == 0)
         parse_global_switch_rule(cur, &cur->skip_system_apps, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "ALLOW_CROSS_APP_DATA") == 0)
+        parse_global_switch_rule(cur, &cur->allow_cross_app_data, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
         parse_fuse_extra_args_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "SANDBOX_DIR") == 0)

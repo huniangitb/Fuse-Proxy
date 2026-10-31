@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include "common.h"
 #include "ns_utils.h"
 #include "ns_global_replace.h"
@@ -568,6 +569,73 @@ int ns_find_native_submounts(int pid, const char* base_path, char mount_points[]
     free(buf);
     return count;
 }
+/* ══════════════ 合并挂载分段计时（定位"135ms 花在哪"） ══════════════
+ * do_combined_mount 跑在 fork 出的子进程里，与父进程不共享栈（COW）——所以用一页
+ * MAP_SHARED|MAP_ANONYMOUS 由子进程写、父进程读；限速输出也放在父进程：子进程每次
+ * 都是新 fork，在那里做采样/限速计数永远从 0 开始，毫无意义。
+ * 只在同步路径（ns_combined_mount）开启；异步/重试路径传 NULL，零成本。
+ * 输出纪律：总耗时 ≥ NSP_SEG_LOG_MIN_MS 一定打一条（慢挂载才是排查目标），否则
+ * 1/NSP_SEG_SAMPLE 采样；另有每秒 NSP_SEG_MAX_PER_SEC 条的硬上限，被折叠的条数
+ * 附在下一行行尾——绝不允许分段计时自己变成新的刷屏源。 */
+enum {
+    NSP_SEG_READY = 0, /* 就绪门控：等 /storage/emulated 出现在应用 ns */
+    NSP_SEG_PRE,       /* 源预检 statfs（必须在任何卸载之前） */
+    NSP_SEG_PRIV,      /* MS_PRIVATE|MS_REC 传播隔离 */
+    NSP_SEG_MOUNTINFO, /* /proc/self/mountinfo 扫描（备份 + 目标） */
+    NSP_SEG_UMOUNT,    /* umount2 卸载（备份子挂载 + 目标子挂载 + 目标） */
+    NSP_SEG_BIND,      /* bind 源到目标 */
+    NSP_SEG_VERIFY,    /* 挂载后 statfs 复核 */
+    NSP_SEG_SUB,       /* preserve 子挂载（Android/data|obb|media） */
+    NSP_SEG_COUNT
+};
+
+struct NsMountSeg {
+    int64_t us[NSP_SEG_COUNT];
+};
+
+#define NSP_SEG_LOG_MIN_MS 20
+#define NSP_SEG_SAMPLE 1024
+#define NSP_SEG_MAX_PER_SEC 20
+
+static int64_t ns_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+/* 限速状态（多 IPC 挂载线程并发调用 → 用原子计数，不加锁） */
+static unsigned long g_seg_samples;
+static int64_t g_seg_window_ms;
+static int g_seg_window_lines;
+static unsigned long g_seg_suppressed;
+
+static void ns_seg_log(const char* pkg, const struct NsMountSeg* seg, int64_t outer_us) {
+    int64_t total_us = 0;
+    for (int i = 0; i < NSP_SEG_COUNT; i++) total_us += seg->us[i];
+    unsigned long n = __atomic_add_fetch(&g_seg_samples, 1, __ATOMIC_RELAXED);
+    bool want = (total_us / 1000 >= NSP_SEG_LOG_MIN_MS) || (n % NSP_SEG_SAMPLE == 0);
+    if (!want) return;
+    int64_t now_ms = ns_now_us() / 1000;
+    if (now_ms - g_seg_window_ms >= 1000) {
+        g_seg_window_ms = now_ms;
+        g_seg_window_lines = 0;
+    }
+    if (g_seg_window_lines >= NSP_SEG_MAX_PER_SEC) {
+        g_seg_suppressed++;
+        return;
+    }
+    g_seg_window_lines++;
+    int64_t outer = outer_us - total_us;
+    LOG_DBG("[ns计] %s 就绪=%lldms 预检=%lldms 私有=%lldms mountinfo=%lldms umount=%lldms "
+            "bind=%lldms 复核=%lldms 子挂载=%lldms 合计=%lldms 段外=%lldms 采样=%lu 折叠=%lu",
+            pkg ? pkg : "?", (long long)(seg->us[NSP_SEG_READY] / 1000),
+            (long long)(seg->us[NSP_SEG_PRE] / 1000), (long long)(seg->us[NSP_SEG_PRIV] / 1000),
+            (long long)(seg->us[NSP_SEG_MOUNTINFO] / 1000), (long long)(seg->us[NSP_SEG_UMOUNT] / 1000),
+            (long long)(seg->us[NSP_SEG_BIND] / 1000), (long long)(seg->us[NSP_SEG_VERIFY] / 1000),
+            (long long)(seg->us[NSP_SEG_SUB] / 1000), (long long)(total_us / 1000),
+            (long long)(outer < 0 ? 0 : outer / 1000), n, g_seg_suppressed);
+}
+
 struct CombinedMountArgs {
     const char* pkg;
     const char* source;
@@ -586,6 +654,9 @@ struct CombinedMountArgs {
        负值哨兵 NSP_READINESS_QUIET = 后台通道（异步/重试）：不等待，缺失属预期，
        只记 DEBUG、不写 error.log、不出现"交由重试队列"措辞。 */
     int readiness_ms;
+    /* 分段计时共享页：仅同步路径（ns_combined_mount）非 NULL，异步/重试路径为 NULL
+       （见上方 NsMountSeg 注释）。 */
+    struct NsMountSeg* seg;
 };
 
 #ifndef FUSE_SUPER_MAGIC
@@ -625,6 +696,73 @@ static void ns_rollback_to_family_root(const char* pkg, const char* target, uid_
 /* NsMountEntry 类型、NS_MOUNTINFO_MAX、mountinfo 枚举与族根工具
    （ns_read_mountinfo_pid/ns_is_family_root/ns_parse_family_root 等）已拆至
    src/injector/ns_global_replace.c/.h（见头部 include） */
+/* 就绪门控（仅进程生命周期首次注入，先于任何 umount2）：ColorOS 等 ROM 的应用
+   命名空间可能尚未建立 /storage/emulated 条目且 /storage tmpfs 只读——旧实现此处
+   mkdir_recursive 触发 EROFS 降级。现改为等待 vold 完成装配：5ms 步进（旧实现
+   100ms，视图一出现就立刻挂载，避免最多 ~100ms 的采样滞后——这段等待落在应用主线程
+   上时，粒度直接就是冷启动延迟），预算由调用方给定，期间进程死亡立即放弃；超时
+   返回 ENOENT 交由重试队列接管。全程不主动创建目录，且失败发生在任何卸载之前，
+   应用原生视图零污染。返回 0=已就绪，否则 errno 风格失败码。 */
+static int ns_wait_ready(const struct CombinedMountArgs* args) {
+    const char* pkg = args->pkg;
+    const char* target = args->target;
+    if (access(target, F_OK) == 0) return 0;
+    int waited = 0;
+    while (waited < args->readiness_ms) {
+        if (kill(args->target_pid, 0) != 0) {
+            log_ns_error("[ns_error] [%s] 等待 %s 出现期间目标进程退出\n", pkg, target);
+            log_internal(LOG_WARN, "[ns_error] [%s] 等待 %s 出现期间目标进程退出", pkg, target);
+            return ESRCH;
+        }
+        usleep(5 * 1000);
+        waited += 5;
+        if (access(target, F_OK) == 0) {
+            LOG_DBG("[%s] %s 已就绪（等待 %dms 后出现），继续合并挂载", pkg, target, waited);
+            return 0;
+        }
+    }
+    /* 两类"缺失属常态"的通道都只记 DEBUG：
+       ① 负值哨兵 = 后台通道（异步扫描 / 失败重试）——本通道正是重试队列自己；
+       ② 就地快试预算（>0 且 ≤ NSP_READINESS_INLINE_MAX_MS，POST 的 20ms）——真机
+          vold 装配 /storage/emulated 要 135–150ms，20ms 必然等不到，那是**预期**
+          未就绪，调用方 fail-open 交后台重试。若按权威尝试 loud 落 error.log，
+          真机每次冷启动都会留一条"缺失(20ms 内未出现)"：旧实现 250ms 预算下
+          error.log 已有 31 条这种噪声，改成 20ms 后会变成 202/322 次挂载各一条。 */
+    if (args->readiness_ms < 0 || (args->readiness_ms > 0 &&
+                                   args->readiness_ms <= NSP_READINESS_INLINE_MAX_MS)) {
+        LOG_DBG("[%s] %s 未就绪（%s，稍后补挂载）", pkg, target,
+                args->readiness_ms < 0 ? "后台通道" : "就地快试");
+        return ENOENT;
+    }
+    log_ns_error("[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列\n", pkg,
+                 target, args->readiness_ms);
+    log_internal(LOG_WARN, "[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列",
+                 pkg, target, args->readiness_ms);
+    return ENOENT;
+}
+
+/* 懒卸载一个挂载点（MNT_DETACH：只摘本命名空间的挂载，不等待引用计数）。
+   旧实现对每个点固定重试 8 次——MNT_DETACH 不会返回 EBUSY 之外的"可重试"错误，
+   8 次纯属重复系统调用（4 处 × 8 次 = 最坏 32 次无效 umount2）。这里只在 EBUSY
+   上再试一次（1ms 间隔），其余错误（EINVAL=本来就不是挂载点、ENOENT…）直接放弃。 */
+static void ns_umount_detach(const char* path) {
+    if (umount2(path, MNT_DETACH) == 0) return;
+    if (errno != EBUSY) return;
+    usleep(1000);
+    if (umount2(path, MNT_DETACH) != 0)
+        LOG_DBG("卸载 %s 失败: %s（保持原样，后续 bind 覆盖）", path, strerror(errno));
+}
+
+/* 分段计时打点：把"距上一个打点"的耗时累加进该段（循环里的多次迭代会累加）。 */
+#define SEG_MARK(idx)                             \
+    do {                                          \
+        if (seg) {                                \
+            int64_t t_now = ns_now_us();          \
+            seg->us[idx] += t_now - t_prev;       \
+            t_prev = t_now;                       \
+        }                                         \
+    } while (0)
+
 static int do_combined_mount(void* raw_args) {
     struct CombinedMountArgs* args = (struct CombinedMountArgs*)raw_args;
     const char* pkg = args->pkg;
@@ -633,57 +771,21 @@ static int do_combined_mount(void* raw_args) {
     const char* backup = args->backup;
     char (*preserve_paths)[256] = args->preserve_paths;
     int preserve_count = args->preserve_count;
-    /* 就绪门控（仅进程生命周期首次注入，先于任何 umount2）：ColorOS 等
-       ROM 的应用命名空间可能尚未建立 /storage/emulated 条目且 /storage
-       tmpfs 只读——旧实现此处 mkdir_recursive 触发 EROFS 降级。现改为等
-       待 vold 完成装配：100ms 步进、总上限 ~1s，期间进程死亡立即放弃；
-       超时返回 ENOENT 交由重试队列按指数退避接管。全程不主动创建目录，
-       且失败发生在任何卸载之前，应用原生视图零污染 */
-    /* 存在性判定必须在任何卸载之前：目标缺失时若继续走卸载流程，会把应用留在
-       "裸"状态（连 /storage/emulated 都没有）。预算由调用方给定：
-         - 0（IPC pre-specialize 快速尝试）：只查一次，缺失立即 ENOENT，由 zygisk
-           在 post-specialize 重发 POST；
-         - >0（POST / 异步首次注入）：100ms 步进等待 vold 装配完成。 */
-    if (access(target, F_OK) != 0) {
-        bool ready = false;
-        int waited = 0;
-        /* 5ms 步进（旧实现 100ms）：视图一出现就立刻挂载，避免最多 ~100ms 的
-           采样滞后——这段等待落在应用主线程（POST）上，粒度直接就是冷启动延迟。
-           单次预算 250ms 最多 50 次 access()，代价可忽略。 */
-        while (waited < args->readiness_ms) {
-            if (kill(args->target_pid, 0) != 0) {
-                log_ns_error("[ns_error] [%s] 等待 %s 出现期间目标进程退出\n", pkg, target);
-                log_internal(LOG_WARN, "[ns_error] [%s] 等待 %s 出现期间目标进程退出", pkg, target);
-                return ESRCH;
-            }
-            usleep(5 * 1000);
-            waited += 5;
-            if (access(target, F_OK) == 0) {
-                ready = true;
-                break;
-            }
-        }
-        if (!ready) {
-            if (args->readiness_ms < 0) {
-                /* 后台通道（异步扫描 / 失败重试）：应用已在运行，代理视图稍后到达
-                   即可。单次未就绪不构成故障——不记 WARN/ERROR、不写 error.log、
-                   不宣称"交由重试队列"（本通道正是重试队列自己，逐轮报错会刷屏）。 */
-                LOG_DBG("[%s] %s 未就绪（后台通道，稍后补挂载）", pkg, target);
-                return ENOENT;
-            }
-            log_ns_error("[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列\n",
-                         pkg, target, args->readiness_ms);
-            log_internal(LOG_WARN,
-                         "[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列", pkg,
-                         target, args->readiness_ms);
-            return ENOENT;
-        }
-        LOG_DBG("[%s] %s 已就绪（等待 %dms 后出现），继续合并挂载", pkg, target, waited);
-    }
+    struct NsMountSeg* seg = args->seg; /* 同步路径才有；NULL = 不计时（零成本） */
+    int64_t t_prev = seg ? ns_now_us() : 0;
+    /* 就绪门控（先于任何 umount2，见 ns_wait_ready）：预算由调用方给定——
+         0（IPC pre-specialize 快速尝试）：只查一次，缺失立即 ENOENT；
+         >0（POST / 异步首次注入）：5ms 步进等待 vold 装配完成；
+         <0（NSP_READINESS_QUIET，后台通道）：不等待，缺失只记 DEBUG。 */
+    int ready_rc = ns_wait_ready(args);
+    SEG_MARK(NSP_SEG_READY);
+    if (ready_rc != 0) return ready_rc;
     /* 源预检（必须在任何卸载之前）：源要是本命名空间内真实的 FUSE 挂载。旧实现
        先卸载目标再 mount，源不可用就把应用的原生存储视图拆成空目录，回滚再失败
        就是"存储整个空了"。这里提前裁决，目标一点不动。 */
-    if (!ns_path_is_fuse_mount(source)) {
+    bool src_is_fuse = ns_path_is_fuse_mount(source);
+    SEG_MARK(NSP_SEG_PRE);
+    if (!src_is_fuse) {
         log_ns_error(
             "[ns_error] [%s] 合并挂载放弃: 源 %s 在本命名空间不是 FUSE 挂载，保持原生视图\n", pkg,
             source);
@@ -701,6 +803,7 @@ static int do_combined_mount(void* raw_args) {
     if (mount(nullptr, target, nullptr, MS_PRIVATE | MS_REC, nullptr) != 0) {
         LOG_DBG("[%s] %s 无需/无法私有化（errno=%d），继续合并挂载", pkg, target, errno);
     }
+    SEG_MARK(NSP_SEG_PRIV);
     size_t tlen = strlen(target); /* preserve 恢复段用它剥前缀（见下方 rel 解析） */
     char backup_mounts[128][NS_MOUNT_PATH_MAX];
     char target_mounts[128][NS_MOUNT_PATH_MAX];
@@ -715,33 +818,28 @@ static int do_combined_mount(void* raw_args) {
     int target_count =
         ns_collect_mounts_under_pid(getpid(), target, target_mounts, 128, "合并挂载(目标)");
     if (target_count < 0) target_count = 0;
+    SEG_MARK(NSP_SEG_MOUNTINFO);
     for (int i = backup_count - 1; i >= 0; i--) {
-        for (int t = 0; t < 8; t++) {
-            if (umount2(backup_mounts[i], MNT_DETACH) == 0) break;
-        }
+        ns_umount_detach(backup_mounts[i]);
     }
-    for (int t = 0; t < 8; t++) {
-        if (umount2(backup, MNT_DETACH) == 0) break;
-    }
+    ns_umount_detach(backup);
     /* 备份机制已移除（不再 mount target→backup 复制原生视图，效仿新挂载
        方案）：preserve 恢复改为直接 bind /mnt/ 下系统 fuse 挂载视图（见
        Step J）。收益：免一次 bind 复制 + 免备份管理，缩短挂载周期延迟；
        且规避部分设备/ROM 应用命名空间内源路径不可见（ENOENT/EROFS）误报。
        backup 目录仍由父进程 ns_combined_mount 预先 mkdir（保留挂载点占位）。 */
     for (int i = target_count - 1; i >= 0; i--) {
-        for (int t = 0; t < 8; t++) {
-            if (umount2(target_mounts[i], MNT_DETACH) == 0) break;
-        }
+        ns_umount_detach(target_mounts[i]);
     }
-    for (int t = 0; t < 8; t++) {
-        if (umount2(target, MNT_DETACH) == 0) break;
-    }
+    ns_umount_detach(target);
+    SEG_MARK(NSP_SEG_UMOUNT);
     /* Step H（mkdir_recursive target）已移除：不再主动创建 /storage/emulated。
        就绪性由函数头部门控保证——首次注入在卸载前等待条目出现；重试注入
        时目录通常已存在（裸挂载点可直接 bind）。此处若仍缺失，Step I 的
        mount 以 ENOENT 真实裁决 */
     if (mount(source, target, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         int err = errno;
+        SEG_MARK(NSP_SEG_BIND);
         log_ns_error(
             "[ns_error] [%s] Combined mount FUSE source failed: mount(src=%s, tgt=%s) errno=%d (%s)\n",
             pkg, source, target, err, strerror(err));
@@ -755,19 +853,20 @@ static int do_combined_mount(void* raw_args) {
         ns_rollback_to_family_root(pkg, target, args->app_uid);
         return err;
     }
+    SEG_MARK(NSP_SEG_BIND);
     /* 挂载后校验：目标必须真的变成 FUSE 视图。某些 ROM 的 /mnt 传播设置会让源在
        应用 ns 里只是一个普通空目录——bind 照样"成功"，但 /storage/emulated/0 全空。
        这种"挂上了却什么都没有"比挂不上更难排查，故校验失败一律回滚原生视图。 */
-    if (!ns_path_is_fuse_mount(target)) {
+    bool target_is_fuse = ns_path_is_fuse_mount(target);
+    SEG_MARK(NSP_SEG_VERIFY);
+    if (!target_is_fuse) {
         log_ns_error("[ns_error] [%s] 合并挂载校验失败: %s 未变成 FUSE 视图（源 %s 在本命名空间不是 FUSE 挂载）\n",
                      pkg, target, source);
         log_internal(LOG_ERROR,
                      "[ns_error] [%s] 合并挂载校验失败: %s 未变成 FUSE 视图（源 %s 在本命名空间不是 FUSE"
                      "挂载），回滚原生视图",
                      pkg, target, source);
-        for (int t = 0; t < 8; t++) {
-            if (umount2(target, MNT_DETACH) == 0) break;
-        }
+        ns_umount_detach(target);
         ns_rollback_to_family_root(pkg, target, args->app_uid);
         return EIO;
     }
@@ -846,8 +945,11 @@ static int do_combined_mount(void* raw_args) {
             free(roots);
         }
     }
+    SEG_MARK(NSP_SEG_SUB);
     return 0;
 }
+#undef SEG_MARK
+
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target,
                       const char* backup, char preserve_paths[][256], int preserve_count,
                       int readiness_ms) {
@@ -871,13 +973,28 @@ int ns_combined_mount(int pid, const char* pkg, const char* source, const char* 
     /* 保留负值哨兵（NSP_READINESS_QUIET = 后台通道）：它决定缺失路径的日志口径，
        不能像预算那样归一成 0。预算另按正值计算。 */
     args.readiness_ms = readiness_ms;
+    /* 分段计时页：MAP_SHARED 让 fork 出的子进程写、本进程读（COW 栈不共享）。
+       申请失败只意味着"这次没计时"，绝不影响挂载本身。 */
+    struct NsMountSeg* seg =
+        mmap(nullptr, sizeof *seg, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (seg == MAP_FAILED) seg = nullptr;
+    if (seg) memset(seg, 0, sizeof *seg);
+    args.seg = seg;
+    int64_t t_begin = seg ? ns_now_us() : 0;
     int child_err = 0;
-    /* 子进程预算 = 就绪等待 + 2s 余量：等待发生在子进程内，超时会被 SIGKILL，
-       预算必须留够（旧实现固定 2s 对应 1s 门控）。健康路径只有一次 access，
-       不消耗预算。 */
+    /* 子进程预算 = 就绪等待 + 800ms 余量：等待发生在子进程内，超时会被 SIGKILL，
+       预算必须留够。健康路径只有一次 access，不消耗预算。注意这段预算**不是**
+       挂载耗时（日志里的"ns操作 耗时"含它）。 */
     int budget_ms = (readiness_ms > 0 ? readiness_ms : 0) + 800;
     int ret = run_in_mnt_ns_timeout(pid, do_combined_mount, &args, &child_err, budget_ms);
-    if (ret < 0 && child_err != 0) errno = child_err;
+    /* child_err 是子进程的 errno 风格返回值（ENOENT/ENODEV/EIO/ESRCH/ETIMEDOUT…）。
+       旧实现只在 ret<0 时写 errno，于是"未就绪返回 ENOENT(2)"这类正数返回值到了
+       调用方手里 errno 是脏值——上层无法据此判"可 fail-open 交重试"。 */
+    if (child_err != 0) errno = child_err;
+    if (seg) {
+        ns_seg_log(pkg, seg, ns_now_us() - t_begin);
+        munmap(seg, sizeof *seg);
+    }
     return ret;
 }
 /* 全局注入方案：简洁追加挂载，无备份/恢复逻辑 */
@@ -939,7 +1056,20 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
 
 /* 同步版全局挂载：挂载完成才返回，用于 IPC 线程 */
 int ns_global_mount(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs args = {pkg, source, target, NULL, NULL, 0, pid, get_app_uid(pid), 0};
+    /* 指定初始化：CombinedMountArgs 还会长（seg 等），位置初始化每加一个字段就
+       触发一条 -Wmissing-field-initializers，改用字段名后不再受结构演化影响 */
+    struct CombinedMountArgs args = {
+        .pkg = pkg,
+        .source = source,
+        .target = target,
+        .backup = NULL,
+        .preserve_paths = NULL,
+        .preserve_count = 0,
+        .target_pid = pid,
+        .app_uid = get_app_uid(pid),
+        .readiness_ms = 0,
+        .seg = NULL,
+    };
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_global_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
