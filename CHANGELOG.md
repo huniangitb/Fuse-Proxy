@@ -55,6 +55,7 @@
 
 ### 缺陷修复
 
+- **injector**: 延迟最小化（事件驱动替换轮询）——① v2 非目标还原：pre 阶段只回 DEFER、模块在 post-specialize 通知后再由 injector 异步还原并立即 ACK（旧实现派发后靠 10ms 步进轮询猜时间，实测 46–60ms 才落地；旧模块/REQ 无 post 通知时退化为有界快等）② 重试入队用 eventfd 唤醒主循环立刻跑一轮（首轮 backoff=0），不再等 1s timer tick ③ 合并挂载就绪等待粒度 100ms → 5ms，去掉最多 ~100ms 采样滞后 (5eec771)
 - **injector**: v2 非目标应用还原与 ACK 解耦（有界快等 30ms，超预算先 ACK 放行、还原线程后台继续，audit_tracked_apps 兜底）——旧实现把 ACK 挂在还原末尾（还带 300ms 重试预算），应用被冻在 specialize，v2 冷启动因此变慢且正确性依赖阻塞；v2/v3 目标应用与 v3 全局视图本就不派发挂载线程、pre 立即回 OK，全局替换方案不依赖 zygisk 的阻塞语义 (ac67197)
 - **injector**: 全局替换加源活性守卫——源必须是目标命名空间内的挂载点（mountinfo 给出 dev），否则按「未就绪」返回 1、族根一点不动（旧实现只打一行 DEBUG 就 bind，空目录被装进族根 → 整机 /storage/emulated/0 变空）；`ns_global_status` 只认 dev 指纹（不再用 fuse_daemon fstype 兜底），FUSE 崩溃重建后不再把死视图误判成「已替换」，源不在挂载表时返回 UNKNOWN 让对账退避 (ac67197)
 - **injector**: v1 两段式改为 pre 只裁决 + POST 短预算（1800→250ms）——pre 阶段进程还在 zygote 的挂载 ns 里，就地挂载会把项目 FUSE 装进 zygote ns、之后 fork 的每个应用都继承它且没人能清；POST 短等即 fail-open 交后台重试，避免"视图迟迟不出现"的设备每次冷启动固定多等 1.8s（真机报的"冷启动明显变慢"） (85b8077)
