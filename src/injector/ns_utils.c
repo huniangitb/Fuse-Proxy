@@ -21,6 +21,8 @@
 #include <stdbool.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include "common.h"
 #include "ns_utils.h"
 #include "ns_global_replace.h"
@@ -513,61 +515,44 @@ int ns_make_shared(int pid, const char* target) {
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
 }
+/* ns_find_native_submounts 的回调上下文：与旧实现逐字相同的判定
+   （严格子路径、不含 base 自身、跳过 fuse 类、容量触顶即停），只是把"整文件
+   读入 + 逐行手写分词"换成唯一的扫描原语 + 前缀预筛。 */
+struct NsNativeSubCtx {
+    const char* base;
+    size_t base_len;
+    char (*out)[256];
+    int max;
+    int n;
+};
+
+static int ns_native_sub_cb(const NsMountLine* ln, void* vctx) {
+    struct NsNativeSubCtx* c = vctx;
+    const char* mp = ln->mount_point;
+    if (strncmp(mp, c->base, c->base_len) != 0) return 0;
+    if (mp[c->base_len] != '/' && mp[c->base_len] != '\0') return 0;
+    if (strcmp(mp, c->base) == 0) return 0;
+    if (strlen(mp) >= 256) return 0;
+    if (fast_strstr(ln->fstype, "fuse") != nullptr) return 0; /* 只保留系统原生视图 */
+    if (c->n >= c->max) return 1;                             /* 触顶：停止扫描 */
+    snprintf(c->out[c->n], 256, "%s", mp);
+    c->n++;
+    return 0;
+}
+
 int ns_find_native_submounts(int pid, const char* base_path, char mount_points[][256],
                              int max_count) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
-    size_t nread = 0;
-    char* buf = read_file_dynamic(path, &nread, 0);
-    if (!buf) return 0;
-    int count = 0;
-    size_t base_len = strlen(base_path);
-    char* line = buf;
-    while (line < buf + nread && count < max_count) {
-        char* next_line = strchr(line, '\n');
-        if (next_line) *next_line = '\0';
-        if (fast_strstr(line, base_path) != nullptr) {
-            char* p = line;
-            int fields_skipped = 0;
-            while (fields_skipped < 4 && *p) {
-                if (*p == ' ') {
-                    fields_skipped++;
-                    while (*p == ' ') p++;
-                } else {
-                    p++;
-                }
-            }
-            if (fields_skipped == 4 && *p) {
-                char* mp_start = p;
-                while (*p && *p != ' ') p++;
-                size_t mp_len = p - mp_start;
-                if (mp_len > 0 && mp_len < 256) {
-                    char mount_point[256];
-                    memcpy(mount_point, mp_start, mp_len);
-                    mount_point[mp_len] = '\0';
-                    if (strncmp(mount_point, base_path, base_len) == 0 &&
-                        (mount_point[base_len] == '/' || mount_point[base_len] == '\0') &&
-                        strcmp(mount_point, base_path) != 0) {
-                        const char* sep = fast_strstr(p, " - ");
-                        if (sep) {
-                            char fstype[64] = {0};
-                            if (sscanf(sep + 3, "%63s", fstype) == 1) {
-                                if (fast_strstr(fstype, "fuse") == nullptr) {
-                                    strncpy(mount_points[count], mount_point, 255);
-                                    mount_points[count][255] = '\0';
-                                    count++;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if (!next_line) break;
-        line = next_line + 1;
-    }
-    free(buf);
-    return count;
+    if (!base_path || !mount_points || max_count <= 0) return 0;
+    struct NsNativeSubCtx c = {.base = base_path,
+                               .base_len = strlen(base_path),
+                               .out = mount_points,
+                               .max = max_count,
+                               .n = 0};
+    /* 前缀预筛：只有含 base_path 子串的行才解析（真机上应用 ns 有上千条 /apex、
+       /system 挂载，旧实现每条都要过 4KB 零初始化 + 手写分词） */
+    const char* prefixes[1] = {base_path};
+    if (ns_scan_mountinfo_prefixed(pid, prefixes, 1, ns_native_sub_cb, &c) < 0) return 0;
+    return c.n;
 }
 /* ══════════════ 合并挂载分段计时（定位"135ms 花在哪"） ══════════════
  * do_combined_mount 跑在 fork 出的子进程里，与父进程不共享栈（COW）——所以用一页
@@ -591,6 +576,15 @@ enum {
 
 struct NsMountSeg {
     int64_t us[NSP_SEG_COUNT];
+    /* mountinfo 段的规模快照（子进程写、父进程读）：段耗时偏高时用来区分
+       「命名空间条目多」（靠预筛/少扫一次解决）与「CPU 被抢」（只能挪出关键路径）。
+       两次扫描读的是同一份 mountinfo，故只记最后一次的规模。 */
+    long mo_lines;
+    long mo_bytes;
+    long mo_candidates;
+    long mo_cpu_us; /* 扫描期间本进程 CPU 时间（user+sys） */
+    long mo_csw;    /* 扫描期间非自愿上下文切换次数 */
+    int mo_skipped; /* 1 = 目标已是挂载点，快路径未读 mountinfo */
 };
 
 #define NSP_SEG_LOG_MIN_MS 20
@@ -626,11 +620,22 @@ static void ns_seg_log(const char* pkg, const struct NsMountSeg* seg, int64_t ou
     }
     g_seg_window_lines++;
     int64_t outer = outer_us - total_us;
-    LOG_DBG("[ns计] %s 就绪=%lldms 预检=%lldms 私有=%lldms mountinfo=%lldms umount=%lldms "
+    /* mountinfo 段后面的括号是规模快照：行数/字节/预筛命中行数。段耗时长而条目
+       不多 = CPU 被应用冷启动抢走；条目几千行 = 命名空间本身巨大（预筛已挡掉
+       99% 的解析，剩下的主要是读文件本身）。 */
+    char mi_detail[128];
+    if (seg->mo_skipped)
+        snprintf(mi_detail, sizeof mi_detail, "跳过:目标已是挂载点,未读 mountinfo");
+    else
+        snprintf(mi_detail, sizeof mi_detail,
+                 "行=%ld 字节=%ldKB 预筛过=%ld CPU=%ldms 抢断=%ld", seg->mo_lines,
+                 seg->mo_bytes / 1024, seg->mo_candidates, seg->mo_cpu_us, seg->mo_csw);
+    LOG_DBG("[ns计] %s 就绪=%lldms 预检=%lldms 私有=%lldms mountinfo=%lldms(%s) umount=%lldms "
             "bind=%lldms 复核=%lldms 子挂载=%lldms 合计=%lldms 段外=%lldms 采样=%lu 折叠=%lu",
             pkg ? pkg : "?", (long long)(seg->us[NSP_SEG_READY] / 1000),
             (long long)(seg->us[NSP_SEG_PRE] / 1000), (long long)(seg->us[NSP_SEG_PRIV] / 1000),
-            (long long)(seg->us[NSP_SEG_MOUNTINFO] / 1000), (long long)(seg->us[NSP_SEG_UMOUNT] / 1000),
+            (long long)(seg->us[NSP_SEG_MOUNTINFO] / 1000), mi_detail,
+            (long long)(seg->us[NSP_SEG_UMOUNT] / 1000),
             (long long)(seg->us[NSP_SEG_BIND] / 1000), (long long)(seg->us[NSP_SEG_VERIFY] / 1000),
             (long long)(seg->us[NSP_SEG_SUB] / 1000), (long long)(total_us / 1000),
             (long long)(outer < 0 ? 0 : outer / 1000), n, g_seg_suppressed);
@@ -800,24 +805,55 @@ static int do_combined_mount(void* raw_args) {
        其它应用同组），直接卸载会**连带摘掉所有共享者**的存储视图——真机表现就是
        "整台设备的 /storage/emulated/0 都空了"。目标不是挂载点时该调用返回 EINVAL，
        无害（随后的 bind 自会建立挂载）。 */
-    if (mount(nullptr, target, nullptr, MS_PRIVATE | MS_REC, nullptr) != 0) {
-        LOG_DBG("[%s] %s 无需/无法私有化（errno=%d），继续合并挂载", pkg, target, errno);
-    }
+    /* 传播隔离，同时顺手当"目标是挂载点吗"的探针：MS_PRIVATE|MS_REC 只在
+       **目标本身是挂载点**时成功，普通目录一律 EINVAL。这个返回值决定了要不要
+       枚举子树，而不只是记一条 DEBUG：
+         - 成功 ⇒ 目标已是挂载点，umount2(target, MNT_DETACH) 会把整棵子树
+           （含其下所有子挂载）一起摘掉，**不需要读 mountinfo**。真机 [ns计]
+           实测这一步每次冷启动 134~136ms，正是"注入后冷启动明显变慢"的来源；
+         - EINVAL ⇒ 目标不是挂载点（首次注入时的普通目录），子挂载只能逐条摘，
+           必须扫描一次；
+         - 其它错误（EPERM/EACCES，SELinux 拒绝）⇒ 判断不了，按"不是挂载点"
+           保守处理（照旧枚举 + 逐条摘）。
+       三条守卫不变：源预检仍在任何卸载之前；MS_PRIVATE 仍先于第一次 umount；
+       挂载后仍 statfs 复核 + 失败回滚族根。 */
+    bool target_is_mount = (mount(nullptr, target, nullptr, MS_PRIVATE | MS_REC, nullptr) == 0);
+    int priv_errno = target_is_mount ? 0 : errno;
+    if (!target_is_mount && priv_errno != EINVAL)
+        LOG_DBG("[%s] %s 私有化失败（errno=%d），按枚举子树处理", pkg, target, priv_errno);
     SEG_MARK(NSP_SEG_PRIV);
     size_t tlen = strlen(target); /* preserve 恢复段用它剥前缀（见下方 rel 解析） */
     char backup_mounts[128][NS_MOUNT_PATH_MAX];
     char target_mounts[128][NS_MOUNT_PATH_MAX];
-    int backup_count =
-        ns_collect_mounts_under_pid(getpid(), backup, backup_mounts, 128, "合并挂载(备份)");
-    if (backup_count < 0) {
-        log_ns_error("[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d\n", pkg, errno);
-        log_internal(LOG_ERROR, "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg,
-                     errno);
-        return errno;
+    int backup_count = 0;
+    int target_count = 0;
+    if (!target_is_mount) {
+        /* 备份树与目标树读的是同一份 mountinfo：一次扫描同时收两者（旧实现各扫
+           一遍，等于把最贵的那步做两遍）。 */
+        NsCollectTarget tg[2] = {
+            {.base = backup, .out = backup_mounts, .max = 128, .who = "合并挂载(备份)"},
+            {.base = target, .out = target_mounts, .max = 128, .who = "合并挂载(目标)"},
+        };
+        if (ns_collect_mounts_multi(getpid(), tg, 2) < 0) {
+            log_ns_error("[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d\n", pkg,
+                         errno);
+            log_internal(LOG_ERROR,
+                         "[ns_error] [%s] open /proc/self/mountinfo failed, errno=%d", pkg, errno);
+            return errno;
+        }
+        backup_count = tg[0].n;
+        target_count = tg[1].n;
     }
-    int target_count =
-        ns_collect_mounts_under_pid(getpid(), target, target_mounts, 128, "合并挂载(目标)");
-    if (target_count < 0) target_count = 0;
+    if (seg) {
+        struct NsMountinfoStats mi;
+        ns_mountinfo_last_stats(&mi);
+        seg->mo_lines = mi.lines;
+        seg->mo_bytes = mi.bytes;
+        seg->mo_candidates = mi.candidates;
+        seg->mo_cpu_us = (long)(mi.cpu_us / 1000);
+        seg->mo_csw = mi.csw;
+        seg->mo_skipped = target_is_mount ? 1 : 0;
+    }
     SEG_MARK(NSP_SEG_MOUNTINFO);
     for (int i = backup_count - 1; i >= 0; i--) {
         ns_umount_detach(backup_mounts[i]);
@@ -827,10 +863,15 @@ static int do_combined_mount(void* raw_args) {
        方案）：preserve 恢复改为直接 bind /mnt/ 下系统 fuse 挂载视图（见
        Step J）。收益：免一次 bind 复制 + 免备份管理，缩短挂载周期延迟；
        且规避部分设备/ROM 应用命名空间内源路径不可见（ENOENT/EROFS）误报。
-       backup 目录仍由父进程 ns_combined_mount 预先 mkdir（保留挂载点占位）。 */
+       backup 目录仍由父进程 ns_combined_mount 预先 mkdir（保留挂载点占位）。
+       注意：快路径（目标是挂载点）不枚举 backup 子树，只摘 backup 自身——
+       旧版本留下的 backup 子挂载只可能出现在长命应用命名空间里，随进程退出
+       一起消失，不值得为此在每次注入都读一遍 mountinfo。 */
     for (int i = target_count - 1; i >= 0; i--) {
         ns_umount_detach(target_mounts[i]);
     }
+    /* 目标已是挂载点时，这一条 MNT_DETACH 连同整棵子树一起摘掉（含
+       Android/data、Android/obb 等子挂载），等价于旧实现"逐条摘 + 摘自身" */
     ns_umount_detach(target);
     SEG_MARK(NSP_SEG_UMOUNT);
     /* Step H（mkdir_recursive target）已移除：不再主动创建 /storage/emulated。
@@ -1025,7 +1066,9 @@ static int do_global_mount(void* raw_args) {
 }
 
 int ns_global_mount_async(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs* args = malloc(sizeof(struct CombinedMountArgs));
+    /* 同 ns_combined_mount_async：结构字段只增不减，零初始化免掉"新字段没赋值"
+       这类静默故障（do_global_mount 目前不读 pkg/seg，但下一个改它的人不会知道）。 */
+    struct CombinedMountArgs* args = calloc(1, sizeof(struct CombinedMountArgs));
     if (!args) return -1;
     args->source = strdup(source);
     if (!args->source) {
@@ -1079,7 +1122,11 @@ int ns_global_mount(int pid, const char* pkg, const char* source, const char* ta
 /* 核心优化：异步非阻塞合并挂载启动函数 */
 int ns_combined_mount_async(int pid, const char* pkg, const char* source, const char* target,
                             const char* backup, char preserve_paths[][256], int preserve_count) {
-    struct CombinedMountArgs* args = malloc(sizeof(struct CombinedMountArgs));
+    /* 必须 calloc：本结构会随功能增长（seg 等），漏初始化某个指针字段就是
+       "子进程 SIGSEGV → 完成管道 EOF → 按失败处理 → 重试"的静默故障。真机/沙箱
+       都复现过：seg 未初始化时 SEG_MARK 往垃圾地址写，异步挂载整批失败（日志只
+       剩"异步挂载结果不可得 read=0"）。calloc 让未显式赋值的字段一律 NULL/0。 */
+    struct CombinedMountArgs* args = calloc(1, sizeof(struct CombinedMountArgs));
     if (!args) return -1;
     args->pkg = pkg ? strdup(pkg) : NULL;
     args->source = strdup(source);
@@ -1095,6 +1142,9 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     /* 后台通道：不等待、缺失只记 DEBUG。迟到由重试队列按退避补挂（旧实现首轮
        等 1000ms 且失败 loud 记账，配上"派发即出队"就变成 1Hz 刷屏）。 */
     args->readiness_ms = NSP_READINESS_QUIET;
+    /* 后台通道不传分段计时共享页（子进程填了也没人读）：显式置空，
+       别依赖 calloc 之外的东西。 */
+    args->seg = NULL;
     int ret = run_in_mnt_ns_async(pid, pkg, do_combined_mount, args, args);
     if (ret < 0) {
         free((void*)args->pkg);
@@ -1107,11 +1157,86 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     return ret;
 }
 
+/* ══════════════ 目标命名空间挂载状态探测（不读 mountinfo） ══════════════
+ * 真机取证（2026-10-31，Redmi/Android 14）：一次冷启动注入的 207ms 里，父进程
+ * read_mount_state 的整文件 mountinfo 读 + 解析占 ~71ms（子进程那两次已由
+ * do_combined_mount 的"目标是挂载点"快路径消掉）。整文件扫描的成本与命名空间
+ * 条目数成正比，与应用、规则、是否注入都无关——这正是"只开一个目标应用、不配
+ * 任何规则也照样慢"的原因。
+ * 替代方案只需要 3 次轻量系统调用：
+ *   statx(target)  → dev + mount id
+ *   statx(target/..) → mount id（两者不同 ⇒ target 是挂载点，libmount 同款判定）
+ *   stat(src)      → dev（相等 ⇒ 就是本项目 FUSE 的 bind/共享视图）
+ * 旧内核（< 5.8）不支持 STATX_MNT_ID 时退回 statfs 判 FUSE_SUPER_MAGIC——本项目的
+ * 目标路径一旦被挂载必然是 FUSE（vold 的原生视图或我们的代理视图），语义等价。 */
+#ifndef STATX_MNT_ID
+#define STATX_MNT_ID 0x00001000U /* linux/stat.h；旧头文件兜底 */
+#endif
+
+struct NsStatProbe {
+    dev_t dev;
+    uint64_t mnt_id;
+    bool has_mnt_id;
+};
+
+/* statx 一次：dev 与 mount id 一起拿。返回 0 成功（errno 由调用方解读） */
+static int ns_stat_probe(const char* path, struct NsStatProbe* out) {
+    struct statx stx;
+    memset(&stx, 0, sizeof stx);
+    if (statx(AT_FDCWD, path, 0, STATX_BASIC_STATS | STATX_MNT_ID, &stx) != 0) return -1;
+    out->dev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
+    out->has_mnt_id = (stx.stx_mask & STATX_MNT_ID) != 0;
+    out->mnt_id = out->has_mnt_id ? (uint64_t)stx.stx_mnt_id : 0;
+    return 0;
+}
+
+int ns_probe_target_view(int pid, const char* path, const char* src, bool* is_mount,
+                         bool* is_ours) {
+    if (is_mount) *is_mount = false;
+    if (is_ours) *is_ours = false;
+    if (!path || !path[0] || pid <= 0) return -1;
+    char full[PATH_MAX];
+    int n = snprintf(full, sizeof full, "/proc/%d/root%s", pid, path);
+    if (n < 0 || (size_t)n >= sizeof full) return -1;
+    struct NsStatProbe self;
+    if (ns_stat_probe(full, &self) != 0) {
+        /* 目标 ns 里 stat 不到这个路径 ⇒ 它肯定不是挂载点（挂载点必然可 stat，
+           例如应用 ns 还没被 vold 装配出 /storage/emulated）。这是**确定结论**，
+           不必回退整文件扫描；只有权限类错误才交给调用方回退。 */
+        return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+    }
+    bool mounted = false;
+    if (self.has_mnt_id) {
+        char parent[PATH_MAX];
+        n = snprintf(parent, sizeof parent, "%s/..", full);
+        if (n < 0 || (size_t)n >= sizeof parent) return -1;
+        struct NsStatProbe up;
+        if (ns_stat_probe(parent, &up) != 0) return -1;
+        if (!up.has_mnt_id) return -1;
+        mounted = (self.mnt_id != up.mnt_id);
+    } else {
+        /* 旧内核：没有 mount id 可用，按"目标一旦挂载必然是 FUSE"判定 */
+        struct statfs sfs;
+        if (statfs(full, &sfs) != 0) return -1;
+        mounted = ((unsigned long)sfs.f_type == (unsigned long)FUSE_SUPER_MAGIC);
+    }
+    if (is_mount) *is_mount = mounted;
+    if (is_ours && mounted && src && src[0]) {
+        struct stat ss;
+        if (stat(src, &ss) == 0) *is_ours = (self.dev == ss.st_dev);
+    }
+    return 0;
+}
+
 int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
     FILE* fp = fopen(path, "re");
     if (!fp) return -1;
+    /* 同 ns_mountinfo.c 的 mi_scan：seq_file 每次 read 都从头重放挂载表，缓冲越小
+       越亏（默认 4KB → 上千次 read）。这里同样拉到 256KB，且用堆缓冲避免线程串内容。 */
+    char* iobuf = malloc(1u << 18);
+    if (iobuf) setvbuf(fp, iobuf, _IOFBF, 1u << 18);
     int found = 0;
     char line[2048], mount_point[1024];
     while (fgets(line, sizeof(line), fp)) {
@@ -1125,6 +1250,7 @@ int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name) 
         }
     }
     fclose(fp);
+    free(iobuf);
     return found;
 }
 /* 核心优化：异步合并挂载完成后，用于回收父进程内存的全局回调 */
@@ -1160,9 +1286,9 @@ void handle_async_mount_event(void* ptr) {
             LOG_DBG("异步挂载失败: App=%s, PID=%d, ret_val=%d, exit_status=%d", ctx->pkg_name,
                     ctx->target_pid, child_ret, status);
         } else {
-            LOG_WRN("异步挂载结果不可得: App=%s, PID=%d, read=%zd（完成管道未回传完整 status，"
-                    "按失败处理）",
-                    ctx->pkg_name, ctx->target_pid, r);
+            LOG_WRN("异步挂载结果不可得: App=%s, PID=%d, read=%zd, exit=%d（完成管道未回传完整 "
+                    "status，按失败处理）",
+                    ctx->pkg_name, ctx->target_pid, r, status);
         }
         /*
          * 只在以下条件满足时才调度重试：

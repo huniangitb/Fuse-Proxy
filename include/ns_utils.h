@@ -2,6 +2,7 @@
 #define NS_UTILS_H
 
 #include <limits.h>
+#include <stdbool.h>
 #include <sys/types.h>
 
 /* 异步挂载上下文结构体 */
@@ -28,6 +29,19 @@ int ns_umount_recursive(int pid, const char* target);
 int ns_umount_and_rmdir(int pid, const char* target);
 /* 检查是否已挂载 */
 int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name);
+
+/* 穿过目标命名空间探测某个路径的挂载状态——**不读 /proc/<pid>/mountinfo**。
+   真机实测一次整文件扫描 ≈68ms（Redmi/Android 14，应用 ns 有上千条挂载），而一次
+   冷启动注入原本要读三遍，是"注入后冷启动明显变慢"的主因。本原语只用 statx：
+     target : 目标命名空间内的绝对路径（如 /storage/emulated/0）
+     src    : 本项目 FUSE 源挂载点（如 /mnt/nsp_global）；NULL = 不判定 is_ours
+     is_mount: 出参，该路径在目标 ns 里是挂载点（statx mount id 与父目录不同）
+     is_ours : 出参，该路径是本项目 FUSE 视图（是挂载点且 dev 与 src 一致）
+   返回 0 = 探测成功（出参有效；路径不存在也算成功，两者均为 false）；
+        -1 = 无法判定（权限 / 内核不支持 mount id 且 statfs 失败），调用方应回退
+             到整文件扫描。 */
+int ns_probe_target_view(int pid, const char* target, const char* src, bool* is_mount,
+                         bool* is_ours);
 /* 设置挂载点为共享 */
 int ns_make_shared(int pid, const char* target);
 /* 查找原生子挂载点 */

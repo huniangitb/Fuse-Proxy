@@ -177,6 +177,33 @@ static void build_mountinfo(const char* target, int n, int long_len) {
     g_mountinfo_len = off;
 }
 
+/* 构造多目标合成 mountinfo：两棵子树各自若干条，外加 noise 条无关行
+   （无关行的挂载点都落在 /noise/ 下——前缀预筛应当把它们挡在字段解析之外） */
+static void build_multi_mountinfo(const char* a, int na, const char* b, int nb, int noise) {
+    g_mountinfo[0] = '\0';
+    size_t off = 0;
+    int id = 1;
+    for (int i = 0; i < noise; i++) {
+        int wrote = snprintf(g_mountinfo + off, sizeof g_mountinfo - off,
+                             "%d 0 8:1 / /noise/sub%04d rw - tmpfs a rw\n", id++, i);
+        if (wrote <= 0) break;
+        off += (size_t)wrote;
+    }
+    for (int i = 0; i < na; i++) {
+        int wrote = snprintf(g_mountinfo + off, sizeof g_mountinfo - off,
+                             "%d 0 8:1 / %s/c%02d rw - tmpfs a rw\n", id++, a, i);
+        if (wrote <= 0) break;
+        off += (size_t)wrote;
+    }
+    for (int i = 0; i < nb; i++) {
+        int wrote = snprintf(g_mountinfo + off, sizeof g_mountinfo - off,
+                             "%d 0 8:1 / %s/c%02d rw - tmpfs a rw\n", id++, b, i);
+        if (wrote <= 0) break;
+        off += (size_t)wrote;
+    }
+    g_mountinfo_len = off;
+}
+
 static void reset_case(void) {
     g_umount_calls = 0;
     g_logbuf[0] = '\0';
@@ -247,6 +274,64 @@ int main(void) {
           g_umount_calls == 65, "卸载请求数与预期不符");
     check("D3 触顶丢弃的 6 条未产生卸载请求（不越界、不错卸）",
           count_oversize_umounts() == 0, "出现超长 umount2 请求");
+
+    /* E. 多目标单次扫描：备份树与目标树读的是同一份 mountinfo，必须一次读完
+       （旧实现各扫一遍整文件 = 最贵的那步做两遍，真机每次冷启动多 ~68ms）。 */
+    reset_case();
+    build_multi_mountinfo("/t1", 3, "/t2", 2, 0);
+    static char ea[8][NS_MOUNT_PATH_MAX];
+    static char eb[8][NS_MOUNT_PATH_MAX];
+    NsCollectTarget tg[2] = {
+        {.base = "/t1", .out = ea, .max = 8, .who = "用例E-1"},
+        {.base = "/t2", .out = eb, .max = 8, .who = "用例E-2"},
+    };
+    int erc = ns_collect_mounts_multi(getpid(), tg, 2);
+    check("E1 多目标扫描返回成功", erc == 0, "扫描失败");
+    check("E2 两棵子树各自收全（3 / 2 条）", tg[0].n == 3 && tg[1].n == 2, "收集条数不符");
+    check("E3 两棵子树结果互不串台",
+          tg[0].n > 0 && tg[1].n > 0 && strstr(ea[0], "/t2") == nullptr &&
+              strstr(eb[0], "/t1") == nullptr,
+          "结果串台");
+
+    /* F. 前缀预筛：只对可能命中的行做字段解析，扫描范围仍是整份文件。
+       判别点：预筛若漏（该收的没收）E/F1 失败；若退化成逐行全解析，
+       candidates 会等于 lines（真机 2.6MB/20000 行时那正是 13ms 的来源）。 */
+    reset_case();
+    build_multi_mountinfo("/t1", 2, "/t2", 0, 500);
+    static char fc[8][NS_MOUNT_PATH_MAX];
+    NsMountinfoStats fst;
+    memset(&fst, 0, sizeof fst);
+    int frc = ns_collect_mounts_under_pid(getpid(), "/t1", fc, 8, "用例F");
+    ns_mountinfo_last_stats(&fst);
+    check("F1 大量无关行下仍只收本子树（2 条）", frc == 2 && fst.lines == 502 && fc[0][0] != '\0',
+          "收集结果不符");
+    check("F2 无关行被预筛挡在字段解析之外", fst.candidates >= 2 && fst.candidates < fst.lines / 10,
+          "预筛没生效：仍在逐行全解析");
+    check("F3 扫描范围未缩小（统计覆盖整份文件）", fst.lines == 502 && fst.bytes > 0,
+          "统计行数与合成内容不符");
+
+    /* G. 父进程挂载状态探测（ns_probe_target_view）：用 statx 的 mnt_id 与 st_dev
+       判「是不是挂载点 / 是不是项目 FUSE 视图」，从而不必读整份 mountinfo
+       （真机父进程 read_mount_state 一次 ~68ms）。 */
+    bool is_mount = false, is_ours = false;
+    int prc = ns_probe_target_view(getpid(), "/proc", "/proc", &is_mount, &is_ours);
+    check("G1 挂载点被识别，且源 dev 相同 ⇒ 是我们的视图",
+          prc == 0 && is_mount && is_ours, "探测判定不符");
+    char probe_tmp[] = "/tmp/nsp_probe_XXXXXX";
+    char* pt = mkdtemp(probe_tmp);
+    is_mount = is_ours = false;
+    prc = ns_probe_target_view(getpid(), pt ? pt : "/tmp", "/proc", &is_mount, &is_ours);
+    check("G2 普通目录不是挂载点（无需读 mountinfo）", prc == 0 && !is_mount && !is_ours,
+          "把普通目录判成了挂载点");
+    is_mount = is_ours = false;
+    prc = ns_probe_target_view(getpid(), "/nonexistent-nsp-probe", "/proc", &is_mount, &is_ours);
+    check("G3 路径不存在：判定成功且两者皆假", prc == 0 && !is_mount && !is_ours,
+          "缺失路径被当成挂载点");
+    is_mount = is_ours = false;
+    prc = ns_probe_target_view(getpid(), "/proc", "/", &is_mount, &is_ours);
+    check("G4 挂载点但 dev 与源不同 ⇒ 不是我们的视图", prc == 0 && is_mount && !is_ours,
+          "把别人的挂载点当成了自己的");
+    if (pt) rmdir(pt);
 
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
     return g_fail;

@@ -30,10 +30,15 @@ src/injector/ns_utils.c 整体 #include（-DNS_UTILS_SRC=），只把 mount/umou
   H. 挂载后校验：目标没有变成 FUSE 视图 → 卸载本次挂载 + 族根回滚 + EIO。
   I. 传播隔离：MS_PRIVATE 必须发生在第一次卸载之前（否则共享挂载组上的卸载事件
      会传播到 zygote/其它应用命名空间，真机表现为"整机存储都空了"）。
+  S1（静态契约）：异步通道的参数结构（CombinedMountArgs）必须 calloc。该结构随
+     功能增长（分段计时 seg 等），异步通道用 malloc 且漏初始化 seg 时，子进程
+     SEG_MARK 往垃圾地址写 → SIGSEGV → 完成管道 EOF（read=0）→ 上层按"挂载失败"
+     重试，日志只有「异步挂载结果不可得」。malloc 出来的内存是否为零取决于堆复用，
+     所以直接盯源码而不是靠运气。
 
 退出码：全部通过 0，任一失败 1。环境变量 NS_UTILS_SRC 可指向另一份源码副本
 （用于验证本用例确能捕获旧实现）：指向 HEAD 的 ns_utils.c 时 E3/E4/E5（静默口径）、
-G2/G3（源预检）、H1/H2（挂载后校验）、I1（传播隔离）必失败。
+G2/G3（源预检）、H1/H2（挂载后校验）、I1（传播隔离）、S1（参数结构零初始化）必失败。
 """
 import os
 import shlex
@@ -45,6 +50,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DRIVER = ROOT / "tests" / "fixtures" / "ns_combined_rollback_driver.c"
 NS_UTILS_SRC = os.environ.get("NS_UTILS_SRC") or str(ROOT / "src" / "injector" / "ns_utils.c")
+
+
+def check_async_args_zero_init(src_path):
+    """S1：异步挂载通道的参数结构必须零初始化（calloc）。
+
+    CombinedMountArgs 会随功能增长（[ns计] 的 seg 就是这么加进来的），异步通道
+    若仍用 malloc 且漏给新字段赋值，子进程 SEG_MARK 就会往垃圾地址写 → SIGSEGV
+    → 完成管道 EOF（read=0）→ 上层按"挂载失败"重试（真机/沙箱都复现过：core 里
+    seg 指向已释放的包名字符串）。malloc 内存是否为零取决于堆复用，故直接盯源码。
+    """
+    text = Path(src_path).read_text(encoding="utf-8", errors="replace")
+    hits = [i + 1 for i, ln in enumerate(text.splitlines())
+            if "malloc(sizeof(struct CombinedMountArgs))" in ln]
+    if hits:
+        print(f"❌ S1 异步挂载参数结构未零初始化：{src_path} 第 {hits[0]} 行仍是 "
+              f"malloc(sizeof(struct CombinedMountArgs))，必须 calloc(1, …)",
+              file=sys.stderr)
+        return 1
+    print("✅ S1 异步挂载参数结构零初始化（calloc）")
+    return 0
 
 
 def main():
@@ -78,7 +103,11 @@ def main():
         sys.stdout.write(run.stdout)
         if run.stderr:
             sys.stderr.write(run.stderr)
-        return run.returncode
+        run_rc = run.returncode
+    # 静态契约放在驱动跑完之后：NS_UTILS_SRC 指向旧副本时，驱动的判别性用例
+    # （E/G/H/I）仍要照常给出结论，别被 S1 提前截断。
+    static_rc = check_async_args_zero_init(NS_UTILS_SRC)
+    return run_rc or static_rc
 
 
 if __name__ == "__main__":
