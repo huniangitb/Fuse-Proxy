@@ -34,19 +34,27 @@ int ns_make_shared(int pid, const char* target);
 int ns_find_native_submounts(int pid, const char* base_path,
                               char mount_points[][256], int max_count);
 
-/* readiness_ms 的负值哨兵：DEFER 预探测。
-   应用场景只有一处——v1 两段式的 pre-specialize 快速尝试（IPC 的 REPORT 通道）：
-   目标 ns 里 /storage/emulated 尚未被 vold 装配时，本次尝试**必然**失败，调用方
-   会回 DEFER 让 zygisk 在 post-specialize 重发 POST。因此缺失不是失败，日志口径
-   必须与真实失败区分（只记 DEBUG，不写 error.log，不宣称"交由重试队列"）。 */
-#define NSP_READINESS_DEFER (-1)
+/* readiness_ms 的负值哨兵：后台通道（异步扫描 / 失败重试）。
+   应用场景：应用已经在运行，代理视图稍后到达即可——本次缺失属**预期未就绪**，
+   由重试队列按退避补挂。日志口径必须与权威尝试区分：只记 DEBUG、不写 error.log、
+   不出现"交由重试队列"措辞（该通道正是重试队列自己，逐轮报错会把正常等待刷成
+   故障：真机历史上表现为每个应用启动刷一条 WARN+一条 error.log，且重试不收敛）。
+   IPC 的权威通道（post-specialize 的 POST、旧模块/REQ 的就地挂载）用正值预算，
+   缺失即 loud 失败。 */
+#define NSP_READINESS_QUIET (-1)
 
 /* 阻塞式合并挂载（作为向下兼容）。
    readiness_ms：挂载前等待目标 ns 内 /storage/emulated 出现的预算——
      0     = 只查一次，缺失立即返回 ENOENT（判定发生在任何卸载之前）；
-     >0    = 在其内按 100ms 步进等待（POST / 异步首次注入）；
-     NSP_READINESS_DEFER（负值）= DEFER 预探测：不等待，缺失按预期未就绪处理
-           （静默，DEBUG），返回 ENOENT 由调用方回 DEFER。 */
+     >0    = 在其内按 100ms 步进等待（POST / 旧模块就地挂载）；
+     NSP_READINESS_QUIET（负值）= 后台通道：不等待，缺失按预期未就绪处理
+           （静默，DEBUG），由重试队列补挂。
+   两条硬约束（真机回归守护）：
+     1. 源必须是本命名空间内真实的 FUSE 挂载（statfs == FUSE_SUPER_MAGIC），
+        否则**不动目标**直接返回——旧实现先卸载再挂，源不可用就把应用存储拆成
+        空目录/空 bind（"某些设备 /storage/emulated/0 整个是空的"）；
+     2. 挂载后必须校验目标确为 FUSE 视图，并先把目标子树置私有（MS_PRIVATE），
+        避免共享挂载组上的卸载事件传播到 zygote/其它应用的命名空间。 */
 int ns_combined_mount(int pid, const char* pkg, const char* source, const char* target, const char* backup,
                       char preserve_paths[][256], int preserve_count, int readiness_ms);
 

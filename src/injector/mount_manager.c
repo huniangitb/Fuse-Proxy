@@ -494,12 +494,11 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         invalidate_mount_cache(pid);
         return 0;
     } else {
-        /* readiness_ms < 0 = pre-specialize 的 DEFER 预探测：目标 ns 里的
-           /storage/emulated 尚未被 vold 装配属**预期**，调用方会回 DEFER 并由
-           post-specialize 的 POST 补齐。这不是失败——若在这里记 ERROR，每次应用
-           启动都会留下一条"挂载失败"，与最终真实结果相反（历史排查噪声源）。 */
+        /* readiness_ms < 0 = 后台通道（异步扫描 / 失败重试）：应用已经在运行，
+           代理视图稍后到达即可，本次未就绪属**预期**——记 ERROR 会把正常等待刷成
+           故障（历史上每次应用启动留一条"挂载失败"，与最终真实结果相反）。 */
         if (readiness_ms < 0) {
-            LOG_DBG("pre 阶段视图未就绪（DEFER，交 post-specialize 补挂载）: %s(PID:%d)", pkg, pid);
+            LOG_DBG("后台通道视图未就绪（稍后补挂载）: %s(PID:%d)", pkg, pid);
         } else {
             LOG_ERR("同步合并挂载失败: PID=%d, pkg=%s", pid, pkg);
         }

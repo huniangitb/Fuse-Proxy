@@ -8,6 +8,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -575,51 +576,50 @@ struct CombinedMountArgs {
     char (*preserve_paths)[256];
     int preserve_count;
     pid_t target_pid; /* 就绪等待期间的存活检查目标 */
-    /* 挂载前等待目标 ns 内 /storage/emulated 出现的预算（ms），0 = 只查一次、
-       缺失即裁决失败。IPC 的 pre-specialize 尝试传 NSP_READINESS_DEFER（负值，
-       见 ns_utils.h）：不等待，且缺失属预期未就绪——DEBUG 说明、不写 error.log、
-       不声称"交由重试队列"，由 zygisk 在 post-specialize 重发 POST；异步路径
-       首次注入传 1000。 */
+    /* 目标应用的 uid（父进程在 fork 前解析一次）。回滚要按 uid 找族根
+       /mnt/{user,androidwritable,installer}/<uid>/emulated；旧实现在子进程里用
+       get_app_uid(target_pid) 反查——进程已退出时得 0，二次用户会被绑到用户 0
+       的视图（跨用户泄漏），用户 0 则找不到族根。 */
+    uid_t app_uid;
+    /* 挂载前等待目标 ns 内 /storage/emulated 出现的预算（ms）。0 = 只查一次、
+       缺失即裁决失败（权威尝试，loud）；>0 = 在其内按 100ms 步进等待；
+       负值哨兵 NSP_READINESS_QUIET = 后台通道（异步/重试）：不等待，缺失属预期，
+       只记 DEBUG、不写 error.log、不出现"交由重试队列"措辞。 */
     int readiness_ms;
 };
 
-/* 就绪门控记录（父进程侧）：同一 pid 仅首次注入执行存在性等待，后续
-   重试注入直接卸载+bind。必须记在父进程——fork 后子进程写内存因 COW
-   不会回传；与 mount_manager 的 g_mount_cache 同口径（固定槽位、pid 复用
-   由槽位淘汰自然覆盖）。溢出时淘汰最旧条目保证新进程仍能获得门控 */
-#define NS_READINESS_SLOTS 64
-static pid_t g_readiness_done[NS_READINESS_SLOTS];
-static int g_readiness_count = 0;
-static pthread_mutex_t g_readiness_mutex = PTHREAD_MUTEX_INITIALIZER;
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546 /* linux/magic.h；NDK 与 GNU 头文件均有，兜底防缺 */
+#endif
 
-static bool ns_readiness_done(pid_t pid) {
-    bool done = false;
-    pthread_mutex_lock(&g_readiness_mutex);
-    for (int i = 0; i < g_readiness_count; i++) {
-        if (g_readiness_done[i] == pid) {
-            done = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_readiness_mutex);
-    return done;
+/* 该路径当前是不是 FUSE 挂载（statfs 一次，无 /proc 解析）。
+   两处使用：挂载前校验**源**（不同 ROM 的 /mnt 传播设置可能让源在应用 ns 里只是
+   一个普通空目录，bind 照样"成功"但视图全空）、挂载后校验**目标**（必须真的变成
+   FUSE 视图，否则立即回滚，绝不把"挂载成功但空"的状态留给应用）。 */
+static bool ns_path_is_fuse_mount(const char* path) {
+    struct statfs sfs;
+    if (statfs(path, &sfs) != 0) return false;
+    return (unsigned long)sfs.f_type == (unsigned long)FUSE_SUPER_MAGIC;
 }
 
-static void ns_readiness_mark(pid_t pid) {
-    pthread_mutex_lock(&g_readiness_mutex);
-    for (int i = 0; i < g_readiness_count; i++) {
-        if (g_readiness_done[i] == pid) {
-            pthread_mutex_unlock(&g_readiness_mutex);
-            return;
-        }
-    }
-    if (g_readiness_count < NS_READINESS_SLOTS) {
-        g_readiness_done[g_readiness_count++] = pid;
+/* 合并挂载失败/校验失败后的唯一回滚出口：用应用 ns 内始终存活的族根（
+   /mnt/{user,androidwritable,installer}/<uid>/emulated）重新 bind 出原生视图。
+   回滚失败即 loud 报错——此时应用存储确实不可用，只能交重试队列按退避接管。 */
+static void ns_rollback_to_family_root(const char* pkg, const char* target, uid_t app_uid) {
+    char fam_src[PATH_MAX];
+    if (ns_find_family_root(getpid(), app_uid, fam_src, sizeof fam_src) == 0 &&
+        mount(fam_src, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) {
+        log_internal(LOG_WARN, "[ns_error] [%s] 合并挂载失败已回滚：%s 还原为族根视图 %s（uid=%u）", pkg,
+                     target, fam_src, (unsigned)app_uid);
     } else {
-        memmove(g_readiness_done, g_readiness_done + 1, sizeof(pid_t) * (NS_READINESS_SLOTS - 1));
-        g_readiness_done[NS_READINESS_SLOTS - 1] = pid;
+        log_ns_error(
+            "[ns_error] [%s] Combined mount rollback failed: target=%s 仍无挂载，应用存储不可用\n", pkg,
+            target);
+        log_internal(LOG_ERROR,
+                     "[ns_error] [%s] 合并挂载失败且回滚未成功（族根 %s 不可用或 bind 失败），"
+                     "target=%s 保持裸挂载态，交由重试队列",
+                     pkg, fam_src[0] ? fam_src : "(未找到)", target);
     }
-    pthread_mutex_unlock(&g_readiness_mutex);
 }
 
 /* NsMountEntry 类型、NS_MOUNTINFO_MAX、mountinfo 枚举与族根工具
@@ -661,15 +661,11 @@ static int do_combined_mount(void* raw_args) {
             }
         }
         if (!ready) {
-            /* DEFER 预探测（readiness_ms < 0）：本次缺失是**预期**状态——调用方会
-               回 DEFER，由 zygisk 在 post-specialize 带预算重发 POST。这里既不记
-               WARN/ERROR（否则每次应用启动都留一条"挂载失败"，与"实际挂载成功"的
-               最终结果相反，正是历史排查中最容易误导人的一行），也不写 error.log、
-               不宣称"交由重试队列"（DEFER 通道不排重试）。loud 报错只属于
-               POST/异步/旧通道的权威尝试。 */
             if (args->readiness_ms < 0) {
-                LOG_DBG("[%s] %s 未就绪（pre 阶段 DEFER 预探测，交 post-specialize 补挂载）", pkg,
-                        target);
+                /* 后台通道（异步扫描 / 失败重试）：应用已在运行，代理视图稍后到达
+                   即可。单次未就绪不构成故障——不记 WARN/ERROR、不写 error.log、
+                   不宣称"交由重试队列"（本通道正是重试队列自己，逐轮报错会刷屏）。 */
+                LOG_DBG("[%s] %s 未就绪（后台通道，稍后补挂载）", pkg, target);
                 return ENOENT;
             }
             log_ns_error("[ns_error] [%s] %s 在应用命名空间缺失(%dms 内未出现)，交由重试队列\n",
@@ -680,6 +676,27 @@ static int do_combined_mount(void* raw_args) {
             return ENOENT;
         }
         LOG_DBG("[%s] %s 已就绪（等待 %dms 后出现），继续合并挂载", pkg, target, waited);
+    }
+    /* 源预检（必须在任何卸载之前）：源要是本命名空间内真实的 FUSE 挂载。旧实现
+       先卸载目标再 mount，源不可用就把应用的原生存储视图拆成空目录，回滚再失败
+       就是"存储整个空了"。这里提前裁决，目标一点不动。 */
+    if (!ns_path_is_fuse_mount(source)) {
+        log_ns_error(
+            "[ns_error] [%s] 合并挂载放弃: 源 %s 在本命名空间不是 FUSE 挂载，保持原生视图\n", pkg,
+            source);
+        log_internal(LOG_WARN,
+                     "[ns_error] [%s] 合并挂载放弃: 源 %s 在本命名空间不是 FUSE 挂载（未就绪或传播"
+                     "未到位），保持原生视图",
+                     pkg, source);
+        return ENODEV;
+    }
+    /* 传播隔离：把目标子树置私有，使随后的 umount/mount 事件只在本命名空间生效。
+       部分 ROM 的应用命名空间里 /storage/emulated 仍是 shared 挂载（与 zygote 或
+       其它应用同组），直接卸载会**连带摘掉所有共享者**的存储视图——真机表现就是
+       "整台设备的 /storage/emulated/0 都空了"。目标不是挂载点时该调用返回 EINVAL，
+       无害（随后的 bind 自会建立挂载）。 */
+    if (mount(nullptr, target, nullptr, MS_PRIVATE | MS_REC, nullptr) != 0) {
+        LOG_DBG("[%s] %s 无需/无法私有化（errno=%d），继续合并挂载", pkg, target, errno);
     }
     size_t tlen = strlen(target); /* preserve 恢复段用它剥前缀（见下方 rel 解析） */
     char backup_mounts[128][NS_MOUNT_PATH_MAX];
@@ -731,26 +748,25 @@ static int do_combined_mount(void* raw_args) {
             pkg, source, target, err, strerror(err));
         /* 回滚：本函数前面已经卸载了 backup 与 target 下的子挂载以及 target 本身，
            挂载再失败就把应用留在"裸"状态（连 /storage/emulated 都没有，直到进程
-           重启或重试成功）。用应用 ns 内始终存活的族根重新 bind 出原生视图——
-           与 cleanup_app_mounts 的还原同源（区别只是这里已在目标 ns 内，无需跨 ns）。
-           回滚失败则 loud 报错，交由重试队列按退避接管。 */
-        uid_t app_uid = get_app_uid(args->target_pid);
-        char fam_src[PATH_MAX];
-        if (ns_find_family_root(getpid(), app_uid, fam_src, sizeof fam_src) == 0 &&
-            mount(fam_src, target, nullptr, MS_BIND | MS_REC, nullptr) == 0) {
-            log_internal(LOG_WARN,
-                         "[ns_error] [%s] 合并挂载失败已回滚：%s 还原为族根视图 %s（uid=%u）", pkg,
-                         target, fam_src, (unsigned)app_uid);
-        } else {
-            log_ns_error(
-                "[ns_error] [%s] Combined mount rollback failed: target=%s 仍无挂载，应用存储不可用\n",
-                pkg, target);
-            log_internal(LOG_ERROR,
-                         "[ns_error] [%s] 合并挂载失败且回滚未成功（族根 %s 不可用或 bind 失败），"
-                         "target=%s 保持裸挂载态，交由重试队列",
-                         pkg, fam_src[0] ? fam_src : "(未找到)", target);
-        }
+           重启或重试成功）。用应用 ns 内始终存活的族根重新 bind 出原生视图。 */
+        ns_rollback_to_family_root(pkg, target, args->app_uid);
         return err;
+    }
+    /* 挂载后校验：目标必须真的变成 FUSE 视图。某些 ROM 的 /mnt 传播设置会让源在
+       应用 ns 里只是一个普通空目录——bind 照样"成功"，但 /storage/emulated/0 全空。
+       这种"挂上了却什么都没有"比挂不上更难排查，故校验失败一律回滚原生视图。 */
+    if (!ns_path_is_fuse_mount(target)) {
+        log_ns_error("[ns_error] [%s] 合并挂载校验失败: %s 未变成 FUSE 视图（源 %s 在本命名空间不是 FUSE 挂载）\n",
+                     pkg, target, source);
+        log_internal(LOG_ERROR,
+                     "[ns_error] [%s] 合并挂载校验失败: %s 未变成 FUSE 视图（源 %s 在本命名空间不是 FUSE"
+                     "挂载），回滚原生视图",
+                     pkg, target, source);
+        for (int t = 0; t < 8; t++) {
+            if (umount2(target, MNT_DETACH) == 0) break;
+        }
+        ns_rollback_to_family_root(pkg, target, args->app_uid);
+        return EIO;
     }
     if (preserve_count > 0) {
         /* 备份机制已移除（不再 mount target→backup 复制原生视图）：preserve
@@ -847,14 +863,16 @@ int ns_combined_mount(int pid, const char* pkg, const char* source, const char* 
     args.preserve_paths = preserve_paths;
     args.preserve_count = preserve_count;
     args.target_pid = pid;
-    /* 保留负值哨兵（NSP_READINESS_DEFER = pre 阶段 DEFER 预探测）：它决定缺失
-       路径的日志口径，不能像预算那样归一成 0。预算另按正值计算。 */
+    /* 父进程此刻能可靠读到目标属主；子进程里再反查会在进程退出后拿到 0 */
+    args.app_uid = get_app_uid(pid);
+    /* 保留负值哨兵（NSP_READINESS_QUIET = 后台通道）：它决定缺失路径的日志口径，
+       不能像预算那样归一成 0。预算另按正值计算。 */
     args.readiness_ms = readiness_ms;
     int child_err = 0;
     /* 子进程预算 = 就绪等待 + 2s 余量：等待发生在子进程内，超时会被 SIGKILL，
        预算必须留够（旧实现固定 2s 对应 1s 门控）。健康路径只有一次 access，
        不消耗预算。 */
-    int budget_ms = (readiness_ms > 0 ? readiness_ms : 0) + 2000;
+    int budget_ms = (readiness_ms > 0 ? readiness_ms : 0) + 800;
     int ret = run_in_mnt_ns_timeout(pid, do_combined_mount, &args, &child_err, budget_ms);
     if (ret < 0 && child_err != 0) errno = child_err;
     return ret;
@@ -905,6 +923,7 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
     args->preserve_count = 0;
     /* 全局注入为纯追加 bind，无卸载前置流程，无需就绪门控 */
     args->target_pid = pid;
+    args->app_uid = get_app_uid(pid);
     args->readiness_ms = 0;
     int ret = run_in_mnt_ns_async(pid, pkg, do_global_mount, args, args);
     if (ret < 0) {
@@ -917,7 +936,7 @@ int ns_global_mount_async(int pid, const char* pkg, const char* source, const ch
 
 /* 同步版全局挂载：挂载完成才返回，用于 IPC 线程 */
 int ns_global_mount(int pid, const char* pkg, const char* source, const char* target) {
-    struct CombinedMountArgs args = {pkg, source, target, NULL, NULL, 0, pid, 0};
+    struct CombinedMountArgs args = {pkg, source, target, NULL, NULL, 0, pid, get_app_uid(pid), 0};
     int child_err = 0;
     int ret = run_in_mnt_ns(pid, do_global_mount, &args, &child_err);
     if (ret < 0 && child_err != 0) errno = child_err;
@@ -938,11 +957,11 @@ int ns_combined_mount_async(int pid, const char* pkg, const char* source, const 
     if (args->preserve_paths && preserve_count > 0) {
         memcpy(args->preserve_paths, preserve_paths, sizeof(char[256]) * (size_t)preserve_count);
     }
-    /* 就绪门控标记在父进程侧（fork COW 子进程写不回传）：无论本次成败，
-       进过一次即视为已完成首次判断，同 pid 后续注入/重试跳过等待 */
     args->target_pid = pid;
-    args->readiness_ms = ns_readiness_done(pid) ? 0 : 1000;
-    if (args->readiness_ms > 0) ns_readiness_mark(pid);
+    args->app_uid = get_app_uid(pid);
+    /* 后台通道：不等待、缺失只记 DEBUG。迟到由重试队列按退避补挂（旧实现首轮
+       等 1000ms 且失败 loud 记账，配上"派发即出队"就变成 1Hz 刷屏）。 */
+    args->readiness_ms = NSP_READINESS_QUIET;
     int ret = run_in_mnt_ns_async(pid, pkg, do_combined_mount, args, args);
     if (ret < 0) {
         free((void*)args->pkg);
@@ -992,17 +1011,23 @@ void handle_async_mount_event(void* ptr) {
         LOG_WRN("异步挂载 waitpid 失败 pid=%d: %s", ctx->child_pid, strerror(errno));
     bool have_status = (r == (ssize_t)sizeof(child_ret));
     if (have_status && child_ret == 0) {
+        /* 真正挂上了才清重试记账（旧实现把"派发成功"当成功，失败回调又以
+           attempts=0 重新入队 → 退避与上限失效，1Hz 永久重试） */
+        retry_mount_succeeded(ctx->target_pid);
         LOG_DBG("异步挂载成功: App=%s, PID=%d", ctx->pkg_name, ctx->target_pid);
     } else {
         /* 失败 / status 缺失(EOF) / 未知：一律按失败收尾（fail-closed——把"未知"
            当成功会让上层以为挂载已完成）。失败收尾统一走 schedule_retry_mount +
            remove_tracked，并按目标存活/是否已被其他任务成功挂载做幂等判定，
            不再与成功分支或收尸结果互斥。 */
+        /* 单次失败只记 DEBUG：后台通道的失败由重试队列接续，逐轮 WARN/ERROR 会在
+           "视图迟迟不出现"的设备上把正常等待刷成故障（error.log 无上限增长）。
+           真正的结论由 retry_queue 在退避耗尽时 loud 一次（"挂载重试耗尽"）。 */
         if (have_status) {
-            LOG_ERR("异步挂载失败: App=%s, PID=%d, ret_val=%d, exit_status=%d", ctx->pkg_name,
+            LOG_DBG("异步挂载失败: App=%s, PID=%d, ret_val=%d, exit_status=%d", ctx->pkg_name,
                     ctx->target_pid, child_ret, status);
         } else {
-            LOG_ERR("异步挂载结果不可得: App=%s, PID=%d, read=%zd（完成管道未回传完整 status，"
+            LOG_WRN("异步挂载结果不可得: App=%s, PID=%d, read=%zd（完成管道未回传完整 status，"
                     "按失败处理）",
                     ctx->pkg_name, ctx->target_pid, r);
         }

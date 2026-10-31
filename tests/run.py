@@ -233,6 +233,14 @@ SUITE_MAP = [
      ("scripts/build-libssh2-android.sh",),
      (),
      "构建脚本危险路径白名单（rm -rf 前的 $OUT 校验）"),
+
+    # 挂载失败重试记账：旧实现「派发成功即出队、失败回调重新入队（次数归零）」
+    # 让退避与 5 次上限永远不生效——挂不上的应用 1Hz 永久重试、错误日志刷屏。
+    # 新实现把尝试次数随条目保存（退避 1/2/4/8s、上限 NSP_RETRY_MAX_ATTEMPTS）。
+    (("test_retry_queue.py",),
+     ("src/injector/retry_queue.c", "include/retry_queue.h"),
+     ("nsp_retry_schedule", "nsp_retry_next", "nsp_retry_done", "nsp_retry_backoff_seconds"),
+     "挂载失败重试记账（重试收敛 / 退避 / 放弃 / 清账）"),
 ]
 
 
@@ -276,6 +284,7 @@ LAYERS = {
             "test_ftp_truncate_list.py",
             "test_ftp_upload_lock.py",
             "test_ns_combined_rollback.py",
+            "test_retry_queue.py",
             "test_ns_umount_overflow.py",
             "test_ns_global_replace_rollback.py",
             "test_inject_method.py",
@@ -473,6 +482,7 @@ PARALLEL_SAFE = frozenset({
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
     "test_rule_file_lock.py",     # cc 直编 nsp_rule_file + 子进程并发写，/tmp 工作目录
     "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权
+    "test_retry_queue.py",           # cc 直编 retry_queue.c + 虚拟时钟，无挂载/无子进程
     "test_ns_umount_overflow.py",    # cc 直编 ns_utils.c + ASan + --wrap 桩 fopen/umount2，无挂载
     "test_ns_global_replace_rollback.py",  # cc 直编 ns_global_replace.c + --wrap 桩 mount/fopen，无挂载
     "test_reaped_managed.py",     # cc 直编收尸留档 + 真实 fork 子进程，无共享状态

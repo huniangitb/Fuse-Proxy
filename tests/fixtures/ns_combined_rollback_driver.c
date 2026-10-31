@@ -1,26 +1,34 @@
 /*
  * tests/fixtures/ns_combined_rollback_driver.c
  *
- * do_combined_mount 合并挂载失败回滚的确定性失败注入驱动。
+ * do_combined_mount 合并挂载的确定性失败注入驱动（回滚 / 源预检 / 传播隔离 /
+ * 挂载后校验 / 后台通道静默）。
  *
  * 做法：把实际源码 src/injector/ns_utils.c 整体 #include 进本 TU（经
  * -DNS_UTILS_SRC= 传入路径）—— 同一翻译单元内 static 的 do_combined_mount
- * 对本文件可见，可直接调用；再用 -Wl,--wrap=mount/--wrap=umount2 拦截挂载
- * 原语，代码路径全走真实实现，只有内核对 mount 的裁决被替换成可控返回值。
- * 时序不依赖命名空间、FUSE、特权与调度运气。
+ * 对本文件可见，可直接调用；再用 -Wl,--wrap=mount/umount2/statfs 拦截挂载与
+ * 文件系统类型原语，代码路径全走真实实现，只有内核对 mount/statfs 的裁决被
+ * 替换成可控返回值。时序不依赖命名空间、FUSE、特权与调度运气。
  *
  * 覆盖：
  *   A. 源 bind 失败 + 族根可用 → 第二次 mount 以族根为源回滚，target 还原为
  *      族根视图，日志含「已回滚」，返回原始 errno（不再让应用停留在裸状态）。
  *   B. 源 bind 失败 + 族根不可用 → 不回滚、只报「回滚未成功」，返回原始 errno。
- *   C. 对照：源 bind 成功 → 不触发任何回滚挂载。
+ *   C. 对照：源 bind 成功 → 不触发任何回滚挂载，且挂载后校验通过。
  *   D. 目标视图未就绪（readiness_ms=0）→ 在任何卸载之前返回 ENOENT。
- *   E. DEFER 预探测（NSP_READINESS_DEFER）→ 缺失属预期：静默（无 WARN/ERROR）、
+ *   E. 后台通道（NSP_READINESS_QUIET）→ 缺失属预期：静默（无 WARN/ERROR）、
  *      不写 error.log、不宣称「交由重试队列」，只留一条 DEBUG 说明。
  *   F. 对照：同缺失但走权威尝试（readiness_ms=0）→ 仍须 WARN + 「交由重试队列」。
+ *   G. 源预检（统计 §源不是 FUSE 挂载）→ **零卸载、零挂载**，返回 ENODEV：
+ *      旧实现会先把 target 拆掉再挂，源是空目录时 bind "成功" → 应用存储全空。
+ *   H. 挂载后校验失败（目标未变成 FUSE 视图）→ 卸载本次挂载 + 族根回滚 + EIO，
+ *      绝不把"挂上了却什么都没有"留给应用。
+ *   I. 传播隔离：MS_PRIVATE 必须在**第一次卸载之前**发出（共享挂载组上的卸载
+ *      事件会传播到 zygote/其它应用的命名空间，真机表现为"整机存储都空了"）。
  *
- * 回归价值：移除 ns_utils.c 回滚分支（旧实现只 return err）后 A 必失败；把
- * DEFER 静默分支换回旧的 WARN 口径（HEAD 实现）后 E3/E4 必失败。
+ * 回归价值：移除回滚分支（旧实现只 return err）→ A 必失败；把后台通道静默换回
+ * 旧的 WARN 口径（HEAD 实现）→ E3/E4/E5 必失败；去掉源预检 → G2/G3 必失败；
+ * 去掉挂载后校验 → H1/H2 必失败；去掉 MS_PRIVATE → I1 必失败。
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -32,7 +40,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -41,6 +51,11 @@
 #include "injector.h"
 #include "ns_global_replace.h"
 #include "ns_utils.h"
+
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546
+#endif
+#define TMPFS_MAGIC_FAKE 0x01021994
 
 /* ══════════════ 测试可控的 mock 状态 ══════════════ */
 
@@ -54,6 +69,14 @@ static const char* g_fail_source;
 static char g_logbuf[8192];
 /* ns_read_mountinfo_pid 的合成返回：族根挂载点（NULL 表示不提供） */
 static const char* g_family_root;
+/* 传播隔离（mount(NULL, target, MS_PRIVATE|MS_REC)）记账 */
+static int g_private_calls;
+static int g_private_seq = -1; /* 私有化发生时已发生的 umount2 次数（-1=未调用） */
+static int g_umount_calls;
+/* statfs 裁决：源/目标分别可被伪造成非 FUSE（预检失败 / 挂载后校验失败） */
+static bool g_source_not_fuse;
+static bool g_target_not_fuse;
+static int g_statfs_calls;
 
 /* 按级别计数：断言"未就绪不算失败"必须能区分 DEBUG 说明与 WARN/ERROR 报错 */
 static int g_warn_lines;
@@ -82,13 +105,18 @@ void log_internal(LogLevel level, const char* format, ...) {
     va_end(ap);
 }
 
-/* ══════════════ 挂载原语拦截 ══════════════ */
+/* ══════════════ 挂载 / statfs 原语拦截 ══════════════ */
 
 int __wrap_mount(const char* source, const char* target, const char* fstype, unsigned long flags,
                  const void* data) {
     (void)fstype;
-    (void)flags;
     (void)data;
+    if ((flags & MS_PRIVATE) && source == nullptr) {
+        /* 传播隔离调用：单独记账，并记录"已经发生了几次卸载"（用于断言顺序） */
+        g_private_calls++;
+        if (g_private_seq < 0) g_private_seq = g_umount_calls;
+        return 0;
+    }
     if (g_mount_calls < MAX_MOUNT_CALLS && source && target) {
         snprintf(g_mount_src[g_mount_calls], sizeof g_mount_src[0], "%s", source);
         snprintf(g_mount_tgt[g_mount_calls], sizeof g_mount_tgt[0], "%s", target);
@@ -104,7 +132,23 @@ int __wrap_mount(const char* source, const char* target, const char* fstype, uns
 int __wrap_umount2(const char* target, int flags) {
     (void)target;
     (void)flags;
+    g_umount_calls++;
     return 0; /* 卸载一律成功：聚焦挂载失败后的回滚分支 */
+}
+
+int __wrap_statfs(const char* path, struct statfs* buf) {
+    g_statfs_calls++;
+    memset(buf, 0, sizeof *buf);
+    if (g_source_not_fuse && path && strcmp(path, "/mnt/nsp_global") == 0) {
+        buf->f_type = TMPFS_MAGIC_FAKE;
+        return 0;
+    }
+    if (g_target_not_fuse && path && strcmp(path, "/mnt/nsp_global") != 0) {
+        buf->f_type = TMPFS_MAGIC_FAKE;
+        return 0;
+    }
+    buf->f_type = FUSE_SUPER_MAGIC;
+    return 0;
 }
 
 /* ══════════════ 其余外部依赖的最小桩 ══════════════ */
@@ -168,6 +212,9 @@ int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_
     return 0;
 }
 
+/* ns_utils.c 的成功回调会清重试记账；本用例不涉及重试队列 */
+void retry_mount_succeeded(int pid) { (void)pid; }
+
 /* ══════════════ 实际源码（static do_combined_mount 由此可见） ══════════════ */
 
 #include NS_UTILS_SRC
@@ -188,6 +235,12 @@ static void reset_case(const char* fail_source, const char* family_root) {
     g_logbuf[0] = '\0';
     g_warn_lines = 0;
     g_err_lines = 0;
+    g_private_calls = 0;
+    g_private_seq = -1;
+    g_umount_calls = 0;
+    g_source_not_fuse = false;
+    g_target_not_fuse = false;
+    g_statfs_calls = 0;
     g_fail_source = fail_source;
     g_family_root = family_root;
 }
@@ -201,21 +254,27 @@ static int run_combined_with(const char* target, int readiness_ms) {
         .preserve_paths = nullptr,
         .preserve_count = 0,
         .target_pid = 1,
+        .app_uid = 10123,
         .readiness_ms = readiness_ms,
     };
     return do_combined_mount(&args);
 }
 
-/* 常规用例：目标视图已存在（宿主上 /storage/emulated 真实存在）、预算 0 */
-static int run_combined(void) { return run_combined_with("/storage/emulated", 0); }
-
 int main(void) {
-    printf("── do_combined_mount 合并挂载失败回滚（失败注入） ──\n");
+    printf("── do_combined_mount 合并挂载（失败注入 / 源预检 / 传播隔离 / 校验） ──\n");
+    /* 目标用一个真实存在的临时目录：不依赖宿主是否有 /storage/emulated */
+    char tgt_tmpl[] = "/tmp/nsp_cm_target_XXXXXX";
+    if (!mkdtemp(tgt_tmpl)) {
+        printf("  [FAIL] 无法创建临时目标目录\n结果: 存在失败\n");
+        return 1;
+    }
+    const char* target = tgt_tmpl;
+    const char* missing = "/nonexistent/nsp_emulated";
 
-    /* A. 源不可见 + 族根可用 → 以族根回滚 */
+    /* A. 源 bind 失败 + 族根可用 → 以族根回滚 */
     reset_case("/mnt/nsp_global", "/mnt/user/0/emulated");
     errno = 0;
-    int rc = run_combined();
+    int rc = run_combined_with(target, 0);
     check("A1 源 bind 失败返回原始 errno(ENOENT)", rc == ENOENT,
           rc == ENOENT ? "" : "返回码与预期不符");
     check("A2 发生第二次 mount（回滚）", g_mount_calls >= 2,
@@ -223,72 +282,109 @@ int main(void) {
     if (g_mount_calls >= 2) {
         bool src_ok = strcmp(g_mount_src[0], "/mnt/nsp_global") == 0;
         bool rb_src_ok = strcmp(g_mount_src[1], "/mnt/user/0/emulated") == 0;
-        bool rb_tgt_ok = strcmp(g_mount_tgt[1], "/storage/emulated") == 0;
+        bool rb_tgt_ok = strcmp(g_mount_tgt[1], target) == 0;
         check("A3 首挂载源=项目 FUSE，回滚源=族根且目标不变", src_ok && rb_src_ok && rb_tgt_ok,
-              g_mount_calls >= 2 ? "" : "调用记录不足");
+              "调用记录不符");
     } else {
         check("A3 首挂载源=项目 FUSE，回滚源=族根且目标不变", false, "调用记录不足");
     }
     check("A4 日志报告已回滚（非裸状态）", log_has("已回滚") && !log_has("回滚未成功"),
           log_has("已回滚") ? "" : "缺少回滚成功日志");
 
-    /* B. 源不可见 + 族根不可用 → 不回滚、loud 报错 */
+    /* B. 源 bind 失败 + 族根不可用 → 不回滚、loud 报错 */
     reset_case("/mnt/nsp_global", nullptr);
     errno = 0;
-    rc = run_combined();
+    rc = run_combined_with(target, 0);
     check("B1 仍返回原始 errno(ENOENT)", rc == ENOENT, "");
     check("B2 族根本不可用时不发生回滚挂载", g_mount_calls == 1,
           g_mount_calls == 1 ? "" : "意外发起了回滚挂载");
     check("B3 loud 报告回滚未成功", log_has("回滚未成功"), log_has("回滚未成功") ? "" : "缺少报错");
 
-    /* C. 对照：源可挂载 → 不触发回滚 */
+    /* C. 对照：源可挂载 → 不触发回滚，且挂载后校验通过 */
     reset_case(nullptr, "/mnt/user/0/emulated");
     errno = 0;
-    rc = run_combined();
+    rc = run_combined_with(target, 0);
     check("C1 源可挂载时成功返回 0", rc == 0, "");
     check("C2 成功路径只挂载一次（无回滚）", g_mount_calls == 1,
           g_mount_calls == 1 ? "" : "成功路径出现了多余挂载");
     check("C3 无回滚日志", !log_has("已回滚") && !log_has("回滚未成功"), "");
+    check("C4 挂载后做了 statfs 校验", g_statfs_calls >= 2,
+          g_statfs_calls >= 2 ? "" : "缺少源预检或挂载后校验");
 
     /* D. 目标视图未就绪（readiness_ms=0）→ 必须在**任何卸载之前**就返回 ENOENT：
-          v1 两段式补挂载把"未就绪"当作 DEFER 的信号，若这里先把应用卸载成裸状态
-          再失败，应用会在等到 POST 之前就失去 /storage/emulated。 */
+          权威通道把"未就绪"当作失败信号，若这里先把应用卸载成裸状态再失败，
+          应用会失去 /storage/emulated。 */
     reset_case(nullptr, nullptr);
     errno = 0;
-    rc = run_combined_with("/nonexistent/nsp_emulated", 0);
+    rc = run_combined_with(missing, 0);
     check("D1 目标缺失 + 预算0 → 立即 ENOENT", rc == ENOENT,
           rc == ENOENT ? "" : "未按未就绪返回 ENOENT");
     check("D2 目标缺失时零挂载调用（判定早于卸载/挂载）", g_mount_calls == 0,
           g_mount_calls == 0 ? "" : "目标缺失仍发起了挂载");
-    check("D3 日志报告缺失而非回滚", log_has("缺失") && !log_has("已回滚"),
+    check("D3 目标缺失时零卸载调用", g_umount_calls == 0, "目标缺失仍卸载了挂载点");
+    check("D4 日志报告缺失而非回滚", log_has("缺失") && !log_has("已回滚"),
           log_has("缺失") ? "" : "缺少缺失日志");
 
-    /* E. DEFER 预探测（readiness_ms = NSP_READINESS_DEFER，v1 两段式的
-          pre-specialize 快速尝试）：目标 ns 尚未被 vold 装配是**预期**状态——
-          调用方会回 DEFER，由 post-specialize 的 POST 补齐。旧实现把它按普通
-          失败记 WARN + error.log，并在日志里宣称"交由重试队列"，真机表现为
-          "实际挂载成功，但日志一直显示没有成功"。此处钉死：静默 + DEBUG 说明。 */
+    /* E. 后台通道（NSP_READINESS_QUIET，异步扫描/失败重试）：目标 ns 尚未被
+          vold 装配是**预期**状态，由重试队列稍后补挂。旧实现按普通失败记
+          WARN + error.log 并宣称"交由重试队列"，真机表现为"错误刷屏"。 */
     reset_case(nullptr, nullptr);
     errno = 0;
-    rc = run_combined_with("/nonexistent/nsp_emulated", NSP_READINESS_DEFER);
-    check("E1 DEFER 预探测目标缺失 → 立即 ENOENT", rc == ENOENT,
+    rc = run_combined_with(missing, NSP_READINESS_QUIET);
+    check("E1 后台通道目标缺失 → 立即 ENOENT", rc == ENOENT,
           rc == ENOENT ? "" : "未按预期未就绪返回 ENOENT");
     check("E2 未就绪时零挂载调用", g_mount_calls == 0, "目标缺失仍发起了挂载");
     check("E3 未就绪不记 WARN/ERROR（不是失败）", g_warn_lines == 0 && g_err_lines == 0,
           "未就绪仍按失败记了 WARN/ERROR");
     check("E4 不宣称“交由重试队列”、不用失败式措辞",
           !log_has("重试队列") && !log_has("缺失("), "仍出现旧失败措辞");
-    check("E5 以 DEBUG 说明 DEFER 语义", log_has("DEFER"), "缺少 DEFER 说明");
+    check("E5 以 DEBUG 说明后台通道语义", log_has("后台通道"), "缺少后台通道说明");
 
     /* F. 对照：同一缺失但走权威尝试（POST/旧通道，readiness_ms=0）→ 必须 loud，
-          否则真实故障会被静默（E 的静默只能限 DEFER 通道）。 */
+          否则真实故障会被静默（E 的静默只能限后台通道）。 */
     reset_case(nullptr, nullptr);
     errno = 0;
-    rc = run_combined_with("/nonexistent/nsp_emulated", 0);
+    rc = run_combined_with(missing, 0);
     check("F1 权威尝试目标缺失 → ENOENT", rc == ENOENT, "");
     check("F2 权威尝试仍 loud（至少一条 WARN）", g_warn_lines >= 1, "真实失败被静默了");
     check("F3 明确交由重试队列", log_has("交由重试队列"), "");
 
+    /* G. 源预检：源在本命名空间不是 FUSE 挂载（不同 ROM 的 /mnt 传播设置可能只
+          把目录传进来、FUSE 没传进来）→ 必须**在卸载之前**放弃：旧实现会先把
+          原生视图拆掉，再把空目录 bind 成 /storage/emulated（"假成功空挂载"），
+          真机表现即"某些设备 /storage/emulated/0 整个是空的"。 */
+    reset_case(nullptr, "/mnt/user/0/emulated");
+    g_source_not_fuse = true;
+    errno = 0;
+    rc = run_combined_with(target, 0);
+    check("G1 源非 FUSE → 返回 ENODEV", rc == ENODEV, rc == ENODEV ? "" : "未拒绝不可用的源");
+    check("G2 源非 FUSE → 零挂载调用（目标一点没动）", g_mount_calls == 0,
+          g_mount_calls == 0 ? "" : "仍对目标发起了 bind");
+    check("G3 源非 FUSE → 零卸载调用", g_umount_calls == 0, "先拆了原生视图");
+    check("G4 明确报告保持原生视图", log_has("保持原生视图"), "");
+
+    /* H. 挂载后校验：目标没有变成 FUSE 视图（源其实是普通目录/其它 fs）→
+          卸载本次挂载 + 族根回滚 + EIO。绝不把"挂上了却什么都没有"留给应用。 */
+    reset_case(nullptr, "/mnt/user/0/emulated");
+    g_target_not_fuse = true;
+    errno = 0;
+    rc = run_combined_with(target, 0);
+    check("H1 校验失败返回 EIO", rc == EIO, rc == EIO ? "" : "未按校验失败返回 EIO");
+    check("H2 校验失败后发起了族根回滚", g_mount_calls >= 2,
+          g_mount_calls >= 2 ? "" : "未回滚到原生视图");
+    check("H3 loud 报告校验失败", log_has("校验失败"), "");
+
+    /* I. 传播隔离：MS_PRIVATE 必须**先于任何卸载**发出——共享挂载组上的卸载
+          事件会传播到 zygote/其它应用的命名空间（真机表现为"整机存储都空了"）。 */
+    reset_case(nullptr, "/mnt/user/0/emulated");
+    errno = 0;
+    rc = run_combined_with(target, 0);
+    check("I1 发出了 MS_PRIVATE 传播隔离调用", g_private_calls == 1,
+          g_private_calls == 1 ? "" : "缺少传播隔离（卸载/挂载事件会传播出去）");
+    check("I2 私有化发生在第一次卸载之前", g_private_seq == 0,
+          g_private_seq == 0 ? "" : "私有化晚于卸载");
+
+    rmdir(target);
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");
     return g_fail;
 }

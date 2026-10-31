@@ -37,6 +37,8 @@ void schedule_retry_mount(const char* pkg, int pid) {
     (void)pkg;
     (void)pid;
 }
+/* 挂载成功清账的桩：真实现随 injector.c（retry_queue 记账）编入，本驱动不链接它 */
+void retry_mount_succeeded(int pid) { (void)pid; }
 /* get_active_mnt_src 由测试通过 audit-ctl 前置参数注入（fuse_src），
    模拟 injector.c 中的实现语义：返回当前项目 FUSE 源挂载点 */
 static const char* g_ctl_mnt_src = nullptr;

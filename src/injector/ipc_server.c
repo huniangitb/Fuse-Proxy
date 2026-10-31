@@ -101,29 +101,23 @@ typedef struct {
        代理视图就绪前继续 specialize 并访问存储（首次启动读到原始目录，或撞上
        合并挂载的裸挂载点窗口 ENOENT）。 */
     int ack_fd;
-    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms）：0 = 立即裁决，
-       >0 = 在其内等待（post-specialize 的 POST），NSP_READINESS_DEFER（负值）=
-       pre-specialize 的 DEFER 预探测——缺失属预期，日志只记 DEBUG、不算失败。 */
+    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms，见 IPC_MOUNT_READINESS_MS）。
+       正预算 = 权威尝试：缺失即 loud 失败并排重试（后台通道的静默口径见
+       ns_utils.h 的 NSP_READINESS_QUIET）。 */
     int readiness_ms;
-    /* 未就绪时回 DEFER 而非 ERR：zygisk 会在 post-specialize 带预算重发 POST。
-       只有"新协议（proto>=2）+ v1 目标应用"的 pre 尝试为 true。 */
-    bool defer_on_fail;
 } IpcMountArg;
 
-/* 见 include/ipc_server.h 的契约说明（IPC_POST_READINESS_MS 亦定义在那里）。
-   独立成纯函数是为了让"哪条通道该等多久、失败该回什么"可被直编单测钉死——
+/* 见 include/ipc_server.h 的契约说明（IPC_MOUNT_READINESS_MS 亦定义在那里）。
+   独立成纯函数是为了让"哪条通道该挂、等多久、失败回什么"可被直编单测钉死——
    真机上的 REPORT/POST 通道只允许 root 对端，普通单测进程无法伪造该凭据。 */
-int ipc_plan_readiness(bool is_post, bool is_report, int proto, bool* defer_on_fail) {
-    if (defer_on_fail) *defer_on_fail = false;
-    if (is_post) return IPC_POST_READINESS_MS;
-    if (is_report && proto >= 2) {
-        if (defer_on_fail) *defer_on_fail = true;
-        /* 负值哨兵而不是 0：把"本次缺失属预期未就绪"的语义一并交给下游
-           （ns_combined_mount / mount_manager 据此只记 DEBUG），否则每次应用
-           启动都会先落一条 WARN/ERROR，与实际挂载结果相反。 */
-        return NSP_READINESS_DEFER;
-    }
-    return 1000;
+IpcChannel ipc_plan_channel(bool is_post, bool is_report, int proto) {
+    if (is_post) return IPC_CHAN_POST;
+    if (is_report) return (proto >= 2) ? IPC_CHAN_DEFER : IPC_CHAN_LEGACY;
+    return IPC_CHAN_LEGACY; /* REQ：应用直连的历史通道，就地挂载 */
+}
+
+int ipc_channel_readiness(IpcChannel ch) {
+    return (ch == IPC_CHAN_DEFER) ? 0 : IPC_MOUNT_READINESS_MS;
 }
 
 /* 视图就绪语义的唯一出口：挂载/还原线程在真实完成后才应答并交还 fd。
@@ -272,20 +266,11 @@ static void* ipc_mount_thread(void* raw) {
     if (ret == 0) {
         /* 同步版不做异步版的簿记（mark_injected/规则转储），在此补齐 */
         mark_injected(arg->pid);
+        /* 真正挂上了才清重试记账（见 retry_queue.h：尝试次数随条目保存） */
+        retry_mount_succeeded(arg->pid);
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
         LOG("IPC挂载完成: %s(PID:%d) 耗时: %ldus（已延迟 ACK 到挂载完成）", arg->pkg, arg->pid,
             elapsed_us);
-    } else if (arg->defer_on_fail) {
-        /* pre-specialize 的快速尝试：视图尚未就绪（vold 还没把 /storage/emulated
-           装配进应用命名空间）。此时**不**排重试、不报错——zygisk 会在
-           post-specialize（应用 Java 代码执行前）带预算重发 POST，那次才是
-           权威结果。 */
-        LOG_DBG("IPC挂载未就绪，交由 zygisk post-specialize 重试: %s(PID:%d) 耗时: %ldus",
-                arg->pkg, arg->pid, elapsed_us);
-        remove_tracked(arg->pid);
-        ipc_reply_and_close(arg->ack_fd, "DEFER");
-        free(arg);
-        return NULL;
     } else {
         LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
         remove_tracked(arg->pid);
@@ -493,8 +478,15 @@ void handle_ipc_client_readable(int client_fd) {
             LOG("已接收到IPC通知，切换到被动模式，停止周期扫描");
         }
         /* 生命周期清理：清除已退出应用的追踪缓存（被动模式无周期扫描，
-           此路径是唯一可靠的清理时机） */
-        cleanup_stale_tracked();
+           此路径是唯一可靠的清理时机）。但它要持 g_tracked_mutex 对整表逐条
+           kill(pid,0)，放在每条 IPC 消息里会给批量冷启动叠加排队延迟
+           （首屏 10+ 应用同时 specialize 时最明显）——限频到每秒一次。 */
+        static time_t last_stale_cleanup;
+        time_t now_ts = time(NULL);
+        if (now_ts != last_stale_cleanup) {
+            last_stale_cleanup = now_ts;
+            cleanup_stale_tracked();
+        }
         if (is_isolated_uid(uid) || strstr(pkg, "_zygote") != nullptr) {
             ipc_ack_and_close(client_fd, true);
             return;
@@ -531,7 +523,6 @@ void handle_ipc_client_readable(int client_fd) {
                     arg->mnt_src[0] = '\0';
                     arg->ack_fd = client_fd; /* 还原完成后由线程 ACK + close */
                     arg->readiness_ms = 0;
-                    arg->defer_on_fail = false;
                     pthread_t tid;
                     if (pthread_create(&tid, NULL, ipc_restore_thread, arg) == 0) {
                         pthread_detach(tid);
@@ -571,8 +562,21 @@ void handle_ipc_client_readable(int client_fd) {
              就绪时立刻挂上（保住"首写前就绪"的快路径），未就绪则回 DEFER，让
              zygisk 在 post-specialize 重发 POST；此路径不排重试、不报错。
            - 旧模块（无 proto）/ REQ：维持原有"等待 1s + 失败排重试"行为。 */
-        bool defer_on_fail = false;
-        int readiness_ms = ipc_plan_readiness(is_post, is_report, proto, &defer_on_fail);
+        /* 通道决策（见 include/ipc_server.h）：
+           - pre-specialize 的 REPORT（proto>=2）只裁决、**不挂载**，立即回 DEFER：
+             此刻应用还在 zygote 的挂载命名空间里（部分 ROM 该 ns 就有
+             /storage/emulated），在这里挂载会把项目 FUSE 装进 zygote ns，之后
+             fork 的每个应用（含非目标）都继承它，且没人能清——应用自己的 ns 要到
+             post-specialize 才成立，那才是唯一该挂载的时机。
+           - POST：就地挂载（短预算，失败排重试）。
+           - 旧模块（无 proto）/ REQ：就地挂载，语义不变。 */
+        IpcChannel chan = ipc_plan_channel(is_post, is_report, proto);
+        if (chan == IPC_CHAN_DEFER) {
+            LOG_DBG("IPC预探测（pre/DEFER）: %s(PID:%d) 交 post-specialize 补挂载", clean_pkg, pid);
+            ipc_reply_and_close(client_fd, "DEFER");
+            return;
+        }
+        int readiness_ms = ipc_channel_readiness(chan);
         IpcMountArg* arg = malloc(sizeof(IpcMountArg));
         if (arg) {
             strncpy(arg->pkg, clean_pkg, sizeof(arg->pkg) - 1);
@@ -582,16 +586,11 @@ void handle_ipc_client_readable(int client_fd) {
             arg->mnt_src[0] = '\0';
             arg->ack_fd = client_fd; /* 挂载完成后由线程 ACK + close */
             arg->readiness_ms = readiness_ms;
-            arg->defer_on_fail = defer_on_fail;
             pthread_t tid;
             if (pthread_create(&tid, NULL, ipc_mount_thread, arg) == 0) {
                 pthread_detach(tid);
-                char rd_desc[32];
-                snprintf(rd_desc, sizeof rd_desc,
-                         readiness_ms < 0 ? "DEFER(预探测)" : "%dms", readiness_ms);
-                LOG_DBG("IPC派发挂载线程（%s，readiness=%s，ACK 延迟到挂载完成）: %s(PID:%d)",
-                        is_post ? "POST" : (defer_on_fail ? "pre/DEFER" : "legacy"), rd_desc,
-                        clean_pkg, pid);
+                LOG_DBG("IPC派发挂载线程（%s，readiness=%dms，ACK 延迟到挂载完成）: %s(PID:%d)",
+                        is_post ? "POST" : "legacy", readiness_ms, clean_pkg, pid);
                 return;
             }
             LOG_ERR("IPC创建挂载线程失败: %s(PID:%d)，按已就绪放行", clean_pkg, pid);

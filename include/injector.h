@@ -60,7 +60,12 @@ void unregister_async_mount_pipe(int fd);
 void handle_fuse_ready_event(void *ptr);
 void handle_async_mount_event(void *ptr);
 
-/* 挂载失败重试：由 handle_async_mount_event 在异步挂载失败时调用 */
+/* 挂载失败重试：由 handle_async_mount_event 在异步挂载失败时调用。
+   记账在 src/injector/retry_queue.c：尝试次数随条目保存，相邻尝试按
+   1/2/4/8s 退避、同一 pid 最多 NSP_RETRY_MAX_ATTEMPTS 次，超限 loud 一次后放弃。 */
 void schedule_retry_mount(const char* pkg, int pid);
+/* 挂载**真正成功**后清账（异步派发成功不算成功——旧实现把两者混为一谈，
+   失败应用因此以 1Hz 永久重试、错误日志刷屏） */
+void retry_mount_succeeded(int pid);
 
 #endif /* INJECTOR_H */

@@ -53,14 +53,18 @@
    /storage/emulated 装配进应用命名空间（~1s），故给足余量。 */
 /* 逐段放宽，保证"内层先裁决、外层后超时"的严格顺序——否则外层先超时会把
    injector 正在做的挂载晾在半空（应用已放行、视图稍后才到，等于没修）：
-     injector POST 预算 1800ms + 子进程超时余量 2000ms ≈ 3.8s
-     < companion POST 6s < module POST 8s
-     injector pre 预算 0 + 子进程超时余量 2000ms ≈ 2s
-     < companion REQ 2.5s < module REQ 3.5s */
-#define COMPANION_REQ_TIMEOUT_MS  2500
-#define COMPANION_POST_TIMEOUT_MS 6000
-#define MODULE_REQ_TIMEOUT_MS     3500
-#define MODULE_POST_TIMEOUT_MS    8000
+     injector POST 预算 250ms + 子进程余量 800ms ≈ 1.05s
+     < companion POST 1.5s < module POST 2s
+     pre 通道 injector 只裁决、**不挂载**（立即回 DEFER），实际往返 < 10ms
+     < companion REQ 0.8s < module REQ 1.2s
+   原则：应用主线程上的等待必须小于"能感知"的量级。旧值（pre 3.5s / post 8s、
+   injector 内部 POST 再等 1800ms）在视图迟迟不出现的设备上意味着每次冷启动
+   固定多等 1.8s，正是"冷启动明显变慢"的来源；现在长等待与重试全部落在
+   injector 的后台通道里，这里只做短等 + fail-open。 */
+#define COMPANION_REQ_TIMEOUT_MS  800
+#define COMPANION_POST_TIMEOUT_MS 1500
+#define MODULE_REQ_TIMEOUT_MS     1200
+#define MODULE_POST_TIMEOUT_MS    2000
 
 /* 抽象命名空间 UDS 地址填充。等价于项目的 nsp_uds_abstract_addr()
    （src/core/nsp_util.c），含同一处修正：地址长度按**截断后**实际写入的
@@ -105,7 +109,9 @@ static void companion_wait_reply(int fd, int timeout_ms, char* out, size_t outsz
    post-specialize 已经处于应用沙箱域，**无法**再 connect 到 zygiskd
    （connectCompanion 会失败），故必须复用 pre-specialize 建立的那条连接。
    读超时保证"收到 DEFER 却不来 POST"的连接最终被回收。 */
-#define COMPANION_IDLE_TIMEOUT_S 15
+/* DEFER 后 post-specialize 一定紧跟（同一进程内连续两个回调），5s 足够覆盖
+   极端调度延迟；更长的空闲只意味着应用没走到 post，白占一个 companion 线程。 */
+#define COMPANION_IDLE_TIMEOUT_S 5
 
 static void companion_handler(int client_fd) {
     struct timeval rtv = {.tv_sec = COMPANION_IDLE_TIMEOUT_S, .tv_usec = 0};
@@ -205,19 +211,25 @@ class AppReporterModule : public zygisk::ModuleBase {
             int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %u %d", final_name,
                                    getpid(), args->uid, NSP_ZYGISK_PROTO);
             if (write(fd, req_buf, req_len) > 0) {
-                /* 等 injector 的判决（上限 2s）：OK = 视图已就绪/无需挂载，
-                   可直接继续；DEFER = 目标 ns 里 /storage/emulated 还没装配
-                   好，post-specialize 再来一次；超时按 OK 处理（fail-open，
-                   绝不因 IPC 异常拖住应用冷启动）。 */
+                /* 等 injector 的判决（上限 1.2s）：OK = 无需挂载，可直接继续；
+                   DEFER = 目标应用，交 post-specialize 补挂载。injector 的 pre
+                   通道只裁决不挂载（此阶段还在 zygote 的挂载 ns 里，不能挂）。 */
                 char reply[16] = {0};
+                bool answered = false;
                 struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
                 if (poll(&pfd, 1, MODULE_REQ_TIMEOUT_MS) > 0) {
                     ssize_t rn = read(fd, reply, sizeof(reply) - 1);
                     if (rn > 0) {
                         reply[rn] = '\0';
-                        pending_ = (strcmp(reply, "DEFER") == 0);
+                        answered = true;
                     }
                 }
+                /* 只有拿到明确的 "OK" 才算"无需补挂载"。没应答（injector 忙/连接
+                   异常）或收到 ERR 时必须把连接留着在 post 再试一次：injector 的
+                   pre 通道只裁决不挂载，缺了这次 POST 应用整个生命周期都没有代理
+                   视图（旧实现"超时按 OK"会静默吞掉 DEFER，真机表现就是"存储
+                   没被代理/是空的"）。 */
+                pending_ = !(answered && strcmp(reply, "OK") == 0);
             }
             /* DEFER 时**保留**连接：post-specialize 已处于应用沙箱域，无法再
                connectCompanion，只能复用这条 pre-specialize 建立的连接。 */
