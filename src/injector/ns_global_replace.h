@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <limits.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 typedef struct NsMountEntry {
@@ -45,6 +46,19 @@ typedef struct {
 /* 逐行扫描回调：返回非 0 立即停止扫描（提前退出）。 */
 typedef int (*NsMountinfoLineFn)(const NsMountLine* ln, void* ctx);
 
+/* 一次扫描的规模快照（诊断）：mountinfo 段偏慢时用来区分「命名空间条目多」与
+   「CPU 被抢」——两者处置完全不同（前者靠预筛/减少扫描次数，后者只能挪出关键
+   路径），旧实现只有总耗时，永远在猜。字段由**最近一次**扫描填写。 */
+typedef struct NsMountinfoStats {
+    long lines;      /* 读到的行数（不含被丢弃的超长行） */
+    long bytes;      /* 读到的字节数 */
+    long candidates; /* 通过前缀预筛、真正做了字段解析的行数 */
+    int64_t scan_us; /* 本次扫描墙钟耗时（含 fopen / 读 / 解析） */
+    int64_t cpu_us;  /* 同期本进程 CPU 时间（user+sys）：远小于墙钟 = 被调度饿着 */
+    long csw;        /* 同期非自愿上下文切换次数：持续上升同样是"CPU 被抢"的证据 */
+    bool truncated;  /* 是否丢弃过超长行 */
+} NsMountinfoStats;
+
 /* mountinfo 解析的**唯一实现**（定义于 ns_utils.c，C7 收口）：逐行读取
  * /proc/<pid>/mountinfo，解析后逐条回调。超长行（≥ 4096 字节）整行丢弃并 loud
  * 告警——不静默裂成两条畸形条目（与配置读取的「超长整行丢弃」语义一致）。
@@ -56,6 +70,31 @@ int ns_scan_mountinfo(int pid, NsMountinfoLineFn cb, void* ctx);
  * who 为告警前缀（如 "递归卸载"）。返回收集条数；-1 = 打开 mountinfo 失败。 */
 int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_PATH_MAX],
                                 int max, const char* who);
+
+/* 取最近一次扫描（进程内）的规模快照；out 为空则忽略。仅供诊断输出使用——
+   判据一律由扫描结果本身给出，不得据此改变行为。 */
+void ns_mountinfo_last_stats(NsMountinfoStats* out);
+
+/* 多目标单次扫描的一个收集目标：语义与 ns_collect_mounts_under_pid 完全一致
+   （严格子路径、不含 base 自身、容量触顶告警并拒绝截断）。 */
+typedef struct NsCollectTarget {
+    const char* base;               /* 子树根 */
+    char (*out)[NS_MOUNT_PATH_MAX]; /* 输出槽 */
+    int max;                        /* 槽容量 */
+    const char* who;                /* 告警前缀 */
+    int n;                          /* 输出：收集条数（入口不读） */
+} NsCollectTarget;
+
+/* 一次扫描收集多棵子树（上限 NS_COLLECT_TARGETS_MAX=4）：各目标互不影响，
+   某个目标触顶不影响其它目标继续收集。返回 0 = 扫描完成（-1 = 打开失败）。 */
+int ns_collect_mounts_multi(int pid, NsCollectTarget* targets, int ntargets);
+
+/* 带前缀预筛的全量扫描：只有行内出现某个前缀（子串）才解析字段并回调。
+   预筛是**必要非充分**条件，回调收到的行内容与 ns_scan_mountinfo 逐字一致，
+   调用方仍需按 mount_point 做精确判定。用于"只关心某几棵子树"的既有扫描点
+   （如 ns_find_native_submounts），把几千条无关挂载的解析成本省掉。 */
+int ns_scan_mountinfo_prefixed(int pid, const char* const* prefixes, int nprefixes,
+                               NsMountinfoLineFn cb, void* ctx);
 
 /* 日志：定义于 ns_utils.c（ns 操作错误日志，写入 ERROR_LOG_PATH） */
 void log_ns_error(const char* format, ...);

@@ -77,6 +77,14 @@ static int g_umount_calls;
 static bool g_source_not_fuse;
 static bool g_target_not_fuse;
 static int g_statfs_calls;
+/* umount2 的 flags 记账（快路径必须用 MNT_DETACH 一次摘整棵子树） */
+static int g_umount_flags[MAX_MOUNT_CALLS];
+/* MS_PRIVATE 返回值控制：0=目标是挂载点（快路径，不读 mountinfo）；
+   -1 + EINVAL=目标不是挂载点（首次注入的普通目录，必须枚举子树） */
+static int g_private_result;
+/* 挂载点收集调用记账：单目标（旧实现各扫一遍）与多目标（一次扫描收两棵子树） */
+static int g_collect_single_calls;
+static int g_collect_multi_calls;
 
 /* 按级别计数：断言"未就绪不算失败"必须能区分 DEBUG 说明与 WARN/ERROR 报错 */
 static int g_warn_lines;
@@ -123,6 +131,10 @@ int __wrap_mount(const char* source, const char* target, const char* fstype, uns
         /* 传播隔离调用：单独记账，并记录"已经发生了几次卸载"（用于断言顺序） */
         g_private_calls++;
         if (g_private_seq < 0) g_private_seq = g_umount_calls;
+        if (g_private_result != 0) {
+            errno = EINVAL; /* 真实内核语义：目标不是挂载点 */
+            return -1;
+        }
         return 0;
     }
     if (g_mount_calls < MAX_MOUNT_CALLS && source && target) {
@@ -139,7 +151,7 @@ int __wrap_mount(const char* source, const char* target, const char* fstype, uns
 
 int __wrap_umount2(const char* target, int flags) {
     (void)target;
-    (void)flags;
+    if (g_umount_calls < MAX_MOUNT_CALLS) g_umount_flags[g_umount_calls] = flags;
     g_umount_calls++;
     return 0; /* 卸载一律成功：聚焦挂载失败后的回滚分支 */
 }
@@ -212,11 +224,36 @@ int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
    （无子挂载点），与上方 read_file_dynamic 桩返回不含匹配项的内容等价。 */
 int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_PATH_MAX],
                                 int max, const char* who) {
+    g_collect_single_calls++;
     (void)pid;
     (void)base;
     (void)out;
     (void)max;
     (void)who;
+    return 0;
+}
+
+/* do_combined_mount 现在一次扫描收多棵子树（备份树 + 目标树）：桩返回"没有
+   子挂载点"。本驱动的 MS_PRIVATE 桩返回 0（等价于"目标已是挂载点"→快路径），
+   因此不会触达扫描；保留桩是为了本 TU 能独立链接。 */
+int ns_collect_mounts_multi(int pid, NsCollectTarget* targets, int ntargets) {
+    g_collect_multi_calls++;
+    (void)pid;
+    for (int i = 0; i < ntargets; i++) targets[i].n = 0;
+    return 0;
+}
+
+void ns_mountinfo_last_stats(NsMountinfoStats* out) {
+    if (out) memset(out, 0, sizeof *out);
+}
+
+int ns_scan_mountinfo_prefixed(int pid, const char* const* prefixes, int nprefixes,
+                               NsMountinfoLineFn cb, void* ctx) {
+    (void)pid;
+    (void)prefixes;
+    (void)nprefixes;
+    (void)cb;
+    (void)ctx;
     return 0;
 }
 
@@ -249,6 +286,10 @@ static void reset_case(const char* fail_source, const char* family_root) {
     g_source_not_fuse = false;
     g_target_not_fuse = false;
     g_statfs_calls = 0;
+    g_private_result = 0;
+    g_collect_single_calls = 0;
+    g_collect_multi_calls = 0;
+    memset(g_umount_flags, 0, sizeof g_umount_flags);
     g_fail_source = fail_source;
     g_family_root = family_root;
 }
@@ -465,6 +506,33 @@ int main(void) {
     check("J4 每秒最多 20 条分段日志（其余折叠并计数）",
           storm_lines <= NSP_SEG_MAX_PER_SEC && log_has("折叠="),
           "分段日志没有每秒上限");
+
+    /* K. 目标是挂载点（MS_PRIVATE|MS_REC 成功）⇒ 一条 MNT_DETACH 连整棵子树一起摘，
+          **完全不读 /proc/self/mountinfo**。真机 [ns计] 实测这一步每次冷启动
+          134~136ms（两次整文件扫描），正是"注入后冷启动明显变慢"的主因；
+          判别点：旧实现无论目标是不是挂载点都枚举子树（单目标收集 2 次）。 */
+    reset_case(nullptr, "/mnt/user/0/emulated");
+    errno = 0;
+    rc = run_combined_with(target, 0);
+    check("K1 目标是挂载点时挂载成功", rc == 0, rc == 0 ? "" : "快路径没走通");
+    check("K2 目标是挂载点 ⇒ 零次 mountinfo 收集（不读整文件）",
+          g_collect_single_calls == 0 && g_collect_multi_calls == 0,
+          "仍然枚举了子树：每次冷启动白读一整份 mountinfo");
+    check("K3 备份与目标各一条卸载，且目标那条带 MNT_DETACH（连子树一起摘）",
+          g_umount_calls == 2 && (g_umount_flags[1] & MNT_DETACH) != 0,
+          "卸载次数/标志不符：整棵子树会漏在挂载点上");
+    check("K4 私有化仍先于第一次卸载", g_private_seq == 0, "私有化晚于卸载");
+
+    /* L. 目标不是挂载点（MS_PRIVATE 返回 EINVAL = 首次注入的普通目录）⇒ 必须枚举
+          子树，且备份树与目标树共用**一次**扫描（旧实现各扫一遍同一份 mountinfo）。 */
+    reset_case(nullptr, "/mnt/user/0/emulated");
+    g_private_result = -1;
+    errno = 0;
+    rc = run_combined_with(target, 0);
+    check("L1 目标非挂载点（EINVAL）时仍挂载成功", rc == 0, rc == 0 ? "" : "EINVAL 被当成致命错误");
+    check("L2 目标非挂载点 ⇒ 枚举子树，且只扫一次（多目标合并）",
+          g_collect_multi_calls == 1 && g_collect_single_calls == 0,
+          "扫描次数不是 1：备份树/目标树又各扫了一遍");
 
     rmdir(target);
     printf("%s\n", g_fail ? "结果: 存在失败" : "结果: 全部通过");

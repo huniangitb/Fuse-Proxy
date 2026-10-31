@@ -101,6 +101,25 @@ int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_
     (void)who;
     return -1;
 }
+/* do_combined_mount 现在一次扫描收多棵子树；本用例走异步通道且 MS_PRIVATE 之外
+   不关心扫描结果，桩返回"没有子挂载"即可 */
+int ns_collect_mounts_multi(int pid, NsCollectTarget* targets, int ntargets) {
+    (void)pid;
+    for (int i = 0; i < ntargets; i++) targets[i].n = 0;
+    return 0;
+}
+void ns_mountinfo_last_stats(NsMountinfoStats* out) {
+    if (out) memset(out, 0, sizeof *out);
+}
+int ns_scan_mountinfo_prefixed(int pid, const char* const* prefixes, int nprefixes,
+                               NsMountinfoLineFn cb, void* ctx) {
+    (void)pid;
+    (void)prefixes;
+    (void)nprefixes;
+    (void)cb;
+    (void)ctx;
+    return 0;
+}
 int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
     (void)pid;
     (void)out;

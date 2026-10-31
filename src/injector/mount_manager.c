@@ -136,6 +136,41 @@ bool is_project_fuse_cached(int pid, const char* target_path) {
 
 static bool read_mount_state(int pid, const char* target, const char* backup, MountState* st) {
     memset(st, 0, sizeof(*st));
+    /* ── 快路径：不读 mountinfo ──────────────────────────────────────────────
+       真机实测：应用命名空间里上千条挂载，整文件读 + 逐行解析一次 ≈68ms，而一次
+       冷启动注入原本要读三遍（这里一遍 + 子进程合并挂载两遍）——这就是"只开一个
+       目标应用、不配任何规则也照样慢"的全部来源。ns_probe_target_view 用 statx
+       拿 dev 与 mount id，3 次轻量系统调用给出同样的两个事实：
+         target_is_mounted      ⇐ 目标是挂载点
+         target_has_fuse(_daemon) ⇐ 是挂载点且 dev 与 FUSE 源一致
+       探测不了（权限不足 / 内核无 mount id）才回退下方整文件扫描，语义不变。 */
+    const char* active_src = get_active_mnt_src();
+    bool t_mount = false, t_ours = false;
+    if (ns_probe_target_view(pid, target, active_src, &t_mount, &t_ours) == 0) {
+        if (t_mount && !t_ours) {
+            /* 不是全局实例的 dev：媒体模块走专用媒体实例，再比一次（旧实现靠
+               fstype 含 fuse_daemon 识别，这里换成 dev 指纹，等价） */
+            const char* media = get_media_mnt_src();
+            if (media && (!active_src || strcmp(media, active_src) != 0)) {
+                bool m2 = false, o2 = false;
+                if (ns_probe_target_view(pid, target, media, &m2, &o2) == 0 && m2 && o2)
+                    t_ours = true;
+            }
+        }
+        st->target_is_mounted = t_mount;
+        st->target_has_fuse = t_mount && t_ours;
+        st->target_has_fuse_daemon = t_mount && t_ours;
+        if (!backup || !backup[0]) return true;
+        bool b_mount = false, b_ours = false;
+        if (ns_probe_target_view(pid, backup, active_src, &b_mount, &b_ours) == 0) {
+            st->backup_is_mounted = b_mount;
+            st->backup_has_fuse = b_mount && b_ours;
+            st->backup_has_fuse_daemon = b_mount && b_ours;
+            return true;
+        }
+        /* backup 探测不了：清掉结论，整体回退整文件扫描（保持旧语义） */
+        memset(st, 0, sizeof(*st));
+    }
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mountinfo", pid);
     size_t nread = 0;
