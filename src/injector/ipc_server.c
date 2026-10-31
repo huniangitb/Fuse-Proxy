@@ -112,9 +112,10 @@ typedef struct {
        装配可能还没完成，但线程是后台的，不占应用时间）；inline/POST 路径给 300ms
        （那时视图通常已就绪，一次命中）。 */
     int wait_ms;
-    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms，见 IPC_MOUNT_READINESS_MS）。
-       正预算 = 权威尝试：缺失即 loud 失败并排重试（后台通道的静默口径见
-       ns_utils.h 的 NSP_READINESS_QUIET）。 */
+    /* 挂载前等待目标 ns 内 /storage/emulated 的预算（ms）：POST 通道 20ms
+       （IPC_MOUNT_INLINE_MS），旧模块就地挂载 250ms（IPC_MOUNT_READINESS_MS），
+       见 ipc_channel_readiness。正预算 = 权威尝试：缺失即 loud 并排重试（后台通道
+       的静默口径见 ns_utils.h 的 NSP_READINESS_QUIET）。 */
     int readiness_ms;
 } IpcMountArg;
 
@@ -143,7 +144,19 @@ IpcChannel ipc_plan_channel(bool is_post, bool is_report, int proto) {
 }
 
 int ipc_channel_readiness(IpcChannel ch) {
-    return (ch == IPC_CHAN_DEFER) ? 0 : IPC_MOUNT_READINESS_MS;
+    switch (ch) {
+        case IPC_CHAN_DEFER:
+            return 0; /* pre 只裁决、不挂载 */
+        case IPC_CHAN_POST:
+            /* 20ms：POST 阶段视图通常还没被 vold 装配好（真机 ~135ms 才出现），
+               在应用主线程上等满 250ms 只会把 18% 的请求打爆且仍拿到原生视图。
+               未就绪就走 fail-open + 后台快重试，应用不被冻在 specialize 上。 */
+            return IPC_MOUNT_INLINE_MS;
+        case IPC_CHAN_LEGACY:
+        default:
+            /* 旧模块没有 post 通知，只能就地等（语义不变） */
+            return IPC_MOUNT_READINESS_MS;
+    }
 }
 
 /* 见 include/ipc_server.h：v2 非目标还原的时序（事件驱动优先，不靠轮询猜时间） */
@@ -398,12 +411,22 @@ static void* ipc_mount_thread(void* raw) {
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
         LOG("IPC挂载完成: %s(PID:%d) 耗时: %ldus（已延迟 ACK 到挂载完成）", arg->pkg, arg->pid,
             elapsed_us);
+    } else if (ret == NSP_MOUNT_DEFERRED) {
+        /* 视图未就绪（vold 还没把 /storage/emulated 装配进应用 ns，真机实测 ~135ms）：
+           **fail-open** 立刻回 OK 让应用继续 specialize，挂载交后台重试队列（快档
+           20ms 起）。旧实现会在这里等满整个预算（250ms）再回 ERR，应用白等一场仍然
+           拿到原生视图——322 次挂载里 59 次 >250ms 就是这么来的。
+           不做 mark_injected（视图确实没挂上），也不清重试记账。 */
+        remove_tracked(arg->pid);
+        schedule_retry_mount(arg->pkg, arg->pid);
+        LOG_DBG("IPC挂载延迟: %s(PID:%d) 视图未就绪，已 fail-open 交后台重试，耗时: %ldus",
+                arg->pkg, arg->pid, elapsed_us);
     } else {
         LOG_ERR("IPC挂载失败: %s(PID:%d) 耗时: %ldus", arg->pkg, arg->pid, elapsed_us);
         remove_tracked(arg->pid);
         schedule_retry_mount(arg->pkg, arg->pid);
     }
-    ipc_ack_and_close(arg->ack_fd, ret == 0);
+    ipc_ack_and_close(arg->ack_fd, ret == 0 || ret == NSP_MOUNT_DEFERRED);
     free(arg);
     return NULL;
 }
@@ -624,6 +647,11 @@ void handle_ipc_client_readable(int client_fd) {
         char* colon = strchr(clean_pkg, ':');
         if (colon) *colon = '\0';
         if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, clean_pkg);
+        /* 全量应用注册（配置热对账的候选来源）：被动模式停掉了周期扫描，
+           这里是「运行中应用」唯一的登记入口——不登记就无法回答「这个应用
+           已经在跑、配置现在把它变成目标了，挂给谁」，只能等应用重启（正是
+           用户报障的现场）。裸 clean_pkg 即可：对账时会重新读 /proc cmdline。 */
+        all_apps_upsert(pid, uid, clean_pkg);
 
         /* ACK 的语义是"目标进程的存储视图已就绪，可以继续 specialize"。
            需要挂载（v1）的路径把 client_fd 交给挂载线程、挂完才 ACK（POST 短预算，

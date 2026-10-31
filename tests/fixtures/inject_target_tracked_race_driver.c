@@ -83,6 +83,13 @@ bool is_project_fuse_cached(int pid, const char* target_path) {
     return false;
 }
 const char* get_active_mnt_src(void) { return NULL; }
+/* 配置热对账（audit_running_apps）新增依赖的桩：本用例只跑追踪表并发遍历 */
+void invalidate_app_mount_cache(int pid) { (void)pid; }
+bool app_has_active_rules(const char* pkg, uid_t uid) {
+    (void)pkg;
+    (void)uid;
+    return true;
+}
 int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
                       const char* trigger) {
     (void)pkg;

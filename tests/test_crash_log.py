@@ -59,11 +59,22 @@ def run_case(name, arg, expected_sig):
     ok_head = "FUSE DAEMON CRASH" in content
     ok_sig_line = f"Signal: {expected_sig}" in content
     ok_bt = "Backtrace" in content and "#00 pc" in content
-    ok = ok_sig and ok_head and ok_sig_line and ok_bt
+    # 帧归属行：把 PC/LR 直接解析成「哪个 .so + 符号偏移」。真机 FORTIFY abort
+    # 现场就死在 backtrace() 之前（信号已复位为 DFL，第二次 abort 直接带走进程），
+    # 只有这一行能回答"是 libfuse3.so 还是模块 .so"，在拿到 tombstone 之前全靠它。
+    owner_lines = [l for l in content.splitlines() if "PC owner:" in l or "LR owner:" in l]
+    ok_owner = bool(owner_lines) and any("+0x" in l for l in owner_lines)
+    # 偏移必须与映射表的 file offset 口径一致（addr2line 才指得准）：
+    # 行内需同时给出 map 区间与 file off
+    ok_owner_fmt = ok_owner and all(
+        ("map 0x" in l and "file off 0x" in l) for l in owner_lines)
+    ok = ok_sig and ok_head and ok_sig_line and ok_bt and ok_owner and ok_owner_fmt
 
     print(f"  {'✅' if ok else '❌'} {name}: 退出码={rc} "
           f"(期望信号 {expected_sig}, 实际 {'命中' if ok_sig else rc}) | "
-          f"崩溃头={'有' if ok_head else '无'} backtrace帧={'有' if ok_bt else '无'}")
+          f"崩溃头={'有' if ok_head else '无'} backtrace帧={'有' if ok_bt else '无'} "
+          f"帧归属={'有' if ok_owner else '无'}"
+          + ("" if ok_owner_fmt else "(格式/偏移缺失)"))
     if not ok:
         print(f"      --- 日志尾部 ---")
         print("\n".join("      | " + l for l in content.splitlines()[-6:]))

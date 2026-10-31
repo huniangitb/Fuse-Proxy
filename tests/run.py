@@ -156,9 +156,13 @@ SUITE_MAP = [
       # 启动水印（nsp_log_build_info）与崩溃留档都写进日志环，故归日志链路
       "src/core/build_info.c", "include/build_info.h",
       "src/core/crash_dump.c", "include/crash_dump.h"),
+     # log_open_unlink_direct 是 fuse_daemon 侧「打开中删除」per-事件 DEBUG 的
+     # 唯一出口（真机一秒 633 行）；它的限速回归是 test_log_pipeline 的 L0 直编
+     # 契约（用例 6，桩掉 LOG_DBG 数行数），所以符号登记在这里而不是挂载环境套件
      ("vfs_log_io", "monitor_on", "persist_stage", "drain_async", "log_internal",
       "fw_config_monitor_for", "nsp_log_level_name", "nsp_log_level_parse",
-      "nsp_getline_capped", "nsp_snprintf_dyn", "nsp_format_dynamic"),
+      "nsp_getline_capped", "nsp_snprintf_dyn", "nsp_format_dynamic",
+      "log_open_unlink_direct"),
      "日志链路（生产 → 通讯 → log_monitor → 查询）"),
 
     # fw_config.c 含规则文件/App-rules 的 inotify 监听线程——热重载触发路径本身，
@@ -235,12 +239,15 @@ SUITE_MAP = [
      "构建脚本危险路径白名单（rm -rf 前的 $OUT 校验）"),
 
     # 挂载失败重试记账：旧实现「派发成功即出队、失败回调重新入队（次数归零）」
-    # 让退避与 5 次上限永远不生效——挂不上的应用 1Hz 永久重试、错误日志刷屏。
-    # 新实现把尝试次数随条目保存（退避 1/2/4/8s、上限 NSP_RETRY_MAX_ATTEMPTS）。
+    # 让退避与上限永远不生效——挂不上的应用 1Hz 永久重试、错误日志刷屏。
+    # 新实现把尝试次数随条目保存，并按**毫秒**分三档退避（快档 20ms×10 → 中档
+    # 100ms×5 → 指数 1/2/4/8s，上限 NSP_RETRY_MAX_ATTEMPTS）：设备上
+    # /storage/emulated 要 ~140ms 才被 vold 装配进应用 ns，秒粒度首个 1s 退避等于白等。
     (("test_retry_queue.py",),
      ("src/injector/retry_queue.c", "include/retry_queue.h"),
-     ("nsp_retry_schedule", "nsp_retry_next", "nsp_retry_done", "nsp_retry_backoff_seconds"),
-     "挂载失败重试记账（重试收敛 / 退避 / 放弃 / 清账）"),
+     ("nsp_retry_schedule", "nsp_retry_next", "nsp_retry_done", "nsp_retry_backoff_ms",
+      "nsp_retry_next_due_ms", "nsp_retry_now_ms"),
+     "挂载失败重试记账（重试收敛 / 毫秒三档退避 / 放弃 / 清账 / 到期时刻）"),
 ]
 
 

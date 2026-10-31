@@ -200,6 +200,25 @@ static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t
 /* FSYNC 与 FLUSH 共用的后端数据收尾（定义在 vfs_inval_path 之后） */
 static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path);
 
+/* open-unlink 本地直删的观测限速（范式同 fw_rules.c 的 br_note_isolation：
+   首个命中 + 每 1024 次各一条）。真机 20:05:18 一秒 633 行（com.taobao.idlefish
+   批量删 lockfile），把 sys.log 里有用的行全冲掉了。首条打全路径，之后每 1024 条
+   一条、只报目录 + 累计计数——"哪个应用在批量删"够用，且不会变成新的刷屏源。 */
+static void log_open_unlink_direct(const char* path) {
+    static atomic_ulong seq;
+    unsigned long n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed) + 1;
+    if (n == 1) {
+        LOG_DBG("open-unlink 本地直删（不产生隐藏名）: %s", path);
+        return;
+    }
+    if ((n & 1023u) != 0) return;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char* slash = strrchr(dir, '/');
+    if (slash && slash != dir) *slash = '\0';
+    LOG_DBG("open-unlink 本地直删（累计 %lu 次，此后只报目录）: %s/", n, dir);
+}
+
 static void log_fuse_err(const char* op, const char* path, int err_code) {
     int err = err_code < 0 ? -err_code : err_code;
     if (err != 0 && err != ENOENT && err != EEXIST && err != EROFS) {
@@ -276,7 +295,7 @@ typedef enum {
     NSP_VIS_TOO_LONG, /* 路径过长：跳过该条目（fail-closed） */
 } NspVisibility;
 
-/* 定义在 vfs_rename 附近；此处只需前置声明供可见性单点调用 */
+/* 定义在 vfs_rename 附近；此处只需前置声明供 open-unlink 分支识别 */
 static bool is_fuse_hidden_name(const char* name);
 
 static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse_path,
@@ -284,11 +303,12 @@ static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse
                                           int path_user_id, uid_t uid, char* item_sub_out,
                                           size_t sub_sz, char* item_fuse_out, size_t fuse_sz) {
     if (path_contains_invalid_chars(name)) return NSP_VIS_SKIP;
-    /* libfuse 的 open-unlink 隐藏名（.fuse_hidden + 16 位十六进制）是内部实现
-       产物：应用扫描目录时一律不可见。本地路径已改为直删（不再产生），此过滤
-       覆盖后端路径（仍用隐藏名兜底）与历史残留文件——即使磁盘上还留着，
-       文件管理器刷新也不会再看到。 */
-    if (is_fuse_hidden_name(name)) return NSP_VIS_SKIP;
+    /* libfuse 的 open-unlink 隐藏名（.fuse_hidden + 16 位十六进制）**不在此处
+       过滤**：本层本地路径已改为直删（vfs_rename 的 open-unlink 分支，不再产生
+       新隐藏名），磁盘上出现的残留来自旧版本 daemon 或下层 FUSE（/data/media
+       由 MediaProvider 提供时，本层 unlink 会触发下层 libfuse 的 hide 语义）。
+       按用户要求按普通条目可见、可 getattr/open——保留取证与手工回收能力，
+       既不做列举过滤，也不在列举时就地删除。 */
     char norm_base[2048], norm_fuse_base[2048];
     /* base 先剥尾部 '/'（与 getattr/child_ino 同一合成语义）：非规范 sub_path
        （如 "/Android/data/"）会拼出 "//name"，与 getattr 规范形式的哈希不一致 */
@@ -2298,7 +2318,7 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
             struct stat snap;
             if (lstat(p_from, &snap) == 0) hidden_stat_put(to, &snap);
             if (unlink(p_from) == 0) {
-                LOG_DBG("open-unlink 本地直删（不产生隐藏名）: %s", sub_from);
+                log_open_unlink_direct(sub_from);
                 return 0;
             }
             int err = errno;

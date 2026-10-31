@@ -861,17 +861,20 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
     checker.check("plain 文件在真实外部目录可读", exists, "exists=%s size=%s" % (exists, size))
 
     # ---- unlink：打开中删除（本地路径直删，不产生 .fuse_hidden）
-    for step in ("delete", "hidden_open", "fstat", "read", "hidden_closed", "exists_closed"):
+    for step in ("delete", "hidden_open", "fstat", "read", "hidden_closed", "exists_closed",
+                 "hidden_legacy"):
         checker.check("unlink 探针 %s 成功" % step, step_ok(phase_a, "unlink", step))
     exists, size = device_file(adb, REAL_ROOT + "/nsp_verify/unlink/nsp_probe_unlink.txt")
     checker.check("unlink 删除后真实文件不存在", not exists, "exists=%s size=%s" % (exists, size))
-    # 历史残留夹具：物理上存在，但列举/扫描必须看不到（readdir 过滤）
+    # 历史残留夹具：按用户要求不做列举过滤——物理上存在、且必须看得见（可取证），
+    # 同时不得被自动清理；残留判定只看「新增」
     # 用 shell 的 test -e（经 FUSE 的 getattr）而不是 check-file：后者走 adb-sh
     # 的文本预检，路径里的 "hidden" 含 "dd" 会被误判成变更动词。
     legacy_out = adb.shell(
         "test -e /sdcard/nsp_verify/unlink/.fuse_hidden0000000000000001 "
         "&& echo present || echo absent").stdout.strip()
-    checker.check("unlink 历史隐藏名夹具仍在磁盘（过滤而非删除）", legacy_out == "present", legacy_out)
+    checker.check("unlink 历史隐藏名夹具仍在磁盘（可见可取证、未被自动清理）",
+                  legacy_out == "present", legacy_out)
     hidden_out = adb.shell(
         "find /sdcard/nsp_verify/unlink -name '.fuse_hidden*' "
         "! -name '.fuse_hidden0000000000000001' 2>/dev/null | wc -l").stdout.strip()

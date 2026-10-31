@@ -117,6 +117,11 @@ static void invalidate_mount_cache(int pid) {
 
 static bool read_mount_state(int pid, const char* target, const char* backup, MountState* st);
 
+/* 跨文件缓存失效入口：配置热对账在探测/挂载/卸载前调用（见 mount_manager.h 注释） */
+void invalidate_app_mount_cache(int pid) {
+    if (pid > 0) invalidate_mount_cache(pid);
+}
+
 /* 注入状态检查（跨文件）：复用挂载状态缓存，避免每次扫描 mountinfo——
    缓存未命中时读取一次并写入缓存（挂载/还原/卸载路径均会失效缓存，
    inject_target 的 handle_list_injected/get_injected_snapshot 等高频调用受益） */
@@ -493,17 +498,20 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
                           preserve_count, readiness_ms) == 0) {
         invalidate_mount_cache(pid);
         return 0;
-    } else {
-        /* readiness_ms < 0 = 后台通道（异步扫描 / 失败重试）：应用已经在运行，
-           代理视图稍后到达即可，本次未就绪属**预期**——记 ERROR 会把正常等待刷成
-           故障（历史上每次应用启动留一条"挂载失败"，与最终真实结果相反）。 */
-        if (readiness_ms < 0) {
-            LOG_DBG("后台通道视图未就绪（稍后补挂载）: %s(PID:%d)", pkg, pid);
-        } else {
-            LOG_ERR("同步合并挂载失败: PID=%d, pkg=%s", pid, pkg);
-        }
-        return -1;
     }
+    /* ns_combined_mount 已把子进程的 errno 风格返回值写回 errno（ENOENT=目标条目
+       还没被 vold 装配、ENODEV=源 FUSE 还没传播进本 ns、ETIMEDOUT=ns 子进程超时）。
+       这三种都是"稍后就能挂上"的时序问题，不是失败：区分出来交给调用方 fail-open，
+       免得把正常等待记成 ERROR（历史上每次应用启动留一条"挂载失败"，与最终真实
+       结果相反，真机 error.log 里 31 条"缺失(250ms 内未出现)"就是这么来的）。 */
+    int merr = errno;
+    bool not_ready = (readiness_ms < 0) || merr == ENOENT || merr == ENODEV || merr == ETIMEDOUT;
+    if (not_ready) {
+        LOG_DBG("视图未就绪，交后台重试: %s(PID:%d) errno=%d(%s)", pkg, pid, merr, strerror(merr));
+        return NSP_MOUNT_DEFERRED;
+    }
+    LOG_ERR("同步合并挂载失败: PID=%d, pkg=%s, errno=%d(%s)", pid, pkg, merr, strerror(merr));
+    return -1;
 }
 
 /*

@@ -60,7 +60,7 @@ case=<ftp|sftp|hide|iso|plain|unlink>|step=<name>|ok=<0|1>|detail=<...>
 | hide | `phase_a` 或（`phase_b` + `write_denied`）, `list`, `done` |
 | iso | `download`, `pictures`, `done` |
 | plain | `write`, `read`, `done` |
-| unlink | `delete`, `hidden_open`, `fstat`, `read`, `hidden_closed`, `exists_closed`, `done` |
+| unlink | `delete`, `hidden_open`, `fstat`, `read`, `hidden_closed`, `exists_closed`, `hidden_legacy`, `done` |
 | race | `attempt`×N, `summary`, `done`（**无 ready**：不等就绪，见下） |
 
 关键语义：
@@ -81,12 +81,12 @@ case=<ftp|sftp|hide|iso|plain|unlink>|step=<name>|ok=<0|1>|detail=<...>
   包名+时间戳的内容并读回；detail 带实际绝对路径。
 - `plain`：写 `/sdcard/Android/data/<pkg>/files/plain.txt` 并读回。
 - `unlink`：在 `/sdcard/nsp_verify/unlink/` 写 `nsp_probe_unlink.txt` 并保持读句柄，
-  删除后立即列举目录（`hidden_open`，期望 `.fuse_hidden` 计数为 0）、用
+  删除后立即列举目录（`hidden_open`，期望**新增** `.fuse_hidden` 计数为 0）、用
   `getChannel().size()` 做 fstat、从原句柄读回内容；关闭后再次列举（`hidden_closed`）
   并确认路径消失（`exists_closed`）。宿主还会预置一个历史隐藏名夹具
-  `.fuse_hidden0000000000000001`：它必须仍在磁盘上、但不出现在列举计数里
-  （验证 readdir 过滤）。该探针只配一条无关 HIDE 以保证被 v1 注入，
-  被测目录本身无任何规则。
+  `.fuse_hidden0000000000000001`：本层**不做列举过滤、也不自动清理**（保留取证能力），
+  因此该夹具必须列举可见（`hidden_legacy`），残留判定只看「新增」。该探针只配一条
+  无关 HIDE 以保证被 v1 注入，被测目录本身无任何规则。
 - `race`：**刻意不等待就绪**，`onCreate` 起每 ~20ms 尝试写两个判别路径并记录
   `i`（序号）、`ms`（相对 `onCreate` 的毫秒）、`fuse`（当时 `/storage/emulated` 是否已是
   `fuse_daemon`）、`a`（写 `/sdcard/Download/nsp_race_a<i>.txt` 的结果，该包配 `SANDBOX ON`）、

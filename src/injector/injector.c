@@ -174,6 +174,74 @@ static void retry_wake_main_loop(void) {
     (void)w;
 }
 
+/* ══════════════ 毫秒到期定时器 + 配置重载去抖 ══════════════
+ * 两件事都需要"毫秒级、事件驱动"的唤醒，1s 的周期 timer 等不来：
+ *   ① 重试队列快档 20ms（vold 把 /storage/emulated 装配进应用 ns 的实测窗口
+ *      是 ~140ms，1s 退避等于白等——真机 322 次挂载 avg=142ms 的由来）；
+ *   ② 配置重载去抖窗口（200ms）。
+ * 共用一个一次性 timerfd：每次臂到"两者中最近的那个到期时刻"，到点后跑一轮
+ * 各自的到期逻辑再重新臂。定时器只做唤醒，不做决策（到期判定仍以
+ * nsp_retry_next_due_ms / g_reload_due_ms 为准，幂等可重入）。 */
+static int g_due_fd = -1;
+/* 配置重载去抖状态。旧实现对 inotify 的每个事件立刻做一次全量重载
+   （reload + 全量对账 + 72KB JSON 广播 + 重加全部 watch），真机实测被刷到
+   **每秒 54 次**（sys.log「配置广播: 0 订阅者, JSON 大小 72469 字节」×54/s），
+   而 v1 的 POST 挂载请求就在同一个单线程事件循环里排队——重载风暴直接把
+   挂载应答饿住，这就是"挂载超时"的第二个成因。现在：窗口内只记
+   「待重载 + 首个触发文件 + 合并事件数」，静默 NSP_RELOAD_DEBOUNCE_MS 后做
+   **一次**重载，并打一条 INFO 说明触发源与合并数（旧实现重载完全静默，
+   现场只能靠 broadcast 行反推，取证极难）。连续写入时窗口最多推迟
+   NSP_RELOAD_MAX_DEFER_MS，保证"一直在写"也不会永远不重载。 */
+#define NSP_RELOAD_DEBOUNCE_MS   200
+#define NSP_RELOAD_MAX_DEFER_MS  1000
+static int64_t g_reload_due_ms = 0;  /* 0 = 无待处理重载 */
+static int64_t g_reload_first_ms = 0;
+static char g_reload_trigger[64];    /* 窗口内第一个 .conf 事件的文件名 */
+static unsigned g_reload_events = 0; /* 窗口内合并的 .conf 事件数 */
+static unsigned long g_reload_total = 0; /* 生命周期内真实重载次数（日志序号） */
+
+/* 把一次性定时器臂到"下一个该做事的时刻"（重试到期 / 重载窗口到期）。
+   两者都空 → 解除定时（it_value 全 0）。可被任意线程调用（IPC 线程入队重试时
+   也要臂一下），定时器本身只负责唤醒主循环。 */
+static void arm_due_timer(void) {
+    if (g_due_fd < 0) return;
+    int64_t now = nsp_retry_now_ms();
+    int64_t wait = -1;
+    int64_t retry_wait = nsp_retry_next_due_ms(now);
+    if (retry_wait >= 0) wait = retry_wait;
+    if (g_reload_due_ms > 0) {
+        int64_t rw = g_reload_due_ms - now;
+        if (rw < 0) rw = 0;
+        if (wait < 0 || rw < wait) wait = rw;
+    }
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    if (wait >= 0) {
+        if (wait == 0) wait = 1; /* 0 表示"解除"，立即到期用 1ms 表达 */
+        its.it_value.tv_sec = (time_t)(wait / 1000);
+        its.it_value.tv_nsec = (long)((wait % 1000) * 1000000L);
+    }
+    timerfd_settime(g_due_fd, 0, &its, nullptr);
+}
+
+/* 登记一次"需要重载配置"的请求并臂上去抖窗口（滑动窗口：每个新事件把 deadline
+   往后推 NSP_RELOAD_DEBOUNCE_MS，静默后才真正重载一次）。连续写入时 deadline 最多
+   推到首个事件之后 NSP_RELOAD_MAX_DEFER_MS——否则"一直在写"会让重载永远不发生。
+   trigger 只记**第一个**触发文件（定位"谁在写配置"靠它）。 */
+static void injector_request_reload(const char* trigger, unsigned events) {
+    int64_t now = nsp_retry_now_ms();
+    if (g_reload_due_ms == 0) {
+        g_reload_first_ms = now;
+        snprintf(g_reload_trigger, sizeof(g_reload_trigger), "%s", trigger ? trigger : "(未知)");
+        g_reload_events = 0;
+    }
+    g_reload_events += events ? events : 1;
+    int64_t due = now + NSP_RELOAD_DEBOUNCE_MS;
+    int64_t cap = g_reload_first_ms + NSP_RELOAD_MAX_DEFER_MS;
+    g_reload_due_ms = due > cap ? cap : due;
+    arm_due_timer();
+}
+
 void schedule_retry_mount(const char* pkg, int pid) {
     if (!nsp_retry_schedule(pkg, pid)) {
         LOG_DBG("重试队列已满，丢弃 %s(PID:%d) 的重试", pkg, pid);
@@ -181,6 +249,9 @@ void schedule_retry_mount(const char* pkg, int pid) {
     }
     LOG_DBG("加入重试队列: %s(PID:%d), 队列长度=%d, 已尝试=%d", pkg, pid, nsp_retry_count(),
             nsp_retry_attempts_of(pid));
+    /* 立即叫醒主循环跑一轮（首次尝试 backoff=0，不叫醒就得等 1s tick），
+       同时把毫秒定时器臂到该条目的下一次退避到期时刻（快档 20ms）。 */
+    arm_due_timer();
     retry_wake_main_loop();
 }
 
@@ -220,18 +291,25 @@ void notify_fuses(int sig) {
 
 /* 建监听并挂到 epoll。返回是否**全部**成功；失败 loud 告警（此前静默吞掉
    返回值 → 规则改了不生效且无任何提示）。
-   每次重载 close/新建 fd：IN_IGNORED 后旧 fd 上的 watch 全失效，复用会
-   得到"看着在监听、事件全丢"的假象；重建是唯一可靠口径。 */
+
+   幂等刷新，不 close/重建 fd：inotify_add_watch 对**已存在**的 watch 直接返回
+   同一个 wd（只改 mask，无新内核对象），所以重复调用是廉价的；而目录被替换
+   （watch 收到 IN_IGNORED 后内核已删除该 watch）时再 add 会重新建立。旧实现
+   每次重载都 close+inotify_init1+epoll_ctl+全量 add_watch，在配置重载风暴里
+   （真机实测 54 次重载/秒）等于每秒重建 54 次监听器，纯属给单线程事件循环
+   添堵——而 v1 的 POST 挂载请求就在同一个循环里排队。 */
 static bool setup_inotify_watches(void) {
-    if (g_inotify_fd >= 0) {
-        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_inotify_fd, nullptr);
-        close(g_inotify_fd);
-        g_inotify_fd = -1;
-    }
-    g_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (g_inotify_fd < 0) {
-        LOG_ERR("inotify_init1 失败: %s（配置热重载失效，改配置需重启）", strerror(errno));
-        return false;
+        g_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (g_inotify_fd < 0) {
+            LOG_ERR("inotify_init1 失败: %s（配置热重载失效，改配置需重启）", strerror(errno));
+            return false;
+        }
+        struct epoll_event ev = {.events = EPOLLIN, .data.fd = g_inotify_fd};
+        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_inotify_fd, &ev) != 0) {
+            LOG_ERR("inotify fd 挂入 epoll 失败: %s（配置热重载整体失效）", strerror(errno));
+            return false;
+        }
     }
     bool ok = true;
     int wd = inotify_add_watch(g_inotify_fd, CONFIG_DIR,
@@ -256,11 +334,6 @@ static bool setup_inotify_watches(void) {
         }
     }
     config_unlock_read();
-    struct epoll_event ev = {.events = EPOLLIN, .data.fd = g_inotify_fd};
-    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_inotify_fd, &ev) != 0) {
-        LOG_ERR("inotify fd 挂入 epoll 失败: %s（配置热重载整体失效）", strerror(errno));
-        ok = false;
-    }
     return ok;
 }
 
@@ -1086,6 +1159,9 @@ typedef struct {
        下一次 tick（挂载失败后视图迟到的那段最长可差近 1s，直接体现为
        "代理视图比应用晚到"的观感延迟） */
     int retry_fd;
+    /* 毫秒到期定时器（一次性）：臂到「重试队列下一个到期」与「配置重载去抖窗口
+       到期」中最近者。1s 周期 tick 装不下 20ms 快档退避与 200ms 去抖窗口。 */
+    int due_fd;
 } InjectorFds;
 
 static void parse_cli_args(int argc, char* argv[], bool* start_passive_out) {
@@ -1182,6 +1258,14 @@ static void injector_setup_epoll(InjectorFds* fds) {
     struct epoll_event ev_retry = {.events = EPOLLIN, .data.fd = retry_fd};
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, retry_fd, &ev_retry);
     g_retry_wake_fd = retry_fd;
+    int due_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (due_fd < 0) {
+        PERROR("无法创建到期定时器");
+        exit(1);
+    }
+    struct epoll_event ev_due = {.events = EPOLLIN, .data.fd = due_fd};
+    epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, due_fd, &ev_due);
+    g_due_fd = due_fd; /* 初始不臂：it_value 全 0 = 解除定时 */
     int ipc_sock = ipc_server_init();
     if (ipc_sock < 0) {
         PERROR("无法初始化 IPC 服务");
@@ -1193,6 +1277,7 @@ static void injector_setup_epoll(InjectorFds* fds) {
     fds->timer_fd = timer_fd;
     fds->ipc_sock = ipc_sock;
     fds->retry_fd = retry_fd;
+    fds->due_fd = due_fd;
 }
 
 static void injector_start_fuses(bool start_passive) {
@@ -1291,7 +1376,7 @@ static void retry_pending_mounts(void) {
     enum { NSP_RETRY_TICK_BUDGET = 4 };
     for (int i = 0; i < NSP_RETRY_TICK_BUDGET; i++) {
         NspRetryEntry e;
-        int what = nsp_retry_next(&e, time(NULL));
+        int what = nsp_retry_next(&e, nsp_retry_now_ms());
         if (what == NSP_RETRY_NONE) break;
         if (what == NSP_RETRY_GIVEUP) {
             /* 退避耗尽：整个生命周期只 loud 这一次，应用继续用原生视图 */
@@ -1311,6 +1396,9 @@ static void retry_pending_mounts(void) {
            把条目摘掉，于是每个 tick 都从头再试）。 */
         perform_app_mount(e.pkg, e.pid, uid, nullptr, "失败重试");
     }
+    /* 队列里还有未到期的条目 → 把毫秒定时器臂到最近那个到期时刻（快档 20ms）；
+       空了就解除定时（nsp_retry_next_due_ms 返回 -1）。 */
+    arm_due_timer();
 }
 
 /* 全局替换（v2/v3）周期对账 ==================================================
@@ -1372,36 +1460,49 @@ static void on_timer_event(int timer_fd) {
         reap_zombies();
         maybe_periodic_scan();
         retry_pending_mounts();
+        arm_due_timer(); /* retry_pending_mounts 内部已臂过一次，这里兜住其它路径 */
     }
 }
 
+/* 一次唤醒把 inotify fd **读空**，再把本批事件折成一条"待重载"请求交给去抖窗口。
+   旧实现只 read 一次 4096 字节（约 100 条事件）就返回：一次唤醒里剩下的上千条
+   要么推迟到下一轮 epoll，要么因内核队列溢出被丢弃——真机 20:05:18 一秒 633 条
+   的 unlink 与 20:13:00 一秒 54 次重载都是从这儿漏进来的。 */
 static void on_inotify_event(void) {
-    char inotify_buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-    ssize_t len = read(g_inotify_fd, inotify_buf, sizeof(inotify_buf));
-    if (len <= 0) {
-        /* EAGAIN：非阻塞 fd 被误唤醒，正常；其余 errno 记一行便于定位 */
-        if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-            LOG_ERR("inotify read 失败: %s", strerror(errno));
-        return;
-    }
-    bool need_reload = false;
+    char inotify_buf[8192] __attribute__((aligned(__alignof__(struct inotify_event))));
     bool overflow = false;
-    for (char* ptr = inotify_buf; ptr < inotify_buf + len;) {
-        struct inotify_event* ev = (struct inotify_event*)ptr;
-        /* IN_Q_OVERFLOW 是 wd == -1 的合成事件，**不代表任何具体文件**；
-           队列溢出说明此间有事件被内核丢弃（用户/规则目录可能已改而我们没
-           看到）。此前因 `ev->len` 为 0 被整条跳过 → 规则改了不生效且无提示。
-           这里保守地当成"有变更"触发一次全量重载（重载幂等，代价可接受）。 */
-        if (ev->mask & IN_Q_OVERFLOW) overflow = true;
-        if (ev->len && (strcmp(ev->name, "injector.conf") == 0 || strstr(ev->name, ".conf")))
-            need_reload = true;
-        ptr += sizeof(struct inotify_event) + ev->len;
+    unsigned conf_events = 0;
+    char first_name[64] = {0};
+    for (;;) {
+        ssize_t len = read(g_inotify_fd, inotify_buf, sizeof(inotify_buf));
+        if (len <= 0) {
+            /* EAGAIN：已读空（非阻塞 fd 的正常收尾）；其余 errno 记一行便于定位 */
+            if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                LOG_ERR("inotify read 失败: %s", strerror(errno));
+            break;
+        }
+        for (char* ptr = inotify_buf; ptr < inotify_buf + len;) {
+            struct inotify_event* ev = (struct inotify_event*)ptr;
+            /* IN_Q_OVERFLOW 是 wd == -1 的合成事件，**不代表任何具体文件**；
+               队列溢出说明此间有事件被内核丢弃（用户/规则目录可能已改而我们没
+               看到）。此前因 `ev->len` 为 0 被整条跳过 → 规则改了不生效且无提示。 */
+            if (ev->mask & IN_Q_OVERFLOW) overflow = true;
+            if (ev->len && strstr(ev->name, ".conf")) {
+                conf_events++;
+                if (!first_name[0]) snprintf(first_name, sizeof(first_name), "%s", ev->name);
+            }
+            ptr += sizeof(struct inotify_event) + ev->len;
+        }
     }
     if (overflow) {
-        LOG_WRN("inotify 队列溢出（事件被内核丢弃），触发一次全量配置重载以补齐");
-        need_reload = true;
+        LOG_WRN("inotify 队列溢出（事件被内核丢弃），按一次配置重载补齐");
+        if (!first_name[0]) snprintf(first_name, sizeof(first_name), "IN_Q_OVERFLOW");
+        if (conf_events == 0) conf_events = 1;
     }
-    if (need_reload) g_reload_config = 1; /* 直接触发，去除 cooldown race */
+    /* 有 .conf 变更 → 只登记去抖窗口，不在事件处理里直接跑全量重载：
+       重载要全量解析 + 全量对账 + 72KB JSON 广播，跑在单线程事件循环里，
+       而 v1 的 POST 挂载请求就在同一个循环排队。 */
+    if (conf_events > 0) injector_request_reload(first_name, conf_events);
 }
 
 static void on_ipc_accept(int ipc_sock) {
@@ -1431,9 +1532,34 @@ static void on_client_fd(int fd) {
     }
 }
 
+/* 配置重载的唯一执行点。只有两件事能推进来：SIGHUP（显式请求，立即执行）
+   与去抖窗口到期（inotify 事件折叠后）。重载次数与触发源必须留痕——旧实现
+   重载完全静默，现场只能靠"配置广播: 0 订阅者"行反推次数，取证极难；
+   而"到底谁在写 .conf"正是本次真机 54 次/秒风暴查不下去的原因。 */
 static void handle_pending_reload(void) {
-    if (g_reload_config && !g_should_exit) {
-        g_reload_config = 0;
+    if (g_should_exit) return;
+    const char* why;
+    if (g_reload_config) {
+        g_reload_config = 0; /* SIGHUP：显式指令，不参与去抖 */
+        snprintf(g_reload_trigger, sizeof(g_reload_trigger), "SIGHUP");
+        g_reload_events = 0;
+        g_reload_due_ms = 0;
+        why = "信号";
+    } else if (g_reload_due_ms > 0 && nsp_retry_now_ms() >= g_reload_due_ms) {
+        why = "inotify";
+    } else {
+        return; /* 没有待处理重载，或去抖窗口还没到期 */
+    }
+    char trigger[64];
+    snprintf(trigger, sizeof(trigger), "%s", g_reload_trigger);
+    unsigned merged = g_reload_events;
+    g_reload_due_ms = 0;
+    g_reload_first_ms = 0;
+    g_reload_events = 0;
+    g_reload_trigger[0] = '\0';
+    g_reload_total++;
+    LOG("配置重载 #%lu: 来源=%s 触发=%s 合并事件=%u", g_reload_total, why, trigger, merged);
+    {
         fast_pid_cache_clear();
         ChangedPkg out_changed[128];
         config_lock_write();
@@ -1456,12 +1582,34 @@ static void handle_pending_reload(void) {
             inject_media_fuse();
         }
 
-        if (changed_count == -1) {
-            audit_tracked_apps();
-        } else if (changed_count > 0) {
-            audit_and_remount_specific_apps(out_changed, changed_count);
+        if (inject_is_global_replace() || inject_restore_nontarget()) {
+            /* v2/v3：全局替换 + 还原策略，保持原有审计粒度 */
+            if (changed_count == -1) {
+                audit_tracked_apps();
+            } else if (changed_count > 0) {
+                audit_and_remount_specific_apps(out_changed, changed_count);
+            }
+        } else {
+            /* v1（逐应用挂载）：上面那条 diff 只认「应用段 inject_enable 翻转 /
+               全局开关变化」，规则内容变化、类别段与 App-rules 子文件的增删都会
+               判成 changed_count==0 → 旧实现什么都不做，运行中的应用只能靠杀进程
+               才换视图。这里无论 changed_count 取何值都对运行中应用做一次全量
+               对账：该挂的挂上、该卸的卸掉（热挂载 / 热卸载）。 */
+            audit_running_apps();
         }
     }
+    arm_due_timer(); /* 重载可能改了活跃用户集合，重臂一次兜住 */
+}
+
+/* 毫秒到期定时器到点：跑「重试到期」与「重载窗口到期」，再重新臂。
+   定时器只负责唤醒，到期判定仍在各自函数里（幂等、可被 1s tick 重复触发）。 */
+static void on_due_event(int due_fd) {
+    uint64_t expirations;
+    while (read(due_fd, &expirations, sizeof(expirations)) == sizeof(expirations)) {
+    }
+    retry_pending_mounts();
+    handle_pending_reload();
+    arm_due_timer();
 }
 
 static void injector_event_loop(const InjectorFds* fds) {
@@ -1485,6 +1633,8 @@ static void injector_event_loop(const InjectorFds* fds) {
                 while (read(fds->retry_fd, &drained, sizeof drained) == sizeof drained) {
                 }
                 retry_pending_mounts();
+            } else if (fd == fds->due_fd) {
+                on_due_event(fds->due_fd);
             } else if (fd == g_inotify_fd) {
                 on_inotify_event();
             } else if (fd == fds->ipc_sock) {
@@ -1510,6 +1660,7 @@ static void injector_shutdown(const InjectorFds* fds) {
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);
+    if (fds->due_fd >= 0) close(fds->due_fd);
     if (sig_fd >= 0) close(sig_fd);
     if (g_epoll_fd >= 0) close(g_epoll_fd);
 }
@@ -1523,7 +1674,7 @@ int main(int argc, char* argv[]) {
                               : g_inject_method == INJECT_METHOD_V2 ? "全局替换，非目标应用还原"
                                                                     : "全局替换，不还原非目标（默认全局挂载）";
     LOG("注入方法: v%d（%s）", (int)g_inject_method, method_desc);
-    InjectorFds fds = {.sig_fd = -1, .timer_fd = -1, .ipc_sock = -1};
+    InjectorFds fds = {.sig_fd = -1, .timer_fd = -1, .ipc_sock = -1, .due_fd = -1};
     injector_setup_epoll(&fds);
     injector_start_fuses(start_passive);
     injector_event_loop(&fds);

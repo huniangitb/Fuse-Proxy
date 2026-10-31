@@ -74,7 +74,7 @@ flowchart TB
 
 - **规则决策**（`fw_rules.c`）：本进程内解析 REDIRECT/SANDBOX/HIDE/ALLOW/RO 与 FTP 前缀归属，输出声明式 `NspPathDecision`（见 `src/daemon/fw_rules.h`）；无 `<uid>/` 用户层的路径（挂载点根）不参与规则，直通处理。
 - **后端分派**：决策命中 FTP 规则（`rr.is_ftp`）时经 `module_backend_lookup` 定位后端模块并改调其 `backend_*` 方法；未命中则本地直通（`module_backend_active()` 快速路径零开销）。后端模块**从内存副本加载**（memfd），磁盘文件被原子替换或就地覆盖都不会破坏运行中的映像。
-- **打开中删除（open-unlink）**：本地路径由 `vfs_rename` 识别 libfuse 的 `.fuse_hidden<16hex>` 隐藏名并**直接 unlink 源文件**（本地 backing 支持 POSIX 的"先删名、后关句柄"），目录里不再出现隐藏文件——与 Android 自带 FUSE 的可见行为一致；删除前的属性快照供后续 `fstat`（内核 GETATTR 常常不带 fh）。后端路径（FTP/SFTP）仍沿用隐藏名：远端立即删除会让正在下载/上传的句柄失去数据源。此外 readdir 的可见性单点（`vfs_entry_visibility`）统一过滤 `.fuse_hidden*`——历史残留与后端隐藏文件在目录列举中一律不可见（只过滤、不删除）。
+- **打开中删除（open-unlink）**：本地路径由 `vfs_rename` 识别 libfuse 的 `.fuse_hidden<16hex>` 隐藏名并**直接 unlink 源文件**（本地 backing 支持 POSIX 的"先删名、后关句柄"），目录里不再出现隐藏文件——与 Android 自带 FUSE 的可见行为一致；删除前的属性快照供后续 `fstat`（内核 GETATTR 常常不带 fh）。后端路径（FTP/SFTP）仍沿用隐藏名：远端立即删除会让正在下载/上传的句柄失去数据源。此外 `.fuse_hidden*` **不是特殊条目**：`vfs_entry_visibility` 不按隐藏名过滤，readdir 看到就按普通条目列举（可 `getattr`/`open`），也不在列举时就地删除——本层本地路径不产生新隐藏名（上面的直删分支），磁盘上出现的残留来自旧版本 daemon 或下层 FUSE（设备上 `/data/media` 由 MediaProvider 的 FUSE 提供时，我们穿过下层 unlink 会让下层 libfuse 把名字改成 `.fuse_hidden` 等 RELEASE 再删），一律保留可见，便于取证与手工回收。后端路径（FTP/SFTP）仍用隐藏名兜底，其隐藏名同样按普通条目可见（只存活到最后一个句柄关闭）。
 - **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。规则引擎内部另有一份同源解析（`fw_rules.c` 的 static `br_get_app_cfg`，它需要 pkg 做 `$package` 变量展开与沙箱隔离）：两者同在框架进程内、算法同源、结果一致。
 
 模块架构详见 `modules.md`。
@@ -182,7 +182,15 @@ FUSE 回调（如 getattr）
 
 ### 4.4 跨应用隔离
 
-`br_is_other_app_pkg` 判定应用访问 `/Android/data|obb/<其他包>/`。隔离**只作用于列举**——readdir 条目级 probe 过滤；resolve（getattr/open）**不判隐藏**，已知路径的文件可正常打开（修复 MT 管理器跨应用列表可见但打开 ENOENT）。**probe 的入参契约是带 `<uid>/` 层的原始 FUSE 路径**（引擎自行剥层后匹配，见 `NspQueryCtx` 注释）：两个调用点（readdir 本地扫描、虚拟目录判空）若传剥过层的路径，探针会因「无用户层」直接早退，等于列举侧完全不过滤——HIDE 条目照旧列出而 stat 报 ENOENT（`test_rules.py` §25 守护）。该标志只存在于 `NspProbeResult`（`is_other_app_pkg`），`NspPathDecision` 不携带。`CONFIG_DIR` 下所有访问无条件隐藏。
+`br_is_other_app_pkg` 判定调用方访问 `/Android/data|obb/<他包>/`。范围只有这两棵子树（`media`/`obj` 历史上不隔离，扩范围会改变既有行为）。隔离与 `HIDE` **同口径**：判定落在 `br_sanitize_and_check_hidden()` 单一出口上，`resolve`（getattr/open）与 `probe`（readdir 条目过滤）共用它，故「看不见 = 打不开」。旧实现只在 probe 侧过滤，任何按名打开的命令都能读到内容（用户报障：特殊命令绕过；当时只能靠 `HIDE Android` + 逐包 `ALLOW` 临时兜住），修复时把判定上移到该出口，probe 各路径仍显式叠加同一判据（快路径不经过 sanitize）。
+
+放行与逃生阀：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包，`br_pkg_same_base`）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局关闭隔离（默认 OFF = 生效）。`SANDBOX ON` 生效的调用方同样豁免（`br_sandbox_active` 复刻 `br_to_real_path` 的三层合并口径）：其 `Android/data|obb` 访问已被重定向进自己的沙盒镜像，读不到他包内容，判 ENOENT 只会让镜像不可用（`test_monitor_layers` 守护）。已知边界：`uid.map` 是 uid→单包名，旧 `sharedUserId` 共享 uid 的两个应用会互判「他包」——现代 Android 上罕见，逃生阀同上（见 `config.md` §4.1）。
+
+backing 门配套收紧（`fw_rules.c` 的 `fw_data_mediation_required()` / `fw_backing_mediation_required_for()`）：隔离生效时 `data`/`obb` 子树（含直接父 `/Android`）一律要求 daemon 仲裁——backing 直通用 daemon 凭证、内核绕过 daemon，per-caller 裁决无从落地（该子树此前直通等于隔离整体失效）。代价是这部分 I/O 回到全量仲裁路径，`ALLOW_CROSS_APP_DATA ON` 后恢复按规则的细粒度直通。
+
+观测：隔离拒绝与 `HIDE` 一样是静默 ENOENT，故 `br_note_isolation()` 记限速 DEBUG（首命中 + 每 1024 次一条，带调用方包名与判定路径），现场据此区分「我们在拦」与 ROM/规则问题。
+
+**probe 的入参契约是带 `<uid>/` 层的原始 FUSE 路径**（引擎自行剥层后匹配，见 `NspQueryCtx` 注释）：两个调用点（readdir 本地扫描、虚拟目录判空）若传剥过层的路径，探针会因「无用户层」直接早退，等于列举侧完全不过滤——HIDE 条目照旧列出而 stat 报 ENOENT（`test_rules.py` §25 守护）。该标志只存在于 `NspProbeResult`（`is_other_app_pkg`），`NspPathDecision` 不携带。`CONFIG_DIR` 下所有访问无条件隐藏。
 
 ### 4.5 决策强制（框架单点）
 
@@ -228,15 +236,25 @@ FUSE 回调（如 getattr）
 - `DEFER`：**仅 v1 目标应用**。pre 通道**只裁决、不挂载**：此刻进程还在 zygote 的挂载命名空间里（部分 ROM 该 ns 里就有 `/storage/emulated`），在这里挂载等于把项目 FUSE 装进 zygote ns——之后 fork 的每个应用（含非目标）都会继承它，且 `cleanup_app_mounts` 只会在应用自己的 ns 里卸载，这份挂载没人能清。应用自己的 ns 要到 `postAppSpecialize` 才成立，那才是唯一该挂载的时机。模块把进程记为 pending，在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST`。
 - `ERR`：主线程短等内没挂上（或 FUSE 暂不可用）；应用照常启动，本次无代理视图，挂载交给后台重试队列（静默、有界）。
 
-`POST` 到达时 injector 在应用命名空间内做一次**短预算**（`IPC_MOUNT_READINESS_MS`，250ms）尝试，**挂载完成才回 `OK`**——健康设备上这段只有 1~3ms（实测 post 阶段视图已就绪），于是应用首个 `open()` 就看见代理视图；等不到就立即 fail-open 回 `OK`，把补挂载交给后台重试队列。**应用主线程上的预算必须小于"能感知"的量级**：旧值 1800ms 在"视图迟迟不出现"的设备上等于每次冷启动固定多等 1.8s，然后失败、再排重试——真机上报的正是"冷启动明显变慢"。
+`POST` 到达时 injector 在应用命名空间内做一次**短预算**尝试，**挂载完成才回 `OK`**。预算按通道分级（`include/ipc_server.h`）：`POST` 走 `IPC_MOUNT_INLINE_MS`（**20ms**），旧模块的 `REQ`/无 post 通知的通道走 `IPC_MOUNT_READINESS_MS`（250ms，那条路只能就地等）。分级依据是真机实测（Redmi manet / Android 14，8 核，322 次 `IPC挂载完成` 全量统计）：vold 把 `/storage/emulated` 装进应用命名空间的窗口是 **135–150ms**（`ns操作 pid=N 耗时: 133~152ms`，集中在 5ms 的整数倍上，正是就绪门控的 `usleep(5*1000)` 步进），250ms 预算下 **202/322 次**落在等待里、**59 次（18%）**直接打爆预算。20ms 对用户不可感知，而"视图还没出现"时应用本来也读不到存储——等与不等对功能的唯一差别是**应用主线程被冻多久**。故 20ms 内没挂上就立即 fail-open 回 `OK`（`perform_app_mount_sync` 返回 `NSP_MOUNT_DEFERRED`，判据 errno ∈ {ENOENT, ENODEV, ETIMEDOUT} 或后台通道的 `NSP_READINESS_QUIET`），把补挂载交给后台重试队列（首档 20ms 快退避，见下条）；**20ms 档的缺失按预期未就绪记 DEBUG、不写错误日志**（判据 `NSP_READINESS_INLINE_MAX_MS`：预算 ≤ 50ms 属"就地快试"，等不到是常态；旧 250ms 预算下错误日志已有 31 条"缺失(250ms 内未出现)"，改成 20ms 后若仍 loud 会变成 202/322 次挂载各一条）；此时应用首个 `open()` 看到原生视图，与旧实现"等满预算再失败"的可见行为相同，只是不再白等。**应用主线程上的预算必须小于"能感知"的量级**：旧值 1800ms 在"视图迟迟不出现"的设备上等于每次冷启动固定多等 1.8s，然后失败、再排重试——真机上报的正是"冷启动明显变慢"；**把 250ms 随手放大到 1s 同样不行**（等于把 18% 的等待换成 100% 的 1s 冻结），所以只调小、并把超预算的那部分交给后台。
 
-**后台重试必须收敛（真机回归）**：重试记账在 `src/injector/retry_queue.c`。旧实现把"异步派发成功"当成"挂载成功"——派发后立即摘条目，真正的失败由完成回调重新入队（新条目尝试次数归零），退避与 5 次上限因此永远不生效：挂不上的应用以 **1Hz 永久重试**，每轮写一条 错误日志 + WARN + ERROR，并持续 fork/读 mountinfo。现在尝试次数随条目保存：相邻尝试按 1/2/4/8s 退避、同一 pid 最多 `NSP_RETRY_MAX_ATTEMPTS`（6）次，超限 loud 一次后放弃（应用继续用原生视图），成功才清账。后台通道（异步扫描 / 失败重试）的"目标未就绪"用负值哨兵 `NSP_READINESS_QUIET` 只记 DEBUG——错误日志 只留给权威尝试。
+**后台重试必须收敛（真机回归）**：重试记账在 `src/injector/retry_queue.c`。旧实现把"异步派发成功"当成"挂载成功"——派发后立即摘条目，真正的失败由完成回调重新入队（新条目尝试次数归零），退避与 5 次上限因此永远不生效：挂不上的应用以 **1Hz 永久重试**，每轮写一条 错误日志 + WARN + ERROR，并持续 fork/读 mountinfo。现在尝试次数随条目保存，且记账精度从**秒**降到**毫秒**（`nsp_retry_now_ms()` = CLOCK_MONOTONIC；秒粒度装不下真机 135–150ms 的视图窗口，旧的首档退避 1s 等于白等一整秒）：三档退避 **20ms×10 → 100ms×5 → 1/2/4/8s（封顶 8s）**，同一 pid 最多 `NSP_RETRY_MAX_ATTEMPTS`（20）次，超限 loud 一次后放弃（应用继续用原生视图），成功才清账。主循环为此多了一枚**一次性毫秒定时器**（`g_due_fd`，臂到"重试队列下一个到期"与"重载去抖窗口到期"中最近者），否则 20ms 快档只能等 1s 周期 tick。后台通道（异步扫描 / 失败重试）的"目标未就绪"用负值哨兵 `NSP_READINESS_QUIET` 只记 DEBUG——错误日志 只留给权威尝试。
 
 **合并挂载的两条硬约束（"某些设备存储全空"的守护）**：
 1. **源预检在卸载之前**：源必须是本命名空间内真实的 FUSE 挂载（`statfs` == `FUSE_SUPER_MAGIC`）。不同 ROM 的 `/mnt` 传播设置可能只把目录传进应用 ns、FUSE 没传进来——此时 bind 照样"成功"，但 `/storage/emulated` 是空的。旧实现先卸载目标再 mount，源不可用就把应用的原生存储拆成空目录；现在预检失败直接返回，目标一点不动。
 2. **传播隔离 + 挂载后校验**：动手前先 `MS_PRIVATE|MS_REC` 把目标子树置私有（共享挂载组上的卸载事件会传播到 zygote/其它应用命名空间，真机表现是"整台设备的 /storage/emulated/0 都空了"）；挂载后再 `statfs` 复核目标确为 FUSE 视图，否则卸载本次挂载并回滚族根视图。
 
-**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时把 pre 通道当作"只裁决"；旧模块（不带 proto）仍走"就地挂载（短预算）+ 后台重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open）。**模块侧不按 uid 硬编码**：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，系统应用是否注入由 `SKIP_SYSTEM_APPS`（默认 ON）在 injector 侧裁决——硬编码会让该开关写 OFF 也永不生效，且 v2 下系统应用连还原机会都没有（真机实测：Settings uid 1000 一直停在项目视图），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector 挂载预算 250ms（+0.8s 子进程余量）< companion 等 injector 1.5s < 模块等 companion 2s；pre 通道只裁决、往返 <10ms < companion 0.8s < 模块 1.2s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
+**挂载耗时的分段观测（`[ns计]`）**：`do_combined_mount` 的每一步都打点，慢挂载不再只能靠"总耗时 135ms"猜。段名固定为 **就绪 / 预检 / 私有 / mountinfo / umount / bind / 复核 / 子挂载 / 合计**，一条 DEBUG：
+
+```
+[ns计] com.example 就绪=133ms 预检=1ms 私有=0ms mountinfo=1ms umount=2ms bind=3ms 复核=1ms 子挂载=2ms 合计=143ms
+```
+
+打点落在子进程（`run_in_mnt_ns_timeout` fork 出来的那个），而输出必须在父进程——fork 后栈是 COW，子进程写自己的栈父进程看不见。故计时段放在一张 `MAP_SHARED|MAP_ANONYMOUS` 的共享页里（`struct NsMountSeg`，仅同步路径 `ns_combined_mount` 传入，异步/重试路径传 NULL、零成本），父进程读完 `munmap`。**输出必须限速，否则这段计时自己就是新的刷屏源**（322 次挂载里 202 次超过 100ms，逐条打等于每次挂载都写一行）：总耗时 ≥20ms 一定打（慢的才是排查目标），否则 1/1024 采样；再加每秒 20 条的硬上限，超出部分只累加，下次输出时附"折叠 N 条"。真机现场靠这一行把"135ms 花在哪"钉死在**就绪门控**上（预检/私有/mountinfo/umount/bind/复核全部 ≤3ms），据此才敢把 POST 预算改成 20ms + fail-open（见上条），而不是去优化那几个 syscall。
+
+**per-事件 DEBUG 必须限速（真机日志风暴）**：`vfs_rename` 的本地 open-unlink 直删分支曾经每删一个文件打一条 `open-unlink 本地直删（不产生隐藏名）: <path>`——真机 `com.taobao.idlefish` 批量删 lockfile 时 **一秒 633 行**，把 `sys.log` 里有用的行全冲掉。现在收口到唯一出口 `log_open_unlink_direct()`（`src/daemon/fuse_daemon.c`，范式同 `fw_rules.c` 的 `br_note_isolation`）：**首条打全路径**，此后每 1024 条一条、只报**目录** + 累计计数（"哪个应用在批量删"够用，且不重复打文件名）。同一现场的另一处风暴是配置重载（见 §5.2），两处的共同纪律是：**热路径上的观测必须有上界**，否则观测本身会变成故障源。
+
+**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时把 pre 通道当作"只裁决"；旧模块（不带 proto）仍走"就地挂载（短预算）+ 后台重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open）。**模块侧不按 uid 硬编码**：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，系统应用是否注入由 `SKIP_SYSTEM_APPS`（默认 ON）在 injector 侧裁决——硬编码会让该开关写 OFF 也永不生效，且 v2 下系统应用连还原机会都没有（真机实测：Settings uid 1000 一直停在项目视图），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector 挂载预算 20ms（POST；旧模块通道 250ms）+0.8s 子进程余量 < companion 等 injector 1.5s < 模块等 companion 2s；pre 通道只裁决、往返 <10ms < companion 0.8s < 模块 1.2s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
 
 #### 注入方法（`--inject-method=v1|v2|v3`）
 
@@ -268,7 +286,7 @@ injector  ipc_server.c 解析 ──→ 置 g_passive_mode，转入被动模式
                             ←── OK / DEFER / ERR
 app 进程  postAppSpecialize ──→ "POST <pkg> <pid> <uid> <proto>"（仅 pre 收到 DEFER 时）
 companion（root）           ──→ "POST ..."（root 通道，与 REPORT 同一身份模型）
-injector  短预算挂载（250ms）──→ 完成才回 OK；等不到就 fail-open 交后台重试
+injector  短预算挂载（POST 20ms / 旧模块 250ms）──→ 完成才回 OK；等不到就 fail-open 交后台重试
                             ←── OK / ERR（应用在此阻塞，仍早于 Java 代码）
 ```
 
@@ -279,9 +297,12 @@ injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫�
 
 ### 5.2 配置热重载
 
-- injector 用 inotify 监听 `injector.conf` 与 `App-rules*/*.conf`。
+- injector 用 inotify 监听 `injector.conf` 与 `App-rules*/*.conf`，**事件先去抖/合并再重载**：`NSP_RELOAD_DEBOUNCE_MS`（200ms）滑动窗口——每个事件重置 deadline，但最多推迟 `NSP_RELOAD_MAX_DEFER_MS`（1000ms，避免管理器持续写入时永不重载）；窗口到期才做**一次**全量重载，SIGHUP（显式指令）不参与去抖、立即执行。旧实现对每个 inotify 事件立刻重载一次：真机现场 **一秒 54 次**（`sys.log` 里「配置广播: 0 订阅者, JSON 大小 72469 字节」×54/s），而重载全程（`reload_config_rules_diff` 全量解析 + 重加全部 inotify watch + 72KB 广播 + `audit_running_apps` 扫 /proc）都在 injector **单线程事件循环**里——v1 的 `POST` 挂载请求也在同一个循环排队，于是挂载应答被重载饿住，现场表现就是「挂载超时」（与 vold 的 135–150ms 视图窗口是两个独立成因，叠加起来正是 322 次挂载里 18% 打爆 250ms 的那部分）。
+- **重载必须留痕**：每次真实重载打一条 INFO `配置重载 #N: 来源=inotify|信号 触发=<首个 .conf 文件名> 合并事件=<n>`。旧实现重载完全静默，现场只能靠"配置广播: 0 订阅者"反推次数，"到底谁在写 .conf"根本查不出来——这条日志就是那个问题的取证入口。
+- **inotify 事件必须读干净**：处理器一次 `read()` 到 EAGAIN（旧实现每次只读 4096 字节，队列一溢出就丢事件，只能靠一次全量重载兜底）；`IN_Q_OVERFLOW` 也折算成一次重载请求。`setup_inotify_watches()` 改为**幂等重加**（`inotify_add_watch` 对已存在的 watch 返回同一 wd，目录被替换后自动重建），不再每次重载都 close + `inotify_init1` + `epoll_ctl` + 全量重加。
 - fuse_daemon 框架侧（`src/daemon/fw_config.c`）**唯一负责**读取与解析规则配置：单个 `config_monitor_thread` 监听规则目录，变更后经 `config_read_view()` 重新解析为扁平视图、原子换入并递增代际，再**按各模块在 `init` 内的订阅**（`api->subscribe_rules`）过滤后回调其监听器（`api->set_config_listener`）。模块不再各自读文件、各自跑 inotify。框架**自己也用同一份视图建索引**（`config_build_from_view()`）：内建规则引擎（`fw_rules.c` 的 AppConfig/Trie/uid 缓存）与 MONITOR 三层合并都建立在它之上，故模块缺席时规则与监控照样成立。
 - injector 经 `config_publisher` 向订阅者广播；`global_inject` 切换则广播全量变更（`changed_count=-1`）触发全应用重挂，否则仅通知受影响包。
+- **v1 逐应用挂载的热对账**：`reload_config_rules_diff()`（`config_parser.c`）只比较 `inject_enable` 与 `global_inject`，规则内容增删、类别段与 `App-rules/<pkg>.conf` 子文件的改动都让它返回 `0`（「不处理单个挂载树内的文件规则变化」）；因此 v1 在**每次**配置重载后都调用 `audit_running_apps()`（`inject_target.c`），对「追踪表 ∪ 运行中应用注册表」做一次全量对账：`is_target_app() && app_has_active_rules()` 为真且未挂 → `perform_app_mount()`；为假但挂着 → `cleanup_app_mounts()` + `unmark_injected()`（`cleanup_app_mounts()` 自身也已失效缓存）。动作前先 `invalidate_app_mount_cache()`（`mount_manager.c`：缓存只是上次探测结果，热路径不能信），故可重复、幂等、单条失败不影响其余应用与主循环，末尾只打一条汇总日志。运行中应用注册表的唯一来源是 zygisk 通知（`ipc_server.c` 对每个被通知的应用 `all_apps_upsert()`）——被动模式下周期扫描已停，不登记就无从发现「已经在跑、现在才变目标」的进程。v2/v3 仍按 `changed_count` 走 `audit_tracked_apps()` / `audit_and_remount_specific_apps()`（全局视图本就覆盖所有应用）。
 
 ### 5.3 路径缓存失效（内核侧）
 
@@ -336,3 +357,22 @@ FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_prob
 
 - `README.md` — 构建与产物　|　`AGENTS.md` — 构建陷阱、红线、测试映射
 - `modules.md` — 模块架构与第三方开发　|　`config.md` — 配置语法与路径变量
+
+## 附：原 AGENTS.md「架构要点」（逐字保留）
+
+> 该节原在 `AGENTS.md`（每轮注入上下文），已压缩成「只留陷阱」的版本；
+> 这里是压缩前的完整文本，权威细节仍以本文件正文与 `docs/modules.md` 为准。
+
+## 架构要点
+
+- **v1 视图就绪语义（两段式，2026-10 起）**：pre 通道**只裁决、不挂载**（`OK`/非目标、`DEFER`/v1 目标、`ERR`）——此刻进程还在 zygote 的挂载 ns 里（部分 ROM 该 ns 就有 `/storage/emulated`），在此挂载会把项目 FUSE 装进 zygote ns，之后 fork 的每个应用都继承它且没人能清。应用自己的 ns 到 `postAppSpecialize` 才成立：模块保留 pre 的 companion 连接（post 已降权、无法再 `connectCompanion`）发 `POST`（**仍早于应用 Java 代码**），injector 带**短预算** `IPC_MOUNT_READINESS_MS`（250ms）尝试，挂完才回 `OK`（健康设备 1~3ms，首写即见代理视图），等不到就 fail-open 回 `OK` 交后台重试。**主线程预算必须小到不可感知**：旧值 1800ms 在视图迟迟不出现的设备上等于每次冷启动多等 1.8s（真机"冷启动明显变慢"）。模块超时同步收窄（pre 1.2s / post 2s，companion 0.8s / 1.5s，DEFER 后 idle 5s）；pre 没拿到明确 `OK` 时**仍记 pending**（旧实现"超时按 OK"会静默吞掉补挂载）。`proto` 握手：旧模块走原路径（就地挂载 + 后台重试），v2/v3 与非目标永不产生 `DEFER`/`POST`；所有等待有上限且失败即放行。
+- **后台重试必须收敛（真机回归）**：记账在 `src/injector/retry_queue.c`（纯记账、可直编）。旧实现把"异步派发成功"当"挂载成功"，退避与上限永不生效 → 挂不上的应用 **1Hz 永久重试**并逐轮刷错误（真机"错误越来越多"）。现在次数随条目保存：1/2/4/8s 退避、上限 6 次、超限 loud 一次后放弃、成功才清账；后台未就绪用 `NSP_READINESS_QUIET` 只记 DEBUG。
+- **合并挂载的两条硬约束（"某些设备存储全空"的守护）**：① **源预检在任何卸载之前**——源必须是本 ns 内真实 FUSE（`statfs` == `FUSE_SUPER_MAGIC`）；ROM 的 `/mnt` 传播可能只带目录不带 FUSE，bind 会"成功"但视图全空，旧实现先拆原生视图就把存储变成空目录；② **传播隔离 + 挂载后校验**——动手前 `MS_PRIVATE|MS_REC` 置私有（共享挂载组上的卸载会传播到 zygote/其它应用 ns，真机表现为"整机 /storage/emulated/0 都空"），挂载后 `statfs` 复核确为 FUSE，否则卸载本次挂载并回滚族根；回滚用调用方传入的 uid（旧实现在子进程里反查 `target_pid`，进程已退出得 0 → 二次用户被绑到用户 0 视图）。
+- **打开中删除（open-unlink）**：本地路径不产生 `.fuse_hidden`。libfuse 默认在"文件仍打开时被删除"会把名字改成 `.fuse_hidden<16hex>` 等 RELEASE 再删；本地 backing 支持 POSIX 的"先删名、后关句柄"，故 `vfs_rename` 识别该隐藏名后直接 unlink 源文件，并留属性快照供删除后的 `fstat`（内核 GETATTR 常不带 fh）。后端路径（FTP/SFTP）仍走隐藏名——远端立即删会让下载/上传中的句柄失去数据源。同时 `.fuse_hidden*` 按普通条目对待：readdir 不过滤、不清理，可 `getattr`/`open`——本层不产生新隐藏名，磁盘上的残留来自旧版本 daemon 或下层 FUSE（见上：`/data/media` 由 MediaProvider 的 FUSE 提供时，本层 unlink 会触发下层 libfuse 的 hide 语义，正是用户报的「一个本体 + 一个 .fusexx」），保留可见是为了取证与手工回收（隐藏会掩盖现场）。后端路径（FTP/SFTP）的隐藏名同样可见，只存活到最后一个句柄关闭。设备探针 `nsp.probe.unlink` 与 `test_functional.py` 模块 9/9b 守护「不新增 + 不隐藏」两条语义。
+- **多进程 + UDS**：`injector`（主控：epoll + inotify + zygote fork 检测）启动 `fuse_daemon`（28 个 FUSE 回调，Android 29 含 `bpf_setup`；+ 模块调度）；`rule_server` 以 JSON 行协议动态改规则；`log_monitor` 收日志、`log_ctl` 查询。injector 维护全局 + 媒体模块两棵 FUSE 树，共用同一二进制与配置。
+- **模块化（V4 起只有一种模块）**：规则决策（REDIRECT/SANDBOX/HIDE/ALLOW/RO + FTP 前缀归属）与 uid→包名、MONITOR 开关都是**框架能力**（`src/daemon/fw_rules.c` / `fw_pkg.c` / `fw_config.c`）——放进模块会让「模块缺席 ⇒ 规则与监控一起失效」。模块只剩**后端存储提供者**（如 `ftp_module.so`）：**不实现 FUSE**，只提供 `backend_*` 方法。FTP 映射由 `FTP <虚拟前缀> <段名>` 规则决定，作用域随所在段（`[GLOBAL]` 全局 / `[包名]` 仅该应用）。模块目录 `<CONFIG_DIR>/modules/<名>/<名>.so`，inotify 热插拔；**模块从内存副本加载**（memfd，maps 里呈现为 `memfd:nsp_module_<名>`），故磁盘上那份文件无论原子替换还是就地覆盖都伤不到运行中的模块。
+- **模块 ABI**：第三方模块只以 `include/nsp_module.h` 为唯一入口（该头代含 `nsp_log.h` / `nsp_constants.h` / `nsp_cfg_view.h`，分发 SDK 须一并给出），编译须带 `-DNSP_MODULE_BUILD`；日志等公共符号经导出表解析——改签名会破坏已编译模块。当前 `NSP_MODULE_ABI_VERSION=5`、`NSP_FRAMEWORK_API_VERSION=4`。**V3 是决策结果的不兼容重构**：声明式 `NspPathDecision` 取代 `NspResolveResult`（`hidden`→`appear_missing`、`ro`→`read_only`、两个虚拟目录 bool→`virtual_kind`、删 `user_id`/`sub_path`（框架自算）、新增 `attr_override`+`mode`/`uid`/`gid`）；`appear_missing` 在所有回调统一 ENOENT（V2 写类是 EACCES，属有意行为修正）。**V4 删掉已归框架的三个成员**——`NspPathDecision` 的 `pkg`/`monitor_on` 与 `NspModuleOps.get_pkg`：包名（`fw_pkg.c`）与 MONITOR 三层合并（`fw_config_monitor_for`）都是配置语义，模块缺席时也必须成立，故框架自算；`monitor_on` 同时**移出决策结构**（`fw_route` 经出参单独给出——它本就不是路径决策）。**V5 给 `backend_readdir` 加 `offset` 分页**（大目录不再 512 截断）+ 超长名跳过语义 + 注册表动态化（初容 16/硬上限 1024）。**V1/V2/V3/V4 模块须重编译**，加载器在 `dlopen` 之后、`init`/`ops` 之前按版本拒载；`NspFrameworkApi` 不变（仍 4）。模块不链接 `nsp_comm`；`nsp_ini_store` 已退出模块 ABI，是 rule_server 的私有静态库（log_ctl 不用）。
+- **决策强制归属**：引擎只声明「路径该怎么表现」（`NspPathDecision`，见 `src/daemon/fw_rules.h`），errno 映射与权限策略在框架单点——`fw_route()` 统一 `appear_missing`→ENOENT 与 `read_only`→EROFS（含 root 豁免）。框架一律原样上报真实属主/权限（「伪造属主=访问者」的默认模式与 `--preserve-perms` 开关均已删除；V3 的 `attr_override` 因无规则语法生产者已随 V4 删除）。**新增回调时必须走 `VFS_SETUP_CORE(path, VFS_OP_READ|VFS_OP_MUTATE)`**，不要在各回调里手写 hidden/ro 判定——那正是 V3 收敛掉的漂移来源。
+- **后端 errno 契约**：`backend_*` 以 errno 风格返回码回传业务失败（`-ENOENT`/`-EPERM`/`-ENOTEMPTY`/`-EIO`……），框架**不把它计入模块熔断窗口**（`backend_rc_is_business()`，`-1..-4095` 即业务码）；否则应用探测若干缺失路径就会把健康模块置毒卸载 + ban（`test_module_circuit.py` §9 守护）。规则模块反之：`resolve`/`probe` 用决策字段回传业务结果，返回非 0 仍判契约违规。新增 `backend_*` 分派分支时，`module_guard_error` 必须带上这一豁免。
+- **配置读取归属**：配置的**读取**（文件 I/O + inotify + 词法/段头识别）完全在框架侧（`src/daemon/fw_config.c` + `config_read_view`），模块**不读文件、不跑 inotify**——**包括模块自己的配置** `<modules_dir>/<名>/<名>.conf`（如 `modules/ftp_module/ftp_module.conf`）：框架读后以 `NSP_CFG_REC_MODULE_FILE`/`MODULE_LINE` 记录**按 owner 过滤**下发给同名模块（视图版本 2），模块在 `set_config_listener` 回调里消费；框架侧 inotify 同时监听模块目录，故模块配置热重载不需要模块持有线程。规则仍按 `subscribe_rules` 的类型过滤下发，模块据此建索引（`config_build_from_view`）。**建索引仍在模块**（规则对象/trie 是模块的索引表示，框架不建 AppConfig）。改动 `config_parser.c` 的读取/词法部分须同时跑 `test_rules.py` 与 `test_config_snapshot.py`。
+- **规则**：INI 格式，`[GLOBAL]` / `[包名]` / `[包名:userid]` / `[USER_APPS:uid]` / `[SYSTEM_APPS]` 段；关键字 `REDIRECT`/`ALLOW`/`HIDE`/`RO`/`SANDBOX`/`MONITOR`。裸 `[包名]` 记为 user_id=-1 跨用户 fallback。`CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（常量权威在 `include/nsp_constants.h`，`common.h` 以别名暴露）。

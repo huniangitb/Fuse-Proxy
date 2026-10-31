@@ -54,8 +54,11 @@ PASS = 0
 FAIL = 0
 ERRORS = []
 
+# 跨应用隔离（默认生效）让 data/obb 子树恒要求仲裁——本文件原有的「无关规则
+# 不仲裁」用例改在 ALLOW_CROSS_APP_DATA ON（= 关掉隔离）下验证规则维度，
+# 另加一组「隔离开启」用例验证新维度（见文首说明与 test_rules.py §27）。
 CASES = [
-    ("空规则", "[GLOBAL]\nGLOBAL_INJECT ON\n", 0),
+    ("空规则", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n", 0),
     ("SANDBOX ON", "[GLOBAL]\nGLOBAL_INJECT ON\nSANDBOX ON\n", 1),
     ("变量展开触及data", "[GLOBAL]\nGLOBAL_INJECT ON\n"
      "DATA_BASE=/sdcard/Android/data/$package\n"
@@ -64,28 +67,36 @@ CASES = [
      "REDIRECT /Android/data/.x /tmp/y\n", 1),
     ("HIDE触及data", "[GLOBAL]\nGLOBAL_INJECT ON\n"
      "HIDE /Android/data/com.foo/*\n", 1),
-    ("无关规则", "[GLOBAL]\nGLOBAL_INJECT ON\n"
+    ("无关规则", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
      "REDIRECT /sdcard/X /tmp/Y\n", 0),
-    ("纯ALLOW", "[GLOBAL]\nGLOBAL_INJECT ON\n"
+    ("纯ALLOW", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
      "ALLOW /Android/data/com.foo\n", 0),
-    ("注释提及", "[GLOBAL]\nGLOBAL_INJECT ON\n"
+    ("注释提及", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
      "#HIDE /Android/data/com.foo/*\n", 0),
     # B1：MONITOR ON 要求仲裁（监控需 daemon 记录 IO；旧实现遗漏此维度 → 期望 0）
     ("MONITOR ON", "[GLOBAL]\nGLOBAL_INJECT ON\nMONITOR ON\n", 1),
+    # 跨应用隔离开启（默认）：与规则无关，data/obb 子树恒要求仲裁
+    ("隔离开启-空规则", "[GLOBAL]\nGLOBAL_INJECT ON\n", 1),
+    ("隔离开启-无关规则", "[GLOBAL]\nGLOBAL_INJECT ON\n"
+     "REDIRECT /sdcard/X /tmp/Y\n", 1),
+    ("隔离开启-纯ALLOW", "[GLOBAL]\nGLOBAL_INJECT ON\n"
+     "ALLOW /Android/data/com.foo\n", 1),
 ]
 
 REDIR_FOO = ("[GLOBAL]\nGLOBAL_INJECT ON\n"
              "REDIRECT /Android/data/com.foo /tmp/y\n")
+# 关掉跨应用隔离（= 旧行为）后再看"规则是否要求仲裁"：远祖先/兄弟目录不强制
+REDIR_FOO_OPEN = REDIR_FOO + "ALLOW_CROSS_APP_DATA ON\n"
 # (描述, 配置, 查询路径, 期望)：查询可带 /<uid>/ 层，门内归一
 PCASES = [
     ("重定向自身", REDIR_FOO, "/0/Android/data/com.foo", 1),
     ("重定向其下", REDIR_FOO, "/0/Android/data/com.foo/bar", 1),
     ("重定向直接父", REDIR_FOO, "/0/Android/data", 1),
-    ("重定向兄弟不受影响", REDIR_FOO, "/0/Android/data/com.bar", 0),
-    ("远祖先不强制", REDIR_FOO, "/", 0),
+    ("重定向兄弟不受影响", REDIR_FOO_OPEN, "/0/Android/data/com.bar", 0),
+    ("远祖先不强制", REDIR_FOO_OPEN, "/", 0),
     ("SANDBOX整树", "[GLOBAL]\nGLOBAL_INJECT ON\nSANDBOX ON\n",
      "/0/Download", 1),
-    ("纯ALLOW直通", "[GLOBAL]\nGLOBAL_INJECT ON\n"
+    ("纯ALLOW直通", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
      "ALLOW /Android/data/com.foo\n", "/0/Android/data/com.foo", 0),
     ("变量展开命中", "[GLOBAL]\nGLOBAL_INJECT ON\n"
      "MYD=/Android/data/com.foo\n"
@@ -94,6 +105,22 @@ PCASES = [
     ("MONITOR 整树仲裁", "[GLOBAL]\nGLOBAL_INJECT ON\nMONITOR ON\n",
      "/0/Download", 1),
     ("MONITOR 整树仲裁（远祖先）", "[GLOBAL]\nGLOBAL_INJECT ON\nMONITOR ON\n", "/", 1),
+    # 跨应用隔离（默认生效）：data/obb 子树（含直接父 /Android、/Android/data
+    # 本身）必须 daemon 仲裁——backing 直通用 daemon 凭证，per-caller 隔离无从
+    # 裁决；media/obj 不在隔离范围，仍可直通；ALLOW_CROSS_APP_DATA ON 后放开。
+    ("隔离开启-他包data", "[GLOBAL]\nGLOBAL_INJECT ON\n",
+     "/0/Android/data/com.other.app/files/x", 1),
+    ("隔离开启-他包obb", "[GLOBAL]\nGLOBAL_INJECT ON\n",
+     "/0/Android/obb/com.other.app", 1),
+    ("隔离开启-自身data也仲裁", "[GLOBAL]\nGLOBAL_INJECT ON\n",
+     "/0/Android/data/com.foo/x", 1),
+    ("隔离开启-data骨架", "[GLOBAL]\nGLOBAL_INJECT ON\n", "/0/Android/data", 1),
+    ("隔离开启-直接父", "[GLOBAL]\nGLOBAL_INJECT ON\n", "/0/Android", 1),
+    ("隔离不扩media", "[GLOBAL]\nGLOBAL_INJECT ON\n", "/0/Android/media/com.other.app", 0),
+    ("隔离不扩obj", "[GLOBAL]\nGLOBAL_INJECT ON\n", "/0/Android/obj/com.other.app", 0),
+    ("隔离开启-远祖先仍加速", "[GLOBAL]\nGLOBAL_INJECT ON\n", "/", 0),
+    ("隔离关闭后他包data可直通", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n",
+     "/0/Android/data/com.other.app/files/x", 0),
 ]
 
 

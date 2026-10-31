@@ -339,8 +339,8 @@ public final class ProbeApp extends Application {
                     "path=" + file.getAbsolutePath() + " exists=" + file.exists());
             steps++;
 
-            int hiddenOpen = countHidden(dir);
-            emit("hidden_open", hiddenOpen == 0, "hidden=" + hiddenOpen);
+            int hiddenOpen = countHidden(dir, false);
+            emit("hidden_open", hiddenOpen == 0, "new_hidden=" + hiddenOpen);
             steps++;
 
             long size = -1;
@@ -374,20 +374,38 @@ public final class ProbeApp extends Application {
                 }
             }
         }
-        int hiddenClosed = countHidden(dir);
-        emit("hidden_closed", hiddenClosed == 0, "hidden=" + hiddenClosed);
+        int hiddenClosed = countHidden(dir, false);
+        emit("hidden_closed", hiddenClosed == 0, "new_hidden=" + hiddenClosed);
         steps++;
         emit("exists_closed", !file.exists(), "exists=" + file.exists());
+        steps++;
+        // 预置的历史残留夹具：按用户要求不再做列举过滤，必须可见、可取证，
+        // 且不得被本层自动清理（清理会抬高取证难度）。
+        boolean legacyExists = new File(dir, LEGACY_HIDDEN_NAME).exists();
+        boolean legacyListed = countHidden(dir, true) > 0;
+        emit("hidden_legacy", !legacyExists || legacyListed,
+                "fixture_exists=" + (legacyExists ? 1 : 0) + " listed=" + (legacyListed ? 1 : 0));
         steps++;
         return steps;
     }
 
-    private static int countHidden(File dir) {
+    /** 预置的历史残留夹具名（与 device/verify-device.sh 的 unlink-fixture 一致）。 */
+    private static final String LEGACY_HIDDEN_NAME = ".fuse_hidden0000000000000001";
+
+    /**
+     * 数 .fuse_hidden* 条目。{@code legacyOnly=true} 只数预置夹具，{@code false} 只数
+     * 新增（排除夹具）——夹具用来验证「可见可取证、不被自动清理」，不属于残留判定，
+     * 混在一起会让两个断言互相矛盾。
+     */
+    private static int countHidden(File dir, boolean legacyOnly) {
         int n = 0;
         String[] names = dir.list();
         if (names != null) {
             for (String name : names) {
-                if (name.startsWith(".fuse_hidden")) {
+                if (!name.startsWith(".fuse_hidden")) {
+                    continue;
+                }
+                if (LEGACY_HIDDEN_NAME.equals(name) == legacyOnly) {
                     n++;
                 }
             }

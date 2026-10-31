@@ -185,8 +185,10 @@ make-hide-fixture)
     ;;
 unlink-fixture)
     need_root
-    # 历史残留夹具：libfuse 的隐藏名文件直接落在磁盘上，应用列举必须看不到
-    # （本地路径已改为直删；该夹具验证 readdir 过滤，文件本身不得被删）。
+    # 历史残留夹具：libfuse 的隐藏名文件直接落在磁盘上。按用户要求本层不再对
+    # .fuse_hidden* 做列举过滤（保留取证能力），因此探针必须**看得见**它，且不得
+    # 被自动清理；残留判定只看「新增」（ProbeApp.runUnlinkCase 的 hidden_open /
+    # hidden_legacy 两步）。
     _d=/data/media/0/nsp_verify/unlink
     mkdir -p "$_d" || die "创建 unlink 夹具目录失败"
     printf 'NSP_LEGACY_HIDDEN

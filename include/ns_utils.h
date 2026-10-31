@@ -43,10 +43,20 @@ int ns_find_native_submounts(int pid, const char* base_path,
    缺失即 loud 失败。 */
 #define NSP_READINESS_QUIET (-1)
 
+/* 就地快试预算的上限（ms）：>0 且 ≤ 此值的等待属"快试"——真机把 /storage/emulated
+   装进应用命名空间要 135–150ms，任何几十毫秒的预算都必然等不到，等不到**是常态**。
+   故这类预算下的缺失按预期未就绪处理（只记 DEBUG、不写 error.log、不出现"交由重试
+   队列"措辞），由调用方 fail-open 交后台重试。POST 通道的 IPC_MOUNT_INLINE_MS（20）
+   正是这一档；旧模块/REQ 的就地挂载（250ms）与 DEFER 预探测（0）仍是权威尝试：
+   缺失即 loud，真实故障绝不能被静默。 */
+#define NSP_READINESS_INLINE_MAX_MS 50
+
 /* 阻塞式合并挂载（作为向下兼容）。
    readiness_ms：挂载前等待目标 ns 内 /storage/emulated 出现的预算——
      0     = 只查一次，缺失立即返回 ENOENT（判定发生在任何卸载之前）；
-     >0    = 在其内按 100ms 步进等待（POST / 旧模块就地挂载）；
+     >0    = 在其内按 5ms 步进等待；只有 > NSP_READINESS_INLINE_MAX_MS 才是权威
+             尝试（缺失 loud），≤ 该值属就地快试（POST 的 20ms：缺失只记 DEBUG、
+             不写 error.log，交后台重试补挂）；
      NSP_READINESS_QUIET（负值）= 后台通道：不等待，缺失按预期未就绪处理
            （静默，DEBUG），由重试队列补挂。
    两条硬约束（真机回归守护）：

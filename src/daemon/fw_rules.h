@@ -147,7 +147,9 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out);
    任一段 **MONITOR ON**（监控需 daemon 记录 IO，直通会让 vfs_log_io 静默归零），
    或任一段 SANDBOX ON，或任一条 REDIRECT（ALLOW 除外，ALLOW 即直通）/HIDE/RO/
    FTP 前缀的字面量或其变量展开值与 data/obb 相交（其下、其本身、其祖先、
-   或规则即 "/"），即要求仲裁。经 config_read_begin/end 快照协议读索引。 */
+   或规则即 "/"），即要求仲裁。另：跨应用隔离默认生效（[GLOBAL] ALLOW_CROSS_APP_DATA 默认 OFF）
+   时恒要求仲裁——隔离按调用方身份裁决，backing 直通用 daemon 凭证且内核绕过
+   daemon，直通即等于隔离失效。经 config_read_begin/end 快照协议读索引。 */
 bool fw_data_mediation_required(void);
 
 /* backing 按路径仲裁（细粒度门）：查询路径 fuse_path（可带 /<uid>/ 层，
@@ -157,7 +159,10 @@ bool fw_data_mediation_required(void);
    重定向目标）上产生 per-caller 差异时返回 true；远祖先（挂载根、/0、
    /Android 等，只列出中间名）不强制要求仲裁，允许 backing 保留。
    SANDBOX ON 除外：共享目录重定向 + 跨应用隔离影响整树，任一查询均 true
-   （隐私模式，正确优先）。REDIRECT 只看 virtual_prefix（ALLOW 跳过）；
+   （隐私模式，正确优先）。跨应用隔离默认生效时同理：data/obb 子树
+   （自身/其下/直接父，故 /Android 与 /Android/data 也算）恒 true，media/obj
+   不在隔离范围故不受此维度影响；ALLOW_CROSS_APP_DATA ON 后回到纯规则判定。
+   REDIRECT 只看 virtual_prefix（ALLOW 跳过）；
    HIDE/RO/FTP 看各自前缀；含 $变量时追查展开值。fail-closed。 */
 bool fw_backing_mediation_required_for(const char* fuse_path);
 

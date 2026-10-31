@@ -30,6 +30,11 @@ typedef struct {
     bool sandbox_explicit; /* true = 显式设置过 SANDBOX ON/OFF，可覆盖全局 */
     bool global_inject;
     bool skip_system_apps; /* 默认跳过 Android 系统应用 (uid < 10000)，配置 SKIP_SYSTEM_APPS OFF 可关闭 */
+    /* 跨应用隔离放宽开关（仅 [GLOBAL] 段有效）：默认 false =
+       /Android/data|obb 下**他包**条目对调用方不可列举也不可打开
+       （resolve/probe 同口径，隔离与隐藏一致）；ALLOW_CROSS_APP_DATA ON
+       = 恢复旧行为（只过滤列举、不限制打开，等于不隔离） */
+    bool allow_cross_app_data;
     char** hide_rules;
     int hide_count;
     int hide_capacity;
