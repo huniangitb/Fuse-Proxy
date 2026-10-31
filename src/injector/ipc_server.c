@@ -168,11 +168,51 @@ static void ipc_ack_and_close(int fd, bool ok) {
 
 static void* ipc_restore_thread(void* raw); /* 定义在后（见下） */
 
+/* 还原派发去重表：pre 的后台兜底与 POST 的快路径可能对同一 pid 各派发一次。
+   两条线程同时跑没有正确性问题（后到的那条只会命中"顶层非项目 FUSE→跳过"），
+   但会白跑一轮并打出误导性的"仍非项目 FUSE 视图"告警——这里按 pid 去重：
+   已有线程在跑就直接复用它的结果。 */
+#define IPC_RESTORE_MAX_INFLIGHT 32
+static pthread_mutex_t g_restore_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_restore_inflight[IPC_RESTORE_MAX_INFLIGHT];
+
+static bool ipc_restore_claim(int pid) {
+    bool ok = false;
+    pthread_mutex_lock(&g_restore_lock);
+    for (int i = 0; i < IPC_RESTORE_MAX_INFLIGHT; i++) {
+        if (g_restore_inflight[i] == pid) {
+            pthread_mutex_unlock(&g_restore_lock);
+            return false; /* 已有线程在跑 */
+        }
+    }
+    for (int i = 0; i < IPC_RESTORE_MAX_INFLIGHT; i++) {
+        if (g_restore_inflight[i] == 0) {
+            g_restore_inflight[i] = pid;
+            ok = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_restore_lock);
+    return ok;
+}
+
+static void ipc_restore_release(int pid) {
+    pthread_mutex_lock(&g_restore_lock);
+    for (int i = 0; i < IPC_RESTORE_MAX_INFLIGHT; i++) {
+        if (g_restore_inflight[i] == pid) g_restore_inflight[i] = 0;
+    }
+    pthread_mutex_unlock(&g_restore_lock);
+}
+
 /* 派发一次 v2 非目标还原（异步线程）。done_pipe_out 非 NULL 时返回一个读端，
    主流程可 poll 它做有界快等（legacy 通道）；传 NULL 表示完全后台（post 通知路径），
    此时不创建管道，ACK 也不经线程。返回 false 表示未能派发（调用方按已就绪放行）。 */
 static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_pipe_out,
                                int wait_ms) {
+    if (!ipc_restore_claim(pid)) {
+        LOG_DBG("IPC还原去重: %s(PID:%d) 已有还原在跑，复用其结果", pkg, pid);
+        return true; /* 覆盖已存在：调用方按"已派发"处理即可 */
+    }
     int done_pipe[2] = {-1, -1};
     if (done_pipe_out) {
         *done_pipe_out = -1;
@@ -180,6 +220,7 @@ static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_
     }
     IpcMountArg* arg = malloc(sizeof(IpcMountArg));
     if (!arg) {
+        ipc_restore_release(pid);
         if (done_pipe[0] >= 0) close(done_pipe[0]);
         if (done_pipe[1] >= 0) close(done_pipe[1]);
         return false;
@@ -202,6 +243,7 @@ static bool ipc_restore_dispatch(const char* pkg, int pid, uid_t uid, int* done_
         return true;
     }
     arg->done_fd = -1;
+    ipc_restore_release(pid);
     if (done_pipe[0] >= 0) close(done_pipe[0]);
     if (done_pipe[1] >= 0) close(done_pipe[1]);
     free(arg);
@@ -230,6 +272,7 @@ static void* ipc_restore_thread(void* raw) {
             /* 进程已死：无需还原，通知主流程放行（ACK 已由主流程发出时 fd=-1） */
             ipc_restore_signal_done(&arg->done_fd);
             ipc_ack_and_close(arg->ack_fd, true);
+            ipc_restore_release(arg->pid);
             free(arg);
             return NULL;
         }
@@ -254,8 +297,12 @@ static void* ipc_restore_thread(void* raw) {
     if (ret == 0) {
         LOG("IPC还原: %s(PID:%d) 成功 (尝试%d次, %ldms)", arg->pkg, arg->pid, attempts, total_ms);
     } else if (ret == 1) {
-        LOG_WRN("IPC还原异常: %s(PID:%d) %ldms内仍非项目 FUSE 视图 (尝试%d次)", arg->pkg, arg->pid,
-                total_ms, attempts);
+        /* "仍非项目 FUSE 视图"= 该进程本来就不在我们的代理视图上（已隔离），
+           无需还原；这不是异常，只是没抢到"视图出现"那一刻。前置派发/POST 双路
+           并发时另一条线程可能已经完成，故只记 DEBUG（真机上占多数，记 WARN 会
+           变成噪声）。 */
+        LOG_DBG("IPC还原无需动作: %s(PID:%d) %ldms内视图始终非项目 FUSE (尝试%d次)", arg->pkg,
+                arg->pid, total_ms, attempts);
     } else {
         LOG_ERR("IPC还原失败: %s(PID:%d) ret=%d (尝试%d次, %ldms)", arg->pkg, arg->pid, ret,
                 attempts, total_ms);
@@ -265,6 +312,7 @@ static void* ipc_restore_thread(void* raw) {
        这里只剩兜底 ACK（ack_fd=-1 时是空操作）。 */
     ipc_restore_signal_done(&arg->done_fd);
     ipc_ack_and_close(arg->ack_fd, ret == 0 || ret == 1);
+    ipc_restore_release(arg->pid);
     free(arg);
     return NULL;
 }
