@@ -236,7 +236,7 @@ FUSE 回调（如 getattr）
 1. **源预检在卸载之前**：源必须是本命名空间内真实的 FUSE 挂载（`statfs` == `FUSE_SUPER_MAGIC`）。不同 ROM 的 `/mnt` 传播设置可能只把目录传进应用 ns、FUSE 没传进来——此时 bind 照样"成功"，但 `/storage/emulated` 是空的。旧实现先卸载目标再 mount，源不可用就把应用的原生存储拆成空目录；现在预检失败直接返回，目标一点不动。
 2. **传播隔离 + 挂载后校验**：动手前先 `MS_PRIVATE|MS_REC` 把目标子树置私有（共享挂载组上的卸载事件会传播到 zygote/其它应用命名空间，真机表现是"整台设备的 /storage/emulated/0 都空了"）；挂载后再 `statfs` 复核目标确为 FUSE 视图，否则卸载本次挂载并回滚族根视图。
 
-**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时把 pre 通道当作"只裁决"；旧模块（不带 proto）仍走"就地挂载（短预算）+ 后台重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector 挂载预算 250ms（+0.8s 子进程余量）< companion 等 injector 1.5s < 模块等 companion 2s；pre 通道只裁决、往返 <10ms < companion 0.8s < 模块 1.2s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
+**协议版本握手**：模块在 `REQ`/`POST` 末尾带 `proto`（当前 2）。injector 只在 `proto>=2` 时把 pre 通道当作"只裁决"；旧模块（不带 proto）仍走"就地挂载（短预算）+ 后台重试"路径，故新 injector 与旧模块组合零回归；v2/v3 与非目标应用在任何组合下都不会产生 `DEFER`/`POST`。所有等待都有上限且失败即放行（fail-open）。**模块侧不按 uid 硬编码**：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，系统应用是否注入由 `SKIP_SYSTEM_APPS`（默认 ON）在 injector 侧裁决——硬编码会让该开关写 OFF 也永不生效，且 v2 下系统应用连还原机会都没有（真机实测：Settings uid 1000 一直停在项目视图），且**内层先裁决、外层后超时**（否则外层超时会把 injector 正在做的挂载晾在半空）：injector 挂载预算 250ms（+0.8s 子进程余量）< companion 等 injector 1.5s < 模块等 companion 2s；pre 通道只裁决、往返 <10ms < companion 0.8s < 模块 1.2s。任何一段超时都只是"本次没有代理视图"，绝不挂死应用冷启动。
 
 #### 注入方法（`--inject-method=v1|v2|v3`）
 

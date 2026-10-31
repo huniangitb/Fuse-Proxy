@@ -50,7 +50,7 @@
 | `MONITOR` | 应用段 | 监控该应用的文件访问 |
 | `SANDBOX` | 应用段 | 启用独立沙箱（隔离 `/Android/data`、`/Android/obb`） |
 | `GLOBAL_INJECT` | 全局段 | 全局注入开关 |
-| `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON** |
+| `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON**。zygisk 模块**不**再按 uid 硬编码过滤：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，是否注入完全由本开关裁决——写成 OFF 时系统应用（如 uid 1000 的 Settings）才会被注入/还原 |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节）；其中 `-o negative_timeout[=N]` 会被单点剥离（恒为 libfuse 默认 0.0，非 0 负缓存以 ino=0 回包会触发内核 nodeid=0 崩溃） |
 | `SANDBOX_DIR` | 全局段 | 沙盒落点目录名（覆盖默认 `sandbox`） |
 
