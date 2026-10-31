@@ -55,6 +55,8 @@
 
 ### 缺陷修复
 
+- **injector**: v2 非目标应用还原与 ACK 解耦（有界快等 30ms，超预算先 ACK 放行、还原线程后台继续，audit_tracked_apps 兜底）——旧实现把 ACK 挂在还原末尾（还带 300ms 重试预算），应用被冻在 specialize，v2 冷启动因此变慢且正确性依赖阻塞；v2/v3 目标应用与 v3 全局视图本就不派发挂载线程、pre 立即回 OK，全局替换方案不依赖 zygisk 的阻塞语义 (ac67197)
+- **injector**: 全局替换加源活性守卫——源必须是目标命名空间内的挂载点（mountinfo 给出 dev），否则按「未就绪」返回 1、族根一点不动（旧实现只打一行 DEBUG 就 bind，空目录被装进族根 → 整机 /storage/emulated/0 变空）；`ns_global_status` 只认 dev 指纹（不再用 fuse_daemon fstype 兜底），FUSE 崩溃重建后不再把死视图误判成「已替换」，源不在挂载表时返回 UNKNOWN 让对账退避 (ac67197)
 - **injector**: v1 两段式改为 pre 只裁决 + POST 短预算（1800→250ms）——pre 阶段进程还在 zygote 的挂载 ns 里，就地挂载会把项目 FUSE 装进 zygote ns、之后 fork 的每个应用都继承它且没人能清；POST 短等即 fail-open 交后台重试，避免"视图迟迟不出现"的设备每次冷启动固定多等 1.8s（真机报的"冷启动明显变慢"） (85b8077)
 - **injector**: 挂载失败重试收敛（新增 src/injector/retry_queue.c）——尝试次数随条目保存：1/2/4/8s 退避、上限 6 次、超限 loud 一次后放弃、成功才清账；旧实现"异步派发即出队 + 失败回调以次数 0 重新入队"让退避与上限永远不生效，挂不上的应用以 1Hz 永久重试并逐轮刷错误日志（真机报的"错误越来越多"）。后台通道的未就绪只记 DEBUG（负值哨兵 NSP_READINESS_QUIET） (85b8077)
 - **injector**: 合并挂载加三道守护——源预检（statfs 为 FUSE 才动手，失败保持原生视图）、动手前 MS_PRIVATE 隔离传播（共享挂载组上的卸载会传播到 zygote/其它应用 ns）、挂载后 statfs 复核并回滚；回滚按调用方传入的 uid 找族根。防"某些设备 /storage/emulated/0 整个为空" (85b8077)
