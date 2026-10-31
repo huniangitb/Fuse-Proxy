@@ -79,13 +79,22 @@ static socklen_t uds_abstract_addr(struct sockaddr_un* addr, const char* name) {
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(addr->sun_path + 1));
 }
 
-/* 普通用户应用判定。上界 90000 与 injector 的 is_isolated_uid()
-   （src/injector/inject_target.c，90000–99999 为 isolated）对齐：isolated
-   进程上报后必被 injector 丢弃，在此提前过滤可省去一次 IPC 往返。
-   下界 10000 对应 AID_APP_START，其下为系统应用。 */
-static bool is_user_app(uint32_t uid) {
+/* 是否上报该进程给 injector。
+ *
+ * **不在模块侧硬编码"只处理 uid >= 10000"**：那是 injector 的配置语义
+ * （[GLOBAL] SKIP_SYSTEM_APPS，默认 ON），硬编码会让用户显式写
+ * SKIP_SYSTEM_APPS OFF 也永远不生效——系统应用（如 uid 1000 的 Settings）
+ * 连上报机会都没有：v1 无法注入、v2 也没机会被还原（会一直停在项目视图上，
+ * 真机实测确认过）。
+ *
+ * 这里只保留两种"必然无意义"的过滤，其余全部上报、由 injector 按配置裁决：
+ *   - uid 0：init/kernel 线程 fork 出来的，不是应用进程；
+ *   - isolated 区（app_id 90000–99999，与 injector 的 is_isolated_uid 对齐）：
+ *     injector 必丢弃，提前过滤只是为了省一次 IPC 往返。 */
+static bool should_report(uint32_t uid) {
     uint32_t app_id = uid % 100000;
-    return app_id >= 10000 && app_id < 90000;
+    if (uid == 0) return false;
+    return app_id < 90000;
 }
 
 /* ============================ Companion（root 权限） ============================ */
@@ -190,7 +199,7 @@ class AppReporterModule : public zygisk::ModuleBase {
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
-        if (!is_user_app(args->uid)) {
+        if (!should_report(args->uid)) {
             return;
         }
 
