@@ -42,6 +42,7 @@
 #include "common.h"
 #include "config_parser.h" /* config_set_modules_dir：模块自有配置的读取归属 */
 #include "fw_acl.h" /* 访问控制唯一判定点（对齐 Android 原生 FUSE 用户态策略层） */
+#include "fw_events.h" /* FUSE 事件通道（默认 OFF，关闭时埋点只剩一次原子读） */
 #include "fw_config.h"
 #include "fw_pkg.h"
 #include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
@@ -518,10 +519,12 @@ static int vfs_storage_root_guard(const struct fuse_context* ctx, const char* pa
     return 0;
 }
 
-static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
-                    bool* nsp_ok, char* current_pkg, int* user_id, char* sub_path, char* real_path,
-                    bool* is_redir, bool* monitor_out, VfsOpKind op, NspAclOp acl_op,
-                    bool acl_is_dir, int acl_mask) {
+/* 判定内核（**唯一决策点**）。对外一律经下方的 fw_route 包装调用——包装只做
+   "把已经做出的决定如实转述给事件通道"，不参与判定，也不改变返回值。 */
+static int fw_route_inner(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
+                          bool* nsp_ok, char* current_pkg, int* user_id, char* sub_path,
+                          char* real_path, bool* is_redir, bool* monitor_out, VfsOpKind op,
+                          NspAclOp acl_op, bool acl_is_dir, int acl_mask) {
     *nsp_ok = false;
     /* user_id 必须先置 -1：fw_parse_path 只在路径含完整 <uid>/ 用户层时才写它，
        挂载点根（"/"）等无用户层路径不会赋值——漏置会让调用方拿到未初始化值，
@@ -584,6 +587,21 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
        重新绑回「模块是否给出有效决策」上。 */
     fw_default_real_path(*user_id, sub_path, real_path, PATH_MAX);
     return vfs_storage_root_guard(ctx, path_val, current_pkg, *user_id, real_path, op);
+}
+
+/* 对外决策入口：内核判定 + 拒绝埋点。
+   write_denied 的语义是「这次变更没落盘」，所以只在变更操作上转述；具体
+   errno（EROFS/HIDE→ENOENT/ACL→EACCES|EPERM）与 op（create/mkdir/rename）
+   的取舍在 fw_events_note_write_denied 内，本函数不写任何判定。 */
+static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
+                    bool* nsp_ok, char* current_pkg, int* user_id, char* sub_path, char* real_path,
+                    bool* is_redir, bool* monitor_out, VfsOpKind op, NspAclOp acl_op,
+                    bool acl_is_dir, int acl_mask) {
+    int rc = fw_route_inner(ctx, path_val, rr, nsp_ok, current_pkg, user_id, sub_path, real_path,
+                            is_redir, monitor_out, op, acl_op, acl_is_dir, acl_mask);
+    if (rc < 0 && op == VFS_OP_MUTATE && fw_events_active())
+        fw_events_note_write_denied(ctx->uid, ctx->pid, path_val, acl_op, rc);
+    return rc;
 }
 
 /* 后端返回码是否为契约内的业务结果：POSIX errno 范围内的负值（-1..-4095）。
@@ -1677,6 +1695,9 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
     }
     inherit_parent_attributes(p, S_IFREG);
     fi->fh = fd;
+    /* 事件通道埋点：create 已落盘（后端分支在上面提前返回，不外发——rpath 无意义） */
+    if (fw_events_active())
+        fw_events_note_write_done(ctx->uid, ctx->pid, path, FW_EV_OP_CREATE, NULL);
     if (g_passthrough_enabled) {
         int backing_id = passthrough_enable_fixed_method(fd);
         if (backing_id > 0) {
@@ -1731,6 +1752,7 @@ static int vfs_mkdir(const char* path, mode_t mode) {
         }
     }
     inherit_parent_attributes(p, S_IFDIR);
+    if (fw_events_active()) fw_events_note_write_done(ctx->uid, ctx->pid, path, FW_EV_OP_MKDIR, NULL);
     VFS_RETURN(0);
 }
 
@@ -1917,6 +1939,14 @@ static int vfs_write(const char* path, const char* buf, size_t size, off_t off,
     /* 已 unlink 仍打开的本地文件：写入会改变 size/mtime，刷新属性快照，
        使随后的 fstat 拿到真实值（而不是删除瞬间的旧值）。 */
     hidden_stat_refresh(path, (int)fi->fh);
+    /* 事件通道埋点：写已落盘。fuse_get_context 的 TLS 读只在开关打开时发生
+       （关闭时上面那次原子读就直接返回，不添任何热路径开销）。op 用
+       close_write：一次 open→多次 write→close 的序列在 200ms 合并里收敛成
+       一条，扫描侧不会被逐 4KB 的写放大成事件风暴。 */
+    if (fw_events_active()) {
+        struct fuse_context* wctx = fuse_get_context();
+        fw_events_note_write_done(wctx->uid, wctx->pid, path, FW_EV_OP_CLOSE_WRITE, NULL);
+    }
     return (int)ret;
 }
 
@@ -1949,6 +1979,17 @@ static int vfs_release(const char* path, struct fuse_file_info* fi) {
     /* 本地 open-unlink：最后一个句柄关闭，属性快照使命结束（名字早已删除） */
     hidden_stat_remove(path);
     close(fi->fh);
+    /* 事件通道埋点：写句柄关闭（只对写意图句柄——只读打开不是"有东西落盘"）。
+       与 vfs_write 的成功埋点同 op，200ms 合并后对同一文件只留一条。 */
+    if (fw_events_active() && (fi->flags & O_ACCMODE) != O_RDONLY) {
+        struct fuse_context* rctx = fuse_get_context();
+        /* libfuse 在 release 上不保证填好调用者身份（实测 uid=pid=0）。没有身份
+           就不发布：事件里的 uid/pkg 是扫描侧归因的依据，宁可少一条也不发
+           "system 写了这个文件"的假事件。真正的数据变更由 vfs_write 的埋点覆盖
+           （同 op=close_write，200ms 合并后仍是同一条）。 */
+        if (rctx && rctx->pid != 0)
+            fw_events_note_write_done(rctx->uid, rctx->pid, path, FW_EV_OP_CLOSE_WRITE, NULL);
+    }
     return 0;
 }
 
@@ -2316,6 +2357,13 @@ static int xdev_temp_name(const char* p_to, char* out, size_t outsz) {
     return 0;
 }
 
+/* 事件通道埋点：rename 成功。两条路径各自成条（契约：rename 的 src/dst 各成
+   一条事件记录），真实落盘路径由事件线程按当时的规则解析。 */
+static void vfs_rename_event(const char* from, const char* to, uid_t uid, pid_t pid) {
+    if (!fw_events_active()) return;
+    fw_events_note_write_done(uid, pid, to, FW_EV_OP_RENAME, from);
+}
+
 static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     struct fuse_context* ctx = fuse_get_context();
     if (!ctx) return -EACCES;
@@ -2405,7 +2453,10 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
        目标，EXCHANGE 失败后退化成单向移动会丢源（§A1）。原样返回 errno。 */
     if (flags) {
 #ifdef SYS_renameat2
-        if (syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) return 0;
+        if (syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) {
+            vfs_rename_event(from, to, ctx->uid, ctx->pid);
+            return 0;
+        }
         int ferr = errno;
 #else
         int ferr = EINVAL; /* 本平台无 renameat2：flags 语义不可满足 */
@@ -2427,7 +2478,10 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
         LOG_ERR("重命名创建目标父目录失败: %s (errno=%d)", p_to, mkdir_err);
         return -mkdir_err; /* 旧实现 free 后用 p_to_dir 打日志（UAF）且取残留 errno */
     }
-    if (rename(p_from, p_to) == 0) return 0;
+    if (rename(p_from, p_to) == 0) {
+        vfs_rename_event(from, to, ctx->uid, ctx->pid);
+        return 0;
+    }
     int err = errno;
     if (err == EXDEV) {
         struct stat st;
@@ -2495,6 +2549,7 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
             LOG_ERR("跨设备搬移：源删除失败（目标已完整，保留）: %s (err=%d)", p_from, rm_res);
             return rm_res;
         }
+        vfs_rename_event(from, to, ctx->uid, ctx->pid);
         return 0;
     }
     log_fuse_err("RENAME", from, err);
@@ -3393,6 +3448,11 @@ int main(int argc, char* argv[]) {
                崩溃将走 libfuse 处理器（记日志后退出）带崩框架，围栏
                longjmp 恢复链路失效。SIGINT/SIGTERM 仍归 libfuse。 */
             fault_fence_rearm();
+            /* 事件通道（nsp_fs_events / nsp_fs_query）：必须在 fuse_daemonize
+               之后建立——后台化会 fork，fork 不保留任何已存在线程。默认
+               [GLOBAL] FUSE_EVENTS OFF 时这里立即返回，零线程零 socket。
+               启动失败不致命：通道是附加能力，起不来不影响挂载与 IO。 */
+            if (fw_events_start() != 0) LOG_WRN("FUSE 事件通道启动失败（不影响挂载与 IO）");
             LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint,
                 (fopts.singlethread || g_fuse_threads == 0)
                     ? "单线程"
@@ -3436,6 +3496,7 @@ int main(int argc, char* argv[]) {
        映射的 .so 并调用其析构器（.fini_array），若该 .so 曾被就地覆盖（映射页
        因 truncate 失效、重定位丢失）就会跳到未重定位地址而崩在退出瞬间。
        module_system_shutdown 内部对失效镜像走"不调 exit、直接 dlclose"。 */
+    fw_events_stop(); /* 先停自己的线程，再卸模块（模块卸载会等其线程退出） */
     module_system_shutdown();
     /* 日志关闭必须在模块卸载之后：module_system_shutdown 内部的 exit 钩子、
        镜像失效/ban 告警、provider 收尾统计都要落盘。log_close 自身的"最尽力

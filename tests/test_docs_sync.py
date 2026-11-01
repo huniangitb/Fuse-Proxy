@@ -56,6 +56,7 @@ EXTERNAL_PATHS = {
     "service.sh": "Magisk 模块骨架脚本，在外部骨架仓库（scripts/pack-module.sh 同步进去）",
     "customize.sh": "同上，Magisk 安装脚本",
     "module.prop": "同上，Magisk 模块元数据",
+    "FUSE-EVENTS.md": "跨项目接口契约，在 Media-Provider-Manager 仓库（docs/architecture.md §4.7 引用其 v5 冻结版）",
     "my_module.c": "docs/modules.md §6 第三方模块示例占位名",
     "my_module.so": "同上",
     "execinfo.h": "glibc 系统头（backtrace，libfuse 链接依赖）",

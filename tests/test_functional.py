@@ -691,8 +691,9 @@ def _extract_static_functions(src_text, names):
     for name in names:
         start = 0
         found = None
-        # 抽取目标可能是 static int，也可能是 static bool（如 is_fuse_hidden_name）
-        for prefix in ("static int ", "static bool "):
+        # 抽取目标可能是 static int / static bool（is_fuse_hidden_name）/
+        # static void（vfs_rename_event：事件埋点辅助函数）
+        for prefix in ("static int ", "static bool ", "static void "):
             needle = prefix + name + "("
             start = 0
             while True:
@@ -757,7 +758,7 @@ def test_rename_exdev_hardening():
     funcs = _extract_static_functions(
         src_text,
         ["recursive_rmdir", "recursive_copy_dir", "vfs_rename_copy_file",
-         "xdev_temp_name", "is_fuse_hidden_name", "vfs_rename"])
+         "xdev_temp_name", "is_fuse_hidden_name", "vfs_rename_event", "vfs_rename"])
     if "static int vfs_rename(" not in funcs:
         fail("抽取 vfs_rename", f"{src_path} 中未找到定义")
         return

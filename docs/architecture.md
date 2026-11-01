@@ -235,6 +235,40 @@ backing 门配套收紧（`fw_rules.c` 的 `fw_data_mediation_required()` / `fw_
 
 **为什么"跨作用域并集"不构成偏差**：`br_is_redirect_target` / `br_is_virtual_ancestor` 对**调用者生效的三层**（本应用段 + 该调用者的类别段 + `[GLOBAL]`）取并集，而 REDIRECT 的"是否存在"本来就是这三层的 OR（首命中只决定**指向哪**），故并集 ≡ 调用者的生效规则集。已实测：非生效层（如调用者走 system 分支时写 `[USER_APPS:0]`）写虚拟前缀既不遮蔽真目录、也不生成幻影目录；生效层则正常遮蔽/合成；作为重定向**目标**的真实目录完整可见。
 
+### 4.7 FUSE 事件通道（`fw_events`）
+
+**目的**：让扫描侧（MediaProvider 侧进程 / Media-Provider-Manager）不必整树重扫——**谁写过什么**由 FUSE 侧直接告诉它。本项目**不扫描媒体、不建索引、不生成缩略图**，只回答「这个路径现在是什么」和「刚刚有谁写过它」；判断"要不要进媒体库"完全是对方的事（分工见 MPM 仓库的 `FUSE-EVENTS.md`，接口 v5 已冻结）。
+
+**开关**：`[GLOBAL] FUSE_EVENTS`，默认 **OFF**。关闭时 `fw_events_start()` 在创建任何线程/socket **之前**返回：零线程、零 socket、零堆分配；IO 路径上只多一次 `relaxed` 原子读（`fw_events_active()`）。
+
+两条 AF_UNIX **抽象命名空间** socket，都由 `fuse_daemon` 提供：
+
+| socket | 类型 | 方向 | 用途 |
+|---|---|---|---|
+| `nsp_fs_events` | `SOCK_DGRAM` | 服务端推送 | 客户端 `{"cmd":"SUBSCRIBE","reply":"<自己的抽象地址>","filter":{"types":[...]}}`，此后收 NDJSON 单行（≤1KB）：`write_done`/`write_denied`/`ping` |
+| `nsp_fs_query` | `SOCK_SEQPACKET` | 一问一答 | `{"cmd":"QUERY","v":1,"spath":"<绝对存储视图路径>","uid":N,"seq":N}` → `{"v","seq","ok","exists","denied","reason","spath","rpath","vol"}` |
+
+**通道身份 ≠ 被查询身份**：两条 socket 都用 `SO_PEERCRED`/`SCM_CREDENTIALS` 校白名单（root(0)/system(1000)/media_rw(1023) + **自动解析的 MediaProvider 进程 uid** + `[GLOBAL] FUSE_EVENTS_UIDS` 追加），**只回答"对端有没有资格连"**；事件里的 `uid/pkg` 由 daemon 按被代理的调用者解析，QUERY 里的 `uid` 直接采信请求方声明的值（调用者是 MediaProvider 一侧，它知道真正发起扫描的应用是谁）。
+
+**白名单为什么必须自动解析 MediaProvider 的 uid**：消费方（MPM）是跑在 MediaProvider 进程里的 Xposed 模块，`SO_PEERCRED` 拿到的是**那个进程**的 uid——实测 **uid=10277**（设备 OPD2404 / Android16，包名 `com.android.providers.media.module`——该 ROM 用的是不带 google 前缀的 AOSP 名，只认 google 名等于白名单落空），既不是 1000(system) 也不是 1023(media_rw)，光靠写死的默认三项等于把通道唯一的消费方拒掉（通道"开着但用不了"）。uid 随 ROM/多用户变，包名才是稳定锚点：daemon 启动时（仅 `FUSE_EVENTS` 打开时）从 `/data/system/packages.list` 解析 `com.google.android.providers.media.module`、`com.android.providers.media.module` 与 `com.android.providers.media` 三个包名的 uid（唯一出口 `fw_pkg_uid_for_package()`，与 `fw_pkg_is_privileged` 同一份文件、同一个测试路径钩子、同一套代际缓存），去重后并入白名单。**只认解析出来的 uid**——包名不可由请求方声明，否则任意进程自称 MediaProvider 就能连上；解析失败（文件不可读/无该行）只少这一项并记一条 DEBUG，通道其余照旧。
+
+**事件字段的三个路径域**（对接最容易错的地方）：
+
+| 字段 | 口径 | 例 |
+|---|---|---|
+| `vpath` | 相对 `/storage/emulated/<user>` | `/Pictures/a.jpg` |
+| `spath` | **存储视图**绝对路径（喂扫描的唯一正确路径域） | `/storage/emulated/0/Pictures/a.jpg` |
+| `rpath` | 真实落盘路径（仅诊断，**write_denied 不带**——文件没落盘） | `/data/media/0/Pictures/a.jpg` |
+
+`spath` 恒为**视图**口径（不受 `--root` 影响，唯一出口 `common_view_path()`），这样 REDIRECT 落点在对方看来仍是应用以为的那个路径域。`rename` 额外带 `src_vpath`/`src_spath`；`write_denied` 额外带 `errno`（`EROFS`/`ENOENT`/`EACCES`/`EPERM`/`ENAMETOOLONG`/`ENOSPC`/`EDQUOT`——容量不足也是"写没落盘"的可解释原因，而 `EIO` 一类瞬态错误属噪声不发）且**必须也带 `spath`**（写被拒时告诉对方"本应落在哪"）。
+
+**不变式**：
+
+- **IO 路径绝不阻塞**：埋点只做一次 `memcpy` 进 4096 槽有界环（满则丢最旧并累加 `dropped`），由独立线程 drain；发送一律 `MSG_DONTWAIT`，订阅者塞满就计数、连续失败 16 次摘除。无订阅者时事件不入环。
+- **200ms 同路径合并**：窗口自首次到达起算，last-wins（一次 open→多次 4KB 写→close 收敛成一条，扫描侧不会被逐块写放大成事件风暴）。`seq` 在发布时分配，丢弃/合并都会让它**跳号**——这正是消费端识别丢帧的信号；`ping` 每 5s 带"自上次心跳以来"的 `dropped` 增量。
+- **判定不在这里**：QUERY 只调 `fw_acl_check`（访问控制）与 `fw_rules_resolve`（规则），自己不写任何 hidden/ro 判定；六类响应互不混淆，`ok=0`（不认识/无规则）与 `denied=1`（被规则拒绝）**不得复用**，拥塞另用 `busy=1`。
+- **exists 有 200ms TTL 缓存，且在该路径 `write_done` 时立即失效**——否则"刚写完立刻查"会拿到 `exists=0` 漏扫。处理器内除缓存未命中的一次 `lstat` 外不做阻塞 IO，绝不回调 MediaProvider。
+
 ## 5. 进程协作
 
 ### 5.1 注入流程

@@ -64,6 +64,16 @@ typedef struct {
     /* [GLOBAL] 段 SANDBOX_DIR：沙盒目录名（覆盖 NSP_SANDBOX_DIRNAME 默认
        "sandbox"）；仅 [GLOBAL] 段有效，空串 = 用默认 */
     char sandbox_dir[64];
+    /* [GLOBAL] FUSE_EVENTS：FUSE 事件通道（nsp_fs_events 推送 / nsp_fs_query
+       查询）总开关。默认 OFF = daemon 不起线程、不建 socket、不分配内存，
+       埋点处只剩一次原子读。**启动期读一次**：通道的 socket 与线程在
+       fuse_daemonize 之后建立，运行期改这个开关不会热启停（重启 daemon 生效
+       ——与 FUSE_EXTRA_ARGS 同为启动期参数）。 */
+    bool fuse_events;
+    /* [GLOBAL] FUSE_EVENTS_UIDS：通道白名单**追加** uid（root/system/media_rw
+       恒在列）。白名单只校验"这条 UDS 通道是谁连的"，不是被查询应用的身份。 */
+    int fuse_events_uids[8];
+    int fuse_events_uid_count;
 } AppConfig;
 
 typedef struct {

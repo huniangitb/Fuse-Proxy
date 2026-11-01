@@ -556,9 +556,13 @@ static bool br_is_wildcard(const char* str) {
     return strpbrk(p, "*?[]") != NULL;
 }
 
+/* sandbox_out：命中来源于 SANDBOX 重定向（而非显式 REDIRECT 规则）。调用方
+   （fw_rules_resolve → NspPathDecision.is_sandbox）据此向外部通道如实报告成因——
+   沙盒路径与普通重定向路径对扫描侧的意义不同（前者是应用私有副本）。
+   skip_sandbox=true 的调用（专用沙盒查询）传 NULL。 */
 static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id,
                                 const char* current_pkg, bool skip_sandbox, size_t temp_size,
-                                uid_t uid, char* mkdir_out, size_t mkdir_sz) {
+                                uid_t uid, char* mkdir_out, size_t mkdir_sz, bool* sandbox_out) {
     if (!c) return false;
     bool matched = false;
     if (c->redir_rules && c->redir_count > 0) {
@@ -664,6 +668,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
         if (mkdir_out && mkdir_sz) snprintf(mkdir_out, mkdir_sz, "%s", sandbox_target);
         int sw = snprintf(temp, temp_size, "%s%s", sandbox_target, sub_path);
         if (sw < 0 || (size_t)sw >= temp_size) return false; /* 超截断 fail-closed */
+        if (sandbox_out) *sandbox_out = true;
         return true;
     }
     return false;
@@ -682,11 +687,13 @@ static void br_ensure_sandbox_dir(const char* dir) {
 }
 
 static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf,
-                           size_t size, int user_id, bool* is_redir_out, const char* current_pkg,
-                           const FwRulesTrieMatch* tm, uid_t uid, char* mkdir_out,
-                           size_t mkdir_sz) {
+                           size_t size, int user_id, bool* is_redir_out, bool* is_sandbox_out,
+                           const char* current_pkg, const FwRulesTrieMatch* tm, uid_t uid,
+                           char* mkdir_out, size_t mkdir_sz) {
     char temp[PATH_MAX] = {0};
     bool redir = false;
+    bool sandbox = false;
+    if (is_sandbox_out) *is_sandbox_out = false;
 
     /* 重定向解析：**作用域优先**——应用段 > 类别段 > [GLOBAL]（docs/config.md §2）。
        同一作用域内静态（Trie）与线性（通配/变量）通道等价：Trie 只是静态规则的
@@ -720,7 +727,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
         }
         if (c && c->dyn_redir) {
             redir = br_check_redir_rule(c, sub_path, temp, user_id, current_pkg, true,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, NULL);
         }
     }
 
@@ -736,14 +743,14 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
        全静态规则已由上方 trie（tm.has_redir）覆盖，跳过 O(N) 扫描。
        顺序：应用 > 类别 > 全局（类别变量展开以类别段为专属作用域） */
     if (!redir && cfg && cfg->dyn_redir)
-        redir =
-            br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid, mkdir_out, mkdir_sz);
+        redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp),
+                                    uid, mkdir_out, mkdir_sz, NULL);
     if (!redir && cat && cat->dyn_redir)
-        redir =
-            br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, true, sizeof(temp), uid, mkdir_out, mkdir_sz);
+        redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, true, sizeof(temp),
+                                    uid, mkdir_out, mkdir_sz, NULL);
     if (!redir && g_global_cfg.dyn_redir)
         redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, true,
-                                    sizeof(temp), uid, mkdir_out, mkdir_sz);
+                                    sizeof(temp), uid, mkdir_out, mkdir_sz, NULL);
     /* sandbox 三层：应用显式 OFF 否决类别+全局；类别显式 OFF 否决全局；
        应用显式 ON（或类别显式 ON 且应用未显式）时各自 sandbox 生效 */
     bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
@@ -751,17 +758,17 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     if (!redir && !g_br_disable_sandbox) {
         if (!app_sandbox_off)
             redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox);
     }
     if (!redir && !g_br_disable_sandbox) {
         if (!app_sandbox_off)
             redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox);
     }
     if (!redir && !g_br_disable_sandbox) {
         if (!app_sandbox_off && !cat_sandbox_off)
             redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox);
     }
     if (!redir) {
         common_default_real_path(user_id, sub_path, temp, sizeof(temp));
@@ -769,6 +776,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     strncpy(out_buf, temp, size - 1);
     out_buf[size - 1] = '\0';
     if (is_redir_out) *is_redir_out = redir;
+    if (is_sandbox_out) *is_sandbox_out = sandbox && redir;
     if (out_buf[0] == '\0') return -ENOENT;
     return 0;
 }
@@ -993,9 +1001,11 @@ static bool br_is_redirect_target(AppConfig* cfg, AppConfig* cat, const char* su
 static inline void br_result_init(NspPathDecision* out) {
     out->valid = false;
     out->appear_missing = false;
+    out->is_other_app_pkg = false;
     out->read_only = false;
     out->real_path[0] = '\0';
     out->is_redirect = false;
+    out->is_sandbox = false;
     out->virtual_kind = NSP_VK_NONE;
     out->is_ftp = false;
 }
@@ -1027,11 +1037,14 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         int path_user_id = -1;
         char sub_path[PATH_MAX];
         FwRulesTrieMatch tm;
-        if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
-                                         sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
-            br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid)) {
+        bool hidden = br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
+                                                  sizeof sub_path, current_pkg, q->uid, &tm) != 0;
+        /* 隔离只在未命中隐藏时判定（保持原短路语义），并单独标注成因 */
+        bool isolated = !hidden && br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid);
+        if (hidden || isolated) {
             out->valid = true;
             out->appear_missing = true;
+            out->is_other_app_pkg = isolated;
             if (config_read_end(cfg_gen)) return;
             continue;
         }
@@ -1039,8 +1052,9 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         char sandbox_mkdir[MAX_PATH_LEN];
         sandbox_mkdir[0] = '\0';
         bool is_redir = false;
-        if (br_to_real_path(cfg, cat, sub_path, p, sizeof p, path_user_id, &is_redir, current_pkg,
-                            &tm, q->uid, sandbox_mkdir, sizeof sandbox_mkdir) != 0) {
+        bool is_sandbox = false;
+        if (br_to_real_path(cfg, cat, sub_path, p, sizeof p, path_user_id, &is_redir, &is_sandbox,
+                            current_pkg, &tm, q->uid, sandbox_mkdir, sizeof sandbox_mkdir) != 0) {
             out->valid = false;
             if (config_read_end(cfg_gen)) return;
             continue;
@@ -1048,6 +1062,7 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         out->valid = true;
         out->read_only = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
         out->is_redirect = is_redir;
+        out->is_sandbox = is_sandbox;
         strcpy(out->real_path, p); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         /* 复用 br_trie_resolve 已完成的 trie 下降结果（app/类别/global 完整匹配节点），
        直接判定虚拟目录性质，避免各自再全路径遍历：

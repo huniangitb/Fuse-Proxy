@@ -54,6 +54,8 @@
 | `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON**。zygisk 模块**不**再按 uid 硬编码过滤：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，是否注入完全由本开关裁决——写成 OFF 时系统应用（如 uid 1000 的 Settings）才会被注入/还原 |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节）；其中 `-o negative_timeout[=N]` 会被单点剥离（恒为 libfuse 默认 0.0，非 0 负缓存以 ino=0 回包会触发内核 nodeid=0 崩溃） |
 | `SANDBOX_DIR` | 全局段 | 沙盒落点目录名（覆盖默认 `sandbox`） |
+| `FUSE_EVENTS` | 全局段 | FUSE 事件通道总开关，默认 **OFF**。开启后 daemon 暴露两条抽象命名空间 UDS：`nsp_fs_events`（订阅后推 NDJSON 事件）与 `nsp_fs_query`（一次性查询），供扫描侧按增量扫描而非整树重扫；关闭时零线程、零 socket，IO 路径只多一次原子读。通道白名单默认含 root(0)/system(1000)/media_rw(1023) + **自动解析的 MediaProvider 进程 uid**（包名 `com.google.android.providers.media.module`、`com.android.providers.media.module` 与 `com.android.providers.media`，启动时从 `/data/system/packages.list` 取 uid 并按相同 uid 去重——消费方跑在该进程内，它既不是 1000 也不是 1023；解析失败只少这一条，通道其余照旧）+ `[GLOBAL] FUSE_EVENTS_UIDS` 追加项。见 `architecture.md` §4.7 |
+| `FUSE_EVENTS_UIDS` | 全局段 | 事件通道**追加**白名单 uid（逗号分隔，上限 8 项；默认已含 root(0)/system(1000)/media_rw(1023) 与自动解析出的 MediaProvider 进程 uid，见上行）。它只决定谁能连这两条 socket，与事件里的 `uid`/`pkg`（被代理的应用）无关 |
 | `ALLOW_CROSS_APP_DATA` | 全局段 | 跨应用隔离放宽开关，默认 **OFF**（=隔离生效：`/Android/data|obb/<他包>` 既**不可列举也不可打开**）。写 `ON` 恢复旧行为（只过滤列举、不限制打开），是跨应用隔离的**唯一逃生阀**，见 §4.1 |
 
 `MONITOR` / `SANDBOX` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记），不存在"继承全局后再覆盖"的中间态。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
