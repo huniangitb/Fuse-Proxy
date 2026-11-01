@@ -33,7 +33,8 @@
 | `[SYSTEM_APPS]` | 类别段：全部**系统应用**（忽略 uid；带 `:uid` 会被归一并告警） |
 
 - 段头后可加 `ON` / `OFF` 控制该段是否注入使能，缺省为 **ON**。解析器只识别紧跟 `]` 后（忽略空格）的 `ON` / `OFF`，其他字符按默认 ON。
-- **优先级：应用专属 > 类别 > GLOBAL**。REDIRECT/FTP 取首命中；HIDE/RO 取并集；MONITOR/SANDBOX 显式覆盖按同序（应用段 `SANDBOX OFF` 显式否决类别+全局）。同一作用域内**静态路径规则先于含通配/变量的规则**（Trie 命中即取，Trie 只是静态规则的加速索引）；跨作用域一律按上面的作用域顺序，**下层作用域的静态规则不得压过上层作用域的通配/变量规则**。
+- **优先级：应用专属 > 类别 > GLOBAL，四类路径规则同一套「作用域优先」**：同一条路径先问应用段**是否发了话**，发了就用应用段的声明（HIDE / ALLOW / RO / REDIRECT 任一个），否则问类别段，最后问 `[GLOBAL]`。所以应用段 `HIDE /Download` 能压过 `[GLOBAL] ALLOW /Download`，应用段 `ALLOW /Download` 也能取消 `[GLOBAL] HIDE /Download`（旧实现把 HIDE/RO 做三层并集，于是 GLOBAL 恒赢、应用段 ALLOW 永远无效——用户报障「单应用规则优先级没全局高」即此，已修）。跨作用域**不再有并集语义**；FTP 取首命中。同一作用域内**静态路径规则先于含通配/变量的规则**（Trie 命中即取，Trie 只是静态规则的加速索引）；跨作用域一律按上面的作用域顺序，**下层作用域的静态规则不得压过上层作用域的通配/变量规则**。同一段内对**同一虚拟前缀**同时写了 `ALLOW` 与 `REDIRECT` 时 **`REDIRECT` 胜**（`ALLOW` 的语义是"不重定向/放行到自身"，显式改写目标更具体；旧实现靠 Trie 同一节点后写覆盖先写，观测结果一致）。
+- **沙盒的作用域**：沙盒"从哪里来的"由最高优先级的声明决定（应用段显式 > 应用段继承 > 类别段 > `[GLOBAL]`），见 §3 `SANDBOX`。**低作用域的 `ALLOW` 不得豁免高作用域声明的沙盒**：`[GLOBAL] SANDBOX ON` + `[GLOBAL] ALLOW /Pictures` 时 `/Pictures` 对普通应用放行（不沙盒）；但某应用段一旦写了 `SANDBOX ON`，该应用下 `/Pictures` 同样进沙盒——要豁免就在**同一应用段**写 `ALLOW /Pictures`。这条是「全局开沙盒时单应用不能继承/不能覆盖」报障的修复口径。
 - **裸 `[<pkg>]` 是跨用户 fallback（user_id=-1），不是 user 0**：查找同名包时先精确匹配 `[<pkg>:<uid>]`，未命中再回退到 `[<pkg>]`。因此 `[com.tencent.mm]` 对 0/999 等所有用户生效，而 `[com.tencent.mm:999]` 只对 999 生效。注意这与 App-rules **文件目录**不同：uid 0 的规则文件放在 `App-rules/`（`0` 是目录默认值），不要据此把裸段头的 user_id 当成 0。
 - 类别判定复用 `SKIP_SYSTEM_APPS` 逻辑：`pm list packages -s` 缓存（injector 落盘 `sys_pkgs.cache` 供 FUSE 侧只读），失败回退 `uid < 10000`。
 - 包名不可解析时（`system`/`unknown`/过短/`zygote`）类别段不生效，仅 GLOBAL 适用。
@@ -49,7 +50,7 @@
 | 开关 | 范围 | 说明 |
 |------|------|------|
 | `MONITOR` | 应用段 | 监控该应用的文件访问 |
-| `SANDBOX` | 应用段 | 启用独立沙箱（隔离 `/Android/data`、`/Android/obb`） |
+| `SANDBOX` | 应用段 / 全局段 | 启用独立沙箱：该应用对存储的访问**整树重定向**到沙盒落点（`<storage>/Android/data/<pkg>/<SANDBOX_DIR>`，见 `architecture.md` §存储视图），`/Android/data`、`/Android/obb` 的跨应用骨架另按 §4.1 隔离。**应用段不写 = 继承 `[GLOBAL]`**；应用段 `ON` = 该应用一律沙箱（连 `[GLOBAL] ALLOW` 的目录也进沙箱，要豁免须写在同一应用段）；应用段 `OFF` = 显式不沙箱。命中 `ALLOW` 的路径不再进沙盒（`ALLOW` = 不重定向），除非沙盒的声明作用域高于该 `ALLOW`。语义见 §2「沙盒的作用域」 |
 | `GLOBAL_INJECT` | 全局段 | 全局注入开关 |
 | `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON**。zygisk 模块**不**再按 uid 硬编码过滤：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，是否注入完全由本开关裁决——写成 OFF 时系统应用（如 uid 1000 的 Settings）才会被注入/还原 |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节）；其中 `-o negative_timeout[=N]` 会被单点剥离（恒为 libfuse 默认 0.0，非 0 负缓存以 ino=0 回包会触发内核 nodeid=0 崩溃） |
@@ -58,7 +59,7 @@
 | `FUSE_EVENTS_UIDS` | 全局段 | 事件通道**追加**白名单 uid（逗号分隔，上限 8 项；默认已含 root(0)/system(1000)/media_rw(1023) 与自动解析出的 MediaProvider 进程 uid，见上行）。它只决定谁能连这两条 socket，与事件里的 `uid`/`pkg`（被代理的应用）无关 |
 | `ALLOW_CROSS_APP_DATA` | 全局段 | 跨应用隔离放宽开关，默认 **OFF**（=隔离生效：`/Android/data|obb/<他包>` 既**不可列举也不可打开**）。写 `ON` 恢复旧行为（只过滤列举、不限制打开），是跨应用隔离的**唯一逃生阀**，见 §4.1 |
 
-`MONITOR` / `SANDBOX` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记），不存在"继承全局后再覆盖"的中间态。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
+`MONITOR` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记）。`SANDBOX` 是**分层声明**而不是「写了才生效」的开关：不写 = 继承全局；`ON` = 该应用一律沙箱（含全局 `ALLOW` 的目录）；`OFF` = 显式不沙箱（见 §2「沙盒的作用域」）。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
 
 `MONITOR` 的三层合并（应用显式 > 类别显式 > `[GLOBAL]`；`[USER_APPS[:uid]]` / `[SYSTEM_APPS]` 均参与）由**框架**统一计算，与规则模块是否加载无关：模块未加载/被 ban、路径无 `<uid>/` 用户层、模块未命中规则时同样算得对。若把开关绑在"模块是否给出有效决策"上，这些情形下文件读写一切正常、IO 监控日志却静默消失且无任何提示（历史缺陷）。框架为此自建一份配置索引并自行解析 uid→包名（`uid.map` → `/proc` 回退，见 `architecture.md` §2.2）；包名不可解析（`system`/`unknown`/过短/`zygote`）时只认 `[GLOBAL]`，与模块侧同一 fail-safe 口径。
 
@@ -70,7 +71,7 @@
 |------|------|------|
 | 隐藏 | `HIDE <path>` | 应用看不到该路径（返回 ENOENT） |
 | 只读 | `RO <path>` | 该路径对应用只读（写操作返回 EROFS） |
-| 放行 | `ALLOW <path>` | 显式放行：等价"重定向回自身真实存储"（parse 生成 `?<path>` 内部前缀） |
+| 放行 | `ALLOW <path>` | 显式放行：等价"重定向回自身真实存储"（parse 生成 `?<path>` 内部前缀）。命中后该路径**不参与沙盒重定向**，且不继承低作用域的 `HIDE`/`RO`/`REDIRECT`（作用域优先，见 §2） |
 | 重定向 | `REDIRECT <vpath> <target>` | 应用访问 `<vpath>` 实际落到 `<target>` |
 
 > 内置隐藏：`CONFIG_DIR` 下所有访问无条件返回 ENOENT；应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用（跨应用隔离，**列举与打开同口径**，见 §4.1）。
@@ -191,6 +192,7 @@ HIDE /secret   # 这不是注释，会被并入规则
 | `SANDBOX_DIR` 写在应用段/类别段 | 只写 `[GLOBAL]` 段 | 仅全局段有效，写在别处忽略并告警（`config_parser.c` 的 `SANDBOX_DIR` 分支）；目录名须单级、不含 `/`、上限 63 字节 |
 | `SANDBOX_TARGET = <路径>` | 用 `[GLOBAL]` 段的 `SANDBOX_DIR` 改目录名 | 无此配置项；沙盒落点固定为 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/<SANDBOX_DIR 或 sandbox>`，不能改成任意路径 |
 | 应用段写 `MONITOR OFF` 期望继承全局 | 全局段写 `MONITOR OFF`，或应用段显式写所需值 | 应用段显式写即覆盖全局 |
+| `[GLOBAL] ALLOW /Pictures` 后应用段 `SANDBOX ON`，期望 `/Pictures` 仍放行 | 在同一应用段写 `ALLOW /Pictures` | 低作用域 `ALLOW` 不豁免高作用域声明的沙盒（§2） |
 | `FUSE_EXTRA_ARGS` 写在应用段 | 仅写 `[GLOBAL]` 段 | 应用段无该字段 |
 | 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `strip_storage_prefix` 不处理 `/sdcard` |
 

@@ -492,7 +492,7 @@ remote_dir = /srv/backup
 
 **超长行同样 fail-closed**：模块配置任一有效行超过 `NSP_CONFIG_LINE_MAX`（2048 字节）时，框架把该模块配置**整份**判为不可用（只下发 `NSP_CFG_REC_MODULE_FILE` 标记、零 `MODULE_LINE`），模块按「无可用配置」清空后端表并 loud 报出路径——绝不因为丢了 `proto = sftp` 一行而按默认 `ftp`/21 静默退回明文 FTP（见 §6.1.1）。
 
-内建引擎的关键语义（修改时必须保持）：appear_missing/read_only 取 app + global **并集**；redirect/sandbox 取 app 优先、global 兜底，sandbox 仅在无 redir 命中时生效；`fw_rules_resolve`/`fw_rules_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
+内建引擎的关键语义（修改时必须保持）：appear_missing/read_only/redirect 同走**作用域优先**（应用 > 类别 > GLOBAL，单点 `br_resolve_decl`，命中即返回，不再并集）；sandbox 的生效作用域由 `br_sandbox_scope` 决定（应用显式 > 应用继承 > 类别 > 全局），低作用域 ALLOW 不免除高作用域沙盒，sandbox 仅在无 redir 命中且无有效 ALLOW 时生效；`fw_rules_resolve`/`fw_rules_probe` 走 `config_read_begin`/`config_read_end` 无锁快照（不持 `config_lock_read()` rwlock，见 `architecture.md` §6）。
 
 ## 8. 相关文档
 
