@@ -77,6 +77,12 @@ SUITE_MAP = [
      ("fw_acl_decide", "fw_acl_classify", "fw_acl_check", "fw_acl_identity",
       "fw_rules_cross_app_isolated"),
      "访问控制判定表(fw_acl) / 跨应用隔离开关"),
+    # ── ACL 不干扰（验收门 G9）：真 daemon + 真挂载上以普通调用者身份做真实文件
+    # 操作，断言「功能预期」而不是 ACL 内部判定——ACL 层不得改变功能语义。
+    (("test_acl_nonintrusive.py",),
+     ("src/daemon/fw_acl.c", "src/daemon/fw_acl.h", "src/daemon/fuse_daemon.c"),
+     ("fw_acl_check", "fw_acl_decide", "fw_route", "vfs_check_read_only"),
+     "ACL 不干扰(G9) / 真实挂载视图功能预期"),
 
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py", "test_negative_timeout.py",
@@ -332,6 +338,7 @@ LAYERS = {
             "test_rules.py",
             "test_decision_enforce.py",
             "test_fw_events_fuse.py",
+            "test_acl_nonintrusive.py",
             "test_negative_timeout.py",
             "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
