@@ -27,4 +27,10 @@ void fw_pkg_shutdown(void);
    tid 为请求者线程 id（0 表示未知，仅用 uid.map）。 */
 bool fw_pkg_resolve(uid_t uid, pid_t tid, char* out, size_t size);
 
+/* 同 fw_pkg_resolve，但**不做** uid<10000 的系统伪包短路：照常按 uid.map →
+   /proc Tgid+cmdline 解析出真实包名（如 uid 1000 的 com.android.settings），
+   供规则匹配层在系统应用上命中显式应用段（[pkg] 段）。解析失败同样返回
+   false 且 out 写入尽力得到的名称。 */
+bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size);
+
 #endif /* FW_PKG_H */

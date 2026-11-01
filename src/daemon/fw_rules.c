@@ -166,9 +166,25 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, Ap
     current_pkg_out[127] = '\0';
 
     if (uid < NSP_SYSTEM_APP_UID_MIN) {
-        /* 系统伪包（uid<10000，fw_pkg 已给出 "system"）：只参与 SYSTEM_APPS 类别层 */
+        /* 系统伪包（uid<10000，fw_pkg 已给出 "system"）：默认只参与 SYSTEM_APPS
+           类别层。但用户会在 injector.conf 里给系统应用写显式应用段（如
+           [com.android.settings] HIDE ...），而伪包名永远匹配不到应用段——
+           实机验证：GLOBAL/类别段 HIDE 生效、应用段不生效。这里用
+           fw_pkg_resolve_exact 解析真实包名（uid.map → cmdline）后再匹配
+           应用段；解析不出或未命中时维持伪包口径。 */
+        int user_id = (int)(uid / NSP_PER_USER_UID_STRIDE);
+        char exact[128];
+        if (fw_pkg_resolve_exact(uid, tid, exact, sizeof exact) && pkg_resolvable(exact)) {
+            AppConfig* sys_matched = find_app_cfg_locked(exact, user_id);
+            if (sys_matched) {
+                strncpy(current_pkg_out, exact, 127);
+                current_pkg_out[127] = '\0';
+                if (cat_out) *cat_out = br_pick_category(uid, user_id, exact);
+                return sys_matched;
+            }
+        }
         if (cat_out)
-            *cat_out = br_pick_category(uid, (int)(uid / NSP_PER_USER_UID_STRIDE), pkg);
+            *cat_out = br_pick_category(uid, user_id, pkg);
         return nullptr;
     }
 

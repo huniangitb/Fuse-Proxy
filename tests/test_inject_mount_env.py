@@ -800,14 +800,18 @@ def build_topology():
     return sys_dev
 
 
-def spawn_app(pkg):
+def spawn_app(pkg, uid=None):
     """zygote 序列拉起假应用：unshare + MS_REC|MS_SLAVE / + UnmountTree(/storage)
-       + rbind /mnt/user/0 → /storage，随后 exec 睡眠进程（argv[0]=pkg）。"""
+       + rbind /mnt/user/0 → /storage，随后 exec 睡眠进程（argv[0]=pkg）。
+       uid 非 None 时 exec 前 setuid（root 沙箱可落 uid<10000 模拟系统应用）。"""
     pid = os.fork()
     if pid == 0:
         try:
             if libc.unshare(CLONE_NEWNS) != 0:
                 os._exit(41)
+            if uid is not None:
+                if libc.setgid(uid) != 0 or libc.setuid(uid) != 0:
+                    os._exit(44)
             mount(None, "/", None, MS_REC | MS_SLAVE)
             entries = read_mountinfo()
             under = [e for e in entries
@@ -1314,6 +1318,48 @@ def inner_main(argv):
             write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
             wait_check("R16 复原配置：应用回到系统视图", dev_is(STORAGE_EMU, sys_dev, app3),
                        timeout=8)
+
+        # ── R17：SKIP_SYSTEM_APPS 只在全局注入打开时才允许跳过 ──
+        # 用户报障（原话）：「会跳过对所有系统应用的处理，这个开关应该是只有在
+        # 全局注入打开的时候才生效，目前用户对其中应用手动设置规则也不会生效」。
+        # 语义：v1 + GLOBAL_INJECT OFF + SKIP_SYSTEM_APPS ON（默认）时，被应用段
+        # 显式点名的系统应用（uid<10000）必须照常注入——SKIP_SYSTEM_APPS 只管
+        # "通配/全局注入波及"路径，不是"系统应用一律不处理"的总闸。
+        # 判别链（全程不重启）：
+        #   (a) 系统应用带应用段规则 → REPORT 后挂上（is_target_app 应用段命中，
+        #       不经过 skip_system_apps 过滤——inject_target.c:486 应用段优先返回）；
+        #   (b) 同一应用删掉规则 → 热对账立即热卸载（want=false）；
+        #   (c) 规则恢复 → 立即重新挂上。
+        if method == "v1":
+            REP.set_phase("r17_sys_app_rules")
+            sys_uid = 5000  # app_id<10000：is_system_app(uid)=true，无需 pm 缓存命中
+            SYS_PKG = "com.test.sysapp"
+            app4 = spawn_app(SYS_PKG)
+            app_pids.append(app4)
+            REP.check(f"R17 前置：系统应用 {SYS_PKG}(uid {sys_uid}) 视图 = 系统视图",
+                      dev_at(STORAGE_EMU, app4) == sys_dev,
+                      f"实际 {entry_desc(top_entry(STORAGE_EMU, app4))}")
+            sys_cfg = CONFIG_TEXT + f"\n[{SYS_PKG}] ON\nHIDE /HIDE_ME/\n"
+            write_config_atomic(CONFIG_PATH, sys_cfg)
+            # uid 由 root companion（zygisk）在报文里声明；沙箱里直接报 5000 模拟
+            # 系统应用 uid（真实链路同源，见 ipc_server.c 的 REPORT 解析）。
+            rep_s = ipc_retry(f"REPORT {SYS_PKG} {app4} {sys_uid} 0")
+            REP.check(f"R17(a) 系统应用应用段规则生效：REPORT {SYS_PKG} 挂载",
+                      wait_listed(app4, SYS_PKG, timeout=8),
+                      f"REPORT 回包 {rep_s!r}；LIST_INJECTED 未含 {SYS_PKG}")
+            check_now(f"R17(a) {SYS_PKG} 视图为项目 FUSE",
+                      dev_is(STORAGE_EMU, g_dev, app4))
+            # (b) 删规则 → 热卸载（audit_running_apps want=false）
+            write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
+            wait_check(f"R17(b) 删除规则后 {SYS_PKG} 立即热卸载（未重启）",
+                       dev_is(STORAGE_EMU, sys_dev, app4), timeout=8)
+            # (c) 规则恢复 → 立即重新挂上
+            write_config_atomic(CONFIG_PATH, sys_cfg)
+            wait_check(f"R17(c) 规则恢复后 {SYS_PKG} 立即重新热挂载（未重启）",
+                       dev_is(STORAGE_EMU, g_dev, app4), timeout=8)
+            write_config_atomic(CONFIG_PATH, CONFIG_TEXT)
+            wait_check(f"R17 复原配置：{SYS_PKG} 回到系统视图",
+                       dev_is(STORAGE_EMU, sys_dev, app4), timeout=8)
 
         # 文件级 IO（init ns 视角）
         if method == "v1":
