@@ -71,9 +71,18 @@ void fw_pkg_shutdown(void) {
 
 /* /data/system/packages.list：Android 全量已装应用清单（"pkg uid ..."），
    系统共享 uid（1000 等）的包名唯一可靠来源（uid.map 无条目、caller pid 不可得）。
-   找到返回 true 并写入 out；找不到/打不开返回 false。 */
-static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size) {
-    FILE* fp = fopen("/data/system/packages.list", "re");
+   找到返回 true 并写入 out；找不到/打不开返回 false。seinfo 非空时顺带带回
+   该行的 MAC 权限标签（如 "platform:privapp:targetSdkVersion=36"），供特权
+   判定（fw_pkg_is_privileged）使用。路径可用 fw_pkg_set_packagelist_path
+   注入（仅测试；生产恒为 /data/system/packages.list）。 */
+static const char g_packagelist_path[] = "/data/system/packages.list";
+static const char* g_packagelist_override = nullptr;
+
+void fw_pkg_set_packagelist_path(const char* path) { g_packagelist_override = path; }
+
+static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size,
+                                             char* seinfo, size_t seinfo_size) {
+    FILE* fp = fopen(g_packagelist_override ? g_packagelist_override : g_packagelist_path, "re");
     if (!fp) return false;
     bool found = false;
     char line[1024];
@@ -82,12 +91,73 @@ static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size) 
         unsigned int puid = 0;
         if (sscanf(line, "%127s %u", name, &puid) == 2 && puid == (unsigned int)uid) {
             snprintf(out, size, "%s", name);
+            if (seinfo && seinfo_size > 0) {
+                /* 第 4 字段 dataDir 第 5 字段 seinfo："pkg uid debug dataDir seinfo ..." */
+                seinfo[0] = '\0';
+                char datadir[256];
+                if (sscanf(line, "%*127s %*u %*u %255s %127s", datadir, seinfo) != 2)
+                    seinfo[0] = '\0';
+            }
             found = true;
             break;
         }
     }
     fclose(fp);
     return found;
+}
+
+/* uid 是否为特权应用（Android 权限体系自动判定，见 fw_pkg.h）。缓存独立于
+   包名解析槽位：privileged 是"uid → 布尔"的稳定事实（packages.list 只在
+   应用安装/升级时变化），包名缓存 gen 失效不影响它。 */
+typedef struct {
+    _Atomic uint64_t seq; /* 奇数 = 写者进行中 */
+    uint64_t gen;
+    uid_t uid;
+    bool known; /* packages.list 有该 uid 的行（不可读/未命中 = false） */
+    bool priv;
+} FwPkgPrivSlot;
+
+static FwPkgPrivSlot g_priv_slots[FW_PKG_CACHE_SIZE];
+static pthread_mutex_t g_priv_fill_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* seinfo 以 "platform" 开头 = platform 签名（system/priv-app/签名共享）。
+   实测 packages.list：DocumentsUI "platform:privapp:…"、Settings "platform:privapp:…"、
+   系统签名覆盖层 "platform:targetSdkVersion=…"；普通应用恒为 "default:…"。
+   "privapp" 子串单独判会漏掉纯 platform 签名应用，故判前缀。 */
+static bool seinfo_is_privileged(const char* seinfo) {
+    return strncmp(seinfo, "platform", 8) == 0 &&
+           (seinfo[8] == '\0' || seinfo[8] == ':');
+}
+
+bool fw_pkg_is_privileged(uid_t uid) {
+    FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    for (;;) {
+        uint64_t v1 = atomic_load_explicit(&s->seq, memory_order_acquire);
+        if (!(v1 & 1)) {
+            if (v1 == s->seq && s->gen == gen && s->uid == uid && s->known)
+                return s->priv;
+        }
+        if (atomic_load_explicit(&s->seq, memory_order_acquire) & 1) continue;
+        pthread_mutex_lock(&g_priv_fill_lock);
+        char pkg[FW_PKG_NAME_MAX];
+        char seinfo[128];
+        bool known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo,
+                                                      sizeof seinfo);
+        bool priv = known && seinfo_is_privileged(seinfo);
+        /* 槽位写回只依赖 g_priv_fill_lock（本函数独占路径）+ 自身 seqlock 标记；
+           绝不碰 g_fill_lock——包名填充路径（g_fill_lock）会调用本函数，嵌套即死锁 */
+        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
+                              memory_order_release); /* 奇：写中 */
+        s->uid = uid;
+        s->known = known;
+        s->priv = priv;
+        s->gen = gen;
+        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
+                              memory_order_release); /* 偶：写完 */
+        pthread_mutex_unlock(&g_priv_fill_lock);
+        return priv;
+    }
 }
 
 /* 取展示包名并判定其可否用于段匹配（等价模块 br_get_app_cfg 的不可解析分支：
@@ -106,7 +176,7 @@ static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool*
            按 uid 取第一个匹配包名。共享 uid（android.uid.system 下多个包）只取
            其一，其余包的应用段规则要生效需等 uid.map 随 REPORT 增长补上；
            伪包 "system" 的 SYSTEM_APPS 类别层判定不受影响。 */
-        resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg);
+        resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, nullptr, 0);
         if (pkg[0] == '\0' && tid > 0) {
             /* packages.list 不可读（非 Android 环境）时退回 cmdline */
             goto cmdline_fallback;
