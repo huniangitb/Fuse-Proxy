@@ -1520,7 +1520,12 @@ static bool br_cfg_touches_data(const AppConfig* c) {
     for (int i = 0; i < c->ro_count; i++)
         if (c->ro_rules && br_rule_touches_data(c, c->ro_rules[i])) return true;
     for (int i = 0; i < c->redir_count; i++) {
-        if (!c->redir_rules || c->redir_rules[i].is_allow) continue; /* ALLOW 即直通 */
+        /* ALLOW 同样算「规则触及」：它声明的是**这一层放行**，而下层 backing
+           直通会把 I/O 交给内核按调用方凭证做 DAC（/data/media 归 MediaProvider，
+           应用一律 EACCES），故 ALLOW 路径也必须由 daemon 代理。旧实现把 ALLOW
+           当直通跳过 → 应用段只写 ALLOW 时该路径仍挂 backing，用户观感「注入后
+           写不进 /Download」。 */
+        if (!c->redir_rules) continue;
         if (br_rule_touches_data(c, c->redir_rules[i].virtual_prefix) ||
             br_rule_touches_data(c, c->redir_rules[i].real_target))
             return true;
@@ -1692,7 +1697,10 @@ static bool br_cfg_mediates_path(const AppConfig* c, const char* query) {
         if (backing_rule_hits(c, c->ro_rules[i], query)) return true;
     }
     for (int i = 0; i < c->redir_count; i++) {
-        if (!c->redir_rules || c->redir_rules[i].is_allow) continue; /* ALLOW 即直通 */
+        /* ALLOW 也要求仲裁：命中 ALLOW 的路径由 daemon 代理 IO，不能挂 backing
+           直通——下层 DAC 按调用方凭证判，应用对 /data/media 一律 EACCES
+           （与 br_cfg_touches_data 同一理由）。 */
+        if (!c->redir_rules) continue;
         if (backing_rule_hits(c, c->redir_rules[i].virtual_prefix, query)) return true;
     }
     for (int i = 0; i < c->ftp_count; i++) {
