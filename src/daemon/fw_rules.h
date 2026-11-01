@@ -175,4 +175,8 @@ int fw_rules_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_
    不进行任何规则合成——从源头规避挂载点根下出现额外虚拟目录。 */
 bool fw_rules_path_has_uid_layer(const char* path);
 
+/* 跨应用隔离当前是否生效（[GLOBAL] ALLOW_CROSS_APP_DATA 默认 OFF ⇒ true）。
+   fw_acl 的「他包私有目录不可见」沿用同一开关，避免两处各自解释这条配置。 */
+bool fw_rules_cross_app_isolated(void);
+
 #endif /* FW_RULES_H */

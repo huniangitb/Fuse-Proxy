@@ -204,6 +204,21 @@ backing 门配套收紧（`fw_rules.c` 的 `fw_data_mediation_required()` / `fw_
 
 收敛前，`hidden`/`ro` 判定散落在 27 个回调里各写一遍（写类还各自映射 `EACCES`），新增回调极易漂移。回归见 `tests/test_decision_enforce.py`（逐回调 errno 矩阵）。
 
+### 4.5.1 访问控制（`fw_acl.c`，对齐 Android 原生 FUSE 的用户态策略层）
+
+挂载层我们与 AOSP 等价：**都不加 `default_permissions`**（AOSP vold 注入挂载参数处有明确注释：不想让内核在路由到 daemon 之前做低层权限检查），属主/权限由 daemon 侧合成。AOSP 的唯一门是 FuseDaemon 的 is_app_accessible_path()（uid < `AID_APP_START`(10000) 直接放行、卷根不可列举、`Android/data|obb/<pkg>` 他包一律 `ENOENT`、`.nomedia` 放行），媒体语义再外包给 MediaProvider 的 13 个 JNI 判定。旧版本我们**完全没有这一层**：daemon 以 root 执行全部 syscall，任意应用可删改挂载内任意文件。
+
+现在的落地方式与「决策强制单点」同一纪律：
+
+- **唯一执行点** `fw_acl_check()` 由 `fw_route()` 在规则决策**之前**调用一次（每次调用即「这个调用者能不能碰这条路径」），回调里不得再写访问判定；`tests/test_acl.py` 的静态契约断言 `fuse_daemon.c` 里 `fw_acl_check(` 只能出现一次。
+- **判定表只有一份**：纯函数 `fw_acl_decide(q, id)`（可直编单测，不依赖全局状态），路径分类 `fw_acl_classify()` 集中处理「卷根 / 骨架目录 / 他包私有目录 / `Android/media` / 顶层条目 / 普通路径」，不散落字符串比较。
+- **三码不混用**：`ENOENT`=看不见（他包 `Android/data|obb`）、`EACCES`=存在但不许（骨架目录列举、顶层结构违规、`access` 的 X_OK）、`EPERM`=结构层不许（骨架/顶层目录的增删改名）。
+- **配置耦合只有一处**：「他包私有目录不可见」沿用既有 `[GLOBAL] ALLOW_CROSS_APP_DATA`（`fw_rules_cross_app_isolated()` 是开关唯一出处），否则这条 AOSP 默认会让显式放行的用户突然失效；platform 签名豁免（`fw_pkg_is_privileged`）同 `766e5f5`。
+- **fail-open 名单明确**：uid < 10000（root/shell/system）、包名解析失败、`MANAGE_EXTERNAL_STORAGE`（后续阶段接入）一律放行——ACL 是「多一道门」，不能变成单点故障（解析失败把应用挡在自己的 data 目录外比越权更难排查）。
+- **与 AOSP 的有意差异（超集，不是缺省）**：`chmod`/`chown` 照旧下发到 backing（AOSP 的 `handle_setattr` 静默丢弃 mode/uid/gid 变更），因为我们的 backing 是真实文件系统、属性可以真的保存；`access(X_OK)` 对文件保守放行、留给内核在 exec 时按 `MS_NOEXEC` 拒绝（回调里判 ACL 时还拿不到 stat，宁可多一层也不误伤目录的 X_OK）。
+
+回归：`tests/test_acl.py`（47 条纯逻辑断言 + 静态契约）。
+
 ### 4.6 虚拟目录性质（`virtual_kind`）
 
 引擎在决策里额外给出 `NspVirtualKind`（`NspPathDecision` 与 `NspProbeResult` 各带一份），只用于**让重定向的虚拟名字在视图里自洽**，不参与规则求值、不改变重定向指向：

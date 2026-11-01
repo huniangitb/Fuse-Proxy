@@ -89,6 +89,18 @@
 
 后端模块可追加规则类型（如 FTP 模块的 `FTP <虚拟前缀> <段名>`），见 `modules.md` §2.1。
 
+### RO 的可见副作用：媒体索引不会自己刷新
+
+Android 11+ 的 `/storage/emulated` 由 **MediaProvider 自己**当 FUSE 服务端。应用的写一旦经本项目 FUSE 落地（`REDIRECT` 落点、或直写 backing），MediaProvider 那一层就**没有见过这次写**——它把新文件收进媒体库只有两条路：① 应用保存后显式请求扫描该路径；② MediaProvider 自身的 idle 维护扫描（分钟到小时级）。
+
+`RO` 掐断的正是 ①：应用照旧对 `RO` 的那条路径请求扫描，而文件因为 `EROFS` 根本没建，MediaProvider 扫出空结果，相册要等 ② 才出现条目。现象是「加了 `RO` 之后相册刷新巨慢」，同时磁盘上另一份（`REDIRECT` 落点）其实是好的；应用若等扫描回调，还会表现为「保存超时」。注意这与单次 I/O 快慢无关：`RO` 拒绝比放行更快（宿主实测 create 被拒 25.9µs vs 放行 62.7µs，p50），`read`/`write` 更不经过规则判定。
+
+- **想让相册立刻看到落地文件**，必须由某一方显式触发一次扫描（命令在 Android 13 实测可用）：
+  `content call --uri content://media/ --method scan_file --arg /storage/emulated/0/DCIM/xxx.jpg`
+  返回 `Bundle[android.intent.extra.STREAM=<生成的媒体 Uri>]`；文件不存在或不是媒体时该值为 `null`。应用侧等价 API 是 `MediaScannerConnection.scanFile(...)` 与 @hide 的 `MediaStore.scanFile(resolver, volume, path)`，都落到同一个 `scan_file`。`android.intent.action.MEDIA_SCANNER_SCAN_FILE` 广播自 API 29 弃用，Android 13 上不可依赖；`--method scan_volume` 是整卷重扫，代价大且部分 ROM 对 volume 参数挑剔。
+- **触发方只能来自知道真实落点的一方**：daemon（重定向目标写入成功/close 之后，按路径去抖、异步执行，禁止占用 I/O 路径等 `fork+exec`）或外部 hook（hook MediaProvider 的 `call`/扫描入口）。
+- **只想「不产生重复文件」而不想改动扫描可见性时，优先用 `REDIRECT`** 让两次保存落到**同一个**真实目标，而不是用 `RO` 把其中一次变成 `EROFS`。
+
 ### 路径前缀归一
 
 底层真实物理存储固定为 `/data/media/<user_id>`（`STORAGE_BASE`）。配置中的路径按下表归一：

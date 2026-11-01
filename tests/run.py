@@ -57,6 +57,16 @@ SUITE_MAP = [
      "通用回归基线"),
 
     # ── AGENTS.md 映射表 ──
+    # ── 访问控制判定表（fw_acl.c）：AOSP 语义的唯一执行点 ──
+    # 直编 fw_acl.c + 纯逻辑驱动（桩掉 uid→包名/特权/隔离开关三个事实源），
+    # 另有静态契约断言：fw_acl_check 在 fuse_daemon.c 只能出现一次、关键回调
+    # 必须把 ACL 操作种类交给 fw_route。
+    (("test_acl.py",),
+     ("src/daemon/fw_acl.c", "src/daemon/fw_acl.h"),
+     ("fw_acl_decide", "fw_acl_classify", "fw_acl_check", "fw_acl_identity",
+      "fw_rules_cross_app_isolated"),
+     "访问控制判定表(fw_acl) / 跨应用隔离开关"),
+
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py", "test_negative_timeout.py",
       "test_readdir_skel_fallback.py", "test_backing_gate.py",
@@ -271,6 +281,7 @@ LAYERS = {
         "静态/契约（无挂载无网络，可并行）",
         (
             "test_docs_sync.py",
+            "test_acl.py",
             "test_config_snapshot.py",
             "test_monitor_layers.py",
             "test_path_vars.py",
@@ -476,6 +487,7 @@ def layer_suites(layers):
 # 新套件默认串行，要加入须先核对判据。
 PARALLEL_SAFE = frozenset({
     "test_docs_sync.py",          # 纯静态读文件（文档/台账一致性），无子进程/无挂载
+    "test_acl.py",                # cc 直编 fw_acl.c + 纯逻辑驱动，TemporaryDirectory，无挂载
     "test_config_snapshot.py",    # cc 编译夹具直跑，TemporaryDirectory
     "test_module_abi.py",         # cc 编译 ABI 夹具，无 daemon（TemporaryDirectory）
     "test_path_vars.py",          # cc 编译直跑（mkdtemp）
