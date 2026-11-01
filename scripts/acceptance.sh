@@ -4,12 +4,13 @@
 # 把 docs/testing.md §4 的验收门变成可执行的单一入口。此前各门散落在不同命令里，
 # 全靠人工逐条照做：漏跑哪一门、哪一门是上次的旧结果，事后无从对账。
 #
-#   scripts/acceptance.sh                  # 跑默认门（G1 G2 G3 G4）
+#   scripts/acceptance.sh                  # 跑默认门（G1 G2 G3 G4 G9；G9 快，故默认跑）
 #   scripts/acceptance.sh --list           # 看门清单，不跑
 #   scripts/acceptance.sh --only G3,G4     # 只跑指定门
+#   scripts/acceptance.sh --only G9        # 只跑「ACL 不干扰」（真 daemon 功能预期）
 #   scripts/acceptance.sh --with-asan      # 追加 G5（ASan+UBSan 复跑，重）
 #   scripts/acceptance.sh --with-isolated  # 追加 G6（宿主零污染隔离跑，重）
-#   scripts/acceptance.sh --all-gates      # G1..G6 全跑
+#   scripts/acceptance.sh --all-gates      # G1..G6 与 G9 全跑
 #   scripts/acceptance.sh --skip-android   # 无 NDK 时跳过 G2（计为 SKIP 而非 PASS）
 #
 # 报告落 .acceptance/<时间戳>/：每门一份日志 + summary.txt 汇总。
@@ -39,7 +40,7 @@ GNU_DIR="${GNU_BUILD_DIR:-build_gnu}"
 ANDROID_DIR="${ANDROID_BUILD_DIR:-build_android}"
 ASAN_DIR="${ASAN_BUILD_DIR:-build_asan2}"
 
-RUN_GATES="G1 G2 G3 G4"
+RUN_GATES="G1 G2 G3 G4 G9"
 WITH_ASAN=0
 WITH_ISOLATED=0
 SKIP_ANDROID=0
@@ -55,6 +56,7 @@ while [ $# -gt 0 ]; do
                 "G2  构建-Android     NDK 交叉构建 + zygisk .so 无 libc++_shared" \
                 "G3  文档/台账一致性   tests/test_docs_sync.py" \
                 "G4  全量测试         tests/run.py --all --strict" \
+                "G9  ACL 不干扰       真 daemon 挂载视图的功能预期（ACL 不得误拦）" \
                 "G5  内存安全(可选)    $ASAN_DIR 下复跑核心套件（--with-asan）" \
                 "G6  宿主隔离(可选)    scripts/test-isolated.sh（--with-isolated）" \
                 "G7  判别性(人工)      新用例须在旧实现上失败" \
@@ -206,6 +208,26 @@ if wanted G4; then
         n_fail="$(grep -c '^  ❌' "$LOG" || true)"
         n_gap="$(grep -c '^  ⏭' "$LOG" || true)"
         record G4 FAIL "rc=$rc（失败 $n_fail、gap $n_gap），见 $(basename "$LOG")"
+    fi
+fi
+
+# ── G9 ACL 不干扰 ─────────────────────────────────────────────────────
+# 判别点：ACL 层的正当性是「补齐 Android 语义」而不是改功能——真 daemon 上以
+# 普通应用 uid 做真实文件操作，被误拦的普通读写/REDIRECT/RO 读/ALLOW/沙盒镜像
+# 会当场失败。跑得快（无构建、单 daemon），故进默认门集合。
+if wanted G9; then
+    banner "G9 ACL 不干扰（真 daemon 挂载视图的功能预期）"
+    LOG="$OUT/G9-acl-nonintrusive.log"
+    "${CLEAN_ENV[@]}" python3 tests/test_acl_nonintrusive.py >"$LOG" 2>&1
+    rc=$?
+    tail -n 24 "$LOG"
+    if [ "$rc" -eq 0 ]; then
+        record G9 PASS "功能预期全部成立（$(grep -c '^  ✅' "$LOG" || true) 项）"
+    elif [ "$rc" -eq 77 ]; then
+        reason="$(grep -m1 '^SKIP:' "$LOG" | sed 's/^SKIP: //')"
+        record G9 SKIP "${reason:-环境不具备（见 $(basename "$LOG")）}"
+    else
+        record G9 FAIL "rc=$rc（$(grep -c '^  ❌' "$LOG" || true) 项功能预期被破坏），见 $(basename "$LOG")"
     fi
 fi
 

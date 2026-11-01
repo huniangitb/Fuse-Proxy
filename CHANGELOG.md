@@ -234,6 +234,7 @@
 
 ### 测试
 
+- **test**: 新增验收门 **G9「ACL 不干扰」**（`tests/test_acl_nonintrusive.py`，默认门集合）——ACL 层只许补齐 Android 语义，不许改变功能预期：在 rootless unshare 沙箱里起真 `fuse_daemon` + 真挂载，配置同时含 REDIRECT/HIDE/RO/ALLOW/SANDBOX，以普通应用 uid 经挂载视图做真实文件操作，逐条断言普通写读删、REDIRECT 落点、HIDE 不可见、RO 读成功而写/删/改名 EROFS、ALLOW 直通、沙盒镜像（他包 data 只许 ENOENT/权限错误）与 AOSP 顶层语义（`/0` 可列举、非默认顶层目录 EPERM/EACCES、`DCIM` 内可建、删顶层被拒）。判别性：`fw_acl_check` 恒回 `-EACCES` 的副本上大量失败，恢复后全过。这也是**模块层可以减策略代码的前提**——ACL 若顺手改了功能语义，减代码就等于减功能。
 - 一条命令验收门（acceptance.sh + 台账校验） (a032cce)
 - ASan 下 LD_PRELOAD 运行时前置 (0a525a0)
 - 杂项判别用例与台账登记 (089faa5)
