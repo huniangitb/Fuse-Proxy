@@ -8,11 +8,14 @@
  * 用法：cross_app_isolation <main_conf> <uid> <path>...
  * 输出（每行一条，便于 Python 逐项比对）：
  *   global=<0|1>                                  —— fw_data_mediation_required()
- *   <path> resolve=<0|1> probe=<0|1> other=<0|1> valid=<0|1> backing=<0|1>
+ *   <path> resolve=<0|1> probe=<0|1> other=<0|1> valid=<0|1> backing=<0|1> sandbox=<0|1> redir=<0|1>
  *     resolve = fw_rules_resolve().appear_missing（打开/getattr 侧裁决）
  *     probe   = fw_rules_probe().appear_missing  （readdir 列举侧裁决）
  *     other   = fw_rules_probe().is_other_app_pkg
  *     backing = fw_backing_mediation_required_for(path)（backing 直通门）
+ *     sandbox = fw_rules_resolve().is_sandbox（落点是否为沙盒副本：作用域优先 /
+ *               「低作用域 ALLOW 不豁免高作用域沙盒」的回归断言靠它）
+ *     redir   = fw_rules_resolve().is_redirect（落点是否经重定向）
  *
  * 调用方身份（uid→包名）走框架真实链路：fw_pkg 先查 <CONFIG_DIR>/uid.map，
  * 未命中再回退 /proc/<pid>/cmdline；pid 用本进程，故 uid.map 是唯一夹具。
@@ -25,6 +28,7 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include "common.h" /* g_real_root（测试根，见下方 NSP_REAL_ROOT） */
 #include "config_parser.h"
 #include "fw_pkg.h"
 #include "fw_rules.h"
@@ -50,6 +54,11 @@ int main(int argc, char** argv) {
     }
     config_set_allow_app_rules_mkdir(false);
     load_config_rules(argv[1]);
+    /* 测试根：g_real_root 为空时 common_* 落到编译期 STORAGE_BASE(/data/media)，
+       沙盒落点/common_sandbox_path 在无该目录的宿主上仍能算出字符串，但显式给根
+       更贴近 daemon 的 --root= 语义（本驱动不 mount，只做决策） */
+    const char* real_root = getenv("NSP_REAL_ROOT");
+    if (real_root) snprintf(g_real_root, sizeof g_real_root, "%s", real_root);
     /* 特权豁免用例的 packages.list 夹具（生产恒读 /data/system，GNU 测试环境没有） */
     const char* plist = getenv("NSP_PACKAGELIST");
     if (plist) fw_pkg_set_packagelist_path(plist);
@@ -66,9 +75,11 @@ int main(int argc, char** argv) {
         NspProbeResult p;
         memset(&p, 0, sizeof p);
         fw_rules_probe(&q, &p);
-        printf("%s resolve=%d probe=%d other=%d valid=%d backing=%d\n", argv[i],
-               d.appear_missing ? 1 : 0, p.appear_missing ? 1 : 0, p.is_other_app_pkg ? 1 : 0,
-               d.valid ? 1 : 0, fw_backing_mediation_required_for(argv[i]) ? 1 : 0);
+        printf("%s resolve=%d probe=%d other=%d valid=%d backing=%d sandbox=%d redir=%d\n",
+               argv[i], d.appear_missing ? 1 : 0, p.appear_missing ? 1 : 0,
+               p.is_other_app_pkg ? 1 : 0, d.valid ? 1 : 0,
+               fw_backing_mediation_required_for(argv[i]) ? 1 : 0, d.is_sandbox ? 1 : 0,
+               d.is_redirect ? 1 : 0);
     }
     return 0;
 }

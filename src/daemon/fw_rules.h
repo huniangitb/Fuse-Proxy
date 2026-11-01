@@ -109,8 +109,19 @@ typedef enum {
 
 typedef struct {
     bool valid;     /* 是否已 resolve */
-    bool hidden;    /* app_hidden || cat_hidden || global_hidden */
-    bool ro;        /* app_ro || cat_ro || global_ro */
+    /* 逐作用域静态命中：作用域优先（应用 > 类别 > [GLOBAL]，docs/config.md §2）
+       的唯一数据源。合并视图（下面 hidden/ro）只能回答"有没有"，答不了"是哪一层
+       声明的"，而作用域优先要求逐层比较：应用段 HIDE 必须压过 GLOBAL ALLOW，应用段
+       ALLOW 也必须压过 GLOBAL HIDE/RO（旧实现把 HIDE/RO 做三层并集，于是 GLOBAL
+       恒赢，用户报障即此）。三组标志同样由 br_trie_resolve 的一次下降填入。 */
+    bool hidden_app;
+    bool hidden_cat;
+    bool hidden_global;
+    bool ro_app;
+    bool ro_cat;
+    bool ro_global;
+    bool hidden;    /* app_hidden || cat_hidden || global_hidden（合并视图，兼容旧调用方） */
+    bool ro;        /* app_ro || cat_ro || global_ro（合并视图） */
     bool has_redir; /* 命中 redirect（app > 类别 > global） */
     BrRuleScope redir_scope; /* has_redir 时命中所在作用域：同层静态 vs 线性、
                                 跨层作用域优先的比较都靠它（旧实现只留合并后的

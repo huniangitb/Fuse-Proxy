@@ -285,6 +285,8 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
     out->valid = true;
     out->hidden = false;
     out->ro = false;
+    out->hidden_app = out->hidden_cat = out->hidden_global = false;
+    out->ro_app = out->ro_cat = out->ro_global = false;
     out->has_redir = false;
     out->redir_scope = BR_SCOPE_NONE;
     out->redir[0] = '\0';
@@ -304,8 +306,14 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
            供 resolve 复用判定 virtual_ancestor/redirect_target（省重复遍历） */
         out->app_node = trie_lookup_full(cfg->trie_root, sub_path, &h, &r, redir, sizeof(redir),
                                          ftp, sizeof(ftp));
-        if (h) out->hidden = true;
-        if (r) out->ro = true;
+        if (h) {
+            out->hidden = true;
+            out->hidden_app = true;
+        }
+        if (r) {
+            out->ro = true;
+            out->ro_app = true;
+        }
         if (ftp[0] != '\0') {
             strcpy(out->ftp_app, ftp); /* 源为 64B 栈缓冲，NUL 结尾 */
         }
@@ -316,7 +324,8 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
             strcpy(out->redir, redir); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
         }
     }
-    /* 类别层（USER_APPS/SYSTEM_APPS）：hidden/ro 取并集，redir 仅 app 未命中时补 */
+    /* 类别层（USER_APPS/SYSTEM_APPS）：逐作用域记录 hidden/ro（供作用域优先比较，不再
+       并集），redir 仅 app 未命中时补 */
     if (cat && cat->trie_root) {
         bool h = false, r = false;
         char redir[PATH_MAX];
@@ -325,8 +334,14 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
         ftp[0] = '\0';
         out->cat_node = trie_lookup_full(cat->trie_root, sub_path, &h, &r, redir, sizeof(redir),
                                          ftp, sizeof(ftp));
-        if (h) out->hidden = true;
-        if (r) out->ro = true;
+        if (h) {
+            out->hidden = true;
+            out->hidden_cat = true;
+        }
+        if (r) {
+            out->ro = true;
+            out->ro_cat = true;
+        }
         if (ftp[0] != '\0') {
             strcpy(out->ftp_cat, ftp);
         }
@@ -344,8 +359,14 @@ static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path
         ftp[0] = '\0';
         out->global_node = trie_lookup_full(g_global_cfg.trie_root, sub_path, &h, &r, redir,
                                             sizeof(redir), ftp, sizeof(ftp));
-        if (h) out->hidden = true;
-        if (r) out->ro = true;
+        if (h) {
+            out->hidden = true;
+            out->hidden_global = true;
+        }
+        if (r) {
+            out->ro = true;
+            out->ro_global = true;
+        }
         if (ftp[0] != '\0') {
             strcpy(out->ftp_global, ftp); /* 源为 64B 栈缓冲，NUL 结尾 */
         }
@@ -418,48 +439,59 @@ static bool br_linear_match(char* const* rules, int count, const char* sub_path,
     return false;
 }
 
-/* 类别 hide 线性扫描（USER_APPS/SYSTEM_APPS 动态规则）：变量展开以类别段
-   为专属作用域（覆盖全局同名），与 app/global 展开对称 */
-static bool br_cat_hide_linear(AppConfig* cat, const char* sub_path, const char* current_pkg) {
-    if (!(cat && cat->hide_rules && cat->dyn_hide)) return false;
-    return br_linear_match(cat->hide_rules, cat->hide_count, sub_path, current_pkg, cat);
-}
+/* ============ 作用域优先声明解析（前置声明） ============
+   定义在 br_check_redir_rule 之后（线性通道的 ALLOW/REDIRECT 判定要复用同一匹配
+   实现，见 docs/config.md §2「应用专属 > 类别 > GLOBAL」）。hide/ro 判定在文件
+   更早处就要用到它，故此处先声明。 */
+typedef struct {
+    bool hide;      /* 该层声明 HIDE */
+    bool allow;     /* 该层声明 ALLOW（放行到真实路径） */
+    bool ro;        /* 该层声明 RO */
+    bool has_redir; /* 该层声明 REDIRECT：目标已填入 redir */
+    char redir[PATH_MAX];
+} BrScopeDecl;
 
+/* 查询轴：ALLOW 在三条轴上都是声明（放行 = 可见 + 非只读 + 真实路径），
+   故一律终止；其余三种各属一条轴，跨轴不互相遮蔽，避免「应用段 RO 顺手把
+   GLOBAL 的 HIDE 也顶掉」这类意外（隐私面宁可保守）。 */
+enum {
+    BR_WANT_VIS = 1u << 0, /* 可见性：HIDE */
+    BR_WANT_RO = 1u << 1,  /* 只读：RO（与 BR_WANT_LOC 合用，令高作用域 REDIRECT 遮蔽低作用域 RO） */
+    BR_WANT_LOC = 1u << 2, /* 落点：REDIRECT */
+};
+
+/* 逐层询问后取**最高**声明作用域；本轴在三层都无声明时 *scope_out = BR_SCOPE_NONE。
+   want 见上面的 BR_WANT_*。 */
+static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                            const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
+                            uid_t uid, char* mkdir_out, size_t mkdir_sz, unsigned want,
+                            BrRuleScope* scope_out, BrScopeDecl* out);
+
+/* 生效沙盒的**声明作用域**（BR_SCOPE_NONE = 沙盒不生效）。ALLOW 能否豁免沙盒要用
+   它：只有「不低於沙盒声明作用域」的 ALLOW 才放行——应用段显式 SANDBOX ON 时，
+   [GLOBAL] 的 ALLOW 不得在该应用里凿洞（用户报障：全局 ALLOW 一动，应用段沙盒/
+   HIDE 全体失效）。 */
+static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat);
+
+/* 隐藏判定：作用域优先（应用段 > 类别段 > [GLOBAL]）。
+   每层按 HIDE > ALLOW > RO > REDIRECT 的固定次序取一个结论（同层冲突 fail-closed，
+   与旧实现「hide 无条件优先」一致）；**第一个有声明的作用域说了算**，下层的声明
+   不再参与。旧实现把三层 HIDE 做并集，于是 GLOBAL 恒赢、应用段 ALLOW 永远无法
+   取消下层 HIDE（docs/config.md §2 的优先级只在 REDIRECT 上落实过）。 */
 static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                        const char* current_pkg, const FwRulesTrieMatch* tm) {
     bool is_skel = false;
-    if (br_hidden_static_part(sub_path, current_pkg, tm, &is_skel)) return true;
+    /* 静态部分只保留 CONFIG_DIR 前缀与 Android 骨架两支：**不能**传 tm 下去，因为
+       br_hidden_static_part 内部的 tm->hidden 是跨作用域并集，会让全局 HIDE 在逐层
+       判定之前就短路成 hidden（应用段/类别段的 ALLOW 再也取消不掉 → 违反作用域优先）。
+       隐藏结论统一由下面的 br_resolve_decl 按 应用 > 类别 > GLOBAL 给出。 */
+    if (br_hidden_static_part(sub_path, current_pkg, NULL, &is_skel)) return true;
     if (is_skel) return false; /* 骨架目录恒不隐藏（原逻辑提前返回，不扫 hide） */
-    if (!(tm && tm->valid)) {
-        bool hidden = false;
-        bool dummy_ro = false;
-        if (cfg && cfg->trie_root) {
-            if (trie_lookup(cfg->trie_root, sub_path, &hidden, &dummy_ro, NULL, 0)) {
-                if (hidden) return true;
-            }
-        }
-        if (cat && cat->trie_root) {
-            bool cat_hidden = false;
-            if (trie_lookup(cat->trie_root, sub_path, &cat_hidden, &dummy_ro, NULL, 0)) {
-                if (cat_hidden) return true;
-            }
-        }
-        if (g_global_cfg.trie_root) {
-            bool global_hidden = false;
-            if (trie_lookup(g_global_cfg.trie_root, sub_path, &global_hidden, &dummy_ro, NULL, 0)) {
-                if (global_hidden) return true;
-            }
-        }
-    }
-    if (cfg && cfg->hide_rules && cfg->dyn_hide &&
-        br_linear_match(cfg->hide_rules, cfg->hide_count, sub_path, current_pkg, cfg))
-        return true;
-    if (br_cat_hide_linear(cat, sub_path, current_pkg)) return true;
-    if (g_global_cfg.hide_rules && g_global_cfg.dyn_hide &&
-        br_linear_match(g_global_cfg.hide_rules, g_global_cfg.hide_count, sub_path, current_pkg,
-                        cfg))
-        return true;
-    return false;
+    BrRuleScope scope = BR_SCOPE_NONE;
+    BrScopeDecl decl;
+    br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, -1, 0, NULL, 0, BR_WANT_VIS, &scope,
+                    &decl);
+    return decl.hide;
 }
 
 /* 剥离 /<user_id>/ 前缀 + 非法字符清理，得到 sub_path。
@@ -517,6 +549,19 @@ static bool br_sandbox_active(AppConfig* cfg, AppConfig* cat) {
     return g_global_cfg.sandbox;
 }
 
+/* 生效沙盒的**声明作用域**（与上面 br_sandbox_active 同序同口径）：
+   应用显式 > 应用非显式 ON > 类别显式 > 类别 ON > [GLOBAL]。BR_SCOPE_NONE =
+   沙盒不生效。供 br_to_real_path 比较「ALLOW 能否豁免沙盒」：ALLOW 的作用域必须
+   不低于沙盒的声明作用域，否则全局 ALLOW 会把应用段显式声明的沙盒整个取消。 */
+static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat) {
+    if (g_br_disable_sandbox) return BR_SCOPE_NONE;
+    if (cfg && cfg->sandbox_explicit) return cfg->sandbox ? BR_SCOPE_APP : BR_SCOPE_NONE;
+    if (cfg && cfg->sandbox) return BR_SCOPE_APP;
+    if (cat && cat->sandbox_explicit) return cat->sandbox ? BR_SCOPE_CAT : BR_SCOPE_NONE;
+    if (cat && cat->sandbox) return BR_SCOPE_CAT;
+    return g_global_cfg.sandbox ? BR_SCOPE_GLOBAL : BR_SCOPE_NONE;
+}
+
 /* 跨应用隔离是否拦下本路径（resolve 侧唯一调用点）：沙盒生效时放行——此时的
    "他包 data" 已被 br_to_real_path 改写成自己的沙盒镜像，读不到他包内容，
    把它判成 ENOENT 会让沙盒镜像整体不可用（test_monitor_layers 守护）。
@@ -562,11 +607,20 @@ static bool br_is_wildcard(const char* str) {
    skip_sandbox=true 的调用（专用沙盒查询）传 NULL。 */
 static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, int user_id,
                                 const char* current_pkg, bool skip_sandbox, size_t temp_size,
-                                uid_t uid, char* mkdir_out, size_t mkdir_sz, bool* sandbox_out) {
+                                uid_t uid, char* mkdir_out, size_t mkdir_sz, bool* sandbox_out,
+                                bool* allow_out) {
+    if (allow_out) *allow_out = false;
     if (!c) return false;
     bool matched = false;
     if (c->redir_rules && c->redir_count > 0) {
+        /* 两趟：先 REDIRECT 后 ALLOW。同一虚拟前缀上同时写了 ALLOW 与 REDIRECT 时
+           REDIRECT 胜——ALLOW 的语义是「不重定向（放行到自身）」，显式改写目标更具体；
+           这与旧实现「同节点后写覆盖先写」（trie_insert 用同一虚拟前缀覆盖 target）
+           的观测结果一致，test_rules 的 ALLOW+REDIRECT 用例按此断言。 */
+        for (int pass = 0; pass < 2 && !matched; pass++)
         for (int i = 0; i < c->redir_count; i++) {
+            const bool want = (pass == 0) ? !c->redir_rules[i].is_allow : c->redir_rules[i].is_allow;
+            if (!want) continue;
             const char* prefix = c->redir_rules[i].virtual_prefix;
             bool rule_hit;
             if (br_is_wildcard(prefix)) {
@@ -586,6 +640,7 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
                    STORAGE_BASE/<uid><sub_path>——语义 = 不重定向（与静态 ALLOW
                    经 trie 自引用命中后的效果一致） */
                 common_default_real_path(user_id, sub_path, temp, temp_size);
+                if (allow_out) *allow_out = true;
                 matched = true;
                 break;
             }
@@ -674,6 +729,114 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
     return false;
 }
 
+/* 单作用域对该路径的声明（作用域优先判定的原子结论）。整合该层静态（Trie）与线性
+   （通配/变量）两个通道——Trie 只是静态规则的加速索引，**不是**更高的优先级层；
+   同层冲突按固定次序裁决：HIDE > ALLOW > RO > REDIRECT（fail-closed，与旧实现
+   「hide 无条件优先」一致，避免同层自相矛盾配置下可见性抖动）。 */
+static void br_scope_decl(AppConfig* c, BrRuleScope scope, const char* sub_path,
+                          const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
+                          uid_t uid, char* mkdir_out, size_t mkdir_sz, BrScopeDecl* out) {
+    memset(out, 0, sizeof *out);
+    if (!c) return;
+    bool static_hide = false;
+    bool static_ro = false;
+    if (tm && tm->valid) {
+        switch (scope) {
+            case BR_SCOPE_APP:
+                static_hide = tm->hidden_app;
+                static_ro = tm->ro_app;
+                break;
+            case BR_SCOPE_CAT:
+                static_hide = tm->hidden_cat;
+                static_ro = tm->ro_cat;
+                break;
+            case BR_SCOPE_GLOBAL:
+                static_hide = tm->hidden_global;
+                static_ro = tm->ro_global;
+                break;
+            default: break;
+        }
+    } else if (c->trie_root) {
+        /* tm 无效（调用方未给缓存）时逐层现查 trie，保持旧兜底语义 */
+        bool h = false;
+        bool r = false;
+        char tgt[PATH_MAX];
+        tgt[0] = '\0';
+        if (trie_lookup(c->trie_root, sub_path, &h, &r, tgt, sizeof tgt)) {
+            static_hide = h;
+            static_ro = r;
+        }
+    }
+    /* 落点（ALLOW / REDIRECT）**不取 trie 目标字符串**：parse 期两者都编码成
+       "?<path>" 内部前缀（parse_redirect_rule 的 else 分支、parse_allow_rule 同一
+       形态），从字符串上区分不出「放行到自身真实路径」与「重写到另一路径」。二者
+       语义不同（只有 ALLOW 才是可被高作用域沙盒压过的"透传"，REDIRECT 永远改写），
+       故落点一律走线性实现 br_check_redir_rule —— 它的 is_allow 是唯一权威。
+       代价：该层有 redir 规则时每请求一次 O(redir_count) 扫描（无 redir 规则时零
+       成本；隐藏命中时提前跳过）。 */
+    bool dyn_hide = false;
+    bool dyn_ro = false;
+    bool dyn_allow = false;
+    char dyn_redir[PATH_MAX];
+    dyn_redir[0] = '\0';
+    if (!static_hide) {
+        if (c->dyn_hide && c->hide_rules)
+            dyn_hide = br_linear_match(c->hide_rules, c->hide_count, sub_path, current_pkg, c);
+        if (!dyn_hide && c->redir_rules && c->redir_count > 0) {
+            bool is_allow = false;
+            if (br_check_redir_rule(c, sub_path, dyn_redir, user_id, current_pkg, true,
+                                    sizeof dyn_redir, uid, mkdir_out, mkdir_sz, NULL,
+                                    &is_allow)) {
+                if (is_allow) {
+                    dyn_redir[0] = '\0';
+                    dyn_allow = true;
+                }
+            }
+        }
+        if (!dyn_hide && !dyn_allow && c->dyn_ro && c->ro_rules)
+            dyn_ro = br_linear_match(c->ro_rules, c->ro_count, sub_path, current_pkg, c);
+    }
+    if (static_hide || dyn_hide) {
+        out->hide = true;
+        return;
+    }
+    if (dyn_allow) {
+        out->allow = true;
+        return;
+    }
+    out->ro = static_ro || dyn_ro;
+    if (dyn_redir[0] != '\0') {
+        out->has_redir = true;
+        snprintf(out->redir, sizeof out->redir, "%s", dyn_redir);
+    }
+}
+
+/* 作用域优先（docs/config.md §2）：从应用段向 [GLOBAL] 逐层询问，**第一个**在查询轴
+   上"说了话"的作用域决定结果。旧实现把 HIDE/RO 做三层并集、只有 REDIRECT 逐层比较，
+   于是「[GLOBAL] 的 HIDE 恒赢」——应用段 ALLOW 永远取消不掉全局 HIDE，用户报障
+   「单应用规则优先级没全局高」即此。 */
+static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                            const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
+                            uid_t uid, char* mkdir_out, size_t mkdir_sz, unsigned want,
+                            BrRuleScope* scope_out, BrScopeDecl* out) {
+    static const BrRuleScope k_order[] = {BR_SCOPE_APP, BR_SCOPE_CAT, BR_SCOPE_GLOBAL};
+    if (scope_out) *scope_out = BR_SCOPE_NONE;
+    memset(out, 0, sizeof *out);
+    for (size_t i = 0; i < sizeof(k_order) / sizeof(k_order[0]); i++) {
+        AppConfig* c = br_scope_cfg(cfg, cat, k_order[i]);
+        if (!c) continue;
+        BrScopeDecl d;
+        br_scope_decl(c, k_order[i], sub_path, current_pkg, tm, user_id, uid, mkdir_out, mkdir_sz,
+                      &d);
+        bool hit = d.allow || (d.hide && (want & BR_WANT_VIS)) || (d.ro && (want & BR_WANT_RO)) ||
+                   (d.has_redir && (want & BR_WANT_LOC));
+        if (!hit) continue;
+        if (scope_out) *scope_out = k_order[i];
+        *out = d;
+        return;
+    }
+}
+
 /* 沙盒落点补建（**槽外**）：决策阶段（config_read_begin 持槽内）只记录待建目录，
    出槽后在此补建——持槽内做 FS 操作会在慢存储上放大发布线程等读者归零的全局停顿
    （C1），也避免给 resolve 热路径引入副作用与 TOCTOU。目录已存在或补建失败都不影响
@@ -695,80 +858,55 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     bool sandbox = false;
     if (is_sandbox_out) *is_sandbox_out = false;
 
-    /* 重定向解析：**作用域优先**——应用段 > 类别段 > [GLOBAL]（docs/config.md §2）。
-       同一作用域内静态（Trie）与线性（通配/变量）通道等价：Trie 只是静态规则的
-       加速索引，不是更高的优先级层，故同层内先看静态命中、再看该层线性规则。
-       旧实现先取「任一作用域的静态命中」、再无条件跳到线性，于是 [GLOBAL] 的静态
-       REDIRECT 会压过应用/类别段的动态规则（与文档优先级相反）。 */
-    const bool tm_ok = (tm && tm->valid);
-    const bool static_hit = tm_ok && tm->has_redir;
-    for (int layer = BR_SCOPE_APP; layer >= BR_SCOPE_GLOBAL && !redir; layer--) {
-        AppConfig* c = br_scope_cfg(cfg, cat, (BrRuleScope)layer);
-        if (static_hit && (int)tm->redir_scope == layer) {
-            strncpy(temp, tm->redir, sizeof(temp) - 1);
-            temp[sizeof(temp) - 1] = '\0';
-            redir = true;
-            break;
-        }
-        /* tm 无效（调用方未给缓存）时逐层现查 trie，保持旧 else 分支的兜底语义 */
-        if (!tm_ok && c && c->trie_root) {
-            bool dummy_hidden = false;
-            bool dummy_ro = false;
-            char static_tgt[PATH_MAX];
-            static_tgt[0] = '\0';
-            if (trie_lookup(c->trie_root, sub_path, &dummy_hidden, &dummy_ro, static_tgt,
-                            sizeof(static_tgt)) &&
-                static_tgt[0] != '\0') {
-                strncpy(temp, static_tgt, sizeof(temp) - 1);
-                temp[sizeof(temp) - 1] = '\0';
-                redir = true;
-                break;
-            }
-        }
-        if (c && c->dyn_redir) {
-            redir = br_check_redir_rule(c, sub_path, temp, user_id, current_pkg, true,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz, NULL);
-        }
+    /* 落点解析：作用域优先（docs/config.md §2）。先取「最高声明作用域」的落点结论：
+       ALLOW → 放行到自身存储；REDIRECT → 改写目标；都没有 → 按 sandbox 三层
+       （顺序与旧实现一致）或默认真实路径。
+       关键修正：**低作用域的 ALLOW 不得豁免高作用域声明的沙盒**——应用段显式
+       SANDBOX ON 时，[GLOBAL] 的 ALLOW 不能在该应用里凿洞（旧实现只要 phase ①
+       命中 ANY ALLOW 就整体跳过 sandbox 分支，于是全局 ALLOW 一动，全局/应用段
+       声明的沙盒对同路径全线失效，用户报障「全局开沙盒时单应用不能继承」）。 */
+    BrRuleScope decl_scope = BR_SCOPE_NONE;
+    BrScopeDecl decl;
+    br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, user_id, uid, mkdir_out, mkdir_sz,
+                    BR_WANT_LOC, &decl_scope, &decl);
+    const BrRuleScope sandbox_scope = br_sandbox_scope(cfg, cat);
+    bool allow_effective =
+        decl.allow && (sandbox_scope == BR_SCOPE_NONE || decl_scope >= sandbox_scope);
+    if (decl.allow && !allow_effective) {
+        /* 被更高作用域的沙盒压过：按「无落点声明」处理，落回 sandbox 分支 */
+        memset(&decl, 0, sizeof decl);
+        decl_scope = BR_SCOPE_NONE;
     }
-
+    if (decl.allow) {
+        /* 与旧实现一致：ALLOW 记为「重定向」，真实路径就是默认路径 */
+        common_default_real_path(user_id, sub_path, temp, sizeof(temp));
+        redir = true;
+    } else if (decl.has_redir) {
+        snprintf(temp, sizeof temp, "%s", decl.redir);
+        redir = true;
+    } else if (decl.hide) {
+        return -ENOENT; /* 防御：隐藏应由调用方先行判定，走到这里说明判定被绕过 */
+    }
     if (redir && temp[0] == '?') {
         int effective_uid = user_id >= 0 ? user_id : 0;
         char real_base[1024];
         common_default_real_path(effective_uid, temp + 1, real_base, sizeof(real_base));
-        strncpy(temp, real_base, sizeof(temp) - 1);
-        temp[sizeof(temp) - 1] = '\0';
+        snprintf(temp, sizeof temp, "%s", real_base);
     }
-
-    /* redir 线性兜底仅当存在通配/变量规则（未入 trie）时执行；
-       全静态规则已由上方 trie（tm.has_redir）覆盖，跳过 O(N) 扫描。
-       顺序：应用 > 类别 > 全局（类别变量展开以类别段为专属作用域） */
-    if (!redir && cfg && cfg->dyn_redir)
-        redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, true, sizeof(temp),
-                                    uid, mkdir_out, mkdir_sz, NULL);
-    if (!redir && cat && cat->dyn_redir)
-        redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, true, sizeof(temp),
-                                    uid, mkdir_out, mkdir_sz, NULL);
-    if (!redir && g_global_cfg.dyn_redir)
-        redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, true,
-                                    sizeof(temp), uid, mkdir_out, mkdir_sz, NULL);
     /* sandbox 三层：应用显式 OFF 否决类别+全局；类别显式 OFF 否决全局；
        应用显式 ON（或类别显式 ON 且应用未显式）时各自 sandbox 生效 */
     bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
     bool cat_sandbox_off = (!app_sandbox_off && cat && cat->sandbox_explicit && !cat->sandbox);
-    if (!redir && !g_br_disable_sandbox) {
+    if (!redir && sandbox_scope != BR_SCOPE_NONE) {
         if (!app_sandbox_off)
             redir = br_check_redir_rule(cfg, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox);
-    }
-    if (!redir && !g_br_disable_sandbox) {
-        if (!app_sandbox_off)
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox, NULL);
+        if (!redir && !app_sandbox_off)
             redir = br_check_redir_rule(cat, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox);
-    }
-    if (!redir && !g_br_disable_sandbox) {
-        if (!app_sandbox_off && !cat_sandbox_off)
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox, NULL);
+        if (!redir && !app_sandbox_off && !cat_sandbox_off)
             redir = br_check_redir_rule(&g_global_cfg, sub_path, temp, user_id, current_pkg, false,
-                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox);
+                                        sizeof(temp), uid, mkdir_out, mkdir_sz, &sandbox, NULL);
     }
     if (!redir) {
         common_default_real_path(user_id, sub_path, temp, sizeof(temp));
@@ -781,45 +919,17 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     return 0;
 }
 
-/* 类别 RO 线性扫描：变量展开以类别段为专属作用域 */
-static bool br_cat_ro_linear(AppConfig* cat, const char* sub_path, const char* current_pkg) {
-    if (!(cat && cat->ro_rules && cat->dyn_ro)) return false;
-    return br_linear_match(cat->ro_rules, cat->ro_count, sub_path, current_pkg, cat);
-}
-
+/* 只读判定：同样作用域优先（应用段 > 类别段 > [GLOBAL]）。
+   BR_WANT_RO|BR_WANT_LOC 的用意：高作用域的 REDIRECT 也遮蔽低作用域的 RO（路径已被
+   改写成别处，低层再判只读没有意义），但 HIDE 不参与本查询——它已在可见性判定里
+   先行返回 ENOENT，此处不必重复。 */
 static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                           const char* current_pkg, const FwRulesTrieMatch* tm) {
-    if (tm && tm->valid) {
-        if (tm->ro) return true;
-    } else {
-        bool dummy_hidden = false;
-        bool ro = false;
-        if (cfg && cfg->trie_root) {
-            if (trie_lookup(cfg->trie_root, sub_path, &dummy_hidden, &ro, NULL, 0)) {
-                if (ro) return true;
-            }
-        }
-        if (cat && cat->trie_root) {
-            bool cat_ro = false;
-            if (trie_lookup(cat->trie_root, sub_path, &dummy_hidden, &cat_ro, NULL, 0)) {
-                if (cat_ro) return true;
-            }
-        }
-        if (g_global_cfg.trie_root) {
-            bool global_ro = false;
-            if (trie_lookup(g_global_cfg.trie_root, sub_path, &dummy_hidden, &global_ro, NULL, 0)) {
-                if (global_ro) return true;
-            }
-        }
-    }
-    if (cfg && cfg->ro_rules && cfg->dyn_ro &&
-        br_linear_match(cfg->ro_rules, cfg->ro_count, sub_path, current_pkg, cfg))
-        return true;
-    if (br_cat_ro_linear(cat, sub_path, current_pkg)) return true;
-    if (g_global_cfg.ro_rules && g_global_cfg.dyn_ro &&
-        br_linear_match(g_global_cfg.ro_rules, g_global_cfg.ro_count, sub_path, current_pkg, cfg))
-        return true;
-    return false;
+    BrRuleScope scope = BR_SCOPE_NONE;
+    BrScopeDecl decl;
+    br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, -1, 0, NULL, 0,
+                    BR_WANT_RO | BR_WANT_LOC, &scope, &decl);
+    return decl.ro;
 }
 
 /* ============ 虚拟目录合成 ============ */
@@ -1164,15 +1274,16 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                               !(cat && (cat->dyn_redir || cat->dyn_hide || cat->dyn_ro)) &&
                               !pc->app_dir_node && !pc->cat_dir_node && !pc->g_dir_node;
             if (all_static) {
-                FwRulesTrieMatch tm;
-                tm.valid = true;
-                tm.hidden = pc->app_dir_hidden || pc->cat_dir_hidden || pc->g_dir_hidden;
-                bool is_skel = false;
                 /* 跨应用隔离与隐藏同口径（br_sanitize_and_check_hidden 亦判，
                此处为同一判据的读取侧：列举过滤走本路径） */
                 bool iso = br_is_other_app_pkg(sub_path, current_pkg) &&
                            !fw_pkg_is_privileged(q->uid);
-                bool hidden = br_hidden_static_part(sub_path, current_pkg, &tm, &is_skel) || iso;
+                /* 作用域优先语义下**不能**再用合并视图（tm.hidden 并集）做静态短路：
+                   GLOBAL 的 HIDE 会因此压过应用段 ALLOW，列举与打开判定分叉。all_static
+                   下无线性规则扫描，逐层现查 trie（每作用域一次下降）的成本远低于一次
+                   syscall，故直接走权威判定 */
+                bool hidden =
+                    br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL) || iso;
                 out->valid = true;
                 out->appear_missing = hidden;
                 out->is_other_app_pkg = iso;
@@ -1182,29 +1293,22 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
             const TrieNode* ca = trie_find_child(pc->app_dir_node, name, name_len);
             const TrieNode* cc = trie_find_child(pc->cat_dir_node, name, name_len);
             const TrieNode* cg = trie_find_child(pc->g_dir_node, name, name_len);
-            bool trie_hidden = pc->app_dir_hidden || pc->cat_dir_hidden || pc->g_dir_hidden;
-            if (ca && ca->is_hidden) trie_hidden = true;
-            if (cc && cc->is_hidden) trie_hidden = true;
-            if (cg && cg->is_hidden) trie_hidden = true;
-            FwRulesTrieMatch tm;
-            tm.valid = true;
-            tm.hidden = trie_hidden;
-            /* 完整隐藏判定（CONFIG_DIR/Android 骨架/跨应用/hide 规则），
-           trie 部分用缓存值（tm.valid 使其跳过内部 trie 查询）。
-           对所有访问者生效（含 root）：与 br_sanitize_and_check_hidden
-           及 vfs_readdir probe 过滤语义一致，HIDE 后 root ls 也看不见。
-          跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
-           同判据：看不见 = 打不开） */
+            /* 完整隐藏判定（CONFIG_DIR/Android 骨架/跨应用/hide 规则）：与 resolve 侧
+               同一函数、同一 tm 数据源（作用域优先：应用段 > 类别段 > [GLOBAL]），故
+               列举与打开不会分叉。旧实现用 tm.hidden 合并视图短路，"GLOBAL 恒赢"，
+               应用段 ALLOW 取消不掉全局 HIDE。ca/cc/cg 只留给下面的虚拟目录判定。
+               跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
+               同判据：看不见 = 打不开） */
             bool iso = br_is_other_app_pkg(sub_path, current_pkg) &&
                        !fw_pkg_is_privileged(q->uid);
-            if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, &tm) || iso) {
+            if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL) || iso) {
                 out->valid = true;
                 out->appear_missing = true;
                 if (config_read_end(cfg_gen)) return;
                 continue;
             }
             out->valid = true;
-            out->appear_missing = trie_hidden || iso;
+            out->appear_missing = false;
             bool dyn_any =
                 (cfg && cfg->dyn_redir) || (cat && cat->dyn_redir) || g_global_cfg.dyn_redir;
             bool p_target = ((ca && ca->redir_target) || (cc && cc->redir_target) ||
@@ -1234,7 +1338,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
             continue;
         }
         out->valid = true;
-        out->appear_missing = tm.hidden;
+        /* 隐藏已由上面 br_sanitize_and_check_hidden 提前返回，此处恒为可见 */
+        out->appear_missing = false;
         out->virtual_kind = br_is_virtual_ancestor(cfg, cat, sub_path)
                                 ? NSP_VK_ANCESTOR
                                 : (br_is_redirect_target(cfg, cat, sub_path) ? NSP_VK_TARGET

@@ -252,6 +252,37 @@ def isolation_section():
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
     ],uid_map="10999 com.ghost.app\n",global_want=1)
     del os.environ["NSP_PACKAGELIST"]
+    # ── 作用域优先 / 沙盒作用域（用户报障 A/B 的回归）：
+    #   A「[GLOBAL] SANDBOX ON + ALLOW /Pictures/… 后，应用段再写 SANDBOX ON 仍不沙盒」
+    #   B「应用段 HIDE 压不过 [GLOBAL] ALLOW（反过来 ALLOW 压 HIDE 却可以）」
+    # 旧实现只有 REDIRECT 做过跨作用域比较：HIDE/RO 是三层并集（GLOBAL 恒赢），
+    # 且 ALLOW 一命中就短路沙盒（br_to_real_path 的三个 sandbox 分支都以 !redir 为前提）。
+    os.environ["NSP_REAL_ROOT"] = os.path.join(ISO_DIR, "root")
+    case("作用域优先:应用 ALLOW 压 GLOBAL HIDE",
+         BASE + "HIDE /Download\n[com.demo.app]\nALLOW /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"resolve":0,"probe":0}),
+    ], uid_map=own)
+    case("作用域优先:应用 HIDE 压 GLOBAL ALLOW",
+         BASE + "ALLOW /Download\n[com.demo.app]\nHIDE /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"resolve":1,"probe":1}),
+    ], uid_map=own)
+    # 全局 ALLOW 与全局沙盒同作用域：ALLOW 照旧生效（不沙盒，历史行为不变）
+    case("沙盒作用域:GLOBAL ALLOW 同层豁免全局沙盒",
+         BASE + "SANDBOX ON\nALLOW /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"redir":1,"sandbox":0}),
+    ], uid_map=own)
+    # 应用段 SANDBOX ON 抬高沙盒的声明作用域：全局 ALLOW 不得凿洞（缺陷 A 本尊）
+    case("沙盒作用域:应用 SANDBOX ON 压过 GLOBAL ALLOW",
+         BASE + "SANDBOX ON\nALLOW /Download\n[com.demo.app]\nSANDBOX ON\n", 10123, [
+        ("/0/Download/hi.txt", {"redir":1,"sandbox":1}),
+    ], uid_map=own)
+    # 要豁免就在同一应用段写 ALLOW（作用域相同，ALLOW 生效）
+    case("沙盒作用域:应用段 ALLOW 豁免应用段沙盒",
+         BASE + "SANDBOX ON\nALLOW /Download\n[com.demo.app]\nSANDBOX ON\nALLOW /Download\n",
+         10123, [
+        ("/0/Download/hi.txt", {"redir":1,"sandbox":0}),
+    ], uid_map=own)
+    del os.environ["NSP_REAL_ROOT"]
     shutil.rmtree(ISO_DIR,ignore_errors=True)
 
 def main():

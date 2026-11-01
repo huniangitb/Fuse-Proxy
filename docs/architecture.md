@@ -404,7 +404,7 @@ FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_prob
 - **fd 归属铁律**：谁拥有集合，谁 `close`。comm 线程拥有的客户端 fd，主线程只允许 `shutdown` + 投递控制消息，**禁止直接 `close`**（不断号，杜绝复用竞态）；退出时先 `nsp_comm_fini()` 再集中关闭。
 - **规则文件编辑唯一实现**：`rule_server` 与 `log_ctl` 的规则行级读写统一走 `nsp_rule_file`（`src/core/nsp_rule_file.c`，纯 libc）——段式文件（`injector.conf`）与无段文件（`App-rules/<pkg>.conf`）的开关替换、规则去重、按 `(类型, 索引)` 删除均只有一份实现，落盘一律 tmp+rename 原子写（inotify 端不会读到半截文件）。索引语义以 `rule_server` 为准：**计入 `#` 停用的行**，与 LIST 输出一致。
 - **决策输出逐字段初始化**：`fw_rules_resolve` 对未命中/空查询/根路径也把 `NspPathDecision` 全部字段置为确定默认值（`valid`/`real_path`/`is_ftp`/`virtual_kind`/`appear_missing`/`read_only`），不是"只置 `valid` 就返回"。FUSE 回调在未命中时仍会读这些标志，只置 `valid` 曾把不存在的路径合成为目录，不得回退。（V3 之前此事由模块侧 `NspResolveResult` + loader 的初始化函数承担，规则内建后收归 `fw_rules.c` 单点。）
-- **规则匹配语义等价**：修改 Trie 或线性通道时保持二者优先级一致——**重定向按作用域优先**（应用 > 类别 > GLOBAL；同层内静态 Trie 与线性规则等价，Trie 只作加速，跨层不得互相压过）；hidden/ro 取三层**并集**。
+- **规则匹配语义等价**：修改 Trie 或线性通道时保持二者优先级一致——四类路径规则（HIDE / ALLOW / RO / REDIRECT）一律**作用域优先**（应用 > 类别 > GLOBAL；同层内静态 Trie 与线性规则等价，Trie 只作加速，跨层不得互相压过），单点实现是 `br_resolve_decl`；**不得**再对 hidden/ro 做三层并集（并集 = GLOBAL 恒赢、应用段 ALLOW 失效，历史缺陷）。沙盒的生效作用域另由 `br_sandbox_scope` 给出，低作用域 `ALLOW` 不免除高作用域沙盒。
 - **Trie matched 语义**：`trie_lookup` 返回值表示"命中至少一条真实规则（含祖先继承）"，而非"途经了无规则的中间节点"——否则 `/Android/data/<未配置包>` 会误判。
 - **数据结构独立**：内聚、零业务依赖的数据结构（如 Trie）自成模块，可独立单测。`path_trie.c` 不引用 AppConfig 或任何配置全局。
 - **YAGNI**：不保留无调用者的"预留"实现。
