@@ -1034,6 +1034,7 @@ def main():
         test_open_unlink_recreate_no_hidden()
         test_sqlite()
         test_concurrent()
+        test_official_semantics()
     finally:
         stop_daemon(proc)
 
@@ -1049,6 +1050,119 @@ def main():
             log("  ... 还有 %d 项", len(ERRORS) - 10)
     log("═══════════════════════════════════════")
     return 0 if FAIL == 0 else 1
+
+# ═══════════════════════════════════════════════════════
+# 模块 11：官方 FUSE 语义补齐（对齐 Android 原生 FUSE）
+# fallocate / link / mknod / fsyncdir——此前缺省 ENOSYS，应用侧
+# （下载器预分配、cp -al、mkfifo）性能退化或失败；后端路径 EOPNOTSUPP。
+# ═══════════════════════════════════════════════════════
+def test_official_semantics():
+    log("\n━━━ 模块11: 官方 FUSE 语义补齐（fallocate/link/mknod/fsyncdir） ━━━")
+    m = Path(MNT)
+    import fcntl, errno
+
+    # 11.1 fallocate：预分配空间（下载器路径）。Python 无直接接口，用
+    #      os.posix_fallocate（走 fallocate(2)；内核/FS 不支持时回退写零，
+    #      两者都算成功——判别点是时间与块占用，此处断言功能可用 + 大小正确）
+    p = m / "0/网盘/prealloc.bin"
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
+        os.close(fd)
+        os.posix_fallocate(fd := os.open(p, os.O_WRONLY), 0, 4 * 1024 * 1024)
+        os.close(fd)
+        ok("fallocate 预分配") if p.stat().st_size == 4 * 1024 * 1024 else fail("fallocate 大小", str(p.stat().st_size))
+    except OSError as e:
+        fail("fallocate", f"errno={e.errno} {e.strerror}")
+    finally:
+        p.unlink(missing_ok=True)
+
+    # 11.2 fallocate KEEP_SIZE 语义（空间预留不改变大小）
+    #      Python 无 FALLOC_FL_KEEP_SIZE 接口，ctypes 直调 fallocate(2)
+    p = m / "0/网盘/keepsize.bin"
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        p.write_bytes(b"hello")
+        fd = os.open(p, os.O_WRONLY)
+        FALLOC_FL_KEEP_SIZE = 0x01
+        rc = libc.fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 1024 * 1024)
+        err = ctypes.get_errno()
+        os.close(fd)
+        if rc != 0:
+            fail("fallocate KEEP_SIZE", f"errno={err}")
+        elif p.stat().st_size == 5:
+            ok("fallocate KEEP_SIZE")
+        else:
+            fail("KEEP_SIZE 大小", str(p.stat().st_size))
+    except OSError as e:
+        fail("fallocate KEEP_SIZE", f"errno={e.errno} {e.strerror}")
+    finally:
+        p.unlink(missing_ok=True)
+
+    # 11.3 硬链接：同目录 link() 成功、内容一致、unlink 原名后链接仍可读
+    src = m / "0/网盘/link_src.txt"
+    dst = m / "0/网盘/link_dst.txt"
+    try:
+        src.write_text("link_body")
+        os.link(src, dst)
+        src.unlink()
+        ok("硬链接存活性") if dst.read_text() == "link_body" else fail("硬链接内容")
+    except OSError as e:
+        fail("硬链接", f"errno={e.errno} {e.strerror}")
+    finally:
+        src.unlink(missing_ok=True); dst.unlink(missing_ok=True)
+
+    # 11.4 跨虚拟目录硬链接：官方 EXDEV（不同 backing 目标不同文件系统口径）
+    a = m / "0/网盘/xlink_a.txt"
+    b = m / "0/照片/xlink_b.txt"
+    try:
+        a.write_text("x")
+        try:
+            os.link(a, b)
+            # 成功也算合法（同一 backing 下 link 可行）；清理即可
+            b.unlink(missing_ok=True)
+            ok("跨虚拟目录硬链接（同 backing 可行）")
+        except OSError as e:
+            ok("跨虚拟目录硬链接") if e.errno in (errno.EXDEV, errno.EPERM) else fail("跨目录硬链接 errno", str(e.errno))
+    finally:
+        a.unlink(missing_ok=True); b.unlink(missing_ok=True)
+
+    # 11.5 mknod FIFO：创建/读写打通（应用沙箱内合法操作）
+    fifo = m / "0/网盘/probe.fifo"
+    try:
+        os.mkfifo(fifo)
+        ok("mkfifo") if fifo.exists() and not fifo.is_file() else fail("mkfifo 验证")
+        # FIFO 非阻塞读写自检（打开写端无读者会阻塞——用非阻塞探活）
+        fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        os.close(fd)
+        ok("FIFO 打开")
+    except OSError as e:
+        fail("mkfifo", f"errno={e.errno} {e.strerror}")
+    finally:
+        fifo.unlink(missing_ok=True)
+
+    # 11.6 mknod 设备节点：EPERM（Android 应用沙箱无 mknod 设备能力，与原生一致）
+    dev = m / "0/网盘/null_dev"
+    try:
+        os.mknod(dev, 0o600 | 0o020000, os.makedev(1, 3))  # S_IFCHR 1:3=/dev/null
+        # 若宿主有权限创建成功（root FUSE）也算合法——清掉即可
+        dev.unlink(missing_ok=True)
+        ok("mknod 设备节点（有权限则成功）")
+    except OSError as e:
+        ok("mknod 设备节点 EPERM") if e.errno == errno.EPERM else fail("mknod 设备节点 errno", str(e.errno))
+    finally:
+        dev.unlink(missing_ok=True)
+
+    # 11.7 fsyncdir：目录 fsync 成功（日志型文件系统目录元数据刷盘）
+    d = m / "0/网盘"
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        os.fsync(fd)
+        os.close(fd)
+        ok("fsyncdir")
+    except OSError as e:
+        fail("fsyncdir", f"errno={e.errno} {e.strerror}")
+
 
 if __name__ == "__main__":
     sys.exit(main())

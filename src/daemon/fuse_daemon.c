@@ -2464,6 +2464,99 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     return -err;
 }
 
+/* ===== 官方 FUSE 语义补齐（对齐 Android 原生 FUSE 的可观察行为） =====
+   Android MediaProvider FUSE（fuse-passthrough）对本地 backing 直接支持
+   fallocate/hardlink 等 VFS 操作；此前缺省回调经 libfuse 回 ENOSYS，应用侧
+   （fallocate 下载器/游戏、cp -al 硬链接）要么性能退化要么失败。以下回调对
+   本地 backing 直接转发；FTP/SFTP 后端无对应能力时按 errno 契约返回
+   -EOPNOTSUPP（内核/应用按"文件系统不支持"处理，与官方语义一致）。 */
+
+static int vfs_fallocate(const char* path, int mode, off_t offset, off_t length,
+                         struct fuse_file_info* fi) {
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    /* 后端路径：模块表无 fallocate 能力（ABI V5），按不支持闭合 */
+    if (rr.is_ftp) VFS_RETURN(-EOPNOTSUPP);
+    /* 与 vfs_write/vfs_fsync 同一口径：本地打开句柄就放在 fi->fh。用它而非重新
+       按名 open——文件被 unlink 后仍持句柄时（编辑器/下载器的常见顺序）按名 open
+       会 ENOENT，句柄视角才与本地文件语义一致。 */
+    bool own_fd = false;
+    int fd = -1;
+    if (fi && fi->fh > 0 && !(fi->fh & NSP_FH_BACKEND_FLAG)) {
+        fd = (int)fi->fh;
+    } else {
+        fd = open(p, O_WRONLY);
+        own_fd = true;
+    }
+    if (fd == -1) {
+        int err = errno;
+        log_fuse_err("FALLOCATE", path, err);
+        VFS_RETURN(-err);
+    }
+    int ret = fallocate(fd, mode, offset, length);
+    int err = errno; /* fallocate 成功时 errno 可能被改写，先存 */
+    if (own_fd) close(fd);
+    if (ret == -1) {
+        log_fuse_err("FALLOCATE", path, err);
+        VFS_RETURN(-err);
+    }
+    VFS_RETURN(0);
+}
+
+static int vfs_link(const char* from, const char* to) {
+    VFS_SETUP_CORE(from, VFS_OP_MUTATE);
+    char p_to[PATH_MAX];
+    NspPathDecision r2;
+    bool ok2 = false, redir_to = false, mon_to = false;
+    char sub_to[PATH_MAX], pkg_to[128];
+    int u_to = -1;
+    int rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, &mon_to,
+                       VFS_OP_MUTATE);
+    if (rrc != 0) return rrc;
+    /* 跨后端：硬链接要求同一文件系统与同一目录语义，官方口径 EXDEV */
+    if (r2.is_ftp || rr.is_ftp) VFS_RETURN(-EXDEV);
+    int ret = link(p, p_to);
+    if (ret == -1) {
+        int err = errno;
+        log_fuse_err("LINK", from, err);
+        VFS_RETURN(-err);
+    }
+    VFS_RETURN(0);
+}
+
+static int vfs_mknod(const char* path, mode_t mode, dev_t rdev) {
+    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    /* 纯转发：设备节点能否建立由内核/SELinux 能力决定（应用无 CAP_MKNOD
+       时自然 EPERM），不在此处额外设限 */
+    int ret = mknod(p, mode, rdev);
+    if (ret == -1) {
+        int err = errno;
+        log_fuse_err("MKNOD", path, err);
+        VFS_RETURN(-err);
+    }
+    VFS_RETURN(0);
+}
+
+static int vfs_fsyncdir(const char* path, int datasync, struct fuse_file_info* fi) {
+    (void)fi;
+    VFS_SETUP_CORE(path, VFS_OP_READ);
+    if (rr.is_ftp) VFS_RETURN(-EOPNOTSUPP);
+    int fd = open(p, O_RDONLY | O_DIRECTORY);
+    if (fd == -1) {
+        int err = errno;
+        log_fuse_err("FSYNCDIR", path, err);
+        VFS_RETURN(-err);
+    }
+    int ret = datasync ? fdatasync(fd) : fsync(fd);
+    int err = errno;
+    close(fd);
+    /* 纯转发：本地目录 fsync 不会失败，失败即真实错误，原样回给应用 */
+    if (ret == -1) {
+        log_fuse_err("FSYNCDIR", path, err);
+        VFS_RETURN(-err);
+    }
+    VFS_RETURN(0);
+}
+
 static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)fi;
     VFS_SETUP_CORE(path, VFS_OP_MUTATE);
@@ -3006,6 +3099,10 @@ static struct fuse_operations vfs_ops = {
     .listxattr = vfs_listxattr,
     .setxattr = vfs_setxattr,
     .removexattr = vfs_removexattr,
+    .fallocate = vfs_fallocate,
+    .link = vfs_link,
+    .mknod = vfs_mknod,
+    .fsyncdir = vfs_fsyncdir,
 #ifdef TARGET_ANDROID
     .bpf_setup = vfs_backing_setup,
 #endif
