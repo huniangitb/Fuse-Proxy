@@ -41,6 +41,7 @@
 #include <limits.h>
 #include "common.h"
 #include "config_parser.h" /* config_set_modules_dir：模块自有配置的读取归属 */
+#include "fw_acl.h" /* 访问控制唯一判定点（对齐 Android 原生 FUSE 用户态策略层） */
 #include "fw_config.h"
 #include "fw_pkg.h"
 #include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
@@ -519,7 +520,8 @@ static int vfs_storage_root_guard(const struct fuse_context* ctx, const char* pa
 
 static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecision* rr,
                     bool* nsp_ok, char* current_pkg, int* user_id, char* sub_path, char* real_path,
-                    bool* is_redir, bool* monitor_out, VfsOpKind op) {
+                    bool* is_redir, bool* monitor_out, VfsOpKind op, NspAclOp acl_op,
+                    bool acl_is_dir, int acl_mask) {
     *nsp_ok = false;
     /* user_id 必须先置 -1：fw_parse_path 只在路径含完整 <uid>/ 用户层时才写它，
        挂载点根（"/"）等无用户层路径不会赋值——漏置会让调用方拿到未初始化值，
@@ -544,6 +546,17 @@ static int fw_route(struct fuse_context* ctx, const char* path_val, NspPathDecis
        由本函数经 monitor_out 单独给出。 */
     *monitor_out = fw_config_monitor_for(ctx->uid, ctx->pid);
     fw_pkg_resolve(ctx->uid, ctx->pid, current_pkg, 128);
+    /* ---- 访问控制唯一执行点（对齐 Android 原生 FUSE 的用户态策略层）----
+       位置与 AOSP 一致：先判「这个调用者能不能碰这条路径」，再谈规则决策。
+       - Android 的 emulated FUSE 故意不加 default_permissions（vold 原注释：
+         不让内核在路由到 daemon 之前做低层权限检查），属主/权限由 daemon 合成；
+         我们的挂载参数因此与之等价，策略全在本调用上。
+       - 判定逻辑只在 fw_acl_decide 一份（fw_acl.c）；这里不得再写任何 if。
+       - 拒绝码分工见 fw_acl.h：ENOENT=看不见、EACCES=存在但不许、EPERM=结构层不许。 */
+    {
+        int acl_rc = fw_acl_check(ctx->uid, ctx->pid, path_val, acl_op, acl_is_dir, acl_mask);
+        if (acl_rc != 0) return acl_rc;
+    }
     /* fw_rules_resolve 内建：无 <uid>/ 用户层的路径（挂载点根）由引擎自己置
        valid=false，机构与「模块未命中」一致——调用方只看 rr->valid。决策结构
        由引擎整体初始化，调用方无需预置。 */
@@ -641,7 +654,7 @@ static inline bool backend_dispatch_after(int bslot, const char* op, int brc, co
     return false;
 }
 
-#define VFS_SETUP_CORE(path_val, op_kind)                                         \
+#define VFS_SETUP_CORE_EX(path_val, op_kind, acl_op, acl_is_dir, acl_mask)        \
     struct fuse_context* ctx = fuse_get_context();                                \
     if (!ctx) return -EIO; /* 不可达：libfuse 在每个回调内均设置上下文 */          \
     NspPathDecision rr;                                                           \
@@ -653,9 +666,25 @@ static inline bool backend_dispatch_after(int bslot, const char* op, int brc, co
     bool is_redir;                                                                \
     bool monitor_on; /* IO 监控开关：配置语义，由 fw_route 单独给出 */             \
     int fw_rc = fw_route(ctx, path_val, &rr, &nsp_ok, current_pkg, &path_user_id, \
-                         sub_path, p, &is_redir, &monitor_on, op_kind);           \
+                         sub_path, p, &is_redir, &monitor_on, op_kind, acl_op,    \
+                         acl_is_dir, acl_mask);                                   \
     if (fw_rc != 0) return fw_rc;                                                 \
     (void)is_redir; /* 部分回调不使用 is_redir，抑制未使用警告 */
+
+/* 缺省入口：按读写种类给一个粗粒度 ACL 操作。需要精确拒绝码的回调
+   （create/unlink/rename/setattr/access…）改用 VFS_SETUP_CORE_OP/ACCESS。
+   ACL 的**判定**始终只有 fw_acl_decide 一处，这里只选「操作种类」。 */
+#define VFS_SETUP_CORE(path_val, op_kind)                                         \
+    VFS_SETUP_CORE_EX(path_val, op_kind,                                          \
+                      ((op_kind) == VFS_OP_MUTATE ? NSP_ACL_OP_GENERIC_WRITE        \
+                                                  : NSP_ACL_OP_GENERIC_READ),      \
+                      false, 0)
+
+#define VFS_SETUP_CORE_OP(path_val, op_kind, acl_op)                              \
+    VFS_SETUP_CORE_EX(path_val, op_kind, acl_op, false, 0)
+
+#define VFS_SETUP_CORE_ACCESS(path_val, op_kind, acl_mask, acl_is_dir)            \
+    VFS_SETUP_CORE_EX(path_val, op_kind, NSP_ACL_OP_ACCESS, acl_is_dir, acl_mask)
 
 #define VFS_RETURN(val) \
     do {                \
@@ -935,7 +964,10 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
 
 static int vfs_access(const char* path, int mask) {
     vfs_flush_pending_closes();
-    VFS_SETUP_CORE(path, VFS_OP_READ);
+    /* is_dir 只能保守取 true：access 在路由解析之前判，此时拿不到 stat。
+       代价仅是「文件的 X_OK 不被单独拒」——AOSP 因 MS_NOEXEC 恒拒，我们留到
+       内核真正 exec 时拒绝（多一层，但不会误伤目录的 X_OK）。 */
+    VFS_SETUP_CORE_ACCESS(path, VFS_OP_READ, mask, true);
     /* access 归类 VFS_OP_READ（F_OK/R_OK 在 RO 路径上必须放行），只在请求
        写访问时走框架的只读策略——"何时算写"由 mask 决定属 FUSE 语义，
        策略本身（root 豁免 + EROFS）仍在 vfs_check_read_only 单点。
@@ -1245,8 +1277,9 @@ static ino_t vfs_readdir_entry_ino(VfsReaddirCtx* d, const char* name) {
     bool nsp_ok = false, is_redir = false, monitor_on = false;
     char current_pkg[128], sub[PATH_MAX], p[PATH_MAX];
     int path_user_id = -1;
+    /* 逐条目路由：这里只做读类判定（整体列举权限已由 readdir/opendir 把关） */
     if (fw_route(d->ctx, child_fuse, &rr, &nsp_ok, current_pkg, &path_user_id, sub, p,
-                 &is_redir, &monitor_on, VFS_OP_READ) == 0) {
+                 &is_redir, &monitor_on, VFS_OP_READ, NSP_ACL_OP_GENERIC_READ, false, 0) == 0) {
         if (rr.is_ftp) {
             const NspModuleOps* bops = NULL;
             if (module_backend_lookup(sub, &bops) == 0) {
@@ -1436,7 +1469,7 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     vfs_flush_pending_closes();
     (void)flags;
     (void)fi;
-    VFS_SETUP_CORE(path, VFS_OP_READ);
+    VFS_SETUP_CORE_OP(path, VFS_OP_READ, NSP_ACL_OP_READDIR);
     vfs_log_io(current_pkg, ctx->uid, "READDIR", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, monitor_on);
     LOG_DBG_PERF("[READDIR_ENTRY] path=%s real=%s", path, p);
@@ -1515,7 +1548,11 @@ static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
 static int vfs_open(const char* path, struct fuse_file_info* fi) {
     FTP_DBG("vfs_open: 入口 path=%s\n", path);
     vfs_flush_pending_closes();
-    VFS_SETUP_CORE(path, VFS_OP_READ);
+    /* 写意图由 flags 决定（O_RDONLY 打开 RO 路径必须放行）；ACL 只看写/读这一维 */
+    const NspAclOp acl_open_op = (fi->flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC))
+                                     ? NSP_ACL_OP_WRITE_OPEN
+                                     : NSP_ACL_OP_GENERIC_READ;
+    VFS_SETUP_CORE_OP(path, VFS_OP_READ, acl_open_op);
     vfs_log_io(current_pkg, ctx->uid, "OPEN", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                monitor_on);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
@@ -1597,7 +1634,7 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
 }
 
 static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_CREATE);
     vfs_log_io(current_pkg, ctx->uid, "CREATE", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, monitor_on);
     if (g_strip_o_direct && (fi->flags & O_DIRECT)) fi->flags &= ~O_DIRECT;
@@ -1658,7 +1695,7 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
 }
 
 static int vfs_mkdir(const char* path, mode_t mode) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_MKDIR);
     vfs_log_io(current_pkg, ctx->uid, "MKDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                monitor_on);
     /* 后端分派：mkdir 由模块方法创建（rr.is_ftp 短路，避免非 FTP 路径付出
@@ -1698,7 +1735,7 @@ static int vfs_mkdir(const char* path, mode_t mode) {
 }
 
 static int vfs_unlink(const char* path) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_DELETE);
     vfs_log_io(current_pkg, ctx->uid, "UNLINK", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, monitor_on);
     /* 后端分派：unlink 由模块方法删除 */
@@ -1729,7 +1766,7 @@ static int vfs_unlink(const char* path) {
 }
 
 static int vfs_rmdir(const char* path) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_RMDIR);
     vfs_log_io(current_pkg, ctx->uid, "RMDIR", sub_path, (nsp_ok && is_redir) ? rr.real_path : NULL,
                monitor_on);
     if (rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET) {
@@ -2015,7 +2052,7 @@ static int vfs_readlink(const char* path, char* buf, size_t size) {
 }
 
 static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
-    VFS_SETUP_CORE(path, VFS_OP_READ);
+    VFS_SETUP_CORE_OP(path, VFS_OP_READ, NSP_ACL_OP_OPENDIR);
     vfs_log_io(current_pkg, ctx->uid, "OPENDIR", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, monitor_on);
     /* 后端分派：目录由后端模块管理时直接放行（readdir 条目由模块方法提供，
@@ -2042,7 +2079,7 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
 }
 
 static int vfs_symlink(const char* target, const char* linkpath) {
-    VFS_SETUP_CORE(linkpath, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(linkpath, VFS_OP_MUTATE, NSP_ACL_OP_SYMLINK);
     vfs_log_io(current_pkg, ctx->uid, "SYMLINK", sub_path,
                (nsp_ok && is_redir) ? rr.real_path : NULL, monitor_on);
     if (symlink(target, p) == -1) {
@@ -2293,10 +2330,10 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     char pkg_from[128], pkg_to[128];
     bool mon_from = false, mon_to = false;
     int rrc = fw_route(ctx, from, &r1, &ok1, pkg_from, &u_from, sub_from, p_from, &redir_from,
-                       &mon_from, VFS_OP_MUTATE);
+                       &mon_from, VFS_OP_MUTATE, NSP_ACL_OP_RENAME_SRC, false, 0);
     if (rrc != 0) return rrc;
     rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, &mon_to,
-                   VFS_OP_MUTATE);
+                   VFS_OP_MUTATE, NSP_ACL_OP_RENAME_DST, false, 0);
     if (rrc != 0) return rrc;
     vfs_log_io(pkg_from, ctx->uid, "RENAME_FROM", sub_from,
                (ok1 && redir_from) ? r1.real_path : NULL, mon_from);
@@ -2503,14 +2540,14 @@ static int vfs_fallocate(const char* path, int mode, off_t offset, off_t length,
 }
 
 static int vfs_link(const char* from, const char* to) {
-    VFS_SETUP_CORE(from, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(from, VFS_OP_MUTATE, NSP_ACL_OP_LINK);
     char p_to[PATH_MAX];
     NspPathDecision r2;
     bool ok2 = false, redir_to = false, mon_to = false;
     char sub_to[PATH_MAX], pkg_to[128];
     int u_to = -1;
     int rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, &mon_to,
-                       VFS_OP_MUTATE);
+                       VFS_OP_MUTATE, NSP_ACL_OP_LINK, false, 0);
     if (rrc != 0) return rrc;
     /* 跨后端：硬链接要求同一文件系统与同一目录语义，官方口径 EXDEV */
     if (r2.is_ftp || rr.is_ftp) VFS_RETURN(-EXDEV);
@@ -2524,7 +2561,7 @@ static int vfs_link(const char* from, const char* to) {
 }
 
 static int vfs_mknod(const char* path, mode_t mode, dev_t rdev) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_MKNOD);
     /* 纯转发：设备节点能否建立由内核/SELinux 能力决定（应用无 CAP_MKNOD
        时自然 EPERM），不在此处额外设限 */
     int ret = mknod(p, mode, rdev);
@@ -2559,7 +2596,10 @@ static int vfs_fsyncdir(const char* path, int datasync, struct fuse_file_info* f
 
 static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    /* 与 AOSP 的取舍差异（有意为之，属超集）：AOSP 的 FuseDaemon 在 handle_setattr
+       里**丢弃** mode/uid/gid 变更（静默成功但不生效）；我们的 backing 是真实文件
+       系统，属性可以真的保存下来，故照旧下发，只把访问控制交给 SETATTR 判定。 */
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETATTR);
     int ret = chmod(p, mode);
     if (ret == -1) {
         int err = errno;
@@ -2571,7 +2611,7 @@ static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
 
 static int vfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETATTR);
     int ret = lchown(p, uid, gid);
     if (ret == -1) {
         int err = errno;
@@ -2583,7 +2623,7 @@ static int vfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_in
 
 static int vfs_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
     (void)fi;
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETATTR);
     /* 后端分派：truncate 由模块方法截断 */
     const NspModuleOps* bops = NULL;
     if (rr.is_ftp && module_backend_lookup(sub_path, &bops) == 0) {
@@ -2677,7 +2717,7 @@ static int vfs_listxattr(const char* path, char* list, size_t size) {
 
 static int vfs_setxattr(const char* path, const char* name, const char* value, size_t size,
                         int flags) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETXATTR);
     int ret = lsetxattr(p, name, value, size, flags);
     if (ret == -1) {
         int err = errno;
@@ -2688,7 +2728,7 @@ static int vfs_setxattr(const char* path, const char* name, const char* value, s
 }
 
 static int vfs_removexattr(const char* path, const char* name) {
-    VFS_SETUP_CORE(path, VFS_OP_MUTATE);
+    VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETXATTR);
     int ret = lremovexattr(p, name);
     if (ret == -1) {
         int err = errno;

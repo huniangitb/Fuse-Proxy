@@ -254,6 +254,8 @@ static bool br_pkg_same_base(const char* a, const char* b) {
    ——用户报障的绕过点即在此，故 resolve 侧必须同样判。
    不隔离的情形：调用方包名不可解析（空/system/unknown，root 与系统工具）、
    [GLOBAL] ALLOW_CROSS_APP_DATA ON（用户显式放行，等于恢复旧行为）。 */
+bool fw_rules_cross_app_isolated(void) { return !g_global_cfg.allow_cross_app_data; }
+
 static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg) {
     if (!current_pkg || !current_pkg[0]) return false;
     if (strcmp(current_pkg, "system") == 0 || strcmp(current_pkg, "unknown") == 0) return false;

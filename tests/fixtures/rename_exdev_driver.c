@@ -48,6 +48,7 @@
 
 #include <fuse3/fuse.h>
 
+#include "fw_acl.h"
 #include "fw_rules.h"
 #include "module_loader.h"
 
@@ -89,9 +90,13 @@ static struct fuse_context g_ctx;
 struct fuse_context* fuse_get_context(void) { return &g_ctx; }
 
 static int fw_route(struct fuse_context* c, const char* path, NspPathDecision* r, bool* ok,
-                    char* pkg, int* u, char* sub, char* real, bool* redir, bool* mon, int op) {
+                    char* pkg, int* u, char* sub, char* real, bool* redir, bool* mon, int op,
+                    NspAclOp acl_op, bool acl_is_dir, int acl_mask) {
     (void)c;
     (void)op;
+    (void)acl_op;
+    (void)acl_is_dir;
+    (void)acl_mask;
     memset(r, 0, sizeof(*r));
     *ok = false;
     *u = 0;
