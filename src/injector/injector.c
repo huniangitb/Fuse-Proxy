@@ -594,7 +594,9 @@ static void inject_global_fuse() {
         }
         args[ai++] = "-f";
         args[ai++] = "-o";
-        args[ai++] = "allow_other,auto_cache,fsname=fuse_daemon,subtype=fuse_daemon";
+        /* noatime 对齐 Android 原生 FUSE（/mnt/user/0/emulated 挂载即 noatime,lazytime）：
+           atime 更新是纯写放大（媒体扫描/备份工具依赖 mtime 而非 atime） */
+        args[ai++] = "allow_other,auto_cache,noatime,fsname=fuse_daemon,subtype=fuse_daemon";
         args[ai] = nullptr;
         setenv("LD_LIBRARY_PATH", get_self_dir(), 1);
         execv(exe, args);
@@ -705,7 +707,7 @@ static void inject_media_fuse() {
 
         args[ai++] = "-f";
         args[ai++] = "-o";
-        args[ai++] = "allow_other,auto_cache,fsname=fuse_daemon,subtype=fuse_media_daemon";
+        args[ai++] = "allow_other,auto_cache,noatime,fsname=fuse_daemon,subtype=fuse_media_daemon";
         args[ai] = nullptr;
         setenv("LD_LIBRARY_PATH", get_self_dir(), 1);
         execv(exe, args);

@@ -4,6 +4,8 @@
 
 ### 新功能
 
+- **fuse**: 按 Android 原生 FUSE 行为补齐缺失回调（`fallocate`/`link`/`mknod`/`fsyncdir`）——MediaProvider 的 fuse-passthrough 对本地 backing 直接支持这些 VFS 操作，此前缺省经 libfuse 回 ENOSYS：下载器/游戏的预分配（`fallocate`）退化为逐字节写零、`cp -al` 硬链接直接失败、`mkfifo` ENOSYS。本地 backing 直接转发（`fallocate(2)`/`link(2)`/`mknod(2)`/目录 `fsync`），FTP/SFTP 后端无对应能力按 errno 契约回 `-EOPNOTSUPP`（应用按“文件系统不支持”处理，与官方一致）；一律纯转发到本地 backing、不加特例（设备节点能否建立交由内核与 SELinux 能力裁决）；硬链接跨后端回 `-EXDEV`。挂载参数对齐原生：injector 拉起 fuse_daemon 的默认 `-o` 补 `noatime`（原生 /mnt/user/0/emulated 即 `noatime,lazytime`，atime 更新是纯写放大；lazytime 是 mount(2) MS 标志，libfuse `-o` 无此通道，暂缺）。回归 `tests/test_functional.py` 模块 11（预分配/KEEP_SIZE/硬链接存活性/跨目录 EXDEV 口径/mkfifo/设备节点 EPERM/fsyncdir；判别性：旧二进制 KEEP_SIZE=ENOSYS、硬链接=EPERM、mkfifo=ENOSYS 实测复现）
+
 - **fw**: 跨应用隔离按 Android 权限体系自动豁免 platform 签名应用（`fw_pkg_is_privileged`：读 `/data/system/packages.list` 的 seinfo 字段判 `platform` 前缀——DocumentsUI/Settings 等 priv-app 为 `platform:privapp:…`，普通应用恒为 `default:…`）。文件中介（DocumentsUI 等）的本职就是访问他包 `/Android/data`，此前唯一放行手段是全局 `ALLOW_CROSS_APP_DATA ON`（把整个隔离功能关掉）或逐包手工规则（应用段 `ALLOW` 豁免不了隔离，实测确认）——现在系统中介自动放行，隔离对普通应用照旧生效，`packages.list` 不可读/无该 uid 时 fail-safe 不豁免。实机背景：用户反馈 DocumentsUI「测试无效、其他系统应用有效」——其余系统应用测的是自身规则（HIDE），DocumentsUI 测的是跨包访问，撞上的正是隔离。回归 `tests/test_rules.py` §28（privapp 豁免 / default 照常隔离 / uid 无行 fail-safe；判别性：旧实现 privapp 用例失败）
 
 - **scripts**: 新增 backing/MONITOR/热重载取证脚本 (b904438)
