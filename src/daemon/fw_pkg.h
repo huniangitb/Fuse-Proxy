@@ -43,6 +43,21 @@ bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size);
    结果按 uid 缓存；fw_pkg_reload（规则重载）后随 gen 失效重读。 */
 bool fw_pkg_is_privileged(uid_t uid);
 
+/* 包名 → uid（/data/system/packages.list 的 "pkg uid ..." 行，与
+   fw_pkg_is_privileged 同一份文件、同一个路径钩子）。
+   用途：FUSE 事件通道的消费方（MPM）跑在 MediaProvider 进程内，SO_PEERCRED
+   拿到的是那个进程的 uid——com.google.android.providers.media.module /
+   com.android.providers.media 既不是 system(1000) 也不是 media_rw(1023)
+   （实测 uid=10277，OPD2404/Android16），默认白名单写死必然把它拒掉，通道等于
+   开不起来。故 daemon 启动时按包名解析出 uid 后追加进白名单。
+   **只认解析出来的 uid**：包名不可由请求方声明，白名单也不接受名字。
+   fail-safe：packages.list 不可读或无该包 → false（调用方只少这一项，通道其余
+   照旧）。结果按 (包名, 代际) 缓存，fw_pkg_reload（配置重载）后随 gen 重解析。
+   锁纪律：自持独立互斥量，函数体内只做 packages.list 解析，不调用任何会回头
+   取 g_fill_lock / g_priv_fill_lock 的函数（那两条路径会反过来调本函数，
+   嵌套即死锁）。 */
+bool fw_pkg_uid_for_package(const char* pkg, uid_t* out);
+
 /* 仅测试：把 packages.list 的读取路径换掉（生产代码永不调用；GNU 测试环境
    没有 /data/system）。传 nullptr 恢复默认路径。 */
 void fw_pkg_set_packagelist_path(const char* path);

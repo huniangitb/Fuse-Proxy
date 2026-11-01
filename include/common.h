@@ -98,10 +98,22 @@ void persist_log_to_disk(const char* log_type, const char* message, bool append_
  * common_sandbox_path：沙盒目标（STORAGE_BASE/<uid>/Android/data/<pkg>/<沙盒目录名>，
  *   目录名默认 NSP_SANDBOX_DIRNAME "sandbox"，经 common_set_sandbox_dirname
  *   由配置发布单点覆盖），
- *   成功返回 0，输入非法或输出放不下返回 -1（调用方自行日志并放弃重定向）。 */
+ *   成功返回 0，输入非法或输出放不下返回 -1（调用方自行日志并放弃重定向）；
+ * common_view_path：**存储视图路径**（应用看到的绝对路径
+ *   NSP_ANDROID_EMULATED_ROOT/<user_id><sub_path>）——事件的 spath 与 QUERY
+ *   响应的 spath 都由它合成（喂 MediaProvider 扫描的唯一路径域），禁止各处
+ *   裸拼 "/storage/emulated"。注意与 common_default_real_path 的差别：后者是
+ *   真实落盘路径（受 --root 测试根影响），本函数恒为**视图**口径，不受
+ *   g_real_root 影响（测试根是 daemon 的内部实现细节，应用永远看不到）。 */
 void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz);
 void common_storage_root(int user_id, char* out, size_t sz);
 int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz);
+void common_view_path(int user_id, const char* sub_path, char* out, size_t sz);
+/* common_fuse_user_path：FUSE 视角路径（"/<user_id><sub_path>"）——common_parse_user_layer
+ * 的逆运算，供事件通道把 QUERY 的绝对 spath 反解结果交回 fw_acl_check/fw_rules_resolve
+ * （两者的 path 入参都是 FUSE 视角层级）。放不下返回 -1 且**不截断**：截断会让判定
+ * 作用在另一个路径上（"/0/Android/data/x" 截成 "/0/Android/da" 就是另一条规则）。 */
+int common_fuse_user_path(int user_id, const char* sub_path, char* out, size_t sz);
 void common_set_sandbox_dirname(const char* name);
 /* 媒体 Provider 判定（common.c 实现；inject_target.h 亦有兼容声明） */
 bool is_media_provider(const char* pkg);

@@ -80,9 +80,15 @@ static const char* g_packagelist_override = nullptr;
 
 void fw_pkg_set_packagelist_path(const char* path) { g_packagelist_override = path; }
 
+/* packages.list 的唯一打开点：uid→包名、包名→uid、特权判定三处共用同一个
+   路径钩子（测试注入一份夹具就同时覆盖三个查询）。 */
+static FILE* open_packagelist(void) {
+    return fopen(g_packagelist_override ? g_packagelist_override : g_packagelist_path, "re");
+}
+
 static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size,
                                              char* seinfo, size_t seinfo_size) {
-    FILE* fp = fopen(g_packagelist_override ? g_packagelist_override : g_packagelist_path, "re");
+    FILE* fp = open_packagelist();
     if (!fp) return false;
     bool found = false;
     char line[1024];
@@ -158,6 +164,71 @@ bool fw_pkg_is_privileged(uid_t uid) {
         pthread_mutex_unlock(&g_priv_fill_lock);
         return priv;
     }
+}
+
+/* ---- 包名 → uid（FUSE 事件通道的白名单自动解析用） ----
+   与上面两条缓存三足鼎立、互不嵌套：本组只用 g_pkguid_fill_lock，且函数体内
+   只解析 packages.list（fopen/fgets，不取任何锁），**不**调用 resolve_uncached
+   → g_fill_lock、也不调用 fw_pkg_is_privileged → g_priv_fill_lock。反过来那两条
+   路径完全不会进本函数，故不存在「持一把锁再取另一把」的环。 */
+typedef struct {
+    uint64_t gen;
+    char pkg[FW_PKG_NAME_MAX];
+    bool known; /* packages.list 有该包名的行 */
+    uid_t uid;
+} FwPkgUidSlot;
+
+#define FW_PKG_UID_SLOTS 8 /* 只有固定的两个 MediaProvider 包名会来查，留余量 */
+
+static FwPkgUidSlot g_pkguid_slots[FW_PKG_UID_SLOTS];
+static pthread_mutex_t g_pkguid_fill_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 按包名扫 packages.list 取 uid（"pkg uid ..."）。找不到/打不开返回 false。 */
+static bool resolve_uid_from_packagelist(const char* pkg, uid_t* out) {
+    FILE* fp = open_packagelist();
+    if (!fp) return false;
+    bool found = false;
+    char line[1024];
+    while (fgets(line, sizeof line, fp)) {
+        char name[FW_PKG_NAME_MAX];
+        unsigned int puid = 0;
+        if (sscanf(line, "%127s %u", name, &puid) == 2 && strcmp(name, pkg) == 0) {
+            *out = (uid_t)puid;
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+bool fw_pkg_uid_for_package(const char* pkg, uid_t* out) {
+    if (!pkg || !pkg[0]) return false;
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    pthread_mutex_lock(&g_pkguid_fill_lock);
+    int use = -1;
+    for (int i = 0; i < FW_PKG_UID_SLOTS && use < 0; i++) {
+        if (g_pkguid_slots[i].gen == gen && strcmp(g_pkguid_slots[i].pkg, pkg) == 0) use = i;
+    }
+    if (use < 0) {
+        /* 未命中：先找本代外的空槽（代际失效即空槽），都被占则用 0 号 */
+        use = 0;
+        for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+            if (g_pkguid_slots[i].gen != gen) {
+                use = i;
+                break;
+            }
+        }
+        FwPkgUidSlot* s = &g_pkguid_slots[use];
+        snprintf(s->pkg, sizeof s->pkg, "%s", pkg);
+        s->known = resolve_uid_from_packagelist(pkg, &s->uid); /* 失败也缓存，直到下次重载 */
+        s->gen = gen;
+    }
+    bool known = g_pkguid_slots[use].known;
+    uid_t uid = g_pkguid_slots[use].uid;
+    pthread_mutex_unlock(&g_pkguid_fill_lock);
+    if (known && out) *out = uid;
+    return known;
 }
 
 /* 取展示包名并判定其可否用于段匹配（等价模块 br_get_app_cfg 的不可解析分支：

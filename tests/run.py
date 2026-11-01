@@ -61,6 +61,17 @@ SUITE_MAP = [
     # 直编 fw_acl.c + 纯逻辑驱动（桩掉 uid→包名/特权/隔离开关三个事实源），
     # 另有静态契约断言：fw_acl_check 在 fuse_daemon.c 只能出现一次、关键回调
     # 必须把 ACL 操作种类交给 fw_route。
+    # ── FUSE 事件通道（fw_events.c）：订阅推送 + 查询面，默认 OFF ──
+    # 单元套件直编 fw_events.c（桩掉路径合成/规则决策/访问控制三个事实源），
+    # 静态契约锁死：判定只问 fw_rules_resolve/fw_acl_check、热路径零分配、
+    # 开关判断先于线程创建；端到端套件在真实 daemon 上验证埋点挂在**回调成功点**。
+    (("test_fw_events.py", "test_fw_events_fuse.py"),
+     ("src/daemon/fw_events.c", "src/daemon/fw_events.h"),
+     ("fw_events_note_write_done", "fw_events_note_write_denied", "fw_events_start",
+      "fw_events_stop", "fw_query_handle", "fw_coalesce_push", "fw_ring_push",
+      "fw_maybe_ping", "fw_exists_lookup", "fw_build_allow_list"),
+     "FUSE 事件通道(fw_events) / 订阅推送 + QUERY"),
+
     (("test_acl.py",),
      ("src/daemon/fw_acl.c", "src/daemon/fw_acl.h"),
      ("fw_acl_decide", "fw_acl_classify", "fw_acl_check", "fw_acl_identity",
@@ -282,6 +293,7 @@ LAYERS = {
         (
             "test_docs_sync.py",
             "test_acl.py",
+            "test_fw_events.py",
             "test_config_snapshot.py",
             "test_monitor_layers.py",
             "test_path_vars.py",
@@ -319,6 +331,7 @@ LAYERS = {
             "test_functional.py",
             "test_rules.py",
             "test_decision_enforce.py",
+            "test_fw_events_fuse.py",
             "test_negative_timeout.py",
             "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
@@ -488,6 +501,8 @@ def layer_suites(layers):
 PARALLEL_SAFE = frozenset({
     "test_docs_sync.py",          # 纯静态读文件（文档/台账一致性），无子进程/无挂载
     "test_acl.py",                # cc 直编 fw_acl.c + 纯逻辑驱动，TemporaryDirectory，无挂载
+    "test_fw_events.py",          # cc 直编 fw_events.c + 驱动，TemporaryDirectory；
+                                  # 只 bind 自己 pid 命名的抽象地址，不碰全局 nsp_fs_*
     "test_config_snapshot.py",    # cc 编译夹具直跑，TemporaryDirectory
     "test_module_abi.py",         # cc 编译 ABI 夹具，无 daemon（TemporaryDirectory）
     "test_path_vars.py",          # cc 编译直跑（mkdtemp）

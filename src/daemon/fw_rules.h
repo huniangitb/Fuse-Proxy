@@ -60,6 +60,10 @@ typedef enum {
 typedef struct NspPathDecision {
     bool valid;          /* false = 不参与规则（无 <uid>/ 用户层或路径被拒），框架直通 */
     bool appear_missing; /* 视为不存在 → 框架在**所有**回调统一返回 ENOENT */
+    /* appear_missing 的成因是跨应用隔离（而非 HIDE 规则）：两者在框架侧同口径
+       （都是 ENOENT），但对外通道要能说清「为什么」——扫描侧据此区分「路径被隐藏」
+       与「不是你自己的东西」，也便于日志归因。*/
+    bool is_other_app_pkg;
     bool read_only;      /* 只读 → 框架在所有变更操作统一返回 EROFS
                             （root 豁免等策略由框架持有） */
     uint8_t virtual_kind; /* NspVirtualKind：合成目录判定 */
@@ -67,6 +71,10 @@ typedef struct NspPathDecision {
        未命中任何规则时为默认存储路径 STORAGE_BASE/<uid><sub>） */
     char real_path[PATH_MAX];
     bool is_redirect; /* 最终路径是否经重定向（日志/权限处理用） */
+    /* 该重定向来自 SANDBOX（应用私有沙盒副本）而非显式 REDIRECT 规则。
+       语义只是"成因标注"：决策仍只看 real_path/is_redirect。外部通道
+       （nsp_fs_query 的 reason）据此如实报告，避免把沙盒路径说成普通重定向。 */
+    bool is_sandbox;
     /* FTP 后端规则命中（injector.conf 的 `FTP <虚拟前缀> <段名>` 规则）：
        规则所在段决定作用域（[GLOBAL]=全局，[应用段]=仅该应用）；
        命中后框架将该路径操作分派给对应 FTP 后端模块。 */

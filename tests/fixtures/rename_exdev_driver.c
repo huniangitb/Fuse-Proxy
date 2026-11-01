@@ -49,8 +49,22 @@
 #include <fuse3/fuse.h>
 
 #include "fw_acl.h"
+#include "fw_events.h"
 #include "fw_rules.h"
 #include "module_loader.h"
+
+/* ---- 事件通道桩：本驱动只判 rename 的 EXDEV 语义，事件侧一律关闭 ----
+   开关恒为 false（fw_events_active() 直接返回 false），但 vfs_rename 里那次
+   调用在链接期仍需要一个符号，故给出最小实现。 */
+_Atomic bool g_fw_events_hot = false;
+void fw_events_note_write_done(uid_t uid, pid_t pid, const char* fuse_path, FwEventOp op,
+                               const char* src_fuse) {
+    (void)uid;
+    (void)pid;
+    (void)fuse_path;
+    (void)op;
+    (void)src_fuse;
+}
 
 #define NSP_FH_HANDLE_MASK ((1ULL << 40) - 1)
 #define VFS_OP_MUTATE 1

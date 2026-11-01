@@ -622,6 +622,37 @@ void common_default_real_path(int user_id, const char* sub_path, char* out, size
     }
 }
 
+/* FUSE 视角路径 "/<user_id><sub_path>"：common_parse_user_layer 的逆运算。
+   事件通道的 QUERY 把绝对 spath 反解成 (user, sub) 后，必须换回这个层级再交给
+   fw_acl_check/fw_rules_resolve（两者的 path 入参都是 FUSE 视角）。放不下返回 -1
+   并清空输出：截断会让判定作用在**另一个路径**上（ACL/规则按路径前缀分类，
+   截断后可能从"他包 Android/data"变成"自己的普通目录"，即放行）。 */
+int common_fuse_user_path(int user_id, const char* sub_path, char* out, size_t sz) {
+    if (!out || sz == 0) return -1;
+    if (!sub_path) sub_path = "/";
+    int n = (user_id < 0) ? snprintf(out, sz, "%s", sub_path)
+                          : snprintf(out, sz, "/%d%s", user_id, sub_path);
+    if (n < 0 || (size_t)n >= sz) {
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+/* 存储视图路径：应用看到的绝对路径 NSP_ANDROID_EMULATED_ROOT/<user_id><sub_path>。
+   user_id<0 表无用户层（挂载点根）：原样输出 sub_path——视图里没有用户层可拼。
+   与 common_default_real_path 的分工见 common.h：本函数恒为**视图**口径，
+   不读 g_real_root（测试根是 daemon 内部实现细节，应用看不到）。 */
+void common_view_path(int user_id, const char* sub_path, char* out, size_t sz) {
+    if (!out || sz == 0) return;
+    if (!sub_path) sub_path = "/";
+    if (user_id < 0) {
+        PATH_SNPRINTF(out, sz, "%s", sub_path);
+        return;
+    }
+    PATH_SNPRINTF(out, sz, NSP_ANDROID_EMULATED_ROOT "/%d%s", user_id, sub_path);
+}
+
 void common_storage_root(int user_id, char* out, size_t sz) {
     if (!out || sz == 0) return;
     if (user_id < 0) user_id = 0;

@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <fnmatch.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -606,6 +607,41 @@ static void parse_sandbox_dir_rule(AppConfig* cur, char* p_ptr, int line_num,
     strcpy(cur->sandbox_dir, val);
 }
 
+/* FUSE_EVENTS_UIDS <uid>[,<uid>...]：仅 [GLOBAL] 段有效；向通道白名单**追加**
+   uid（root/system/media_rw 恒在列，无需重复写）。逗号或空白分隔，最多
+   sizeof(fuse_events_uids) 项；非法/超限项告警后跳过，不放弃整行
+   （白名单少一项只是连不上，不该让整份配置读失败）。 */
+static void parse_fuse_events_uids_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                        const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("FUSE_EVENTS_UIDS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                file_path);
+        return;
+    }
+    const int cap = (int)(sizeof(cur->fuse_events_uids) / sizeof(cur->fuse_events_uids[0]));
+    cur->fuse_events_uid_count = 0;
+    char* p = p_ptr;
+    while (p && *p) {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        char* end = p;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > INT_MAX) {
+            LOG_WRN("FUSE_EVENTS_UIDS 含非法 uid \"%.*s\"（行 %d, 文件 %s），已跳过",
+                    (int)(strcspn(p, ", \t")), p, line_num, file_path);
+            while (*p && !isspace((unsigned char)*p) && *p != ',') p++;
+            continue;
+        }
+        if (cur->fuse_events_uid_count >= cap) {
+            LOG_WRN("FUSE_EVENTS_UIDS 超过 %d 项上限（行 %d, 文件 %s），多余项已忽略", cap,
+                    line_num, file_path);
+            break;
+        }
+        cur->fuse_events_uids[cur->fuse_events_uid_count++] = (int)v;
+        p = end;
+    }
+}
+
 /* HIDE <path> / RO <path> */
 static void parse_path_rule(AppConfig* cur, char* p_ptr, bool is_hide, int line_num,
                             const char* file_path) {
@@ -733,6 +769,10 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_global_switch_rule(cur, &cur->skip_system_apps, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "ALLOW_CROSS_APP_DATA") == 0)
         parse_global_switch_rule(cur, &cur->allow_cross_app_data, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "FUSE_EVENTS") == 0)
+        parse_global_switch_rule(cur, &cur->fuse_events, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "FUSE_EVENTS_UIDS") == 0)
+        parse_fuse_events_uids_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
         parse_fuse_extra_args_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "SANDBOX_DIR") == 0)
