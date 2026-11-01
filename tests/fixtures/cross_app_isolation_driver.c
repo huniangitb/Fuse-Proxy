@@ -50,6 +50,9 @@ int main(int argc, char** argv) {
     }
     config_set_allow_app_rules_mkdir(false);
     load_config_rules(argv[1]);
+    /* 特权豁免用例的 packages.list 夹具（生产恒读 /data/system，GNU 测试环境没有） */
+    const char* plist = getenv("NSP_PACKAGELIST");
+    if (plist) fw_pkg_set_packagelist_path(plist);
     /* 生产链路上 fw_config 发布时会 fw_pkg_reload()（装载 CONFIG_DIR/uid.map）；
        本驱动不经 fw_config，须显式装一次，否则 uid→包名 恒走 /proc 回退 */
     fw_pkg_reload();

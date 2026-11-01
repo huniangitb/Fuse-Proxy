@@ -33,4 +33,18 @@ bool fw_pkg_resolve(uid_t uid, pid_t tid, char* out, size_t size);
    false 且 out 写入尽力得到的名称。 */
 bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size);
 
+/* uid 是否为**特权应用**：来源 /data/system/packages.list 的 seinfo 字段
+   （SELinux MAC 标签，由系统按签名/分区判定），以 "platform" 开头即 platform
+   签名（system/priv-app/共享签名；实测 DocumentsUI/Settings 为
+   "platform:privapp:…"，普通应用恒为 "default:…"）。
+   用途：跨应用隔离的自动豁免——DocumentsUI 等文件中介的本职就是访问他包
+   /Android/data，逐包手工写规则不可维护，按 Android 自己的权限体系放行。
+   fail-safe：packages.list 不可读或该 uid 无行 → false（不豁免）。
+   结果按 uid 缓存；fw_pkg_reload（规则重载）后随 gen 失效重读。 */
+bool fw_pkg_is_privileged(uid_t uid);
+
+/* 仅测试：把 packages.list 的读取路径换掉（生产代码永不调用；GNU 测试环境
+   没有 /data/system）。传 nullptr 恢复默认路径。 */
+void fw_pkg_set_packagelist_path(const char* path);
+
 #endif /* FW_PKG_H */

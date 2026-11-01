@@ -518,11 +518,14 @@ static bool br_sandbox_active(AppConfig* cfg, AppConfig* cat) {
 /* 跨应用隔离是否拦下本路径（resolve 侧唯一调用点）：沙盒生效时放行——此时的
    "他包 data" 已被 br_to_real_path 改写成自己的沙盒镜像，读不到他包内容，
    把它判成 ENOENT 会让沙盒镜像整体不可用（test_monitor_layers 守护）。
-   其余情形：看不见 = 打不开（与 probe 列举过滤同口径）。 */
+   特权应用（platform 签名，packages.list seinfo 判定）自动豁免——DocumentsUI
+   等文件中介的本职是访问他包 /Android/data，与 Android 权限体系对齐而非逐包
+   手工规则。其余情形：看不见 = 打不开（与 probe 列举过滤同口径）。 */
 static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
-                                const char* current_pkg) {
+                                const char* current_pkg, uid_t uid) {
     if (!br_is_other_app_pkg(sub_path, current_pkg)) return false;
     if (br_sandbox_active(cfg, cat)) return false;
+    if (fw_pkg_is_privileged(uid)) return false;
     br_note_isolation(current_pkg, sub_path);
     return true;
 }
@@ -1024,7 +1027,7 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
-            br_isolation_blocks(cfg, cat, sub_path, current_pkg)) {
+            br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid)) {
             out->valid = true;
             out->appear_missing = true;
             if (config_read_end(cfg_gen)) return;
@@ -1150,7 +1153,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                 bool is_skel = false;
                 /* 跨应用隔离与隐藏同口径（br_sanitize_and_check_hidden 亦判，
                此处为同一判据的读取侧：列举过滤走本路径） */
-                bool iso = br_is_other_app_pkg(sub_path, current_pkg);
+                bool iso = br_is_other_app_pkg(sub_path, current_pkg) &&
+                           !fw_pkg_is_privileged(q->uid);
                 bool hidden = br_hidden_static_part(sub_path, current_pkg, &tm, &is_skel) || iso;
                 out->valid = true;
                 out->appear_missing = hidden;
@@ -1174,7 +1178,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
            及 vfs_readdir probe 过滤语义一致，HIDE 后 root ls 也看不见。
           跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
            同判据：看不见 = 打不开） */
-            bool iso = br_is_other_app_pkg(sub_path, current_pkg);
+            bool iso = br_is_other_app_pkg(sub_path, current_pkg) &&
+                       !fw_pkg_is_privileged(q->uid);
             if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, &tm) || iso) {
                 out->valid = true;
                 out->appear_missing = true;
@@ -1205,7 +1210,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
         FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
-            br_is_other_app_pkg(sub_path, current_pkg)) {
+            (br_is_other_app_pkg(sub_path, current_pkg) && !fw_pkg_is_privileged(q->uid))) {
             out->valid = true;
             out->appear_missing = true;
             if (config_read_end(cfg_gen)) return;

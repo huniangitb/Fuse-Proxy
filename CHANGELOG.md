@@ -4,6 +4,8 @@
 
 ### 新功能
 
+- **fw**: 跨应用隔离按 Android 权限体系自动豁免 platform 签名应用（`fw_pkg_is_privileged`：读 `/data/system/packages.list` 的 seinfo 字段判 `platform` 前缀——DocumentsUI/Settings 等 priv-app 为 `platform:privapp:…`，普通应用恒为 `default:…`）。文件中介（DocumentsUI 等）的本职就是访问他包 `/Android/data`，此前唯一放行手段是全局 `ALLOW_CROSS_APP_DATA ON`（把整个隔离功能关掉）或逐包手工规则（应用段 `ALLOW` 豁免不了隔离，实测确认）——现在系统中介自动放行，隔离对普通应用照旧生效，`packages.list` 不可读/无该 uid 时 fail-safe 不豁免。实机背景：用户反馈 DocumentsUI「测试无效、其他系统应用有效」——其余系统应用测的是自身规则（HIDE），DocumentsUI 测的是跨包访问，撞上的正是隔离。回归 `tests/test_rules.py` §28（privapp 豁免 / default 照常隔离 / uid 无行 fail-safe；判别性：旧实现 privapp 用例失败）
+
 - **scripts**: 新增 backing/MONITOR/热重载取证脚本 (b904438)
 - **rule**: UDS 控制面加对端鉴权（SO_PEERCRED） (fbd39bf)
 - **fw**: 默认沙盒落点改为 <pkg>/sandbox 且可配置 (179b9b6)

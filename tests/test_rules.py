@@ -228,6 +228,30 @@ def isolation_section():
     case("系统应用无应用段",BASE+"[com.android.settings]\nHIDE /secret_sys\n",1000,[
         ("/0/secret_sys",{"resolve":0,"probe":0}),
     ],uid_map="1001 com.android.phone\n")
+    # ── 特权应用自动豁免隔离（Android 权限体系对齐）：packages.list 的 seinfo
+    # 字段以 "platform" 开头 = platform 签名（DocumentsUI 等文件中介的本职是
+    # 访问他包 /Android/data，逐包手工写规则不可维护）。default 签名照常隔离；
+    # packages.list 不可读/无该 uid → fail-safe 不豁免。
+    plist=os.path.join(cfg,"packages.list")
+    open(plist,"w").write(
+        "com.android.documentsui 10071 0 /data/user/0/com.android.documentsui "
+        "platform:privapp:targetSdkVersion=36 none 0 36 1 @system\n"
+        "com.demo.app 10123 0 /data/user/0/com.demo.app default:targetSdkVersion=30 "
+        "3003 0 26101061 1 @null\n"
+        "com.plain.app 10500 0 /data/user/0/com.plain.app default:targetSdkVersion=33 "
+        "none 0 33 1 @null\n")
+    os.environ["NSP_PACKAGELIST"]=plist
+    case("特权豁免:privapp",BASE,10071,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+        ("/0/Download/hi.txt",{"resolve":0,"probe":0}),
+    ],uid_map="10071 com.android.documentsui\n",global_want=1)
+    case("特权豁免:default 签名照常隔离",BASE,10123,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10123 com.demo.app\n",global_want=1)
+    case("特权豁免:uid 无 packages.list 行 fail-safe",BASE,10999,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10999 com.ghost.app\n",global_want=1)
+    del os.environ["NSP_PACKAGELIST"]
     shutil.rmtree(ISO_DIR,ignore_errors=True)
 
 def main():

@@ -79,6 +79,7 @@
 
 - **放行**：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局放行。
 - **与 `SANDBOX ON` 的关系**：沙盒生效的调用方被豁免——它的 `Android/data|obb` 访问本就会被 `SANDBOX` 重定向进**自己的**沙盒镜像（读不到他包内容），判成 ENOENT 只会让镜像路径整体不可用；列举侧仍按隔离过滤（保持既有行为）。
+- **特权应用自动豁免**：调用方是 **platform 签名**应用（`/data/system/packages.list` 的 seinfo 字段以 `platform` 开头，含 `platform:privapp` 与纯 `platform` 共享签名；DocumentsUI / Settings 等系统中介均为 priv-app）时自动放行——文件中介（如 DocumentsUI）的本职就是访问他包 `Android/data`，逐包手工写规则不可维护，按 Android 自己的权限体系判定。普通应用（seinfo `default`）与 `packages.list` 不可读/无该 uid（fail-safe）照常隔离。此豁免与 `ALLOW_CROSS_APP_DATA` 无关、无需配置。
 - **边界（共享 uid）**：`uid.map` 是「uid → 单个包名」，若两个非系统应用共享 uid（旧 `sharedUserId`，API 29 起废弃），A 进程访问 `/Android/data/B` 会被判成「他包」而返回 ENOENT。这类设备很少见，逃生阀同上（写 `ALLOW_CROSS_APP_DATA ON`；或用 `ALLOW /Android/data/B` 类规则——规则放行的是**路径**，与调用方身份无关）。
 - **代价**：隔离开启时 `Android/data|obb` 子树不做 backing 直通（该子树必须由 daemon 按调用方裁决），即这部分 I/O 回到全量仲裁路径；`ALLOW_CROSS_APP_DATA ON` 后恢复按规则细分的 backing 直通。
 
