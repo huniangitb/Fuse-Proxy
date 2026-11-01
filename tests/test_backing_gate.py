@@ -9,16 +9,24 @@ stat 他包 data 目录被判 ENOENT（直接访问 backing 则正常），且 S
 
 两层门：
 - 全局门 `fw_data_mediation_required()`（9 组）：任一规则触及 data 即要求仲裁。
-- 按路径门 `fw_backing_mediation_required_for(query)`（9 组）：仅自身/其下/
-  直接父命中才要求仲裁，远祖先（/、/0、/Android）不强制，SANDBOX ON 除外
-  （整树仲裁）。REDIRECT 只看 virtual_prefix（ALLOW 跳过）。
+- 按路径门 `fw_backing_mediation_required_for(query)`：仅自身/其下/直接父
+  命中才要求仲裁，远祖先（/、/0、/Android）不强制，SANDBOX ON 除外（整树
+  仲裁）。REDIRECT 只看 virtual_prefix。
+
+**ALLOW 也算仲裁维度（DAC）**：ALLOW 只声明"这一层放行"，不代表可以绕过
+daemon——backing 直通之后的下层 I/O 由内核按**调用方凭证**做 DAC，
+`/data/media` 归 MediaProvider（10277:1023、子目录 2700），应用一律 EACCES。
+旧实现把 ALLOW 当直通跳过，线上表现「只写 ALLOW /Download 时注入后反而写不
+进去」。另有静态契约锁住 `vfs_backing_setup`：全局实例（非 --media-fuse）
+一个 dentry 也不挂 backing——dentry 由所有应用共用，无法按调用方分别裁决。
 
 **MONITOR 维度（B1）**：`MONITOR ON` 的段其调用者 IO 要进 io.log，而 backing 直通后
 内核绕过 daemon、`vfs_log_io` 静默归零——故任一段 MONITOR ON 即要求整树仲裁
 （监控优先，牺牲该子树的部分加速）。旧实现的门只扫 sandbox/hide/ro/redir/ftp，
 仅 `MONITOR ON`（无改路径规则）时子树仍被挂 backing，监控静默失效。
 
-本用例临时编译实际源码（fw_rules.c 等，不经 Meson）并断言 18 组配置。
+本用例临时编译实际源码（fw_rules.c 等，不经 Meson）并断言 12 组全局门配置 +
+22 组按路径门配置，另加 2 条源码静态契约（全局实例不得挂 backing）。
 前置：本机 cc、json-c；缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
 """
 import os
@@ -69,8 +77,10 @@ CASES = [
      "HIDE /Android/data/com.foo/*\n", 1),
     ("无关规则", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
      "REDIRECT /sdcard/X /tmp/Y\n", 0),
+    # ALLOW 不再算直通：它只声明"这一层放行"，路径仍须由 daemon 代理（下层 DAC
+    # 按调用方凭证，应用对 /data/media 一律 EACCES）——旧实现该项期望 0。
     ("纯ALLOW", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
-     "ALLOW /Android/data/com.foo\n", 0),
+     "ALLOW /Android/data/com.foo\n", 1),
     ("注释提及", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
      "#HIDE /Android/data/com.foo/*\n", 0),
     # B1：MONITOR ON 要求仲裁（监控需 daemon 记录 IO；旧实现遗漏此维度 → 期望 0）
@@ -96,8 +106,15 @@ PCASES = [
     ("远祖先不强制", REDIR_FOO_OPEN, "/", 0),
     ("SANDBOX整树", "[GLOBAL]\nGLOBAL_INJECT ON\nSANDBOX ON\n",
      "/0/Download", 1),
-    ("纯ALLOW直通", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
-     "ALLOW /Android/data/com.foo\n", "/0/Android/data/com.foo", 0),
+    # ALLOW 也要求仲裁（同上）：命中 ALLOW 的路径必须由 daemon 代理
+    ("纯ALLOW也仲裁", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
+     "ALLOW /Android/data/com.foo\n", "/0/Android/data/com.foo", 1),
+    ("ALLOW 其下也仲裁", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
+     "ALLOW /Android/data/com.foo\n", "/0/Android/data/com.foo/bar", 1),
+    ("非data ALLOW 也仲裁", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
+     "ALLOW /Download\n", "/0/Download", 1),
+    ("非data 无规则仍可直通", "[GLOBAL]\nGLOBAL_INJECT ON\nALLOW_CROSS_APP_DATA ON\n"
+     "ALLOW /Download\n", "/0/Documents", 0),
     ("变量展开命中", "[GLOBAL]\nGLOBAL_INJECT ON\n"
      "MYD=/Android/data/com.foo\n"
      "HIDE $MYD/*\n", "/0/Android/data/com.foo/a", 1),
@@ -139,6 +156,59 @@ def fail(desc, detail=""):
     FAIL += 1
     log(f"  ❌ {desc}: {detail}")
     ERRORS.append((desc, detail))
+
+
+def _brace_block(text, start):
+    """从 start 处的 '{' 起做花括号配对，返回块内文本（含首尾括号），失败返回 None。"""
+    i = text.find("{", start)
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+    return None
+
+
+def static_contract():
+    """静态契约：全局实例不得挂 backing（DAC）。
+
+    `vfs_backing_setup` 里 `if (!g_is_media_fuse)` 分支必须直接 decline 并
+    返回 -ENOENT，`e->backing_fd =` 只能出现在它之后（= 只有 media 实例能走到
+    挂接）。不编译 daemon（重量级，且 bpf_setup 依赖内核支持），只锁源码形状。
+    """
+    path = os.path.join(ROOT, "src", "daemon", "fuse_daemon.c")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    fn = text.find("static int vfs_backing_setup(")
+    if fn < 0:
+        fail("静态契约：vfs_backing_setup 存在", "函数未找到")
+        return
+    body = _brace_block(text, fn)
+    if body is None:
+        fail("静态契约：vfs_backing_setup 可解析", "花括号不配对")
+        return
+    gi = body.find("if (!g_is_media_fuse)")
+    blk = _brace_block(body, gi) if gi >= 0 else None
+    if blk is None:
+        fail("静态契约：全局实例分支存在", "未找到 if (!g_is_media_fuse) 块")
+        return
+    ok1 = "BACKING_DECLINE_GLOBAL_DAC" in blk and "return -ENOENT" in blk
+    if ok1:
+        ok("静态契约：全局实例分支直接 decline 挂接")
+    else:
+        fail("静态契约：全局实例分支直接 decline 挂接", f"块内容={blk.strip()[:200]!r}")
+    fd = body.find("->backing_fd = ")
+    ok2 = fd > gi
+    if ok2:
+        ok("静态契约：只有 media 实例能走到 backing 挂接")
+    else:
+        fail("静态契约：只有 media 实例能走到 backing 挂接",
+             f"backing_fd 赋值早于全局实例分支（idx={fd} vs {gi}）")
 
 
 def pkg_config(flag):
@@ -199,6 +269,7 @@ def main():
     if r.returncode != 0:
         fail("测试二进制编译", r.stderr.strip()[-500:])
         return 1
+    static_contract()
     for desc, conf, want in CASES:
         with open(os.path.join(cfgdir, "injector.conf"), "w") as fh:
             fh.write(conf)

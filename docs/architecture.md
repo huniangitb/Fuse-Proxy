@@ -186,7 +186,9 @@ FUSE 回调（如 getattr）
 
 放行与逃生阀：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包，`br_pkg_same_base`）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局关闭隔离（默认 OFF = 生效）。`SANDBOX ON` 生效的调用方同样豁免（`br_sandbox_active` 复刻 `br_to_real_path` 的三层合并口径）：其 `Android/data|obb` 访问已被重定向进自己的沙盒镜像，读不到他包内容，判 ENOENT 只会让镜像不可用（`test_monitor_layers` 守护）。已知边界：`uid.map` 是 uid→单包名，旧 `sharedUserId` 共享 uid 的两个应用会互判「他包」——现代 Android 上罕见，逃生阀同上（见 `config.md` §4.1）。
 
-backing 门配套收紧（`fw_rules.c` 的 `fw_data_mediation_required()` / `fw_backing_mediation_required_for()`）：隔离生效时 `data`/`obb` 子树（含直接父 `/Android`）一律要求 daemon 仲裁——backing 直通用 daemon 凭证、内核绕过 daemon，per-caller 裁决无从落地（该子树此前直通等于隔离整体失效）。代价是这部分 I/O 回到全量仲裁路径，`ALLOW_CROSS_APP_DATA ON` 后恢复按规则的细粒度直通。
+**backing 直通只在 media 实例里开**（`vfs_backing_setup`）：全局实例（服务所有被注入应用，dentry 全应用共用）**一个 dentry 也不挂 backing**，全部回落 daemon 全权 mediation。两条理由：① 隔离开生效时 `data`/`obb` 的可见性取决于调用方，backing 之后内核绕过 daemon，per-caller 裁决无从落地（该子树此前直通等于隔离整体失效）；② 更要紧的是 DAC——backing 之后的下层 I/O 由内核在**发起请求的应用进程上下文**里直接打到真实文件（lookup/create/opendir 都按调用方凭证判），而 `/data/media/0` 整棵树归 MediaProvider（`10277:1023`、子目录 `2700`），任何应用都过不了。backing 结论按 dentry 缓存、无法按调用方分别裁决，故共享实例上这条路只能整体关掉（线上实测：只写 `ALLOW /Download` 或不写路径规则时，注入后的应用写 `/Download` 反被内核 EACCES 拒绝）。media 实例（`--media-fuse`，调用方恒为 MediaProvider）保留直通，按路径门 `fw_backing_mediation_required_for()` 逐路径裁决。
+
+`ALLOW` 也算"要求仲裁"的维度（`fw_rules.c` 的 `br_cfg_touches_data()` / `br_cfg_mediates_path()`）：它只声明"这一层放行"，不代表可以让内核代跑 IO。旧实现把 ALLOW 当直通跳过，正是上面 ② 的触发点。代价是全局实例的 I/O 回到全量仲裁路径（等于是把 `--no-bpf` 变成全局实例的恒定行为），换来的是"注入后与未注入行为一致"。
 
 观测：隔离拒绝与 `HIDE` 一样是静默 ENOENT，故 `br_note_isolation()` 记限速 DEBUG（首命中 + 每 1024 次一条，带调用方包名与判定路径），现场据此区分「我们在拦」与 ROM/规则问题。
 

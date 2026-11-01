@@ -3077,10 +3077,10 @@ static bool is_fuse_bpf_supported(void) {
    条数与最近一条路径样本。
    注意：LOG_DBG 在 log_internal 里**不受级别过滤**（前身 LOG_MON 要求监控日志
    恒可见，见该函数注释），所以限频是这里唯一的抑制手段，别指望 --log-level。 */
-enum { BACKING_DECLINE_RULE = 0, BACKING_DECLINE_GLOBAL_DATAOBB, BACKING_DECLINE_N };
+enum { BACKING_DECLINE_RULE = 0, BACKING_DECLINE_GLOBAL_DAC, BACKING_DECLINE_N };
 static const char* const g_backing_decline_what[BACKING_DECLINE_N] = {
     "规则需仲裁，放弃挂接",
-    "全局 data/obb 由 daemon 全权仲裁，不挂接",
+    "全局实例按调用方凭证 DAC，不挂接（见 vfs_backing_setup 注释）",
 };
 /* nsp_log_gate 非线程安全：FUSE 多 worker 并发进 vfs_backing_setup，故加锁。
    该分支本就回退全量 mediation（内核不再走 backing），一把短锁的代价可忽略。 */
@@ -3109,13 +3109,23 @@ static void backing_decline_log(int reason, const char* path) {
    策略程序——后者按调用方独立裁决且 verdict 最终（daemon 零感知），线上实例：
    空规则下 root 按名 stat 他包 data 目录被它以 ENOENT 拒绝（直接访问 backing
    则正常），且 SANDBOX/REDIRECT/HIDE/RO 对该子树整体失效。故：
-   - 全局实例 data/obb：永不挂接（DAC per-caller：opendir 按调用方凭证，
-     fd 相对沿用 daemon root 凭证，直通即越权；与规则无关）；
-   - 其余路径（含全局非 data/obb 与全部媒体路径）：按路径门
-     fw_backing_mediation_required_for() 逐路径裁决——命中（自身/其下/
-     直接父）即 declined（-ENOENT，内核回退 daemon 全权 mediation），
-     未命中则 backing-only 挂接。远祖先（/、/0、/Android 等）不强制仲裁，
-     保留加速；SANDBOX ON 时整树要求仲裁（隐私模式）。
+
+   - **全局实例（默认，服务所有被注入应用）：一个 dentry 也不挂接**，全部回落
+     daemon 全权 mediation。原因在 DAC 而不在规则：backing 之后的下层 I/O 由内核
+     在**发起请求的应用进程上下文**里直接打到真实文件（lookup / create / opendir
+     都按调用方凭证判 DAC），而 /data/media/0 整棵树归 MediaProvider（10277:1023）、
+     子目录 2700——任何应用都过不了。线上实测：应用段只写 ALLOW /Download
+     （或不写任何路径规则）时该路径命中 backing 直通，create 随即被内核以 EACCES
+     拒绝，观感就是「注入之后反而写不进 /Download，拿掉模块就正常」。而 backing
+     结论是**按 dentry 缓存**的，同一 dentry 由不同 uid 的应用共用，无法按调用方
+     分别裁决；共享实例上这条路只能整体关掉（要全仲裁本就可用 --no-bpf，现在
+     全局实例等于恒全仲裁）。
+   - **media 实例（--media-fuse，调用方恒为 MediaProvider 自身）**：保留直通，按
+     路径门 fw_backing_mediation_required_for() 逐路径裁决——命中（自身/其下/
+     直接父）即 declined（-ENOENT，内核回退 mediation），未命中则 backing-only
+     挂接。远祖先（/、/0、/Android 等）不强制仲裁；SANDBOX ON 时整树要求仲裁
+     （隐私模式）。该实例只有 MediaProvider 一个调用方，其 uid 10277 就是
+     /data/media/0 树的所有者，DAC 成立，加速才安全。
    已挂接 dentry 对运行期新增规则不感知（与此前同约束，历史行为一致）。 */
 static int vfs_backing_setup(const char* path, struct fuse_entry_param* e) {
     if (g_bpf_disabled) return -ENOSYS;
@@ -3124,18 +3134,12 @@ static int vfs_backing_setup(const char* path, struct fuse_entry_param* e) {
     char real[PATH_MAX];
 
     if (!g_is_media_fuse) {
-        if (strstr(path, "/Android/data") != NULL ||
-            strstr(path, "/Android/obb") != NULL) {
-            /* 全局实例 data/obb 永不挂接：见函数头 DAC 注释。 */
-            backing_decline_log(BACKING_DECLINE_GLOBAL_DATAOBB, path);
-            return -ENOENT;
-        }
-        /* 全局非 data/obb：按路径门裁决（无关路径保留加速）。 */
-        if (fw_backing_mediation_required_for(path)) {
-            backing_decline_log(BACKING_DECLINE_RULE, path);
-            return -ENOENT;
-        }
-    } else if (fw_backing_mediation_required_for(path)) {
+        /* 全局实例永不挂接：dentry 由所有应用共用，而下层 I/O 按调用方凭证
+           做 DAC（见函数头注释）。 */
+        backing_decline_log(BACKING_DECLINE_GLOBAL_DAC, path);
+        return -ENOENT;
+    }
+    if (fw_backing_mediation_required_for(path)) {
         /* 媒体实例：调用方单一，仅规则需仲裁此路径时 declined。 */
         backing_decline_log(BACKING_DECLINE_RULE, path);
         return -ENOENT;
@@ -3405,7 +3409,10 @@ int main(int argc, char* argv[]) {
     if (g_bpf_disabled) {
         LOG("FUSE backing: 已被 --no-bpf 参数禁用（标准 FUSE 全仲裁模式）");
     } else if (is_fuse_bpf_supported()) {
-        LOG("FUSE backing: 直通就绪（仅 backing，无系统策略程序）");
+        if (g_is_media_fuse)
+            LOG("FUSE backing: 直通就绪（仅 backing，无系统策略程序）");
+        else
+            LOG("FUSE backing: 全局实例全量 mediation（下层 DAC 按调用方凭证，不挂 backing）");
     } else {
         LOG_WRN("FUSE backing: 内核不支持，直通挂接不可用，将以标准 FUSE 模式运行");
     }
