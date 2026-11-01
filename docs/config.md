@@ -37,6 +37,7 @@
 - **裸 `[<pkg>]` 是跨用户 fallback（user_id=-1），不是 user 0**：查找同名包时先精确匹配 `[<pkg>:<uid>]`，未命中再回退到 `[<pkg>]`。因此 `[com.tencent.mm]` 对 0/999 等所有用户生效，而 `[com.tencent.mm:999]` 只对 999 生效。注意这与 App-rules **文件目录**不同：uid 0 的规则文件放在 `App-rules/`（`0` 是目录默认值），不要据此把裸段头的 user_id 当成 0。
 - 类别判定复用 `SKIP_SYSTEM_APPS` 逻辑：`pm list packages -s` 缓存（injector 落盘 `sys_pkgs.cache` 供 FUSE 侧只读），失败回退 `uid < 10000`。
 - 包名不可解析时（`system`/`unknown`/过短/`zygote`）类别段不生效，仅 GLOBAL 适用。
+- **系统应用的应用段**（如 `[com.android.settings]`，uid < 10000）在 FUSE 侧可命中：`fw_pkg_resolve_exact` 先查 `uid.map`（格式 `uid pkg`，共享 uid 可手工加一行），无条目时读 `/data/system/packages.list` 按 uid 取包名兜底；命中应用段才替换伪包口径，解析不出或未命中仍按 `system` 伪包参与 SYSTEM_APPS 类别层。注意两点：① 系统应用进程要能把 `POST` 发回 injector，SELinux 需放行其域对 `zygote` 的 `unix_stream_socket` 写权限（模块 `sepolicy.rule` 已含 `system_app`/`platform_app`/`priv_app`；缺失时 pre DEFER 后 POST 静默丢失、永不挂载，logcat 可见 `avc: denied { write } ... tclass=unix_stream_socket`）；② 排查/验证规则效果须以应用自身身份访问（`setpriv --reuid <uid>` 进其 mount ns），root 经 `/proc/<pid>/root` 穿透的请求以 uid 0 发出，解析不出应用段属预期 fail-safe。
 - 类别段有实质规则（REDIRECT/HIDE/RO/SANDBOX）即视为点名注入（跳过 `SKIP_SYSTEM_APPS` 过滤）；段头 `OFF` 显式否决该类别注入。
 - 类别段只写主文件；`GLOBAL_INJECT` / `SKIP_SYSTEM_APPS` / `FUSE_EXTRA_ARGS` / `SANDBOX_DIR` 仅 `[GLOBAL]` 段有效，写在别处忽略并告警。
 - 活跃用户列表由 `scan_active_users` 经 `pm list users` 获取（失败回退 `/data/media` 扫描，再兜底 user 0）。

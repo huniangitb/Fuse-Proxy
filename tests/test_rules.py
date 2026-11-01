@@ -215,6 +215,19 @@ def isolation_section():
         ("/0/Android/data/com.demo.app/files/x",{"resolve":0,"probe":0}),
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
     ],uid_map=None,argv0="com.demo.app:push")
+    # (6) 系统应用显式应用段：uid<10000 曾被 fw_pkg 短路成伪包 "system"，
+    #     应用段永不命中（实机：GLOBAL/类别段 HIDE 生效、[系统应用] 段不生效）。
+    #     现在经 fw_pkg_resolve_exact（uid.map → cmdline）解析真实包名后命中应用段。
+    sysmap="1000 com.android.settings\n"
+    case("系统应用应用段",BASE+"[com.android.settings]\nHIDE /secret_sys\n",1000,[
+        ("/0/secret_sys",{"resolve":1,"probe":1}),
+        ("/0/Download/x.txt",{"resolve":0,"probe":0}),
+    ],uid_map=sysmap)
+    # (7) 系统应用无对应应用段：维持伪包口径（仅 SYSTEM_APPS 类别层参与，
+    #     未写类别规则时 HIDE 不命中），且不得误命中其他应用段
+    case("系统应用无应用段",BASE+"[com.android.settings]\nHIDE /secret_sys\n",1000,[
+        ("/0/secret_sys",{"resolve":0,"probe":0}),
+    ],uid_map="1001 com.android.phone\n")
     shutil.rmtree(ISO_DIR,ignore_errors=True)
 
 def main():

@@ -69,6 +69,27 @@ void fw_pkg_shutdown(void) {
     g_uid_map_count = 0;
 }
 
+/* /data/system/packages.list：Android 全量已装应用清单（"pkg uid ..."），
+   系统共享 uid（1000 等）的包名唯一可靠来源（uid.map 无条目、caller pid 不可得）。
+   找到返回 true 并写入 out；找不到/打不开返回 false。 */
+static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size) {
+    FILE* fp = fopen("/data/system/packages.list", "re");
+    if (!fp) return false;
+    bool found = false;
+    char line[1024];
+    while (fgets(line, sizeof line, fp)) {
+        char name[FW_PKG_NAME_MAX];
+        unsigned int puid = 0;
+        if (sscanf(line, "%127s %u", name, &puid) == 2 && puid == (unsigned int)uid) {
+            snprintf(out, size, "%s", name);
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
 /* 取展示包名并判定其可否用于段匹配（等价模块 br_get_app_cfg 的不可解析分支：
    过短 / zygote / <pre- 一律只能命中 GLOBAL） */
 static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool* lookup_ok) {
@@ -76,7 +97,22 @@ static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool*
     const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
     if (mapped) {
         snprintf(pkg, sizeof pkg, "%s", mapped);
+    } else if (uid < NSP_SYSTEM_APP_UID_MIN) {
+        /* 系统共享 uid（1000 等）在 uid.map 里通常没有条目（injector 只在应用
+           REPORT 时写入），而 FUSE 请求侧拿不到 caller pid（q->pid 是 daemon
+           伪造的连接标识），cmdline 回退也不可用——实机验证：系统应用的显式
+           应用段（[com.android.settings] 等）永不命中，而 GLOBAL/类别段正常。
+           /data/system/packages.list 的 "pkg uid ..." 行覆盖全部已装应用，
+           按 uid 取第一个匹配包名。共享 uid（android.uid.system 下多个包）只取
+           其一，其余包的应用段规则要生效需等 uid.map 随 REPORT 增长补上；
+           伪包 "system" 的 SYSTEM_APPS 类别层判定不受影响。 */
+        resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg);
+        if (pkg[0] == '\0' && tid > 0) {
+            /* packages.list 不可读（非 Android 环境）时退回 cmdline */
+            goto cmdline_fallback;
+        }
     } else if (tid > 0) {
+      cmdline_fallback:;
         /* 主线程 id 取自 /proc/<tid>/status 的 Tgid：应用线程的 cmdline 就是包名，
            但只保证主线程可读（zygote fork 后线程组细节），故先定位 Tgid */
         pid_t main_pid = tid;
@@ -110,6 +146,11 @@ bool fw_pkg_resolve(uid_t uid, pid_t tid, char* out, size_t size) {
         snprintf(out, size, "system");
         return false; /* system 伪包只参与 SYSTEM_APPS 类别层，不属于应用段 */
     }
+    return fw_pkg_resolve_exact(uid, tid, out, size);
+}
+
+bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size) {
+    if (!out || size == 0) return false;
     FwPkgSlot* s = &g_slots[uid % FW_PKG_CACHE_SIZE];
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
     for (;;) {
