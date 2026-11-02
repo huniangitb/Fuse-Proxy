@@ -61,6 +61,16 @@ SUITE_MAP = [
     # 直编 fw_acl.c + 纯逻辑驱动（桩掉 uid→包名/特权/隔离开关三个事实源），
     # 另有静态契约断言：fw_acl_check 在 fuse_daemon.c 只能出现一次、关键回调
     # 必须把 ACL 操作种类交给 fw_route。
+    # ── 虚拟条目（vfs_synth.c）：路径段判定 + 合成条目属性 ──
+    # 沙盒合成的 /Android/obb/<pkg> 曾因 getattr 兜底不认这条路径而落回 ENOENT，
+    # 文件管理器列表里看得见、点不开（画成文件 + 1970-01-01）。
+    # 单元套件直编 vfs_synth.c 守住合成属性（目录/nlink>=2/size>0/mtime>0），
+    # 静态契约锁住 getattr/access/opendir 三处兜底都问 is_virtual_own_pkg_dir。
+    (("test_vfs_synth.py",),
+     ("src/daemon/vfs_synth.c", "src/daemon/vfs_synth.h", "src/daemon/fuse_daemon.c"),
+     ("nsp_synth_stat_fill", "is_virtual_own_pkg_dir", "is_android_skel_dir"),
+     "虚拟条目(vfs_synth) / 合成条目属性 + 自身包名目录判定"),
+
     # ── FUSE 事件通道（fw_events.c）：订阅推送 + 查询面，默认 OFF ──
     # 单元套件直编 fw_events.c（桩掉路径合成/规则决策/访问控制三个事实源），
     # 静态契约锁死：判定只问 fw_rules_resolve/fw_acl_check、热路径零分配、
@@ -299,6 +309,7 @@ LAYERS = {
         (
             "test_docs_sync.py",
             "test_acl.py",
+            "test_vfs_synth.py",
             "test_fw_events.py",
             "test_config_snapshot.py",
             "test_monitor_layers.py",
