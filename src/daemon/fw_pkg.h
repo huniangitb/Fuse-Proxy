@@ -43,6 +43,35 @@ bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size);
    结果按 uid 缓存；fw_pkg_reload（规则重载）后随 gen 失效重读。 */
 bool fw_pkg_is_privileged(uid_t uid);
 
+/* uid 是否持有 **MANAGE_EXTERNAL_STORAGE**（"所有文件访问"，Android 11+ 的 All
+   files access）。来源：AppOpsService 自身——该权限是 appop，AOSP 14+ 不再落
+   /data/system/appops.xml，设备上也没有任何可读的状态文件，故按 uid 解析出包名
+   后跑一次 cmd appops get <pkg>（root 直跑，实测约 40ms，与 legacy storage 共用
+   同一次查询）。输出 "Uid mode: …: allow" 与 "…: allow" 两种形态都算持有。
+   用途：与 fw_pkg_is_privileged 同一个豁免位——安装器/文件管理器/应用商店这类
+   持有 All files access 的应用，本职就是读他包 /Android/data（如安装器读 IM
+   落盘的 apk），按 Android 自己的授权放行，而不是逐包写规则。
+   fail-safe：packages.list 查不到该 uid、命令缺失或执行失败 → false（不豁免）。
+   结果按 uid 缓存（命中/未命中都缓存），fw_pkg_reload 后随 gen 失效重查；
+   另有 30s 有效期——appops 模式是运行期可变的（用户在设置里随时授予/撤销），
+   只靠 gen 失效会让授权在重启 daemon 前一直不生效。
+   锁纪律：自持独立互斥量 g_ext_fill_lock，函数体内只碰 packages.list 解析与
+   posix_spawn，不调用任何其它 fw_pkg 缓存函数。 */
+bool fw_pkg_manages_external(uid_t uid);
+
+/* uid 是否处于 **legacy storage** 模式（targetSdk ≤ 29 的旧式整盘访问，appop
+   LEGACY_STORAGE 为 allow）。与 fw_pkg_manages_external 共用同一份 appops 查询
+   与同一个 uid 槽位，判定口径一致。
+   用途：同上——legacy storage 应用在 AOSP 里本来就看得见他包 /Android/data，
+   本项目把它们判成不可见属于收紧过度。
+   fail-safe 与缓存策略同 fw_pkg_manages_external。 */
+bool fw_pkg_has_legacy_storage(uid_t uid);
+
+/* 仅测试：替换 appop 查询实现（GNU 测试环境没有 /system/bin/cmd）。传 nullptr
+   恢复生产查询；两个钩子任一非空即走钩子路径，未设的那个按 false 处理。 */
+void fw_pkg_set_manage_external_probe(bool (*fn)(const char* pkg));
+void fw_pkg_set_legacy_storage_probe(bool (*fn)(const char* pkg));
+
 /* 包名 → uid（/data/system/packages.list 的 "pkg uid ..." 行，与
    fw_pkg_is_privileged 同一份文件、同一个路径钩子）。
    用途：FUSE 事件通道的消费方（MPM）跑在 MediaProvider 进程内，SO_PEERCRED

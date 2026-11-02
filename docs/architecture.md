@@ -215,8 +215,8 @@ FUSE 回调（如 getattr）
 - **唯一执行点** `fw_acl_check()` 由 `fw_route()` 在规则决策**之前**调用一次（每次调用即「这个调用者能不能碰这条路径」），回调里不得再写访问判定；`tests/test_acl.py` 的静态契约断言 `fuse_daemon.c` 里 `fw_acl_check(` 只能出现一次。
 - **判定表只有一份**：纯函数 `fw_acl_decide(q, id)`（可直编单测，不依赖全局状态），路径分类 `fw_acl_classify()` 集中处理「卷根 / 骨架目录 / 他包私有目录 / `Android/media` / 顶层条目 / 普通路径」，不散落字符串比较。
 - **三码不混用**：`ENOENT`=看不见（他包 `Android/data|obb`）、`EACCES`=存在但不许（骨架目录列举、顶层结构违规、`access` 的 X_OK）、`EPERM`=结构层不许（骨架/顶层目录的增删改名）。
-- **配置耦合只有一处**：「他包私有目录不可见」沿用既有 `[GLOBAL] ALLOW_CROSS_APP_DATA`（`fw_rules_cross_app_isolated()` 是开关唯一出处），否则这条 AOSP 默认会让显式放行的用户突然失效；platform 签名豁免（`fw_pkg_is_privileged`）同 `766e5f5`。
-- **fail-open 名单明确**：uid < 10000（root/shell/system）、包名解析失败、`MANAGE_EXTERNAL_STORAGE`（后续阶段接入）一律放行——ACL 是「多一道门」，不能变成单点故障（解析失败把应用挡在自己的 data 目录外比越权更难排查）。
+- **配置耦合只有一处**：「他包私有目录不可见」沿用既有 `[GLOBAL] ALLOW_CROSS_APP_DATA`（`fw_rules_cross_app_isolated()` 是开关唯一出处），否则这条 AOSP 默认会让显式放行的用户突然失效；platform 签名豁免（`fw_pkg_is_privileged`，同 `766e5f5`）、All files access 豁免（`fw_pkg_manages_external`：按 uid 查 appops 的 `MANAGE_EXTERNAL_STORAGE`，安装器/文件管理器/商店读他包 `Android/data` 的本职访问）与 legacy storage 豁免（`fw_pkg_has_legacy_storage`：同一次 appops 查询里的 `LEGACY_STORAGE`）都在 `fw_rules` 的隔离判定同点叠加。
+- **fail-open 名单明确**：uid < 10000（root/shell/system）、包名解析失败、`MANAGE_EXTERNAL_STORAGE` 与 legacy storage（appops 判定，`fw_pkg_manages_external` / `fw_pkg_has_legacy_storage`）一律放行——ACL 是「多一道门」，不能变成单点故障（解析失败把应用挡在自己的 data 目录外比越权更难排查）。
 - **与 AOSP 的有意差异（超集，不是缺省）**：`chmod`/`chown` 照旧下发到 backing（AOSP 的 `handle_setattr` 静默丢弃 mode/uid/gid 变更），因为我们的 backing 是真实文件系统、属性可以真的保存；`access(X_OK)` 对文件保守放行、留给内核在 exec 时按 `MS_NOEXEC` 拒绝（回调里判 ACL 时还拿不到 stat，宁可多一层也不误伤目录的 X_OK）。
 
 回归：`tests/test_acl.py`（47 条纯逻辑断言 + 静态契约）。
