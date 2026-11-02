@@ -396,12 +396,51 @@ static bool fw_virtual_dir_empty(const char* fuse_path, const char* sub_path,
     return empty;
 }
 
+/* 剥掉开头的 /<数字> 用户层（/0/Android → /Android）；无用户层原样返回。
+   骨架判定不能假设路径已剥用户层：无用户层的挂载（或后续归一变化）下，
+   带前缀的同一路径必须得到同一结论。 */
+static const char* sub_path_strip_user_layer(const char* sub_path) {
+    if (!sub_path || sub_path[0] != '/') return sub_path;
+    const char* d = sub_path + 1;
+    while (*d >= '0' && *d <= '9') d++;
+    if (d == (sub_path + 1) || *d != '/') return sub_path;
+    return d;
+}
+
+/* 路径末段是否为 name（忽略尾部 '/'）："/Android"、"/0/Android/" 均命中 */
+static bool sub_path_tail_is(const char* sub_path, const char* name) {
+    if (!sub_path) return false;
+    size_t len = strlen(sub_path);
+    while (len > 1 && sub_path[len - 1] == '/') len--;
+    const char* base = sub_path + len;
+    while (base > sub_path && base[-1] != '/') base--;
+    size_t bl = (size_t)(sub_path + len - base);
+    return bl == strlen(name) && memcmp(base, name, bl) == 0;
+}
+
+/* 是否是 /Android 目录本身（含带用户层的 /<uid>/Android） */
+static bool sub_path_is_android_dir(const char* sub_path) {
+    return sub_path_tail_is(sub_path_strip_user_layer(sub_path), "Android");
+}
+
+/* 是否是 /Android/data 或 /Android/obb 目录本身（含带用户层的形态） */
+static bool sub_path_is_android_container(const char* sub_path) {
+    const char* p = sub_path_strip_user_layer(sub_path);
+    if (!sub_path_tail_is(p, "data") && !sub_path_tail_is(p, "obb")) return false;
+    char parent[PATH_MAX];
+    strncpy(parent, p, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char* last = strrchr(parent, '/');
+    if (!last) return false;
+    *last = '\0';
+    return sub_path_is_android_dir(parent);
+}
+
 static bool is_android_skel_dir(const char* sub_path) {
-    if (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0) return true;
-    if (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0)
-        return true;
-    if (strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0)
-        return true;
+    const char* p = sub_path_strip_user_layer(sub_path);
+    if (strcmp(p, "/Android") == 0 || strcmp(p, "/Android/") == 0) return true;
+    if (strcmp(p, "/Android/data") == 0 || strcmp(p, "/Android/data/") == 0) return true;
+    if (strcmp(p, "/Android/obb") == 0 || strcmp(p, "/Android/obb/") == 0) return true;
     return false;
 }
 
@@ -1272,8 +1311,8 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     d->is_root = (strcmp(sub_path, "/") == 0 || sub_path[0] == '\0');
     /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑；无用户层（user_id<0）同理 */
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
-    d->is_android_dir = (!skip_sandbox &&
-                         (strcmp(sub_path, "/Android") == 0 || strcmp(sub_path, "/Android/") == 0));
+    /* 骨架补齐不能依赖用户层是否剥离：无用户层的挂载上同样要补 data/obb */
+    d->is_android_dir = (!skip_sandbox && sub_path_is_android_dir(sub_path));
     d->hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
                       strcmp(current_pkg, "unknown") != 0);
     d->has_data = d->has_obb = d->has_android = d->has_pkg = false;
@@ -1367,36 +1406,60 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
            ino）。否则 DT_UNKNOWN 条目会让管理器显示为文件且无法点击，而按名
            stat（getattr 虚拟分支）又是目录——线上实例：lower 层 EACCES 致 lstat
            失败时 has_* 已预置，fill 合成被跳过，列表里只剩无类型条目。 */
-        bool skel = (d->is_root && d->hide_others && strcmp(de->d_name, "Android") == 0) ||
-                    (d->is_android_dir && (strcmp(de->d_name, "data") == 0 ||
-                                           strcmp(de->d_name, "obb") == 0)) ||
-                    (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
-                                        strcmp(d->sub_path, "/Android/data/") == 0 ||
-                                        strcmp(d->sub_path, "/Android/obb") == 0 ||
-                                        strcmp(d->sub_path, "/Android/obb/") == 0) &&
-                     strcmp(de->d_name, d->current_pkg) == 0);
+        /* 骨架名判定与访问者身份、用户层无关：root（hide_others=false）与无用户层
+           挂载同样命中，否则这几条路径正好退化成无类型条目。 */
+        bool skel = (d->is_root && strcmp(de->d_name, "Android") == 0) ||
+                    ((strcmp(de->d_name, "data") == 0 || strcmp(de->d_name, "obb") == 0) &&
+                     (d->is_android_dir || sub_path_is_android_dir(d->sub_path))) ||
+                    (d->hide_others && strcmp(de->d_name, d->current_pkg) == 0 &&
+                     sub_path_is_android_container(d->sub_path));
         struct stat st;
         memset(&st, 0, sizeof(st));
         readdir_join(item_real_path, 2047, d->real_path, de->d_name);
         if (lstat(item_real_path, &st) != 0) {
-            if (skel) continue; /* 回退 fill 合成（has_* 保持 false，不占 ht 名额） */
+            if (skel) {
+                /* 骨架名：lstat 失败也按目录上架（getattr 对同一路径有骨架兜底，
+                   两侧口径必须一致），并置 has_* 免得 fill 阶段重复补一条 */
+                if (d->is_root && strcmp(de->d_name, "Android") == 0)
+                    d->has_android = true;
+                else if (strcmp(de->d_name, "data") == 0)
+                    d->has_data = true;
+                else if (strcmp(de->d_name, "obb") == 0)
+                    d->has_obb = true;
+                else
+                    d->has_pkg = true;
+                if (!vfs_readdir_emit_dedup(d, de->d_name)) return false;
+                continue;
+            }
+            /* 非骨架条目：lstat 失败（下层 EACCES/ENOENT）时按 getdents 给出的
+               d_type 合成条目——无类型条目会让管理器显示为文件且无法点击，而按名
+               getattr 却可能是真实类型。d_type 也是 DT_UNKNOWN 时才退回 NULL。 */
+            if (de->d_type == DT_DIR || de->d_type == DT_REG || de->d_type == DT_LNK) {
+                struct stat dst;
+                memset(&dst, 0, sizeof dst);
+                dst.st_ino = vfs_readdir_entry_ino(d, de->d_name);
+                dst.st_mode = (de->d_type == DT_DIR)     ? (S_IFDIR | 0755)
+                              : (de->d_type == DT_LNK)   ? (S_IFLNK | 0777)
+                                                         : (S_IFREG | 0644);
+                if (vfs_hash_insert(&d->ht, de->d_name)) {
+                    if (!vfs_emit(d, de->d_name, &dst)) return false;
+                }
+                continue;
+            }
             if (vfs_hash_insert(&d->ht, de->d_name)) {
                 if (!vfs_emit(d, de->d_name, nullptr)) return false;
             }
             continue;
         }
         if (d->is_root && strcmp(de->d_name, "Android") == 0) d->has_android = true;
-        if (d->is_android_dir) {
+        if (d->is_android_dir || sub_path_is_android_dir(d->sub_path)) {
             if (strcmp(de->d_name, "data") == 0)
                 d->has_data = true;
             else if (strcmp(de->d_name, "obb") == 0)
                 d->has_obb = true;
         }
-        if (d->hide_others && (strcmp(d->sub_path, "/Android/data") == 0 ||
-                               strcmp(d->sub_path, "/Android/data/") == 0 ||
-                               strcmp(d->sub_path, "/Android/obb") == 0 ||
-                               strcmp(d->sub_path, "/Android/obb/") == 0) &&
-            strcmp(de->d_name, d->current_pkg) == 0)
+        if (d->hide_others && strcmp(de->d_name, d->current_pkg) == 0 &&
+            sub_path_is_android_container(d->sub_path))
             d->has_pkg = true;
         if (vfs_hash_insert(&d->ht, de->d_name)) {
             if (!vfs_emit(d, de->d_name, &st)) return false;
@@ -1423,11 +1486,7 @@ static bool vfs_readdir_fill_android_children(VfsReaddirCtx* d) {
 
 /* /Android/data|obb 下访问者自身包名骨架补齐（跨应用隔离下仅见自身） */
 static bool vfs_readdir_fill_own_pkg(VfsReaddirCtx* d) {
-    if (!(d->hide_others && !d->has_pkg &&
-          (strcmp(d->sub_path, "/Android/data") == 0 ||
-           strcmp(d->sub_path, "/Android/data/") == 0 || strcmp(d->sub_path, "/Android/obb") == 0 ||
-           strcmp(d->sub_path, "/Android/obb/") == 0)))
-        return true;
+    if (!(d->hide_others && !d->has_pkg && sub_path_is_android_container(d->sub_path))) return true;
     return vfs_readdir_emit_dedup(d, d->current_pkg);
 }
 
