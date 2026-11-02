@@ -31,6 +31,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include "zygisk.hpp"
 
@@ -43,10 +45,15 @@
    运行时拖进 zygote 子进程。 */
 #define IPC_SOCKET_NAME "nsp_ipc_socket"
 
-/* 协议版本：2 = 支持"pre 回 DEFER、post 发 POST"的两段式补挂载。
+/* 协议版本：3 = pre 只裁决、post **不再回连**的补挂载。
    injector 只在收到 >=2 的 proto 时才允许延迟应答；旧模块（不带 proto）走
-   原有的"就地挂载 + 异步重试"路径，故新 injector 与旧模块组合零回归。 */
-#define NSP_ZYGISK_PROTO 2
+   原有的"就地挂载 + 异步重试"路径，故新 injector 与旧模块组合零回归。
+   2 → 3 的差别：v2 靠"保留 pre 建立的 companion 连接、post 再发 POST"，
+   而 ZygiskNext 1.3.4+ 会把 preAppSpecialize 返回后仍持有的 companion fd 直接
+   关闭（Companion API 使用不当），post 再写就是写已关闭的 fd。v3 改为 pre 拿完
+   判决即关闭连接，post 在本地等待自己的命名空间出现代理视图（injector 收到
+   pre 通知后就在后台盯着这个进程的 ns，一变即挂）。 */
+#define NSP_ZYGISK_PROTO 3
 
 /* 各段等待上限（都必须有界，任何一段超时都按"放行应用"处理，绝不挂死）。
    companion 侧等 injector：REQ 只需一次快速尝试，POST 可能要等 vold 把
@@ -65,7 +72,10 @@
 #define COMPANION_REQ_TIMEOUT_MS  800
 #define COMPANION_POST_TIMEOUT_MS 1500
 #define MODULE_REQ_TIMEOUT_MS     1200
-#define MODULE_POST_TIMEOUT_MS    2000
+/* post-specialize 在本地等"自己的命名空间出现代理视图"的上限。injector 收到 pre
+   通知后就在后台盯这个进程的 ns，切换后立即挂载（实测 2 跳退避内完成），这里
+   只做上界保护：等不到就放行应用（它继续用原生视图），绝不挂死。 */
+#define MODULE_PROXY_WAIT_MS      1500
 
 /* 抽象命名空间 UDS 地址填充。等价于项目的 nsp_uds_abstract_addr()
    （src/core/nsp_util.c），含同一处修正：地址长度按**截断后**实际写入的
@@ -78,6 +88,40 @@ static socklen_t uds_abstract_addr(struct sockaddr_un* addr, const char* name) {
     strncpy(addr->sun_path + 1, name, sizeof(addr->sun_path) - 2);
     addr->sun_path[sizeof(addr->sun_path) - 1] = '\0';
     return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(addr->sun_path + 1));
+}
+
+/* 本进程的 /storage/emulated 是否已经是项目代理视图：mountinfo 里该挂载点的
+   fstype 是 injector 挂载时指定的 subtype（fuse.fuse_daemon）。v1 逐应用挂载
+   完成后才会出现；v3 全局替换下开机即有。读失败按"未就绪"处理（fail-open：
+   调用方只会在超时后放行，不会因此拒绝启动应用）。 */
+static bool storage_is_proxied(void) {
+    FILE* fp = fopen("/proc/self/mountinfo", "re");
+    if (fp == nullptr) return false;
+    char* line = nullptr;
+    size_t cap = 0;
+    bool found = false;
+    while (getline(&line, &cap, fp) > 0) {
+        if (strstr(line, " /storage/emulated ") != nullptr &&
+            strstr(line, "fuse.fuse_daemon") != nullptr) {
+            found = true;
+            break;
+        }
+    }
+    free(line);
+    fclose(fp);
+    return found;
+}
+
+/* 有界等待代理视图就绪（2ms 步进）。返回已等待的毫秒数；0 = 立即可用。 */
+static long wait_storage_proxied(int timeout_ms) {
+    long waited = 0;
+    while (!storage_is_proxied()) {
+        if (waited >= timeout_ms) break;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+        nanosleep(&ts, nullptr);
+        waited += 2;
+    }
+    return waited;
 }
 
 /* 是否上报该进程给 injector。
@@ -183,7 +227,9 @@ static void companion_handler(int client_fd) {
         }
 
         LOGD("Companion: %s %s (PID:%d, UID:%d) → %s", verb, pkg_name, pid, uid, reply);
-        write(client_fd, reply, strlen(reply));
+        /* MSG_NOSIGNAL：应用侧读完应答就关连接（v3 起 pre 阶段必定关闭），此刻
+           写回会命中 EPIPE——默认 SIGPIPE 会把 companion 线程连带进程打死。 */
+        send(client_fd, reply, strlen(reply), MSG_NOSIGNAL);
         /* 只有 DEFER 才继续留在连接上等 POST；OK/ERR 即本条连接使命结束 */
         if (strcmp(reply, "DEFER") != 0) break;
     } /* for (;;) */
@@ -214,16 +260,16 @@ class AppReporterModule : public zygisk::ModuleBase {
         uid_ = args->uid;
         pending_ = false;
 
-        companion_fd_ = api->connectCompanion();
-        int fd = companion_fd_;
+        int fd = api->connectCompanion();
         if (fd >= 0) {
             char req_buf[512];
             int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %u %d", final_name,
                                    getpid(), args->uid, NSP_ZYGISK_PROTO);
             if (write(fd, req_buf, req_len) > 0) {
                 /* 等 injector 的判决（上限 1.2s）：OK = 无需挂载，可直接继续；
-                   DEFER = 目标应用，交 post-specialize 补挂载。injector 的 pre
-                   通道只裁决不挂载（此阶段还在 zygote 的挂载 ns 里，不能挂）。 */
+                   DEFER = 目标应用，injector 已在后台盯着本 pid 的命名空间，本进程
+                   到 post 再等自己的视图出现。pre 通道只裁决不挂载——此刻还在
+                   zygote 的挂载 ns 里，挂上去会被之后 fork 的每个应用继承。 */
                 char reply[16] = {0};
                 bool answered = false;
                 struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
@@ -234,19 +280,16 @@ class AppReporterModule : public zygisk::ModuleBase {
                         answered = true;
                     }
                 }
-                /* 只有拿到明确的 "OK" 才算"无需补挂载"。没应答（injector 忙/连接
-                   异常）或收到 ERR 时必须把连接留着在 post 再试一次：injector 的
-                   pre 通道只裁决不挂载，缺了这次 POST 应用整个生命周期都没有代理
-                   视图（旧实现"超时按 OK"会静默吞掉 DEFER，真机表现就是"存储
+                /* 只有拿到明确的 "OK" 才算"无需挂载"。没应答（injector 忙/连接异常）
+                   或收到 ERR 时仍按"可能要挂"处理：post 的本地等待是有界的，等不到
+                   就放行（旧实现"超时按 OK"会静默吞掉 DEFER，真机表现就是"存储
                    没被代理/是空的"）。 */
                 pending_ = !(answered && strcmp(reply, "OK") == 0);
             }
-            /* DEFER 时**保留**连接：post-specialize 已处于应用沙箱域，无法再
-               connectCompanion，只能复用这条 pre-specialize 建立的连接。 */
-            if (!pending_) {
-                close(fd);
-                companion_fd_ = -1;
-            }
+            /* 连接只在本回调内使用，返回前必须关闭（见 NSP_ZYGISK_PROTO 注释：
+               ZygiskNext 1.3.4+ 会关掉 preAppSpecialize 返回后仍持有的 companion
+               fd，留着它就是"Companion API 使用不当"，且 post 再写必失败）。 */
+            close(fd);
         }
 
         if (nice_name) {
@@ -257,33 +300,24 @@ class AppReporterModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
-        /* v1 补挂载：pre-specialize 时 injector 回 DEFER 的进程在这里阻塞等待，
-           直到 injector 在**应用命名空间内**把 /storage/emulated 换成项目 FUSE。
+        /* v1 补挂载：pre-specialize 时 injector 回 DEFER 的进程在这里等自己的
+           /storage/emulated 变成项目 FUSE（injector 侧在 ns 切换的瞬间挂载）。
            本回调仍早于应用 Java 代码（Application.onCreate）执行，因此应用的
-           首次写入就能看到代理视图——这正是把"异步重试队列"搬到 zygisk 的目的。
-           只在 pending_ 时发起 IPC：未命中配置的应用、v2/v3（全局替换）以及
-           injector 不在线的情况都不会多一次往返，也不会被阻塞。 */
+           首次写入就能看到代理视图。只在 pending_ 时等待：未命中配置的应用、
+           v2/v3（全局替换）与 injector 不在线的情况都不会多一次等待。 */
         if (pending_) {
             pending_ = false;
-            int fd = companion_fd_;
-            companion_fd_ = -1;
-            if (fd >= 0) {
-                char req_buf[512];
-                int req_len = snprintf(req_buf, sizeof(req_buf), "POST %s %d %u %d", pkg_, getpid(),
-                                       uid_, NSP_ZYGISK_PROTO);
-                if (write(fd, req_buf, req_len) > 0) {
-                    char reply[16] = {0};
-                    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-                    if (poll(&pfd, 1, MODULE_POST_TIMEOUT_MS) > 0) {
-                        ssize_t rn = read(fd, reply, sizeof(reply) - 1);
-                        if (rn > 0) reply[rn] = '\0';
-                    }
-                    LOGI("App [%s] (PID:%d) 补挂载结果: %s", pkg_, getpid(),
-                         reply[0] ? reply : "无应答");
-                }
-                close(fd);
+            /* 本进程已在自己的挂载命名空间里：injector 在收到 pre 通知后就盯着这个
+               pid 的 ns，切换完成的第一时间挂载。这里只等"自己的视图就绪"这个
+               本地事实（不访问任何 fd/IPC），等到即继续，等不到由 injector 的后台
+               重试队列补挂——绝不把应用卡死在 specialize 上。 */
+            long waited = wait_storage_proxied(MODULE_PROXY_WAIT_MS);
+            if (storage_is_proxied()) {
+                LOGI("App [%s] (PID:%d) 补挂载完成: 代理视图在 %ldms 内就绪", pkg_, getpid(),
+                     waited);
             } else {
-                LOGI("App [%s] 补挂载失败: 无可用 companion 连接", pkg_);
+                LOGI("App [%s] (PID:%d) 补挂载未就绪: %dms 内未见代理视图，已放行（后台重试补挂）",
+                     pkg_, getpid(), MODULE_PROXY_WAIT_MS);
             }
         }
         /* 上报已完成，卸载自身以保持应用进程纯净 */
@@ -298,9 +332,6 @@ class AppReporterModule : public zygisk::ModuleBase {
     char pkg_[256] = {0};
     uint32_t uid_ = 0;
     bool pending_ = false;
-    /* pre-specialize 建立、在 DEFER 时保留到 post-specialize 的 companion 连接。
-       post 阶段已降权进应用沙箱域，无法再 connect 到 zygiskd，只能复用。 */
-    int companion_fd_ = -1;
 };
 
 REGISTER_ZYGISK_MODULE(AppReporterModule)
