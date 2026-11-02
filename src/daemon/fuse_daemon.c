@@ -436,6 +436,22 @@ static bool sub_path_is_android_container(const char* sub_path) {
     return sub_path_is_android_dir(parent);
 }
 
+/* 沙盒合成的「容器/当前包名」目录：/Android/data/<pkg> 或 /Android/obb/<pkg>。
+   真实目录可以不存在，readdir 由 fill_own_pkg 合成这一条；getattr/access/opendir
+   必须同口径把它当目录，否则列表里看得见、stat 却 ENOENT，客户端把它画成文件。 */
+static bool is_virtual_own_pkg_dir(const char* sub_path, const char* pkg) {
+    if (!sub_path || !pkg || pkg[0] == '\0') return false;
+    if (!sub_path_tail_is(sub_path, pkg)) return false;
+    char parent[PATH_MAX];
+    const char* p = sub_path_strip_user_layer(sub_path);
+    strncpy(parent, p, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char* last = strrchr(parent, '/');
+    if (!last) return false;
+    *last = '\0';
+    return sub_path_is_android_container(parent);
+}
+
 static bool is_android_skel_dir(const char* sub_path) {
     const char* p = sub_path_strip_user_layer(sub_path);
     if (strcmp(p, "/Android") == 0 || strcmp(p, "/Android/") == 0) return true;
@@ -984,7 +1000,7 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             VFS_RETURN(0);
         }
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
+            (is_android_skel_dir(sub_path) || is_virtual_own_pkg_dir(sub_path, current_pkg) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             /* 虚拟目录（无真实底层文件，如 FTP 前缀/重定向祖先）：权限继承
                上级目录（父路径的真实 mode/uid/gid），而非固定 root/访问者 */
             memset(st, 0, sizeof(struct stat));
@@ -1059,7 +1075,7 @@ static int vfs_access(const char* path, int mask) {
     if (access(p, mask) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
+            (is_android_skel_dir(sub_path) || is_virtual_own_pkg_dir(sub_path, current_pkg) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             VFS_RETURN(0);
         }
         log_fuse_err("ACCESS", path, err);
@@ -2220,7 +2236,7 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
     }
     int err = errno;
     if ((err == ENOENT || err == EACCES) &&
-        (is_android_skel_dir(sub_path) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
+        (is_android_skel_dir(sub_path) || is_virtual_own_pkg_dir(sub_path, current_pkg) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
         VFS_RETURN(0);
     }
     log_fuse_err("OPENDIR", path, err);
