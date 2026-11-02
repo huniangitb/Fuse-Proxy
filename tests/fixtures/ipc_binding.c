@@ -585,6 +585,10 @@ static void run_plan_readiness_cases(void) {
         {"A2 REQ(应用直连,proto=2) → legacy 通道（历史行为不变）", false, false, 2,
          IPC_CHAN_LEGACY, IPC_MOUNT_READINESS_MS},
         {"A2 POST(无proto) → POST 通道", true, false, 0, IPC_CHAN_POST, IPC_MOUNT_INLINE_MS},
+        {"A2 pre(REPORT,proto=3) → DEFER 通道（新模块不再回连，改由 injector 盯 ns）", false,
+         true, 3, IPC_CHAN_DEFER, 0},
+        {"A2 POST(proto=3) → POST 通道（计划不变；新模块已不再发 POST）", true, false, 3,
+         IPC_CHAN_POST, IPC_MOUNT_INLINE_MS},
     };
     char detail[400];
     for (size_t i = 0; i < sizeof cs / sizeof cs[0]; i++) {
@@ -603,6 +607,14 @@ static void run_plan_readiness_cases(void) {
     report(IPC_MOUNT_INLINE_MS <= 50 && IPC_MOUNT_INLINE_MS < IPC_MOUNT_READINESS_MS,
            "A2 POST 预算 ≤ 50ms 且小于 legacy 预算（不可感知 + fail-open 交后台重试）",
            "POST 预算过大：应用主线程白等且仍拿不到视图");
+
+    /* 补挂载盯梢（proto>=3）的两段预算必须收在模块等待里：injector 先盯命名空间
+       切换（IPC_POST_WAIT_MS）再做同步挂载（IPC_MOUNT_READINESS_MS），模块在 post
+       里等自己的视图上限 1500ms——加起来超了就是"应用已放行、挂载才刚做完"，
+       按设计模块超时后由后台重试补挂（正确但慢），故钉住"先放弃的是 injector"。 */
+    report(IPC_POST_WAIT_MS + IPC_MOUNT_READINESS_MS < 1500,
+           "A2 补挂载两段预算之和 < 模块等待上限（先放弃的是 injector）",
+           "预算过大：模块放行时挂载尚未完成");
 
     /* A2b：v2 非目标还原的时序（事件驱动优先，不靠 10ms 轮询猜时间）。
        新协议 pre 阶段不还原、不轮询——此刻应用 ns 里还没有项目视图（还原只会

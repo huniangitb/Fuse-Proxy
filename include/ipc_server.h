@@ -40,6 +40,16 @@ void handle_ipc_client_readable(int client_fd);
  * 把预算放大到 1s 才是红线禁止的——那是每次冷启动固定多等 1s。 */
 #define IPC_MOUNT_INLINE_MS 20
 
+/* v3 补挂载盯梢：pre 通道收到目标应用通知后，后台以 2ms 步进盯
+ * /proc/<pid>/ns/mnt，命名空间一变（specialize 完成）就立刻挂载；模块侧在
+ * post-specialize 里等自己视图出现（上限 1500ms，见 zygisk 模块）。 */
+#define IPC_POST_WAIT_MS 1200
+
+/* 模块 proto 版本：>=3 的模块在 pre 阶段拿完判决即关闭 companion 连接，
+ * post 不再回连（ZygiskNext 1.3.4+ 会关掉跨回调遗留的 companion fd）。
+ * injector 对这类模块在 pre 阶段就派发补挂载盯梢。 */
+#define IPC_PROTO_LOCAL_WAIT 3
+
 /* v1 挂载通道（纯函数决策，便于直编单测）：
  *   IPC_CHAN_DEFER  = pre-specialize 的 REPORT 预探测（proto>=2）：**只裁决不挂载**，
  *       立即回 DEFER。此刻应用还在 zygote 的挂载命名空间里——部分 ROM 该 ns 里

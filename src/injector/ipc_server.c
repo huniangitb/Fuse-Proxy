@@ -21,6 +21,7 @@
 #include <time.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <dirent.h>
 #include "config_parser.h"
 #include "fast_pid.h"
@@ -430,6 +431,135 @@ static void* ipc_mount_thread(void* raw) {
     free(arg);
     return NULL;
 }
+
+/* ================= v3 补挂载盯梢 =================
+ * proto>=3 的模块在 pre-specialize 里拿完判决就关掉 companion 连接，post 阶段
+ * 不再回连（ZygiskNext 1.3.4+ 会关掉跨回调遗留的 companion fd；官方 Zygisk 的
+ * connectCompanion 也只在 pre 可用）。"何时可以挂"因此改由 injector 判定：
+ * pre 时应用还在 zygote 的挂载命名空间里（见 ipc_plan_channel 的 DEFER 说明），
+ * 这里盯 /proc/<pid>/ns/mnt 的 (dev, ino)，一变即说明应用自己的 ns 已成立，
+ * 立刻同步挂载；模块在 post 里等自己的视图出现，两侧以"视图"对齐，不再有
+ * 跨回调的连接。 */
+typedef struct {
+    char pkg[256];
+    int pid;
+    uid_t uid;
+    dev_t ns_dev;
+    ino_t ns_ino;
+    int readiness_ms;
+} IpcPostArg;
+
+static long ipc_elapsed_ms(const struct timespec* from, const struct timespec* to) {
+    return (to->tv_sec - from->tv_sec) * 1000L + (to->tv_nsec - from->tv_nsec) / 1000000L;
+}
+
+static void* ipc_post_mount_thread(void* raw) {
+    IpcPostArg* arg = (IpcPostArg*)raw;
+    nsp_set_thread_name("nsp_post");
+    struct timespec t0, tn;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* 先占追踪位，避免与后台重试队列对同一 pid 并发挂载 */
+    add_tracked(arg->pid);
+
+    bool switched = false;
+    for (;;) {
+        if (kill(arg->pid, 0) != 0) break; /* 进程已死，没必要再等 */
+        char ns_path[64];
+        struct stat st;
+        snprintf(ns_path, sizeof ns_path, "/proc/%d/ns/mnt", arg->pid);
+        if (stat(ns_path, &st) == 0 && (st.st_dev != arg->ns_dev || st.st_ino != arg->ns_ino)) {
+            switched = true;
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        if (ipc_elapsed_ms(&t0, &tn) >= IPC_POST_WAIT_MS) break;
+        struct timespec step = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+        nanosleep(&step, nullptr);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    long waited_ms = ipc_elapsed_ms(&t0, &tn);
+    if (!switched) {
+        /* 没等到切换就绝不挂：此时挂上去会落进 zygote 的命名空间，被之后 fork 的
+           每个应用继承且无法清理。应用先用原生视图跑，视图交后台重试队列补。 */
+        remove_tracked(arg->pid);
+        LOG_DBG("IPC补挂载跳过: %s(PID:%d) %ldms 内未见命名空间切换", arg->pkg, arg->pid,
+                waited_ms);
+        free(arg);
+        return NULL;
+    }
+    if (!is_target_app(arg->pkg, arg->uid, arg->pid, true)) {
+        remove_tracked(arg->pid);
+        LOG_DBG("IPC补挂载: 配置无匹配 %s(PID:%d)", arg->pkg, arg->pid);
+        free(arg);
+        return NULL;
+    }
+    if (!get_active_mnt_src()) {
+        remove_tracked(arg->pid);
+        LOG_ERR("IPC补挂载: 全局 FUSE 不可用，无法为 %s(PID:%d) 挂载", arg->pkg, arg->pid);
+        schedule_retry_mount(arg->pkg, arg->pid);
+        free(arg);
+        return NULL;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int ret = perform_app_mount_sync(arg->pkg, arg->pid, arg->uid, NULL, arg->readiness_ms);
+    clock_gettime(CLOCK_MONOTONIC, &tn);
+    long mount_ms = ipc_elapsed_ms(&t0, &tn);
+    if (ret == 0) {
+        /* 同步版不做异步版的簿记，在此补齐（与 POST 通道一致） */
+        mark_injected(arg->pid);
+        retry_mount_succeeded(arg->pid);
+        print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
+        LOG("IPC补挂载完成: %s(PID:%d) 切换后 %ldms 就绪（挂载 %ldms）", arg->pkg, arg->pid,
+            waited_ms, mount_ms);
+    } else if (ret == NSP_MOUNT_DEFERRED) {
+        remove_tracked(arg->pid);
+        schedule_retry_mount(arg->pkg, arg->pid);
+        LOG_DBG("IPC补挂载延迟: %s(PID:%d) 视图未就绪，交后台重试（挂载 %ldms）", arg->pkg, arg->pid,
+                mount_ms);
+    } else {
+        remove_tracked(arg->pid);
+        schedule_retry_mount(arg->pkg, arg->pid);
+        LOG_ERR("IPC补挂载失败: %s(PID:%d) ret=%d（挂载 %ldms）", arg->pkg, arg->pid, ret, mount_ms);
+    }
+    free(arg);
+    return NULL;
+}
+
+/* 派发补挂载盯梢（pre 通道，proto>=3）。先取当前命名空间身份作为"还没切换"的
+   基线；取不到说明进程已消失，交由调用方按已就绪处理。 */
+static bool ipc_post_mount_dispatch(const char* pkg, int pid, uid_t uid) {
+    char ns_path[64];
+    struct stat st;
+    snprintf(ns_path, sizeof ns_path, "/proc/%d/ns/mnt", pid);
+    if (stat(ns_path, &st) != 0) {
+        LOG_DBG("IPC补挂载: 无法读取 %s(PID:%d) 的命名空间（%s）", pkg, pid, strerror(errno));
+        return false;
+    }
+    IpcPostArg* arg = malloc(sizeof(*arg));
+    if (!arg) return false;
+    memset(arg, 0, sizeof(*arg));
+    snprintf(arg->pkg, sizeof arg->pkg, "%s", pkg);
+    arg->pid = pid;
+    arg->uid = uid;
+    arg->ns_dev = st.st_dev;
+    arg->ns_ino = st.st_ino;
+    /* 盯梢线程不在应用主线程上等，可以给足 vold 装配窗口（实测 ~135–150ms），
+       让"应用首次读存储"就能看到代理视图；模块侧上限 1500ms 覆盖这段预算。 */
+    arg->readiness_ms = IPC_MOUNT_READINESS_MS;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, ipc_post_mount_thread, arg) == 0) {
+        pthread_detach(tid);
+        LOG_DBG("IPC派发补挂载盯梢: %s(PID:%d)（等待命名空间切换，上限 %dms）", pkg, pid,
+                IPC_POST_WAIT_MS);
+        return true;
+    }
+    free(arg);
+    LOG_ERR("IPC补挂载: 创建盯梢线程失败 %s(PID:%d)", pkg, pid);
+    return false;
+}
+
 int ipc_server_init() {
     /* 将整个 injector 进程绑定到大核 4-7，减少调度迁移延迟 */
     cpu_set_t cpus;
@@ -677,14 +807,25 @@ void handle_ipc_client_readable(int client_fd) {
                 if (plan == IPC_RESTORE_ON_POST) {
                     /* 双保险：① 立刻派发一次**后台**还原线程（10ms 步进、最多 1.2s），
                        视图一出现就还原——这条不依赖任何模块通知，是正确性底线；
-                       ② 同时回 DEFER，让模块在 post-specialize 再通知一次：POST 到达
-                       时再派发一次，通常一次命中（~5ms），把窗口压到最小。
-                       两条路重复执行时，后到的那条只会命中"顶层非项目 FUSE→跳过"。 */
+                       ② 旧模块（proto<3）同时回 DEFER，让它在 post-specialize 再通知
+                       一次：POST 到达时再派发一次，通常一次命中（~5ms），把窗口压到
+                       最小。两条路重复执行时，后到的那条只会命中"顶层非项目 FUSE→
+                       跳过"。
+                       新模块（proto>=3）没有第二次通知，且它会把 DEFER 当成"要等自己的
+                       代理视图"——本应用恰恰不该被代理，等满 1500ms 只会白等一场
+                       （每次冷启动可见地变慢）。故对这类模块直接回 OK，还原仍由上面
+                       那条后台线程完成。 */
                     bool dispatched =
                         ipc_restore_dispatch(clean_pkg, pid, uid, nullptr, 1200);
-                    LOG_DBG("IPC还原计划: %s(PID:%d) 后台还原%s；同时回 DEFER 等 post 通知加速",
-                            clean_pkg, pid, dispatched ? "已派发" : "派发失败");
-                    ipc_reply_and_close(client_fd, "DEFER");
+                    bool defer = proto < IPC_PROTO_LOCAL_WAIT;
+                    LOG_DBG("IPC还原计划: %s(PID:%d) 后台还原%s；%s", clean_pkg, pid,
+                            dispatched ? "已派发" : "派发失败",
+                            defer ? "同时回 DEFER 等 post 通知加速" : "回 OK（新模块不再回连）");
+                    if (defer) {
+                        ipc_reply_and_close(client_fd, "DEFER");
+                    } else {
+                        ipc_ack_and_close(client_fd, true);
+                    }
                     return;
                 }
                 if (plan == IPC_RESTORE_NOW) {
@@ -755,8 +896,12 @@ void handle_ipc_client_readable(int client_fd) {
            - 旧模块（无 proto）/ REQ：就地挂载，语义不变。 */
         IpcChannel chan = ipc_plan_channel(is_post, is_report, proto);
         if (chan == IPC_CHAN_DEFER) {
-            LOG_DBG("IPC预探测（pre/DEFER）: %s(PID:%d) 交 post-specialize 补挂载", clean_pkg, pid);
             ipc_reply_and_close(client_fd, "DEFER");
+            /* 新模块（proto>=3）post 阶段不再回连，改由这里盯它的命名空间：
+               应答先发出去（模块在等），盯梢线程随后建，不拖慢判决。 */
+            if (proto >= IPC_PROTO_LOCAL_WAIT) {
+                ipc_post_mount_dispatch(clean_pkg, pid, uid);
+            }
             return;
         }
         int readiness_ms = ipc_channel_readiness(chan);
