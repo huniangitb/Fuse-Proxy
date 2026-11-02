@@ -98,3 +98,26 @@ void nsp_synth_stat_fill(struct stat* st, ino_t ino, mode_t type_mode,
         st->st_mode = S_IFDIR | (src->st_mode & 07777);
     }
 }
+
+/* 最近的存在祖先：从父目录逐级上溯（调用方传入的路径本身不参与——它正是
+   lstat 失败的那个）。尾部 '/' 先剥掉，避免 "/a/b/" 只切出 "/a/b" 又原地失败。
+   逐级只按 '/' 切，不做路径规范化：入参来自框架的 real_path，已是规范形态。 */
+bool nsp_stat_nearest_ancestor(const char* real_path, struct stat* out) {
+    if (!real_path || !out) return false;
+    size_t len = strlen(real_path);
+    if (len == 0 || len >= PATH_MAX) return false;
+    char path[PATH_MAX];
+    memcpy(path, real_path, len + 1);
+    while (len > 1 && path[len - 1] == '/') path[--len] = '\0';
+    if (len == 1) return false; /* 入参就是根："自己的父目录" 没有意义 */
+    for (;;) {
+        char* slash = strrchr(path, '/');
+        if (!slash) return false;
+        if (slash == path)
+            path[1] = '\0';
+        else
+            *slash = '\0';
+        if (lstat(path, out) == 0) return true;
+        if (strcmp(path, "/") == 0) return false;
+    }
+}

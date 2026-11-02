@@ -947,17 +947,11 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             st->st_ino = synthetic_inode(sub_path);
             st->st_mode = S_IFDIR;
             st->st_nlink = 2;
-            char parent[PATH_MAX];
-            strncpy(parent, p, sizeof(parent) - 1);
-            parent[sizeof(parent) - 1] = '\0';
-            char* last = strrchr(parent, '/');
-            if (last && last != parent)
-                *last = '\0';
-            else if (last == parent)
-                strcpy(parent, "/");
             st->st_size = 4096;
             struct stat pst;
-            if (lstat(parent, &pst) == 0) {
+            /* 逐级上溯到最近存在的祖先：重定向落点不存在时整条链都是合成的，
+               直接父目录 lstat 不到是常态；只问一层会让时间戳留 0（1970-01-01） */
+            if (nsp_stat_nearest_ancestor(p, &pst)) {
                 st->st_mode |= (pst.st_mode & 07777);
                 st->st_uid = pst.st_uid;
                 st->st_gid = pst.st_gid;
@@ -1335,8 +1329,12 @@ static void vfs_synth_stat(VfsReaddirCtx* d, const char* name, mode_t type_mode,
     const struct stat* real_child = nullptr;
     if (readdir_join_checked(child, sizeof child, d->real_path, name) == 0 && lstat(child, &real) == 0)
         real_child = &real;
+    /* 直接父目录也缺失时（重定向落点不存在的多级合成链）继续上溯到最近存在的
+       祖先：属性来源全空会让时间戳留 0，客户端把条目画成 1970-01-01 */
     struct stat parent;
-    const struct stat* parent_stat = (lstat(d->real_path, &parent) == 0) ? &parent : nullptr;
+    const struct stat* parent_stat = nullptr;
+    if (lstat(d->real_path, &parent) == 0 || nsp_stat_nearest_ancestor(d->real_path, &parent))
+        parent_stat = &parent;
     nsp_synth_stat_fill(st, vfs_readdir_entry_ino(d, name), type_mode, real_child, parent_stat);
 }
 
@@ -1348,12 +1346,16 @@ static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
     return vfs_emit(d, name, &st);
 }
 
-/* 合成目录条目输出（不经 ht 去重）：data/obb 骨架沿用原语义——物理扫描未
-   出现即补，不与后续虚拟目录条目去重。返回 false = filler 缓冲已满 */
+/* 合成目录条目输出（不因 ht 已有同名条目而跳过）：data/obb 骨架沿用原语义——
+   物理扫描未出现即补。发射后把名字登记进 ht，否则同一名字又被后续虚拟前缀
+   （如 REDIRECT 到 /Android/data 的虚拟条目）走 emit_dedup 再发一次，
+   内核侧会看到同名条目出现两遍。返回 false = filler 缓冲已满 */
 static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
     struct stat st;
     vfs_synth_stat(d, name, S_IFDIR | 0755, &st);
-    return vfs_emit(d, name, &st);
+    bool ok = vfs_emit(d, name, &st);
+    if (ok) (void)vfs_hash_insert(&d->ht, name);
+    return ok;
 }
 
 /* 本地目录扫描：probe 条目级过滤（hidden/redirect_target）+ ht 去重 +

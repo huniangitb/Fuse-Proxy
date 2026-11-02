@@ -25,4 +25,11 @@ bool is_virtual_own_pkg_dir(const char* sub_path, const char* pkg);
 void nsp_synth_stat_fill(struct stat* st, ino_t ino, mode_t type_mode,
                          const struct stat* real_child, const struct stat* parent);
 
+/* 最近的存在祖先：从 real_path 的父目录逐级上溯，第一个 lstat 成功的上级写入 out
+   并返回 true（到 "/" 仍失败返回 false）。
+   虚拟目录链（重定向落点不存在时的多级合成）上「直接父目录也缺失」是常态，
+   只继承一层会让时间戳留 0，客户端把条目画成 1970-01-01；调用方在直接父目录
+   lstat 失败时应改用本函数继续上溯。 */
+bool nsp_stat_nearest_ancestor(const char* real_path, struct stat* out);
+
 #endif /* NSP_VFS_SYNTH_H */
