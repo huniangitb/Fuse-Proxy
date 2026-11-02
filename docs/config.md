@@ -83,6 +83,8 @@
 - **放行**：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局放行。
 - **与 `SANDBOX ON` 的关系**：沙盒生效的调用方被豁免——它的 `Android/data|obb` 访问本就会被 `SANDBOX` 重定向进**自己的**沙盒镜像（读不到他包内容），判成 ENOENT 只会让镜像路径整体不可用；列举侧仍按隔离过滤（保持既有行为）。
 - **特权应用自动豁免**：调用方是 **platform 签名**应用（`/data/system/packages.list` 的 seinfo 字段以 `platform` 开头，含 `platform:privapp` 与纯 `platform` 共享签名；DocumentsUI / Settings 等系统中介均为 priv-app）时自动放行——文件中介（如 DocumentsUI）的本职就是访问他包 `Android/data`，逐包手工写规则不可维护，按 Android 自己的权限体系判定。普通应用（seinfo `default`）与 `packages.list` 不可读/无该 uid（fail-safe）照常隔离。此豁免与 `ALLOW_CROSS_APP_DATA` 无关、无需配置。
+- **All files access 自动豁免**：调用方持有 **MANAGE_EXTERNAL_STORAGE** 时同样放行（按 uid 查 appops 的 `MANAGE_EXTERNAL_STORAGE` 模式，`allow` 即豁免，结果按 uid 缓存、配置重载后失效重查，另设 30s 有效期——运行期新授予的 All files access 最多 30s 内生效，不必重启 daemon）。安装器、文件管理器、应用商店这类应用的本职就是读他包 `Android/data`（安装器读 IM 落盘的安装包、商店写自己的下载目录），与系统原生授权对齐即可，不必逐包写规则。该豁免只针对跨应用隔离：`HIDE` 等显式规则照旧生效，`ALLOW_CROSS_APP_DATA` 的语义不受影响（关掉它仍然全局放行、打开隔离仍然生效）。
+- **legacy storage 自动豁免**：调用方处于 legacy storage 模式（targetSdk ≤ 29 的旧式整盘访问，appops 的 `LEGACY_STORAGE` 为 `allow`）时同样放行——这类应用在 AOSP 里本就看得见他包 `Android/data`，把它们判成不可见属于收紧过度。与 All files access 共用一次 appops 查询与同一份 uid 缓存（含 30s 有效期），口径与边界完全一致。
 - **边界（共享 uid）**：`uid.map` 是「uid → 单个包名」，若两个非系统应用共享 uid（旧 `sharedUserId`，API 29 起废弃），A 进程访问 `/Android/data/B` 会被判成「他包」而返回 ENOENT。这类设备很少见，逃生阀同上（写 `ALLOW_CROSS_APP_DATA ON`；或用 `ALLOW /Android/data/B` 类规则——规则放行的是**路径**，与调用方身份无关）。
 - **代价**：全局实例（服务所有被注入应用的那个 daemon）**不做任何 backing 直通**，全部 I/O 由 daemon 代理——隔离需要 per-caller 裁决只是原因之一，更硬的原因是下层 DAC：backing 之后内核按**调用方凭证**访问 `/data/media`（归 MediaProvider `10277:1023`、子目录 `2700`），应用一律 EACCES。加速只在 media 实例（调用方恒为 MediaProvider 自身）保留，见 `architecture.md` §跨应用隔离。
 

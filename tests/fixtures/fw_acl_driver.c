@@ -32,6 +32,16 @@ bool fw_pkg_is_privileged(uid_t uid) {
     (void)uid;
     return g_stub_priv;
 }
+/* All files access / legacy storage 在驱动里由 mkdecide 的 manage/legacy 参数
+   直接给定，桩恒 false */
+bool fw_pkg_manages_external(uid_t uid) {
+    (void)uid;
+    return false;
+}
+bool fw_pkg_has_legacy_storage(uid_t uid) {
+    (void)uid;
+    return false;
+}
 bool fw_rules_cross_app_isolated(void) { return g_stub_isolated; }
 
 /* 拒绝日志走 LOG_DBG → log_internal：驱动里吞掉（判定逻辑与日志无关） */
@@ -71,6 +81,44 @@ static void expect_cls(const char* path, NspPathClass want, const char* want_own
         printf("❌ 分类 %s: 期望 %s(owner=%s) 实际 %s(owner=%s)\n", path, cls_name(want),
                want_owner ? want_owner : "-", cls_name(got), owner);
     }
+}
+
+static NspAclVerdict mkdecide_manage(const char* path, NspAclOp op, const char* pkg, bool priv,
+                                    bool manage, bool isolated, bool known, int mask, bool is_dir) {
+    NspAclIdentity id;
+    memset(&id, 0, sizeof(id));
+    id.uid = 10123;
+    id.is_system = false;
+    id.pkg_known = known;
+    snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
+    id.privileged = priv;
+    id.manage_external = manage;
+    id.cross_app_isolated = isolated;
+    NspAclQuery q;
+    memset(&q, 0, sizeof(q));
+    q.uid = id.uid;
+    q.path = path;
+    q.op = op;
+    q.access_mask = mask;
+    q.is_dir = is_dir;
+    return fw_acl_decide(&q, &id);
+}
+
+/* legacy storage 豁免用例（All files access 之外的第二种存储类 appop） */
+static NspAclVerdict mkdecide_legacy(const char* path, NspAclOp op, const char* pkg) {
+    NspAclIdentity id;
+    memset(&id, 0, sizeof(id));
+    id.uid = 10123;
+    id.pkg_known = true;
+    snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
+    id.legacy = true;
+    id.cross_app_isolated = true;
+    NspAclQuery q;
+    memset(&q, 0, sizeof(q));
+    q.uid = id.uid;
+    q.path = path;
+    q.op = op;
+    return fw_acl_decide(&q, &id);
 }
 
 static NspAclVerdict mkdecide(const char* path, NspAclOp op, const char* pkg, bool priv,
@@ -146,6 +194,18 @@ int main(void) {
              mkdecide("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ, "com.priv", true,
                       true, true, 0, false),
              NSP_ACL_ALLOW);
+    expect_v("All files access（MANAGE_EXTERNAL_STORAGE）→ ALLOW",
+             mkdecide_manage("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                             "com.installer.app", false, true, true, true, 0, false),
+             NSP_ACL_ALLOW);
+    expect_v("legacy storage（LEGACY_STORAGE）→ ALLOW",
+             mkdecide_legacy("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                             "com.legacy.app"),
+             NSP_ACL_ALLOW);
+    expect_v("无 All files access 的普通应用 → ENOENT",
+             mkdecide_manage("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                             "com.installer.app", false, false, true, true, 0, false),
+             NSP_ACL_DENY_ENOENT);
     expect_v("ALLOW_CROSS_APP_DATA ON → ALLOW",
              mkdecide("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ, "com.mine", false,
                       false, true, 0, false),

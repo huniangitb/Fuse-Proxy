@@ -215,13 +215,14 @@ NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id) {
         return NSP_ACL_ALLOW;
 
     case NSP_PATH_OWNED:
-        /* 他包私有目录：看不见（AOSP 一律 ENOENT）。自己包 / 特权 / 全文件访问放行。 */
+        /* 他包私有目录：看不见（AOSP 一律 ENOENT）。自己包 / 特权 / 全文件访问 /
+           legacy storage 放行。 */
         /* 包名解析不出来时一律放行：ACL 是「多一道门」，不能变成单点故障。
            与 fw_rules 的跨应用隔离同口径（current_pkg 为 system/unknown 即不隔离），
            否则解析失败会把应用挡在自己的 data 目录外（真实故障，比越权更难排查）。 */
         if (!id->pkg_known) return NSP_ACL_ALLOW;
         if (owner[0] && acl_pkg_same_base(owner, id->pkg)) return NSP_ACL_ALLOW;
-        if (id->privileged || id->manage_external) return NSP_ACL_ALLOW;
+        if (id->privileged || id->manage_external || id->legacy) return NSP_ACL_ALLOW;
         /* 隔离开关沿用既有配置口径（默认生效）；关闭时按旧行为放行，
            否则这条 AOSP 默认会让 ALLOW_CROSS_APP_DATA ON 的用户突然失效。 */
         return id->cross_app_isolated ? NSP_ACL_DENY_ENOENT : NSP_ACL_ALLOW;
@@ -282,6 +283,8 @@ void fw_acl_identity(uid_t uid, pid_t pid, NspAclIdentity* out) {
             out->pkg_known = true;
         }
         out->privileged = fw_pkg_is_privileged(uid);
+        out->manage_external = fw_pkg_manages_external(uid);
+        out->legacy = fw_pkg_has_legacy_storage(uid);
         out->cross_app_isolated = fw_rules_cross_app_isolated();
     }
 }

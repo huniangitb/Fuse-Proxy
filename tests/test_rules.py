@@ -239,7 +239,9 @@ def isolation_section():
         "com.demo.app 10123 0 /data/user/0/com.demo.app default:targetSdkVersion=30 "
         "3003 0 26101061 1 @null\n"
         "com.plain.app 10500 0 /data/user/0/com.plain.app default:targetSdkVersion=33 "
-        "none 0 33 1 @null\n")
+        "none 0 33 1 @null\n"
+        "com.installer.app 10339 0 /data/user/0/com.installer.app default:targetSdkVersion=34 "
+        "none 0 34 1 @null\n")
     os.environ["NSP_PACKAGELIST"]=plist
     case("特权豁免:privapp",BASE,10071,[
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
@@ -251,6 +253,41 @@ def isolation_section():
     case("特权豁免:uid 无 packages.list 行 fail-safe",BASE,10999,[
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
     ],uid_map="10999 com.ghost.app\n",global_want=1)
+    # ── All files access 自动豁免（MANAGE_EXTERNAL_STORAGE，生产查 appops）：
+    # 安装器/文件管理器/应用商店的本职就是读他包 /Android/data（安装器读 IM
+    # 落盘的安装包、商店写自己的下载目录），按 Android 自己的授权放行；未持有
+    # 该权限的应用照常隔离；豁免只针对跨应用隔离，HIDE 等显式规则照旧生效。
+    os.environ["NSP_MANAGE_EXTERNAL"]="com.installer.app"
+    case("AllFiles 豁免:data/obb 放行",BASE,10339,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+        ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
+        ("/0/Android/data",{"resolve":0,"probe":0,"backing":1}),
+        ("/0/Download/a.apk",{"resolve":0,"probe":0}),
+    ],uid_map="10339 com.installer.app\n",global_want=1)
+    case("AllFiles 豁免:不豁免 HIDE",BASE+"HIDE /Download\n",10339,[
+        ("/0/Download/a.apk",{"resolve":1,"probe":1}),
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    ],uid_map="10339 com.installer.app\n",global_want=1)
+    del os.environ["NSP_MANAGE_EXTERNAL"]
+    case("AllFiles 未持有:照常隔离",BASE,10339,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10339 com.installer.app\n",global_want=1)
+    # ── legacy storage 自动豁免（appop LEGACY_STORAGE）：targetSdk ≤ 29 的旧式
+    # 整盘访问在 AOSP 里本来就看得见他包 /Android/data，口径与 All files access
+    # 一致；同样只豁免跨应用隔离，HIDE 等显式规则照旧。
+    os.environ["NSP_LEGACY_STORAGE"]="com.plain.app"
+    case("Legacy 豁免:data 放行",BASE,10500,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+        ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
+    ],uid_map="10500 com.plain.app\n",global_want=1)
+    case("Legacy 豁免:不豁免 HIDE",BASE+"HIDE /Download\n",10500,[
+        ("/0/Download/a.apk",{"resolve":1,"probe":1}),
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    ],uid_map="10500 com.plain.app\n",global_want=1)
+    del os.environ["NSP_LEGACY_STORAGE"]
+    case("Legacy 未持有:照常隔离",BASE,10500,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10500 com.plain.app\n",global_want=1)
     del os.environ["NSP_PACKAGELIST"]
     # ── 作用域优先 / 沙盒作用域（用户报障 A/B 的回归）：
     #   A「[GLOBAL] SANDBOX ON + ALLOW /Pictures/… 后，应用段再写 SANDBOX ON 仍不沙盒」

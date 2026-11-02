@@ -565,15 +565,32 @@ static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat) {
 /* 跨应用隔离是否拦下本路径（resolve 侧唯一调用点）：沙盒生效时放行——此时的
    "他包 data" 已被 br_to_real_path 改写成自己的沙盒镜像，读不到他包内容，
    把它判成 ENOENT 会让沙盒镜像整体不可用（test_monitor_layers 守护）。
-   特权应用（platform 签名，packages.list seinfo 判定）自动豁免——DocumentsUI
-   等文件中介的本职是访问他包 /Android/data，与 Android 权限体系对齐而非逐包
-   手工规则。其余情形：看不见 = 打不开（与 probe 列举过滤同口径）。 */
+   特权应用（platform 签名，packages.list seinfo 判定）、持有 MANAGE_EXTERNAL_STORAGE
+   的应用（安装器、文件管理器、应用商店：appops 判定，fw_pkg_manages_external）与
+   legacy storage 应用（targetSdk ≤ 29，appop LEGACY_STORAGE）自动豁免——它们的
+   本职就是访问他包 /Android/data（安装器读 IM 落盘的安装包、商店写下载目录），
+   与 Android 权限体系对齐而非逐包手工规则。其余情形：看不见 = 打不开（与 probe
+   列举过滤同口径）。 */
 static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                 const char* current_pkg, uid_t uid) {
     if (!br_is_other_app_pkg(sub_path, current_pkg)) return false;
     if (br_sandbox_active(cfg, cat)) return false;
     if (fw_pkg_is_privileged(uid)) return false;
+    if (fw_pkg_manages_external(uid)) return false;
+    if (fw_pkg_has_legacy_storage(uid)) return false;
     br_note_isolation(current_pkg, sub_path);
+    return true;
+}
+
+/* 列举侧（probe/目录缓存）的隔离判据：与 br_isolation_blocks 共用同一组
+   豁免（特权签名 + MANAGE_EXTERNAL_STORAGE + legacy storage），但不含沙盒让位——
+   沙盒生效时 resolve 放行是为了让重定向进自己镜像的路径可用，列举照旧只显示
+   自身包名（test_rules 的「沙盒豁免隔离」用例守护这一差异）。 */
+static bool br_isolation_hides(const char* sub_path, const char* current_pkg, uid_t uid) {
+    if (!br_is_other_app_pkg(sub_path, current_pkg)) return false;
+    if (fw_pkg_is_privileged(uid)) return false;
+    if (fw_pkg_manages_external(uid)) return false;
+    if (fw_pkg_has_legacy_storage(uid)) return false;
     return true;
 }
 
@@ -1276,8 +1293,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
             if (all_static) {
                 /* 跨应用隔离与隐藏同口径（br_sanitize_and_check_hidden 亦判，
                此处为同一判据的读取侧：列举过滤走本路径） */
-                bool iso = br_is_other_app_pkg(sub_path, current_pkg) &&
-                           !fw_pkg_is_privileged(q->uid);
+                bool iso = br_isolation_hides(sub_path, current_pkg, q->uid);
                 /* 作用域优先语义下**不能**再用合并视图（tm.hidden 并集）做静态短路：
                    GLOBAL 的 HIDE 会因此压过应用段 ALLOW，列举与打开判定分叉。all_static
                    下无线性规则扫描，逐层现查 trie（每作用域一次下降）的成本远低于一次
@@ -1299,8 +1315,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                应用段 ALLOW 取消不掉全局 HIDE。ca/cc/cg 只留给下面的虚拟目录判定。
                跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
                同判据：看不见 = 打不开） */
-            bool iso = br_is_other_app_pkg(sub_path, current_pkg) &&
-                       !fw_pkg_is_privileged(q->uid);
+            bool iso = br_isolation_hides(sub_path, current_pkg, q->uid);
             if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL) || iso) {
                 out->valid = true;
                 out->appear_missing = true;
@@ -1331,7 +1346,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
         FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
-            (br_is_other_app_pkg(sub_path, current_pkg) && !fw_pkg_is_privileged(q->uid))) {
+            br_isolation_hides(sub_path, current_pkg, q->uid)) {
             out->valid = true;
             out->appear_missing = true;
             if (config_read_end(cfg_gen)) return;
