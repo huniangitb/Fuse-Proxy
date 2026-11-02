@@ -41,7 +41,8 @@
 #include <limits.h>
 #include "common.h"
 #include "config_parser.h" /* config_set_modules_dir：模块自有配置的读取归属 */
-#include "fw_acl.h" /* 访问控制唯一判定点（对齐 Android 原生 FUSE 用户态策略层） */
+#include "fw_acl.h"
+#include "vfs_synth.h" /* 访问控制唯一判定点（对齐 Android 原生 FUSE 用户态策略层） */
 #include "fw_events.h" /* FUSE 事件通道（默认 OFF，关闭时埋点只剩一次原子读） */
 #include "fw_config.h"
 #include "fw_pkg.h"
@@ -396,69 +397,8 @@ static bool fw_virtual_dir_empty(const char* fuse_path, const char* sub_path,
     return empty;
 }
 
-/* 剥掉开头的 /<数字> 用户层（/0/Android → /Android）；无用户层原样返回。
-   骨架判定不能假设路径已剥用户层：无用户层的挂载（或后续归一变化）下，
-   带前缀的同一路径必须得到同一结论。 */
-static const char* sub_path_strip_user_layer(const char* sub_path) {
-    if (!sub_path || sub_path[0] != '/') return sub_path;
-    const char* d = sub_path + 1;
-    while (*d >= '0' && *d <= '9') d++;
-    if (d == (sub_path + 1) || *d != '/') return sub_path;
-    return d;
-}
-
-/* 路径末段是否为 name（忽略尾部 '/'）："/Android"、"/0/Android/" 均命中 */
-static bool sub_path_tail_is(const char* sub_path, const char* name) {
-    if (!sub_path) return false;
-    size_t len = strlen(sub_path);
-    while (len > 1 && sub_path[len - 1] == '/') len--;
-    const char* base = sub_path + len;
-    while (base > sub_path && base[-1] != '/') base--;
-    size_t bl = (size_t)(sub_path + len - base);
-    return bl == strlen(name) && memcmp(base, name, bl) == 0;
-}
-
-/* 是否是 /Android 目录本身（含带用户层的 /<uid>/Android） */
-static bool sub_path_is_android_dir(const char* sub_path) {
-    return sub_path_tail_is(sub_path_strip_user_layer(sub_path), "Android");
-}
-
-/* 是否是 /Android/data 或 /Android/obb 目录本身（含带用户层的形态） */
-static bool sub_path_is_android_container(const char* sub_path) {
-    const char* p = sub_path_strip_user_layer(sub_path);
-    if (!sub_path_tail_is(p, "data") && !sub_path_tail_is(p, "obb")) return false;
-    char parent[PATH_MAX];
-    strncpy(parent, p, sizeof(parent) - 1);
-    parent[sizeof(parent) - 1] = '\0';
-    char* last = strrchr(parent, '/');
-    if (!last) return false;
-    *last = '\0';
-    return sub_path_is_android_dir(parent);
-}
-
-/* 沙盒合成的「容器/当前包名」目录：/Android/data/<pkg> 或 /Android/obb/<pkg>。
-   真实目录可以不存在，readdir 由 fill_own_pkg 合成这一条；getattr/access/opendir
-   必须同口径把它当目录，否则列表里看得见、stat 却 ENOENT，客户端把它画成文件。 */
-static bool is_virtual_own_pkg_dir(const char* sub_path, const char* pkg) {
-    if (!sub_path || !pkg || pkg[0] == '\0') return false;
-    if (!sub_path_tail_is(sub_path, pkg)) return false;
-    char parent[PATH_MAX];
-    const char* p = sub_path_strip_user_layer(sub_path);
-    strncpy(parent, p, sizeof(parent) - 1);
-    parent[sizeof(parent) - 1] = '\0';
-    char* last = strrchr(parent, '/');
-    if (!last) return false;
-    *last = '\0';
-    return sub_path_is_android_container(parent);
-}
-
-static bool is_android_skel_dir(const char* sub_path) {
-    const char* p = sub_path_strip_user_layer(sub_path);
-    if (strcmp(p, "/Android") == 0 || strcmp(p, "/Android/") == 0) return true;
-    if (strcmp(p, "/Android/data") == 0 || strcmp(p, "/Android/data/") == 0) return true;
-    if (strcmp(p, "/Android/obb") == 0 || strcmp(p, "/Android/obb/") == 0) return true;
-    return false;
-}
+/* 路径段判定与合成条目属性住在 vfs_synth.c：readdir 列举与 getattr/access/
+   opendir 兜底共用同一份实现，避免「列表里看得见、stat 却失败」的口径漂移。 */
 
 /* ================= 三层数据路径（Phase 2 重构） =================
  *   FUSE 节点（内核）→ FUSE 守护进程：
@@ -1390,36 +1330,14 @@ static ino_t vfs_readdir_entry_ino(VfsReaddirCtx* d, const char* name) {
    ——先试同名真实子项，取不到再继承父目录。合成条目若只填 ino/mode，客户端
    拿到的 mtime 是 0（显示成 1970-01-01）、size 是 0，目录还容易被画成文件。 */
 static void vfs_synth_stat(VfsReaddirCtx* d, const char* name, mode_t type_mode, struct stat* st) {
-    memset(st, 0, sizeof(*st));
-    st->st_ino = vfs_readdir_entry_ino(d, name);
-    st->st_mode = type_mode;
-    const bool want_dir = S_ISDIR(type_mode);
-    st->st_nlink = want_dir ? 2 : 1;
-    st->st_size = want_dir ? 4096 : 0;
     char child[2048];
     struct stat real;
-    if (readdir_join_checked(child, sizeof child, d->real_path, name) == 0 && lstat(child, &real) == 0) {
-        st->st_atime = real.st_atime;
-        st->st_mtime = real.st_mtime;
-        st->st_ctime = real.st_ctime;
-        st->st_uid = real.st_uid;
-        st->st_gid = real.st_gid;
-        if (want_dir && S_ISDIR(real.st_mode)) {
-            st->st_mode = S_IFDIR | (real.st_mode & 07777);
-            st->st_nlink = real.st_nlink;
-            st->st_size = real.st_size;
-        }
-        return;
-    }
+    const struct stat* real_child = nullptr;
+    if (readdir_join_checked(child, sizeof child, d->real_path, name) == 0 && lstat(child, &real) == 0)
+        real_child = &real;
     struct stat parent;
-    if (lstat(d->real_path, &parent) == 0) {
-        st->st_atime = parent.st_atime;
-        st->st_mtime = parent.st_mtime;
-        st->st_ctime = parent.st_ctime;
-        st->st_uid = parent.st_uid;
-        st->st_gid = parent.st_gid;
-        if (want_dir) st->st_mode = S_IFDIR | (parent.st_mode & 07777);
-    }
+    const struct stat* parent_stat = (lstat(d->real_path, &parent) == 0) ? &parent : nullptr;
+    nsp_synth_stat_fill(st, vfs_readdir_entry_ino(d, name), type_mode, real_child, parent_stat);
 }
 
 /* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束 */
