@@ -6,6 +6,8 @@
  *
  * 解析顺序与模块 br_get_app_cfg 保持一致（uid.map → /proc），使框架与模块对同一
  * 请求得到同一个包名；差别只在本文件不做 AppConfig 关联（那是 fw_config 的事）。
+ * 例外是**带真实调用方 pid** 的请求：共享 uid 下 uid.map 只有一条，先按进程自身
+ * cmdline 解析才能区分兄弟包（见 resolve_from_pid）。
  */
 #include "fw_pkg.h"
 #include "common.h"
@@ -406,6 +408,39 @@ bool fw_pkg_uid_for_package(const char* pkg, uid_t* out) {
     return known;
 }
 
+/* 共享 uid（android:sharedUserId / 同进程宿主）下同一 uid 挂着多个包，uid.map
+   与 packages.list 都只能给出其中一个。包身份因此必须取自**进程自身**：zygote
+   fork 出的应用进程 cmdline 就是它的包名，兄弟包各不相同。只有该名字确属本 uid
+   名下已安装的包时才采信，其余情形（非应用进程、cmdline 被改）一律回退，
+   避免把 /proc 里的任意字符串当包名参与白名单与应用段匹配。 */
+static bool resolve_from_pid(uid_t uid, pid_t tid, char* out, size_t size) {
+    if (tid <= 0) return false;
+    /* /proc/<tid>/status 的 Tgid：线程 id 亦可用，但 cmdline 只有主线程保证 */
+    pid_t main_pid = tid;
+    char status_path[64];
+    snprintf(status_path, sizeof status_path, "/proc/%d/status", (int)tid);
+    FILE* fp = fopen(status_path, "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof line, fp)) {
+            if (strncmp(line, "Tgid:", 5) == 0) {
+                main_pid = (pid_t)atoi(line + 5);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    char pkg[FW_PKG_NAME_MAX] = {0};
+    if (!proc_get_cmdline(main_pid, pkg, sizeof pkg)) return false;
+    char* colon = strchr(pkg, ':');
+    if (colon) *colon = '\0';
+    if (strlen(pkg) < 3 || strstr(pkg, "zygote") || strstr(pkg, "<pre-")) return false;
+    uid_t pkg_uid = 0;
+    if (!fw_pkg_uid_for_package(pkg, &pkg_uid) || pkg_uid != uid) return false;
+    snprintf(out, size, "%s", pkg);
+    return true;
+}
+
 /* 取展示包名并判定其可否用于段匹配（等价模块 br_get_app_cfg 的不可解析分支：
    过短 / zygote / <pre- 一律只能命中 GLOBAL） */
 static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool* lookup_ok) {
@@ -467,6 +502,9 @@ bool fw_pkg_resolve(uid_t uid, pid_t tid, char* out, size_t size) {
 
 bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size) {
     if (!out || size == 0) return false;
+    /* 有真实调用方 pid 时按进程自身解析，且**不进 uid 槽缓存**：同一 uid 下的
+       多个包各有各的进程，缓存按 uid 存会让先到的包顶替后来者。 */
+    if (resolve_from_pid(uid, tid, out, size)) return true;
     FwPkgSlot* s = &g_slots[uid % FW_PKG_CACHE_SIZE];
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
     for (;;) {
