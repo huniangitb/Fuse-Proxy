@@ -42,7 +42,46 @@ bool fw_pkg_has_legacy_storage(uid_t uid) {
     (void)uid;
     return false;
 }
+/* 包名 → uid：生产实现读 /data/system/packages.list，驱动里给一张最小表，
+   供「同 uid 多包」（sharedUserId / 系统同进程宿主）用例使用。表外一律查不到
+   → 调用方维持原判定（不额外放行）。 */
+struct StubPkgUid {
+    const char* pkg;
+    uid_t uid;
+};
+static const struct StubPkgUid g_stub_pkg_uids[] = {
+    {"com.mine", 10123},
+    {"com.shared.a", 10123},
+    {"com.shared.b", 10123},
+    {"com.other.app", 10999},
+};
+bool fw_pkg_uid_for_package(const char* pkg, uid_t* out) {
+    if (!pkg || !pkg[0]) return false;
+    for (size_t i = 0; i < sizeof(g_stub_pkg_uids) / sizeof(g_stub_pkg_uids[0]); i++) {
+        if (strcmp(g_stub_pkg_uids[i].pkg, pkg) == 0) {
+            if (out) *out = g_stub_pkg_uids[i].uid;
+            return true;
+        }
+    }
+    return false;
+}
 bool fw_rules_cross_app_isolated(void) { return g_stub_isolated; }
+/* 跨应用放行白名单（生产读 [GLOBAL] ALLOW_CROSS_APP_PKGS）与能力豁免总闸
+   （读 ALLOW_CROSS_APP_BY_CAPABILITY）在驱动里各给一个最小桩；判定函数的
+   实现由 tests/test_rules.py 走真实 fw_rules.c 覆盖。 */
+static const char* const g_stub_allow_pkgs[] = {"com.allow.app"};
+static bool g_stub_capability = true;
+
+bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
+    if (!pkg || !pkg[0]) return false;
+    size_t len = strcspn(pkg, ":");
+    for (size_t i = 0; i < sizeof(g_stub_allow_pkgs) / sizeof(g_stub_allow_pkgs[0]); i++) {
+        if (strlen(g_stub_allow_pkgs[i]) == len && strncmp(g_stub_allow_pkgs[i], pkg, len) == 0)
+            return true;
+    }
+    return false;
+}
+bool fw_rules_cross_app_capability(void) { return g_stub_capability; }
 
 /* 拒绝日志走 LOG_DBG → log_internal：驱动里吞掉（判定逻辑与日志无关） */
 #include "nsp_log.h"
@@ -93,6 +132,7 @@ static NspAclVerdict mkdecide_manage(const char* path, NspAclOp op, const char* 
     snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
     id.privileged = priv;
     id.manage_external = manage;
+    id.cross_app_by_capability = true;
     id.cross_app_isolated = isolated;
     NspAclQuery q;
     memset(&q, 0, sizeof(q));
@@ -112,6 +152,7 @@ static NspAclVerdict mkdecide_legacy(const char* path, NspAclOp op, const char* 
     id.pkg_known = true;
     snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
     id.legacy = true;
+    id.cross_app_by_capability = true;
     id.cross_app_isolated = true;
     NspAclQuery q;
     memset(&q, 0, sizeof(q));
@@ -138,6 +179,42 @@ static NspAclVerdict mkdecide(const char* path, NspAclOp op, const char* pkg, bo
     q.op = op;
     q.access_mask = mask;
     q.is_dir = is_dir;
+    return fw_acl_decide(&q, &id);
+}
+
+/* 按包名白名单命中（生产由 fw_rules_cross_app_pkg_allowed 填充） */
+static NspAclVerdict mkdecide_allow(const char* path, NspAclOp op, const char* pkg) {
+    NspAclIdentity id;
+    memset(&id, 0, sizeof(id));
+    id.uid = 10123;
+    id.pkg_known = true;
+    snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
+    id.cross_app_allowed = fw_rules_cross_app_pkg_allowed(id.pkg);
+    id.cross_app_isolated = true;
+    NspAclQuery q;
+    memset(&q, 0, sizeof(q));
+    q.uid = id.uid;
+    q.path = path;
+    q.op = op;
+    return fw_acl_decide(&q, &id);
+}
+
+/* 能力豁免总闸关闭：能力位仍为真也不得放行（默认配置下的行为） */
+static NspAclVerdict mkdecide_cap_off(const char* path, NspAclOp op, const char* pkg, bool manage,
+                                     bool legacy) {
+    NspAclIdentity id;
+    memset(&id, 0, sizeof(id));
+    id.uid = 10123;
+    id.pkg_known = true;
+    snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
+    id.manage_external = manage;
+    id.legacy = legacy;
+    id.cross_app_isolated = true;
+    NspAclQuery q;
+    memset(&q, 0, sizeof(q));
+    q.uid = id.uid;
+    q.path = path;
+    q.op = op;
     return fw_acl_decide(&q, &id);
 }
 
@@ -202,6 +279,45 @@ int main(void) {
              mkdecide_legacy("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
                              "com.legacy.app"),
              NSP_ACL_ALLOW);
+    /* 按包名白名单放行：命中者与 appops 授权无关；未列出的一律隔离，且匹配按调用方
+       自身包名 —— 同 uid 的兄弟包不会被顺带放行。 */
+    expect_v("白名单命中 → ALLOW",
+             mkdecide_allow("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                            "com.allow.app"),
+             NSP_ACL_ALLOW);
+    expect_v("白名单未列出 → ENOENT",
+             mkdecide_allow("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                            "com.mine"),
+             NSP_ACL_DENY_ENOENT);
+    expect_v("白名单命中且进程后缀 :push → ALLOW",
+             mkdecide_allow("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                            "com.allow.app:push"),
+             NSP_ACL_ALLOW);
+    /* 能力豁免默认关：持 All files access / legacy storage 也不再自动放行，必须由
+       [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON 显式打开。 */
+    expect_v("能力豁免关（All files access）→ ENOENT",
+             mkdecide_cap_off("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                              "com.installer.app", true, false),
+             NSP_ACL_DENY_ENOENT);
+    expect_v("能力豁免关（legacy storage）→ ENOENT",
+             mkdecide_cap_off("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                              "com.plain.app", false, true),
+             NSP_ACL_DENY_ENOENT);
+    /* 同 uid 多包 = 同一 app 身份（Linux DAC 只认 uid）：系统里 MediaProvider 与
+       DownloadsProvider 同宿于 android.process.media 这类结构，按包名比较会把它们
+       误判成跨应用。不同 uid 照常 ENOENT。 */
+    expect_v("同 uid 他包 data → ALLOW",
+             mkdecide("/0/Android/data/com.shared.b/files/a.db", NSP_ACL_OP_GENERIC_READ,
+                      "com.shared.a", false, true, true, 0, false),
+             NSP_ACL_ALLOW);
+    expect_v("同 uid 他包 data 写入 → ALLOW",
+             mkdecide("/0/Android/data/com.shared.b/files/new.db", NSP_ACL_OP_CREATE, "com.shared.a",
+                      false, true, true, 0, false),
+             NSP_ACL_ALLOW);
+    expect_v("不同 uid 他包 data → ENOENT",
+             mkdecide("/0/Android/data/com.other.app/files/a.db", NSP_ACL_OP_GENERIC_READ,
+                      "com.shared.a", false, true, true, 0, false),
+             NSP_ACL_DENY_ENOENT);
     expect_v("无 All files access 的普通应用 → ENOENT",
              mkdecide_manage("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
                              "com.installer.app", false, false, true, true, 0, false),

@@ -146,6 +146,8 @@ def isolation_section():
     conf_path=os.path.join(cfg,"injector.conf"); map_path=os.path.join(cfg,"uid.map")
     BASE="[GLOBAL]\nMONITOR OFF\n"
     ALLOW="[GLOBAL]\nMONITOR OFF\nALLOW_CROSS_APP_DATA ON\n"
+    CAP="[GLOBAL]\nMONITOR OFF\nALLOW_CROSS_APP_BY_CAPABILITY ON\n"
+    WL=BASE+"ALLOW_CROSS_APP_PKGS com.demo.app\n"
 
     def drive(conf,uid,paths,uid_map=None,argv0=None):
         open(conf_path,"w",encoding="utf-8").write(conf)
@@ -241,6 +243,12 @@ def isolation_section():
         "com.plain.app 10500 0 /data/user/0/com.plain.app default:targetSdkVersion=33 "
         "none 0 33 1 @null\n"
         "com.installer.app 10339 0 /data/user/0/com.installer.app default:targetSdkVersion=34 "
+        "none 0 34 1 @null\n"
+        "com.shared.a 10610 0 /data/user/0/com.shared.a default:targetSdkVersion=34 "
+        "none 0 34 1 @null\n"
+        "com.shared.b 10610 0 /data/user/0/com.shared.b default:targetSdkVersion=34 "
+        "none 0 34 1 @null\n"
+        "com.other.app 10777 0 /data/user/0/com.other.app default:targetSdkVersion=34 "
         "none 0 34 1 @null\n")
     os.environ["NSP_PACKAGELIST"]=plist
     case("特权豁免:privapp",BASE,10071,[
@@ -258,13 +266,13 @@ def isolation_section():
     # 落盘的安装包、商店写自己的下载目录），按 Android 自己的授权放行；未持有
     # 该权限的应用照常隔离；豁免只针对跨应用隔离，HIDE 等显式规则照旧生效。
     os.environ["NSP_MANAGE_EXTERNAL"]="com.installer.app"
-    case("AllFiles 豁免:data/obb 放行",BASE,10339,[
+    case("AllFiles 豁免:data/obb 放行",CAP,10339,[
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
         ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
         ("/0/Android/data",{"resolve":0,"probe":0,"backing":1}),
         ("/0/Download/a.apk",{"resolve":0,"probe":0}),
     ],uid_map="10339 com.installer.app\n",global_want=1)
-    case("AllFiles 豁免:不豁免 HIDE",BASE+"HIDE /Download\n",10339,[
+    case("AllFiles 豁免:不豁免 HIDE",CAP+"HIDE /Download\n",10339,[
         ("/0/Download/a.apk",{"resolve":1,"probe":1}),
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
     ],uid_map="10339 com.installer.app\n",global_want=1)
@@ -276,11 +284,11 @@ def isolation_section():
     # 整盘访问在 AOSP 里本来就看得见他包 /Android/data，口径与 All files access
     # 一致；同样只豁免跨应用隔离，HIDE 等显式规则照旧。
     os.environ["NSP_LEGACY_STORAGE"]="com.plain.app"
-    case("Legacy 豁免:data 放行",BASE,10500,[
+    case("Legacy 豁免:data 放行",CAP,10500,[
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
         ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
     ],uid_map="10500 com.plain.app\n",global_want=1)
-    case("Legacy 豁免:不豁免 HIDE",BASE+"HIDE /Download\n",10500,[
+    case("Legacy 豁免:不豁免 HIDE",CAP+"HIDE /Download\n",10500,[
         ("/0/Download/a.apk",{"resolve":1,"probe":1}),
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
     ],uid_map="10500 com.plain.app\n",global_want=1)
@@ -288,6 +296,54 @@ def isolation_section():
     case("Legacy 未持有:照常隔离",BASE,10500,[
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
     ],uid_map="10500 com.plain.app\n",global_want=1)
+    # ── 能力豁免默认关：系统授权（All files access / legacy storage）不等于允许跨
+    # 应用读取，必须由 [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON 显式打开。
+    os.environ["NSP_MANAGE_EXTERNAL"]="com.installer.app"
+    case("能力豁免默认关:持 All files 仍隔离",BASE,10339,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10339 com.installer.app\n",global_want=1)
+    del os.environ["NSP_MANAGE_EXTERNAL"]
+    # ── 按包名白名单：列出的调用方可访问他包 data/obb，与 appops 授权无关；未列出
+    # 的照常隔离；匹配按调用方自身包名，同 uid 的兄弟包不会被顺带放行；白名单只
+    # 解除隔离，HIDE 等显式规则照旧生效（非法包名项跳过、整行仍生效）。
+    case("白名单:命中放行",WL,10123,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+        ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
+    ],uid_map="10123 com.demo.app\n",global_want=1)
+    case("白名单:未列出照常隔离",WL,10500,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10500 com.plain.app\n",global_want=1)
+    case("白名单:不按 uid 连带兄弟包",
+         BASE+"ALLOW_CROSS_APP_PKGS com.shared.a\n",10610,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10610 com.shared.b\n",global_want=1)
+    case("白名单:同 uid 兄弟包各自写才放行",
+         BASE+"ALLOW_CROSS_APP_PKGS com.shared.a,com.shared.b\n",10610,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    ],uid_map="10610 com.shared.b\n",global_want=1)
+    case("白名单:不豁免 HIDE",WL+"HIDE /Download\n",10123,[
+        ("/0/Download/a.apk",{"resolve":1,"probe":1}),
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    ],uid_map="10123 com.demo.app\n",global_want=1)
+    case("白名单:非法项跳过整行仍生效",
+         BASE+"ALLOW_CROSS_APP_PKGS /bad,pkg:1,com.demo.app\n",10123,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    ],uid_map="10123 com.demo.app\n",global_want=1)
+    # ── 同 uid 多包 = 同一应用身份（Linux DAC 只认 uid）：系统里 MediaProvider 与
+    # DownloadsProvider 同宿于 android.process.media 这类结构，全局挂载下按包名
+    # 比较会把下载器读 Downloads 私有目录判成跨应用。不同 uid 照常隔离，HIDE
+    # 等显式规则照旧生效（豁免只针对跨应用隔离本身）。
+    case("同 uid 多包:互访放行",BASE,10610,[
+        ("/0/Android/data/com.shared.b/x",{"resolve":0,"probe":0}),
+        ("/0/Android/data/com.shared.a/y",{"resolve":0,"probe":0}),
+    ],uid_map="10610 com.shared.a\n",global_want=1)
+    case("同 uid 多包:跨 uid 照常隔离",BASE,10610,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10610 com.shared.a\n",global_want=1)
+    case("同 uid 多包:不豁免 HIDE",BASE+"HIDE /Download\n",10610,[
+        ("/0/Download/a.apk",{"resolve":1,"probe":1}),
+        ("/0/Android/data/com.shared.b/x",{"resolve":0,"probe":0}),
+    ],uid_map="10610 com.shared.a\n",global_want=1)
     del os.environ["NSP_PACKAGELIST"]
     # ── 作用域优先 / 沙盒作用域（用户报障 A/B 的回归）：
     #   A「[GLOBAL] SANDBOX ON + ALLOW /Pictures/… 后，应用段再写 SANDBOX ON 仍不沙盒」

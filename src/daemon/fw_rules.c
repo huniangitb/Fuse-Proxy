@@ -253,10 +253,35 @@ static bool br_pkg_same_base(const char* a, const char* b) {
    命令（ls /sdcard/Android/data/<他包>、cat、copy、find -exec…）都能读到内容
    ——用户报障的绕过点即在此，故 resolve 侧必须同样判。
    不隔离的情形：调用方包名不可解析（空/system/unknown，root 与系统工具）、
-   [GLOBAL] ALLOW_CROSS_APP_DATA ON（用户显式放行，等于恢复旧行为）。 */
+   目录属主包与调用方**同 uid**（sharedUserId / 系统同进程宿主：Linux DAC 里就是
+   同一个 app 身份，只按包名比较会把 android.process.media 读 Downloads 私有目录
+   判成跨应用）、[GLOBAL] ALLOW_CROSS_APP_DATA ON（用户显式放行，等于恢复旧行为）。 */
 bool fw_rules_cross_app_isolated(void) { return !g_global_cfg.allow_cross_app_data; }
 
-static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg) {
+/* 白名单按调用方**自身**包名比较（包名带 ':' 进程后缀时只比基础包名）。
+   不做 uid 兜底：uid 相同只说明是同一个 Linux 身份，不说明用户同意它们互读
+   私有目录——共享 uid 的兄弟包要跨应用访问，也得各自写进白名单。 */
+bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
+    if (!pkg || !pkg[0] || g_global_cfg.allow_cross_pkg_count <= 0) return false;
+    size_t len = strcspn(pkg, ":");
+    if (len == 0) return false;
+    for (int i = 0; i < g_global_cfg.allow_cross_pkg_count; i++) {
+        const char* entry = g_global_cfg.allow_cross_pkgs[i];
+        if (entry && strlen(entry) == len && strncmp(entry, pkg, len) == 0) return true;
+    }
+    return false;
+}
+
+bool fw_rules_cross_app_capability(void) { return g_global_cfg.allow_cross_by_capability; }
+
+bool fw_rules_cross_app_exempt(const char* pkg, uid_t uid) {
+    if (fw_rules_cross_app_pkg_allowed(pkg)) return true;
+    if (fw_pkg_is_privileged(uid)) return true;
+    if (!fw_rules_cross_app_capability()) return false;
+    return fw_pkg_manages_external(uid) || fw_pkg_has_legacy_storage(uid);
+}
+
+static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg, uid_t uid) {
     if (!current_pkg || !current_pkg[0]) return false;
     if (strcmp(current_pkg, "system") == 0 || strcmp(current_pkg, "unknown") == 0) return false;
     if (g_global_cfg.allow_cross_app_data) return false;
@@ -272,7 +297,12 @@ static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg) {
                 char target_pkg[256];
                 memcpy(target_pkg, pkg_start, pkg_len);
                 target_pkg[pkg_len] = '\0';
-                if (!br_pkg_same_base(target_pkg, current_pkg)) return true;
+                if (br_pkg_same_base(target_pkg, current_pkg)) break;
+                /* 同 uid 多包 = 同一 app 身份（见上方注释）：目标目录属主 uid 等于
+                   调用方 uid 时不算"他应用"。解析不到属主 uid 则维持隔离。 */
+                uid_t owner_uid = 0;
+                if (fw_pkg_uid_for_package(target_pkg, &owner_uid) && owner_uid == uid) break;
+                return true;
             }
             break;
         }
@@ -565,32 +595,29 @@ static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat) {
 /* 跨应用隔离是否拦下本路径（resolve 侧唯一调用点）：沙盒生效时放行——此时的
    "他包 data" 已被 br_to_real_path 改写成自己的沙盒镜像，读不到他包内容，
    把它判成 ENOENT 会让沙盒镜像整体不可用（test_monitor_layers 守护）。
-   特权应用（platform 签名，packages.list seinfo 判定）、持有 MANAGE_EXTERNAL_STORAGE
-   的应用（安装器、文件管理器、应用商店：appops 判定，fw_pkg_manages_external）与
-   legacy storage 应用（targetSdk ≤ 29，appop LEGACY_STORAGE）自动豁免——它们的
-   本职就是访问他包 /Android/data（安装器读 IM 落盘的安装包、商店写下载目录），
-   与 Android 权限体系对齐而非逐包手工规则。其余情形：看不见 = 打不开（与 probe
-   列举过滤同口径）。 */
+   放行分三类（组合判定统一在 fw_rules_cross_app_exempt）：显式白名单
+   （[GLOBAL] ALLOW_CROSS_APP_PKGS，按调用方自身包名）、platform 签名特权应用
+   （packages.list seinfo）、能力豁免（appops 的 MANAGE_EXTERNAL_STORAGE /
+   LEGACY_STORAGE，受 [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY 控制，**默认关**：
+   授权不等于同意读取别的应用的私有目录）。同 uid 内的多包（sharedUserId / 系统
+   同进程宿主）在 br_is_other_app_pkg 里已按 uid 视为同一应用。其余情形：
+   看不见 = 打不开（与 probe 列举过滤同口径）。 */
 static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                 const char* current_pkg, uid_t uid) {
-    if (!br_is_other_app_pkg(sub_path, current_pkg)) return false;
+    if (!br_is_other_app_pkg(sub_path, current_pkg, uid)) return false;
     if (br_sandbox_active(cfg, cat)) return false;
-    if (fw_pkg_is_privileged(uid)) return false;
-    if (fw_pkg_manages_external(uid)) return false;
-    if (fw_pkg_has_legacy_storage(uid)) return false;
+    if (fw_rules_cross_app_exempt(current_pkg, uid)) return false;
     br_note_isolation(current_pkg, sub_path);
     return true;
 }
 
 /* 列举侧（probe/目录缓存）的隔离判据：与 br_isolation_blocks 共用同一组
-   豁免（特权签名 + MANAGE_EXTERNAL_STORAGE + legacy storage），但不含沙盒让位——
+   豁免（fw_rules_cross_app_exempt：白名单 + 特权签名 + 能力开关），但不含沙盒让位——
    沙盒生效时 resolve 放行是为了让重定向进自己镜像的路径可用，列举照旧只显示
    自身包名（test_rules 的「沙盒豁免隔离」用例守护这一差异）。 */
 static bool br_isolation_hides(const char* sub_path, const char* current_pkg, uid_t uid) {
-    if (!br_is_other_app_pkg(sub_path, current_pkg)) return false;
-    if (fw_pkg_is_privileged(uid)) return false;
-    if (fw_pkg_manages_external(uid)) return false;
-    if (fw_pkg_has_legacy_storage(uid)) return false;
+    if (!br_is_other_app_pkg(sub_path, current_pkg, uid)) return false;
+    if (fw_rules_cross_app_exempt(current_pkg, uid)) return false;
     return true;
 }
 
@@ -1359,7 +1386,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                                 ? NSP_VK_ANCESTOR
                                 : (br_is_redirect_target(cfg, cat, sub_path) ? NSP_VK_TARGET
                                                                             : NSP_VK_NONE);
-        out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg);
+        out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg, q->uid);
 
         /* 填充目录缓存（trie 沿父目录一次下降，后续条目复用） */
         memset(pc, 0, sizeof *pc);
