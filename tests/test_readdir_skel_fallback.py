@@ -9,16 +9,20 @@ readdir 骨架回退回归测试
 且无法点击，按名 stat（getattr 虚拟分支）却又是正常目录。
 
 修复约定：lstat 失败的骨架名不上架、不置标记，由 fill 阶段合成标准
-目录条目（S_IFDIR|0755 + 同源 ino）；非骨架名维持原语义（NULL 条目，
-按需 lookup 由 getattr 裁决）。
+目录条目（S_IFDIR|0755 + 同源 ino）；lstat 失败但 getdents 已给出类型的
+非骨架名按该类型合成条目（不再上架 NULL stat 条目——NULL 即 d_type=UNKNOWN，
+客户端会把它画成「未知/文件」）；类型未知时才保留 NULL 条目，按需 lookup
+由 getattr 裁决。
 
 复现手段：LD_PRELOAD 垫片让 daemon 进程内指定后缀路径的 `lstat`
 恒报 EACCES（目录本身真实存在），无需 root。d_type 经原始
 getdents64 解析（Python 的 scandir/is_dir 在 UNKNOWN 时会 stat 兜底，
 不能作为类型探针）：
   - 骨架名 data：d_type == DT_DIR（修复前为 UNKNOWN，即复现）；
-  - 非骨架对照名：仍按旧语义上架（d_type UNKNOWN），证明垫片生效、
-    测试非空转（若垫片未拦截，对照名将是正常 DIR，测试失败）。
+  - 非骨架对照名 otherdir：按其 getdents 类型合成 DIR（曾为 UNKNOWN）；
+  - 同一被拒目录里的普通文件 seed.txt：合成为 DT_REG——与 otherdir 一起
+    构成「条目类型取自 getdents 而非 lstat」的证据，证明垫片确实生效、
+    测试非空转。
 
 前置：GNU 产物 build_gnu/fuse_daemon、fusermount3、/dev/fuse、cc；
 缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
@@ -74,6 +78,7 @@ def asan_runtime_path():
 
 DT_UNKNOWN = 0
 DT_DIR = 4
+DT_REG = 8
 
 SHIM_SRC = r"""
 #define _GNU_SOURCE
@@ -291,11 +296,20 @@ def main():
             except OSError as e:
                 fail("按名 stat 为可进入目录", repr(e))
                 rc = 1
-            # 3. 非骨架对照名：维持旧语义（UNKNOWN 上架），证明垫片生效
-            if dtypes.get("otherdir") == DT_UNKNOWN:
-                ok("非骨架对照名维持旧语义（UNKNOWN 上架，垫片生效）")
+            # 3. 非骨架对照名：lstat 被拒但 getdents 给了类型，按该类型合成
+            if dtypes.get("otherdir") == DT_DIR:
+                ok("非骨架对照名按 d_type 合成 DIR（不再上架 UNKNOWN 条目）")
             else:
-                fail("非骨架对照名维持旧语义", f"实测={dtypes.get('otherdir')}")
+                fail("非骨架对照名按 d_type 合成 DIR", f"实测={dtypes.get('otherdir')}")
+                rc = 1
+            # 4. 同一被拒目录里的普通文件：类型必须取自 d_type（REG），
+            #    证明垫片拦住了 lstat 且 readdir 不靠 lstat 定类型
+            data_dtypes = raw_dtypes(MNT + "/0/Android/data")
+            if data_dtypes.get("seed.txt") == DT_REG:
+                ok("被拒目录内的普通文件按 d_type 上报 DT_REG（类型不依赖 lstat）")
+            else:
+                fail("被拒目录内的普通文件上报 DT_REG",
+                     f"实测={data_dtypes.get('seed.txt')}，全表={data_dtypes}")
                 rc = 1
     finally:
         stop_daemon(proc)
