@@ -189,6 +189,13 @@ static void free_app_config_rules(AppConfig* cfg) {
     }
     cfg->hide_count = 0;
     cfg->hide_capacity = 0;
+    if (cfg->allow_cross_pkgs) {
+        for (int i = 0; i < cfg->allow_cross_pkg_count; i++) free(cfg->allow_cross_pkgs[i]);
+        free(cfg->allow_cross_pkgs);
+        cfg->allow_cross_pkgs = nullptr;
+    }
+    cfg->allow_cross_pkg_count = 0;
+    cfg->allow_cross_pkg_capacity = 0;
     if (cfg->ro_rules) {
         for (int i = 0; i < cfg->ro_count; i++) free(cfg->ro_rules[i]);
         free(cfg->ro_rules);
@@ -642,6 +649,48 @@ static void parse_fuse_events_uids_rule(AppConfig* cur, char* p_ptr, int line_nu
     }
 }
 
+/* ALLOW_CROSS_APP_PKGS <包名>[,<包名>...]：仅 [GLOBAL] 段有效；向跨应用放行
+   白名单**追加**包名（重复项只留一条）。逗号或空白分隔；非法项（含路径分隔符、
+   ':'、超长）告警后跳过，不放弃整行——白名单少一项只是该应用照常隔离，不该让
+   整份配置读失败。 */
+static void parse_allow_cross_app_pkgs_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                            const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("ALLOW_CROSS_APP_PKGS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                file_path);
+        return;
+    }
+    char* p = p_ptr;
+    while (p && *p) {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        size_t len = strcspn(p, ", \t");
+        /* 包名只允许 [A-Za-z0-9._]：路径分隔符/进程后缀（':'）会让精确比较永远
+           落空，静默不生效比告警更糟 */
+        bool bad = (len == 0 || len >= 128);
+        for (size_t i = 0; !bad && i < len; i++) {
+            unsigned char c = (unsigned char)p[i];
+            if (!(isalnum(c) || c == '.' || c == '_')) bad = true;
+        }
+        if (bad) {
+            LOG_WRN("ALLOW_CROSS_APP_PKGS 含非法包名 \"%.*s\"（行 %d, 文件 %s），已跳过",
+                    (int)len, p, line_num, file_path);
+            p += len;
+            continue;
+        }
+        char pkg[128];
+        memcpy(pkg, p, len);
+        pkg[len] = '\0';
+        bool dup = false;
+        for (int i = 0; i < cur->allow_cross_pkg_count && !dup; i++)
+            if (strcmp(cur->allow_cross_pkgs[i], pkg) == 0) dup = true;
+        if (!dup && !append_str_rule(&cur->allow_cross_pkgs, &cur->allow_cross_pkg_count,
+                                     &cur->allow_cross_pkg_capacity, pkg))
+            LOG_WRN("ALLOW_CROSS_APP_PKGS 追加失败（行 %d, 文件 %s）", line_num, file_path);
+        p += len;
+    }
+}
+
 /* HIDE <path> / RO <path> */
 static void parse_path_rule(AppConfig* cur, char* p_ptr, bool is_hide, int line_num,
                             const char* file_path) {
@@ -769,6 +818,11 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_global_switch_rule(cur, &cur->skip_system_apps, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "ALLOW_CROSS_APP_DATA") == 0)
         parse_global_switch_rule(cur, &cur->allow_cross_app_data, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "ALLOW_CROSS_APP_BY_CAPABILITY") == 0)
+        parse_global_switch_rule(cur, &cur->allow_cross_by_capability, tok, p_ptr, line_num,
+                                 file_path);
+    else if (strcmp(tok, "ALLOW_CROSS_APP_PKGS") == 0)
+        parse_allow_cross_app_pkgs_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EVENTS") == 0)
         parse_global_switch_rule(cur, &cur->fuse_events, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EVENTS_UIDS") == 0)

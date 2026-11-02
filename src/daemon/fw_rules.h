@@ -198,4 +198,19 @@ bool fw_rules_path_has_uid_layer(const char* path);
    fw_acl 的「他包私有目录不可见」沿用同一开关，避免两处各自解释这条配置。 */
 bool fw_rules_cross_app_isolated(void);
 
+/* 跨应用隔离的**放行**判定（隔离生效时才有意义）。三条独立来源：
+   - 白名单：[GLOBAL] ALLOW_CROSS_APP_PKGS 里列了调用方包名（按调用方**自身**
+     包名精确比较，不做 uid 兜底，故同 uid 的兄弟包不会被顺带放行）；
+   - 特权：platform 签名应用（packages.list 的 seinfo）；
+   - 能力：MANAGE_EXTERNAL_STORAGE / legacy storage，**仅在**
+     [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON 时生效（默认关）。
+   fw_rules_cross_app_exempt() 是这条判定的**唯一**出口：resolve 侧
+   （br_isolation_blocks/hides）与 readdir 列举（vfs_entry_visibility）都调它，
+   三处各写一份组合会漏，漏一处的表现就是「列表里看不到、按名打开却成功」或反之。 */
+bool fw_rules_cross_app_exempt(const char* pkg, uid_t uid);
+/* 白名单查询（仅包名维度，供日志/诊断与单测断言使用） */
+bool fw_rules_cross_app_pkg_allowed(const char* pkg);
+/* 能力豁免总闸（[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY，默认 OFF） */
+bool fw_rules_cross_app_capability(void);
+
 #endif /* FW_RULES_H */

@@ -167,6 +167,15 @@ static bool acl_pkg_same_base(const char* a, const char* b) {
     return la == lb && la > 0 && strncmp(a, b, la) == 0;
 }
 
+/* 该目录属主包是否与调用方同 uid（同 uid 多包 = 同一 app 身份，见
+   fw_acl_decide 的 NSP_PATH_OWNED 分支）。packages.list 里查不到该包 → false，
+   维持原判定（不额外放行）。 */
+static bool acl_owner_shares_uid(const char* owner_pkg, uid_t uid) {
+    uid_t owner_uid = 0;
+    return owner_pkg && owner_pkg[0] && fw_pkg_uid_for_package(owner_pkg, &owner_uid) &&
+           owner_uid == uid;
+}
+
 static bool acl_op_is_create_like(NspAclOp op) {
     return op == NSP_ACL_OP_CREATE || op == NSP_ACL_OP_MKDIR || op == NSP_ACL_OP_MKNOD ||
            op == NSP_ACL_OP_SYMLINK || op == NSP_ACL_OP_LINK;
@@ -215,14 +224,26 @@ NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id) {
         return NSP_ACL_ALLOW;
 
     case NSP_PATH_OWNED:
-        /* 他包私有目录：看不见（AOSP 一律 ENOENT）。自己包 / 特权 / 全文件访问 /
-           legacy storage 放行。 */
+        /* 他包私有目录：看不见（AOSP 一律 ENOENT）。自己包 / 同 uid 包 /
+           白名单包（[GLOBAL] ALLOW_CROSS_APP_PKGS）/ 特权签名 / 能力豁免（开关开时）
+           放行。 */
         /* 包名解析不出来时一律放行：ACL 是「多一道门」，不能变成单点故障。
            与 fw_rules 的跨应用隔离同口径（current_pkg 为 system/unknown 即不隔离），
            否则解析失败会把应用挡在自己的 data 目录外（真实故障，比越权更难排查）。 */
         if (!id->pkg_known) return NSP_ACL_ALLOW;
         if (owner[0] && acl_pkg_same_base(owner, id->pkg)) return NSP_ACL_ALLOW;
-        if (id->privileged || id->manage_external || id->legacy) return NSP_ACL_ALLOW;
+        /* 同一 uid 内的多个包（sharedUserId，或系统同进程宿主如 MediaProvider 与
+           DownloadProvider 共用 android.process.media）在 Linux DAC 里本就是同一个
+           app 身份：/Android/data/<包> 的属主 uid 等于调用方 uid。只按包名比较会把
+           它们误判成跨应用（现场表现：下载器读不到 Downloads 的私有目录，ENOENT）。 */
+        if (owner[0] && acl_owner_shares_uid(owner, q->uid)) return NSP_ACL_ALLOW;
+        if (id->cross_app_allowed) return NSP_ACL_ALLOW;
+        if (id->privileged) return NSP_ACL_ALLOW;
+        /* 能力豁免（All files access / legacy storage）默认关：系统授权只是"用户
+           给了这个能力"，不等于同意读别的应用的私有目录，故由
+           [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY 显式开启。 */
+        if (id->cross_app_by_capability && (id->manage_external || id->legacy))
+            return NSP_ACL_ALLOW;
         /* 隔离开关沿用既有配置口径（默认生效）；关闭时按旧行为放行，
            否则这条 AOSP 默认会让 ALLOW_CROSS_APP_DATA ON 的用户突然失效。 */
         return id->cross_app_isolated ? NSP_ACL_DENY_ENOENT : NSP_ACL_ALLOW;
@@ -283,8 +304,13 @@ void fw_acl_identity(uid_t uid, pid_t pid, NspAclIdentity* out) {
             out->pkg_known = true;
         }
         out->privileged = fw_pkg_is_privileged(uid);
-        out->manage_external = fw_pkg_manages_external(uid);
-        out->legacy = fw_pkg_has_legacy_storage(uid);
+        out->cross_app_allowed = fw_rules_cross_app_pkg_allowed(out->pkg);
+        out->cross_app_by_capability = fw_rules_cross_app_capability();
+        /* 总闸关着就不查 appops（一次子进程查询），免得为一条不生效的豁免付代价 */
+        if (out->cross_app_by_capability) {
+            out->manage_external = fw_pkg_manages_external(uid);
+            out->legacy = fw_pkg_has_legacy_storage(uid);
+        }
         out->cross_app_isolated = fw_rules_cross_app_isolated();
     }
 }

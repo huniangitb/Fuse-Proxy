@@ -70,8 +70,15 @@ typedef struct {
     bool pkg_known;         /* 包名是否可信（false 时按最保守口径处理） */
     bool is_system;         /* uid < AID_APP_START(10000)：AOSP 直接放行 */
     bool privileged;        /* platform 签名（mount-mode 的现有近似，fw_pkg 提供） */
-    bool manage_external;   /* MANAGE_EXTERNAL_STORAGE（appops，fw_pkg_manages_external 提供） */
-    bool legacy;            /* legacy storage（appops，fw_pkg_has_legacy_storage 提供） */
+    bool manage_external;   /* MANAGE_EXTERNAL_STORAGE（appops，fw_pkg_manages_external 提供）；
+                               仅在 cross_app_by_capability 为真时才参与判定 */
+    bool legacy;            /* legacy storage（appops，fw_pkg_has_legacy_storage 提供）；同上 */
+    /* 跨应用放行白名单命中（[GLOBAL] ALLOW_CROSS_APP_PKGS，按调用方自身包名）：
+       命中即允许访问他包 /Android/data|obb，与能力判定无关。 */
+    bool cross_app_allowed;
+    /* [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY 是否打开（能力豁免总闸，默认 OFF）：
+       授权（All files access / legacy storage）不等于用户同意跨应用读取。 */
+    bool cross_app_by_capability;
     bool cross_app_isolated; /* 跨应用隔离生效（沿用 [GLOBAL] ALLOW_CROSS_APP_DATA，单一出处
                                 fw_rules_cross_app_isolated()）：false 时他包 data/obb 按旧行为放行 */
 } NspAclIdentity;
@@ -96,7 +103,9 @@ NspPathClass fw_acl_classify(const char* path, char* owner_pkg, size_t size);
 int fw_acl_errno(NspAclVerdict v);
 
 /* 生产路径：按 uid/pid 组装身份（包名走 fw_pkg，特权走 packages.list 的 seinfo，
-   All files access 与 legacy storage 都走 appops，见 fw_pkg.h）。 */
+   All files access 与 legacy storage 都走 appops 见 fw_pkg.h，白名单与能力总闸
+   走 fw_rules 的配置视图）。能力两项只在总闸打开时才查询——关着就没必要付
+   一次 appops 查询的代价。 */
 void fw_acl_identity(uid_t uid, pid_t pid, NspAclIdentity* out);
 
 /* 唯一执行点：fw_route 在完成规则决策后调用，非 0 即拒绝（返回负 errno）。

@@ -58,6 +58,8 @@
 | `FUSE_EVENTS` | 全局段 | FUSE 事件通道总开关，默认 **OFF**。开启后 daemon 暴露两条抽象命名空间 UDS：`nsp_fs_events`（订阅后推 NDJSON 事件）与 `nsp_fs_query`（一次性查询），供扫描侧按增量扫描而非整树重扫；关闭时零线程、零 socket，IO 路径只多一次原子读。通道白名单默认含 root(0)/system(1000)/media_rw(1023) + **自动解析的 MediaProvider 进程 uid**（包名 `com.google.android.providers.media.module`、`com.android.providers.media.module` 与 `com.android.providers.media`，启动时从 `/data/system/packages.list` 取 uid 并按相同 uid 去重——消费方跑在该进程内，它既不是 1000 也不是 1023；解析失败只少这一条，通道其余照旧）+ `[GLOBAL] FUSE_EVENTS_UIDS` 追加项。见 `architecture.md` §4.7 |
 | `FUSE_EVENTS_UIDS` | 全局段 | 事件通道**追加**白名单 uid（逗号分隔，上限 8 项；默认已含 root(0)/system(1000)/media_rw(1023) 与自动解析出的 MediaProvider 进程 uid，见上行）。它只决定谁能连这两条 socket，与事件里的 `uid`/`pkg`（被代理的应用）无关 |
 | `ALLOW_CROSS_APP_DATA` | 全局段 | 跨应用隔离放宽开关，默认 **OFF**（=隔离生效：`/Android/data|obb/<他包>` 既**不可列举也不可打开**）。写 `ON` 恢复旧行为（只过滤列举、不限制打开），是跨应用隔离的**唯一逃生阀**，见 §4.1 |
+| `ALLOW_CROSS_APP_PKGS` | 全局段 | 跨应用放行白名单（可写多次，累积）。列出的**调用方**包名可以访问他包 `/Android/data|obb`，未列出的照常隔离；按调用方**自身**包名精确匹配（不做 uid 兜底，同 uid 的兄弟包不会被顺带放行），独立于 appops 授权。见 §4.1 |
+| `ALLOW_CROSS_APP_BY_CAPABILITY` | 全局段 | 是否按能力（`MANAGE_EXTERNAL_STORAGE` / legacy storage）自动放行跨应用访问，默认 **OFF**——系统授权只说明用户给了这个能力，不等于同意该应用读取别的应用的私有目录。见 §4.1 |
 
 `MONITOR` 在应用段**显式写一次即覆盖全局**（`*_explicit` 标记）。`SANDBOX` 是**分层声明**而不是「写了才生效」的开关：不写 = 继承全局；`ON` = 该应用一律沙箱（含全局 `ALLOW` 的目录）；`OFF` = 显式不沙箱（见 §2「沙盒的作用域」）。开关词法唯一出处 `nsp_switch_on()`（`ON`/`1` 为开）。
 
@@ -80,12 +82,13 @@
 
 生效范围只有 `Android/data` 与 `Android/obb`（`media`/`obj` 不在其中——历史就没有隔离，扩范围会改变既有行为）。隔离与 `HIDE` **同口径**：`resolve`（getattr/open）与 `probe`（readdir 条目过滤）走同一个隐藏判定出口，所以「看不见 = 打不开」；旧实现只在列举侧过滤，任何按名打开的命令都能读到内容。
 
-- **放行**：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局放行。
+- **放行**：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局放行；调用方命中 §4.1 的白名单/特权/能力豁免时放行。
+- **同 uid 视为同一应用**：目标目录的**属主 uid** 等于调用方 uid 时放行（判据取自 `/data/system/packages.list` 的「包名 uid」行，查不到则维持隔离）。Linux DAC 只认 uid，同一 uid 下的多个包（旧 `sharedUserId`，或系统里共用进程的两个 provider，例如 `android.process.media` 宿主同时提供 MediaProvider 与 DownloadsProvider）本就是同一个 app 身份；只按包名比较会把它们误判成「他应用」，在 v3 全局挂载下表现为下载器读不到 Downloads 的私有目录（ENOENT）。解析/目录属主 uid 失败时不额外放行。
 - **与 `SANDBOX ON` 的关系**：沙盒生效的调用方被豁免——它的 `Android/data|obb` 访问本就会被 `SANDBOX` 重定向进**自己的**沙盒镜像（读不到他包内容），判成 ENOENT 只会让镜像路径整体不可用；列举侧仍按隔离过滤（保持既有行为）。
 - **特权应用自动豁免**：调用方是 **platform 签名**应用（`/data/system/packages.list` 的 seinfo 字段以 `platform` 开头，含 `platform:privapp` 与纯 `platform` 共享签名；DocumentsUI / Settings 等系统中介均为 priv-app）时自动放行——文件中介（如 DocumentsUI）的本职就是访问他包 `Android/data`，逐包手工写规则不可维护，按 Android 自己的权限体系判定。普通应用（seinfo `default`）与 `packages.list` 不可读/无该 uid（fail-safe）照常隔离。此豁免与 `ALLOW_CROSS_APP_DATA` 无关、无需配置。
-- **All files access 自动豁免**：调用方持有 **MANAGE_EXTERNAL_STORAGE** 时同样放行（按 uid 查 appops 的 `MANAGE_EXTERNAL_STORAGE` 模式，`allow` 即豁免，结果按 uid 缓存、配置重载后失效重查，另设 30s 有效期——运行期新授予的 All files access 最多 30s 内生效，不必重启 daemon）。安装器、文件管理器、应用商店这类应用的本职就是读他包 `Android/data`（安装器读 IM 落盘的安装包、商店写自己的下载目录），与系统原生授权对齐即可，不必逐包写规则。该豁免只针对跨应用隔离：`HIDE` 等显式规则照旧生效，`ALLOW_CROSS_APP_DATA` 的语义不受影响（关掉它仍然全局放行、打开隔离仍然生效）。
-- **legacy storage 自动豁免**：调用方处于 legacy storage 模式（targetSdk ≤ 29 的旧式整盘访问，appops 的 `LEGACY_STORAGE` 为 `allow`）时同样放行——这类应用在 AOSP 里本就看得见他包 `Android/data`，把它们判成不可见属于收紧过度。与 All files access 共用一次 appops 查询与同一份 uid 缓存（含 30s 有效期），口径与边界完全一致。
-- **边界（共享 uid）**：`uid.map` 是「uid → 单个包名」，若两个非系统应用共享 uid（旧 `sharedUserId`，API 29 起废弃），A 进程访问 `/Android/data/B` 会被判成「他包」而返回 ENOENT。这类设备很少见，逃生阀同上（写 `ALLOW_CROSS_APP_DATA ON`；或用 `ALLOW /Android/data/B` 类规则——规则放行的是**路径**，与调用方身份无关）。
+- **按包名白名单**：`[GLOBAL] ALLOW_CROSS_APP_PKGS com.a,com.b` 列出的**调用方**包名可以访问他包 `Android/data|obb`，与 appops 授权无关，用于「不想给全盘权限、又确实要读某个他包目录」的场合（安装器、迁移工具、备份应用）。匹配用调用方自身包名精确比较，**不做 uid 兜底**：同 uid 的兄弟包要访问也各自写一行——`uid.map` 是 uid→单包名，按 uid 放行等于让共享 uid 的所有包互相看光。未列出的应用照常隔离；白名单只解除隔离，`HIDE`/`RO`/`REDIRECT` 规则照旧生效。
+- **能力豁免（默认关）**：`[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON` 时，持有 **MANAGE_EXTERNAL_STORAGE**（All files access）或处于 **legacy storage**（targetSdk ≤ 29，appops `LEGACY_STORAGE`）的调用方自动放行——这两类应用在 Android 权限体系里本就看得见他包 `Android/data`。**默认 OFF**：授权是用户给出的能力，不等于用户同意该应用读取别的应用的私有目录，故要跨应用读数据必须显式开这个开关或写白名单。开着时按 uid 查一次 appops（`MANAGE_EXTERNAL_STORAGE` / `LEGACY_STORAGE` 模式为 `allow` 即命中），结果按 uid 缓存、配置重载后失效重查，另设 30s 有效期——运行期新授予的权限最多 30s 内生效，不必重启 daemon；关着时根本不查 appops，不付这次开销。边界与白名单一致：只解除隔离，`HIDE`/`RO` 等显式规则照旧生效。
+- **边界（共享 uid）**：`uid.map` 是「uid → 单个包名」，所以**调用方身份**只能按包名展示；但「是否他应用」看的是 uid（见上一条），同 uid 多包互访不再被拦。仍然拦的情形：两个不同 uid 的应用互读对方私有目录（正常跨应用隔离）、目标包在 `packages.list` 里查不到 uid（无法证明同 uid，维持隔离）。逃生阀不变（`ALLOW_CROSS_APP_DATA ON`，或 `ALLOW /Android/data/B` 这类按路径放行的规则）。
 - **代价**：全局实例（服务所有被注入应用的那个 daemon）**不做任何 backing 直通**，全部 I/O 由 daemon 代理——隔离需要 per-caller 裁决只是原因之一，更硬的原因是下层 DAC：backing 之后内核按**调用方凭证**访问 `/data/media`（归 MediaProvider `10277:1023`、子目录 `2700`），应用一律 EACCES。加速只在 media 实例（调用方恒为 MediaProvider 自身）保留，见 `architecture.md` §跨应用隔离。
 
 > **`REDIRECT <vpath> <target>` 的 `<vpath>` 会遮蔽同名的真实条目**：该名字在列举里由虚拟目录提供（内容取 `<target>`），底层若存在同名文件/目录则不再单独列出——否则会出现「列表里是真实目录、`stat` 却落到重定向目标」的不一致；虚拟前缀的父目录在底层缺失时也会被合成为目录。`<target>`（真实目标）**不受影响**，仍是普通路径，照常列举与访问。

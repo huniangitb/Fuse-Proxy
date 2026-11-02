@@ -74,6 +74,18 @@ typedef struct {
        恒在列）。白名单只校验"这条 UDS 通道是谁连的"，不是被查询应用的身份。 */
     int fuse_events_uids[8];
     int fuse_events_uid_count;
+    /* [GLOBAL] ALLOW_CROSS_APP_PKGS <包名>[,<包名>...]：跨应用放行白名单**追加**
+       包名。命中的**调用方**可以访问他包 /Android/data|obb，未命中的照常隔离。
+       匹配用调用方自身包名精确比较（不做 uid 兜底），故 sharedUserId 的兄弟包不会
+       被顺带放行；该豁免独立于能力判定（appops / legacy storage），不需要任何系统
+       授权。 */
+    char** allow_cross_pkgs;
+    int allow_cross_pkg_count;
+    int allow_cross_pkg_capacity;
+    /* [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY：是否按能力（MANAGE_EXTERNAL_STORAGE /
+       legacy storage）自动放行跨应用访问。默认 OFF —— 授权是用户给出的，不等于
+       用户同意该应用读取别的应用的私有目录。 */
+    bool allow_cross_by_capability;
 } AppConfig;
 
 typedef struct {
