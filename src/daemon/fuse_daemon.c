@@ -1416,7 +1416,11 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         struct stat st;
         memset(&st, 0, sizeof(st));
         readdir_join(item_real_path, 2047, d->real_path, de->d_name);
-        if (lstat(item_real_path, &st) != 0) {
+        /* 真实路径拼接必须可容纳检查：base 已接近缓冲区上限时，截断路径会命中
+           目录自身（lstat 成功、拿到父目录的 S_IFDIR），整个目录的条目就被画成
+           文件夹。放不下时按 d_type 合成，与 lstat 失败同一条路径。 */
+        bool joined = readdir_join_checked(item_real_path, sizeof item_real_path, d->real_path, de->d_name) == 0;
+        if (!joined || lstat(item_real_path, &st) != 0) {
             if (skel) {
                 /* 骨架名：lstat 失败也按目录上架（getattr 对同一路径有骨架兜底，
                    两侧口径必须一致），并置 has_* 免得 fill 阶段重复补一条 */
