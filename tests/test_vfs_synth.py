@@ -13,6 +13,8 @@
   2. 静态契约：vfs_synth_stat 必须经 nsp_synth_stat_fill 生成属性（不再自己
      memset），且 getattr / access / opendir 三处虚拟兜底都必须问
      is_virtual_own_pkg_dir——「obb/<pkg> 不存在时 stat 也要成功」靠这条守住。
+     另外 getattr 兜底与 vfs_synth_stat 都必须经 nsp_stat_nearest_ancestor 上溯：
+     重定向落点不存在时整条虚拟目录链都缺，只继承一层会让时间戳留 0。
 
 退出码遵循 tests/run.py 约定：0 通过、1 失败。无环境依赖，不会 gap。
 """
@@ -48,6 +50,12 @@ def static_contract():
             errs.append("vfs_synth_stat 未经 nsp_synth_stat_fill 生成属性")
         if "memset(st" in synth:
             errs.append("vfs_synth_stat 又自己 memset：合成属性必须由 vfs_synth.c 单点给出")
+        if "nsp_stat_nearest_ancestor" not in synth:
+            errs.append("vfs_synth_stat 未经 nsp_stat_nearest_ancestor 上溯父目录")
+    getattr = func_body(src, "static int vfs_getattr", 9000)
+    if getattr and "nsp_stat_nearest_ancestor" not in getattr:
+        errs.append("getattr 虚拟目录兜底未经 nsp_stat_nearest_ancestor 上溯父目录"
+                    "（多级合成链的时间戳会留 0）")
     for fn in ("static int vfs_getattr", "static int vfs_access", "static int vfs_opendir"):
         body = func_body(src, fn, 9000)
         if not body:
