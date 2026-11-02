@@ -999,11 +999,16 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                 *last = '\0';
             else if (last == parent)
                 strcpy(parent, "/");
+            st->st_size = 4096;
             struct stat pst;
             if (lstat(parent, &pst) == 0) {
                 st->st_mode |= (pst.st_mode & 07777);
                 st->st_uid = pst.st_uid;
                 st->st_gid = pst.st_gid;
+                /* 时间戳同样继承上级：留 0 会让客户端显示 1970-01-01 */
+                st->st_atime = pst.st_atime;
+                st->st_mtime = pst.st_mtime;
+                st->st_ctime = pst.st_ctime;
             } else {
                 /* 上级也取不到：属主未知，保持 memset 的 0（root/未知），
                    不伪造为访问者属主 */
@@ -1365,14 +1370,47 @@ static ino_t vfs_readdir_entry_ino(VfsReaddirCtx* d, const char* name) {
     return synthetic_inode(child_sub);
 }
 
-/* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束。
-   只给 st_ino + 类型位：fuse_add_direntry 不读 uid/gid（属主看 getattr） */
+/* 合成条目的 stat 兜底：类型位由调用方给定，时间戳/属主/链接数尽量取真实值
+   ——先试同名真实子项，取不到再继承父目录。合成条目若只填 ino/mode，客户端
+   拿到的 mtime 是 0（显示成 1970-01-01）、size 是 0，目录还容易被画成文件。 */
+static void vfs_synth_stat(VfsReaddirCtx* d, const char* name, mode_t type_mode, struct stat* st) {
+    memset(st, 0, sizeof(*st));
+    st->st_ino = vfs_readdir_entry_ino(d, name);
+    st->st_mode = type_mode;
+    const bool want_dir = S_ISDIR(type_mode);
+    st->st_nlink = want_dir ? 2 : 1;
+    st->st_size = want_dir ? 4096 : 0;
+    char child[2048];
+    struct stat real;
+    if (readdir_join_checked(child, sizeof child, d->real_path, name) == 0 && lstat(child, &real) == 0) {
+        st->st_atime = real.st_atime;
+        st->st_mtime = real.st_mtime;
+        st->st_ctime = real.st_ctime;
+        st->st_uid = real.st_uid;
+        st->st_gid = real.st_gid;
+        if (want_dir && S_ISDIR(real.st_mode)) {
+            st->st_mode = S_IFDIR | (real.st_mode & 07777);
+            st->st_nlink = real.st_nlink;
+            st->st_size = real.st_size;
+        }
+        return;
+    }
+    struct stat parent;
+    if (lstat(d->real_path, &parent) == 0) {
+        st->st_atime = parent.st_atime;
+        st->st_mtime = parent.st_mtime;
+        st->st_ctime = parent.st_ctime;
+        st->st_uid = parent.st_uid;
+        st->st_gid = parent.st_gid;
+        if (want_dir) st->st_mode = S_IFDIR | (parent.st_mode & 07777);
+    }
+}
+
+/* 合成目录条目输出（经 ht 去重）。返回 false = filler 缓冲已满，须立即结束 */
 static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
     if (!vfs_hash_insert(&d->ht, name)) return true; /* 已存在：跳过 */
     struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_ino = vfs_readdir_entry_ino(d, name);
-    st.st_mode = S_IFDIR | 0755;
+    vfs_synth_stat(d, name, S_IFDIR | 0755, &st);
     return vfs_emit(d, name, &st);
 }
 
@@ -1380,9 +1418,7 @@ static bool vfs_readdir_emit_dedup(VfsReaddirCtx* d, const char* name) {
    出现即补，不与后续虚拟目录条目去重。返回 false = filler 缓冲已满 */
 static bool vfs_readdir_emit_raw(VfsReaddirCtx* d, const char* name) {
     struct stat st;
-    memset(&st, 0, sizeof(st));
-    st.st_ino = vfs_readdir_entry_ino(d, name);
-    st.st_mode = S_IFDIR | 0755;
+    vfs_synth_stat(d, name, S_IFDIR | 0755, &st);
     return vfs_emit(d, name, &st);
 }
 
@@ -1440,11 +1476,11 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
                getattr 却可能是真实类型。d_type 也是 DT_UNKNOWN 时才退回 NULL。 */
             if (de->d_type == DT_DIR || de->d_type == DT_REG || de->d_type == DT_LNK) {
                 struct stat dst;
-                memset(&dst, 0, sizeof dst);
-                dst.st_ino = vfs_readdir_entry_ino(d, de->d_name);
-                dst.st_mode = (de->d_type == DT_DIR)     ? (S_IFDIR | 0755)
-                              : (de->d_type == DT_LNK)   ? (S_IFLNK | 0777)
-                                                         : (S_IFREG | 0644);
+                vfs_synth_stat(d, de->d_name,
+                               (de->d_type == DT_DIR)   ? (S_IFDIR | 0755)
+                               : (de->d_type == DT_LNK) ? (S_IFLNK | 0777)
+                                                        : (S_IFREG | 0644),
+                               &dst);
                 if (vfs_hash_insert(&d->ht, de->d_name)) {
                     if (!vfs_emit(d, de->d_name, &dst)) return false;
                 }
@@ -1535,9 +1571,9 @@ static bool vfs_readdir_fill_virtual(VfsReaddirCtx* d, int path_user_id) {
         if (virt[vi].name[0] == '\0') continue;
         if (!vfs_hash_insert(&d->ht, virt[vi].name)) continue;
         struct stat st_dir;
-        memset(&st_dir, 0, sizeof(st_dir));
-        st_dir.st_ino = vfs_readdir_entry_ino(d, virt[vi].name);
-        st_dir.st_mode = S_IFDIR; /* filler 只取类型位给出 d_type */
+        /* 类型位必须带 S_IFDIR | 权限位：权限全 0 的目录条目在部分管理器里
+           会被画成不可进入的条目；时间戳同样取真实值而非 0 */
+        vfs_synth_stat(d, virt[vi].name, S_IFDIR | 0755, &st_dir);
         if (!vfs_emit(d, virt[vi].name, &st_dir)) {
             ok = false; /* 内核缓冲满：短路后继阶段（与旧语义一致） */
             break;
