@@ -1,8 +1,11 @@
 /* 虚拟条目判定与合成属性的判别性用例：直编 src/daemon/vfs_synth.c，
    不起 daemon、不挂载。失败条数即退出码来源。 */
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "vfs_synth.h"
 
@@ -118,6 +121,48 @@ static void case_skel_and_user_layer(void) {
           "带用户层的 /0/Android/obb 是容器");
 }
 
+/* 最近存在祖先：虚拟目录链上「直接父目录也不存在」是常态，属性只能从更上级借。
+   判别性要求：返回的是父目录而不是入参自身（入参正是 lstat 失败的那个）。 */
+static void case_nearest_ancestor(void) {
+    char tmpl[] = "/tmp/nsp_synth_XXXXXX";
+    char* dir = mkdtemp(tmpl);
+    if (!dir) {
+        check(0, "mkdtemp 建立临时目录");
+        return;
+    }
+    struct stat base;
+    if (lstat(dir, &base) != 0) {
+        check(0, "临时目录可 stat");
+        (void)rmdir(dir);
+        return;
+    }
+
+    char path[PATH_MAX];
+    struct stat out;
+    snprintf(path, sizeof path, "%s/miss_a/miss_b/file", dir);
+    memset(&out, 0, sizeof out);
+    check(nsp_stat_nearest_ancestor(path, &out), "多级缺失子路径：找到最近存在祖先");
+    check(out.st_ino == base.st_ino, "最近祖先就是临时目录本身");
+
+    snprintf(path, sizeof path, "%s/miss_a/miss_b/", dir);
+    memset(&out, 0, sizeof out);
+    check(nsp_stat_nearest_ancestor(path, &out) && out.st_ino == base.st_ino,
+          "尾部斜杠不影响上溯");
+
+    snprintf(path, sizeof path, "%s", dir);
+    memset(&out, 0, sizeof out);
+    struct stat parent;
+    if (lstat("/tmp", &parent) == 0) {
+        check(nsp_stat_nearest_ancestor(path, &out) && out.st_ino == parent.st_ino,
+              "入参自身存在时返回其父目录，不返回自身");
+    }
+
+    memset(&out, 0, sizeof out);
+    check(!nsp_stat_nearest_ancestor("/", &out), "根目录没有更上级可借");
+    check(!nsp_stat_nearest_ancestor(nullptr, &out), "空路径返回 false");
+    (void)rmdir(dir);
+}
+
 int main(void) {
     case_synth_dir_without_real_child();
     case_synth_dir_with_real_child();
@@ -125,6 +170,7 @@ int main(void) {
     case_synth_file_entry();
     case_own_pkg_paths();
     case_skel_and_user_layer();
+    case_nearest_ancestor();
     if (failed) printf("失败 %d 条\n", failed);
     return failed ? 1 : 0;
 }
