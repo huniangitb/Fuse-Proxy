@@ -90,6 +90,10 @@ static volatile int g_fuse_starting = 0;
 static int g_pending_first_scan = 0;
 /* FUSE 崩溃恢复后待重挂标记：新 FUSE 就绪时重挂所有追踪应用 */
 static volatile sig_atomic_t g_pending_remount = 0;
+/* 启动扫描待办标记：FUSE 就绪后扫一次「挂着项目 FUSE 但连接已断」的进程。
+   只在进程启动时置位——FUSE 崩溃恢复走 g_pending_remount（追踪表），两者不同：
+   前者覆盖本进程启动前就已存在、且不在追踪表里的旧进程。 */
+static volatile sig_atomic_t g_pending_startup_scan = 0;
 
 /* 挂载失败重试记账在 src/injector/retry_queue.c（纯记账、可直编单测）。
    这里只保留调度：旧实现把"异步派发成功"当成"挂载成功"，条目当场摘掉、
@@ -454,6 +458,15 @@ void handle_fuse_ready_event(void* ptr) {
                     maybe_reconcile_global_replace();
                 }
             }
+        }
+        /* 启动扫描：injector 重启后，已注入应用命名空间里的旧挂载仍指向随旧 daemon
+           中止的 FUSE 连接（访问一律 ENOTCONN）。追踪表此时是空的，崩溃恢复路径覆盖
+           不到它们，只能靠这里扫一遍。健康进程零行为变化（判据见
+           repair_stale_app_mounts_at_startup）。 */
+        if (g_pending_startup_scan) {
+            g_pending_startup_scan = 0;
+            int repaired = repair_stale_app_mounts_at_startup();
+            if (repaired > 0) LOG("启动扫描: 修复了 %d 个连接已断的应用挂载", repaired);
         }
         if (g_pending_first_scan) {
             g_pending_first_scan = 0;
@@ -1312,6 +1325,7 @@ static void injector_start_fuses(bool start_passive) {
     }
 
     g_pending_first_scan = 1;
+    g_pending_startup_scan = 1;
     seconds_until_next_scan = 0;
     if (start_passive) {
         g_passive_mode = 1;

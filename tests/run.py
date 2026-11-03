@@ -156,6 +156,18 @@ SUITE_MAP = [
      ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
 
+    # ── 已挂载视图的连接活性（ns_mount_health.c）+ 启动扫描修复 ──
+    # 直编探测原语 + --wrap=statfs：判据矩阵，以及「没有项目挂载时一次探测都不做」
+    # （健康进程零行为变化）。静态契约锁住三处接线：两条挂载路径都必须先要求
+    # target_fuse_unverified 才探测、启动扫描只在 FUSE 就绪分支跑一次且 v2/v3 直接返回、
+    # 探测不得换成会被 FUSE 属性缓存骗过的 stat/statx。
+    (("test_mount_liveness.py",),
+     ("src/injector/ns_mount_health.c", "src/injector/mount_manager.c",
+      "include/mount_manager.h", "include/ns_utils.h", "src/injector/injector.c"),
+     ("ns_mount_conn_state", "ns_mount_needs_repair",
+      "repair_stale_app_mounts_at_startup", "target_fuse_unverified"),
+     "已挂载视图连接活性 / 启动扫描修复死连接挂载"),
+
     (("test_reaped_managed.py",),
      ("src/injector/reaped_managed.c", "src/injector/reaped_managed.h",
       "src/injector/injector.c"),
@@ -336,6 +348,7 @@ LAYERS = {
             "test_ns_global_replace_rollback.py",
             "test_inject_method.py",
             "test_inject_tracked_race.py",
+            "test_mount_liveness.py",
             "test_log_ctl_rules.py",
             "test_commit_msg_lint.py",
             "test_build_scripts.py",
@@ -527,6 +540,7 @@ PARALLEL_SAFE = frozenset({
     "test_monitor_layers.py",     # cc 编译实际源码 + 合成 uid，无挂载（TemporaryDirectory）
     "test_log_ctl_rules.py",      # 全走 mkdtemp（--config-dir 指向临时目录）
     "test_inject_method.py",      # conf 全走 mkdtemp + global_replace_ctl 驱动，无 daemon
+    "test_mount_liveness.py",     # cc 直编 ns_mount_health.c + --wrap=statfs，无挂载/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
     "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill

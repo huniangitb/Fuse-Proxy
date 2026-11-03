@@ -42,6 +42,29 @@ int ns_is_mounted(int pid, const char* target_mount, const char* match_fs_name);
              到整文件扫描。 */
 int ns_probe_target_view(int pid, const char* target, const char* src, bool* is_mount,
                          bool* is_ours);
+/* ================ 已挂载视图的连接活性（ns_mount_health.c） ================
+ *
+ * 为什么需要单独探测：daemon 退出后 mountinfo 里的 FUSE 条目仍然存在（内核只把该
+ * superblock 标成断开），所以「目标是项目 FUSE 挂载」回答不了「这个视图现在还能用
+ * 吗」。injector 重启不会重建已注入应用命名空间里的旧挂载：那些进程此后每次访问
+ * 存储都拿到 ENOTCONN，直到自身换挂载或设备重启。 */
+enum {
+    NSP_CONN_UNKNOWN = -1, /* 无法判定（路径不存在/权限/非 FUSE 文件系统）：保持旧行为 */
+    NSP_CONN_LIVE = 0,     /* 连接可用 */
+    NSP_CONN_DEAD = 1,     /* 连接已断（ENOTCONN / ECONNREFUSED） */
+};
+
+/* 探测目标进程命名空间内 mount_point 处文件系统的 FUSE 连接状态。
+   mount_point 是目标 ns 内的绝对路径（如 /storage/emulated/0），经 /proc/<pid>/root
+   访问，不必进入该命名空间。判据只有 statfs：它必然落到超级块、不被属性缓存挡住。 */
+int ns_mount_conn_state(int pid, const char* mount_point);
+
+/* 修复判据：目标进程已挂着项目 FUSE（has_project_fuse，来自挂载状态探测）**且**该挂载
+   的连接确实已断时，才需要先清理再重挂。
+   has_project_fuse=false 时一次探测都不做——没有项目挂载的进程（绝大多数）不因本判据
+   产生任何额外系统调用，行为与旧实现完全一致。 */
+bool ns_mount_needs_repair(int pid, const char* mount_point, bool has_project_fuse);
+
 /* 设置挂载点为共享 */
 int ns_make_shared(int pid, const char* target);
 /* 查找原生子挂载点 */
