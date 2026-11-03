@@ -25,6 +25,12 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
 /* 全局替换模式：对非目标应用卸载项目 FUSE 并 bind 回该用户备份的系统视图（幂等） */
 int perform_app_restore(const char* pkg, int pid, uid_t uid);
 
+/* 启动扫描：把「挂着项目 FUSE 但连接已断」的进程清理并重挂（injector 重启后
+   旧进程的挂载指向已中止的 FUSE 连接，访问存储一律 ENOTCONN）。
+   只处理连接确认已断的进程，健康/无法判定的一律不动；返回修复的进程数。
+   v2/v3（全局替换）下不适用，直接返回 0。 */
+int repair_stale_app_mounts_at_startup(void);
+
 /* 注入状态检查（跨文件）：复用挂载状态缓存，未命中时读取一次并写入缓存 */
 bool is_project_fuse_cached(int pid, const char* target_path);
 

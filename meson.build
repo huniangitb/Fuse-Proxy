@@ -40,10 +40,10 @@ _git_override = get_option('git_hash_override')
 _git_prog = find_program('git', required: false)
 
 # 水印必须在**构建期**取：旧实现用 add_project_arguments 在**配置期**固化哈希，
-# 之后只跑 ninja 的构建一直沿用 configure 那一刻的值（构建目录不重建就永远旧），
-# 现场取证读到的是几天前的提交——曾有版本 module.prop 写着新版本号、二进制里却是
-# 更早的哈希，被误判成「装的是老代码」。vcs_tag 是构建期命令，ninja 每次重跑；
-# 输出内容变化会触发依赖它的目标重编，因此水印恒等于本次构建时的 HEAD。
+# 之后只跑 ninja 的构建会一直沿用 configure 那一刻的值（配置目录没重建就一直旧），
+# 现场取证读到的是几天前的提交——曾有版本 module.prop 写 325、二进制里却是更早
+# 的哈希，误判成「装的是老代码」。vcs_tag 是构建期命令，ninja 每次重跑；输出文件
+# 内容变化会触发依赖它的目标重编，因此水印恒等于本次构建时的 HEAD。
 _nsp_sh = find_program('sh')
 if _git_override != ''
   # 显式指定（tarball / 无 git 环境）：不再询问 git
@@ -312,7 +312,7 @@ fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/vfs_synth.c', 'sr
   # pthread_create 截持：libfuse worker 默认命名 fuse_worker（见文件头），
   # 仅 fuse_daemon 编入（injector/log_monitor 自有线程均已自命名，无需截持）
   'src/daemon/fuse_thread_naming.c']
-injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c', 'src/injector/ns_mountinfo.c', 'src/injector/reaped_managed.c', 'src/injector/retry_queue.c', 'src/core/fast_pid.c']
+injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_mount_health.c', 'src/injector/ns_global_replace.c', 'src/injector/ns_mountinfo.c', 'src/injector/reaped_managed.c', 'src/injector/retry_queue.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
 install_bin_dir = 'bin'
@@ -397,7 +397,7 @@ else
   # 供 tests/test_global_replace.py 在私有挂载命名空间中模拟安卓视图验证。
   executable('global_replace_ctl',
     ['src/injector/global_replace_ctl.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c',
-     'src/injector/ns_mountinfo.c',
+     'src/injector/ns_mountinfo.c', 'src/injector/ns_mount_health.c',
      'src/injector/inject_target.c', 'src/injector/mount_manager.c',
       'src/core/fast_pid.c'] + common_sources,
     include_directories: all_inc_dirs,

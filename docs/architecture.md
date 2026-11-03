@@ -276,6 +276,7 @@ FUSE 回调（如 getattr）
 ### 5.1 注入流程
 
 1. injector 启动先 `inject_global_fuse` 挂载全局 FUSE；若 `com.android.providers.media.module` 在目标之列，惰性起媒体专属实例。
+1b. **就绪后的启动扫描**（v1）：`repair_stale_app_mounts_at_startup` 遍历进程，只处理「挂着项目 FUSE 但连接已断」的那些——injector 重启不重建旧进程命名空间里的挂载，它们此后访问存储一律 `ENOTCONN`（内核只把 superblock 标成断开，mountinfo 条目仍在），杀模块进程、重启模块都没用，只有杀应用进程或重启设备才恢复。判据分两层：挂载状态来自 `statx` 快路径 ⇒ 连接已证明可用，直接跳过、一次探测都不做；只有结论来自 mountinfo 兜底扫描时才做一次 `statfs`（`ns_mount_conn_state`，必落超级块、不被 FUSE 属性缓存挡住），返回 `ENOTCONN`/`ECONNREFUSED` 才清理重挂。v2/v3 不适用（emulated 由全局替换统一提供）。同一判据也挂在两条挂载路径的「已存在项目 FUSE ⇒ 跳过」分支之前：注入前先查一次，死连接先清再挂。
 2. 经 zygote 子进程检测（`fast_pid` + `/proc` 扫描，timerfd 驱动）发现新启动应用。
 3. `inject_target` 判定是否为目标（含 `SKIP_SYSTEM_APPS` 过滤、隔离进程过滤）。
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。

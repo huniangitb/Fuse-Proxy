@@ -8,6 +8,7 @@
 #include "injector.h"
 #include "common.h"
 #include "sys_pkg.h"
+#include "fast_pid.h"
 #include "fast_search.h"
 #include <stdio.h>
 #include <string.h>
@@ -53,6 +54,10 @@ typedef struct {
     bool backup_has_fuse;
     bool backup_has_fuse_daemon;
     bool backup_is_mounted;
+    /* target_has_fuse 来自 mountinfo 兜底扫描（快路径探测失败）时为 true：「挂着项目
+       FUSE」此时是确定的，但连接是否可用未知——死连接会让快路径的 statx 直接失败，
+       结论只能由扫描得出。判据见 ns_mount_needs_repair。 */
+    bool target_fuse_unverified;
 } MountState;
 
 /* MountState 缓存：避免为同一 PID 重复读取 /proc/<pid>/mountinfo
@@ -231,6 +236,9 @@ static bool read_mount_state(int pid, const char* target, const char* backup, Mo
                             if (has_fuse || (src_dev[0] && strcmp(devbuf, src_dev) == 0))
                                 st->target_has_fuse = true;
                             if (has_fuse_daemon) st->target_has_fuse_daemon = true;
+                            /* 结论来自扫描而非探测：条目在 ≠ 连接可用 */
+                            if (st->target_has_fuse || st->target_has_fuse_daemon)
+                                st->target_fuse_unverified = true;
                         }
                         if (backup_match) {
                             st->backup_is_mounted = true;
@@ -383,6 +391,23 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
         update_mount_cache(pid, &mnt);
     }
 
+    /* 既有挂载可能已经没人服务（injector/daemon 重启后应用命名空间里遗留的挂载仍
+       指向已中止的 FUSE 连接）：「已存在项目 FUSE」只说明条目在，不能说明视图可用；
+       直接跳过会让该进程此后每次访问存储都拿到 ENOTCONN。死连接清理后按正常路径重挂。
+       健康视图走到这里时 target_fuse_unverified 为 false（快路径探测本身就证明连接
+       可用），不产生任何额外请求。 */
+    if ((mnt.target_has_fuse || mnt.target_has_fuse_daemon) && mnt.target_fuse_unverified &&
+        ns_mount_needs_repair(pid, target_path, true)) {
+        LOG_WRN("既有 FUSE 挂载连接已断开，清理后重挂: %s(PID:%d, %s)", target_path, pid, pkg);
+        cleanup_app_mounts(pid, target_path, backup_path, uid);
+        invalidate_mount_cache(pid);
+        if (!read_mount_state(pid, target_path, backup_path, &mnt)) {
+            LOG_ERR("死连接清理后重读挂载状态失败: PID=%d, target=%s", pid, target_path);
+            return -1;
+        }
+        update_mount_cache(pid, &mnt);
+    }
+
     if (mnt.target_has_fuse || mnt.target_has_fuse_daemon) {
         LOG_DBG("挂载跳过: %s (PID: %d, %s) - 已经存在程序自身的 FUSE 挂载", target_path, pid, pkg);
         if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, pkg);
@@ -489,6 +514,19 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         update_mount_cache(pid, &mnt);
     }
 
+    /* 同 perform_app_mount：条目在 ≠ 连接可用，死连接先清理再按正常路径挂载 */
+    if ((mnt.target_has_fuse || mnt.target_has_fuse_daemon) && mnt.target_fuse_unverified &&
+        ns_mount_needs_repair(pid, target_path, true)) {
+        LOG_WRN("既有 FUSE 挂载连接已断开，清理后重挂: %s(PID:%d, %s)", target_path, pid, pkg);
+        cleanup_app_mounts(pid, target_path, backup_path, uid);
+        invalidate_mount_cache(pid);
+        if (!read_mount_state(pid, target_path, backup_path, &mnt)) {
+            LOG_ERR("死连接清理后重读挂载状态失败: PID=%d, target=%s", pid, target_path);
+            return -1;
+        }
+        update_mount_cache(pid, &mnt);
+    }
+
     if (mnt.target_has_fuse || mnt.target_has_fuse_daemon) {
         LOG_DBG("同步挂载跳过: %s (PID: %d, %s) - 已存在 FUSE 挂载", target_path, pid, pkg);
         return 0;
@@ -582,4 +620,55 @@ int perform_app_restore(const char* pkg, int pid, uid_t uid) {
         invalidate_mount_cache(pid);
     }
     return ret;
+}
+/* ================= 启动扫描：修复连接已断的既有挂载 =================
+ *
+ * 场景：injector（连同 fuse_daemon）被重启而设备没有重启——已注入的应用进程在自身
+ * 命名空间里仍留着旧挂载，它指向的 FUSE 连接已随旧 daemon 中止。这类进程此后每次
+ * 访问存储都拿到 ENOTCONN，而模块进程重启**不会**自愈：新 injector 只为新注入的进程
+ * 建挂载，旧进程的挂载表没人碰；只有杀掉应用进程或重启设备才恢复。
+ *
+ * 判据严格（健康进程零行为变化）：
+ *   - 快路径探测成功（ns_probe_target_view 拿到 dev）⇒ 连接可用，直接跳过；
+ *   - 结论来自 mountinfo 兜底（target_fuse_unverified）才做一次 statfs 活性探测；
+ *   - 只有探测明确返回 DEAD 才清理并重挂；UNKNOWN（权限/路径不存在）保持原行为。
+ * 非注入目标的进程只还原原生视图，不再挂载（与配置热对账同口径）。
+ */
+static int repair_stale_mount_cb(int pid, const char* cmd, void* data) {
+    int* repaired = (int*)data;
+    if (!is_process_safe_to_inject(cmd)) return 0;
+    uid_t uid = get_app_uid(pid);
+    char target_path[128];
+    get_target_storage_path(uid, target_path, sizeof(target_path));
+    MountState mnt;
+    if (!read_mount_state(pid, target_path, "", &mnt)) return 0;
+    if (!(mnt.target_has_fuse || mnt.target_has_fuse_daemon)) return 0;
+    if (!mnt.target_fuse_unverified) return 0;
+    if (!ns_mount_needs_repair(pid, target_path, true)) return 0;
+
+    char pkg[256];
+    snprintf(pkg, sizeof(pkg), "%s", cmd);
+    char* colon = strchr(pkg, ':');
+    if (colon) *colon = '\0';
+    char backup_path[PATH_MAX];
+    snprintf(backup_path, sizeof(backup_path), BACKUP_DIR "/storage");
+    LOG("启动扫描: %s(PID:%d) 的原 FUSE 挂载连接已断开，清理后重挂", pkg, pid);
+    cleanup_app_mounts(pid, target_path, backup_path, uid);
+    invalidate_mount_cache(pid);
+    if (is_target_app(pkg, uid, pid, false)) {
+        if (perform_app_mount(pkg, pid, uid, nullptr, "启动扫描重挂") != 0)
+            LOG_DBG("启动扫描重挂失败: %s(PID:%d)", pkg, pid);
+    } else {
+        LOG_DBG("启动扫描: %s(PID:%d) 非注入目标，保留还原后的原生视图", pkg, pid);
+    }
+    (*repaired)++;
+    return 0;
+}
+
+int repair_stale_app_mounts_at_startup(void) {
+    /* v2/v3：/storage/emulated 由全局替换统一提供，逐应用旧挂载不是机制的一部分 */
+    if (inject_is_global_replace()) return 0;
+    int repaired = 0;
+    fast_pid_each(repair_stale_mount_cb, &repaired);
+    return repaired;
 }
