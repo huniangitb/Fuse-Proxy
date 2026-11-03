@@ -82,4 +82,10 @@ _Static_assert(sizeof(NSP_DEFAULT_FILE_CONTEXT) == 33,
 
 #define NSP_LOG_DIR NSP_CONFIG_DIR "/log"
 
+/* FUSE 事件通道的两条抽象 UDS 名。服务端（fuse_daemon 的 fw_events.c）与
+   只读诊断（log_ctl 的归属检查）必须用同一份字面量，否则「谁绑着这个名字」
+   会被查成「没人绑」。 */
+#define NSP_EVENTS_SOCK_NAME "nsp_fs_events"
+#define NSP_EVENTS_QUERY_SOCK_NAME "nsp_fs_query"
+
 #endif /* NSP_CONSTANTS_H */

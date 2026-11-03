@@ -17,6 +17,7 @@
 #include "config_publisher.h"
 #include "sys_pkg.h"
 #include "build_info.h"
+#include "crash_tail.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -351,29 +352,51 @@ static void reload_injector_config() {
     setup_inotify_watches();
 }
 
-static void dump_crash_log_tail() {
+/* 崩溃诊断：只摊「本次守护进程启动之后」写进 fuse_crash.log 的 stderr。
+   该文件跨启动 append（见 inject_global_fuse 的 O_APPEND 打开），直接把尾部
+   16KB 交给现场，会把上一次启动的 linker 报错读成本次崩溃原因。起点用 spawn
+   时记下的文件大小（crash_log_start），窗口计算见 crash_tail.h。 */
+static void dump_crash_log_tail(off_t run_start) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/fuse_crash.log", LOG_DIR);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
-    char buf[16384];
-    off_t end = lseek(fd, 0, SEEK_END);
-    off_t start = (end > (off_t)sizeof(buf)) ? end - (off_t)sizeof(buf) : 0;
-    lseek(fd, start, SEEK_SET);
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return;
+    }
+    const size_t cap = 16384;
+    CrashTailWindow win;
+    if (!crash_tail_window(st.st_size, run_start, cap, &win)) {
+        close(fd);
+        LOG_ERR("===== FUSE 崩溃诊断信息 =====");
+        LOG_ERR("| 本次守护进程启动后 fuse_crash.log 无新增输出（起点偏移 %lld，当前大小 %lld）",
+                (long long)run_start, (long long)st.st_size);
+        LOG_ERR("===== 诊断结束 =====");
+        return;
+    }
+    char buf[16384 + 1];
+    size_t want = win.len < cap ? win.len : cap;
+    if (lseek(fd, win.start, SEEK_SET) < 0) {
+        close(fd);
+        return;
+    }
+    ssize_t n = read(fd, buf, want);
     close(fd);
     if (n > 0) {
         buf[n] = '\0';
         char* p = buf;
-        if (start > 0) {
-            p = memchr(buf, '\n', n);
+        if (win.drop_first_line) {
+            p = memchr(buf, '\n', (size_t)n);
             if (p)
                 p++;
             else
                 p = buf;
         }
         if (*p) {
-            LOG_ERR("===== FUSE 崩溃诊断信息 =====");
+            LOG_ERR("===== FUSE 崩溃诊断信息（仅本次启动后，起点偏移 %lld）=====",
+                    (long long)win.start);
             char* line = p;
             while (line && *line) {
                 char* nl = strchr(line, '\n');
@@ -418,7 +441,7 @@ void handle_fuse_ready_event(void* ptr) {
                         /* ① daemon 已退出：连接随进程死亡而中止 */
                         LOG_ERR("fuse_daemon(pid=%d) 已退出，连接随之中止（崩溃或被杀）",
                                 g_global_fuse.fuse_pid);
-                        dump_crash_log_tail();
+                        dump_crash_log_tail(g_global_fuse.crash_log_start);
                     } else {
                         /* ② daemon 存活但连接死亡：内核拒绝了 INIT 回包（fc->conn_error）。
                            典型：DAX 内核把回包 legacy bit31 误读为 FUSE_MAP_ALIGNMENT，
@@ -440,7 +463,7 @@ void handle_fuse_ready_event(void* ptr) {
                             if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) == 0)
                                 kill(g_global_fuse.fuse_pid, SIGKILL);
                         }
-                        dump_crash_log_tail();
+                        dump_crash_log_tail(g_global_fuse.crash_log_start);
                     }
                     g_fuse_ready = 0;
                     g_pending_remount = 1;
@@ -480,7 +503,7 @@ void handle_fuse_ready_event(void* ptr) {
         }
     } else {
         LOG_ERR("FUSE 异步启动失败，管道未收到就绪字符");
-        dump_crash_log_tail();
+        dump_crash_log_tail(g_global_fuse.crash_log_start);
     }
     free(ctx);
 }
@@ -515,10 +538,21 @@ static void inject_global_fuse() {
         __sync_lock_release(&g_fuse_starting);
         return;
     }
+    /* fuse_crash.log 在 fork 之前打开并记下当前大小：daemon 的 stderr 追加写这个
+       文件，记下的偏移就是「本次启动」的起点，诊断只读它之后的内容（历史启动的
+       报错不能被读成本次崩溃原因）。子进程直接复用这个 fd。 */
+    int crash_fd =
+        open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    g_global_fuse.crash_log_start = -1;
+    if (crash_fd >= 0) {
+        struct stat crash_st;
+        if (fstat(crash_fd, &crash_st) == 0) g_global_fuse.crash_log_start = crash_st.st_size;
+    }
     pid_t child = fork();
     if (child == -1) {
         close(ready_pipe[0]);
         close(ready_pipe[1]);
+        if (crash_fd >= 0) close(crash_fd);
         __sync_lock_release(&g_fuse_starting);
         return;
     }
@@ -537,17 +571,13 @@ static void inject_global_fuse() {
         }
         close(fd);
         if (mkdir(g_global_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
-        /* fuse_crash.log 始终创建（O_CREAT）：确保首次崩溃即捕获完整
-           backtrace——daemon 的 stderr 重定向到此文件（crash_handler 的
-           backtrace 帧写 stderr），崩溃后 injector 的 dump_crash_log_tail()
-           读取其尾部。此前不带 O_CREAT 导致文件从不创建、stderr 不重定向，
-           backtrace 全部丢失（设备上 fuse_crash.log 从未出现即此原因） */
-        int log_fd =
-            open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
-        if (log_fd >= 0) {
-            dup2(log_fd, STDERR_FILENO);
-            dup2(log_fd, STDOUT_FILENO);
-            close(log_fd);
+        /* stderr 接到父进程开好的 crash_fd：crash_handler 的 backtrace 帧写
+           stderr，崩溃后由 dump_crash_log_tail(crash_log_start) 从「本次启动」
+           的偏移开始摊开（O_CREAT 保证首次崩溃即能捕获完整 backtrace）。 */
+        if (crash_fd >= 0) {
+            dup2(crash_fd, STDERR_FILENO);
+            dup2(crash_fd, STDOUT_FILENO);
+            close(crash_fd);
         }
         char exe[256];
         snprintf(exe, sizeof(exe), "%s/fuse_daemon", get_self_dir());
@@ -616,6 +646,7 @@ static void inject_global_fuse() {
         _exit(13);
     }
     close(ready_pipe[1]);
+    if (crash_fd >= 0) close(crash_fd);
     g_global_fuse.fuse_pid = child;
     FuseReadyCtx* ctx = malloc(sizeof(FuseReadyCtx));
     if (ctx) {
@@ -654,10 +685,19 @@ static void inject_media_fuse() {
     ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
     int ready_pipe[2];
     if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) return;
+    /* 同全局实例：fork 前打开 crash log 并记下偏移，子进程只管接 stderr */
+    int crash_fd =
+        open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    g_media_fuse.crash_log_start = -1;
+    if (crash_fd >= 0) {
+        struct stat crash_st;
+        if (fstat(crash_fd, &crash_st) == 0) g_media_fuse.crash_log_start = crash_st.st_size;
+    }
     pid_t child = fork();
     if (child == -1) {
         close(ready_pipe[0]);
         close(ready_pipe[1]);
+        if (crash_fd >= 0) close(crash_fd);
         return;
     }
     if (child == 0) {
@@ -675,17 +715,13 @@ static void inject_media_fuse() {
         }
         close(fd);
         if (mkdir(g_media_fuse.mnt_path, 0755) != 0 && errno != EEXIST) _exit(12);
-        /* fuse_crash.log 始终创建（O_CREAT）：确保首次崩溃即捕获完整
-           backtrace——daemon 的 stderr 重定向到此文件（crash_handler 的
-           backtrace 帧写 stderr），崩溃后 injector 的 dump_crash_log_tail()
-           读取其尾部。此前不带 O_CREAT 导致文件从不创建、stderr 不重定向，
-           backtrace 全部丢失（设备上 fuse_crash.log 从未出现即此原因） */
-        int log_fd =
-            open(LOG_DIR "/fuse_crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
-        if (log_fd >= 0) {
-            dup2(log_fd, STDERR_FILENO);
-            dup2(log_fd, STDOUT_FILENO);
-            close(log_fd);
+        /* stderr 接到父进程开好的 crash_fd：crash_handler 的 backtrace 帧写
+           stderr，崩溃后由 dump_crash_log_tail(crash_log_start) 从「本次启动」
+           的偏移开始摊开（O_CREAT 保证首次崩溃即能捕获完整 backtrace）。 */
+        if (crash_fd >= 0) {
+            dup2(crash_fd, STDERR_FILENO);
+            dup2(crash_fd, STDOUT_FILENO);
+            close(crash_fd);
         }
         char exe[256];
         snprintf(exe, sizeof(exe), "%s/fuse_daemon", get_self_dir());
@@ -727,6 +763,7 @@ static void inject_media_fuse() {
         _exit(13);
     }
     close(ready_pipe[1]);
+    if (crash_fd >= 0) close(crash_fd);
     g_media_fuse.fuse_pid = child;
     close(ready_pipe[0]);
 }
@@ -789,7 +826,7 @@ static void check_and_recover_fuse() {
     if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) != 0) {
         g_fuse_ready = 0;
         int status = 0;
-        if (reaped_managed_exited(g_global_fuse.fuse_pid, &status)) dump_crash_log_tail();
+        if (reaped_managed_exited(g_global_fuse.fuse_pid, &status)) dump_crash_log_tail(g_global_fuse.crash_log_start);
         g_global_fuse.fuse_pid = 0;
         time_t now = time(nullptr);
         if (now - g_global_fuse.last_crash_time < 60)

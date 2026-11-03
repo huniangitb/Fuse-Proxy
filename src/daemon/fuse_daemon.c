@@ -3502,8 +3502,17 @@ int main(int argc, char* argv[]) {
             /* 事件通道（nsp_fs_events / nsp_fs_query）：必须在 fuse_daemonize
                之后建立——后台化会 fork，fork 不保留任何已存在线程。默认
                [GLOBAL] FUSE_EVENTS OFF 时这里立即返回，零线程零 socket。
-               启动失败不致命：通道是附加能力，起不来不影响挂载与 IO。 */
-            if (fw_events_start() != 0) LOG_WRN("FUSE 事件通道启动失败（不影响挂载与 IO）");
+               启动失败不致命：通道是附加能力，起不来不影响挂载与 IO。
+
+               归属只给全局实例：媒体实例（--media-fuse）只服务 MediaProvider
+               自己的挂载，事件本来就该由全局实例发布。此前两个实例都往同一个
+               抽象名上 bind，谁先绑谁赢——输的那条实例的应用事件永远发不出去，
+               且只有一条 WARN 滚在日志里（用户视角：事件功能随机哑掉）。 */
+            if (g_is_media_fuse) {
+                LOG("媒体实例不建立事件通道：归属固定为全局实例");
+            } else if (fw_events_start() != 0) {
+                LOG_WRN("FUSE 事件通道启动失败（不影响挂载与 IO）");
+            }
             LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint,
                 (fopts.singlethread || g_fuse_threads == 0)
                     ? "单线程"

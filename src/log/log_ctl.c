@@ -23,6 +23,7 @@
 #include "nsp_util.h"
 #include "nsp_rule_file.h"
 #include "config_parser.h"
+#include "nsp_events_status.h"
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -59,6 +60,8 @@ void usage(const char* prog) {
     printf("\n注入状态命令:\n");
     printf("  list-injected [api]        列出已注入应用列表\n");
     printf("  list-users [api]           列出当前活跃用户及对应应用数\n");
+    printf("\n事件通道诊断命令:\n");
+    printf("  events [api]               事件通道归属：谁绑着 nsp_fs_events，状态是否正常\n");
     printf("\n配置查看命令:\n");
     printf("  get-config [api]           获取当前内存中的解析后配置（JSON）\n");
     printf("  get-config --static [api]  从磁盘读取原始规则文件内容（JSON）\n");
@@ -466,8 +469,115 @@ static void handle_reload_config(bool api_mode) {
     }
 }
 
+/* ========== 事件通道归属 ========== */
+/* [GLOBAL] FUSE_EVENTS 只在配置里：log_ctl 是短命 CLI，就地解析一次即可。 */
+static bool events_enabled_from_config(void) {
+    load_config_rules(g_main_conf);
+    return g_global_cfg.fuse_events;
+}
+
+static const char* owner_kind_name(int kind) {
+    switch (kind) {
+        case NSP_EVENTS_OWNER_GLOBAL: return "global";
+        case NSP_EVENTS_OWNER_MEDIA: return "media";
+        case NSP_EVENTS_OWNER_FOREIGN: return "foreign";
+        default: return "none";
+    }
+}
+
+static const char* owner_kind_display(int kind) {
+    switch (kind) {
+        case NSP_EVENTS_OWNER_GLOBAL: return "全局实例";
+        case NSP_EVENTS_OWNER_MEDIA: return "媒体实例";
+        case NSP_EVENTS_OWNER_FOREIGN: return "非本项目进程";
+        default: return "未知";
+    }
+}
+
+static void events_json_add(json_object* root, const NspEventsStatus* st) {
+    json_object* ev = json_object_new_object();
+    json_object_object_add(ev, "enabled", json_object_new_boolean(st->enabled));
+    json_object_object_add(ev, "state", json_object_new_string(nsp_events_state(st)));
+    json_object_object_add(ev, "hint", json_object_new_string(nsp_events_hint(st)));
+
+    json_object* daemons = json_object_new_object();
+    json_object_object_add(daemons, "total", json_object_new_int(st->daemon_count));
+    json_object_object_add(daemons, "global", json_object_new_int(st->global_daemons));
+    json_object_object_add(daemons, "media", json_object_new_int(st->media_daemons));
+    json_object_object_add(ev, "daemons", daemons);
+
+    json_object* events = json_object_new_object();
+    json_object_object_add(events, "socket", json_object_new_string(NSP_EVENTS_SOCK_NAME));
+    json_object_object_add(events, "inode", json_object_new_int64((int64_t)st->events_inode));
+    json_object_object_add(events, "owner_pid", json_object_new_int(st->events_owner_pid));
+    json_object_object_add(events, "owner_kind",
+                           json_object_new_string(owner_kind_name(st->events_owner)));
+    json_object_object_add(ev, "event_socket", events);
+
+    json_object* query = json_object_new_object();
+    json_object_object_add(query, "socket", json_object_new_string(NSP_EVENTS_QUERY_SOCK_NAME));
+    json_object_object_add(query, "inode", json_object_new_int64((int64_t)st->query_inode));
+    json_object_object_add(query, "owner_pid", json_object_new_int(st->query_owner_pid));
+    json_object_object_add(query, "owner_kind",
+                           json_object_new_string(owner_kind_name(st->query_owner)));
+    json_object_object_add(ev, "query_socket", query);
+
+    json_object* last = json_object_new_object();
+    json_object_object_add(last, "present", json_object_new_boolean(st->last_fail_present));
+    json_object_object_add(last, "path", json_object_new_string(st->last_fail_path));
+    json_object_object_add(last, "line", json_object_new_string(st->last_fail));
+    json_object_object_add(ev, "last_failure", last);
+
+    json_object_object_add(root, "events", ev);
+}
+
+static void handle_events(bool api_mode) {
+    NspEventsStatus st;
+    nsp_events_status_collect(&st, events_enabled_from_config(), LOG_DIR);
+    const char* state = nsp_events_state(&st);
+    const char* hint = nsp_events_hint(&st);
+
+    if (api_mode) {
+        json_object* root = json_object_new_object();
+        json_object_object_add(root, "timestamp", json_object_new_int64((int64_t)time(NULL)));
+        events_json_add(root, &st);
+        json_api_finish(true, "\"events\"",
+                        json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
+        json_object_put(root);
+        return;
+    }
+
+    printf("===== 事件通道归属 =====\n");
+    printf("[GLOBAL] FUSE_EVENTS: %s\n", st.enabled ? "开" : "关");
+    printf("fuse_daemon 实例: %d（全局 %d、媒体 %d）\n", st.daemon_count, st.global_daemons,
+           st.media_daemons);
+    if (st.events_inode > 0) {
+        if (st.events_owner_pid > 0)
+            printf("%s: 持有者 PID %d（%s），inode %ld\n", NSP_EVENTS_SOCK_NAME,
+                   st.events_owner_pid, owner_kind_display(st.events_owner), st.events_inode);
+        else
+            printf("%s: 名字已绑定（inode %ld），但持有者进程不可见\n", NSP_EVENTS_SOCK_NAME,
+                   st.events_inode);
+    } else {
+        printf("%s: 没有进程绑定\n", NSP_EVENTS_SOCK_NAME);
+    }
+    if (st.query_inode > 0)
+        printf("%s: 持有者 PID %d（%s），inode %ld\n", NSP_EVENTS_QUERY_SOCK_NAME,
+               st.query_owner_pid, owner_kind_display(st.query_owner), st.query_inode);
+    else
+        printf("%s: 没有进程绑定\n", NSP_EVENTS_QUERY_SOCK_NAME);
+    printf("状态: %s\n", state);
+    if (hint && *hint) printf("提示: %s\n", hint);
+    if (st.last_fail_present) printf("上次启动失败记录: %s\n  %s\n", st.last_fail_path, st.last_fail);
+}
+
 /* ========== 系统状态 ========== */
 static void handle_status(bool api_mode) {
+    /* 事件归属要看 [GLOBAL] FUSE_EVENTS，内存中的 app 计数也要有配置才有意义：
+       这里统一解析一次，避免两处各调一遍 load_config_rules。 */
+    bool events_on = events_enabled_from_config();
+    NspEventsStatus events_st;
+    nsp_events_status_collect(&events_st, events_on, LOG_DIR);
     int injector_pid = read_pid_file(INJECTOR_PID_PATH);
     bool injector_alive = (injector_pid > 0 && kill(injector_pid, 0) == 0);
     int fuse_pid = 0;
@@ -553,6 +663,8 @@ static void handle_status(bool api_mode) {
         json_object_object_add(system, "pid_file", json_object_new_string(INJECTOR_PID_PATH));
         json_object_object_add(root, "system", system);
 
+        events_json_add(root, &events_st);
+
         json_api_finish(true, "\"status\"",
                         json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN));
         json_object_put(root);
@@ -564,6 +676,15 @@ static void handle_status(bool api_mode) {
         printf("主配置文件: %s (%d 字节)\n", g_main_conf, main_conf_size);
         printf("应用规则文件数: %d\n", app_rule_files);
         printf("内存中已解析应用: %d\n", mem_app_count);
+        printf("事件通道: %s（%s）\n", nsp_events_state(&events_st),
+               events_st.enabled ? "已启用" : "未启用");
+        if (events_st.events_owner_pid > 0)
+            printf("  nsp_fs_events 持有者: PID %d（%s）\n", events_st.events_owner_pid,
+                   owner_kind_display(events_st.events_owner));
+        {
+            const char* hint = nsp_events_hint(&events_st);
+            if (hint && *hint) printf("  提示: %s\n", hint);
+        }
     }
 }
 
@@ -1206,6 +1327,10 @@ int main(int argc, char* argv[]) {
     }
     if (strcmp(pos_args[0], "status") == 0) {
         handle_status(api_mode);
+        return 0;
+    }
+    if (strcmp(pos_args[0], "events") == 0) {
+        handle_events(api_mode);
         return 0;
     }
     if (strcmp(pos_args[0], "set-rule") == 0) {

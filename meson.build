@@ -293,6 +293,10 @@ all_inc_dirs += include_directories('.')
 common_sources = [
     'src/core/common.c',
     'src/core/build_info.c',
+    # 崩溃诊断窗口（只读「本次启动后」的 fuse_crash.log）与事件通道归属快照：
+    # 两者都被 injector / fuse_daemon / log_ctl 共用，不引入项目全局依赖。
+    'src/core/crash_tail.c',
+    'src/core/nsp_events_status.c',
     'src/core/path_trie.c',
     'src/config/config_parser.c',
     'src/config/path_vars.c',

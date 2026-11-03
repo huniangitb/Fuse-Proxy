@@ -183,6 +183,29 @@ SUITE_MAP = [
       "NS_BACKUP_UNKNOWN"),
      "mountinfo 读取容量语义 / 未知态不降级为未挂载"),
 
+    # ── 事件通道归属（fw_events.c + fuse_daemon.c + nsp_events_status.c + log_ctl.c）──
+    # nsp_fs_events / nsp_fs_query 是抽象 UDS，名字唯一：全局实例与媒体实例都曾尝试
+    # bind，归属由启动竞态决定，输的那条实例的应用事件一条也发不出去，外部只表现为
+    # 「事件功能随机全哑」。现在媒体实例不参与事件通道，归属固定给全局实例；任何一步
+    # 失败都写 log/events_socket.status，log_ctl events 能查到持有者与处置提示。
+    (("test_events_owner.py",),
+     ("src/daemon/fw_events.c", "src/core/nsp_events_status.c",
+      "include/nsp_events_status.h", "src/log/log_ctl.c",
+      "include/nsp_constants.h", "src/daemon/fuse_daemon.c"),
+     ("fw_events_start", "fw_events_record_result", "nsp_events_status_collect",
+      "nsp_events_state"),
+     "事件通道归属固定给全局实例 / 失败可从 log_ctl 查"),
+
+    # ── 崩溃诊断窗口（crash_tail.c + injector.c）──
+    # fuse_crash.log 是 append 打开的长期文件，历次启动的 stderr 都在里面；诊断原先
+    # 摊尾部固定 16KB，会把上一轮启动的 linker 报错读成「本次崩溃原因」。窗口现在锚在
+    # 本次 daemon 启动时的文件大小上，起点不可信时才退回尾部并丢弃可能的半行。
+    (("test_crash_tail.py",),
+     ("src/core/crash_tail.c", "include/crash_tail.h",
+      "src/injector/injector.c", "include/injector.h"),
+     ("crash_tail_window", "dump_crash_log_tail", "crash_log_start"),
+     "崩溃诊断只取本次 daemon 启动之后的输出"),
+
     (("test_reaped_managed.py",),
      ("src/injector/reaped_managed.c", "src/injector/reaped_managed.h",
       "src/injector/injector.c"),
@@ -366,6 +389,8 @@ LAYERS = {
             "test_mount_liveness.py",
             "test_mountinfo_dynamic.py",
             "test_mount_state_read.py",
+            "test_events_owner.py",
+            "test_crash_tail.py",
             "test_log_ctl_rules.py",
             "test_commit_msg_lint.py",
             "test_build_scripts.py",
@@ -561,6 +586,8 @@ PARALLEL_SAFE = frozenset({
     "test_mountinfo_dynamic.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap=fopen，
                                   # 合成 mountinfo，无挂载/无 daemon
     "test_mount_state_read.py",   # cc 直编 mount_manager.c + 桩，合成 mountinfo，无挂载/无 daemon
+    "test_events_owner.py",       # cc 直编 nsp_events_status.c + 只读 /proc 快照，不起 daemon
+    "test_crash_tail.py",         # cc 直编 crash_tail.c 纯函数，无文件/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
     "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
