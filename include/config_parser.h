@@ -171,7 +171,7 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
 char* clean_path_string(char* str);
 void strip_trailing_slash(char* path);
 /* 变量展开后的规则路径归一（折叠开头重复 '/'、剥离存储根别名 /storage/emulated/<N>
-   与 /sdcard、/mnt/sdcard、补前导 '/'、无通配符时去尾斜杠）。false = 放不下。 */
+   与 /sdcard、/mnt/sdcard、/storage/self/primary、补前导 '/'、无通配符时去尾斜杠）。false = 放不下。 */
 bool normalize_expanded_rule_path(const char* in, char* out, size_t outsz);
 /* mkdir_recursive_p 声明归 common.h 所有（实现已迁移至 common.c），此处不重复声明 */
 void print_active_rules(const char* pkg, int pid, uid_t uid, const char* trigger_source);

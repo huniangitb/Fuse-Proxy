@@ -7,7 +7,7 @@
 bool has_path_var(const char* s);
 bool pkg_resolvable(const char* pkg);
 bool is_system_abs_path(const char* path);
-/* 外部存储根别名归一：/storage/emulated/<N>、/sdcard、/mnt/sdcard →
+/* 外部存储根别名归一：/storage/emulated/<N>、/sdcard、/mnt/sdcard、/storage/self/primary →
    以 '/' 开头的剩余路径（根为 "/"）；其余输入原样返回。 */
 const char* nsp_strip_storage_prefix(const char* path);
 
