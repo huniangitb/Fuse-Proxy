@@ -63,6 +63,21 @@ def static_contract():
             continue
         if "is_virtual_own_pkg_dir" not in body:
             errs.append(fn + " 的虚拟目录兜底未接入 is_virtual_own_pkg_dir")
+    init = func_body(src, "static void vfs_readdir_ctx_init", 1800)
+    if not init:
+        errs.append("找不到 vfs_readdir_ctx_init")
+    elif "sub_path_is_storage_android_dir" not in init:
+        errs.append("vfs_readdir_ctx_init 的 is_android_dir 未用存储根判定"
+                    "（尾段匹配会让嵌套 Android 目录也补 data/obb）")
+    if "sub_path_is_android_dir(" in src:
+        errs.append("fuse_daemon 仍引用尾段匹配的 sub_path_is_android_dir")
+    children = func_body(src, "static bool vfs_readdir_fill_android_children", 900)
+    if not children or "d->is_android_dir" not in children:
+        errs.append("vfs_readdir_fill_android_children 未由 d->is_android_dir 守门")
+    vis = func_body(src, "static NspVisibility vfs_entry_visibility", 9000)
+    for need in ('"/Android/data"', '"/Android/obb"'):
+        if vis and need not in vis:
+            errs.append("vfs_entry_visibility 缺少根层精确判定 " + need)
     return errs
 
 

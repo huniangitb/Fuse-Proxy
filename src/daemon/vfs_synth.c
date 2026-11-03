@@ -28,30 +28,27 @@ bool sub_path_tail_is(const char* sub_path, const char* name) {
     return bl == strlen(name) && memcmp(base, name, bl) == 0;
 }
 
-/* 是否是 /Android 目录本身（含带用户层的 /<uid>/Android） */
-bool sub_path_is_android_dir(const char* sub_path) {
-    return sub_path_tail_is(sub_path_strip_user_layer(sub_path), "Android");
+/* 剥用户层后是否恰好等于 want（尾部单个 '/' 可接受，否则必须是结尾） */
+static bool path_is_stripped(const char* sub_path, const char* want) {
+    const char* p = sub_path_strip_user_layer(sub_path);
+    if (!p) return false;
+    size_t len = strlen(want);
+    if (strncmp(p, want, len) != 0) return false;
+    return p[len] == '\0' || (p[len] == '/' && p[len + 1] == '\0');
 }
 
-/* 是否是 /Android/data 或 /Android/obb 目录本身（含带用户层的形态） */
+bool sub_path_is_storage_android_dir(const char* sub_path) {
+    return path_is_stripped(sub_path, "/Android");
+}
+
 bool sub_path_is_android_container(const char* sub_path) {
-    const char* p = sub_path_strip_user_layer(sub_path);
-    if (!sub_path_tail_is(p, "data") && !sub_path_tail_is(p, "obb")) return false;
-    char parent[PATH_MAX];
-    strncpy(parent, p, sizeof(parent) - 1);
-    parent[sizeof(parent) - 1] = '\0';
-    char* last = strrchr(parent, '/');
-    if (!last) return false;
-    *last = '\0';
-    return sub_path_is_android_dir(parent);
+    return path_is_stripped(sub_path, "/Android/data") ||
+           path_is_stripped(sub_path, "/Android/obb");
 }
 
 bool is_android_skel_dir(const char* sub_path) {
-    const char* p = sub_path_strip_user_layer(sub_path);
-    if (strcmp(p, "/Android") == 0 || strcmp(p, "/Android/") == 0) return true;
-    if (strcmp(p, "/Android/data") == 0 || strcmp(p, "/Android/data/") == 0) return true;
-    if (strcmp(p, "/Android/obb") == 0 || strcmp(p, "/Android/obb/") == 0) return true;
-    return false;
+    return sub_path_is_storage_android_dir(sub_path) ||
+           sub_path_is_android_container(sub_path);
 }
 
 bool is_virtual_own_pkg_dir(const char* sub_path, const char* pkg) {
