@@ -22,6 +22,30 @@ static bool starts_with_root(const char* path, const char* root) {
     return c == '\0' || c == '/';
 }
 
+/* 存储根别名剥离：/storage/emulated/<N>、/sdcard、/mnt/sdcard 都指向
+   同一外部存储根，规则路径与重定向目标统一剥成"/剩余路径"形态（返回以 '/'
+   开头的剩余路径，或 "/"）。其余路径原样返回。 */
+const char* nsp_strip_storage_prefix(const char* path) {
+    if (!path) return path;
+    const size_t emu = sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1;
+    if (strncmp(path, NSP_ANDROID_EMULATED_ROOT "/", emu) == 0) {
+        const char* p = path + emu;
+        while (*p && isdigit((unsigned char)*p)) p++;
+        if (*p == '/') return p;
+        if (*p == '\0') return "/";
+        return p - 1;
+    }
+    static const char* const aliases[] = {"/sdcard", "/mnt/sdcard"};
+    for (size_t i = 0; i < sizeof aliases / sizeof aliases[0]; i++) {
+        const size_t al = strlen(aliases[i]);
+        if (strncmp(path, aliases[i], al) != 0) continue;
+        const char* p = path + al;
+        if (*p == '/') return p;
+        if (*p == '\0') return "/";
+    }
+    return path;
+}
+
 bool is_system_abs_path(const char* path) {
     if (!path || path[0] != '/') return false;
     return starts_with_root(path, "/data") || starts_with_root(path, "/mnt") ||
@@ -346,6 +370,11 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
         rest = t + emu_prefix_len;
         while (*rest && isdigit((unsigned char)*rest)) rest++;
         if (*rest == '/') rest++;
+    } else if (strncmp(t, "/sdcard", 7) == 0 || strncmp(t, "/mnt/sdcard", 11) == 0) {
+        /* /sdcard、/mnt/sdcard 与 /storage/emulated/<N> 同指当前用户存储：
+           剥掉别名后按剩余路径合成，避免落成 <STORAGE_BASE>/<uid>/sdcard/... */
+        const char* q = nsp_strip_storage_prefix(t);
+        rest = (q[0] == '/') ? q + 1 : q;
     } else if (is_system_abs_path(t)) {
         /* 系统绝对路径（/data、/mnt、/storage 开头，非挂载镜像）：原样使用。
            放不下即失效——截断的绝对路径会指向另一个（更浅的）位置 */

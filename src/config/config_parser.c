@@ -345,19 +345,10 @@ static char* get_next_token(char** ptr) {
     }
     return start;
 }
+/* 存储根别名剥离统一实现在 path_vars.c（/storage/emulated/<N>、/sdcard、
+   /mnt/sdcard）——重定向目标的运行期合成都用同一份，避免两处漂移。 */
 static const char* strip_storage_prefix(const char* path) {
-    /* 前缀含尾斜杠：sizeof(字面量)-1 = 18（NSP_ANDROID_EMULATED_ROOT 本身 17 字符） */
-    if (strncmp(path, NSP_ANDROID_EMULATED_ROOT "/", sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1) ==
-        0) {
-        const char* p = path + sizeof(NSP_ANDROID_EMULATED_ROOT "/") - 1;
-        while (*p && isdigit((unsigned char)*p)) p++;
-        if (*p == '/') return p;    /* /storage/emulated/0/Download -> /Download */
-        if (*p == '\0') return "/"; /* /storage/emulated/0 -> / */
-        /* 异常形态:缺数字 user_id 或后跟非数字(如 /storage/emulated/Download)。
-           把 p 退回非数字起始位置,前面补 '/',让残留当子路径(与正常 emulated 剥离一致)。 */
-        return p - 1;
-    }
-    return path;
+    return nsp_strip_storage_prefix(path);
 }
 static int cmp_redir(const void* a, const void* b) {
     return (int)strlen(((const RedirectRule*)b)->virtual_prefix) -
@@ -407,6 +398,24 @@ static bool normalize_rule_path(const char* in, char* out, size_t outsz, bool ke
     const char* p = strip_storage_prefix(in);
     bool ok = (p[0] == '/' || (keep_star_head && p[0] == '*')) ? path_fmt(out, outsz, "%s", p)
                                                                : path_fmt(out, outsz, "/%s", p);
+    if (!ok) return false;
+    if (strpbrk(out, "*?[]") == nullptr) strip_trailing_slash(out);
+    return true;
+}
+
+/* 展开后的规则路径归一（br_linear_match 用）：变量值可能自带前导 '/'，而
+   「以变量开头」的规则在解析期已被补上一个 '/'（normalize_rule_path），展开
+   会拼出 "//storage/..."，与剥层后的 sub_path 永不相等；变量值也可能写成
+   /sdcard/... 或 /storage/emulated/0/...。故在匹配前把展开结果按静态规则的
+   同一套口径再归一一次：折叠开头重复 '/'、剥离存储根别名、补前导 '/'、无
+   通配符时去尾斜杠。只折叠**开头**的重复斜杠——路径内部的 "//" 可能与真实
+   文件名有关，不得改动。返回 false = 放不下 out（已置空，调用方丢弃该规则）。 */
+bool normalize_expanded_rule_path(const char* in, char* out, size_t outsz) {
+    if (!in || !out || outsz == 0) return false;
+    while (in[0] == '/' && in[1] == '/') in++;
+    const char* p = strip_storage_prefix(in);
+    bool ok = (p[0] == '/' || p[0] == '*') ? path_fmt(out, outsz, "%s", p)
+                                          : path_fmt(out, outsz, "/%s", p);
     if (!ok) return false;
     if (strpbrk(out, "*?[]") == nullptr) strip_trailing_slash(out);
     return true;
@@ -747,6 +756,11 @@ static void parse_redirect_rule(AppConfig* cur, char* p_ptr, int line_num, const
         while (*p && isdigit((unsigned char)*p)) p++;
         if (*p == '/') p++;
         ok = path_fmt(real_target, sizeof real_target, "?/%s", p);
+    } else if (strncmp(v2, "/sdcard", 7) == 0 || strncmp(v2, "/mnt/sdcard", 11) == 0) {
+        /* /sdcard、/mnt/sdcard 是当前用户存储的别名：与 /storage/emulated 分支
+           同口径转成 "?<剩余路径>"，否则目标会被当成存储根下的子目录 */
+        const char* p = strip_storage_prefix(v2);
+        ok = path_fmt(real_target, sizeof real_target, "?%s", p);
     } else if (is_system_abs_path(v2)) {
         ok = path_fmt(real_target, sizeof real_target, "%s", v2);
     } else {

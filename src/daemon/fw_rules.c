@@ -452,13 +452,17 @@ static bool br_linear_match(char* const* rules, int count, const char* sub_path,
         if (!rules[i]) continue;
         const char* rule = rules[i];
         char expanded[PATH_MAX];
+        char normalized[PATH_MAX];
         const char* match_str = rule;
         if (has_path_var(rule)) {
             if (!pkg_resolvable(current_pkg)) continue;
             if (!expand_path_vars(rule, expanded, sizeof expanded, scope, &g_global_cfg,
                                   current_pkg))
                 continue;
-            match_str = expanded;
+            /* 展开结果须与静态规则同形态（变量值可能自带前导 '/'、或写
+               /sdcard、/storage/emulated/0 前缀）——不归一会得到 "//storage/..." */
+            if (!normalize_expanded_rule_path(expanded, normalized, sizeof normalized)) continue;
+            match_str = normalized;
         }
         if (fnmatch(match_str, sub_path, 0) == 0) return true;
         size_t len = strlen(match_str);

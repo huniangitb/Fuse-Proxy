@@ -41,6 +41,9 @@ int main(void) {
     check("? relative strip", "?/foo", 0, 1, "/data/media/0/foo");
     check("? relative uid10", "?/bar", 10, 1, "/data/media/10/bar");
     check("storage emulated", "/storage/emulated/0/foo", 7, 1, "/data/media/7/foo");
+    check("/sdcard alias", "/sdcard/foo", 0, 1, "/data/media/0/foo");
+    check("/mnt/sdcard alias", "/mnt/sdcard/bar", 3, 1, "/data/media/3/bar");
+    check("/sdcard2 not alias", "/data/sdcard2/x", 0, 1, "/data/sdcard2/x");
     check("? root reject", "?/", 0, 0, NULL);
     check("? root only reject", "?", 0, 0, NULL);
     check("sys abs data", "/data/foo/bar", 0, 1, "/data/foo/bar");

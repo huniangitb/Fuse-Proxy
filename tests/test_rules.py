@@ -374,6 +374,40 @@ def isolation_section():
         ("/0/Download/hi.txt",{"resolve":1,"probe":1}),
     ],uid_map=MEDIA_MAP)
     del os.environ["NSP_PACKAGELIST"]
+    # ── 规则路径里的变量展开：展开结果必须与静态规则同形态。
+    #   解析期会给「不以 / 或 * 开头」的规则补前导 '/'（$DATA_BASE/files →
+    #   /$DATA_BASE/files），变量值又可能自带前导 '/'，直接拼接会得到
+    #   "//storage/..." 永不命中；值写 /sdcard、/mnt/sdcard 也是存储根别名。
+    #   四种写法 × 值带/不带前导 '/' 都要落到同一路径。
+    VP = "/0/Android/data/com.demo.app/files/x"
+    case("变量:值 /sdcard 前缀", BASE +
+         "DATA_BASE=/sdcard/Android/data/$package\n[com.demo.app]\nHIDE $DATA_BASE/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:值 /storage/emulated/0 前缀", BASE +
+         "DATA_BASE=/storage/emulated/0/Android/data/$package\n[com.demo.app]\nHIDE $DATA_BASE/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:值不带前导 /", BASE +
+         "DATA_BASE=Android/data/$package\n[com.demo.app]\nHIDE $DATA_BASE/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:值 /mnt/sdcard 前缀", BASE +
+         "DATA_BASE=/mnt/sdcard/Android/data/$package\n[com.demo.app]\nHIDE $DATA_BASE/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:规则写 /$DATA_BASE/files", BASE +
+         "DATA_BASE=/storage/emulated/0/Android/data/$package\n[com.demo.app]\nHIDE /$DATA_BASE/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:规则写 ${DATA_BASE}/files", BASE +
+         "DATA_BASE=/storage/emulated/0/Android/data/$package\n[com.demo.app]\nHIDE ${DATA_BASE}/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:应用段内定义变量可见", BASE +
+         "[com.demo.app]\nDATA_BASE=/sdcard/Android/data/$package\nHIDE $DATA_BASE/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("变量:无 HIDE 时可见（对照）", BASE,
+         10123, [(VP, {"resolve":0,"probe":0})], uid_map=own)
+    case("存储别名:字面 /sdcard 规则", BASE + "HIDE /sdcard/Android/data/com.demo.app/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
+    case("存储别名:字面 /mnt/sdcard 规则", BASE +
+         "HIDE /mnt/sdcard/Android/data/com.demo.app/files\n",
+         10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
     # ── 作用域优先 / 沙盒作用域（用户报障 A/B 的回归）：
     #   A「[GLOBAL] SANDBOX ON + ALLOW /Pictures/… 后，应用段再写 SANDBOX ON 仍不沙盒」
     #   B「应用段 HIDE 压不过 [GLOBAL] ALLOW（反过来 ALLOW 压 HIDE 却可以）」
