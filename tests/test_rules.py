@@ -344,6 +344,35 @@ def isolation_section():
         ("/0/Download/a.apk",{"resolve":1,"probe":1}),
         ("/0/Android/data/com.shared.b/x",{"resolve":0,"probe":0}),
     ],uid_map="10610 com.shared.a\n",global_want=1)
+    # ── 媒体提供者不参与沙盒：它在 FUSE 视图里是第三方应用取字节的通道
+    #    （Photo Picker / 缩略图 / 转码），重定向进空沙盒目录会让所有未被 ALLOW
+    #    覆盖的媒体 ENOENT（v3 全局替换下「选完图读不出」的根因）。与 v1 不给
+    #    媒体提供者挂 FUSE 实例的口径一致；应用段/类别段显式 SANDBOX ON 被忽略
+    #    并告警；HIDE 等显式规则与跨应用隔离让位保持原样。
+    MEDIA_MAP="10277 com.android.providers.media.module\n"+own
+    case("媒体提供者:全局沙盒不生效",BASE+"SANDBOX ON\n",10277,[
+        ("/0/Download/hi.txt",{"resolve":0,"sandbox":0,"redir":0}),
+        # 隔离让位保持（v1 不挂载即无此判定）
+        ("/0/Android/data/com.other.app/f",{"resolve":0,"probe":1}),
+    ],uid_map=MEDIA_MAP)
+    case("媒体提供者:普通应用照常进沙盒",BASE+"SANDBOX ON\n",10123,[
+        ("/0/Download/hi.txt",{"sandbox":1,"redir":1}),
+    ],uid_map=MEDIA_MAP)
+    case("媒体提供者:应用段 SANDBOX ON 被忽略",
+         BASE+"SANDBOX ON\n[com.android.providers.media.module]\nSANDBOX ON\n",10277,[
+        ("/0/Download/hi.txt",{"sandbox":0,"redir":0}),
+    ],uid_map=MEDIA_MAP)
+    # 类别段同样不能给它开沙盒（SYSTEM_APPS 判定读 sys_pkgs.cache，此处即夹具）
+    sys_cache=os.path.join(cfg,"sys_pkgs.cache")
+    open(sys_cache,"w",encoding="utf-8").write("com.android.providers.media.module\n")
+    case("媒体提供者:类别段沙盒不生效",
+         BASE+"SANDBOX ON\n[SYSTEM_APPS]\nSANDBOX ON\n",10277,[
+        ("/0/Download/hi.txt",{"sandbox":0,"redir":0}),
+    ],uid_map=MEDIA_MAP)
+    os.unlink(sys_cache)
+    case("媒体提供者:不豁免 HIDE",BASE+"SANDBOX ON\nHIDE /Download\n",10277,[
+        ("/0/Download/hi.txt",{"resolve":1,"probe":1}),
+    ],uid_map=MEDIA_MAP)
     del os.environ["NSP_PACKAGELIST"]
     # ── 作用域优先 / 沙盒作用域（用户报障 A/B 的回归）：
     #   A「[GLOBAL] SANDBOX ON + ALLOW /Pictures/… 后，应用段再写 SANDBOX ON 仍不沙盒」

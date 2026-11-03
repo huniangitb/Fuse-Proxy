@@ -501,7 +501,7 @@ static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path
    它：只有「不低於沙盒声明作用域」的 ALLOW 才放行——应用段显式 SANDBOX ON 时，
    [GLOBAL] 的 ALLOW 不得在该应用里凿洞（用户报障：全局 ALLOW 一动，应用段沙盒/
    HIDE 全体失效）。 */
-static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat);
+static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* current_pkg);
 
 /* 隐藏判定：作用域优先（应用段 > 类别段 > [GLOBAL]）。
    每层按 HIDE > ALLOW > RO > REDIRECT 的固定次序取一个结论（同层冲突 fail-closed，
@@ -564,12 +564,32 @@ static void br_note_isolation(const char* current_pkg, const char* sub_path) {
                 current_pkg, sub_path, n);
 }
 
+/* 媒体提供者（\`com.android.providers.media*\`，含 \`.module\`）不参与沙盒裁决：
+   它的存储视图是第三方应用取字节的通道（Photo Picker、缩略图、转码），把它的
+   打开请求重定向进空沙盒目录会让所有未被 ALLOW 覆盖的媒体 ENOENT。v1 按应用
+   挂载时本就不给媒体提供者挂 FUSE 实例（mount_manager 的 use_global_sandbox
+   口径），此处与之对齐。 */
+static bool br_media_provider_exempt(const char* pkg) {
+    return pkg && pkg[0] && is_media_provider(pkg);
+}
+
+/* 媒体提供者显式写 SANDBOX ON：语义上无法实现（picker 必然 ENOENT），不能静默
+   吞掉。选择告警后忽略而不是拒绝加载整份配置——后者会让该设备上其余应用的规则
+   一并失效，代价远大于一个被忽略的开关。每进程一条，避免配置热重载刷屏。 */
+static void br_note_media_sandbox_ignored(const char* pkg) {
+    static atomic_flag once = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set_explicit(&once, memory_order_relaxed))
+        LOG_WRN("媒体提供者不参与沙盒：忽略 %s 的 SANDBOX ON（picker 取字节会 ENOENT）", pkg);
+}
+
 /* 该调用方的沙盒是否生效（三层合并，口径与 br_to_real_path 的 sandbox 分支
    一致）：应用显式 OFF 否决类别与全局；类别显式 OFF 否决全局；
-   --disable-sandbox 全局关闭。沙盒生效时 data/obb 下的他包访问会被重定向到
-   **自己的**沙盒镜像（读不到他包内容），故隔离让位（见 br_isolation_blocks）。 */
-static bool br_sandbox_active(AppConfig* cfg, AppConfig* cat) {
+   --disable-sandbox 全局关闭；媒体提供者恒不生效。沙盒生效时 data/obb 下的他包
+   访问会被重定向到**自己的**沙盒镜像（读不到他包内容），故隔离让位（见
+   br_isolation_blocks）。 */
+static bool br_sandbox_active(AppConfig* cfg, AppConfig* cat, const char* current_pkg) {
     if (g_br_disable_sandbox) return false;
+    if (br_media_provider_exempt(current_pkg)) return false;
     if (cfg && cfg->sandbox_explicit && !cfg->sandbox) return false;
     if (cfg && cfg->sandbox) return true;
     if (cat) {
@@ -583,8 +603,14 @@ static bool br_sandbox_active(AppConfig* cfg, AppConfig* cat) {
    应用显式 > 应用非显式 ON > 类别显式 > 类别 ON > [GLOBAL]。BR_SCOPE_NONE =
    沙盒不生效。供 br_to_real_path 比较「ALLOW 能否豁免沙盒」：ALLOW 的作用域必须
    不低于沙盒的声明作用域，否则全局 ALLOW 会把应用段显式声明的沙盒整个取消。 */
-static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat) {
+static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* current_pkg) {
     if (g_br_disable_sandbox) return BR_SCOPE_NONE;
+    if (br_media_provider_exempt(current_pkg)) {
+        if ((cfg && cfg->sandbox_explicit && cfg->sandbox) ||
+            (cat && cat->sandbox_explicit && cat->sandbox))
+            br_note_media_sandbox_ignored(current_pkg);
+        return BR_SCOPE_NONE;
+    }
     if (cfg && cfg->sandbox_explicit) return cfg->sandbox ? BR_SCOPE_APP : BR_SCOPE_NONE;
     if (cfg && cfg->sandbox) return BR_SCOPE_APP;
     if (cat && cat->sandbox_explicit) return cat->sandbox ? BR_SCOPE_CAT : BR_SCOPE_NONE;
@@ -605,7 +631,10 @@ static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat) {
 static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                 const char* current_pkg, uid_t uid) {
     if (!br_is_other_app_pkg(sub_path, current_pkg, uid)) return false;
-    if (br_sandbox_active(cfg, cat)) return false;
+    /* 媒体提供者：沙盒本身已豁免，隔离让位仍保持——它读 /Android/data 里的媒体
+       内容不该因为「不再沙盒」而新被拦（v1 不挂载即无此判定）。 */
+    if (br_sandbox_active(cfg, cat, current_pkg)) return false;
+    if (br_media_provider_exempt(current_pkg)) return false;
     if (fw_rules_cross_app_exempt(current_pkg, uid)) return false;
     br_note_isolation(current_pkg, sub_path);
     return true;
@@ -893,6 +922,18 @@ static void br_ensure_sandbox_dir(const char* dir) {
     if (access(dir, F_OK) != 0) common_mkdir_within_storage(dir, 0775);
 }
 
+/* 沙盒重定向的限速观测（WARN）：现场遇到 ENOENT 时先看这里——路径是被我们改写
+   进沙盒镜像的，不是文件不在。首个命中与每 1024 次各一条，带调用方 uid/包名、
+   原路径与落点（日志在槽外异步投递，与 br_note_isolation 同一节奏）。 */
+static void br_note_sandbox_redirect(uid_t uid, const char* pkg, const char* sub_path,
+                                     const char* target) {
+    static atomic_ulong seq;
+    unsigned long n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed) + 1;
+    if (n == 1 || (n & 1023u) == 0)
+        LOG_WRN("沙盒重定向: uid=%u 包名=%s %s → %s（累计 %lu 次）", (unsigned)uid,
+                pkg && pkg[0] ? pkg : "?", sub_path, target, n);
+}
+
 static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf,
                            size_t size, int user_id, bool* is_redir_out, bool* is_sandbox_out,
                            const char* current_pkg, const FwRulesTrieMatch* tm, uid_t uid,
@@ -913,7 +954,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     BrScopeDecl decl;
     br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, user_id, uid, mkdir_out, mkdir_sz,
                     BR_WANT_LOC, &decl_scope, &decl);
-    const BrRuleScope sandbox_scope = br_sandbox_scope(cfg, cat);
+    const BrRuleScope sandbox_scope = br_sandbox_scope(cfg, cat, current_pkg);
     bool allow_effective =
         decl.allow && (sandbox_scope == BR_SCOPE_NONE || decl_scope >= sandbox_scope);
     if (decl.allow && !allow_effective) {
@@ -959,6 +1000,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     out_buf[size - 1] = '\0';
     if (is_redir_out) *is_redir_out = redir;
     if (is_sandbox_out) *is_sandbox_out = sandbox && redir;
+    if (sandbox && redir) br_note_sandbox_redirect(uid, current_pkg, sub_path, out_buf);
     if (out_buf[0] == '\0') return -ENOENT;
     return 0;
 }

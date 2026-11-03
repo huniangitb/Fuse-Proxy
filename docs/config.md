@@ -50,7 +50,7 @@
 | 开关 | 范围 | 说明 |
 |------|------|------|
 | `MONITOR` | 应用段 | 监控该应用的文件访问 |
-| `SANDBOX` | 应用段 / 全局段 | 启用独立沙箱：该应用对存储的访问**整树重定向**到沙盒落点（`<storage>/Android/data/<pkg>/<SANDBOX_DIR>`，见 `architecture.md` §存储视图），`/Android/data`、`/Android/obb` 的跨应用骨架另按 §4.1 隔离。**应用段不写 = 继承 `[GLOBAL]`**；应用段 `ON` = 该应用一律沙箱（连 `[GLOBAL] ALLOW` 的目录也进沙箱，要豁免须写在同一应用段）；应用段 `OFF` = 显式不沙箱。命中 `ALLOW` 的路径不再进沙盒（`ALLOW` = 不重定向），除非沙盒的声明作用域高于该 `ALLOW`。语义见 §2「沙盒的作用域」 |
+| `SANDBOX` | 应用段 / 全局段 | 启用独立沙箱：该应用对存储的访问**整树重定向**到沙盒落点（`<storage>/Android/data/<pkg>/<SANDBOX_DIR>`，见 `architecture.md` §存储视图），`/Android/data`、`/Android/obb` 的跨应用骨架另按 §4.1 隔离。**应用段不写 = 继承 `[GLOBAL]`**；应用段 `ON` = 该应用一律沙箱（连 `[GLOBAL] ALLOW` 的目录也进沙箱，要豁免须写在同一应用段）；应用段 `OFF` = 显式不沙箱。**媒体提供者（`com.android.providers.media*`，含 `.module`）不参与沙盒**：它在 FUSE 视图里是第三方应用取字节的通道（Photo Picker、缩略图、转码），重定向进空沙盒目录会让所有未被 `ALLOW` 覆盖的媒体 ENOENT；应用段/类别段对它显式写 `SANDBOX ON` 会被忽略并告警（v1 按应用挂载时本就不给它挂 FUSE 实例，口径一致）。命中 `ALLOW` 的路径不再进沙盒（`ALLOW` = 不重定向），除非沙盒的声明作用域高于该 `ALLOW`。语义见 §2「沙盒的作用域」 |
 | `GLOBAL_INJECT` | 全局段 | 全局注入开关 |
 | `SKIP_SYSTEM_APPS` | 全局段 | 跳过系统应用，默认 **ON**。zygisk 模块**不**再按 uid 硬编码过滤：除 `uid 0` 与 isolated 区（90000–99999）外一律上报，是否注入完全由本开关裁决——写成 OFF 时系统应用（如 uid 1000 的 Settings）才会被注入/还原 |
 | `FUSE_EXTRA_ARGS` | 全局段 | 透传给 `fuse_daemon` 的额外参数（行尾原样，不分词，上限 512 字节）；其中 `-o negative_timeout[=N]` 会被单点剥离（恒为 libfuse 默认 0.0，非 0 负缓存以 ino=0 回包会触发内核 nodeid=0 崩溃） |
@@ -84,7 +84,7 @@
 
 - **放行**：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局放行；调用方命中 §4.1 的白名单/特权/能力豁免时放行。
 - **同 uid 视为同一应用**：目标目录的**属主 uid** 等于调用方 uid 时放行（判据取自 `/data/system/packages.list` 的「包名 uid」行，查不到则维持隔离）。Linux DAC 只认 uid，同一 uid 下的多个包（旧 `sharedUserId`，或系统里共用进程的两个 provider，例如 `android.process.media` 宿主同时提供 MediaProvider 与 DownloadsProvider）本就是同一个 app 身份；只按包名比较会把它们误判成「他应用」，在 v3 全局挂载下表现为下载器读不到 Downloads 的私有目录（ENOENT）。解析/目录属主 uid 失败时不额外放行。
-- **与 `SANDBOX ON` 的关系**：沙盒生效的调用方被豁免——它的 `Android/data|obb` 访问本就会被 `SANDBOX` 重定向进**自己的**沙盒镜像（读不到他包内容），判成 ENOENT 只会让镜像路径整体不可用；列举侧仍按隔离过滤（保持既有行为）。
+- **与 `SANDBOX ON` 的关系**：沙盒生效的调用方被豁免——它的 `Android/data|obb` 访问本就会被 `SANDBOX` 重定向进**自己的**沙盒镜像（读不到他包内容），判成 ENOENT 只会让镜像路径整体不可用；列举侧仍按隔离过滤（保持既有行为）。媒体提供者不参与沙盒，但同样豁免隔离：它读 `/Android/data` 里的媒体内容不该因为「不再沙盒」而新被拦（v1 不挂载即无此判定）。
 - **特权应用自动豁免**：调用方是 **platform 签名**应用（`/data/system/packages.list` 的 seinfo 字段以 `platform` 开头，含 `platform:privapp` 与纯 `platform` 共享签名；DocumentsUI / Settings 等系统中介均为 priv-app）时自动放行——文件中介（如 DocumentsUI）的本职就是访问他包 `Android/data`，逐包手工写规则不可维护，按 Android 自己的权限体系判定。普通应用（seinfo `default`）与 `packages.list` 不可读/无该 uid（fail-safe）照常隔离。此豁免与 `ALLOW_CROSS_APP_DATA` 无关、无需配置。
 - **按包名白名单**：`[GLOBAL] ALLOW_CROSS_APP_PKGS com.a,com.b` 列出的**调用方**包名可以访问他包 `Android/data|obb`，与 appops 授权无关，用于「不想给全盘权限、又确实要读某个他包目录」的场合（安装器、迁移工具、备份应用）。匹配用调用方自身包名精确比较，**不做 uid 兜底**：同 uid 的兄弟包要访问也各自写一行——`uid.map` 是 uid→单包名，按 uid 放行等于让共享 uid 的所有包互相看光。未列出的应用照常隔离；白名单只解除隔离，`HIDE`/`RO`/`REDIRECT` 规则照旧生效。
 - **能力豁免（默认关）**：`[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON` 时，持有 **MANAGE_EXTERNAL_STORAGE**（All files access）或处于 **legacy storage**（targetSdk ≤ 29，appops `LEGACY_STORAGE`）的调用方自动放行——这两类应用在 Android 权限体系里本就看得见他包 `Android/data`。**默认 OFF**：授权是用户给出的能力，不等于用户同意该应用读取别的应用的私有目录，故要跨应用读数据必须显式开这个开关或写白名单。开着时按 uid 查一次 appops（`MANAGE_EXTERNAL_STORAGE` / `LEGACY_STORAGE` 模式为 `allow` 即命中），结果按 uid 缓存、配置重载后失效重查，另设 30s 有效期——运行期新授予的权限最多 30s 内生效，不必重启 daemon；关着时根本不查 appops，不付这次开销。边界与白名单一致：只解除隔离，`HIDE`/`RO` 等显式规则照旧生效。
