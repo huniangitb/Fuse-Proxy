@@ -21,8 +21,9 @@ typedef struct NsMountEntry {
     int depth;
 } NsMountEntry;
 
-/* mountinfo 全量读取上限：真实设备（多用户 + 嵌套视图 + f2fs 直通）可达 1900+ 行，
-   旧上限 512 会截断族根（行号 1894+）与 nsp_global（1934 行），导致替换静默失败 */
+/* 历史遗留的固定条目容量：仅剩少量固定大小数组还在用它，**读取路径已不再受它
+   限制**（ns_read_mountinfo_pid 按需增长，见下方声明）。真实设备上条目数只与命名
+   空间里挂了多少东西有关，卡一个数字就必然会在某台设备上截断族根。 */
 #ifndef NS_MOUNTINFO_MAX
 #define NS_MOUNTINFO_MAX 4096
 #endif
@@ -65,6 +66,10 @@ typedef struct NsMountinfoStats {
  * 返回已回调的行数；-1 = 打开失败（errno 有效）。 */
 int ns_scan_mountinfo(int pid, NsMountinfoLineFn cb, void* ctx);
 
+/* 同上，但把本次扫描的规模快照写进 out（调用方自带，不会被并发扫描覆盖）。
+   用于「这次读取有没有丢弃过超长行」这类必须按次判定的场景。 */
+int ns_scan_mountinfo_stats(int pid, NsMountinfoLineFn cb, void* ctx, NsMountinfoStats* out);
+
 /* 收集 base 之下（严格子路径，不含 base 自身）的挂载点，按扫描顺序写入 out。
  * 容量触顶或路径 ≥ NS_MOUNT_PATH_MAX 一律 loud 告警并拒绝（绝不静默截断）；
  * who 为告警前缀（如 "递归卸载"）。返回收集条数；-1 = 打开 mountinfo 失败。 */
@@ -106,7 +111,19 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
 
 /* ---- mountinfo 枚举与族根工具（原 ns_utils.c static，拆分后跨文件共享） ----
    命名统一 ns_ 前缀（mount namespace 操作域），禁裸通用名污染全局命名空间 */
-int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max);
+/* 读取指定进程的 mountinfo 全字段（只解析文件，不进入命名空间）。
+ *
+ * 条目数不设上限：内部按需增长（realloc），调用方不再预分配，也就不存在「读满
+ * 就停」。条目数随多用户与嵌套视图增长，任何固定上限都会在某台设备上漏掉族根或
+ * 目标挂载点。
+ *
+ * 返回条目数（>=0，0 = 该命名空间没有挂载条目）；-1 = **结论未知**（打开失败、
+ * 内存不足、或扫描中丢弃过超长行——这份列表不完整）。调用方必须把 -1 当成
+ * 「不知道」而不是「没有挂载」：后者会让决策路径去挂一个已经挂过的视图，或者把
+ * 活着的视图判成「未替换」再替换一次。
+ *
+ * 成功时 *out 由本函数分配，调用方负责 free（返回 0 时 *out 为 NULL）。 */
+int ns_read_mountinfo_pid(int pid, NsMountEntry** out);
 bool ns_is_digit_char(char c);
 bool ns_is_family_root(const char* mp);
 int ns_parse_family_root(const char* mp, int* user_id);
@@ -116,6 +133,12 @@ int ns_count_mounts_under(const NsMountEntry* all, int n, const char* base, bool
                           bool include_fuse);
 void ns_sort_deepest_first(NsMountEntry* arr, int n);
 void ns_sort_shallowest_first(NsMountEntry* arr, int n);
+/* 备份点状态。读取 mountinfo 失败时返回 NS_BACKUP_UNKNOWN——既不能当「未挂载」
+   （会往已有备份上再 bind 一层），也不能当「已挂载」（会信任不存在的备份）。 */
+#define NS_BACKUP_UNKNOWN (-2)
+#define NS_BACKUP_POLLUTED (-1)
+#define NS_BACKUP_ABSENT 0
+#define NS_BACKUP_VALID 1
 int ns_backup_point_state(int pid, const char* path);
 
 /* ---- 全局替换方案导出入口（injector / global_replace_ctl / mount_manager 调用） ---- */

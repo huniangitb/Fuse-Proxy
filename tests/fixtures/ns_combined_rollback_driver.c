@@ -211,11 +211,15 @@ int ns_parse_family_root(const char* mp, int* user_id) {
     return -1;
 }
 
-int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
+int ns_read_mountinfo_pid(int pid, NsMountEntry** out) {
     (void)pid;
-    if (!g_family_root || max < 1) return 0;
-    out[0].mount_point[0] = '\0';
-    snprintf(out[0].mount_point, sizeof out[0].mount_point, "%s", g_family_root);
+    if (!out) return -1;
+    *out = nullptr;
+    if (!g_family_root) return 0;
+    NsMountEntry* entries = calloc(1, sizeof *entries);
+    if (!entries) return -1;
+    snprintf(entries[0].mount_point, sizeof entries[0].mount_point, "%s", g_family_root);
+    *out = entries;
     return 1;
 }
 

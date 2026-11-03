@@ -120,10 +120,9 @@ int ns_scan_mountinfo_prefixed(int pid, const char* const* prefixes, int nprefix
     (void)ctx;
     return 0;
 }
-int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
+int ns_read_mountinfo_pid(int pid, NsMountEntry** out) {
     (void)pid;
-    (void)out;
-    (void)max;
+    if (out) *out = nullptr;
     return 0;
 }
 bool ns_is_digit_char(char c) { return c >= '0' && c <= '9'; }

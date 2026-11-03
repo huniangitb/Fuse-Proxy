@@ -88,7 +88,7 @@ static bool mi_prefilter_pass(const char* line, const char* const* prefixes, int
 /* 扫描实现：prefixes 为 NULL/0 时逐行解析（全量读取，ns_read_mountinfo_pid 走这条），
    否则先预筛再解析。返回已回调行数；-1 = 打开失败（errno 有效）。 */
 static int mi_scan(int pid, const char* const* prefixes, int nprefixes, NsMountinfoLineFn cb,
-                   void* ctx) {
+                   void* ctx, NsMountinfoStats* out_stats) {
     if (!cb) return -1;
     char path[64];
     /* 自身进程走 /proc/self：省一次 pid 复用竞态窗口，也是既有实现与测试桩
@@ -154,18 +154,25 @@ static int mi_scan(int pid, const char* const* prefixes, int nprefixes, NsMounti
     st.cpu_us = cpu_end - cpu_begin;
     st.csw = csw_end - csw_begin;
     g_mi_last = st;
+    /* 调用方自带快照：全局 g_mi_last 会被并发扫描覆盖，判据（例如「这次有没有丢弃
+       过超长行」）必须用本次扫描自己的那份 */
+    if (out_stats) *out_stats = st;
     return count;
 }
 
 int ns_scan_mountinfo(int pid, NsMountinfoLineFn cb, void* ctx) {
-    return mi_scan(pid, nullptr, 0, cb, ctx);
+    return mi_scan(pid, nullptr, 0, cb, ctx, nullptr);
+}
+
+int ns_scan_mountinfo_stats(int pid, NsMountinfoLineFn cb, void* ctx, NsMountinfoStats* out) {
+    return mi_scan(pid, nullptr, 0, cb, ctx, out);
 }
 
 int ns_scan_mountinfo_prefixed(int pid, const char* const* prefixes, int nprefixes,
                                NsMountinfoLineFn cb, void* ctx) {
     /* 预筛只是"必要非充分"：命中者仍走完整字段解析，回调拿到的行与全量扫描完全
        一致——调用方按 mount_point 做精确判定即可，语义与逐行全扫一字不差。 */
-    return mi_scan(pid, prefixes, nprefixes, cb, ctx);
+    return mi_scan(pid, prefixes, nprefixes, cb, ctx, nullptr);
 }
 
 /* 单棵子树的收集状态：单 base 与多 base 共用一个 applier，保证两条路径的
@@ -214,7 +221,7 @@ int ns_collect_mounts_under_pid(int pid, const char* base, char (*out)[NS_MOUNT_
                              .who = who ? who : "收集挂载点"};
     /* 以 base 作前缀预筛：只有可能落在该子树内的行才做字段级解析 */
     const char* prefixes[1] = {base};
-    if (mi_scan(pid, prefixes, 1, ns_collect_cb, &c) < 0) return -1;
+    if (mi_scan(pid, prefixes, 1, ns_collect_cb, &c, nullptr) < 0) return -1;
     return c.n;
 }
 
@@ -261,7 +268,7 @@ int ns_collect_mounts_multi(int pid, NsCollectTarget* targets, int ntargets) {
     }
     if (nprefix == 0) return 0;
     struct NsCollectMultiCtx mc = {.t = ctx, .n = ntargets};
-    if (mi_scan(pid, prefixes, nprefix, ns_collect_multi_cb, &mc) < 0) return -1;
+    if (mi_scan(pid, prefixes, nprefix, ns_collect_multi_cb, &mc, nullptr) < 0) return -1;
     for (int i = 0; i < ntargets; i++) targets[i].n = ctx[i].n;
     return 0;
 }
