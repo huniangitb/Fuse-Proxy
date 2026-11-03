@@ -103,12 +103,12 @@ static void check_snapshot(void) {
 
     /* ---- [GLOBAL] 规则（含归一与 ALLOW/REDIRECT 区分） ---- */
     ck(g_global_cfg.hide_count == 2 &&
-           has_str(g_global_cfg.hide_rules, g_global_cfg.hide_count, "/sdcard/Secret") &&
+           has_str(g_global_cfg.hide_rules, g_global_cfg.hide_count, "/Secret") &&
            has_str(g_global_cfg.hide_rules, g_global_cfg.hide_count, "/EmuHidden"),
-       "snapshot.global HIDE 归一(/storage/emulated 剥离)");
+       "snapshot.global HIDE 归一(存储根别名剥离)");
     ck(g_global_cfg.ro_count == 2 &&
-           has_str(g_global_cfg.ro_rules, g_global_cfg.ro_count, "/sdcard/ReadOnly") &&
-           has_str(g_global_cfg.ro_rules, g_global_cfg.ro_count, "/sdcard/*/cache/"),
+           has_str(g_global_cfg.ro_rules, g_global_cfg.ro_count, "/ReadOnly") &&
+           has_str(g_global_cfg.ro_rules, g_global_cfg.ro_count, "/*/cache/"),
        "snapshot.global RO 通配保留尾斜杠");
     const RedirectRule* r1 = find_redir(&g_global_cfg, false, "/files");
     ck(r1 && streq(r1->real_target, "?/Download"), "snapshot.global REDIRECT 相对目标 ? 前缀");
@@ -132,7 +132,7 @@ static void check_snapshot(void) {
     ck(app0 && app0->inject_enable, "snapshot.[pkg] 默认使能 ON 且 user_id=-1");
     ck(app0 && app0->monitor == true && app0->monitor_explicit, "snapshot.[pkg] MONITOR 显式 ON");
     ck(app0 && app0->sandbox == false, "snapshot.[pkg] SANDBOX 默认 OFF");
-    ck(app0 && app0->hide_count == 1 && streq(app0->hide_rules[0], "/sdcard/AppSecret"),
+    ck(app0 && app0->hide_count == 1 && streq(app0->hide_rules[0], "/AppSecret"),
        "snapshot.[pkg] HIDE");
     const RedirectRule* ar = app0 ? find_redir(app0, false, "/appdir") : NULL;
     ck(ar && streq(ar->real_target, "/data/media/0/AppDir"),
@@ -141,12 +141,12 @@ static void check_snapshot(void) {
     AppConfig* app999 = find_app("com.example.app", 999);
     ck(app999 && app999->sandbox == true && app999->sandbox_explicit,
        "snapshot.[pkg:uid] 独立作用域 SANDBOX ON");
-    const RedirectRule* al = app999 ? find_redir(app999, true, "/sdcard/Public") : NULL;
-    ck(al && streq(al->real_target, "?/sdcard/Public"), "snapshot.[pkg:uid] ALLOW");
+    const RedirectRule* al = app999 ? find_redir(app999, true, "/Public") : NULL;
+    ck(al && streq(al->real_target, "?/Public"), "snapshot.[pkg:uid] ALLOW");
 
     /* ---- 类别段 ---- */
     AppConfig* ua = find_app("USER_APPS", 0);
-    ck(ua && ua->hide_count == 1 && streq(ua->hide_rules[0], "/sdcard/CatSecret"),
+    ck(ua && ua->hide_count == 1 && streq(ua->hide_rules[0], "/CatSecret"),
        "snapshot.[USER_APPS:0]");
     AppConfig* sa = find_app("SYSTEM_APPS", -1);
     ck(sa && sa->ro_count == 1 && streq(sa->ro_rules[0], "/system/vendor"),
@@ -156,7 +156,7 @@ static void check_snapshot(void) {
     AppConfig* other = find_app("com.other.app", 999);
     ck(other && other->inject_enable, "snapshot.App-rules-999 分文件使能");
     ck(other && other->monitor == true && other->hide_count == 1 &&
-           streq(other->hide_rules[0], "/sdcard/OtherHidden"),
+           streq(other->hide_rules[0], "/OtherHidden"),
        "snapshot.App-rules-999 规则内容");
 }
 
@@ -242,10 +242,10 @@ static void check_static_json(void) {
        "static.switches.skip_system_apps=ON（默认值）");
 
     json_object* hide = obj_get(global, "hide_rules");
-    ck(arr_has_str(hide, "/sdcard/Secret") && arr_has_str(hide, "/EmuHidden"),
+    ck(arr_has_str(hide, "/Secret") && arr_has_str(hide, "/EmuHidden"),
        "static.global.hide_rules 来自快照（含归一）");
     json_object* ro = obj_get(global, "ro_rules");
-    ck(arr_has_str(ro, "/sdcard/ReadOnly") && arr_has_str(ro, "/sdcard/*/cache/"),
+    ck(arr_has_str(ro, "/ReadOnly") && arr_has_str(ro, "/*/cache/"),
        "static.global.ro_rules 来自快照");
 
     json_object* redir = obj_get(global, "redirect_rules");

@@ -117,11 +117,12 @@ Android 11+ 的 `/storage/emulated` 由 **MediaProvider 自己**当 FUSE 服务�
 |------|------|
 | `Android/data/foo`（相对，无前导 `/`） | 当前用户存储 `/data/media/<user_id>/Android/data/foo` |
 | `/storage/emulated/0/xxx` | 归一为当前用户存储（剥离 `/storage/emulated/<N>`） |
-| `/sdcard/xxx` | 当前用户存储（走"其他以 `/` 开头"分支，非前缀剥离） |
+| `/sdcard/xxx`、`/mnt/sdcard/xxx` | 当前用户存储（存储根别名，与 `/storage/emulated/<N>` 同口径剥离，见 `nsp_strip_storage_prefix`） |
 | `/data/...`、`/mnt/...`、`/storage/...` | 绝对路径原样（`is_system_abs_path`） |
 | `?/xxx` | 当前用户存储（内部前缀，parse 阶段自动生成，无需手写） |
 
 - 路径不以 `/` 或 `*` 开头时自动补前导 `/`；不含通配符的路径自动去尾部 `/`。
+- **变量展开的结果按同一套口径再归一一次**（`normalize_expanded_rule_path`）：折叠开头重复的 `/`、剥离存储根别名（`/storage/emulated/<N>`、`/sdcard`、`/mnt/sdcard`）、必要时补前导 `/`、无通配符时去尾 `/`。原因：以变量开头的规则在解析期已被补上前导 `/`，而变量值可能自带 `/` 或使用别名，不归一会拼出 `//storage/...` 而永不命中。故 `HIDE $DATA_BASE/files` 与 `HIDE /storage/emulated/0/.../files` 等价，变量值写 `/sdcard/...`、`/mnt/sdcard/...` 或不带前导 `/` 均可。只折叠**开头**的重复斜杠，路径内部的 `//` 不予改动；展开结果放不进缓冲时该规则按不命中丢弃（fail-closed）。
 - `REDIRECT` 的真实目标含变量时原样存入，分类延迟到运行时 `build_real_base_from_target`。
 
 ## 5. 路径变量
@@ -152,6 +153,7 @@ MNT_BASE=/mnt/sdcard/$package
   - 变量查找顺序恒为「传入的段 `AppConfig` → `global_cfg`」（`lookup_var`），`$package` 单独走 `current_pkg`（不经变量表，故在上述三层都可用）。
   - 因此：**应用变量只能被该应用自己的段规则看到**；类别/GLOBAL 规则写 `$APP_VAR` 时若该变量未在对应段定义，将保留字面（未定义变量语义）而非展开成当前应用的值。需要「随应用变化」的规则请写在**应用段**或用 `$package`。
 - **值引用**：可引用其他变量（含 `$package`），运行时递归展开（`expand_into`，最大 32 层）。循环引用（`A=$B` + `B=$A`）自动检测，保留字面不展开。
+- **值里的存储路径**：可写 `/sdcard/...`、`/mnt/sdcard/...`、`/storage/emulated/<N>/...` 或相对形式；规则引用变量时，展开结果会按「路径前缀归一」一节的同一套口径归一再匹配（见该节说明）。
 - **保留名**：`package` 禁止覆盖（告警并忽略）。
 - **VALUE 语义**：取 `=` 后行尾原样内容（含空格），不剥离行内注释——`VAR=/x # 备注` 的值是 `/x # 备注`。
 
@@ -199,7 +201,7 @@ HIDE /secret   # 这不是注释，会被并入规则
 | 应用段写 `MONITOR OFF` 期望继承全局 | 全局段写 `MONITOR OFF`，或应用段显式写所需值 | 应用段显式写即覆盖全局 |
 | `[GLOBAL] ALLOW /Pictures` 后应用段 `SANDBOX ON`，期望 `/Pictures` 仍放行 | 在同一应用段写 `ALLOW /Pictures` | 低作用域 `ALLOW` 不豁免高作用域声明的沙盒（§2） |
 | `FUSE_EXTRA_ARGS` 写在应用段 | 仅写 `[GLOBAL]` 段 | 应用段无该字段 |
-| 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `strip_storage_prefix` 不处理 `/sdcard` |
+| 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `/sdcard`、`/mnt/sdcard` 是存储根别名，规则路径与变量值都按别名剥离 |
 
 ## 8. 完整示例
 
