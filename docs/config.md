@@ -67,7 +67,7 @@
 
 `io.log` 的行数完全由 `MONITOR` 决定：**三层合并后未生效的调用方一行都不记**（默认 `OFF`，空白配置下该文件不增长）。正常行 `时间|LEVEL|[pkg(uid)] [OP] <虚拟路径>`，命中 `REDIRECT` 时尾部追加 ` -> <target>`；**正常行不带 errno**，失败另起 `[pkg] [ERR] <OP> <路径> errno=…`。排查「文件明明在却打不开」要的是拒绝原因，那条在 `sys.log`（`隐藏规则命中`/`访问控制拒绝`/`跨应用隔离`/存储根守卫，都带 `errno=`）——按 `io.log` 里同一个路径、同一个时间窗去对 `sys.log`，别在 `io.log` 里找错误码。
 
-注入方法为 `v3` 时（`injector --inject-method=v3`，见 `architecture.md` §5.1），`GLOBAL_INJECT` / `SKIP_SYSTEM_APPS` **不参与目标判定**——含系统应用在内一律经项目 FUSE；应用段与类别段头的 `OFF` 仍然生效。
+注入方法为 `v3` 时（`injector --inject-method=v3`，见 `architecture.md` §5.1），`GLOBAL_INJECT` / `SKIP_SYSTEM_APPS` **不参与目标判定**——含系统应用在内一律经项目 FUSE。应用段与类别段头的 `OFF` 只表示「该应用不被注入」：v1 / v2 下该应用根本不进项目 FUSE（v1 不挂、v2 还原成原生视图），段内**规则不会被评估**；v3 下非目标应用不还原、仍走全局 FUSE，段内规则**照旧参与裁决**——在 v3 下写 `[pkg] OFF` 再配 `HIDE /` 会真的把该应用的存储根隐藏掉。
 
 ## 4. 四类规则
 
