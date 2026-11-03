@@ -466,9 +466,13 @@ int ns_find_family_root(int pid, uid_t app_uid, char* out, size_t outsz) {
     if (!out || outsz == 0) return EINVAL;
     out[0] = '\0';
     int user_id = (int)(app_uid / 100000u);
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
-    if (!all) return ENOMEM;
-    int n = ns_read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
+    NsMountEntry* all = NULL;
+    int n = ns_read_mountinfo_pid(pid, &all);
+    if (n < 0) {
+        /* 读不到挂载表 = 未知：不能报 ENOENT（调用方会当成「这个用户没有族根」） */
+        free(all);
+        return EIO;
+    }
     int ret = ENOENT;
     for (int fam = 2; fam >= 0 && ret == ENOENT; fam--) {
         for (int i = 0; i < n; i++) {
@@ -918,10 +922,11 @@ static int do_combined_mount(void* raw_args) {
            原生视图，无需备份副本。扫描 mountinfo 收集全部族根并按 rel 首段
            user id 匹配——确保多用户（/mnt/user/0、/mnt/user/10…）各自恢复
            到正确族根，不串用户 */
-        NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+        NsMountEntry* all = NULL;
         NsMountEntry* roots = malloc(128 * sizeof(NsMountEntry));
-        if (all && roots) {
-            int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
+        /* n < 0 = 挂载表读不到（结论未知）：不逐条去猜族根，整体跳过并告警 */
+        int n = roots ? ns_read_mountinfo_pid(getpid(), &all) : -1;
+        if (roots && n >= 0) {
             int root_count = 0;
             for (int i = 0; i < n && root_count < 128; i++) {
                 if (ns_is_family_root(all[i].mount_point)) roots[root_count++] = all[i];
@@ -984,6 +989,15 @@ static int do_combined_mount(void* raw_args) {
             }
             free(all);
             free(roots);
+        } else {
+            free(all);
+            free(roots);
+            log_ns_error(
+                "[ns_error] [%s] Combined mount preserve skipped: mountinfo unreadable (unknown), %d path(s) not restored\n",
+                pkg, preserve_count);
+            log_internal(LOG_ERROR,
+                         "[ns_error] [%s] 恢复保留子挂载点失败：读不到挂载表（结论未知），本次未恢复 %d 条",
+                         pkg, preserve_count);
         }
     }
     SEG_MARK(NSP_SEG_SUB);

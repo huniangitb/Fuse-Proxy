@@ -128,10 +128,9 @@ int ns_parse_family_root(const char* mp, int* user_id) {
     return -1;
 }
 
-int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
+int ns_read_mountinfo_pid(int pid, NsMountEntry** out) {
     (void)pid;
-    (void)out;
-    (void)max;
+    if (out) *out = nullptr;
     return 0;
 }
 

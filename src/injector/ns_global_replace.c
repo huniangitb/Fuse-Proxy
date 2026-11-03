@@ -35,18 +35,28 @@
 #define NS_MOUNTINFO_MAX 4096
 #endif
 
+/* 初始容量（条目数）：按真实设备的量级起手，再翻倍增长——挂载条目数没有绝对值
+   上限，任何「一次分配到底」的写法都会在某台设备上截断。 */
+#define NS_MOUNTINFO_INIT_ENTRIES 256
+
 struct NsReadAllCtx {
-    NsMountEntry* out;
-    int max;
-    int n;
-    bool truncated;
+    NsMountEntry* out; /* 按需 realloc 增长，由 ns_read_mountinfo_pid 接管所有权 */
+    int cap;            /* out 的容量（条目数） */
+    int n;              /* 已写入条目数 */
+    bool nomem;         /* 扩容失败：本次读取作废（半份条目等于静默截断） */
 };
 
 static int ns_read_all_cb(const NsMountLine* ln, void* vctx) {
     struct NsReadAllCtx* c = vctx;
-    if (c->n >= c->max) { /* 容量触顶：拒绝静默截断（族根漏处理会让替换失败） */
-        c->truncated = true;
-        return 1;
+    if (c->n == c->cap) {
+        int cap = c->cap > 0 ? c->cap * 2 : NS_MOUNTINFO_INIT_ENTRIES;
+        NsMountEntry* grown = realloc(c->out, (size_t)cap * sizeof(NsMountEntry));
+        if (!grown) {
+            c->nomem = true;
+            return 1; /* 停扫描：宁可整份作废，也不把前 n 条当成完整结论 */
+        }
+        c->out = grown;
+        c->cap = cap;
     }
     NsMountEntry* e = &c->out[c->n];
     snprintf(e->mount_point, sizeof e->mount_point, "%s", ln->mount_point);
@@ -59,16 +69,26 @@ static int ns_read_all_cb(const NsMountLine* ln, void* vctx) {
 }
 
 /* 读取指定进程的 mountinfo 全字段（本函数不进入命名空间，仅解析文件）。
- * 解析统一走 ns_scan_mountinfo（唯一实现，C7）：超长行整行丢弃、容量触顶 loud
- * 告警而非静默丢弃——旧实现各自 fopen+sscanf 且触顶无声。 */
-int ns_read_mountinfo_pid(int pid, NsMountEntry* out, int max) {
-    if (!out || max <= 0) return -1;
-    struct NsReadAllCtx c = {.out = out, .max = max};
-    if (ns_scan_mountinfo(pid, ns_read_all_cb, &c) < 0) return -1;
-    if (c.truncated)
-        LOG_WRN("mountinfo 条数达到上限 %d（pid=%d），其余条目被忽略——上限不足会让族根/"
-                "目标挂载点漏处理",
-                max, pid);
+ * 解析统一走 ns_scan_mountinfo（唯一实现，C7）：超长行整行丢弃。
+ * 条目数按需增长，没有固定上限；只要这份列表可能不完整（打开失败、内存不足、
+ * 丢弃过超长行），就返回 -1 = 未知，而不是交回半份条目让调用方当结论。 */
+int ns_read_mountinfo_pid(int pid, NsMountEntry** out) {
+    if (!out) return -1;
+    *out = nullptr;
+    struct NsReadAllCtx c = {.out = nullptr, .cap = 0, .n = 0, .nomem = false};
+    NsMountinfoStats st;
+    memset(&st, 0, sizeof st);
+    if (ns_scan_mountinfo_stats(pid, ns_read_all_cb, &c, &st) < 0) {
+        free(c.out);
+        return -1;
+    }
+    if (c.nomem || st.truncated) {
+        LOG_ERR("mountinfo 读取不完整（pid=%d, 已读 %d 条, 丢弃超长行=%d, 内存不足=%d），按未知处理",
+                pid, c.n, st.truncated ? 1 : 0, c.nomem ? 1 : 0);
+        free(c.out);
+        return -1;
+    }
+    *out = c.out;
     return c.n;
 }
 
@@ -173,27 +193,27 @@ void ns_sort_shallowest_first(NsMountEntry* arr, int n) {
     }
 }
 
-/* 备份点有效性：0=未挂载(可新建), 1=已挂载且为系统视图备份(有效), -1=已被项目 FUSE 视图污染。
+/* 备份点有效性：NS_BACKUP_ABSENT=未挂载(可新建), NS_BACKUP_VALID=已挂载且为系统视图备份(有效),
+   NS_BACKUP_POLLUTED=已被项目 FUSE 视图污染, NS_BACKUP_UNKNOWN=读不到挂载表（结论未知）。
    关键：系统视图备份的 bind 视图，mountinfo source 是 fsname=/dev/fuse（fstype=fuse），
    **这是有效备份的正常特征**，绝不能判为污染；仅当 source/fstype 含 fuse_daemon
    （项目 FUSE 视图，如崩溃恢复二次替换叠上去的代理 bind）时才判为污染 */
 int ns_backup_point_state(int pid, const char* path) {
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
-    if (!all) return 0;
-    int n = ns_read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
-    if (n <= 0) {
+    NsMountEntry* all = NULL;
+    int n = ns_read_mountinfo_pid(pid, &all);
+    if (n < 0) {
         free(all);
-        return 0;
+        return NS_BACKUP_UNKNOWN;
     }
-    int st = 0;
+    int st = NS_BACKUP_ABSENT;
     for (int i = 0; i < n; i++) {
         if (strcmp(all[i].mount_point, path) != 0) continue;
         if (fast_strstr(all[i].source, "fuse_daemon") != nullptr ||
             fast_strstr(all[i].fstype, "fuse_daemon") != nullptr) {
-            st = -1;
+            st = NS_BACKUP_POLLUTED;
             break;
         }
-        st = 1;
+        st = NS_BACKUP_VALID;
         break;
     }
     free(all);
@@ -286,11 +306,9 @@ static int restore_root_from_backup(const char* root, const char* btop, const Ns
    备份树保留待重试）。 */
 static int rollback_replaced_roots(const NsMountEntry* roots, int count, const char* backup_root) {
     if (count <= 0) return 0;
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
     NsMountEntry* bsub = malloc(128 * sizeof(NsMountEntry));
     NsMountEntry* scratch = malloc(128 * sizeof(NsMountEntry));
-    if (!all || !bsub || !scratch) {
-        free(all);
+    if (!bsub || !scratch) {
         free(bsub);
         free(scratch);
         LOG_ERR("全局替换回滚: 分配内存失败，无法回滚（族根可能停在裸挂载点）");
@@ -299,9 +317,13 @@ static int rollback_replaced_roots(const NsMountEntry* roots, int count, const c
     bool failed = false;
     for (int i = 0; i < count; i++) {
         const char* root = roots[i].mount_point;
-        int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
-        if (n <= 0) {
-            LOG_ERR("全局替换回滚: 读取 mountinfo 失败，族根 %s 无法回滚", root);
+        /* 每个族根各读一次：读不到 = 不知道挂载表现在什么样，此时只能放弃回滚
+           （继续瞎卸载会把族根留在裸挂载点） */
+        NsMountEntry* all = NULL;
+        int n = ns_read_mountinfo_pid(getpid(), &all);
+        if (n < 0) {
+            free(all);
+            LOG_ERR("全局替换回滚: 读取 mountinfo 失败（结论未知），族根 %s 无法回滚", root);
             failed = true;
             continue;
         }
@@ -309,26 +331,29 @@ static int rollback_replaced_roots(const NsMountEntry* roots, int count, const c
         (void)ns_parse_family_root(root, &uid);
         char btop[PATH_MAX];
         snprintf(btop, sizeof(btop), "%s/user_%d/emulated", backup_root, uid);
-        if (ns_backup_point_state(getpid(), btop) != 1) {
+        if (ns_backup_point_state(getpid(), btop) != NS_BACKUP_VALID) {
+            free(all);
             LOG_ERR("全局替换回滚: 族根 %s 的备份点 %s 不可用，无法回滚", root, btop);
             failed = true;
             continue;
         }
         int bn = ns_gather_mounts_under(all, n, btop, true, true, bsub, 128);
         if (bn <= 0 || bn >= 128) {
+            free(all);
             LOG_ERR("全局替换回滚: 备份点 %s 下挂载数异常(%d)，无法回滚族根 %s", btop, bn, root);
             failed = true;
             continue;
         }
         ns_sort_shallowest_first(bsub, bn);
-        if (restore_root_from_backup(root, btop, bsub, bn, all, n, scratch, 128) != 0) {
+        int rc = restore_root_from_backup(root, btop, bsub, bn, all, n, scratch, 128);
+        free(all);
+        if (rc != 0) {
             LOG_ERR("全局替换回滚: 族根 %s 还原不完整（备份树保留待重试）", root);
             failed = true;
             continue;
         }
         LOG("全局替换回滚: 族根 %s 已从备份 %s 还原", root, btop);
     }
-    free(all);
     free(bsub);
     free(scratch);
     return failed ? -1 : 0;
@@ -342,23 +367,22 @@ static int do_global_replace(void* raw) {
     bool skip_backup = args->skip_backup;
     /* NsMountEntry 单条约 8.3KB，栈上声明大数组会叠加超 8MB 栈上限导致 SIGSEGV，
        全部改为堆分配 */
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+    NsMountEntry* all = NULL;
     NsMountEntry* roots = malloc(128 * sizeof(NsMountEntry));
     NsMountEntry* sub = malloc(128 * sizeof(NsMountEntry));
-    if (!all || !roots || !sub) {
-        free(all);
+    if (!roots || !sub) {
         free(roots);
         free(sub);
         LOG_ERR("全局替换: 分配内存失败");
         return -1;
     }
-    int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
-    if (n <= 0) {
+    int n = ns_read_mountinfo_pid(getpid(), &all);
+    if (n < 0) {
         free(all);
         free(roots);
         free(sub);
-        log_ns_error("[global_replace] read mountinfo failed n=%d errno=%d\n", n, errno);
-        LOG_ERR("全局替换: 读取 mountinfo 失败");
+        log_ns_error("[global_replace] read mountinfo failed (unknown) errno=%d\n", errno);
+        LOG_ERR("全局替换: 读取 mountinfo 失败（结论未知）");
         return -1;
     }
     LOG_DBG("全局替换: mountinfo 共 %d 行, fuse_src=%s, backup_root=%s", n, fuse_src, backup_root);
@@ -613,17 +637,16 @@ int ns_global_replace_system(int mnt_ns_pid, const char* fuse_src, const char* b
 /* 在目标命名空间内执行：从备份恢复三族所有用户视图 */
 static int do_global_restore(void* raw) {
     const char* backup_root = (const char*)raw;
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+    NsMountEntry* all = NULL;
     NsMountEntry* bsub = malloc(128 * sizeof(NsMountEntry));
     NsMountEntry* cur = malloc(128 * sizeof(NsMountEntry));
-    if (!all || !bsub || !cur) {
-        free(all);
+    if (!bsub || !cur) {
         free(bsub);
         free(cur);
         return -1;
     }
-    int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
-    if (n <= 0) {
+    int n = ns_read_mountinfo_pid(getpid(), &all);
+    if (n < 0) {
         free(all);
         free(bsub);
         free(cur);
@@ -713,15 +736,10 @@ int ns_global_restore_system(int mnt_ns_pid, const char* backup_root) {
 /* 在应用命名空间内执行：卸载项目 FUSE 并 bind 回备份（幂等） */
 static int do_restore_app_fuse(void* raw) {
     struct AppRestoreArgs* args = (struct AppRestoreArgs*)raw;
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+    NsMountEntry* all = NULL;
     NsMountEntry* sub = NULL; /* 动态分配：按 target/备份树下实际挂载数决定容量 */
-    if (!all) {
-        free(all);
-        free(sub);
-        return -1;
-    }
-    int n = ns_read_mountinfo_pid(getpid(), all, NS_MOUNTINFO_MAX);
-    if (n <= 0) {
+    int n = ns_read_mountinfo_pid(getpid(), &all);
+    if (n < 0) {
         free(all);
         free(sub);
         return -1;
@@ -889,10 +907,11 @@ int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_ro
 /* 查询全局替换状态（读 /proc/<pid>/mountinfo，无需进入命名空间） */
 int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
     if (!fuse_src || fuse_src[0] == '\0') return NSP_GLOBAL_STATUS_UNKNOWN;
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
-    if (!all) return NSP_GLOBAL_STATUS_UNKNOWN;
-    int n = ns_read_mountinfo_pid(mnt_ns_pid, all, NS_MOUNTINFO_MAX);
-    if (n <= 0) {
+    NsMountEntry* all = NULL;
+    int n = ns_read_mountinfo_pid(mnt_ns_pid, &all);
+    if (n < 0) {
+        /* 读不到挂载表 = 状态未知。不能返回 NORMAL：对账会把它当成「还没替换」
+           而对活着的视图再替换一次 */
         free(all);
         return NSP_GLOBAL_STATUS_UNKNOWN;
     }
@@ -931,18 +950,18 @@ int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
 int ns_collect_mounts_under(int pid, const char* base_path, int include_self, int include_fuse,
                             char mount_points[][PATH_MAX], int max_count) {
     if (!base_path || max_count <= 0) return 0;
-    NsMountEntry* all = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
+    NsMountEntry* all = NULL;
     NsMountEntry* sub = malloc(NS_MOUNTINFO_MAX * sizeof(NsMountEntry));
-    if (!all || !sub) {
-        free(all);
+    if (!sub) {
         free(sub);
-        return 0;
+        return -1;
     }
-    int n = ns_read_mountinfo_pid(pid, all, NS_MOUNTINFO_MAX);
-    if (n <= 0) {
+    int n = ns_read_mountinfo_pid(pid, &all);
+    if (n < 0) {
+        /* 未知：返回 -1 让调用方区分「挂载表读不到」与「子树里没有挂载」 */
         free(all);
         free(sub);
-        return 0;
+        return -1;
     }
     int count =
         ns_gather_mounts_under(all, n, base_path, include_self != 0, include_fuse != 0, sub, 512);

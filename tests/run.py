@@ -168,6 +168,21 @@ SUITE_MAP = [
       "repair_stale_app_mounts_at_startup", "target_fuse_unverified"),
      "已挂载视图连接活性 / 启动扫描修复死连接挂载"),
 
+    # ── mountinfo 读取容量语义（ns_mountinfo.c + ns_global_replace.c + mount_manager.c）──
+    # 读取原先由调用方预分配 NS_MOUNTINFO_MAX(4096) 条，触顶只打一行 WRN 就把读到的
+    # 那部分当结果返回——调用方分不清「表里只有 n 条」与「被截断了」；族根落在 4096
+    # 之后时，替换/回滚/状态判定会把它当成不存在。现在按需增长，任何可能不完整的读取
+    # （打开失败 / 内存不足 / 丢弃过超长行）都返回 -1「未知」，状态判定给 UNKNOWN、
+    # 备份点给 NS_BACKUP_UNKNOWN；mount_manager 的挂载状态读取本身无上限，读不出结论
+    # 一律返回 false 而不是「成功且没有挂载」。
+    (("test_mountinfo_dynamic.py", "test_mount_state_read.py"),
+     ("src/injector/ns_mountinfo.c", "src/injector/ns_global_replace.c",
+      "src/injector/ns_global_replace.h", "src/injector/mount_manager.c",
+      "src/injector/ns_utils.c", "include/ns_utils.h"),
+     ("ns_read_mountinfo_pid", "ns_scan_mountinfo_stats", "read_mount_state",
+      "NS_BACKUP_UNKNOWN"),
+     "mountinfo 读取容量语义 / 未知态不降级为未挂载"),
+
     (("test_reaped_managed.py",),
      ("src/injector/reaped_managed.c", "src/injector/reaped_managed.h",
       "src/injector/injector.c"),
@@ -349,6 +364,8 @@ LAYERS = {
             "test_inject_method.py",
             "test_inject_tracked_race.py",
             "test_mount_liveness.py",
+            "test_mountinfo_dynamic.py",
+            "test_mount_state_read.py",
             "test_log_ctl_rules.py",
             "test_commit_msg_lint.py",
             "test_build_scripts.py",
@@ -541,6 +558,9 @@ PARALLEL_SAFE = frozenset({
     "test_log_ctl_rules.py",      # 全走 mkdtemp（--config-dir 指向临时目录）
     "test_inject_method.py",      # conf 全走 mkdtemp + global_replace_ctl 驱动，无 daemon
     "test_mount_liveness.py",     # cc 直编 ns_mount_health.c + --wrap=statfs，无挂载/无 daemon
+    "test_mountinfo_dynamic.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap=fopen，
+                                  # 合成 mountinfo，无挂载/无 daemon
+    "test_mount_state_read.py",   # cc 直编 mount_manager.c + 桩，合成 mountinfo，无挂载/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
     "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
