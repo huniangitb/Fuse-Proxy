@@ -76,6 +76,8 @@
 | 放行 | `ALLOW <path>` | 显式放行：等价"重定向回自身真实存储"（parse 生成 `?<path>` 内部前缀）。命中后该路径**不参与沙盒重定向**，且不继承低作用域的 `HIDE`/`RO`/`REDIRECT`（作用域优先，见 §2）。**IO 仍由 daemon 代理**（不挂 backing 直达下层）——否则内核会按应用自身凭证对 `/data/media` 做 DAC，放行路径反而写不进去 |
 | 重定向 | `REDIRECT <vpath> <target>` | 应用访问 `<vpath>` 实际落到 `<target>` |
 
+> **v3 下的连带影响**：`v3` 全局替换后媒体提供者（`com.android.providers.media*`）也经本项目 FUSE（见 `architecture.md` §5.1），故 `[GLOBAL] HIDE` 对它的中转路径同样生效。隐藏 `/.picker_transcoded`、`/.transforms` 会让系统相册选择器（Photo Picker）取字节失败（ENOENT），表现为「选完图读不出来」——这是配置后果，不是模块缺陷。命中 HIDE 规则时 daemon 打限频 WARN `隐藏规则命中: uid=… 包名=… <路径>`（首个命中与每 1024 次各一条），排查「文件明明在却打不开」先看这条。
+
 > 内置隐藏：`CONFIG_DIR` 下所有访问无条件返回 ENOENT；应用访问 `/Android/data/<其他包>/`、`/Android/obb/<其他包>/` 自动判为其他应用（跨应用隔离，**列举与打开同口径**，见 §4.1）。
 
 ### 4.1 跨应用隔离
@@ -201,6 +203,7 @@ HIDE /secret   # 这不是注释，会被并入规则
 | 应用段写 `MONITOR OFF` 期望继承全局 | 全局段写 `MONITOR OFF`，或应用段显式写所需值 | 应用段显式写即覆盖全局 |
 | `[GLOBAL] ALLOW /Pictures` 后应用段 `SANDBOX ON`，期望 `/Pictures` 仍放行 | 在同一应用段写 `ALLOW /Pictures` | 低作用域 `ALLOW` 不豁免高作用域声明的沙盒（§2） |
 | `FUSE_EXTRA_ARGS` 写在应用段 | 仅写 `[GLOBAL]` 段 | 应用段无该字段 |
+| `HIDE /.picker_transcoded`（或 `/.transforms`）后期望系统相册选择器照常取图 | 不要隐藏系统 picker 的转码/临时目录 | v3 下媒体提供者也在 FUSE 视图内，隐藏这些目录会让 Photo Picker 取字节 ENOENT |
 | 期望 `/sdcard` 原样保留 | 知悉其归一到当前用户存储 | `/sdcard`、`/mnt/sdcard` 是存储根别名，规则路径与变量值都按别名剥离 |
 
 ## 8. 完整示例

@@ -507,13 +507,16 @@ static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path
    HIDE 全体失效）。 */
 static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* current_pkg);
 
+static void br_note_hide_rule(uid_t uid, const char* pkg, const char* sub_path);
+
 /* 隐藏判定：作用域优先（应用段 > 类别段 > [GLOBAL]）。
    每层按 HIDE > ALLOW > RO > REDIRECT 的固定次序取一个结论（同层冲突 fail-closed，
    与旧实现「hide 无条件优先」一致）；**第一个有声明的作用域说了算**，下层的声明
    不再参与。旧实现把三层 HIDE 做并集，于是 GLOBAL 恒赢、应用段 ALLOW 永远无法
    取消下层 HIDE（docs/config.md §2 的优先级只在 REDIRECT 上落实过）。 */
 static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const char* sub_path,
-                                       const char* current_pkg, const FwRulesTrieMatch* tm) {
+                                       const char* current_pkg, const FwRulesTrieMatch* tm,
+                                       uid_t uid) {
     bool is_skel = false;
     /* 静态部分只保留 CONFIG_DIR 前缀与 Android 骨架两支：**不能**传 tm 下去，因为
        br_hidden_static_part 内部的 tm->hidden 是跨作用域并集，会让全局 HIDE 在逐层
@@ -525,6 +528,7 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const cha
     BrScopeDecl decl;
     br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, -1, 0, NULL, 0, BR_WANT_VIS, &scope,
                     &decl);
+    if (decl.hide) br_note_hide_rule(uid, current_pkg, sub_path);
     return decl.hide;
 }
 
@@ -566,6 +570,24 @@ static void br_note_isolation(const char* current_pkg, const char* sub_path) {
     if (n == 1 || (n & 1023u) == 0)
         LOG_DBG("跨应用隔离: 拒绝 %s → %s（累计 %lu 次；[GLOBAL] ALLOW_CROSS_APP_DATA ON 可放行）",
                 current_pkg, sub_path, n);
+}
+
+/* 隐藏规则命中的限速观测（WARN）：命中 HIDE 是**静默 ENOENT**，现场只看到文件
+   不存在，分不清是规则拦的还是真没有（Photo Picker 读 `/.picker_transcoded`
+   这类缓存目录时尤其难查）。首个命中与每 1024 次各一条，带调用方 uid/包名与
+   判定路径。骨架/CONFIG_DIR 等内部隐藏不在此列，只记用户规则命中。 */
+static void br_note_hide_rule(uid_t uid, const char* pkg, const char* sub_path) {
+    static atomic_ulong seq;
+    static atomic_uint callers; /* 按包名哈希的位图：每个调用方首次命中各记一条 */
+    const char* name = pkg && pkg[0] ? pkg : "?";
+    unsigned long n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed) + 1;
+    unsigned hash = 2166136261u;
+    for (const char* p = name; *p; p++) hash = (hash ^ (unsigned char)*p) * 16777619u;
+    unsigned bit = hash & 31u;
+    unsigned seen = atomic_fetch_or_explicit(&callers, 1u << bit, memory_order_relaxed);
+    if (!(seen & (1u << bit)) || (n & 1023u) == 0)
+        LOG_WRN("隐藏规则命中: uid=%u 包名=%s %s（累计 %lu 次）", (unsigned)uid, name, sub_path,
+                n);
 }
 
 /* 媒体提供者（\`com.android.providers.media*\`，含 \`.module\`）不参与沙盒裁决：
@@ -658,13 +680,12 @@ static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const ch
                                         int* path_user_id_out, char* sub_path_out,
                                         size_t sub_path_size, const char* current_pkg, uid_t uid,
                                         FwRulesTrieMatch* tm_out) {
-    (void)uid;
     if (br_strip_and_sanitize(path, path_user_id_out, sub_path_out, sub_path_size) != 0)
         return -ENOENT;
     if (tm_out) br_trie_resolve(cfg, cat, sub_path_out, tm_out);
     /* 隐藏判定对所有访问者生效（含 root，与 vfs_readdir probe 过滤一致）：
        HIDE 规则配置后，root ls 也不应看到被隐藏条目 */
-    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out)) return -ENOENT;
+    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out, uid)) return -ENOENT;
     return 0;
 }
 
@@ -1372,7 +1393,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                    下无线性规则扫描，逐层现查 trie（每作用域一次下降）的成本远低于一次
                    syscall，故直接走权威判定 */
                 bool hidden =
-                    br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL) || iso;
+                    br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid) || iso;
                 out->valid = true;
                 out->appear_missing = hidden;
                 out->is_other_app_pkg = iso;
@@ -1389,7 +1410,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
                同判据：看不见 = 打不开） */
             bool iso = br_isolation_hides(sub_path, current_pkg, q->uid);
-            if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL) || iso) {
+            if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid) || iso) {
                 out->valid = true;
                 out->appear_missing = true;
                 if (config_read_end(cfg_gen)) return;
