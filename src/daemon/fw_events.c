@@ -65,8 +65,10 @@
 
 /* ================== 常量 ================== */
 
-#define FW_EVENTS_SOCK_NAME "nsp_fs_events"
-#define FW_QUERY_SOCK_NAME "nsp_fs_query"
+/* 名字的字面量集中在 nsp_constants.h：log_ctl 的归属诊断按同一个常量查
+   /proc/net/unix，两处各写一份会静默查空。 */
+#define FW_EVENTS_SOCK_NAME NSP_EVENTS_SOCK_NAME
+#define FW_QUERY_SOCK_NAME NSP_EVENTS_QUERY_SOCK_NAME
 
 #define FW_EVENTS_RING_CAP 4096
 #define FW_EVENTS_PATH_MAX 256       /* fuse 视角路径 */
@@ -1239,33 +1241,60 @@ static void fw_build_allow_list(void) {
     }
 }
 
+/* 通道起不来时把原因落到 LOG_DIR/events_socket.status：sys.log 里那条 ERR 会随日志
+   滚动消失，而「事件通道哑了」本身没有任何外部表现（订阅者收不到事件，界面上也
+   看不到异常），必须能从 log_ctl 反查到。成功启动或开关关闭时删掉该文件，避免旧
+   失败残留被读成本次状态。 */
+static void fw_events_record_result(bool ok, const char* stage, int err) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/events_socket.status", LOG_DIR);
+    if (ok) {
+        unlink(path);
+        return;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "time=%lld pid=%d stage=%s errno=%d msg=%s\n",
+                     (long long)time(NULL), (int)getpid(), stage ? stage : "?", err,
+                     strerror(err));
+    if (n > 0) (void)write(fd, buf, (size_t)((n < (int)sizeof(buf)) ? n : (int)sizeof(buf) - 1));
+    close(fd);
+}
+
 int fw_events_start(void) {
     if (atomic_load_explicit(&g_events_on, memory_order_relaxed)) return 0;
     if (!g_global_cfg.fuse_events) {
         LOG_DBG("FUSE 事件通道未启用（[GLOBAL] FUSE_EVENTS 默认 OFF）：零线程零 socket");
+        fw_events_record_result(true, NULL, 0); /* 开关关闭不是故障，别留旧失败记录 */
         return 0;
     }
+    const char* stage = "init";
     fw_build_allow_list();
     fw_events_reset();
     g_ring = calloc(FW_EVENTS_RING_CAP, sizeof *g_ring);
     if (!g_ring) {
         LOG_ERR("事件环分配失败（%d 槽）", FW_EVENTS_RING_CAP);
+        fw_events_record_result(false, "ring-alloc", ENOMEM);
         return -1;
     }
     g_evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (g_evfd < 0) {
         LOG_ERR("eventfd 创建失败: %s", strerror(errno));
+        stage = "eventfd";
         goto fail;
     }
     struct sockaddr_un addr;
     g_evsock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (g_evsock < 0) {
         LOG_ERR("事件 socket 创建失败: %s", strerror(errno));
+        stage = "events-socket";
         goto fail;
     }
     socklen_t alen = nsp_uds_abstract_addr(&addr, FW_EVENTS_SOCK_NAME);
     if (bind(g_evsock, (struct sockaddr*)&addr, alen) != 0) {
         LOG_ERR("事件 socket 绑定 %s 失败: %s", FW_EVENTS_SOCK_NAME, strerror(errno));
+        stage = "events-bind";
         goto fail;
     }
     int one = 1;
@@ -1273,31 +1302,37 @@ int fw_events_start(void) {
        SO_PASSCRED 的 SCM_CREDENTIALS 取（内核按发送者填，不可伪造）。 */
     if (setsockopt(g_evsock, SOL_SOCKET, SO_PASSCRED, &one, sizeof one) != 0) {
         LOG_ERR("事件 socket 开启 SO_PASSCRED 失败: %s", strerror(errno));
+        stage = "events-passcred";
         goto fail;
     }
     g_qsock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (g_qsock < 0) {
         LOG_ERR("查询 socket 创建失败: %s", strerror(errno));
+        stage = "query-socket";
         goto fail;
     }
     alen = nsp_uds_abstract_addr(&addr, FW_QUERY_SOCK_NAME);
     if (bind(g_qsock, (struct sockaddr*)&addr, alen) != 0) {
         LOG_ERR("查询 socket 绑定 %s 失败: %s", FW_QUERY_SOCK_NAME, strerror(errno));
+        stage = "query-bind";
         goto fail;
     }
     if (listen(g_qsock, FW_QUERY_MAX_CONNS) != 0) {
         LOG_ERR("查询 socket listen 失败: %s", strerror(errno));
+        stage = "query-listen";
         goto fail;
     }
     atomic_store_explicit(&g_quit, false, memory_order_relaxed);
     pthread_t th;
     if (pthread_create(&th, NULL, fw_query_accept_thread, NULL) != 0) {
         LOG_ERR("QUERY 线程创建失败");
+        stage = "query-thread";
         goto fail;
     }
     g_accept_thread = th;
     if (pthread_create(&th, NULL, fw_events_thread, NULL) != 0) {
         LOG_ERR("事件线程创建失败");
+        stage = "events-thread";
         atomic_store_explicit(&g_quit, true, memory_order_relaxed);
         shutdown(g_qsock, SHUT_RDWR);
         pthread_join(g_accept_thread, NULL);
@@ -1306,16 +1341,21 @@ int fw_events_start(void) {
     g_ev_thread = th;
     g_threads_up = true;
     atomic_store_explicit(&g_events_on, true, memory_order_relaxed);
+    fw_events_record_result(true, NULL, 0);
     LOG("FUSE 事件通道已启动：%s（订阅者上限 %d，环 %d）、%s（并发上限 %d，白名单 %d 项）",
         FW_EVENTS_SOCK_NAME, FW_EVENTS_MAX_SUBS, FW_EVENTS_RING_CAP, FW_QUERY_SOCK_NAME,
         FW_QUERY_MAX_CONNS, g_allow_count);
     return 0;
 
-fail:
+fail: {
+    int saved_errno = errno;
+    fw_events_record_result(false, stage, saved_errno);
     fw_events_close_fds();
     free(g_ring);
     g_ring = NULL;
+    errno = saved_errno;
     return -1;
+}
 }
 
 void fw_events_stop(void) {

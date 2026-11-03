@@ -13,6 +13,9 @@ struct GlobalFuseInfo {
     int crash_count;
     time_t last_crash_time;
     bool disabled;
+    /* 本次 spawn 时 fuse_crash.log 的大小（-1=未知）。崩溃诊断只读这个偏移之后
+       的内容：该文件跨启动 append，历史记录不能被读成本次崩溃原因。 */
+    off_t crash_log_start;
 };
 
 extern struct GlobalFuseInfo g_global_fuse;

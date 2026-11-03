@@ -271,6 +271,8 @@ FUSE 回调（如 getattr）
 - **判定不在这里**：QUERY 只调 `fw_acl_check`（访问控制）与 `fw_rules_resolve`（规则），自己不写任何 hidden/ro 判定；六类响应互不混淆，`ok=0`（不认识/无规则）与 `denied=1`（被规则拒绝）**不得复用**，拥塞另用 `busy=1`。
 - **exists 有 200ms TTL 缓存，且在该路径 `write_done` 时立即失效**——否则"刚写完立刻查"会拿到 `exists=0` 漏扫。处理器内除缓存未命中的一次 `lstat` 外不做阻塞 IO，绝不回调 MediaProvider。
 
+**通道归属固定给全局实例**：两个实例（全局、媒体）都曾调用 `fw_events_start()` 抢同一个抽象名——内核对名字唯一，先 bind 者赢，输的那条实例的应用事件**一条也发不出去**，外部表现只是「事件功能随机全哑」，而现场只留一条 WARN 滚在日志里，事后无从查。现在**媒体实例不建立事件通道**（`g_is_media_fuse` 早退：`/mnt/nsp_media` 只服务 MediaProvider，应用事件本就该走全局那条）。任何一步失败（ring 分配 / eventfd / socket / bind / passcred / listen / 线程）都把**阶段名与 errno** 写进 `LOG_DIR/events_socket.status`，成功或开关关闭时删除该文件；`log_ctl events [api]` 结合该文件、`/proc/net/unix` 与 `/proc/<pid>/fd` 实测「此刻谁绑着这个名字」，给出 `ok` / `missing` / `unknown-owner` / `media-owner` / `foreign` / `disabled` 与处置提示（`log_ctl status` 同时带一个 `events` 块）。
+
 ## 5. 进程协作
 
 ### 5.1 注入流程
@@ -389,6 +391,12 @@ entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导
 | `nsp_config_broadcast` | DGRAM 抽象 | 配置广播（GET/STATIC/SUBSCRIBE） |
 | `nsp_log_socket` | SOCK_STREAM 抽象 | 各进程 `log_internal` → log_monitor；log_ctl 查询同走此路 |
 | `nsp_rule_socket` | SOCK_STREAM 抽象 | rule_server 的 JSON 行协议控制面（规则增删改查、SERVICE、EXPORT_LOGS；高危命令经 `SO_PEERCRED` 鉴权，见 §2.3） |
+
+### 5.5 崩溃诊断的读取窗口
+
+`fuse_crash.log` 是 **append 打开的长期文件**：每次 `fuse_daemon` 启动都接着往里写，历次启动的 linker 报错、backtrace 与退出原因都留在同一个文件里。诊断原先摊**尾部固定 16KB**，于是「本次启动后一行没写」时会把上一轮启动残留的 linker 报错当成本次崩溃主因（现场据此误判过一次死因）。
+
+现在窗口锚在**本次守护进程启动时的文件大小**上（`include/crash_tail.h` 的 `crash_tail_window`，纯函数）：只读这个偏移之后的内容；本次启动后没有新增时不摊旧内容，只报「无新增输出」；起点不可信（`stat` 失败，或文件被截断/轮转导致起点大于当前大小）才退回尾部，并丢弃可能残掉的首行以免输出半截 backtrace 帧。启动时的大小在 `fork()` **之前**由 `fstat` 取（`GlobalFuseInfo.crash_log_start` 与 `g_media_fuse.crash_log_start`），子进程只 `dup2` 父进程已打开的 fd、不重新打开文件；四类调用点（ready 检查两处、async 启动失败、`check_and_recover_fuse`）永远传同一起点。
 
 ## 6. 全局状态与并发
 

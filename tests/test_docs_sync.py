@@ -65,6 +65,8 @@ EXTERNAL_PATHS = {
     "sys.log": "同上",
     "daemon.log": "同上",
     "module_errors.log": "同上",
+    "fuse_crash.log": "运行期日志（LOG_DIR 下，daemon 的 stderr append 到这里）",
+    "events_socket.status": "运行期状态文件（LOG_DIR 下，事件通道启动失败时写一行）",
     "uid.map": "运行期生成的 uid→包名映射（CONFIG_DIR 下）",
     "sys_pkgs.cache": "运行期生成的系统包缓存（CONFIG_DIR 下）",
     "injector.conf": "运行期配置（CONFIG_DIR 下；conf/ 里是示例）",
