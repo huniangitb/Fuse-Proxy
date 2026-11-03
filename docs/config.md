@@ -65,6 +65,8 @@
 
 `MONITOR` 的三层合并（应用显式 > 类别显式 > `[GLOBAL]`；`[USER_APPS[:uid]]` / `[SYSTEM_APPS]` 均参与）由**框架**统一计算，与规则模块是否加载无关：模块未加载/被 ban、路径无 `<uid>/` 用户层、模块未命中规则时同样算得对。若把开关绑在"模块是否给出有效决策"上，这些情形下文件读写一切正常、IO 监控日志却静默消失且无任何提示（历史缺陷）。框架为此自建一份配置索引并自行解析 uid→包名（`uid.map` → `/proc` 回退，见 `architecture.md` §2.2）；包名不可解析（`system`/`unknown`/过短/`zygote`）时只认 `[GLOBAL]`，与模块侧同一 fail-safe 口径。
 
+`io.log` 的行数完全由 `MONITOR` 决定：**三层合并后未生效的调用方一行都不记**（默认 `OFF`，空白配置下该文件不增长）。正常行 `时间|LEVEL|[pkg(uid)] [OP] <虚拟路径>`，命中 `REDIRECT` 时尾部追加 ` -> <target>`；**正常行不带 errno**，失败另起 `[pkg] [ERR] <OP> <路径> errno=…`。排查「文件明明在却打不开」要的是拒绝原因，那条在 `sys.log`（`隐藏规则命中`/`访问控制拒绝`/`跨应用隔离`/存储根守卫，都带 `errno=`）——按 `io.log` 里同一个路径、同一个时间窗去对 `sys.log`，别在 `io.log` 里找错误码。
+
 注入方法为 `v3` 时（`injector --inject-method=v3`，见 `architecture.md` §5.1），`GLOBAL_INJECT` / `SKIP_SYSTEM_APPS` **不参与目标判定**——含系统应用在内一律经项目 FUSE；应用段与类别段头的 `OFF` 仍然生效。
 
 ## 4. 四类规则
