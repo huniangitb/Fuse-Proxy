@@ -26,6 +26,8 @@
 #include <sys/un.h>
 #include <sys/time.h>
 #include <sys/poll.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +41,7 @@
 #define LOG_TAG   "Zygisk_NSProxy"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
 /* 必须与 include/common.h 的 IPC_SOCKET_NAME 同值（抽象命名空间地址）。
    本模块不可 include common.h——它代含 nsp_comm.h 等十余个头，会把项目
@@ -66,7 +69,13 @@
    1.5s 解析 mountinfo，开机会被拖慢几十秒，锁屏/桌面也跟着晚出来。 */
 #define COMPANION_REQ_TIMEOUT_MS  150
 #define COMPANION_POST_TIMEOUT_MS 1500
-#define MODULE_REQ_TIMEOUT_MS     200
+/* companion 连 injector 的上限。AF_UNIX 的 connect 在监听队列满时**没有**超时
+   （内核会让它一直等到有 accept 或对端退出），injector 卡死而队列被占满时，
+   companion 线程会永久停在 connect 上；线程池耗尽后，后续应用连
+   connectCompanion 也拿不到线程，就会卡死在 specialize——只能杀进程重开。
+   非阻塞 connect + 有界轮询把这段封死。 */
+#define COMPANION_CONNECT_TIMEOUT_MS 100
+#define MODULE_REQ_TIMEOUT_MS     100
 /* post-specialize 本地等待"自己的命名空间出现代理视图"的上限。injector 的盯梢线程
    在 ns 切换后立即挂载（实测 0–9ms），这里等 100ms 只覆盖慢设备上的装配窗口；
    等不到就放行（应用继续用原生视图），由 injector 的后台重试队列补挂。 */
@@ -142,6 +151,29 @@ static bool should_report(uint32_t uid) {
 
 /* ============================ Companion（root 权限） ============================ */
 
+/* 带超时的 connect：AF_UNIX 的阻塞 connect 在监听队列满时会无限等待，
+   companion 线程一旦卡在这里就不会退出（见 COMPANION_CONNECT_TIMEOUT_MS）。 */
+static int connect_with_timeout(int fd, const struct sockaddr* addr, socklen_t addr_len,
+                                int timeout_ms) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+
+    int rc = connect(fd, addr, addr_len);
+    if (rc != 0 && errno == EINPROGRESS) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+        if (poll(&pfd, 1, timeout_ms) > 0) {
+            int err = 0;
+            socklen_t err_len = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0 && err == 0) {
+                rc = 0;
+            }
+        }
+    }
+    fcntl(fd, F_SETFL, flags);
+    return rc;
+}
+
 /* 从 injector 读应答动词（OK/ERR/DEFER），超时或无应答一律回落 "ERR"。
    应答是短字符串且不带换行，读到即返回。 */
 static void companion_wait_reply(int fd, int timeout_ms, char* out, size_t outsz) {
@@ -209,7 +241,8 @@ static void companion_handler(int client_fd) {
             setsockopt(inj_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(inj_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-            if (connect(inj_fd, (struct sockaddr*)&addr, addr_len) == 0) {
+            if (connect_with_timeout(inj_fd, (struct sockaddr*)&addr, addr_len,
+                                     COMPANION_CONNECT_TIMEOUT_MS) == 0) {
                 char report_msg[512];
                 int msg_len = (nf >= 5) ? snprintf(report_msg, sizeof(report_msg), "%s %s %d %d %s",
                                                    fwd_verb, pkg_name, pid, uid, proto)
@@ -260,6 +293,8 @@ class AppReporterModule : public zygisk::ModuleBase {
         answered_ = false;
         reply_ok_ = false;
 
+        struct timespec t_pre0;
+        clock_gettime(CLOCK_MONOTONIC, &t_pre0);
         int fd = api->connectCompanion();
         if (fd >= 0) {
             char req_buf[512];
@@ -290,6 +325,16 @@ class AppReporterModule : public zygisk::ModuleBase {
                ZygiskNext 1.3.4+ 会关掉 preAppSpecialize 返回后仍持有的 companion
                fd，留着它就是"Companion API 使用不当"，且 post 再写必失败）。 */
             close(fd);
+        }
+
+        /* 判决往返正常在个位数毫秒（真机 41 次采样 p50=1ms、p90=6ms、max=16ms）。
+           接近预算说明 injector 侧卡顿，只记一条 WARN，方便现场直接看出慢在哪。 */
+        struct timespec t_pre1;
+        clock_gettime(CLOCK_MONOTONIC, &t_pre1);
+        long pre_ms = (t_pre1.tv_sec - t_pre0.tv_sec) * 1000 + (t_pre1.tv_nsec - t_pre0.tv_nsec) / 1000000;
+        if (pre_ms >= MODULE_REQ_TIMEOUT_MS * 4 / 5) {
+            LOGW("App [%s] (UID:%u) pre 判决等待 %ldms（预算 %dms，injector 可能卡顿）", final_name,
+                 args->uid, pre_ms, MODULE_REQ_TIMEOUT_MS);
         }
 
         if (nice_name) {
