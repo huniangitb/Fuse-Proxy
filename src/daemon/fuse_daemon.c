@@ -3540,7 +3540,18 @@ int main(int argc, char* argv[]) {
     if (lcfg) fuse_loop_cfg_destroy(lcfg);
     free(fopts.mountpoint);
     fuse_opt_free_args(&fa);
-    if (fmain_rc && fmain_rc != 8) LOG_ERR("FUSE 会话退出: rc=%d", fmain_rc);
+    /* mt 模式把 fuse_loop_mt 的任何非零返回压成 8，而 8 只表示"线程池里某个
+       worker 出过错"，与单线程 rc 不同源；旧实现连同 8 一起静默——会话被中止
+       （挂载被卸载、连接被 abort）导致 daemon 退出时，日志里一个字都没有，
+       现场只能看到 injector 侧的"挂载点不可达"，归因断在这里。退出原因必须
+       留痕：正常退出（rc=0）仍不记，避免每次重载都刷一行。 */
+    if (fmain_rc) {
+        if (fmain_rc == 8) {
+            LOG_WRN("FUSE 会话退出: 线程池返回非零（会话被中止或 worker 出错）");
+        } else {
+            LOG_ERR("FUSE 会话退出: rc=%d", fmain_rc);
+        }
+    }
     /* 退出前卸载模块（并停配置监听线程、释放引擎缓存）：
        ① 模块的 exit 应在进程退出前正常调用；
        ② 更要紧的是**别把模块留在映射里**——`exit()` → `_dl_fini` 会遍历所有仍
