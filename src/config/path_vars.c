@@ -35,7 +35,7 @@ const char* nsp_strip_storage_prefix(const char* path) {
         if (*p == '\0') return "/";
         return p - 1;
     }
-    static const char* const aliases[] = {"/sdcard", "/mnt/sdcard"};
+    static const char* const aliases[] = {"/sdcard", "/mnt/sdcard", "/storage/self/primary"};
     for (size_t i = 0; i < sizeof aliases / sizeof aliases[0]; i++) {
         const size_t al = strlen(aliases[i]);
         if (strncmp(path, aliases[i], al) != 0) continue;
@@ -370,9 +370,10 @@ bool build_real_base_from_target(const char* target, int user_id, char* real_bas
         rest = t + emu_prefix_len;
         while (*rest && isdigit((unsigned char)*rest)) rest++;
         if (*rest == '/') rest++;
-    } else if (strncmp(t, "/sdcard", 7) == 0 || strncmp(t, "/mnt/sdcard", 11) == 0) {
-        /* /sdcard、/mnt/sdcard 与 /storage/emulated/<N> 同指当前用户存储：
-           剥掉别名后按剩余路径合成，避免落成 <STORAGE_BASE>/<uid>/sdcard/... */
+    } else if (nsp_strip_storage_prefix(t) != t) {
+        /* /sdcard、/mnt/sdcard、/storage/self/primary 与 /storage/emulated/<N> 同指
+           当前用户存储：剥掉别名后按剩余路径合成，避免落成 <STORAGE_BASE>/<uid>/sdcard/...
+           用剥离函数的返回值判定别名，避免「/sdcardXxx」这类同前缀但非别名的路径被误剥 */
         const char* q = nsp_strip_storage_prefix(t);
         rest = (q[0] == '/') ? q + 1 : q;
     } else if (is_system_abs_path(t)) {

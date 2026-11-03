@@ -48,6 +48,8 @@ int main(void) {
     check("? root only reject", "?", 0, 0, NULL);
     check("sys abs data", "/data/foo/bar", 0, 1, "/data/foo/bar");
     check("sys abs mnt", "/mnt/nsp_global2/foo", 0, 1, "/mnt/nsp_global2/foo");
+    check("self primary alias", "/storage/self/primary/Download", 0, 1, "/data/media/0/Download");
+    check("sdcard prefix not alias", "/sdcardXxx/file", 0, 1, "/data/media/0/sdcardXxx/file");
     check("relative path", "foo/bar", 0, 1, "/data/media/0/foo/bar");
     printf(fails ? "FAILED %d\n" : "ALL PASS\n", fails);
     return fails;
