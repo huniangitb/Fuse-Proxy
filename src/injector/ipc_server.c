@@ -546,7 +546,8 @@ static bool ipc_post_mount_dispatch(const char* pkg, int pid, uid_t uid) {
     arg->ns_dev = st.st_dev;
     arg->ns_ino = st.st_ino;
     /* 盯梢线程不在应用主线程上等，可以给足 vold 装配窗口（实测 ~135–150ms），
-       让"应用首次读存储"就能看到代理视图；模块侧上限 1500ms 覆盖这段预算。 */
+       让"应用首次读存储"就能看到代理视图；模块侧只等 100ms（且仅在明确 DEFER
+       时），没赶上就由后台重试队列补挂，应用启动不被拖慢。 */
     arg->readiness_ms = IPC_MOUNT_READINESS_MS;
     pthread_t tid;
     if (pthread_create(&tid, NULL, ipc_post_mount_thread, arg) == 0) {
@@ -812,7 +813,7 @@ void handle_ipc_client_readable(int client_fd) {
                        最小。两条路重复执行时，后到的那条只会命中"顶层非项目 FUSE→
                        跳过"。
                        新模块（proto>=3）没有第二次通知，且它会把 DEFER 当成"要等自己的
-                       代理视图"——本应用恰恰不该被代理，等满 1500ms 只会白等一场
+                       代理视图"——本应用恰恰不该被代理，等满自己的 100ms 上界只会白等一场
                        （每次冷启动可见地变慢）。故对这类模块直接回 OK，还原仍由上面
                        那条后台线程完成。 */
                     bool dispatched =

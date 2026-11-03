@@ -608,13 +608,13 @@ static void run_plan_readiness_cases(void) {
            "A2 POST 预算 ≤ 50ms 且小于 legacy 预算（不可感知 + fail-open 交后台重试）",
            "POST 预算过大：应用主线程白等且仍拿不到视图");
 
-    /* 补挂载盯梢（proto>=3）的两段预算必须收在模块等待里：injector 先盯命名空间
-       切换（IPC_POST_WAIT_MS）再做同步挂载（IPC_MOUNT_READINESS_MS），模块在 post
-       里等自己的视图上限 1500ms——加起来超了就是"应用已放行、挂载才刚做完"，
-       按设计模块超时后由后台重试补挂（正确但慢），故钉住"先放弃的是 injector"。 */
-    report(IPC_POST_WAIT_MS + IPC_MOUNT_READINESS_MS < 1500,
-           "A2 补挂载两段预算之和 < 模块等待上限（先放弃的是 injector）",
-           "预算过大：模块放行时挂载尚未完成");
+    /* 补挂载盯梢（proto>=3）完全在 injector 后台线程里跑：模块侧只在收到明确
+       DEFER 时本地等 100ms（MODULE_PROXY_WAIT_MS），没等到就放行、由后台重试
+       队列补挂。故这里只钉住 injector 自己的两段预算有界——应用启动不再等它们
+       走完（旧实现让模块等 1500ms，启动高峰把每个进程都拖慢 1.5s）。 */
+    report(IPC_POST_WAIT_MS + IPC_MOUNT_READINESS_MS <= 2000,
+           "A2 补挂载两段预算有界（应用侧已放行，不依赖它们完成）",
+           "预算无界：后台盯梢会长期占用线程/重试队列");
 
     /* A2b：v2 非目标还原的时序（事件驱动优先，不靠 10ms 轮询猜时间）。
        新协议 pre 阶段不还原、不轮询——此刻应用 ns 里还没有项目视图（还原只会
