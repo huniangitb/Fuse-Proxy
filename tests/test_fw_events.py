@@ -140,6 +140,29 @@ def static_contract():
                     "fw_pkg_uid_for_package 从 packages.list 解析得到")
     if "bool fw_pkg_uid_for_package(" not in pkg_c:
         errs.append("fw_pkg.c 缺 fw_pkg_uid_for_package 实现（pkg→uid 唯一出处）")
+
+    # ⑧ 事件线程不得空转：合并槽只能被 maintain 清，且无订阅者时超时必须非 0
+    #    （现场形态：最后一个订阅者失联后遗留槽的 deadline 永远是过去时，
+    #    超时恒 0 → poll(…,0) 立即返回 → 事件线程单核 100%，请求全堵）
+    if "static void fw_events_maintain(void)" not in ev:
+        errs.append("fw_events.c 缺 fw_events_maintain（合并槽清理/环排空必须收敛到单一入口）")
+    if ev.count("fw_coalesce_flush_due();") != 1:
+        errs.append(f"fw_coalesce_flush_due() 被调用 {ev.count('fw_coalesce_flush_due();')} 次，"
+                    "期望 1 次（只在 fw_events_maintain 内，无条件执行）")
+    maintain = ev.split("static void fw_events_maintain(void) {", 1)
+    if len(maintain) == 2:
+        body = maintain[1].split("\n}\n", 1)[0]
+        if "fw_coalesce_flush_due();" not in body:
+            errs.append("合并槽清理不在 fw_events_maintain 内——放回 g_sub_count>0 分支会让"
+                        "无订阅者时遗留槽永不清、事件线程空转")
+    if not re.search(r"if \(g_sub_count == 0\)\s*\n?\s*return FW_EVENTS_POLL_MAX_MS;", ev):
+        errs.append("fw_coalesce_timeout() 缺 g_sub_count == 0 守卫（无订阅者时按槽到期返回 0 会空转）")
+    if "static int fw_poll_timeout_ms(void)" not in ev:
+        errs.append("fw_events.c 缺 fw_poll_timeout_ms（合并槽到期与心跳取小、封顶 POLL_MAX_MS）")
+    if "poll(pfd, 2, fw_poll_timeout_ms())" not in ev:
+        errs.append("事件线程的 poll 超时必须走 fw_poll_timeout_ms()")
+    if "fw_events_maintain();" not in ev:
+        errs.append("事件线程每轮必须调用 fw_events_maintain()")
     return errs
 
 

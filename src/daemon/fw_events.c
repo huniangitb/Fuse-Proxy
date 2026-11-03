@@ -609,8 +609,11 @@ static void fw_coalesce_flush_due(void) {
     }
 }
 
-/* 距最近一次到期的毫秒数（无待发 → FW_EVENTS_POLL_MAX_MS） */
+/* 距最近一次到期的毫秒数（无待发 → FW_EVENTS_POLL_MAX_MS）
+   无订阅者时直接按上限睡：此时没有任何发送机会，按槽到期时间返回 0 只会让
+   事件线程 poll(0) 空转（合并槽要等订阅者回来才有人清）。 */
 static int fw_coalesce_timeout(void) {
+    if (g_sub_count == 0) return FW_EVENTS_POLL_MAX_MS;
     int64_t now = fw_now_ms();
     int64_t best = INT64_MAX;
     for (int i = 0; i < FW_EVENTS_COALESCE_SLOTS; i++) {
@@ -844,6 +847,30 @@ static void fw_maybe_ping(void) {
 
 /* ================== 事件线程 ================== */
 
+/* 单轮 poll 的超时：最近合并槽到期与下一次心跳取小；两者都远时封顶
+   FW_EVENTS_POLL_MAX_MS（长睡也必须按时醒来发心跳）。 */
+static int fw_poll_timeout_ms(void) {
+    int timeout = fw_coalesce_timeout();
+    int64_t until_ping = g_next_ping_ms - fw_now_ms();
+    if (until_ping < timeout) timeout = until_ping > 0 ? (int)until_ping : 0;
+    return timeout;
+}
+
+/* 单轮"排空 + 合并"：有订阅者时把环渲染进合并槽；无订阅者时环直接丢弃。
+   合并槽必须**无条件** flush——槽只有 flush 才清，而在 g_sub_count 归零的分支
+   里不清的话，遗留槽的 deadline 永远是过去时，poll 超时恒 0，事件线程空转烧满
+   一核（最后一个订阅者被 sendto 失联摘除的那一刻就会进入这个状态）。 */
+static void fw_events_maintain(void) {
+    if (g_sub_count > 0) {
+        fw_drain_ring();
+    } else {
+        FwEventRec junk[16];
+        while (fw_ring_pop(junk, 16) > 0) {
+        } /* 无订阅者：直接弃，不渲染 */
+    }
+    fw_coalesce_flush_due();
+}
+
 static void* fw_events_thread(void* arg) {
     (void)arg;
     nsp_set_thread_name("nsp_fs_events");
@@ -856,10 +883,7 @@ static void* fw_events_thread(void* arg) {
     while (!atomic_load_explicit(&g_quit, memory_order_relaxed)) {
         pfd[0].revents = 0;
         pfd[1].revents = 0;
-        int timeout = fw_coalesce_timeout();
-        int64_t until_ping = g_next_ping_ms - fw_now_ms();
-        if (until_ping < timeout) timeout = until_ping > 0 ? (int)until_ping : 0;
-        int r = poll(pfd, 2, timeout);
+        int r = poll(pfd, 2, fw_poll_timeout_ms());
         if (r < 0 && errno != EINTR) break;
         if (pfd[1].revents & POLLIN) {
             uint64_t v;
@@ -867,14 +891,7 @@ static void* fw_events_thread(void* arg) {
             (void)rd;
         }
         if (pfd[0].revents & POLLIN) fw_recv_subscribes();
-        if (g_sub_count > 0) {
-            fw_drain_ring();
-            fw_coalesce_flush_due();
-        } else {
-            FwEventRec junk[16];
-            while (fw_ring_pop(junk, 16) > 0) {
-            } /* 无订阅者：直接弃，不渲染 */
-        }
+        fw_events_maintain();
         fw_maybe_ping();
     }
     return NULL;
