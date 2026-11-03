@@ -756,9 +756,10 @@ static void parse_redirect_rule(AppConfig* cur, char* p_ptr, int line_num, const
         while (*p && isdigit((unsigned char)*p)) p++;
         if (*p == '/') p++;
         ok = path_fmt(real_target, sizeof real_target, "?/%s", p);
-    } else if (strncmp(v2, "/sdcard", 7) == 0 || strncmp(v2, "/mnt/sdcard", 11) == 0) {
-        /* /sdcard、/mnt/sdcard 是当前用户存储的别名：与 /storage/emulated 分支
-           同口径转成 "?<剩余路径>"，否则目标会被当成存储根下的子目录 */
+    } else if (strip_storage_prefix(v2) != v2) {
+        /* /sdcard、/mnt/sdcard、/storage/self/primary 是当前用户存储的别名：与
+           /storage/emulated 分支同口径转成 "?<剩余路径>"，否则目标会被当成存储根
+           下的子目录。用剥离函数的返回值判定，避免「/sdcardXxx」被误剥 */
         const char* p = strip_storage_prefix(v2);
         ok = path_fmt(real_target, sizeof real_target, "?%s", p);
     } else if (is_system_abs_path(v2)) {

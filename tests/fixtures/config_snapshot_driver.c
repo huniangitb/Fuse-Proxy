@@ -82,6 +82,13 @@ static bool has_str(char* const* arr, int count, const char* want) {
     return false;
 }
 
+static int count_str(char** arr, int n, const char* want) {
+    int c = 0;
+    for (int i = 0; i < n; i++)
+        if (arr[i] && streq(arr[i], want)) c++;
+    return c;
+}
+
 static const RedirectRule* find_redir(const AppConfig* cfg, bool is_allow, const char* vp) {
     for (int i = 0; i < cfg->redir_count; i++) {
         if (cfg->redir_rules[i].is_allow == is_allow &&
@@ -153,6 +160,31 @@ static void check_snapshot(void) {
        "snapshot.[SYSTEM_APPS] uid 归一为 -1");
 
     /* ---- App-rules-<uid>/ 分文件 ---- */
+    /* ---- 存储根别名四种写法：HIDE/RO/ALLOW/REDIRECT 必须一致 ---- */
+    AppConfig* alias = find_app("alias.four", -1);
+    ck(alias && count_str(alias->hide_rules, alias->hide_count, "/Download") == 4,
+       "snapshot.alias HIDE 四种写法归一为 /Download");
+    ck(alias && count_str(alias->ro_rules, alias->ro_count, "/Download") == 4,
+       "snapshot.alias RO 四种写法归一为 /Download");
+    {
+        int allow_hits = 0;
+        for (int i = 0; alias && i < alias->redir_count; i++)
+            if (alias->redir_rules[i].is_allow &&
+                streq(alias->redir_rules[i].real_target, "?/Download") &&
+                streq(alias->redir_rules[i].virtual_prefix, "/Download"))
+                allow_hits++;
+        ck(allow_hits == 4, "snapshot.alias ALLOW 四种写法归一为 ?/Download");
+    }
+    {
+        static const char* const vps[] = {"/a1", "/a2", "/a3", "/a4"};
+        int ok = 1;
+        for (int i = 0; i < 4; i++) {
+            const RedirectRule* r = alias ? find_redir(alias, false, vps[i]) : NULL;
+            if (!r || !streq(r->real_target, "?/Download")) ok = 0;
+        }
+        ck(ok, "snapshot.alias REDIRECT 目标四种写法归一为 ?/Download");
+    }
+
     AppConfig* other = find_app("com.other.app", 999);
     ck(other && other->inject_enable, "snapshot.App-rules-999 分文件使能");
     ck(other && other->monitor == true && other->hide_count == 1 &&
