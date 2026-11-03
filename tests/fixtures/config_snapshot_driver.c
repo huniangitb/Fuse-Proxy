@@ -238,6 +238,8 @@ static void check_static_json(void) {
        "static.switches.monitor=OFF（默认值）");
     ck(streq(json_object_get_string(obj_get(sw, "sandbox")), "OFF"),
        "static.switches.sandbox=OFF（默认值）");
+    ck(streq(json_object_get_string(obj_get(sw, "skip_system_apps")), "ON"),
+       "static.switches.skip_system_apps=ON（默认值）");
 
     json_object* hide = obj_get(global, "hide_rules");
     ck(arr_has_str(hide, "/sdcard/Secret") && arr_has_str(hide, "/EmuHidden"),
