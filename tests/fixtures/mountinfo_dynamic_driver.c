@@ -190,8 +190,24 @@ int main(void) {
     mi_add("0:364", ROOT_USER, "fuse", "fuse_daemon");
     all = nullptr;
     n = ns_read_mountinfo_pid((int)getpid(), &all);
-    snprintf(detail, sizeof detail, "n=%d", n);
+    snprintf(detail, sizeof detail, "n=%d out=%p", n, (void*)all);
     check("D1_dropped_line_is_unknown", n == -1 && all == nullptr, detail);
+
+    /* D2：对照组——同样的两条有效条目、去掉超长行，读取必须成功且两条都在。
+       用来证明 D1 的未知确实由那行超长内容触发，而不是这份合成内容本身有问题。 */
+    mi_reset();
+    mi_add("0:364", FUSE_SRC, "fuse", "fuse_daemon");
+    mi_add("0:364", ROOT_USER, "fuse", "fuse_daemon");
+    all = nullptr;
+    int n_clean = ns_read_mountinfo_pid((int)getpid(), &all);
+    snprintf(detail, sizeof detail, "n=%d out=%p", n_clean, (void*)all);
+    check("D2_control_without_long_line_succeeds", n_clean == 2 && all != nullptr, detail);
+    free(all);
+
+    /* D3：D1 的返回值不得等于对照组的 2。「跳过这一行继续读」正是会返回 2 的那种
+       写法——顺序、条数、族根都会对得上，看起来完全正常，所以这条单独钉住。 */
+    snprintf(detail, sizeof detail, "n=%d control_n=%d", n, n_clean);
+    check("D3_skip_and_continue_would_look_valid", n != n_clean && n_clean == 2, detail);
 
     /* E：空挂载表是有效结论（0 条），与 C/D 的未知区分开 */
     mi_reset();

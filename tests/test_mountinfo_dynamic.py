@@ -118,6 +118,18 @@ def run_contracts():
     failures += check("P9_backup_state_has_unknown_value",
                       "NS_BACKUP_UNKNOWN" in backup_body)
 
+    # 不完整读取必须整份作废：先 free 再按未知返回，且不得把部分条目交出去；
+    # 也禁止「跳过这一行继续」的写法（顺序/条数都对得上，看起来完全正常）
+    trunc = impl.find("if (c.nomem || st.truncated)")
+    failures += check("P13_truncated_invalidates_whole_result",
+                      trunc >= 0 and
+                      impl.find("free(c.out);", trunc) > trunc and
+                      impl.find("return -1;", trunc) > trunc and
+                      impl.find("*out = c.out;") > impl.find("return -1;", trunc))
+    failures += check("P14_no_skip_and_continue_on_truncation",
+                      "if (st.truncated) continue" not in impl and
+                      "if (st.truncated) break" not in impl)
+
     # mount_manager：挂载状态读取无上限（max_size=0），且失败一律不当「未挂载」
     failures += check("P10_mount_state_read_is_unbounded",
                       "read_file_dynamic(path, &nread, 0)" in mm)
