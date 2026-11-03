@@ -24,7 +24,7 @@
 
 退出码：0 全过 / 1 失败 / 77 跳过（缺 sshd、sftp-server、libcurl 无 SFTP）。
 """
-import os, re, shlex, shutil, subprocess, sys, tempfile, time
+import os, pwd, re, shlex, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 BASE       = "/tmp/fuse_sftp_test"
@@ -57,6 +57,15 @@ def skip(msg):
     print(f"  ⏭  跳过: {msg}")
     sys.exit(77)
 
+def login_user():
+    """本套件的 sshd 只允许非 root 登录（PermitRootLogin no），登录用户取运行者 uid。
+    不能依赖 USER 环境变量：非交互 shell / CI 里它常常为空，
+    回退到 root 会让全部用例报 EIO（而不是跳过）。"""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return os.environ.get("USER") or ""
+
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
@@ -65,6 +74,9 @@ def run(cmd, **kw):
 def start_sshd():
     if not (os.path.exists(SSHD) and os.path.exists(SFTP_SERVER)):
         skip(f"缺 sshd({SSHD}) 或 sftp-server({SFTP_SERVER})")
+    login = login_user()
+    if not login or login == "root":
+        skip("需非 root 登录用户（sshd 侧 PermitRootLogin no）")
     shutil.rmtree(BASE, ignore_errors=True)
     for d in (REMOTE, SSH_DIR, CONF_DIR):
         os.makedirs(d, exist_ok=True)
@@ -112,7 +124,7 @@ LogLevel ERROR
 proto = sftp
 host = 127.0.0.1
 port = {PORT}
-user = {os.environ.get('USER') or 'root'}
+user = {login_user()}
 key_file = {cli_key}
 known_hosts = {SSH_DIR}/known_hosts
 host_key_check = on
