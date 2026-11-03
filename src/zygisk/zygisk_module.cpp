@@ -56,26 +56,21 @@
 #define NSP_ZYGISK_PROTO 3
 
 /* 各段等待上限（都必须有界，任何一段超时都按"放行应用"处理，绝不挂死）。
-   companion 侧等 injector：REQ 只需一次快速尝试，POST 可能要等 vold 把
-   /storage/emulated 装配进应用命名空间（~1s），故给足余量。 */
-/* 逐段放宽，保证"内层先裁决、外层后超时"的严格顺序——否则外层先超时会把
-   injector 正在做的挂载晾在半空（应用已放行、视图稍后才到，等于没修）：
-     injector POST 就地快试 20ms + 子进程余量 800ms ≈ 0.82s
-     （拿不到就 fail-open ACK + 后台毫秒快重试，绝不在这里等存储视图）
-     < companion POST 1.5s < module POST 2s
-     pre 通道 injector 只裁决、**不挂载**（立即回 DEFER），实际往返 < 10ms
-     < companion REQ 0.8s < module REQ 1.2s
-   原则：应用主线程上的等待必须小于"能感知"的量级。旧值（pre 3.5s / post 8s、
-   injector 内部 POST 再等 1800ms）在视图迟迟不出现的设备上意味着每次冷启动
-   固定多等 1.8s，正是"冷启动明显变慢"的来源；现在长等待与重试全部落在
-   injector 的后台通道里，这里只做短等 + fail-open。 */
-#define COMPANION_REQ_TIMEOUT_MS  800
+   唯一硬约束：**injector 没有应答（未启动/崩溃/忙）时，本模块不得产生任何等待**。
+   pre 拿不到明确的 DEFER 就直接放行；只有 injector 明确回 DEFER 才在 post 做一次
+   很短的本地等待（上限 100ms、10ms 步进）。
+
+   启动高峰期 zygote 会连续 specialize 几十个进程（冷启动实测 60 个，含 SystemUI
+   与 launcher），而 injector 要到 boot_completed 之后才由 service.sh 拉起：这段
+   窗口里每个进程都拿不到应答。若按"没应答就等满上界"处理，每个进程都要空转
+   1.5s 解析 mountinfo，开机会被拖慢几十秒，锁屏/桌面也跟着晚出来。 */
+#define COMPANION_REQ_TIMEOUT_MS  150
 #define COMPANION_POST_TIMEOUT_MS 1500
-#define MODULE_REQ_TIMEOUT_MS     1200
-/* post-specialize 在本地等"自己的命名空间出现代理视图"的上限。injector 收到 pre
-   通知后就在后台盯这个进程的 ns，切换后立即挂载（实测 2 跳退避内完成），这里
-   只做上界保护：等不到就放行应用（它继续用原生视图），绝不挂死。 */
-#define MODULE_PROXY_WAIT_MS      1500
+#define MODULE_REQ_TIMEOUT_MS     200
+/* post-specialize 本地等待"自己的命名空间出现代理视图"的上限。injector 的盯梢线程
+   在 ns 切换后立即挂载（实测 0–9ms），这里等 100ms 只覆盖慢设备上的装配窗口；
+   等不到就放行（应用继续用原生视图），由 injector 的后台重试队列补挂。 */
+#define MODULE_PROXY_WAIT_MS      100
 
 /* 抽象命名空间 UDS 地址填充。等价于项目的 nsp_uds_abstract_addr()
    （src/core/nsp_util.c），含同一处修正：地址长度按**截断后**实际写入的
@@ -112,14 +107,17 @@ static bool storage_is_proxied(void) {
     return found;
 }
 
-/* 有界等待代理视图就绪（2ms 步进）。返回已等待的毫秒数；0 = 立即可用。 */
+/* 有界等待代理视图就绪（10ms 步进）。返回已等待的毫秒数；0 = 立即可用。
+   步长不宜再小：每次探测都要整表解析 mountinfo，2ms 步进在上限 1.5s 时等于每个
+   进程做 750 次全表解析，启动高峰会把 CPU 和 mountinfo 读锁一起打满。10ms 步进
+   在上限 100ms 内只做 10 次，足够覆盖"挂载在 0–9ms 内完成"的常态。 */
 static long wait_storage_proxied(int timeout_ms) {
     long waited = 0;
     while (!storage_is_proxied()) {
         if (waited >= timeout_ms) break;
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
         nanosleep(&ts, nullptr);
-        waited += 2;
+        waited += 10;
     }
     return waited;
 }
@@ -259,6 +257,8 @@ class AppReporterModule : public zygisk::ModuleBase {
         snprintf(pkg_, sizeof pkg_, "%s", final_name);
         uid_ = args->uid;
         pending_ = false;
+        answered_ = false;
+        reply_ok_ = false;
 
         int fd = api->connectCompanion();
         if (fd >= 0) {
@@ -266,25 +266,25 @@ class AppReporterModule : public zygisk::ModuleBase {
             int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %u %d", final_name,
                                    getpid(), args->uid, NSP_ZYGISK_PROTO);
             if (write(fd, req_buf, req_len) > 0) {
-                /* 等 injector 的判决（上限 1.2s）：OK = 无需挂载，可直接继续；
+                /* 等 injector 的判决（上限 200ms）：OK = 无需挂载，可直接继续；
                    DEFER = 目标应用，injector 已在后台盯着本 pid 的命名空间，本进程
                    到 post 再等自己的视图出现。pre 通道只裁决不挂载——此刻还在
                    zygote 的挂载 ns 里，挂上去会被之后 fork 的每个应用继承。 */
                 char reply[16] = {0};
-                bool answered = false;
                 struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
                 if (poll(&pfd, 1, MODULE_REQ_TIMEOUT_MS) > 0) {
                     ssize_t rn = read(fd, reply, sizeof(reply) - 1);
                     if (rn > 0) {
                         reply[rn] = '\0';
-                        answered = true;
+                        answered_ = true;
                     }
                 }
-                /* 只有拿到明确的 "OK" 才算"无需挂载"。没应答（injector 忙/连接异常）
-                   或收到 ERR 时仍按"可能要挂"处理：post 的本地等待是有界的，等不到
-                   就放行（旧实现"超时按 OK"会静默吞掉 DEFER，真机表现就是"存储
-                   没被代理/是空的"）。 */
-                pending_ = !(answered && strcmp(reply, "OK") == 0);
+                /* 只有明确的 DEFER 才需要在 post 再等一次。没应答（injector 还没启动
+                   / 崩溃 / 忙）或收到 ERR 时一律直接放行：等待在这种情形下毫无意义，
+                   而启动高峰期每个进程多等上界就会把开机拖成"卡死"。
+                   注意不能反过来"没应答算 pending"——这正是上一版的缺陷。 */
+                pending_ = (answered_ && strcmp(reply, "DEFER") == 0);
+                reply_ok_ = (answered_ && strcmp(reply, "OK") == 0);
             }
             /* 连接只在本回调内使用，返回前必须关闭（见 NSP_ZYGISK_PROTO 注释：
                ZygiskNext 1.3.4+ 会关掉 preAppSpecialize 返回后仍持有的 companion
@@ -295,8 +295,18 @@ class AppReporterModule : public zygisk::ModuleBase {
         if (nice_name) {
             env->ReleaseStringUTFChars(args->nice_name, nice_name);
         }
-        LOGI("App [%s] (UID:%u) 上报完成%s", final_name, args->uid,
-             pending_ ? "：视图未就绪，post-specialize 补挂载" : "");
+        if (pending_) {
+            LOGI("App [%s] (UID:%u) 上报完成：injector 已受理（DEFER），post-specialize 补挂载",
+                 final_name, args->uid);
+        } else if (!answered_) {
+            LOGI("App [%s] (UID:%u) 上报完成：未收到 injector 判决，直接放行", final_name,
+                 args->uid);
+        } else if (reply_ok_) {
+            LOGI("App [%s] (UID:%u) 上报完成：无需补挂载（OK）", final_name, args->uid);
+        } else {
+            LOGI("App [%s] (UID:%u) 上报完成：injector 未受理（ERR），直接放行", final_name,
+                 args->uid);
+        }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
@@ -332,6 +342,9 @@ class AppReporterModule : public zygisk::ModuleBase {
     char pkg_[256] = {0};
     uint32_t uid_ = 0;
     bool pending_ = false;
+    /* pre 是否真的收到 injector 的应答（区分"ERR/超时放行"与"明确 OK"） */
+    bool answered_ = false;
+    bool reply_ok_ = false;
 };
 
 REGISTER_ZYGISK_MODULE(AppReporterModule)
