@@ -18,6 +18,13 @@
  */
 #include <stddef.h>
 
+/* 构建水印头由 meson 的 vcs_tag 在**构建期**生成（ninja 每次刷新，见 meson.build）；
+   直接 gcc 编译（测试夹具 / 第三方）时没有这个头，走下面的回退 */
+#ifdef __has_include
+#if __has_include("nsp_git_hash.h")
+#include "nsp_git_hash.h"
+#endif
+#endif
 /* meson 未注入时（如第三方直接 gcc）的回退，保证头文件自包含可编译 */
 #ifndef NSP_GIT_HASH
 #define NSP_GIT_HASH "unknown"

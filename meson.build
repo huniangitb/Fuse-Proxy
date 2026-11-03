@@ -38,20 +38,29 @@ is_clang = cc.get_id() == 'clang'
 # -Dgit_hash_override=<sha> 手动指定，如 tarball 构建）。
 _git_override = get_option('git_hash_override')
 _git_prog = find_program('git', required: false)
-_git_hash = _git_override
-if _git_hash == '' and _git_prog.found()
-  _git_hash = run_command(_git_prog, 'rev-parse', '--short', 'HEAD',
-                          check: false).stdout().strip()
+
+# 水印必须在**构建期**取：旧实现用 add_project_arguments 在**配置期**固化哈希，
+# 之后只跑 ninja 的构建一直沿用 configure 那一刻的值（构建目录不重建就永远旧），
+# 现场取证读到的是几天前的提交——曾有版本 module.prop 写着新版本号、二进制里却是
+# 更早的哈希，被误判成「装的是老代码」。vcs_tag 是构建期命令，ninja 每次重跑；
+# 输出内容变化会触发依赖它的目标重编，因此水印恒等于本次构建时的 HEAD。
+_nsp_sh = find_program('sh')
+if _git_override != ''
+  # 显式指定（tarball / 无 git 环境）：不再询问 git
+  _nsp_hash_cmd = 'echo "' + _git_override + '"'
+elif _git_prog.found()
+  _nsp_hash_cmd = 'h=$(git rev-parse --short HEAD) || exit 1; git diff --quiet || h="$h-dirty"; echo "$h"'
+else
+  _nsp_hash_cmd = 'echo unknown'
 endif
-if _git_hash == ''
-  _git_hash = 'unknown'
-elif _git_override == '' and _git_prog.found()
-  _dirty = run_command(_git_prog, 'diff', '--quiet', check: false)
-  if _dirty.returncode() != 0
-    _git_hash = _git_hash + '-dirty'
-  endif
-endif
-add_project_arguments('-DNSP_GIT_HASH="' + _git_hash + '"', language: 'c')
+_nsp_git_hash_h = vcs_tag(
+  input: 'version/nsp_git_hash.h.in',
+  # vcs_tag 的输出只能是不带路径的文件名（落在构建根）；构建根经下方
+  # include_directories('.') 进头文件搜索路径
+  output: 'nsp_git_hash.h',
+  command: [_nsp_sh, '-c', _nsp_hash_cmd],
+  fallback: _git_override != '' ? _git_override : 'unknown',
+)
 add_project_arguments('-DNSP_BUILD_MODE="' + (enable_debug ? 'debug' : 'release') + '"',
                       language: 'c')
 add_project_arguments('-DNSP_PROJECT_VERSION="' + meson.project_version() + '"',
@@ -211,6 +220,8 @@ project_deps = [
   libiconv,
   json_c
 ] + gnu_extra_deps
+# 构建水印头随依赖下发给所有目标：内容变化 → 目标重编，水印永不落后于 HEAD
+project_deps += [declare_dependency(sources: _nsp_git_hash_h)]
 
 # ================= 编译标志 =================
 opt_flags = []
@@ -271,6 +282,9 @@ else
   # GNU + 系统库/子模块：子模块构建时追加 compat/ 转接头
   all_inc_dirs = [inc_dir, compat_inc]
 endif
+# 构建根（vcs_tag 产物 nsp_git_hash.h 落在这里）必须在搜索路径上——构建水印由
+# 构建期命令生成，见文件头部「构建版本水印」段
+all_inc_dirs += include_directories('.')
 
 # ================= 源码集合 =================
 # 契约：common_sources 被多个二进制逐源重编译（Meson 正常行为，非错误）。
