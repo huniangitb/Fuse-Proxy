@@ -1,5 +1,6 @@
 /* 由 meson 的 vcs_tag 在**构建期**生成：ninja 每次执行都会重跑 git 取当前 HEAD。
- * 占位符是 vcs_tag 的默认替换串 @VCS_TAG@，不要手改本模板，也不要在别处重复定义
+ * 占位符是 vcs_tag 的默认替换串（@ + VCS_TAG + @）：它会被全量替换，因此注释
+ * 里也不要写字面量，否则生成出来的说明行会变成那串哈希。不要手改本模板，也不要在别处重复定义
  * NSP_GIT_HASH。
  */
 #ifndef NSP_GIT_HASH
