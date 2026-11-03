@@ -343,6 +343,8 @@ static void build_static_global_json(json_object* root) {
                            json_object_new_string(g_global_cfg.monitor ? "ON" : "OFF"));
     json_object_object_add(switches, "sandbox",
                            json_object_new_string(g_global_cfg.sandbox ? "ON" : "OFF"));
+    json_object_object_add(switches, "skip_system_apps",
+                           json_object_new_string(g_global_cfg.skip_system_apps ? "ON" : "OFF"));
     json_object_object_add(global, "switches", switches);
 
     json_object* ro_rules = json_object_new_array();
