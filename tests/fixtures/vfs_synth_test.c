@@ -163,6 +163,28 @@ static void case_nearest_ancestor(void) {
     (void)rmdir(dir);
 }
 
+/* 只有存储根下的 /Android 有 data/obb 合成语义：嵌套同名目录命中的话，
+   readdir 会补出没有 getattr 兜底的 data/obb（stat ENOENT → 客户端画成文件）。 */
+static void case_storage_android_only(void) {
+    check(sub_path_is_storage_android_dir("/Android"), "存储根 /Android 命中");
+    check(sub_path_is_storage_android_dir("/0/Android/"), "带用户层、尾斜杠仍命中");
+    check(!sub_path_is_storage_android_dir("/Android/data"),
+          "/Android/data 不是 /Android 本身");
+    check(!sub_path_is_storage_android_dir("/Download/Android"),
+          "存储根下一层的同名目录不命中");
+    check(!sub_path_is_storage_android_dir("/DCIM/files/Lua/Android"),
+          "深层嵌套同名 Android 目录不命中");
+    check(!sub_path_is_storage_android_dir("/AndroidX"), "仅前缀相同不算命中");
+    check(!sub_path_is_android_container("/DCIM/files/Lua/Android/data"),
+          "嵌套 Android/data 不是沙盒容器");
+    check(!sub_path_is_android_container("/DCIM/files/Lua/Android/obb"),
+          "嵌套 Android/obb 不是沙盒容器");
+    check(!is_virtual_own_pkg_dir("/DCIM/files/Lua/Android/data/com.example", "com.example"),
+          "嵌套容器下不合成当前包名目录");
+    check(!is_android_skel_dir("/DCIM/files/Lua/Android"),
+          "嵌套 Android 不是骨架目录");
+}
+
 int main(void) {
     case_synth_dir_without_real_child();
     case_synth_dir_with_real_child();
@@ -170,6 +192,7 @@ int main(void) {
     case_synth_file_entry();
     case_own_pkg_paths();
     case_skel_and_user_layer();
+    case_storage_android_only();
     case_nearest_ancestor();
     if (failed) printf("失败 %d 条\n", failed);
     return failed ? 1 : 0;

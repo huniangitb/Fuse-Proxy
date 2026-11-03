@@ -9,7 +9,11 @@
    骨架判定不能假设路径已剥用户层——无用户层的挂载下同一路径必须得到同一结论。 */
 const char* sub_path_strip_user_layer(const char* sub_path);
 bool sub_path_tail_is(const char* sub_path, const char* name);
-bool sub_path_is_android_dir(const char* sub_path);
+/* 存储根下的 /Android 本身（/Android、/0/Android，尾斜杠可有）。只有这一层有
+   data/obb 骨架合成的语义：嵌套同名目录（…/files/Lua/Android）没有 getattr/
+   opendir 的骨架兜底，合成出来的条目 stat 会 ENOENT，客户端把它画成文件。 */
+bool sub_path_is_storage_android_dir(const char* sub_path);
+/* 存储根下的 /Android/data|obb（同样只认根层，嵌套同名目录不算）。 */
 bool sub_path_is_android_container(const char* sub_path);
 bool is_android_skel_dir(const char* sub_path);
 

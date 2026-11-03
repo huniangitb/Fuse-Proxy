@@ -1267,7 +1267,7 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     /* 根据 g_disable_sandbox 强制跳过沙盒屏蔽逻辑；无用户层（user_id<0）同理 */
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
     /* 骨架补齐不能依赖用户层是否剥离：无用户层的挂载上同样要补 data/obb */
-    d->is_android_dir = (!skip_sandbox && sub_path_is_android_dir(sub_path));
+    d->is_android_dir = (!skip_sandbox && sub_path_is_storage_android_dir(sub_path));
     d->hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
                       strcmp(current_pkg, "unknown") != 0);
     d->has_data = d->has_obb = d->has_android = d->has_pkg = false;
@@ -1382,7 +1382,7 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
            挂载同样命中，否则这几条路径正好退化成无类型条目。 */
         bool skel = (d->is_root && strcmp(de->d_name, "Android") == 0) ||
                     ((strcmp(de->d_name, "data") == 0 || strcmp(de->d_name, "obb") == 0) &&
-                     (d->is_android_dir || sub_path_is_android_dir(d->sub_path))) ||
+                     (d->is_android_dir || sub_path_is_storage_android_dir(d->sub_path))) ||
                     (d->hide_others && strcmp(de->d_name, d->current_pkg) == 0 &&
                      sub_path_is_android_container(d->sub_path));
         struct stat st;
@@ -1428,7 +1428,7 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
             continue;
         }
         if (d->is_root && strcmp(de->d_name, "Android") == 0) d->has_android = true;
-        if (d->is_android_dir || sub_path_is_android_dir(d->sub_path)) {
+        if (d->is_android_dir || sub_path_is_storage_android_dir(d->sub_path)) {
             if (strcmp(de->d_name, "data") == 0)
                 d->has_data = true;
             else if (strcmp(de->d_name, "obb") == 0)
