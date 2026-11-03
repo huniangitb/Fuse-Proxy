@@ -717,6 +717,52 @@ static void pkglist_set(const char* body) {
     fw_pkg_reload();
 }
 
+/* 最后一个订阅者消失后，合并槽必须被清掉、poll 超时必须回到上限。
+   槽只有 flush 才清：遗留槽的 deadline 永远是过去时，超时恒 0，事件线程
+   poll(…,0) 空转（现场形态：daemon 单线程 CPU 90%、请求全堵，杀掉该进程
+   积压瞬间释放）。 */
+static void test_no_sub_coalesce_drain(void) {
+    channel_up();
+    char buf[2048];
+    while (drv_recv(buf, sizeof buf) > 0) {
+    }
+    while (fw_ring_pop(&(FwEventRec){0}, 1) > 0) {
+    }
+    memset(g_coalesce, 0, sizeof g_coalesce);
+    atomic_store(&g_fw_events_hot, true);
+    fw_events_set_test_now_ms(950000);
+    /* 两个不同 vpath → 两个合并槽（同 vpath 会被合并成一条） */
+    fw_events_note_write_done(10337, 0, "/0/Pictures/a.jpg", FW_EV_OP_CREATE, NULL);
+    fw_events_note_write_done(10337, 0, "/0/Pictures/b.jpg", FW_EV_OP_CREATE, NULL);
+    fw_drain_ring();
+    CHECK(fw_coalesce_timeout() > 0, "窗口未到期时超时不应为 0（会无谓唤醒）");
+    /* 等价于 sendto 连续失败后的摘除结果：订阅表清空、计数归零 */
+    g_subs[0].used = false;
+    g_sub_count = 0;
+    fw_update_hot();
+    fw_events_set_test_now_ms(950300); /* 已过 200ms 合并窗口 */
+    fw_events_maintain();              /* 生产线程每轮都会调它 */
+    int timeout = fw_coalesce_timeout();
+    CHECK(timeout == FW_EVENTS_POLL_MAX_MS,
+          "无订阅者时 poll 超时必须回到上限，实际 %d（0 会让事件线程空转烧核）", timeout);
+    bool leftover = false;
+    for (int i = 0; i < FW_EVENTS_COALESCE_SLOTS; i++) {
+        if (g_coalesce[i].used) leftover = true;
+    }
+    CHECK(!leftover, "无订阅者时遗留的合并槽必须被 flush 清掉");
+
+    /* 订阅者回来之后仍然能正常收事件（clean 之后不留自锁状态） */
+    channel_up();
+    while (drv_recv(buf, sizeof buf) > 0) {
+    }
+    fw_events_set_test_now_ms(960000);
+    fw_events_note_write_done(10337, 0, "/0/Pictures/c.jpg", FW_EV_OP_CREATE, NULL);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(960300);
+    fw_events_maintain();
+    CHECK(drv_recv(buf, sizeof buf) > 0, "订阅者重新登记后必须恢复推送");
+}
+
 static void test_whitelist(void) {
     channel_up();
     g_global_cfg.fuse_events_uid_count = 0;
@@ -802,6 +848,7 @@ int main(void) {
     test_query_reasons();
     test_user10_and_ttl();
     test_sub_filters();
+    test_no_sub_coalesce_drain();
     test_whitelist();
 
     rm_rf(g_fake_base);
