@@ -576,7 +576,8 @@ static int fw_route_inner(struct fuse_context* ctx, const char* path_val, NspPat
         strcpy(real_path, rr->real_path);
         *is_redir = rr->is_redirect;
         /* ---- 决策强制（单点）---- */
-        if (rr->appear_missing) return -ENOENT;
+        if (rr->appear_missing)
+            return rr->deny_errno ? -rr->deny_errno : -ENOENT; /* HIDE_ERRNO 可换码 */
         if (op == VFS_OP_MUTATE) {
             int rc = vfs_check_read_only(rr, ctx->uid);
             if (rc != 0) {

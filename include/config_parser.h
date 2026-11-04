@@ -79,6 +79,9 @@ typedef struct {
        显式指定；-1 = 交回 libfuse 默认（10）。启动期参数：改它需要重启
        daemon（与 FUSE_EVENTS / FUSE_EXTRA_ARGS 同为启动期设置）。 */
     int fuse_threads;
+    /* HIDE 命中时对外返回的 errno（0 = ENOENT）。应用普遍把 ENOENT 当「还没建好」
+       而重试，遇到这类重试风暴可在 [GLOBAL] 写 HIDE_ERRNO EACCES 换成拒绝语义。 */
+    int hide_errno;
     /* [GLOBAL] ALLOW_CROSS_APP_PKGS <包名>[,<包名>...]：跨应用放行白名单**追加**
        包名。命中的**调用方**可以访问他包 /Android/data|obb，未命中的照常隔离。
        匹配用调用方自身包名精确比较（不做 uid 兜底），故 sharedUserId 的兄弟包不会

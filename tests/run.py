@@ -340,6 +340,14 @@ SUITE_MAP = [
      ("nsp_default_fuse_threads", "g_fuse_threads_explicit", "fuse_threads"),
      "FUSE worker 线程数的默认取值与配置覆盖"),
 
+    # HIDE 命中返回码：ENOENT 会被「失败就重试」的应用当成「还没生成」，
+    # 一次启动把同一条路径打几百遍；HIDE_ERRNO 允许换成 EACCES/EPERM。
+    (("test_hide_errno.py",),
+     ("include/nsp_hide_errno.h", "src/daemon/fw_rules.c", "src/config/config_parser.c",
+      "include/config_parser.h", "docs/config.md"),
+     ("nsp_hide_errno_of", "hide_errno", "HIDE_ERRNO"),
+     "HIDE 命中返回码可配（默认 ENOENT）"),
+
     # 挂载失败重试记账：旧实现「派发成功即出队、失败回调重新入队（次数归零）」
     # 让退避与上限永远不生效——挂不上的应用 1Hz 永久重试、错误日志刷屏。
     # 新实现把尝试次数随条目保存，并按**毫秒**分三档退避（快档 20ms×10 → 中档
@@ -411,6 +419,7 @@ LAYERS = {
             "test_build_scripts.py",
             "test_inject_reload_filter.py",
             "test_fuse_threads.py",
+            "test_hide_errno.py",
         ),
     ),
     "L1": (
@@ -626,6 +635,7 @@ PARALLEL_SAFE = frozenset({
     "test_build_scripts.py",      # 假 HOME + PATH 桩跑脚本，TemporaryDirectory，不碰真实路径
     "test_inject_reload_filter.py",  # 抽出 injector.c 的纯函数直编，无挂载/无 daemon
     "test_fuse_threads.py",          # 抽出 fuse_threads.h 的内联函数直编，无挂载/无 daemon
+    "test_hide_errno.py",            # 直编 nsp_hide_errno.h 的内联函数，无挂载/无 daemon
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。
