@@ -643,6 +643,29 @@ static void parse_fuse_threads_rule(AppConfig* cur, char* p_ptr, int line_num,
     cur->fuse_threads = (int)n;
 }
 
+/* HIDE_ERRNO <ENOENT|EACCES|EPERM>：仅 [GLOBAL] 段有效；隐藏规则命中时对外返回
+   的 errno（缺省 ENOENT）。存在意义是应用侧语义：ENOENT 表示「没有这个文件」，
+   多数应用会当作「还没生成」反复重试（重试风暴会把 FUSE 请求量放大成倍）；EACCES
+   表示「存在但不许访问」，通常让应用直接放弃。非法值告警忽略并保持缺省。 */
+static void parse_hide_errno_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                  const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("HIDE_ERRNO 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+        return;
+    }
+    char* val = get_next_token(&p_ptr);
+    int err = 0;
+    if (val && strcasecmp(val, "ENOENT") == 0) err = ENOENT;
+    else if (val && strcasecmp(val, "EACCES") == 0) err = EACCES;
+    else if (val && strcasecmp(val, "EPERM") == 0) err = EPERM;
+    if (err == 0) {
+        LOG_WRN("HIDE_ERRNO 取值非法 \"%s\"（行 %d, 文件 %s），已保持 ENOENT", val ? val : "",
+                line_num, file_path);
+        return;
+    }
+    cur->hide_errno = err;
+}
+
 /* FUSE_EVENTS_UIDS <uid>[,<uid>...]：仅 [GLOBAL] 段有效；向通道白名单**追加**
    uid（root/system/media_rw 恒在列，无需重复写）。逗号或空白分隔，最多
    sizeof(fuse_events_uids) 项；非法/超限项告警后跳过，不放弃整行
@@ -864,6 +887,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_fuse_events_uids_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_THREADS") == 0)
         parse_fuse_threads_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "HIDE_ERRNO") == 0)
+        parse_hide_errno_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
         parse_fuse_extra_args_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "SANDBOX_DIR") == 0)

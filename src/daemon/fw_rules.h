@@ -64,6 +64,10 @@ typedef struct NspPathDecision {
        （都是 ENOENT），但对外通道要能说清「为什么」——扫描侧据此区分「路径被隐藏」
        与「不是你自己的东西」，也便于日志归因。*/
     bool is_other_app_pkg;
+    /* appear_missing 时的拒绝码：0 = ENOENT（默认）。只有 HIDE 规则命中会填非 0
+       （[GLOBAL] HIDE_ERRNO：ENOENT/EACCES/EPERM），让「失败就重试」的应用换一种
+       放弃方式；跨应用隔离恒为 0——隔离必须与「本来就不存在」不可区分。 */
+    int deny_errno;
     bool read_only;      /* 只读 → 框架在所有变更操作统一返回 EROFS
                             （root 豁免等策略由框架持有） */
     uint8_t virtual_kind; /* NspVirtualKind：合成目录判定 */

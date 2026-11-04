@@ -12,6 +12,7 @@
  * 内部符号沿用 `br_` 前缀（basic_rules 时代的命名）——它们是本文件私有的
  * static 量与私有结构，不跨文件、不跨 ABI，故不做批量改名以免噪音。
  */
+#include "nsp_hide_errno.h"
 #include "fw_rules.h"      /* NspQueryCtx/NspPathDecision + nsp_module.h（LOG 宏） */
 #include "fw_pkg.h"        /* fw_pkg_resolve：包名解析归框架 */
 #include "config_parser.h" /* AppConfig / find_*_cfg_locked / config_read_* */
@@ -685,7 +686,8 @@ static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const ch
     if (tm_out) br_trie_resolve(cfg, cat, sub_path_out, tm_out);
     /* 隐藏判定对所有访问者生效（含 root，与 vfs_readdir probe 过滤一致）：
        HIDE 规则配置后，root ls 也不应看到被隐藏条目 */
-    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out, uid)) return -ENOENT;
+    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out, uid))
+        return -nsp_hide_errno_of(g_global_cfg.hide_errno);
     return 0;
 }
 
@@ -1223,6 +1225,7 @@ static inline void br_result_init(NspPathDecision* out) {
     out->valid = false;
     out->appear_missing = false;
     out->is_other_app_pkg = false;
+    out->deny_errno = 0;
     out->read_only = false;
     out->real_path[0] = '\0';
     out->is_redirect = false;
@@ -1266,6 +1269,8 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
             out->valid = true;
             out->appear_missing = true;
             out->is_other_app_pkg = isolated;
+            /* 只有 HIDE 规则命中才改返回码；隔离恒 ENOENT（见 fw_rules.h 字段注释） */
+            out->deny_errno = hidden ? nsp_hide_errno_of(g_global_cfg.hide_errno) : 0;
             if (config_read_end(cfg_gen)) return;
             continue;
         }
