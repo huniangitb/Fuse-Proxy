@@ -802,6 +802,9 @@ static void cleanup_all_target_apps() {
     fast_pid_each(cleanup_cb, nullptr);
 }
 
+/* 崩溃恢复重挂的计数：只统计真正挂上的应用，失败另有逐条日志 */
+static int g_remount_done;
+
 static int remount_cb(int pid, const char* cmd, void* data) {
     if (!is_process_safe_to_inject(cmd)) return 0;
     uid_t uid = get_app_uid(pid);
@@ -812,7 +815,9 @@ static int remount_cb(int pid, const char* cmd, void* data) {
         pkg[sizeof(pkg) - 1] = '\0';
         char* colon = strchr(pkg, ':');
         if (colon) *colon = '\0';
-        if (perform_app_mount(pkg, pid, uid, mnt_src, "FUSE崩溃恢复重挂") != 0) {
+        if (perform_app_mount(pkg, pid, uid, mnt_src, "FUSE崩溃恢复重挂") == 0) {
+            g_remount_done++;
+        } else {
             LOG_DBG("FUSE 崩溃恢复重挂失败: %s(PID:%d)", pkg, pid);
         }
     }
@@ -825,10 +830,17 @@ static void remount_all_tracked() {
         LOG_DBG("FUSE 尚未就绪，推迟重挂所有追踪应用");
         return;
     }
+    struct timespec ts_start;
+    struct timespec ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    g_remount_done = 0;
     LOG("FUSE 崩溃恢复: 开始重挂所有目标应用");
     fast_pid_each(remount_cb, (void*)mnt_src);
     g_pending_remount = 0;
-    LOG("FUSE 崩溃恢复重挂完成");
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    long elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000L +
+                      (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000L;
+    LOG("FUSE 崩溃恢复重挂完成: 重挂 %d 个（用时 %ldms）", g_remount_done, elapsed_ms);
 }
 
 /* 受管子进程的退出状态留档与复核见 reaped_managed.{h,c}：通用收尸
