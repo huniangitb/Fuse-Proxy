@@ -43,7 +43,8 @@
 #include "config_parser.h" /* config_set_modules_dir：模块自有配置的读取归属 */
 #include "fw_acl.h"
 #include "vfs_synth.h" /* 访问控制唯一判定点（对齐 Android 原生 FUSE 用户态策略层） */
-#include "fw_events.h" /* FUSE 事件通道（默认 OFF，关闭时埋点只剩一次原子读） */
+#include "fw_events.h"
+#include "fuse_threads.h" /* FUSE 事件通道（默认 OFF，关闭时埋点只剩一次原子读） */
 #include "fw_config.h"
 #include "fw_pkg.h"
 #include "fw_rules.h" /* 内建规则引擎：规则决策已归框架 */
@@ -179,6 +180,7 @@ static atomic_bool g_pt_probe_pending = false;      /* GNU：init 无会话 fd�
 static int passthrough_enable_fixed_method(int fd); /* 实现见文件后部 */
 static bool g_is_media_fuse = false;                /* --media-fuse: 媒体模块专属 FUSE */
 static char g_modules_dir_arg[PATH_MAX] = {0};      /* --modules-dir: 热插拔模块目录覆盖 */
+static bool g_fuse_threads_explicit = false;       /* 是否由 --fuse-threads 显式指定 */
 static int g_fuse_threads = 2;                      /* --fuse-threads: FUSE worker 线程数上限
                                                    （默认 2=双线程；0/-s=单线程；-1=libfuse 默认 10） */
 
@@ -3382,6 +3384,7 @@ int main(int argc, char* argv[]) {
                注入器可按宿主 CPU 核数经 fuse_extra_args 下发调优。 */
             g_fuse_threads = atoi(argv[i] + 15);
             if (g_fuse_threads < -1) g_fuse_threads = -1;
+            g_fuse_threads_explicit = true;
         } else if (strcmp(argv[i], "debug") == 0 || strcmp(argv[i], "--debug") == 0) {
             g_min_log_level = LOG_DEBUG;
             fuse_argv[fuse_argc++] = "-d";
@@ -3396,6 +3399,11 @@ int main(int argc, char* argv[]) {
         }
     }
     fuse_argv[fuse_argc] = nullptr;
+    /* 未显式指定时按宿主核数取默认（见 fuse_threads.h）：worker 太少会被单个
+       应用的冷启动打满队列，太多只是让线程互抢 CPU。注入器也可经配置下发。 */
+    if (!g_fuse_threads_explicit) {
+        g_fuse_threads = nsp_default_fuse_threads((int)sysconf(_SC_NPROCESSORS_ONLN));
+    }
     prctl(PR_SET_NAME, "fuse_daemon", 0, 0, 0);
     log_init("fuse_daemon");
     /* 负缓存熔断单点（nodeid=0 上送崩溃防御）：须在 log_init 之后，
@@ -3513,12 +3521,17 @@ int main(int argc, char* argv[]) {
             } else if (fw_events_start() != 0) {
                 LOG_WRN("FUSE 事件通道启动失败（不影响挂载与 IO）");
             }
-            LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint,
-                (fopts.singlethread || g_fuse_threads == 0)
-                    ? "单线程"
-                    : (g_fuse_threads == -1  ? "libfuse 默认(10)"
-                       : g_fuse_threads == 2 ? "双线程(2)"
-                                             : "自定义"));
+            char thread_desc[64];
+            if (fopts.singlethread || g_fuse_threads == 0)
+                snprintf(thread_desc, sizeof thread_desc, "单线程");
+            else if (g_fuse_threads == -1)
+                snprintf(thread_desc, sizeof thread_desc, "libfuse 默认(10)");
+            else if (g_fuse_threads_explicit)
+                snprintf(thread_desc, sizeof thread_desc, "%d 线程（显式）", g_fuse_threads);
+            else
+                snprintf(thread_desc, sizeof thread_desc, "%d 线程（按核数自动）",
+                         g_fuse_threads);
+            LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint, thread_desc);
             if (fopts.singlethread || g_fuse_threads == 0) {
                 /* 单线程（-s / --fuse-threads=0）：刻意沿用旧 fuse_loop 语义
                    （调用线程服务请求）。libfuse 3.19 起将其标记 deprecated

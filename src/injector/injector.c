@@ -183,7 +183,7 @@ static void retry_wake_main_loop(void) {
  * 两件事都需要"毫秒级、事件驱动"的唤醒，1s 的周期 timer 等不来：
  *   ① 重试队列快档 20ms（vold 把 /storage/emulated 装配进应用 ns 的实测窗口
  *      是 ~140ms，1s 退避等于白等——真机 322 次挂载 avg=142ms 的由来）；
- *   ② 配置重载去抖窗口（200ms）。
+ *   ② 配置重载去抖窗口（500ms）。
  * 共用一个一次性 timerfd：每次臂到"两者中最近的那个到期时刻"，到点后跑一轮
  * 各自的到期逻辑再重新臂。定时器只做唤醒，不做决策（到期判定仍以
  * nsp_retry_next_due_ms / g_reload_due_ms 为准，幂等可重入）。 */
@@ -197,8 +197,8 @@ static int g_due_fd = -1;
    **一次**重载，并打一条 INFO 说明触发源与合并数（旧实现重载完全静默，
    现场只能靠 broadcast 行反推，取证极难）。连续写入时窗口最多推迟
    NSP_RELOAD_MAX_DEFER_MS，保证"一直在写"也不会永远不重载。 */
-#define NSP_RELOAD_DEBOUNCE_MS   200
-#define NSP_RELOAD_MAX_DEFER_MS  1000
+#define NSP_RELOAD_DEBOUNCE_MS   500
+#define NSP_RELOAD_MAX_DEFER_MS  2000
 static int64_t g_reload_due_ms = 0;  /* 0 = 无待处理重载 */
 static int64_t g_reload_first_ms = 0;
 static char g_reload_trigger[64];    /* 窗口内第一个 .conf 事件的文件名 */
@@ -605,6 +605,13 @@ static void inject_global_fuse() {
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
         if (log_lvl) args[ai++] = (char*)log_lvl;
+        char threads_arg[32];
+        if (g_global_cfg.fuse_threads != 0) {
+            /* [GLOBAL] FUSE_THREADS 非 0 时显式下发；0 表示交给 daemon 按核数取默认 */
+            snprintf(threads_arg, sizeof threads_arg, "--fuse-threads=%d",
+                     g_global_cfg.fuse_threads);
+            args[ai++] = threads_arg;
+        }
         /* FUSE_EXTRA_ARGS 分词追加：守卫必须按「尾部固定项数」预留——尾部还要
            无条件追加 -f / -o / 挂载选项 / NULL 共 4 项。旧守卫 ai < 31 会让
            末条 token 落到 args[31] 之后（FUSE_EXTRA_ARGS 上限 512 字节，24 个
@@ -748,6 +755,13 @@ static void inject_media_fuse() {
         if (g_crash_test) args[ai++] = "--crash-test";
         args[ai++] = arg_ready;
         if (log_lvl) args[ai++] = (char*)log_lvl;
+        char threads_arg[32];
+        if (g_global_cfg.fuse_threads != 0) {
+            /* [GLOBAL] FUSE_THREADS 非 0 时显式下发；0 表示交给 daemon 按核数取默认 */
+            snprintf(threads_arg, sizeof threads_arg, "--fuse-threads=%d",
+                     g_global_cfg.fuse_threads);
+            args[ai++] = threads_arg;
+        }
         args[ai++] = "--no-passthrough";
         args[ai++] = "--media-fuse";
 
@@ -1517,6 +1531,19 @@ static void on_timer_event(int timer_fd) {
     }
 }
 
+/* 只认「以 .conf 结尾」的文件名。旧实现用 strstr(name, ".conf") 做子串匹配，
+   于是 CONFIG_DIR 里任何 *.config（例如别的工具维护的包名对照表 list.config）
+   每写一次都触发一次整份重载——现场「配置重载 #1 来源=inotify 合并事件=390」
+   就是这么来的。后缀比较后 .config / .conf.bak 都不再算。 */
+static bool reload_name_matches(const char* name) {
+    if (!name || !name[0]) return 0;
+    static const char kSuffix[] = ".conf";
+    const size_t slen = sizeof(kSuffix) - 1;
+    const size_t len = strlen(name);
+    if (len <= slen) return 0;
+    return strcmp(name + len - slen, kSuffix) == 0;
+}
+
 /* 一次唤醒把 inotify fd **读空**，再把本批事件折成一条"待重载"请求交给去抖窗口。
    旧实现只 read 一次 4096 字节（约 100 条事件）就返回：一次唤醒里剩下的上千条
    要么推迟到下一轮 epoll，要么因内核队列溢出被丢弃——真机 20:05:18 一秒 633 条
@@ -1540,7 +1567,7 @@ static void on_inotify_event(void) {
                队列溢出说明此间有事件被内核丢弃（用户/规则目录可能已改而我们没
                看到）。此前因 `ev->len` 为 0 被整条跳过 → 规则改了不生效且无提示。 */
             if (ev->mask & IN_Q_OVERFLOW) overflow = true;
-            if (ev->len && strstr(ev->name, ".conf")) {
+            if (ev->len && reload_name_matches(ev->name)) {
                 conf_events++;
                 if (!first_name[0]) snprintf(first_name, sizeof(first_name), "%s", ev->name);
             }

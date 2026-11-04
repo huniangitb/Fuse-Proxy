@@ -77,6 +77,8 @@ flowchart TB
 - **打开中删除（open-unlink）**：本地路径由 `vfs_rename` 识别 libfuse 的 `.fuse_hidden<16hex>` 隐藏名并**直接 unlink 源文件**（本地 backing 支持 POSIX 的"先删名、后关句柄"），目录里不再出现隐藏文件——与 Android 自带 FUSE 的可见行为一致；删除前的属性快照供后续 `fstat`（内核 GETATTR 常常不带 fh）。后端路径（FTP/SFTP）仍沿用隐藏名：远端立即删除会让正在下载/上传的句柄失去数据源。此外 `.fuse_hidden*` **不是特殊条目**：`vfs_entry_visibility` 不按隐藏名过滤，readdir 看到就按普通条目列举（可 `getattr`/`open`），也不在列举时就地删除——本层本地路径不产生新隐藏名（上面的直删分支），磁盘上出现的残留来自旧版本 daemon 或下层 FUSE（设备上 `/data/media` 由 MediaProvider 的 FUSE 提供时，我们穿过下层 unlink 会让下层 libfuse 把名字改成 `.fuse_hidden` 等 RELEASE 再删），一律保留可见，便于取证与手工回收。后端路径（FTP/SFTP）仍用隐藏名兜底，其隐藏名同样按普通条目可见（只存活到最后一个句柄关闭）。
 - **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。规则引擎内部另有一份同源解析（`fw_rules.c` 的 static `br_get_app_cfg`，它需要 pkg 做 `$package` 变量展开与沙箱隔离）：两者同在框架进程内、算法同源、结果一致。
 
+- **worker 线程数**（`include/fuse_threads.h`）：多线程 loop 的 worker 上限默认按宿主核数取 `min(max(2, ncpu/2), 8)`（4 核 → 2、8 核 → 4、16 核及以上 → 8）。单个应用冷启动有成百上千次并发 `getattr/open/read`，2 个 worker 会把同一条 FUSE 连接排满；而按核数一把梭在低端机上只是让线程互抢 CPU。`--fuse-threads=N` 覆盖（`0`=单线程、`-1`=libfuse 默认 10），injector 按 `[GLOBAL] FUSE_THREADS` 下发；启动期参数，改它需重启 daemon。
+
 模块架构详见 `modules.md`。
 
 ### 2.3 日志子系统
