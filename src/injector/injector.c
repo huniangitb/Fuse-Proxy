@@ -835,6 +835,10 @@ static void remount_all_tracked() {
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
     g_remount_done = 0;
     LOG("FUSE 崩溃恢复: 开始重挂所有目标应用");
+    /* PID 缓存记录的是「本进程已经处理过的 pid」，命中即跳过回调。守护进程崩溃后
+       这些 pid 的挂载连接已经断了，缓存却仍把它们当已处理——不清缓存，遍历只看得到
+       崩溃后新起的进程，活着的应用一个都不会重挂。 */
+    fast_pid_cache_clear();
     fast_pid_each(remount_cb, (void*)mnt_src);
     g_pending_remount = 0;
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
