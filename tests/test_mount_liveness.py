@@ -115,6 +115,18 @@ def run_contracts():
                       inj.count("g_pending_startup_scan = 1;") == 1)
     failures += check("P12_scan_consumed_once",
                       inj.count("if (g_pending_startup_scan)") == 1)
+
+    # 崩溃恢复重挂的耗时与条数：现场只能看到「开始/完成」两行时无法区分
+    # 「重挂很快、卡在别处」和「重挂本身慢」，所以完成行必须带条数与毫秒
+    remount = inj.find("static void remount_all_tracked() {")
+    body = inj[remount:remount + 1200] if remount >= 0 else ""
+    failures += check("P13_recovery_timer_is_monotonic",
+                      body.count("clock_gettime(CLOCK_MONOTONIC") == 2)
+    failures += check("P14_recovery_finish_logs_count_and_ms",
+                      "FUSE 崩溃恢复重挂完成: 重挂 %d 个（用时 %ldms）" in body)
+    ok_site = inj.find('perform_app_mount(pkg, pid, uid, mnt_src, "FUSE崩溃恢复重挂") == 0')
+    failures += check("P15_recovery_counts_only_success",
+                      0 <= ok_site and "g_remount_done++;" in inj[ok_site:ok_site + 200])
     return failures
 
 
