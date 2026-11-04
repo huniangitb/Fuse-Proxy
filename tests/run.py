@@ -325,6 +325,21 @@ SUITE_MAP = [
      (),
      "构建脚本危险路径白名单（rm -rf 前的 $OUT 校验）"),
 
+    # 配置重载的 inotify 过滤：CONFIG_DIR 里还有别的工具维护的文件（包名对照表
+    # list.config），旧实现的子串匹配把它当成配置文件，每写一次就整份重载。
+    (("test_inject_reload_filter.py",),
+     ("src/injector/injector.c",),
+     ("reload_name_matches", "NSP_RELOAD_DEBOUNCE_MS", "NSP_RELOAD_MAX_DEFER_MS"),
+     "配置重载只认 .conf 结尾（list.config 不再触发整份重载）"),
+
+    # FUSE worker 线程数：2 个在单个应用冷启动时排队，按核数一把梭又会互抢 CPU，
+    # 默认取 min(max(2, ncpu/2), 8)，显式值（0 单线程 / -1 libfuse 默认）仍保留。
+    (("test_fuse_threads.py",),
+     ("include/fuse_threads.h", "src/daemon/fuse_daemon.c", "src/injector/injector.c",
+      "src/config/config_parser.c", "include/config_parser.h", "docs/config.md"),
+     ("nsp_default_fuse_threads", "g_fuse_threads_explicit", "fuse_threads"),
+     "FUSE worker 线程数的默认取值与配置覆盖"),
+
     # 挂载失败重试记账：旧实现「派发成功即出队、失败回调重新入队（次数归零）」
     # 让退避与上限永远不生效——挂不上的应用 1Hz 永久重试、错误日志刷屏。
     # 新实现把尝试次数随条目保存，并按**毫秒**分三档退避（快档 20ms×10 → 中档
@@ -394,6 +409,8 @@ LAYERS = {
             "test_log_ctl_rules.py",
             "test_commit_msg_lint.py",
             "test_build_scripts.py",
+            "test_inject_reload_filter.py",
+            "test_fuse_threads.py",
         ),
     ),
     "L1": (
@@ -607,6 +624,8 @@ PARALLEL_SAFE = frozenset({
     "test_a26_misc.py",           # cc 直编 ftp_conf.c/nsp_ini_store.c，/tmp mkdtemp，无挂载/网络
     "test_pt_probe_toctou.py",    # cc 直编驱动 + --wrap 桩 open/unlink，cwd 临时目录，无挂载/特权
     "test_build_scripts.py",      # 假 HOME + PATH 桩跑脚本，TemporaryDirectory，不碰真实路径
+    "test_inject_reload_filter.py",  # 抽出 injector.c 的纯函数直编，无挂载/无 daemon
+    "test_fuse_threads.py",          # 抽出 fuse_threads.h 的内联函数直编，无挂载/无 daemon
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。

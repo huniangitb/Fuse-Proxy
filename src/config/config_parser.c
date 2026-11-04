@@ -623,6 +623,26 @@ static void parse_sandbox_dir_rule(AppConfig* cur, char* p_ptr, int line_num,
     strcpy(cur->sandbox_dir, val);
 }
 
+/* FUSE_THREADS <n>：仅 [GLOBAL] 段有效；FUSE worker 线程数上限。
+   0 = 自动（daemon 按核数取默认）；1..32 显式；-1 = libfuse 默认 10。
+   非法值告警忽略（保持自动），不让一个数字写错把整份配置读失败。 */
+static void parse_fuse_threads_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                    const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("FUSE_THREADS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num, file_path);
+        return;
+    }
+    char* val = get_next_token(&p_ptr);
+    char* end = nullptr;
+    long n = val ? strtol(val, &end, 10) : 0;
+    if (!val || end == val || (end && *end != '\0') || n < -1 || n > 32) {
+        LOG_WRN("FUSE_THREADS 取值非法 \"%s\"（行 %d, 文件 %s），已忽略",
+                val ? val : "", line_num, file_path);
+        return;
+    }
+    cur->fuse_threads = (int)n;
+}
+
 /* FUSE_EVENTS_UIDS <uid>[,<uid>...]：仅 [GLOBAL] 段有效；向通道白名单**追加**
    uid（root/system/media_rw 恒在列，无需重复写）。逗号或空白分隔，最多
    sizeof(fuse_events_uids) 项；非法/超限项告警后跳过，不放弃整行
@@ -842,6 +862,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_global_switch_rule(cur, &cur->fuse_events, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EVENTS_UIDS") == 0)
         parse_fuse_events_uids_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "FUSE_THREADS") == 0)
+        parse_fuse_threads_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
         parse_fuse_extra_args_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "SANDBOX_DIR") == 0)

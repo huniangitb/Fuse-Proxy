@@ -74,6 +74,11 @@ typedef struct {
        恒在列）。白名单只校验"这条 UDS 通道是谁连的"，不是被查询应用的身份。 */
     int fuse_events_uids[8];
     int fuse_events_uid_count;
+    /* [GLOBAL] FUSE_THREADS <n>：FUSE worker 线程数上限。0 = 自动（按宿主
+       CPU 核数取 min(max(2, ncpu/2), 8)，见 include/fuse_threads.h）；1..32
+       显式指定；-1 = 交回 libfuse 默认（10）。启动期参数：改它需要重启
+       daemon（与 FUSE_EVENTS / FUSE_EXTRA_ARGS 同为启动期设置）。 */
+    int fuse_threads;
     /* [GLOBAL] ALLOW_CROSS_APP_PKGS <包名>[,<包名>...]：跨应用放行白名单**追加**
        包名。命中的**调用方**可以访问他包 /Android/data|obb，未命中的照常隔离。
        匹配用调用方自身包名精确比较（不做 uid 兜底），故 sharedUserId 的兄弟包不会
