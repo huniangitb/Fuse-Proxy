@@ -348,6 +348,16 @@ SUITE_MAP = [
      ("nsp_hide_errno_of", "hide_errno", "HIDE_ERRNO"),
      "HIDE 命中返回码可配（默认 ENOENT）"),
 
+    # COPY_FILE_RANGE 一律交回内核：libfuse 高层 wrapper 在判断操作是否存在之前
+    # 先取线程上下文，收尾窗口里上下文缺失就解空指针（现场 SIGSEGV 落在 libc 的
+    # pthread_getspecific）；关掉低层派发后内核收到 ENOSYS 即永久改走 read/write。
+    (("test_fuse_copy_range.py",),
+     ("subprojects/libfuse/include/fuse.h", "subprojects/libfuse/lib/fuse.c",
+      "subprojects/libfuse/lib/fuse_lowlevel.c", "src/daemon/fuse_daemon.c",
+      "docs/architecture.md"),
+     ("fuse_disable_copy_file_range", "copy_file_range_common", "COPY_FILE_RANGE"),
+     "COPY_FILE_RANGE 一律交回内核（不进入 libfuse 高层回退路径）"),
+
     # 挂载失败重试记账：旧实现「派发成功即出队、失败回调重新入队（次数归零）」
     # 让退避与上限永远不生效——挂不上的应用 1Hz 永久重试、错误日志刷屏。
     # 新实现把尝试次数随条目保存，并按**毫秒**分三档退避（快档 20ms×10 → 中档
@@ -420,6 +430,7 @@ LAYERS = {
             "test_inject_reload_filter.py",
             "test_fuse_threads.py",
             "test_hide_errno.py",
+            "test_fuse_copy_range.py",
         ),
     ),
     "L1": (
@@ -636,6 +647,7 @@ PARALLEL_SAFE = frozenset({
     "test_inject_reload_filter.py",  # 抽出 injector.c 的纯函数直编，无挂载/无 daemon
     "test_fuse_threads.py",          # 抽出 fuse_threads.h 的内联函数直编，无挂载/无 daemon
     "test_hide_errno.py",            # 直编 nsp_hide_errno.h 的内联函数，无挂载/无 daemon
+    "test_fuse_copy_range.py",       # 只读源码文本做静态契约，无挂载/无 daemon
 })
 # Tier 2 独占：碰全局 log_monitor（R6）的套件，串行且排在最后执行，保证收尾时
 # 系统 monitor 已还原，不干扰其他套件。

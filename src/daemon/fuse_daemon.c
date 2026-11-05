@@ -54,6 +54,10 @@
 #include "crash_dump.h"
 #include "fault_fence.h"
 #include "module_guard.h"
+
+/* GNU 开发构建链接的是系统 libfuse（3.18.3），没有这个 API：弱引用使缺失时
+   编译链接照旧通过，运行时把判断跳过（Android 子模块固定提供该实现）。 */
+extern void fuse_disable_copy_file_range(struct fuse *f) __attribute__((weak));
 #include "module_loader.h"
 #include <fuse3/fuse_log.h>
 /* 透传 ABI：Android 用定制 libfuse 的 fuse_kernel.h（含 V0/V1/V2 旧式 ioctl 与
@@ -3533,6 +3537,17 @@ int main(int argc, char* argv[]) {
                 snprintf(thread_desc, sizeof thread_desc, "%d 线程（按核数自动）",
                          g_fuse_threads);
             LOG("FUSE 会话就绪: 挂载点=%s, worker 线程数=%s", fopts.mountpoint, thread_desc);
+            /* COPY_FILE_RANGE 一律交回内核：本文件不实现 copy_file_range，
+               而 libfuse 高层的 fuse_fs_copy_file_range() 在判断操作是否存在
+               之前就先取线程上下文（fuse_get_context），缺上下文时解空指针崩溃。
+               关掉低层派发后内核收到 ENOSYS 即永久改走 read/write 循环。 */
+            if (fuse_disable_copy_file_range != NULL) {
+                fuse_disable_copy_file_range(f);
+                LOG("FUSE copy_file_range: 关闭派发，内核回退 read/write");
+            } else {
+                LOG_DBG("libfuse 未提供 fuse_disable_copy_file_range，"
+                        "COPY_FILE_RANGE 仍可能进入高层回退路径");
+            }
             if (fopts.singlethread || g_fuse_threads == 0) {
                 /* 单线程（-s / --fuse-threads=0）：刻意沿用旧 fuse_loop 语义
                    （调用线程服务请求）。libfuse 3.19 起将其标记 deprecated
