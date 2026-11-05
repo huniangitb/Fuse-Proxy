@@ -79,6 +79,8 @@ flowchart TB
 
 - **worker 线程数**（`include/fuse_threads.h`）：多线程 loop 的 worker 上限默认按宿主核数取 `min(max(2, ncpu/2), 8)`（4 核 → 2、8 核 → 4、16 核及以上 → 8）。单个应用冷启动有成百上千次并发 `getattr/open/read`，2 个 worker 会把同一条 FUSE 连接排满；而按核数一把梭在低端机上只是让线程互抢 CPU。`--fuse-threads=N` 覆盖（`0`=单线程、`-1`=libfuse 默认 10），injector 按 `[GLOBAL] FUSE_THREADS` 下发；启动期参数，改它需重启 daemon。
 
+- **COPY_FILE_RANGE 不接**（`fuse_daemon.c` 启动期调 libfuse fork 的 `fuse_disable_copy_file_range()`）：本 daemon 的 `vfs_ops` 没有 `copy_file_range`，libfuse 因此把请求交给高层回退 `fuse_lib_copy_file_range` → `fuse_fs_copy_file_range`，而后者在判断“操作是否存在”**之前**先取线程上下文（`fuse_get_context()`），上下文缺失的收尾窗口里按小偏移解空指针（现场崩溃栈：`pthread_getspecific` → `fuse_get_context_internal` → `fuse_fs_copy_file_range` → `fuse_lib_copy_file_range`，SIGSEGV）。关掉低层派发后，请求在 `copy_file_range_common()` 处直接拿到 `ENOSYS`，内核据此永久改走 read/write 循环（本 daemon 的 `vfs_read`/`vfs_write`，长期在用的路径），崩溃点不可达。GNU 开发构建链接系统 libfuse 3.18.3 无此 API，调用点用弱引用守卫（缺失则跳过）。
+
 模块架构详见 `modules.md`。
 
 ### 2.3 日志子系统
