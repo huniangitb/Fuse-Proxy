@@ -28,6 +28,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DAEMON = os.path.join(ROOT, "src", "daemon", "fuse_daemon.c")
 SOURCE = os.path.join(ROOT, "src", "daemon", "vfs_synth.c")
 DRIVER = os.path.join(ROOT, "tests", "fixtures", "vfs_synth_test.c")
+ACL = os.path.join(ROOT, "src", "daemon", "fw_acl.c")
 RUN_TIMEOUT = 60
 
 
@@ -78,6 +79,61 @@ def static_contract():
     for need in ('"/Android/data"', '"/Android/obb"'):
         if vis and need not in vis:
             errs.append("vfs_entry_visibility 缺少根层精确判定 " + need)
+    errs.extend(container_listing_contract(src))
+    return errs
+
+
+def container_listing_contract(src):
+    """容器目录（/Android/data|obb）列举只能出自身包名。
+
+    两道门都钉住：①列举前逐条过 vfs_entry_visibility（发射点不得早于判定点）；
+    ②合成阶段只补自身包名，绝不枚举真实目录。任一条被绕开，沙盒开启的应用
+    就能在容器里看到别的包名目录（隔离问题，不是显示问题）。"""
+    errs = []
+    scan = func_body(src, "static bool vfs_readdir_scan_local", 9000)
+    if not scan:
+        return ["找不到 vfs_readdir_scan_local"]
+    vis_at = scan.find("vfs_entry_visibility(")
+    if vis_at < 0:
+        errs.append("vfs_readdir_scan_local 未调用 vfs_entry_visibility（容器列举会漏出他包条目）")
+    else:
+        for emit in ("vfs_emit(", "vfs_readdir_emit_dedup("):
+            pos = scan.find(emit)
+            while pos >= 0:
+                if pos < vis_at:
+                    errs.append("vfs_readdir_scan_local 在可见性判定之前就发射条目：" + emit)
+                    break
+                pos = scan.find(emit, pos + 1)
+    own = func_body(src, "static bool vfs_readdir_fill_own_pkg", 900)
+    if not own:
+        errs.append("找不到 vfs_readdir_fill_own_pkg")
+    else:
+        if "d->current_pkg" not in own:
+            errs.append("fill_own_pkg 未按 d->current_pkg 合成自身包名目录")
+        if "hide_others" not in own or "sub_path_is_android_container" not in own:
+            errs.append("fill_own_pkg 的合成条件缺少 hide_others/container 守门")
+        if "readdir(" in own:
+            errs.append("fill_own_pkg 枚举了真实目录（应只合成自身包名）")
+    return errs
+
+
+def acl_contract():
+    """ACL 骨架门：容器目录本身对应用不可列举（AOSP 语义）。
+
+    这条门是容器列举的最后一道保险——它与可见性过滤互不替代。门被放开而过滤
+    没跟上，就是「应用能列出 obb 下所有包名」的现成路径。"""
+    if not os.path.exists(ACL):
+        return ["缺少源文件 " + ACL]
+    with open(ACL, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    idx = src.find("case NSP_PATH_SKELETON:")
+    if idx < 0:
+        return ["fw_acl.c 找不到 NSP_PATH_SKELETON 分支"]
+    body = src[idx:idx + 800]
+    errs = []
+    for need in ("NSP_ACL_OP_OPENDIR", "NSP_ACL_OP_READDIR", "NSP_ACL_DENY_EACCES"):
+        if need not in body:
+            errs.append("ACL 骨架目录分支缺少 " + need + "（容器可被列举＝他包目录名外泄）")
     return errs
 
 
@@ -87,7 +143,7 @@ def main():
             print("缺少源文件 " + path, file=sys.stderr)
             return 1
 
-    errs = static_contract()
+    errs = static_contract() + acl_contract()
     if errs:
         for e in errs:
             print("[FAIL] " + e, file=sys.stderr)
