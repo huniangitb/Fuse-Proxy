@@ -904,45 +904,62 @@ int ns_restore_app_fuse(int app_pid, const char* fuse_src, const char* backup_ro
     return ret;
 }
 
-/* 查询全局替换状态（读 /proc/<pid>/mountinfo，无需进入命名空间） */
+/* 状态判定只关心两类行：项目 FUSE 源自身（取 dev 指纹）与 emulated 族根。
+   族根数量是个位数，按数量存 dev 即可，不需要把整张挂载表读进内存——稳态对账
+   每 5s 调一次，全量读在挂载条目多的机型上要按 MB 分配并按行做 snprintf。 */
+#define NS_GREPL_STATUS_ROOTS 8
+
+struct NsStatusCtx {
+    const char* fuse_src;
+    char src_dev[64];
+    char root_dev[NS_GREPL_STATUS_ROOTS][64];
+    int total;
+    bool overflow;
+};
+
+static int ns_status_cb(const NsMountLine* ln, void* vctx) {
+    struct NsStatusCtx* c = vctx;
+    if (strcmp(ln->mount_point, c->fuse_src) == 0) {
+        if (c->src_dev[0] == '\0') snprintf(c->src_dev, sizeof c->src_dev, "%s", ln->dev);
+        return 0;
+    }
+    if (!ns_is_family_root(ln->mount_point)) return 0;
+    if (c->total >= NS_GREPL_STATUS_ROOTS) {
+        /* 族根多过预期间隔：结论按未知处理，不猜 */
+        c->overflow = true;
+        return 1;
+    }
+    snprintf(c->root_dev[c->total], sizeof c->root_dev[0], "%s", ln->dev);
+    c->total++;
+    return 0;
+}
+
+/* 查询全局替换状态（读 /proc/<pid>/mountinfo，无需进入命名空间）。
+   单次流式扫描：内存只与族根数量有关，与挂载条目总数无关。 */
 int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
     if (!fuse_src || fuse_src[0] == '\0') return NSP_GLOBAL_STATUS_UNKNOWN;
-    NsMountEntry* all = NULL;
-    int n = ns_read_mountinfo_pid(mnt_ns_pid, &all);
-    if (n < 0) {
+    struct NsStatusCtx c;
+    memset(&c, 0, sizeof c);
+    c.fuse_src = fuse_src;
+    if (ns_scan_mountinfo_stats(mnt_ns_pid, ns_status_cb, &c, nullptr) < 0) {
         /* 读不到挂载表 = 状态未知。不能返回 NORMAL：对账会把它当成「还没替换」
            而对活着的视图再替换一次 */
-        free(all);
         return NSP_GLOBAL_STATUS_UNKNOWN;
     }
-    /* 项目 FUSE 源的 major:minor：bind 视图与源共享 superblock，
-       mountinfo source 字段是 devname/fsname 而非 bind 源路径，需以 dev 判定 */
-    char src_dev[64] = {0};
-    for (int i = 0; i < n; i++) {
-        if (strcmp(all[i].mount_point, fuse_src) == 0) {
-            strncpy(src_dev, all[i].dev, sizeof(src_dev) - 1);
-            break;
-        }
-    }
-    if (src_dev[0] == '\0') {
+    if (c.overflow || c.src_dev[0] == '\0' || c.total == 0) {
         /* 源不在本命名空间的挂载表里：无法判定族根是否为**当前**项目视图
            （FUSE 崩溃重建后族根仍带旧 dev 与 fuse_daemon fstype，靠 fstype 兜底
            会把死视图误判成 REPLACED，对账永远跳过——应用一直挂在失效超块上）。
            返回 UNKNOWN 让对账按「未就绪」退避；源回来后会按 dev 重新替换。 */
-        free(all);
         return NSP_GLOBAL_STATUS_UNKNOWN;
     }
-    int total = 0, replaced = 0;
-    for (int i = 0; i < n; i++) {
-        if (!ns_is_family_root(all[i].mount_point)) continue;
-        total++;
+    int replaced = 0;
+    for (int i = 0; i < c.total; i++) {
         /* 只认 dev 相等：bind 与源共享 superblock，dev 就是"当前源"的指纹；
            不再用 fstype 兜底（陈旧 bind 同样带 fuse_daemon 字样） */
-        if (strcmp(all[i].dev, src_dev) == 0) replaced++;
+        if (strcmp(c.root_dev[i], c.src_dev) == 0) replaced++;
     }
-    free(all);
-    if (total == 0) return NSP_GLOBAL_STATUS_UNKNOWN;
-    if (replaced == total) return NSP_GLOBAL_STATUS_REPLACED;
+    if (replaced == c.total) return NSP_GLOBAL_STATUS_REPLACED;
     if (replaced == 0) return NSP_GLOBAL_STATUS_NORMAL;
     return NSP_GLOBAL_STATUS_MIXED;
 }
