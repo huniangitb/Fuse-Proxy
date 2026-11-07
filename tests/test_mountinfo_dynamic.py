@@ -107,10 +107,16 @@ def run_contracts():
 
     # 状态判定：读不到不得返回 NORMAL
     status = impl.find("int ns_global_status(")
-    status_body = impl[status:status + 2000]
+    status_body = impl[status:status + 2600]
+    nxt = status_body.find("\nint ns_collect_mounts_under(")
+    if nxt > 0:
+        status_body = status_body[:nxt]
     failures += check("P8_status_returns_unknown_on_read_failure",
-                      "if (n < 0)" in status_body and
+                      "ns_scan_mountinfo_stats(" in status_body and
                       status_body.count("NSP_GLOBAL_STATUS_UNKNOWN") >= 2)
+    # 稳态对账每 5s 调一次：状态判定必须是流式扫描，不得把整张挂载表读进内存
+    failures += check("P8b_status_scan_is_streaming",
+                      "ns_read_mountinfo_pid(" not in status_body)
 
     # 备份点：读不到不得返回「未挂载可新建」
     backup = impl.find("int ns_backup_point_state(")
