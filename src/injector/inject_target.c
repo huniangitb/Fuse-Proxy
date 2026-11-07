@@ -481,6 +481,23 @@ bool is_zygote_child(pid_t pid) {
     return false;
 }
 
+/* 全局层的豁免：GLOBAL_INJECT（v1/v2）或 v3 全局挂载才算「全局覆盖到」，
+   隔离进程与 zygote 一律排除。
+   SKIP_SYSTEM_APPS 是这个全局层的作用域收窄项，只在全局层本身成立时才参与判定
+   —— GLOBAL_INJECT 关闭时它不单独生效（否则等于给「没开全局注入」的配置
+   凭空加一条跳过规则）。v3 是全局挂载，系统应用没有「不注入」这个选项，故跳过
+   判定在 v3 下不适用。显式点名的应用段 / 类别段 / [*] 段各有自己的使能位，
+   在到达这里之前就已经返回，不受这两个全局键影响。 */
+static bool global_scope_covers_locked(const char* cmdline, uid_t uid) {
+    if (!(g_inject_method == INJECT_METHOD_V3) && !g_global_cfg.global_inject) return false;
+    if (is_isolated_uid(uid)) return false;
+    if (strstr(cmdline, "zygote")) return false;
+    if (g_inject_method != INJECT_METHOD_V3 && g_global_cfg.skip_system_apps &&
+        is_system_app_by_pkg(cmdline, uid))
+        return false;
+    return true;
+}
+
 bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_ipc) {
     int user_id = uid / NSP_PER_USER_UID_STRIDE;
     AppConfig* cfg = find_app_cfg_locked(cmdline, user_id);
@@ -495,17 +512,9 @@ bool is_target_app_locked(const char* cmdline, uid_t uid, pid_t pid, bool from_i
         if (category_has_rules_locked(is_sys, user_id)) return true;
     }
     if (has_wildcard_enabled_locked(user_id)) return true;
-    /* 注入方法 v3（默认全局挂载，含系统应用）：忽略 GLOBAL_INJECT 与
-       SKIP_SYSTEM_APPS 两个全局参数；应用段/类别段头的显式 OFF、隔离进程
-       与 zygote 排除照旧生效 */
-    bool v3 = (g_inject_method == INJECT_METHOD_V3);
-    if ((v3 || g_global_cfg.global_inject) && !is_isolated_uid(uid) &&
-        !strstr(cmdline, "zygote")) {
-        /* 默认跳过系统应用，pm list packages -s 查询失败时回退到 uid < 10000 */
-        if (!v3 && g_global_cfg.skip_system_apps && is_system_app_by_pkg(cmdline, uid))
-            return false;
-        if (from_ipc || is_zygote_child(pid)) return true;
-    }
+    /* 走到这里说明没有任何显式段命中该应用，归属全局层裁决 */
+    if (!global_scope_covers_locked(cmdline, uid)) return false;
+    if (from_ipc || is_zygote_child(pid)) return true;
     return false;
 }
 

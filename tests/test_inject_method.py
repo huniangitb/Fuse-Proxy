@@ -336,6 +336,46 @@ def main():
     expect("v1 扫描路径", is_target(conf_on, "v1", "com.norm.app", NORM_UID, ipc=0)[1], 0)
     expect("v3 扫描路径", is_target(conf_on, "v3", "com.norm.app", NORM_UID, ipc=0)[1], 0)
 
+    # 4×2 矩阵：系统/用户应用 × 有/无应用段，在两档 GLOBAL_INJECT 下各跑一遍。
+    # SKIP_SYSTEM_APPS 只在 GLOBAL_INJECT 成立时收窄作用域：GLOBAL_INJECT OFF 时它
+    # 不单独生效（显式段本来就独立裁决，两种取值下都必须照常注入）。
+    conf_gi_on_skip_on = write_conf(
+        tmp, "m_on_on.conf",
+        "[GLOBAL]\nGLOBAL_INJECT ON\nSKIP_SYSTEM_APPS ON\n\n"
+        "[com.sys.named] ON\n[com.user.named] ON\n[com.user.off] OFF\n")
+    conf_gi_on_skip_off = write_conf(
+        tmp, "m_on_off.conf",
+        "[GLOBAL]\nGLOBAL_INJECT ON\nSKIP_SYSTEM_APPS OFF\n\n"
+        "[com.sys.named] ON\n[com.user.named] ON\n[com.user.off] OFF\n")
+    conf_gi_off_skip_on = write_conf(
+        tmp, "m_off_on.conf",
+        "[GLOBAL]\nGLOBAL_INJECT OFF\nSKIP_SYSTEM_APPS ON\n\n"
+        "[com.sys.named] ON\n[com.user.named] ON\n[com.user.off] OFF\n")
+    conf_gi_off_skip_off = write_conf(
+        tmp, "m_off_off.conf",
+        "[GLOBAL]\nGLOBAL_INJECT OFF\nSKIP_SYSTEM_APPS OFF\n\n"
+        "[com.sys.named] ON\n[com.user.named] ON\n[com.user.off] OFF\n")
+
+    matrix = (
+        # (配置, 名称, GLOBAL_INJECT, SKIP_SYSTEM_APPS,
+        #  系统应用无段, 系统应用有段, 用户应用无段, 用户应用有段)
+        (conf_gi_on_skip_on, "GLOBAL_INJECT ON  SKIP_SYSTEM_APPS ON ", 1, 1, 0, 1, 1, 1),
+        (conf_gi_on_skip_off, "GLOBAL_INJECT ON  SKIP_SYSTEM_APPS OFF", 1, 0, 1, 1, 1, 1),
+        (conf_gi_off_skip_on, "GLOBAL_INJECT OFF SKIP_SYSTEM_APPS ON ", 0, 1, 0, 1, 0, 1),
+        (conf_gi_off_skip_off, "GLOBAL_INJECT OFF SKIP_SYSTEM_APPS OFF", 0, 0, 0, 1, 0, 1),
+    )
+    for conf, label, _gi, _skip, sys_plain, sys_named, user_plain, user_named in matrix:
+        log(f"场景8: 4×2 矩阵 — {label}")
+        for method in ("v1", "v2"):
+            expect(f"{method} {label} 系统应用·无段", is_target(conf, method, "com.sys.app", SYS_UID)[1], sys_plain)
+            expect(f"{method} {label} 系统应用·有段", is_target(conf, method, "com.sys.named", SYS_UID)[1], sys_named)
+            expect(f"{method} {label} 用户应用·无段", is_target(conf, method, "com.user.app", NORM_UID)[1], user_plain)
+            expect(f"{method} {label} 用户应用·有段", is_target(conf, method, "com.user.named", NORM_UID)[1], user_named)
+            expect(f"{method} {label} 用户应用·段 OFF", is_target(conf, method, "com.user.off", OFF_UID)[1], 0)
+        # v3：全局挂载，两键都不参与
+        expect(f"v3 {label} 系统应用·无段", is_target(conf, "v3", "com.sys.app", SYS_UID)[1], 1)
+        expect(f"v3 {label} 用户应用·段 OFF", is_target(conf, "v3", "com.user.off", OFF_UID)[1], 0)
+
     log(f"\n结果: {PASS} 通过, {FAIL} 失败")
     for d, e in ERRORS:
         log(f"  ❌ {d}: {e}")
