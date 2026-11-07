@@ -1,6 +1,7 @@
 /* 虚拟条目判定与合成属性的判别性用例：直编 src/daemon/vfs_synth.c，
    不起 daemon、不挂载。失败条数即退出码来源。 */
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -185,6 +186,55 @@ static void case_storage_android_only(void) {
           "嵌套 Android 不是骨架目录");
 }
 
+/* 合成列举登记：own_pkg 兜底只认「readdir 真的发出过这一条」。
+   判别性要求：未列举必须不放行（直接 statx 一个不存在的 own_pkg 路径要 ENOENT），
+   列举窗口内放行（列表里看得见就点得开），窗口过期、换 uid、换容器即失效。 */
+static uint64_t g_fake_ms;
+
+static uint64_t fake_clock(void) {
+    return g_fake_ms;
+}
+
+static void case_listed_registry(void) {
+    nsp_listed_set_clock_for_test(fake_clock);
+    nsp_listed_clear();
+    g_fake_ms = 1000;
+
+    check(!nsp_listed_own_pkg(10000, "/Android/obb/com.example", "com.example"),
+          "未列举：own_pkg 兜底不放行");
+    nsp_listed_mark_own_pkg(10000, "/Android/obb", "com.example");
+    check(nsp_listed_own_pkg(10000, "/Android/obb/com.example", "com.example"),
+          "列举过：容器下的 own_pkg 路径放行");
+    check(nsp_listed_own_pkg(10000, "/0/Android/obb/com.example/", "com.example"),
+          "带用户层与尾斜杠的同一路径仍放行");
+    check(!nsp_listed_own_pkg(10001, "/Android/obb/com.example", "com.example"),
+          "别的 uid 不共享登记");
+    check(!nsp_listed_own_pkg(10000, "/Android/data/com.example", "com.example"),
+          "obb 的登记不放到 data 容器");
+    check(!nsp_listed_own_pkg(10000, "/Android/obb/com.other", "com.other"),
+          "未列举的另一个包名不放行");
+    check(!nsp_listed_own_pkg(10000, "/Android/obb", "com.example"),
+          "容器本身不是 own_pkg 条目");
+
+    g_fake_ms = 1000 + 30001;
+    check(!nsp_listed_own_pkg(10000, "/Android/obb/com.example", "com.example"),
+          "超过窗口：登记失效（按未列举处理）");
+
+    g_fake_ms = 1000;
+    nsp_listed_mark_own_pkg(10000, "/Android/data", "com.example");
+    check(nsp_listed_own_pkg(10000, "/Android/data/com.example", "com.example"),
+          "data 容器的登记只对 data 生效");
+
+    nsp_listed_mark_own_pkg(20000, "/Download/Android/obb", "com.example");
+    check(!nsp_listed_own_pkg(20000, "/Download/Android/obb/com.example", "com.example"),
+          "非存储根容器不产生登记");
+
+    nsp_listed_clear();
+    check(!nsp_listed_own_pkg(10000, "/Android/data/com.example", "com.example"),
+          "clear 之后一律不放行");
+    nsp_listed_set_clock_for_test(nullptr);
+}
+
 int main(void) {
     case_synth_dir_without_real_child();
     case_synth_dir_with_real_child();
@@ -194,6 +244,7 @@ int main(void) {
     case_skel_and_user_layer();
     case_storage_android_only();
     case_nearest_ancestor();
+    case_listed_registry();
     if (failed) printf("失败 %d 条\n", failed);
     return failed ? 1 : 0;
 }

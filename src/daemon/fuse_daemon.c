@@ -947,7 +947,10 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             VFS_RETURN(0);
         }
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) || is_virtual_own_pkg_dir(sub_path, current_pkg) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
+            (is_android_skel_dir(sub_path) ||
+             (is_virtual_own_pkg_dir(sub_path, current_pkg) &&
+              nsp_listed_own_pkg(ctx->uid, sub_path, current_pkg)) ||
+             rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             /* 虚拟目录（无真实底层文件，如 FTP 前缀/重定向祖先）：权限继承
                上级目录（父路径的真实 mode/uid/gid），而非固定 root/访问者 */
             memset(st, 0, sizeof(struct stat));
@@ -1016,7 +1019,10 @@ static int vfs_access(const char* path, int mask) {
     if (access(p, mask) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) || is_virtual_own_pkg_dir(sub_path, current_pkg) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
+            (is_android_skel_dir(sub_path) ||
+             (is_virtual_own_pkg_dir(sub_path, current_pkg) &&
+              nsp_listed_own_pkg(ctx->uid, sub_path, current_pkg)) ||
+             rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
             VFS_RETURN(0);
         }
         log_fuse_err("ACCESS", path, err);
@@ -1470,7 +1476,11 @@ static bool vfs_readdir_fill_android_children(VfsReaddirCtx* d) {
 /* /Android/data|obb 下访问者自身包名骨架补齐（跨应用隔离下仅见自身） */
 static bool vfs_readdir_fill_own_pkg(VfsReaddirCtx* d) {
     if (!(d->hide_others && !d->has_pkg && sub_path_is_android_container(d->sub_path))) return true;
-    return vfs_readdir_emit_dedup(d, d->current_pkg);
+    bool ok = vfs_readdir_emit_dedup(d, d->current_pkg);
+    /* 发出去了才登记：getattr/access/opendir 的 own_pkg 兜底只认「这一条真的
+       被列举过」，直接 stat 一个从未列举的路径仍按真实结果失败 */
+    if (ok) nsp_listed_mark_own_pkg(d->ctx->uid, d->sub_path, d->current_pkg);
+    return ok;
 }
 
 /* 虚拟目录补充：模块 readdir_extra 返回条目数组，框架 ht 去重 + filler。
@@ -1577,6 +1587,10 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     (void)(vfs_readdir_fill_android_skel(&d) && vfs_readdir_fill_android_children(&d) &&
            vfs_readdir_fill_own_pkg(&d) && vfs_readdir_fill_virtual(&d, path_user_id) &&
            vfs_readdir_fill_dots(&d));
+    /* 物理扫描已发出自身包名条目（真实目录存在，或其 lstat 失败按骨架名上架）：
+       同样算「列举过」，按名 getattr 必须与列表口径一致 */
+    if (d.has_pkg && sub_path_is_android_container(d.sub_path))
+        nsp_listed_mark_own_pkg(d.ctx->uid, d.sub_path, d.current_pkg);
     vfs_hash_free(&d.ht);
     VFS_RETURN(0);
 }
@@ -2163,7 +2177,10 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
     }
     int err = errno;
     if ((err == ENOENT || err == EACCES) &&
-        (is_android_skel_dir(sub_path) || is_virtual_own_pkg_dir(sub_path, current_pkg) || rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
+        (is_android_skel_dir(sub_path) ||
+         (is_virtual_own_pkg_dir(sub_path, current_pkg) &&
+          nsp_listed_own_pkg(ctx->uid, sub_path, current_pkg)) ||
+         rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
         VFS_RETURN(0);
     }
     log_fuse_err("OPENDIR", path, err);
