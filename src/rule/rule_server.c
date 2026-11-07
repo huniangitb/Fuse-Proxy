@@ -1814,20 +1814,13 @@ static void handle_set(int fd, json_object* req) {
     handle_add(fd, req, "SET");
 }
 
+static int read_injector_pid(void);
+
 /* 向 injector 发送信号（SIGHUP 重载 / SIGTERM 停止） */
 static void signal_injector(int fd, const char* cmd, int sig) {
-    char path[PATH_MAX];
-    injector_pid_path(path, sizeof(path));
-    FILE* fp = fopen(path, "r");
-    if (!fp) {
-        reply_error(fd, cmd, "无法读取注入器 PID 文件 %s: %s", path, strerror(errno));
-        return;
-    }
-    int pid = -1;
-    if (fscanf(fp, "%d", &pid) != 1) pid = -1;
-    fclose(fp);
+    int pid = read_injector_pid();
     if (pid <= 0) {
-        reply_error(fd, cmd, "PID 文件 %s 内容无效", path);
+        reply_error(fd, cmd, "未找到注入器进程");
         return;
     }
     if (kill(pid, sig) != 0) {
@@ -2134,17 +2127,8 @@ static void handle_stop(int fd, json_object* req) {
 
 static void handle_status(int fd, json_object* req) {
     (void)req;
-    int injector_pid = -1;
-    bool injector_alive = false;
-    char path[PATH_MAX];
-    injector_pid_path(path, sizeof(path));
-    FILE* fp = fopen(path, "r");
-    if (fp) {
-        if (fscanf(fp, "%d", &injector_pid) == 1 && injector_pid > 0) {
-            injector_alive = (kill(injector_pid, 0) == 0 || errno == EPERM);
-        }
-        fclose(fp);
-    }
+    int injector_pid = read_injector_pid();
+    bool injector_alive = proc_alive(injector_pid);
     json_object* data = json_object_new_object();
     json_object_object_add(data, "version", json_object_new_string(RULE_VERSION));
     json_object_object_add(data, "config_dir", json_object_new_string(g_config_dir));

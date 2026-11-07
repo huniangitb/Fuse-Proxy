@@ -110,6 +110,10 @@ static void json_api_error(bool api_mode, const char* cmd, const char* error_msg
 }
 
 /* ========== 配置文件读写辅助 ========== */
+static void injector_pid_path(char* out, size_t size) {
+    snprintf(out, size, "%s/injector.pid", g_config_dir);
+}
+
 static int read_pid_file(const char* path) {
     FILE* fp = fopen(path, "r");
     if (!fp) return -1;
@@ -119,9 +123,54 @@ static int read_pid_file(const char* path) {
     return pid;
 }
 
+/* /proc/<pid>/comm 是内核写死的任务名，PID 被回收后必然对不上，
+   比仅凭 kill(pid,0) 判活更可靠 */
+static bool proc_comm_is(int pid, const char* name) {
+    char path[64];
+    char buf[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return false;
+    bool match = false;
+    if (fgets(buf, sizeof(buf), fp)) {
+        size_t n = strlen(buf);
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' ')) buf[--n] = '\0';
+        match = (strcmp(buf, name) == 0);
+    }
+    fclose(fp);
+    return match;
+}
+
+static int scan_pid_by_name(const char* name) {
+    DIR* d = opendir("/proc");
+    if (!d) return -1;
+    struct dirent* de;
+    int found = -1;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int pid = atoi(de->d_name);
+        if (pid > 0 && proc_comm_is(pid, name)) {
+            found = pid;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* PID 文件是精确入口；文件缺失、内容损坏或进程已退出时退回 /proc 按名扫描，
+   否则注入器明明在跑，状态查询与信号命令却报它不在 */
+static int resolve_injector_pid(void) {
+    char path[PATH_MAX];
+    injector_pid_path(path, sizeof(path));
+    int pid = read_pid_file(path);
+    if (pid > 0 && proc_comm_is(pid, "injector")) return pid;
+    return scan_pid_by_name("injector");
+}
+
 static const char* send_reload_signal(void) {
-    int pid = read_pid_file(INJECTOR_PID_PATH);
-    if (pid <= 0) return "无法读取注入器 PID 文件";
+    int pid = resolve_injector_pid();
+    if (pid <= 0) return "未找到注入器进程";
     if (kill(pid, SIGHUP) != 0) {
         static char err_buf[128];
         snprintf(err_buf, sizeof(err_buf), "发送 SIGHUP 到 PID %d 失败: %s", pid, strerror(errno));
@@ -460,11 +509,11 @@ static void handle_reload_config(bool api_mode) {
     }
     if (api_mode) {
         char data_buf[256];
-        int pid = read_pid_file(INJECTOR_PID_PATH);
+        int pid = resolve_injector_pid();
         snprintf(data_buf, sizeof(data_buf), "{\"pid\":%d,\"signal\":\"SIGHUP\"}", pid);
         json_api_finish(true, "\"reload-config\"", data_buf);
     } else {
-        int pid = read_pid_file(INJECTOR_PID_PATH);
+        int pid = resolve_injector_pid();
         printf("已向注入器 (PID %d) 发送 SIGHUP 信号，触发配置重载\n", pid);
     }
 }
@@ -578,8 +627,8 @@ static void handle_status(bool api_mode) {
     bool events_on = events_enabled_from_config();
     NspEventsStatus events_st;
     nsp_events_status_collect(&events_st, events_on, LOG_DIR);
-    int injector_pid = read_pid_file(INJECTOR_PID_PATH);
-    bool injector_alive = (injector_pid > 0 && kill(injector_pid, 0) == 0);
+    int injector_pid = resolve_injector_pid();
+    bool injector_alive = (injector_pid > 0);
     int fuse_pid = 0;
     FILE* fp = fopen("/proc/self/mountinfo", "r");
     if (fp) {
