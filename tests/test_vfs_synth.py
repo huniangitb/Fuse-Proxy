@@ -64,6 +64,9 @@ def static_contract():
             continue
         if "is_virtual_own_pkg_dir" not in body:
             errs.append(fn + " 的虚拟目录兜底未接入 is_virtual_own_pkg_dir")
+        if "nsp_listed_own_pkg" not in body:
+            errs.append(fn + " 的 own_pkg 兜底未要求列举登记"
+                        "（路径形状像就放行＝凭空变出目录）")
     init = func_body(src, "static void vfs_readdir_ctx_init", 1800)
     if not init:
         errs.append("找不到 vfs_readdir_ctx_init")
@@ -104,6 +107,10 @@ def container_listing_contract(src):
                     errs.append("vfs_readdir_scan_local 在可见性判定之前就发射条目：" + emit)
                     break
                 pos = scan.find(emit, pos + 1)
+    for fn in ("static bool vfs_readdir_fill_own_pkg", "static int vfs_readdir"):
+        body = func_body(src, fn, 12000)
+        if body and "nsp_listed_mark_own_pkg" not in body:
+            errs.append(fn + " 发出 own_pkg 条目后未登记（getattr 兜底会拒掉刚列出的目录）")
     own = func_body(src, "static bool vfs_readdir_fill_own_pkg", 900)
     if not own:
         errs.append("找不到 vfs_readdir_fill_own_pkg")
