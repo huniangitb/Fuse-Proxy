@@ -93,6 +93,9 @@ static void build_templates_json(json_object* root) {
     json_object_object_add(global, "apply_to_app", apply_to);
 
     json_object_object_add(global, "enable_sandbox", json_object_new_boolean(g_global_cfg.sandbox));
+    /* 是否在 [GLOBAL] 段显式写过 SANDBOX：消费端据此区分「继承」与「明确关闭」 */
+    json_object_object_add(global, "sandbox_explicit",
+                           json_object_new_boolean(g_global_cfg.sandbox_explicit));
     /* 全局注入状态强制关闭，不再跟随 g_global_cfg.global_inject 规则改变 */
     json_object_object_add(global, "global_inject", json_object_new_boolean(false));
 
@@ -128,10 +131,11 @@ static void build_templates_json(json_object* root) {
         AppConfig* cfg = g_app_cfgs[i];
         json_object* app = json_object_new_object();
         json_object_object_add(app, "template_name", json_object_new_string(cfg->pkg_name));
-        if (strcmp(cfg->pkg_name, "USER_APPS") == 0 || strcmp(cfg->pkg_name, "SYSTEM_APPS") == 0) {
+        /* user_id 对所有段都发：工作资料/应用分身下同名包各有一段，消费端靠它区分，
+           否则两段按模板名合并、后到的覆盖先到的 */
+        json_object_object_add(app, "user_id", json_object_new_int(cfg->user_id));
+        if (strcmp(cfg->pkg_name, "USER_APPS") == 0 || strcmp(cfg->pkg_name, "SYSTEM_APPS") == 0)
             json_object_object_add(app, "scope", json_object_new_string("category"));
-            json_object_object_add(app, "user_id", json_object_new_int(cfg->user_id));
-        }
 
         json_object* hook_op = json_object_new_array();
         json_object_array_add(hook_op, json_object_new_string("query"));
@@ -143,6 +147,9 @@ static void build_templates_json(json_object* root) {
         json_object_object_add(app, "apply_to_app", apply_to);
 
         json_object_object_add(app, "enable_sandbox", json_object_new_boolean(cfg->sandbox));
+        /* 同 GLOBAL 模板：区分「段内没写 SANDBOX」与「段内写了 SANDBOX OFF」 */
+        json_object_object_add(app, "sandbox_explicit",
+                               json_object_new_boolean(cfg->sandbox_explicit));
         json_object_object_add(app, "monitor", json_object_new_boolean(cfg->monitor));
         json_object_object_add(app, "inject_enable", json_object_new_boolean(cfg->inject_enable));
 
@@ -379,6 +386,10 @@ static void build_static_apps_json(json_object* root) {
         json_object_object_add(app, "user_id", json_object_new_int(cfg->user_id));
         json_object_object_add(app, "inject_enable",
                                json_object_new_string(cfg->inject_enable ? "ON" : "OFF"));
+        json_object_object_add(app, "sandbox",
+                               json_object_new_string(cfg->sandbox ? "ON" : "OFF"));
+        json_object_object_add(app, "sandbox_explicit",
+                               json_object_new_string(cfg->sandbox_explicit ? "ON" : "OFF"));
         if (strcmp(cfg->pkg_name, "USER_APPS") == 0 || strcmp(cfg->pkg_name, "SYSTEM_APPS") == 0)
             json_object_object_add(app, "scope", json_object_new_string("category"));
         json_object_array_add(apps, app);
