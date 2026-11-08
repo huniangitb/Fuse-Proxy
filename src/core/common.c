@@ -262,42 +262,71 @@ char* read_file_dynamic(const char* path, size_t* out_size, size_t max_size) {
     return buf;
 }
 
-/* 递归创建目录（带父目录属性继承，原 config_parser.c 提供，迁至公共工具） */
-static void sync_attributes(const char* source_parent, const char* target_path) {
-    struct stat st;
-    if (lstat(source_parent, &st) != 0) return;
-    if (lchown(target_path, st.st_uid, st.st_gid) != 0) {
+/* 新建条目的属性收尾（唯一出口）：create / mkdir / mknod / symlink / 父目录补建 /
+   沙盒落点全部经这里定最终 mode 与属主，各回调不得再自己 chmod。
+
+   mode 口径：**调用方 mode 是权威值**。本模块不置 FUSE_CAP_DONT_MASK，VFS 在进
+   FUSE 回调之前就已按请求者 umask 归一过 mode（mode & ~umask），daemon 拿到的是
+   最终值。若再拿父目录 mode 覆盖它，umask 与应用显式指定的 0600/0700 会一起失效
+   （实测：umask 000 / 022 / 077 建同一目录，结果都是父目录的 2770）。父目录只提供
+   两件事：属主（新建条目归父目录属主，与 MediaProvider 建条目一致）与 setgid
+   （POSIX：父目录带 S_ISGID 时子目录继承，否则不带——反过来把 setgid 送给不带它的
+   父目录下的一切，就会造出 setgid 目录树，其中所有条目都归 _media_rw 组）。
+
+   caller_mode 为 0 表示调用点确实没有 mode 可传（符号链接的 mode 在内核恒为 0777，
+   真实值无意义）：此时回落父目录 mode，只作「值未知」的缺省，不用来覆盖已知值。
+
+   符号链接不改 mode：chmod(2) 会穿透链接改到目标文件（旧实现正是如此）。 */
+void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
+    if (!real_path || real_path[0] != '/') return;
+    char parent[PATH_MAX];
+    int wn = snprintf(parent, sizeof(parent), "%s", real_path);
+    if (wn <= 0 || (size_t)wn >= sizeof(parent)) return; /* 放不下就不猜：保持创建时的值 */
+    char* last = strrchr(parent, '/');
+    if (!last) return;
+    if (last == parent)
+        parent[1] = '\0';
+    else
+        *last = '\0';
+    struct stat pst;
+    if (lstat(parent, &pst) != 0) return;
+    struct stat est;
+    if (lstat(real_path, &est) != 0) return; /* 条目已不在（并发删）：无事可做 */
+    /* 属主跟随父目录：daemon 以 root 建出来的条目必须归回父目录属主，否则应用在
+       自己的存储树里拿到 root 属主的条目，后续 open/chmod 全被 DAC 拒掉。 */
+    if (lchown(real_path, pst.st_uid, pst.st_gid) != 0) {
+        /* 失败不致命（例如后端目标不支持 chown）：mode 照旧收敛，errno 留给调用点 */
     }
-    chmod(target_path, st.st_mode & 07777);
+    if (!S_ISLNK(est.st_mode)) {
+        mode_t final_mode = caller_mode & 07777;
+        if (final_mode == 0) final_mode = pst.st_mode & 07777;
+        if (S_ISDIR(est.st_mode))
+            final_mode =
+                (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
+        chmod(real_path, final_mode);
+    }
 #ifdef TARGET_ANDROID
     char context[256];
-    ssize_t ctx_len = lgetxattr(source_parent, "security.selinux", context, sizeof(context));
+    ssize_t ctx_len = lgetxattr(parent, "security.selinux", context, sizeof(context));
     if (ctx_len > 0) {
-        lsetxattr(target_path, "security.selinux", context, (size_t)ctx_len, 0);
-    } else if (strstr(target_path, STORAGE_BASE) == target_path) {
+        lsetxattr(real_path, "security.selinux", context, (size_t)ctx_len, 0);
+    } else if (strncmp(real_path, STORAGE_BASE, sizeof(STORAGE_BASE) - 1) == 0) {
         /* 长度用 sizeof（含 NUL）：与 fuse_daemon 侧回填同一常量、同一算法，
            消除「手写字节数」这一类越界读来源 */
-        lsetxattr(target_path, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
+        lsetxattr(real_path, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
                   sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
     }
 #endif
 }
 
-static void inherit_from_parent(const char* real_path) {
-    char parent[PATH_MAX];
-    strncpy(parent, real_path, PATH_MAX - 1);
-    char* last = strrchr(parent, '/');
-    if (last) {
-        if (last == parent)
-            strcpy(parent, "/");
-        else
-            *last = '\0';
-        sync_attributes(parent, real_path);
-    }
+/* 父目录补建时的收尾：中间目录没有「调用方 mode」，用 mkdir 时给的 mode 作
+   权威值（同一趟循环里的 mode 参数），语义与其余创建路径完全一致。 */
+static void inherit_from_parent(const char* real_path, mode_t mode) {
+    nsp_new_entry_attrs(real_path, mode);
 }
 
-/* 递归建目录的唯一实现。inherit=true 时对新目录套用父目录的属主/模式
-   （Android 另含 SELinux 上下文），供 mkdir_recursive_p；
+/* 递归建目录的唯一实现。inherit=true 时对新目录套用父目录的属主与 setgid，
+   mode 仍取本函数的 mode 参数（Android 另含 SELinux 上下文），供 mkdir_recursive_p；
    mkdir_recursive 保持历史语义（不继承属性、固定 0755）。
    两者语义确有差异故保留两个入口，但共用本实现——此前各写一份循环，
    且 mkdir_recursive 用 256 字节栈缓冲，超长路径会被静默拒绝。 */
@@ -324,7 +353,7 @@ static int mkdir_p_impl(const char* path, mode_t mode, bool inherit, size_t star
             *p = '\0';
             if (access(tmp, F_OK) != 0) {
                 if (mkdir(tmp, mode) == 0) {
-                    if (inherit) inherit_from_parent(tmp);
+                    if (inherit) inherit_from_parent(tmp, mode);
                 } else if (errno != EEXIST) {
                     return -1;
                 }
@@ -334,7 +363,7 @@ static int mkdir_p_impl(const char* path, mode_t mode, bool inherit, size_t star
     }
     if (access(tmp, F_OK) != 0) {
         if (mkdir(tmp, mode) == 0) {
-            if (inherit) inherit_from_parent(tmp);
+            if (inherit) inherit_from_parent(tmp, mode);
         } else if (errno != EEXIST) {
             return -1;
         }
