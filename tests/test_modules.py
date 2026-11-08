@@ -19,7 +19,7 @@ ROOT   = HERE.parent
 MNT    = "/tmp/fuse_mod_test/mnt"
 STORAGE= "/tmp/fuse_mod_test/storage"
 MODDIR = "/tmp/fuse_mod_test/modules"
-CONF   = "/tmp/Namespace-Proxy/injector.conf"
+CONF   = "/tmp/fuse_mod_test/injector.conf"  # 本套件 BASE 内，勿与其他套件共用
 DAEMON = os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(HERE, "..", "build_gnu", "fuse_daemon"))
 MODULE = "backend_bad"
@@ -196,7 +196,7 @@ def setup():
     (Path(STORAGE)/"0/real_dir/hi.txt").write_text("redirected")
     (Path(STORAGE)/"0/normal/n.txt").write_text("normal")
     os.makedirs(MNT, exist_ok=True)
-    os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
     os.makedirs(MODDIR, exist_ok=True)   # 空模块目录：case1 验证"无模块也有规则"
 
 def wconf(t): open(CONF, "w").write(t.strip())

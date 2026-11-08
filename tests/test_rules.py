@@ -5,7 +5,7 @@ from pathlib import Path
 
 MNT="/tmp/fuse_rules_test/mnt"; STORAGE="/tmp/fuse_rules_test/storage"
 MODDIR="/tmp/fuse_rules_test/modules"
-CONF="/tmp/Namespace-Proxy/injector.conf"
+CONF="/tmp/fuse_rules_test/injector.conf"  # 本套件 BASE 内，勿与其他套件共用
 ROOT=os.path.abspath(os.path.join(os.path.dirname(__file__),".."))
 DAEMON=os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
@@ -19,7 +19,7 @@ def setup():
     subprocess.run(["fusermount3","-u",MNT],capture_output=True)
     for d in ["0/Download/Pics","0/Download/Music","0/Download/Docs"]:
         os.makedirs(f"{STORAGE}/{d}",exist_ok=True)
-    os.makedirs(MNT,exist_ok=True); os.makedirs("/tmp/Namespace-Proxy",exist_ok=True)
+    os.makedirs(MNT,exist_ok=True); os.makedirs(os.path.dirname(CONF),exist_ok=True)
     # 规则引擎已内建（fw_rules）：无需模块目录，规则直接由 fuse_daemon 解释
     (Path(STORAGE)/"0/Download/hi.txt").write_text("hello")
     (Path(STORAGE)/"0/Download/Pics/1.jpg").write_text("img1")
@@ -751,7 +751,8 @@ REDIRECT /rv/ /Download/{LONG_B}""", [
     isolation_section()
 
     # cleanup
-    subprocess.run(["pkill","-f","fuse_daemon"],capture_output=True)
+    # 只清本套件起的 daemon（按 --rules 路径精确匹配），不误杀并发套件的进程
+    subprocess.run(["pkill","-f","fuse_daemon.*--rules="+CONF],capture_output=True)
     subprocess.run(["fusermount3","-u",MNT],capture_output=True)
     log(f"\n❖ {PASS} 通过 | {FAIL} 失败 | 共 {PASS+FAIL}")
     for d,dt in ERRS: log(f"  ❌ {d}: {dt}")

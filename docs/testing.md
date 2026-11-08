@@ -16,7 +16,7 @@ python3 tests/run.py --list           # 只看会跑哪些，不真跑
 python3 tests/run.py --layer L0       # 只跑某一验收层（可重复 --layer L0 --layer L1）
 python3 tests/run.py --all --strict   # 全量验收：跳过项计为失败
 python3 tests/run.py test_rules.py    # 显式指定（跳过自动匹配）
-python3 tests/run.py --jobs 4         # L0 类套件并行；挂载类恒串行
+python3 tests/run.py --jobs 4         # 资源感知并行：无冲突的套件同时跑
 python3 tests/run.py --base <ref>     # 换改动对比基线（默认 HEAD）
 scripts/acceptance.sh                 # 完整验收门（构建 + 测试 + 文档 + 报告）
 ```
@@ -68,21 +68,32 @@ scripts/acceptance.sh                 # 完整验收门（构建 + 测试 + 文�
 
 | | 唯一出处 | 管什么 | 怎么划 |
 |---|---|---|---|
-| **Tier** | `PARALLEL_SAFE` / `TIER_EXCLUSIVE` | 能不能并行跑 | 按共享状态冲突 |
+| **Tier** | `PARALLEL_SAFE` / `QUIET_ON_HOST` / `TIER_EXCLUSIVE` / `SUITE_RESOURCES` | 能不能并行跑 | 按共享状态冲突 |
 | **Layer** | `LAYERS` | 验收递进顺序 | 按贴近 Android 的程度 |
 
 ### 3.1 Tier（并行安全性）
 
-- **Tier 0**：`PARALLEL_SAFE` 白名单，进线程池并行。判据：CONF/挂载点全由
-  `mkdtemp` 派生自管或根本不挂载；无固定端口；无全局 `pkill`；不碰系统
-  `log_monitor` 与真实日志文件。**新套件默认串行**，要进白名单须先逐条核对判据。
-- **Tier 1**：挂载类，恒串行。
+并行是**按资源**判的，不是「白名单并行、其余全串行」：挂载类套件的规则文件、
+挂载点、日志、模块目录都在各自 BASE 下，彼此几乎没有共享，串行只是省事，
+代价是每条用例都要排队（实测串行段占整套墙钟 92%）。
+
+- **Tier 0**：`PARALLEL_SAFE`，宿主零副作用。判据：不进宿主命名空间挂载、不 bind
+  固定端口、不做全局 `pkill`、不碰系统 `log_monitor` 与真实日志文件（工作目录自管
+  即可，`mkdtemp` 或自有 BASE 都算）。这类套件与任何套件都能同时跑。
+- **Tier 1**：会动宿主挂载的套件，彼此**可以并发**，但要服从下面两个约束：
+  - `SUITE_RESOURCES`：同名资源（vsftpd 21 + 服务端目录、中继端口 2121、
+    系统 `log_monitor`、`/tmp/fuse_proxy_test`）的套件互斥，不同资源照常并发；
+  - `QUIET_ON_HOST`：断言「宿主 mountinfo 全程零变化」的套件要独占跑（写锁）。
+    它们排在最前，写完锁才放挂载类进来；写者等待期间不再放新的挂载类，
+    免得安静套件被源源不断的挂载饿死。
 - **Tier 2**：独占，串行且排最后——碰全局 `log_monitor`（抽象套接字单例 + 系统
   `LOG_DIR`）的套件，收尾时系统实例已还原，不干扰别人。
 
-共享资源冲突矩阵（逐个审计得出）记在 `tests/run.py` 的 `PARALLEL_SAFE` 上方注释里：
-固定 `CONF` 路径、`/tmp/fuse_proxy_test` 基目录复用、全局 `pkill`、vsftpd 服务端目录、
-固定中继端口 2121、全局 `log_monitor`、系统 `injector.conf` 共七项。
+共享资源冲突矩阵（逐个审计得出）记在 `tests/run.py` 里 `PARALLEL_SAFE` 上方注释。
+曾经的固定 `CONF`（`/tmp/Namespace-Proxy/injector.conf`，8 个套件共用）已各自搬进
+BASE；全局 `pkill -f fuse_daemon` 已收窄成只杀本套件起的 daemon——这两处是并发时
+互相踩踏的主因。新增共享外部状态时，登记进 `SUITE_RESOURCES`，别把「同一类的」
+当资源（那等于退回全串行）。
 
 ### 3.2 Layer（验收分层）
 
@@ -387,7 +398,7 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 「每个套件恰好属一层」。
 
 - **L0 静态/契约**（无挂载无网络，可并行）：多为「直编实际源码 + `--wrap` 桩/ASan」的判别性用例，只需 `cc`。
-- **L1 GNU 真实 FUSE**（串行）：起真 daemon、真挂载，部分需 vsftpd 或系统 log_monitor。
+- **L1 GNU 真实 FUSE**：起真 daemon、真挂载，部分需 vsftpd 或系统 log_monitor；彼此可按资源并发（§3.1）。
 - **L2 Android 拓扑仿真**：rootless unshare 沙箱内仿真安卓拓扑，须核对宿主 `mountinfo` 前后零变化。
 - **L3 真实 Android 内核/权限**（需 emulator/AVD 或真机；本机无，未做）：SELinux/Bionic/vold/FUSE-BPF/Zygisk 双 ABI/多用户。
 - **L4 设备最终验收**：仅授权后经 `scripts/adb-sh.sh`（强制降权 `su shell`、`SAFE_ROOT` 合成 fixture）。

@@ -23,7 +23,7 @@ MODDIR   = "/tmp/fuse_ftp_test/modules"
 # 模块自有配置：框架读 <modules-dir>/<模块名>/<模块名>.conf 后经视图下发
 # （模块不读文件、不跑 inotify——见 docs/modules.md §6.1.1）
 CONF_FTP = f"{MODDIR}/ftp_module/ftp_module.conf"
-CONF     = "/tmp/Namespace-Proxy/injector.conf"
+CONF     = "/tmp/fuse_ftp_test/injector.conf"   # 本套件 BASE 内，勿与其他套件共用
 SERVER   = "云盘"
 SERVER2  = "备份"
 REPO     = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -71,7 +71,7 @@ def setup():
     for _uid in ("0", "1", "2"):
         os.makedirs(f"{STORAGE}/{_uid}", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
-    os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
     os.makedirs(f"{MODDIR}/ftp_module", exist_ok=True)
     if BACKEND_SRC:
         if not build_module_from_source(f"{MODDIR}/ftp_module/ftp_module.so"):

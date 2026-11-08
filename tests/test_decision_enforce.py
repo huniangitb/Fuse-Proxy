@@ -25,7 +25,9 @@ ROOT = HERE.parent
 MNT = Path("/tmp/fuse_overrides_test/mnt")
 STORAGE = Path("/tmp/fuse_overrides_test/storage")
 MODDIR = Path("/tmp/fuse_overrides_test/modules")
-CONF = Path("/tmp/Namespace-Proxy/injector.conf")
+# 规则文件放在本套件自己的 BASE 下：套件并行时共用一个固定路径会互相覆盖
+# （daemon 按 --rules 读，路径由本套件独占即可）。
+CONF = Path("/tmp/fuse_overrides_test/injector.conf")
 DLOG = Path("/tmp/fo.log")
 DAEMON = os.environ.get("FUSE_DAEMON") or str(ROOT / "build_gnu" / "fuse_daemon")
 OVR_UID, OVR_GID = 4242, 4343

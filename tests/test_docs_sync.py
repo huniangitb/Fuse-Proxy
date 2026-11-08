@@ -224,6 +224,29 @@ def check_tiers(run, mapped):
     both = run.PARALLEL_SAFE & run.TIER_EXCLUSIVE
     if both:
         fail(f"[Tier] 既在并行白名单又在独占 Tier：{sorted(both)}")
+    # 并发调度的两张新表同样要能自洽：点名不存在的套件，等于这条约束在空转
+    # （调度器读不到它，那个套件就悄悄按默认姿态跑）。
+    for s in sorted(run.QUIET_ON_HOST):
+        if s not in mapped:
+            fail(f"[Tier] QUIET_ON_HOST 含未知套件 tests/{s}")
+    quiet_free = run.QUIET_ON_HOST & run.PARALLEL_SAFE
+    if quiet_free:
+        fail(f"[Tier] 既要求宿主静默又在无挂载白名单：{sorted(quiet_free)}")
+    for name, res in sorted(run.SUITE_RESOURCES.items()):
+        if name not in mapped:
+            fail(f"[Tier] SUITE_RESOURCES 含未知套件 tests/{name}")
+        if not res:
+            fail(f"[Tier] SUITE_RESOURCES[{name}] 是空集合——空占位会让调度器"
+                 f"以为它有约束")
+    # 资源名打错不会报错，只会让互斥失效：这类名字集中出现在 declare 处，检查
+    # 每个资源至少被两个套件共用才有意义（唯一的资源等于没互斥）。
+    owners = {}
+    for name, res in run.SUITE_RESOURCES.items():
+        for r in res:
+            owners.setdefault(r, []).append(name)
+    for r, names in sorted(owners.items()):
+        if len(names) < 2:
+            print(f"  ⚠ 资源 {r} 只有 {names[0]} 使用（不与任何人互斥，可从表里删掉）")
     checked += 1
 
 

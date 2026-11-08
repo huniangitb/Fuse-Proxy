@@ -13,7 +13,7 @@ from pathlib import Path
 MNT     = "/tmp/fuse_proxy_test/mnt"
 MODDIR  = "/tmp/fuse_proxy_test/modules"
 STORAGE = "/tmp/fuse_proxy_test/storage"
-CONF    = "/tmp/Namespace-Proxy/injector.conf"
+CONF    = "/tmp/fuse_proxy_test/injector.conf"  # 本套件 BASE 内，勿与其他套件共用
 DAEMON  = os.environ.get("FUSE_DAEMON") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "build_gnu", "fuse_daemon"))
 TEST_ID = str(uuid.uuid4())[:8]
@@ -69,7 +69,7 @@ def setup_env():
     for d in dirs:
         os.makedirs(f"{STORAGE}/{d}", exist_ok=True)
     os.makedirs(MNT, exist_ok=True)
-    os.makedirs("/tmp/Namespace-Proxy", exist_ok=True)
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
     # 规则引擎已内建（fw_rules）：无需模块目录
     # 预置文件
     for f in ["hello.txt", "Pictures/photo1.jpg", "Documents/report.pdf", "Music/song.mp3"]:
@@ -1015,7 +1015,10 @@ def main():
 
     # 清理旧状态
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
-    subprocess.run(["pkill", "-f", "fuse_daemon"], capture_output=True)
+    # 只清本套件的残留 daemon：pkill -f 匹配整条命令行，按自己的 --rules 路径收窄
+    # 后，并发跑的其他套件daemon 不会被误杀。
+    subprocess.run(["pkill", "-f", "fuse_daemon.*--rules=" + CONF],
+                   capture_output=True)
     time.sleep(1)
 
     setup_env()

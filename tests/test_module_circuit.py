@@ -44,7 +44,7 @@ ROOT  = HERE.parent
 MNT   = Path("/tmp/fuse_circuit_test/mnt")
 STORAGE= Path("/tmp/fuse_circuit_test/storage")
 MODDIR= Path("/tmp/fuse_circuit_test/modules")
-CONF  = Path("/tmp/Namespace-Proxy/injector.conf")
+CONF  = Path("/tmp/fuse_circuit_test/injector.conf")  # 本套件 BASE 内，勿与其他套件共用
 DLOG  = Path("/tmp/fc.log")
 DAEMON= os.environ.get("FUSE_DAEMON") or str(ROOT / "build_gnu" / "fuse_daemon")
 # 熔断参数：3 秒窗口 5 次阈值（env 透传给 daemon 进程）
