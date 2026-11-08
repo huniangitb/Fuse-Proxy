@@ -120,6 +120,13 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
 
 const char* fast_strstr(const char* haystack, const char* needle) { return strstr(haystack, needle); }
 
+/* 本驱动只考整份扫描（读失败、截断、容量增长）。把「是不是 FUSE」恒判为否，快查分支
+   就不下结论、直接落到扫描上——快查自己的覆盖面由 test_grepl_status_fast.py 负责。 */
+bool ns_path_is_fuse_mount(const char* path) {
+    (void)path;
+    return false;
+}
+
 /* ══════════════ 实际源码 ══════════════ */
 
 #include "ns_mountinfo.c"

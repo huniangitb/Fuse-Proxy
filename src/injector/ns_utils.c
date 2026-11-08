@@ -673,10 +673,11 @@ struct CombinedMountArgs {
 #endif
 
 /* 该路径当前是不是 FUSE 挂载（statfs 一次，无 /proc 解析）。
-   两处使用：挂载前校验**源**（不同 ROM 的 /mnt 传播设置可能让源在应用 ns 里只是
+   三处使用：挂载前校验**源**（不同 ROM 的 /mnt 传播设置可能让源在应用 ns 里只是
    一个普通空目录，bind 照样"成功"但视图全空）、挂载后校验**目标**（必须真的变成
-   FUSE 视图，否则立即回滚，绝不把"挂载成功但空"的状态留给应用）。 */
-static bool ns_path_is_fuse_mount(const char* path) {
+   FUSE 视图，否则立即回滚，绝不把"挂载成功但空"的状态留给应用）、以及稳态对账的
+   族根快查（族根与源都必须还是 FUSE 视图）。 */
+bool ns_path_is_fuse_mount(const char* path) {
     struct statfs sfs;
     if (statfs(path, &sfs) != 0) return false;
     return (unsigned long)sfs.f_type == (unsigned long)FUSE_SUPER_MAGIC;

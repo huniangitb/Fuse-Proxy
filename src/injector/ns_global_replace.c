@@ -17,8 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <errno.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
 
 /* ================= 全局替换式挂载方案（注入方法 v2/v3，卸载优先） =================
  * 对应 scripts/global.sh 的 replace/restore/status，injector 内建实现。
@@ -934,10 +936,89 @@ static int ns_status_cb(const NsMountLine* ln, void* vctx) {
     return 0;
 }
 
+/* ══════════════ 稳态快查：族根是不是本项目的 FUSE 视图 ══════════════
+ * 稳态对账的结论九成以上是 REPLACED。判据有两半：族根与源共享 superblock（全局替换
+ * 就是 bind，bind 共享 superblock，dev 相同），以及**两边都还是 FUSE**。前半句够用时
+ * 只 stat 一次即可；后半句不能省——共享挂载组上的挂载会传播到同居的挂载点，vold 重挂
+ * 族根时源也可能被同一个空 tmpfs 盖住：那时源与族根 dev 相同、都不是项目视图，只看
+ * dev 会把「视图被覆盖」判成「一切正常」，对账从此不再复查。挂载表的行里带着每条
+ * 条目的 fstype，所以这两个条件本来就都在旧判据的语义内。
+ *
+ * 族根是个位数条目，各自 statfs + stat 两次即可；真正需要看全部条目的只有「对不上」
+ * 和「判不出来」，那两种情形才回落到整份 mountinfo 扫描（NORMAL / MIXED / UNKNOWN
+ * 都只能从那里得出）。大表机型上，稳态对账的代价因此从「整份文件读 + 逐行解析」降到
+ * 十几次轻量调用——同一份挂载表在条目上千的机型上要 68ms 级（见 mount_manager.c）。
+ *
+ * 枚举必须覆盖三族下**全部**数字用户目录：漏掉一条现存族根，就等于让对账永久跳过
+ * 那一族（新用户接管、被 vold 重挂回系统视图都靠这条链自愈）。所以这里只做「全部
+ * 相等才下结论」的加速，任何不确定——目录打不开、statfs/stat 出错、fstype 不是 FUSE、
+ * 一条族根都没看到——都返回 false，把结论交回整份扫描。
+ *
+ * 路径走 /proc/<pid>/root/...，与 mountinfo 读的是同一个命名空间；族根本身是项目
+ * FUSE 视图时这两次调用会各走一趟 FUSE 请求（本机实测 8~17µs/op），与「每 5s 全量
+ * 解析」不在一个量级上。 */
+static bool ns_family_root_quick_replaced(int pid, const char* fuse_src) {
+    static const char* const families[] = {"installer", "androidwritable", "user"};
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof path, "/proc/%d/root%s", pid, fuse_src);
+    if (n < 0 || (size_t)n >= sizeof path) return false;
+    /* 源本身必须是 FUSE：FUSE 没起、或源被上层挂载盖住时，源与 /mnt 下的普通目录同处
+       一个文件系统、dev 相等，只比 dev 会把「一条都还没挂」判成「全换好了」 */
+    if (!ns_path_is_fuse_mount(path)) return false;
+    struct stat src;
+    if (stat(path, &src) != 0) return false;
+    int seen = 0;
+    for (int i = 0; i < 3; i++) {
+        n = snprintf(path, sizeof path, "/proc/%d/root/mnt/%s", pid, families[i]);
+        if (n < 0 || (size_t)n >= sizeof path) return false;
+        DIR* d = opendir(path);
+        if (!d) {
+            /* 有些 ROM 没有 installer/androidwritable 整族——不存在是正常情形，
+               其余 errno 意味着覆盖面拿不全，不下结论 */
+            if (errno == ENOENT || errno == ENOTDIR) continue;
+            return false;
+        }
+        bool bail = false;
+        for (struct dirent* ent; !bail && (ent = readdir(d)) != nullptr;) {
+            const char* p = ent->d_name;
+            while (ns_is_digit_char(*p)) p++;
+            if (p == ent->d_name || *p != '\0') continue; /* 只认纯数字用户目录 */
+            n = snprintf(path, sizeof path, "/proc/%d/root/mnt/%s/%s/emulated", pid, families[i],
+                         ent->d_name);
+            if (n < 0 || (size_t)n >= sizeof path) return false;
+            /* 先 stat 判「这一条存不存在」：statfs 成功时不动 errno，用它区分
+               「这一族还没建族根」与「判不出来」是不可靠的 */
+            struct stat root;
+            if (stat(path, &root) != 0) {
+                if (errno == ENOENT || errno == ENOTDIR) continue; /* 这一族还没建族根 */
+                bail = true;
+                break;
+            }
+            /* 不是 FUSE ⇒ 这一条现在不是项目视图（被重挂回系统视图，或只是 vold 建的
+               空目录）：结论交给扫描，按挂载表本身判 NORMAL / MIXED */
+            if (!ns_path_is_fuse_mount(path)) {
+                bail = true;
+                break;
+            }
+            if (root.st_dev != src.st_dev) {
+                bail = true; /* 对不上 → 交给扫描判 MIXED/NORMAL */
+                break;
+            }
+            seen++;
+        }
+        closedir(d);
+        if (bail) return false;
+    }
+    /* 一条族根都没看到 = 还没有族根可替换（未就绪），那不是 REPLACED */
+    return seen > 0;
+}
+
 /* 查询全局替换状态（读 /proc/<pid>/mountinfo，无需进入命名空间）。
    单次流式扫描：内存只与族根数量有关，与挂载条目总数无关。 */
 int ns_global_status(int mnt_ns_pid, const char* fuse_src) {
     if (!fuse_src || fuse_src[0] == '\0') return NSP_GLOBAL_STATUS_UNKNOWN;
+    /* 稳态快查命中就直接 REPLACED，不读挂载表；判不出来才走下面的整份扫描 */
+    if (ns_family_root_quick_replaced(mnt_ns_pid, fuse_src)) return NSP_GLOBAL_STATUS_REPLACED;
     struct NsStatusCtx c;
     memset(&c, 0, sizeof c);
     c.fuse_src = fuse_src;

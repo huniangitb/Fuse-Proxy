@@ -59,6 +59,10 @@ enum {
    访问，不必进入该命名空间。判据只有 statfs：它必然落到超级块、不被属性缓存挡住。 */
 int ns_mount_conn_state(int pid, const char* mount_point);
 
+/* 该路径当前是不是 FUSE 挂载：statfs 一次判 f_type，不经 /proc、不受属性缓存影响。
+   路径按调用方所在命名空间解析（跨 ns 场景由调用方自己拼 /proc/<pid>/root 前缀）。 */
+bool ns_path_is_fuse_mount(const char* path);
+
 /* 修复判据：目标进程已挂着项目 FUSE（has_project_fuse，来自挂载状态探测）**且**该挂载
    的连接确实已断时，才需要先清理再重挂。
    has_project_fuse=false 时一次探测都不做——没有项目挂载的进程（绝大多数）不因本判据
