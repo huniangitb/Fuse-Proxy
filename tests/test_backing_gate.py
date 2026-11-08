@@ -15,7 +15,8 @@ stat 他包 data 目录被判 ENOENT（直接访问 backing 则正常），且 S
 
 **ALLOW 也算仲裁维度（DAC）**：ALLOW 只声明"这一层放行"，不代表可以绕过
 daemon——backing 直通之后的下层 I/O 由内核按**调用方凭证**做 DAC，
-`/data/media` 归 MediaProvider（10277:1023、子目录 2700），应用一律 EACCES。
+`/data/media` 归 MediaProvider（10277:1023、属组 media_rw），普通应用不在
+属主/属组里，一律 EACCES。
 旧实现把 ALLOW 当直通跳过，线上表现「只写 ALLOW /Download 时注入后反而写不
 进去」。另有静态契约锁住 `vfs_backing_setup`：全局实例（非 --media-fuse）
 一个 dentry 也不挂 backing——dentry 由所有应用共用，无法按调用方分别裁决。

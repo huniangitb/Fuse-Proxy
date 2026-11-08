@@ -970,9 +970,18 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
                 st->st_mtime = pst.st_mtime;
                 st->st_ctime = pst.st_ctime;
             } else {
-                /* 上级也取不到：属主未知，保持 memset 的 0（root/未知），
-                   不伪造为访问者属主 */
-                st->st_mode |= 0755;
+                /* 上级也取不到（挂载点还没就绪，或整条链都不存在）：权限位仍要有个
+                   真实出处，否则凭空造出的 0755 会在 0770 的树上表现成"文件管理器
+                   看得到、open 又被拒"。取本次调用的用户存储根（<base>/<user_id>）
+                   的真实 mode；连它也 lstat 不到时保持 0——属主未知（root/未知），
+                   不伪造为访问者属主。 */
+                char uroot[PATH_MAX];
+                common_storage_root(path_user_id >= 0 ? path_user_id : 0, uroot, sizeof(uroot));
+                struct stat rst;
+                if (uroot[0] && lstat(uroot, &rst) == 0)
+                    st->st_mode |= (rst.st_mode & 07777);
+                else
+                    st->st_mode |= 0755;
             }
             VFS_RETURN(0);
         }
@@ -2332,8 +2341,11 @@ static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* s
        可写：创建必须原子且失败闭合——O_EXCL 拒绝任何既有对象（含符号链接），
        O_NOFOLLOW 再堵一层；**绝不 O_TRUNC**（旧实现会跟随攻击者预置的同名
        符号链接，以 root 把源内容写进任意可写文件，R2）。 */
+    /* 建文件的 mode 参数取源条目完整的 07777，与上面的目录拷贝
+       （mkdir(dst, st.st_mode & 07777)）同一口径。最终值由随后的 fchmod 决定，
+       这里只是不在创建瞬间用比源更窄的权限位建一个中间态。 */
     int fd_dst =
-        open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, st->st_mode & 0777);
+        open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, st->st_mode & 07777);
     if (fd_dst < 0) {
         int err = errno;
         close(fd_src);
@@ -3183,8 +3195,9 @@ static void backing_decline_log(int reason, const char* path) {
    - **全局实例（默认，服务所有被注入应用）：一个 dentry 也不挂接**，全部回落
      daemon 全权 mediation。原因在 DAC 而不在规则：backing 之后的下层 I/O 由内核
      在**发起请求的应用进程上下文**里直接打到真实文件（lookup / create / opendir
-     都按调用方凭证判 DAC），而 /data/media/0 整棵树归 MediaProvider（10277:1023）、
-     子目录 2700——任何应用都过不了。线上实测：应用段只写 ALLOW /Download
+     都按调用方凭证判 DAC），而 /data/media/0 整棵树归 MediaProvider（10277:1023、
+     属组 media_rw），普通应用既不在属主也不在属组——同组位也只能靠 0770 的组
+     权限过。线上实测：应用段只写 ALLOW /Download
      （或不写任何路径规则）时该路径命中 backing 直通，create 随即被内核以 EACCES
      拒绝，观感就是「注入之后反而写不进 /Download，拿掉模块就正常」。而 backing
      结论是**按 dentry 缓存**的，同一 dentry 由不同 uid 的应用共用，无法按调用方
@@ -3474,6 +3487,16 @@ int main(int argc, char* argv[]) {
     config_set_modules_dir(g_modules_dir_arg[0] ? g_modules_dir_arg : NULL);
     /* 内建规则引擎先就绪：它把派生缓存作废注册进配置发布临界区（此后每次发布自动作废） */
     fw_rules_init(rules_path, g_disable_sandbox);
+    /* 全局沙盒开启时的可观测性：沙盒把应用对用户根的访问整树重定向到
+       <base>/<uid>/Android/data/<pkg>/<SANDBOX_DIR>，只有显式 ALLOW 的目录例外。
+       默认目录（Download/DCIM/Music…）一旦不在 ALLOW 里，应用写进去的文件会落在
+       自己沙盒里——写入成功、其它应用看不见、报 ENOENT 而不是 EACCES，现场极难
+       自查。这里只在启动时点明这个前提，不改变任何路由（改沙盒作用域是策略变更，
+       不在权限缺陷的修复范围内）。 */
+    if (g_global_cfg.sandbox)
+        LOG_WRN("全局 SANDBOX ON：未被 ALLOW 覆盖的用户根目录会整树重定向到应用沙盒"
+                "（<存储根>/<用户id>/Android/data/<包名>/<沙盒目录>），文件落盘但其它应用"
+                "看不见；需要哪些目录共享，就在规则里为它们写 ALLOW");
     /* 顶层目录体检：<base>/<uid> 下的默认目录权限被写坏（属组位丢失，d---------
        形态）时改回 drwxrwx---，非默认目录只记日志。放在导出视图之前：视图一旦
        导出，应用就会按错误权限读写，事后修正不会让已经失败的调用重试。 */
