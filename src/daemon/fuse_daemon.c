@@ -2700,10 +2700,25 @@ static int vfs_fsyncdir(const char* path, int datasync, struct fuse_file_info* f
 
 static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)fi;
-    /* 与 AOSP 的取舍差异（有意为之，属超集）：AOSP 的 FuseDaemon 在 handle_setattr
-       里**丢弃** mode/uid/gid 变更（静默成功但不生效）；我们的 backing 是真实文件
-       系统，属性可以真的保存下来，故照旧下发，只把访问控制交给 SETATTR 判定。 */
+    /* 与 AOSP 的取舍：普通条目上我们的 backing 是真实文件系统，属性可以真的保存
+       下来，故照旧下发，只把访问控制交给 SETATTR 判定。但结构条目（卷根、用户根、
+       /Android/{data,obb,media}、用户根下一级条目）例外，与 AOSP 的 handle_setattr
+       一样丢弃 mode 变更并静默成功：这些条目的 mode 由存储层与 daemon 决定，不归
+       任何应用——放行等于给每个应用一个把 /sdcard/Download 改成 0700/2700 的开关，
+       一旦改掉，此后其它应用在该目录里全被 DAC 拒（比权限继承写坏更难排查，因为
+       没有任何调用栈可看）。 */
     VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETATTR);
+    if (fw_acl_is_structure_entry(path)) {
+        LOG_WRN("丢弃结构条目的 chmod: path=%s mode=%04o", path, (unsigned)(mode & 07777));
+        VFS_RETURN(0);
+    }
+    /* 带 POSIX ACL 的条目同样丢弃：chmod(2) 会就地改写 ACL 的 mask 条目，把
+       文件管理器按 ACL 设好的 a_* 权限压回 mode 位模型。AOSP 遇到已存在的
+       system.posix_acl_access 也是丢弃 mode 变更。 */
+    if (lgetxattr(p, "system.posix_acl_access", NULL, 0) > 0) {
+        LOG_WRN("丢弃带 ACL 条目的 chmod: path=%s mode=%04o", path, (unsigned)(mode & 07777));
+        VFS_RETURN(0);
+    }
     int ret = chmod(p, mode);
     if (ret == -1) {
         int err = errno;
@@ -2716,6 +2731,12 @@ static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
 static int vfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi) {
     (void)fi;
     VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_SETATTR);
+    /* 结构条目同 chmod：属主由存储层决定，丢弃变更并静默成功（AOSP 口径）。 */
+    if (fw_acl_is_structure_entry(path)) {
+        LOG_WRN("丢弃结构条目的 chown: path=%s uid=%u gid=%u", path, (unsigned)uid,
+                (unsigned)gid);
+        VFS_RETURN(0);
+    }
     int ret = lchown(p, uid, gid);
     if (ret == -1) {
         int err = errno;
@@ -3453,6 +3474,14 @@ int main(int argc, char* argv[]) {
     config_set_modules_dir(g_modules_dir_arg[0] ? g_modules_dir_arg : NULL);
     /* 内建规则引擎先就绪：它把派生缓存作废注册进配置发布临界区（此后每次发布自动作废） */
     fw_rules_init(rules_path, g_disable_sandbox);
+    /* 顶层目录体检：<base>/<uid> 下的默认目录权限被写坏（属组位丢失，d---------
+       形态）时改回 drwxrwx---，非默认目录只记日志。放在导出视图之前：视图一旦
+       导出，应用就会按错误权限读写，事后修正不会让已经失败的调用重试。 */
+    {
+        char sbase[PATH_MAX];
+        common_storage_base(sbase, sizeof(sbase));
+        fw_acl_repair_storage_toplevel(sbase);
+    }
     /* 热插拔模块系统：扫描模块目录并启动监控线程（只剩后端模块形态） */
     module_system_init(rules_path, g_modules_dir_arg[0] ? g_modules_dir_arg : NULL);
 

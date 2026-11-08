@@ -101,6 +101,14 @@ NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id);
    无包名时写空串）。 */
 NspPathClass fw_acl_classify(const char* path, char* owner_pkg, size_t size);
 
+/* 启动期体检：<base>/<uid> 下一级目录的权限修正（默认目录改回 0770，非默认目录
+   只记日志）。base 由 common_storage_base 给出。挂载点不可读时静默返回。 */
+void fw_acl_repair_storage_toplevel(const char* base);
+
+/* 是否为存储结构条目（卷根、用户根、/Android/{data,obb,media} 本身、用户根下
+   一级条目）：这些条目的 mode 由存储层决定，调用方的 mode/属主变更应被丢弃。 */
+bool fw_acl_is_structure_entry(const char* path);
+
 /* 判定结果 → 负 errno（ALLOW 返回 0）。 */
 int fw_acl_errno(NspAclVerdict v);
 
