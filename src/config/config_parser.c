@@ -1724,10 +1724,17 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
     } else {
         final_monitor = g_global_cfg.monitor;
     }
+    /* 日志要反映**真实生效值**，而不是把「没配置」印成 OFF：全局 MONITOR 从未在
+       配置里出现时 print 成 "OFF" 会让排查者以为有人显式关掉了它，进而去追一条
+       不存在的规则。未配置就直说未配置。 */
+    const char* monitor_desc = final_monitor ? "ON" : "OFF";
+    if (!(cfg && cfg->monitor_explicit) && !(cat && cat->monitor_explicit) &&
+        !g_global_cfg.monitor_explicit)
+        monitor_desc = "未配置";
     if (cfg) {
         LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | 规则细节 -> MONITOR:%s SANDBOX:%s 重定向(通配):%d条 隐藏(通配):%d条 只读(通配):%d条",
-            pkg, pid, user_id, trigger_source, final_monitor ? "ON" : "OFF",
-            final_sandbox ? "ON" : "OFF", final_redir_count, final_hide_count, final_ro_count);
+            pkg, pid, user_id, trigger_source, monitor_desc, final_sandbox ? "ON" : "OFF",
+            final_redir_count, final_hide_count, final_ro_count);
         for (int i = 0; i < cfg->redir_count; i++) {
         }
         for (int i = 0; i < cfg->hide_count; i++) {
@@ -1735,12 +1742,14 @@ void print_active_rules(const char* pkg, int pid, uid_t linux_uid, const char* t
         for (int i = 0; i < cfg->ro_count; i++) {
         }
     } else {
+        /* 没有应用/类别规则时，全局配置照旧生效（全局 FUSE 已给出代理视图），
+           此时写「无匹配规则」与下一行「已由全局 FUSE 提供代理视图」自相矛盾，
+           会让排查者得出「这个应用没被代理」的错误结论。 */
         const char* match_desc =
             is_wildcard ? "命中通配符 [*]"
-                        : (g_global_cfg.global_inject ? "命中 GLOBAL_INJECT" : "无匹配规则");
+                        : (g_global_cfg.global_inject ? "命中 GLOBAL_INJECT" : "按全局配置");
         LOG("应用 %s (PID: %d, 用户: %d) 注入完毕 [%s] | %s (全局 MONITOR:%s SANDBOX:%s)", pkg, pid,
-            user_id, trigger_source, match_desc, final_monitor ? "ON" : "OFF",
-            final_sandbox ? "ON" : "OFF");
+            user_id, trigger_source, match_desc, monitor_desc, final_sandbox ? "ON" : "OFF");
     }
     if (g_global_cfg.redir_count > 0 || g_global_cfg.hide_count > 0 || g_global_cfg.ro_count > 0) {
         LOG_DBG("  [全局规则通配] MONITOR:%s SANDBOX:%s 重定向:%d条 隐藏:%d条 只读:%d条",
