@@ -156,6 +156,19 @@ SUITE_MAP = [
      ("cleanup_app_mounts", "do_combined_mount"),
      "injector 挂载/清理序列"),
 
+    # ── 稳态对账的唤醒源：挂载表变化事件（ns_mnt_watch.c + injector 接线）──
+    # 事件源是 /proc/<pid>/mountinfo 的 poll 实现：该命名空间每次 mount/umount 后
+    # 以 EPOLLERR 回报一次。驱动在 rootless 沙箱里真实挂/卸，量「空闲不自旋、变化必到、
+    # 每次变化只报一次、读文件不吞事件」；静态契约锁住 injector 侧三条接线——注册掩码
+    # 必须为 0（mounts_poll 恒置 EPOLLIN，带上就是忙轮询）、稳态等事件而事件源不可用时
+    # 回落 GREPL_STEADY_SEC、两次动挂载之间必须有间隔闸（替换自身会触发事件源）。
+    (("test_mnt_watch.py",),
+     ("src/injector/ns_mnt_watch.c", "src/injector/ns_mnt_watch.h",
+      "src/injector/injector.c"),
+     ("ns_mnt_watch_open", "GREPL_STEADY_EVENT", "on_mnt_watch_event",
+      "g_grepl_replace_gap"),
+     "稳态对账由挂载表变化事件驱动"),
+
     # ── 已挂载视图的连接活性（ns_mount_health.c）+ 启动扫描修复 ──
     # 直编探测原语 + --wrap=statfs：判据矩阵，以及「没有项目挂载时一次探测都不做」
     # （健康进程零行为变化）。静态契约锁住三处接线：两条挂载路径都必须先要求
@@ -466,6 +479,7 @@ LAYERS = {
         (
             "test_inject_mount_env.py",
             "test_global_replace.py",
+            "test_mnt_watch.py",
         ),
     ),
 }

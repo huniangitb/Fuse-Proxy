@@ -8,6 +8,7 @@
 #include "nsp_util.h"
 #include "config_parser.h"
 #include "ns_utils.h"
+#include "ns_mnt_watch.h"
 #include "fast_pid.h"
 #include "inject_target.h"
 #include "reaped_managed.h"
@@ -55,13 +56,30 @@ static bool g_last_scan_found = false;
    还原存量非目标应用；之后生命周期内不再反复周期检测（新应用
    由 zygisk IPC 通知即时还原） */
 static bool g_global_replace_scanned_once = false;
-/* 全局替换（v2/v3）周期对账状态：见 maybe_reconcile_global_replace() */
-#define GREPL_STEADY_SEC    5
+/* 全局替换（v2/v3）对账状态：见 maybe_reconcile_global_replace()
+ * g_grepl_next_sec 同时表达三件事：>0 = 还有几秒复查（1s tick 递减）；
+ * 0 = 下一个 tick 立即复查；GREPL_STEADY_EVENT = 稳态，等挂载表变化事件。
+ * g_grepl_backoff 管「还没就绪/失败后」的复查节奏，g_grepl_replace_gap 管
+ * 「两次动挂载之间」的最小间隔（替换自身会触发事件源，见函数头注释）。 */
+#define GREPL_STEADY_SEC    5    /* 事件源不可用时的稳态复查间隔（兜底） */
+#define GREPL_STEADY_EVENT  (-1) /* 稳态：等挂载表变化事件 */
 #define GREPL_RETRY_MIN_SEC 1
 #define GREPL_RETRY_MAX_SEC 30
+/* 连续动挂载的观察窗口：替换自身也改挂载表，事件源会立刻回报自己的动作。
+   只有「窗口内反复动挂载」才把最小间隔加倍——健康的单次替换（开机一次、
+   vold 重挂一次、新用户出现一次）不该把间隔越推越大，否则紧随其后出现的
+   族根要等一个凭空变长的间隔，反而比原来的周期复查更慢。 */
+#define GREPL_CHURN_WINDOW_MS 10000
+#define GREPL_CHURN_SLOTS     4
 static int g_grepl_next_sec;
 static int g_grepl_backoff = GREPL_RETRY_MIN_SEC;
+static int g_grepl_replace_gap = GREPL_RETRY_MIN_SEC;
+static int64_t g_grepl_last_replace_ms;
+static int64_t g_grepl_churn_ms[GREPL_CHURN_SLOTS];
+static int g_grepl_churn_n;
+static int g_grepl_churn_pos;
 static bool g_grepl_replaced_once;
+static int g_grepl_watch_fd = -1;
 struct GlobalFuseInfo g_global_fuse = {.pid = 1,
                                        .fuse_pid = 0,
                                        .mnt_path = "/mnt/nsp_global",
@@ -419,6 +437,7 @@ typedef struct {
 
 static void remount_all_tracked(void);
 static void maybe_reconcile_global_replace(void);
+static void grepl_reconcile_reset(void);
 
 void handle_fuse_ready_event(void* ptr) {
     FuseReadyCtx* ctx = (FuseReadyCtx*)ptr;
@@ -477,7 +496,7 @@ void handle_fuse_ready_event(void* ptr) {
                    「尚未就绪」，由周期对账退避重试；旧实现在这种情况下静默成功、
                    此后永不重试，真机上就是「开机后 v2/v3 不生效」。 */
                 if (inject_is_global_replace()) {
-                    g_grepl_next_sec = 0;
+                    grepl_reconcile_reset();
                     maybe_reconcile_global_replace();
                 }
             }
@@ -1484,40 +1503,118 @@ static void retry_pending_mounts(void) {
     arm_due_timer();
 }
 
-/* 全局替换（v2/v3）周期对账 ==================================================
+/* 全局替换（v2/v3）对账 =====================================================
  * 族根的生命周期由 vold 掌握：用户启动/切换、卷重挂、FUSE 崩溃恢复都会新建或重建
  * /mnt/<族>/<uid>/emulated。旧实现只在「FUSE 就绪」这一刻替换一次：族根还没出现时
  * 静默成功（见 ns_global_replace.c 的 root_count==0 分支）、此后永不重试——真机上
  * 表现为「开机后 v2/v3 不生效」；运行中新用户的族根也永远不会被接管。
  *
- * 这里每秒记账、按退避节奏对账：
- *   - 已是 REPLACED：按稳态间隔（5s）复查。稳态复查通常只是核对族根与源（
- *     ns_global_status 的快查分支：都还是 FUSE 且 dev 相同），对不上或判不出来才整份
- *     读 mountinfo；发现被 vold 重挂成系统视图或出现新用户族根（MIXED）就重新替换。
- *   - replace 返回 1（尚无族根）：短线退避 1s→2s→…→30s，直到 vold 建立族根。
- *   - replace 返回 <0（真实失败）：同样退避；替换内部已把动过的族根回滚到备份，
- *     系统视图不会停在裸挂载点。
+ * 稳态（已是 REPLACED）由挂载表变化驱动，不再按固定周期复查：事件源是
+ * ns_mnt_watch 打开的 /proc/<pid>/mountinfo，内核在该命名空间每次 mount/umount 后
+ * 用 EPOLLERR 回报一次。vold 重挂族根、新用户出现都必然改变挂载表，于是「变化发生
+ * → 复查」只隔一次 epoll 唤醒；没有变化时一次复查都不做，也不整份读挂载表。
+ * 事件源打不开时才退回 GREPL_STEADY_SEC 周期复查（功能不变，只是延迟受周期限制）。
+ *
+ * 尚未替换时按退避节奏动手：
+ *   - replace 返回 1（尚无族根）：1s→2s→…→30s；事件源把倒计时压到 1s——族根一
+ *     出现（vold 一挂上，挂载表就变）就复查，不必等满一个退避周期。
+ *   - replace 返回 <0（真实失败）：同样退避；替换内部已把动过的族根回滚到备份。
+ *   - replace 返回 0：1s 后自检一次确认真的生效，之后回到事件驱动。
+ * 两次真正动挂载之间至少隔 g_grepl_replace_gap（1s 起，短窗口内反复时加倍）：
+ * 替换自身就会改变挂载表，事件源随即回报自己的动作——没有这道闸，「替换 → 事件 →
+ * 再替换」会退化成毫秒级循环（ns_global_replace.c 记过「5s 一次卸载 + 重 bind」
+ * 的老毛病；换成事件驱动后周期由事件定，只会更快，所以间隔闸必须自己设）。
+ * 加倍的条件是「短窗口内反复动挂载」（g_grepl_churn_*），不是「动过一次」：健康的
+ * 单次替换不该把间隔推大，否则紧随其后的族根反而要等更久；真在打转时 1s→2s→…→30s
+ * 仍然成立，最终节奏远慢于老周期。状态回到 REPLACED 时窗口与间隔一起复位。
+ * replace 返回 1 时一点挂载都没动，故不记 last：否则前面攒下的退避会正好把
+ * 「族根刚刚出现」这一刻挡在门外。
+ *
  * 首次成功替换后若又发生了「后续替换成功」，说明出现了新用户/新族根：复位兜底扫描
  * 标记，让 v2 对该用户的存量应用再审查一次（非目标应用还原）。 */
+
+/* 事件源：/proc/<init 命名空间的 pid>/mountinfo，注册进主循环 epoll。幂等；
+   取不到只告警一次，g_grepl_watch_fd 保持 -1（对账退回 GREPL_STEADY_SEC 周期）。 */
+static void grepl_watch_arm(void) {
+    if (g_grepl_watch_fd >= 0 || g_epoll_fd < 0) return;
+    int fd = ns_mnt_watch_open(g_global_fuse.pid);
+    if (fd < 0) {
+        LOG_WRN("全局替换对账: 挂载表变化事件源不可用(%s)，稳态按 %ds 周期复查",
+                strerror(errno), GREPL_STEADY_SEC);
+        return;
+    }
+    /* 掩码必须为 0：mounts_poll 恒置 EPOLLIN（文件恒可读），带进掩码就是忙轮询；
+       EPOLLERR 不受掩码约束，只留它才是「挂载表变了」的纯通知。 */
+    struct epoll_event ev = {.events = 0, .data.fd = fd};
+    if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        LOG_WRN("全局替换对账: 事件源注册失败(%s)，稳态按 %ds 周期复查", strerror(errno),
+                GREPL_STEADY_SEC);
+        close(fd);
+        return;
+    }
+    g_grepl_watch_fd = fd;
+    LOG_DBG("全局替换对账: 挂载表变化事件源就绪(/proc/%d/mountinfo)", g_global_fuse.pid);
+}
+
+/* 记账复位：FUSE 重建或注入方法切换后按「什么都没做过」重新开始，别让上一轮攒下的
+   退避与间隔闸把这一轮的首次替换挡在门外。 */
+static void grepl_reconcile_reset(void) {
+    g_grepl_next_sec = 0;
+    g_grepl_backoff = GREPL_RETRY_MIN_SEC;
+    g_grepl_replace_gap = GREPL_RETRY_MIN_SEC;
+    g_grepl_last_replace_ms = 0;
+    g_grepl_churn_n = 0;
+    g_grepl_churn_pos = 0;
+}
+
 static void maybe_reconcile_global_replace(void) {
     if (!inject_is_global_replace()) return;
     if (g_global_fuse.disabled || g_global_fuse.pid <= 0 || !g_fuse_ready) return;
-    if (g_grepl_next_sec > 0) {
+    grepl_watch_arm();
+    if (g_grepl_next_sec > 0) { /* 退避/自检倒计时（1s tick 递减） */
         g_grepl_next_sec--;
         return;
     }
+    if (g_grepl_next_sec < 0) return; /* 稳态：等挂载表变化事件 */
     int st = ns_global_status(g_global_fuse.pid, g_global_fuse.mnt_path);
     if (st == NSP_GLOBAL_STATUS_REPLACED) {
-        g_grepl_next_sec = GREPL_STEADY_SEC;
+        g_grepl_next_sec = (g_grepl_watch_fd >= 0) ? GREPL_STEADY_EVENT : GREPL_STEADY_SEC;
         g_grepl_backoff = GREPL_RETRY_MIN_SEC;
+        g_grepl_replace_gap = GREPL_RETRY_MIN_SEC;
+        g_grepl_churn_n = 0; /* 收敛了：间隔闸的观察窗口清零 */
+        return;
+    }
+    /* 不是「已替换」：要动挂载，先过最小间隔闸（见函数头注释） */
+    int64_t now = nsp_retry_now_ms();
+    if (g_grepl_last_replace_ms > 0 &&
+        now - g_grepl_last_replace_ms < (int64_t)g_grepl_replace_gap * 1000) {
+        g_grepl_next_sec = GREPL_RETRY_MIN_SEC;
         return;
     }
     int ret =
         ns_global_replace_system(g_global_fuse.pid, g_global_fuse.mnt_path, GLOBAL_BACKUP_ROOT);
+    if (ret > 0) {
+        int delay = g_grepl_backoff;
+        g_grepl_backoff = (delay * 2 > GREPL_RETRY_MAX_SEC) ? GREPL_RETRY_MAX_SEC : delay * 2;
+        g_grepl_next_sec = delay;
+        LOG_DBG("全局替换对账: 族根尚未建立，%ds 后重试", delay);
+        return;
+    }
+    g_grepl_last_replace_ms = nsp_retry_now_ms();
+    /* 记下这次动挂载；只有窗口内已攒够 GREPL_CHURN_SLOTS 次才认为在打转、加倍间隔。
+       g_grepl_churn_pos 指向最旧的一格（刚被覆盖的就是它）。 */
+    g_grepl_churn_ms[g_grepl_churn_pos] = g_grepl_last_replace_ms;
+    g_grepl_churn_pos = (g_grepl_churn_pos + 1) % GREPL_CHURN_SLOTS;
+    if (g_grepl_churn_n < GREPL_CHURN_SLOTS) g_grepl_churn_n++;
+    if (g_grepl_churn_n >= GREPL_CHURN_SLOTS &&
+        g_grepl_last_replace_ms - g_grepl_churn_ms[g_grepl_churn_pos] < GREPL_CHURN_WINDOW_MS) {
+        g_grepl_replace_gap =
+            (g_grepl_replace_gap * 2 > GREPL_RETRY_MAX_SEC) ? GREPL_RETRY_MAX_SEC : g_grepl_replace_gap * 2;
+    }
+    g_grepl_next_sec = GREPL_RETRY_MIN_SEC; /* 1s 后自检一次：确认真的生效 */
     if (ret == 0) {
         bool followup = g_grepl_replaced_once; /* 本次不是首次替换 → 出现了新族根 */
         g_grepl_replaced_once = true;
-        g_grepl_next_sec = GREPL_STEADY_SEC;
         g_grepl_backoff = GREPL_RETRY_MIN_SEC;
         if (followup) {
             LOG("全局替换: 新族根已接管（新用户/重挂），补一次应用审查");
@@ -1529,11 +1626,19 @@ static void maybe_reconcile_global_replace(void) {
     int delay = g_grepl_backoff;
     g_grepl_backoff = (delay * 2 > GREPL_RETRY_MAX_SEC) ? GREPL_RETRY_MAX_SEC : delay * 2;
     g_grepl_next_sec = delay;
-    if (ret > 0) {
-        LOG_DBG("全局替换对账: 族根尚未建立，%ds 后重试", delay);
-    } else {
-        LOG_ERR("全局替换对账失败，%ds 后重试（系统视图保持原样）", delay);
+    LOG_ERR("全局替换对账失败（系统视图保持原样），%ds 后重试", delay);
+}
+
+/* 挂载表变了：稳态立刻复查；退避中把倒计时压到最小档——开机阶段挂载事件密集，
+   逐条复查等于把「没就绪」的判定换成挂载事件轮询，反而更贵。 */
+static void on_mnt_watch_event(void) {
+    if (!inject_is_global_replace()) return;
+    if (g_grepl_next_sec > GREPL_RETRY_MIN_SEC) {
+        g_grepl_next_sec = GREPL_RETRY_MIN_SEC;
+        return;
     }
+    if (g_grepl_next_sec < 0) g_grepl_next_sec = 0;
+    maybe_reconcile_global_replace();
 }
 
 /* 运行期注入方法切换 ========================================================
@@ -1576,7 +1681,7 @@ static void apply_inject_method_switch(void) {
                 return;
             }
         }
-        g_grepl_next_sec = 0;
+        grepl_reconcile_reset();
         g_grepl_replaced_once = false;
         g_global_replace_scanned_once = true; /* v1 不做全局兜底扫描 */
         g_inject_method = INJECT_METHOD_V1;
@@ -1585,7 +1690,7 @@ static void apply_inject_method_switch(void) {
         return;
     }
     g_inject_method = want;
-    g_grepl_next_sec = 0;
+    grepl_reconcile_reset();
     g_grepl_replaced_once = false;
     g_global_replace_scanned_once = false; /* 新方法下对存量应用重新审查一次 */
     LOG("注入方法切换: v%d -> v%d（立即对账全局替换）", (int)had, (int)want);
@@ -1791,6 +1896,8 @@ static void injector_event_loop(const InjectorFds* fds) {
                 on_due_event(fds->due_fd);
             } else if (fd == g_inotify_fd) {
                 on_inotify_event();
+            } else if (fd == g_grepl_watch_fd) {
+                on_mnt_watch_event();
             } else if (fd == fds->ipc_sock) {
                 on_ipc_accept(fds->ipc_sock);
             } else if (fd == g_config_pub_fd) {
@@ -1816,6 +1923,7 @@ static void injector_shutdown(const InjectorFds* fds) {
     if (timer_fd >= 0) close(timer_fd);
     if (fds->due_fd >= 0) close(fds->due_fd);
     if (sig_fd >= 0) close(sig_fd);
+    if (g_grepl_watch_fd >= 0) close(g_grepl_watch_fd);
     if (g_epoll_fd >= 0) close(g_epoll_fd);
 }
 
