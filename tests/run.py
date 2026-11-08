@@ -175,12 +175,17 @@ SUITE_MAP = [
     # （打开失败 / 内存不足 / 丢弃过超长行）都返回 -1「未知」，状态判定给 UNKNOWN、
     # 备份点给 NS_BACKUP_UNKNOWN；mount_manager 的挂载状态读取本身无上限，读不出结论
     # 一律返回 false 而不是「成功且没有挂载」。
-    (("test_mountinfo_dynamic.py", "test_mount_state_read.py"),
+    # ── 稳态对账快查（ns_global_status 的 dev 快判分支）──
+    # 周期对账每 5s 一次，旧实现每次都整份读 + 逐行解析 mountinfo。稳态结论九成以上
+    # 是「已替换」，判据只是「每个族根挂在当前 FUSE 源的超块上」。现在先按族根 dev
+    # 快判（三族 × 数字用户各 stat 一次），判不出来才回落扫描；缺一个用户就是让那
+    # 一族永久跳过对账，所以两段都要有判别用例。
+    (("test_mountinfo_dynamic.py", "test_mount_state_read.py", "test_grepl_status_fast.py"),
      ("src/injector/ns_mountinfo.c", "src/injector/ns_global_replace.c",
       "src/injector/ns_global_replace.h", "src/injector/mount_manager.c",
       "src/injector/ns_utils.c", "include/ns_utils.h"),
      ("ns_read_mountinfo_pid", "ns_scan_mountinfo_stats", "read_mount_state",
-      "NS_BACKUP_UNKNOWN"),
+      "NS_BACKUP_UNKNOWN", "ns_family_root_quick_replaced"),
      "mountinfo 读取容量语义 / 未知态不降级为未挂载"),
 
     # ── 事件通道归属（fw_events.c + fuse_daemon.c + nsp_events_status.c + log_ctl.c）──
@@ -422,6 +427,7 @@ LAYERS = {
             "test_mount_liveness.py",
             "test_mountinfo_dynamic.py",
             "test_mount_state_read.py",
+            "test_grepl_status_fast.py",
             "test_events_owner.py",
             "test_crash_tail.py",
             "test_log_ctl_rules.py",
@@ -623,6 +629,8 @@ PARALLEL_SAFE = frozenset({
     "test_mountinfo_dynamic.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap=fopen，
                                   # 合成 mountinfo，无挂载/无 daemon
     "test_mount_state_read.py",   # cc 直编 mount_manager.c + 桩，合成 mountinfo，无挂载/无 daemon
+    "test_grepl_status_fast.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap 桩
+                                  # stat/opendir/readdir/fopen，合成族目录，无挂载/无 daemon
     "test_events_owner.py",       # cc 直编 nsp_events_status.c + 只读 /proc 快照，不起 daemon
     "test_crash_tail.py",         # cc 直编 crash_tail.c 纯函数，无文件/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件

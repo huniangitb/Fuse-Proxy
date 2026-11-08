@@ -1491,8 +1491,9 @@ static void retry_pending_mounts(void) {
  * 表现为「开机后 v2/v3 不生效」；运行中新用户的族根也永远不会被接管。
  *
  * 这里每秒记账、按退避节奏对账：
- *   - 已是 REPLACED：按稳态间隔（5s）复查。花费只是一次 mountinfo 读取；发现被
- *     vold 重挂成系统视图或出现新用户族根（MIXED）就重新替换。
+ *   - 已是 REPLACED：按稳态间隔（5s）复查。稳态复查通常只是核对族根与源（
+ *     ns_global_status 的快查分支：都还是 FUSE 且 dev 相同），对不上或判不出来才整份
+ *     读 mountinfo；发现被 vold 重挂成系统视图或出现新用户族根（MIXED）就重新替换。
  *   - replace 返回 1（尚无族根）：短线退避 1s→2s→…→30s，直到 vold 建立族根。
  *   - replace 返回 <0（真实失败）：同样退避；替换内部已把动过的族根回滚到备份，
  *     系统视图不会停在裸挂载点。
