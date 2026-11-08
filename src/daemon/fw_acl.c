@@ -215,15 +215,9 @@ void fw_acl_repair_storage_toplevel(const char* base) {
    这些条目的 mode 由存储层决定，不属于任何一个应用；调用方对它们的 mode/属主
    变更一律丢弃（见 vfs_chmod/vfs_chown），与 AOSP 的 handle_setattr 一致。 */
 bool fw_acl_is_structure_entry(const char* path) {
-    switch (fw_acl_classify(path, nullptr, 0)) {
-    case NSP_PATH_ROOT:
-    case NSP_PATH_USER_ROOT:
-    case NSP_PATH_SKELETON:
-    case NSP_PATH_TOPLEVEL:
-        return true;
-    default:
-        return false;
-    }
+    NspPathClass cls = fw_acl_classify(path, nullptr, 0);
+    return cls == NSP_PATH_ROOT || cls == NSP_PATH_USER_ROOT || cls == NSP_PATH_SKELETON ||
+           cls == NSP_PATH_TOPLEVEL;
 }
 
 int fw_acl_errno(NspAclVerdict v) {
