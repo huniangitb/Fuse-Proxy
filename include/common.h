@@ -82,6 +82,14 @@ char* get_self_dir();
 void set_self_dir(const char* path);
 int mkdir_recursive(const char* dir);
 int mkdir_recursive_p(const char* path, mode_t mode);
+/* 新建条目的属性收尾（唯一出口）：create / mkdir / mknod / symlink / 父目录补建
+   / 沙盒落点全部调用它，禁止回调里自己 chmod。
+   语义：mode 以**调用方 mode** 为准（VFS 已按 umask 归一，daemon 再套父目录
+   mode 会让 umask 与应用指定的 0600/0700 一起失效）；父目录只提供属主与
+   setgid（父目录带 S_ISGID 时子目录继承，否则不带）。caller_mode==0 表示该
+   调用点没有 mode（符号链接），此时回落父目录 mode。符号链接不改 mode
+   （chmod 会穿透链接改到目标文件）。必须在条目已创建之后调用。 */
+void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode);
 /* 读取整个文件到堆内存（动态扩容，尾随 NUL）。失败返回 NULL（max_size 超限时
    errno=EFBIG）。max_size > 0 时超过该上限即失败；0 表不限制。
    公共工具：injector 的 mount_manager/ns_utils 与 config_publisher 共用。 */

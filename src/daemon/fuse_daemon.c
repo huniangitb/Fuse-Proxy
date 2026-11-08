@@ -1595,39 +1595,6 @@ static int vfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_
     VFS_RETURN(0);
 }
 
-static void inherit_parent_attributes(const char* real_path, mode_t base_mode) {
-    char parent[PATH_MAX];
-    strncpy(parent, real_path, PATH_MAX - 1);
-    parent[PATH_MAX - 1] = '\0';
-    char* last = strrchr(parent, '/');
-    if (last) {
-        if (last == parent)
-            strcpy(parent, "/");
-        else
-            *last = '\0';
-        struct stat st;
-        if (lstat(parent, &st) == 0) {
-            if (lchown(real_path, st.st_uid, st.st_gid) != 0) {
-            }
-            mode_t final_mode = st.st_mode & 07777;
-            if (!S_ISDIR(base_mode)) {
-                final_mode &= ~0111;
-                final_mode &= ~06000;
-            }
-            chmod(real_path, final_mode);
-#ifdef TARGET_ANDROID
-            char context[256];
-            ssize_t ctx_len = lgetxattr(parent, "security.selinux", context, sizeof(context));
-            if (ctx_len > 0)
-                lsetxattr(real_path, "security.selinux", context, (size_t)ctx_len, 0);
-            else if (strstr(real_path, STORAGE_BASE) == real_path)
-                lsetxattr(real_path, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
-                          sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
-#endif
-        }
-    }
-}
-
 static int vfs_open(const char* path, struct fuse_file_info* fi) {
     FTP_DBG("vfs_open: 入口 path=%s\n", path);
     vfs_flush_pending_closes();
@@ -1758,7 +1725,7 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
             VFS_RETURN(-err);
         }
     }
-    inherit_parent_attributes(p, S_IFREG);
+    nsp_new_entry_attrs(p, mode);
     fi->fh = fd;
     /* 事件通道埋点：create 已落盘（后端分支在上面提前返回，不外发——rpath 无意义） */
     if (fw_events_active())
@@ -1816,7 +1783,7 @@ static int vfs_mkdir(const char* path, mode_t mode) {
             VFS_RETURN(-err);
         }
     }
-    inherit_parent_attributes(p, S_IFDIR);
+    nsp_new_entry_attrs(p, mode);
     if (fw_events_active()) fw_events_note_write_done(ctx->uid, ctx->pid, path, FW_EV_OP_MKDIR, NULL);
     VFS_RETURN(0);
 }
@@ -2196,7 +2163,8 @@ static int vfs_symlink(const char* target, const char* linkpath) {
             char *p_dup = strdup(p), *p_dir = dirname(p_dup);
             if (common_mkdir_within_storage(p_dir, 0775) == 0 && symlink(target, p) == 0) {
                 free(p_dup);
-                inherit_parent_attributes(p, S_IFLNK);
+                /* 符号链接的 mode 在内核恒为 0777，这里只做属主与 SELinux 收敛 */
+                nsp_new_entry_attrs(p, 0);
                 VFS_RETURN(0);
             }
             free(p_dup);
@@ -2204,7 +2172,7 @@ static int vfs_symlink(const char* target, const char* linkpath) {
         log_fuse_err("SYMLINK", linkpath, errno);
         VFS_RETURN(-errno);
     }
-    inherit_parent_attributes(p, S_IFLNK);
+    nsp_new_entry_attrs(p, 0);
     VFS_RETURN(0);
 }
 
@@ -2674,6 +2642,8 @@ static int vfs_link(const char* from, const char* to) {
     if (rrc != 0) return rrc;
     /* 跨后端：硬链接要求同一文件系统与同一目录语义，官方口径 EXDEV */
     if (r2.is_ftp || rr.is_ftp) VFS_RETURN(-EXDEV);
+    /* 不走 nsp_new_entry_attrs：硬链接不产生新 inode，这里改 mode/属主等于改
+       源文件（同一 inode），那是 chmod/chown 回调的事，不是建条目的属性收尾。 */
     int ret = link(p, p_to);
     if (ret == -1) {
         int err = errno;
@@ -2685,14 +2655,18 @@ static int vfs_link(const char* from, const char* to) {
 
 static int vfs_mknod(const char* path, mode_t mode, dev_t rdev) {
     VFS_SETUP_CORE_OP(path, VFS_OP_MUTATE, NSP_ACL_OP_MKNOD);
-    /* 纯转发：设备节点能否建立由内核/SELinux 能力决定（应用无 CAP_MKNOD
-       时自然 EPERM），不在此处额外设限 */
+    /* 能力判定纯转发：设备节点能否建立由内核/SELinux 决定（应用无 CAP_MKNOD
+       时自然 EPERM），不在此处额外设限。
+       属性收尾与 create/mkdir 同一出口：旧实现既不 lchown 也不 chmod，mknod
+       出来的节点属主是 root、mode 是 mode & ~umask，与同目录下 create 出来的
+       条目（属主=父目录属主、mode=调用方 mode）方向完全相反。 */
     int ret = mknod(p, mode, rdev);
     if (ret == -1) {
         int err = errno;
         log_fuse_err("MKNOD", path, err);
         VFS_RETURN(-err);
     }
+    nsp_new_entry_attrs(p, mode);
     VFS_RETURN(0);
 }
 
