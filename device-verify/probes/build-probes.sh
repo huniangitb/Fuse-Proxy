@@ -7,7 +7,7 @@
 #   SKIP_CHECK=1 device-verify/probes/build-probes.sh    # 只构建，不跑自检
 #
 # 产物:
-#   device-verify/dist/apks/nsp.probe.{ftp,sftp,hide,iso,plain,race}.apk
+#   device-verify/dist/apks/nsp.probe.{ftp,sftp,hide,iso,plain,unlink,race}.apk
 #   device-verify/dist/apks/BUILD-CHECK.txt               # 自检摘要（默认跑）
 #   device-verify/dist/keys/debug.keystore                # 首次生成，之后复用
 #

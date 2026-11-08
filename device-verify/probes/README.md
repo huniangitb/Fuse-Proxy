@@ -1,6 +1,6 @@
 # device-verify/probes — NSP 设备验证探针 APK
 
-6 个探针 APK 用于在真实 Android 设备上验证 FUSE 存储代理模块的 v1 注入视图。
+7 个探针 APK 用于在真实 Android 设备上验证 FUSE 存储代理模块的 v1 注入视图。
 离线构建（javac + d8 + aapt2 + zipalign + apksigner），**不需要 gradle、不联网、不调用 adb**。
 
 ## 构建

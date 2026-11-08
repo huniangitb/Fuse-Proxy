@@ -5,7 +5,7 @@
  *
  * 背景：线下日志包曾无法对应到代码提交（崩溃 backtrace 仅 2 帧绝对地址，
  * stripped 产物无符号），排查靠猜。本模块把三类信息打进 sys.log：
- *   1. 构建水印：git 提交哈希（meson 配置期注入 NSP_GIT_HASH）+ 项目版本 +
+ *   1. 构建水印：git 提交哈希（vcs_tag 构建期生成 NSP_GIT_HASH）+ 项目版本 +
  *      编译日期/编译器/target（android/gnu）+ debug/release；
  *   2. 内核/系统：uname（sysname/release/version/machine）；
  *   3. 硬件：/proc/cpuinfo（Hardware/model name 首见 + processor 计数）、
