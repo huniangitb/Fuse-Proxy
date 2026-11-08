@@ -187,9 +187,13 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 CHANGELOG 由提交历史生成，复用同一份 conventional 解析，不必手工整理发布说明：
 
 ```bash
-python3 scripts/commit_msg.py changelog                        # 最近 tag..HEAD → stdout
+python3 scripts/commit_msg.py changelog                        # 最近 tag..HEAD（无 tag 时为全部历史）→ stdout
 python3 scripts/commit_msg.py changelog --output CHANGELOG.md  # 已存在则在首个标题后插入
 ```
+
+`--output` 是插入新段、不覆盖旧段：重复执行会累积多个 `##` 小节。整份重建请用
+stdout 重定向到 `CHANGELOG.md`；每行括号里的短哈希对应本仓库提交，
+`git show <短哈希>` 可复核。
 
 ### 5.6 正文超宽了怎么办
 

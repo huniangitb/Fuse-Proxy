@@ -5,7 +5,7 @@
 `tests/test_docs_sync.py` 机器校验（不再靠人工同步）。
 
 - 构建细节与陷阱 → `../AGENTS.md`
-- 单个用例的判别性设计细节（为什么这样写才能在旧实现上失败）→ `../AGENTS.md` 映射表
+- 单个用例的判别性设计细节（为什么这样写才能在旧实现上失败）→ 本文 §附录「逐套件判别性细节」
 - 提交前流程 → `../CONTRIBUTING.md`
 
 ## 1. 一条命令
@@ -281,7 +281,8 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 
 ## 10. 相关文档
 
-- `../AGENTS.md` — 构建陷阱、逐套件判别性细节、设备操作纪律
+- `../AGENTS.md` — 构建陷阱、设备操作纪律
+- 本文 §附录 — 逐套件判别性细节、ASan 复跑、隔离跑、按改动→套件映射表
 - `../CONTRIBUTING.md` — 开发流程、红线、提交规范
 - `architecture.md` — 进程架构与并发模型（§7 维护规范）
 - `modules.md` — 模块 ABI 与故障隔离
@@ -336,7 +337,7 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 ### 2026-10-18 审计修复的判别性要点
 
 本轮清空 `review-findings-20261018.md` 的 15 条（R1–R15）。新增/扩展用例的判别信号
-（旧实现均为 HEAD `f55b572`；直编类均支持 `*_SRC=` 指向旧源码副本复验）：
+（旧实现均为 `34c68a5`；直编类均支持 `*_SRC=` 指向旧源码副本复验）：
 
 - **R1/R2 跨设备 rename**：`test_functional.py` 模块 6b 从实际源码逐字抽取
   `vfs_rename` 五个函数 + `--wrap=rename` 强制首次 EXDEV。旧实现非空目标 `rc=0`
@@ -431,8 +432,8 @@ scripts/acceptance.sh                     # 跑完整验收门并落报告
 
 以下两处此前只取证未改，现按标准语义修复，各配判别性用例（旧实现上均必失败）。
 
-1. **`vfs_rmdir` 非空目录返回 ENOTEMPTY**（`src/daemon/fuse_daemon.c`，旧实现由 `51abd2c`
-   引入）。旧实现对本地真实路径的 ENOTEMPTY 直接 `recursive_rmdir(p)` 并返回 0——即
+1. **`vfs_rmdir` 非空目录返回 ENOTEMPTY**（`src/daemon/fuse_daemon.c`）。
+   旧实现对本地真实路径的 ENOTEMPTY 直接 `recursive_rmdir(p)` 并返回 0——即
    **对非空目录调 `rmdir` 会静默删掉整个子树**（实测一次普通 `os.rmdir()` 让
    `dir/a/sub/c` 全部消失），不符 POSIX，也与同函数的虚拟路径分支（返回 ENOTEMPTY）不一致。
    现本地分支直接返回 `-ENOTEMPTY`。`recursive_rmdir` 仍保留给 `rename` 的 EXDEV 回退

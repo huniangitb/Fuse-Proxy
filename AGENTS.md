@@ -8,7 +8,7 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 - `target_os` **默认是 `android`**：普通 Linux 上不带 `-Dtarget_os=gnu` 必然失败。
 - **一律走仓库脚本，别自己拼命令**：GNU `scripts/build.sh`（`build_gnu/`）；Android `scripts/android-build.sh [目录] [meson 参数…]`（自动找 NDK、导出 PATH、`--reconfigure` 后 `ninja`；符号包目录同脚本传 `build_android_sym`；`ANDROID_API` 默认 35）；打包 `scripts/pack-module.sh`。
-- **先 commit 再构建**：`NSP_GIT_HASH` 在 configure 期固化，不 reconfigure 出的包水印/`module.prop` version 仍是旧提交。
+- **先 commit 再构建**：`NSP_GIT_HASH` 由 `meson.build` 的 `vcs_tag` 在**构建期**取（`git rev-parse --short HEAD`，已跟踪文件有未提交改动时追加 `-dirty`）；`scripts/pack-module.sh` 的 `module.prop` version 在打包时取 `git rev-parse HEAD`。未提交就构建只能得到 `<sha>-dirty`，现场取证读到的哈希对应不到任何提交。
 - 手工等价：`PATH=<ndk>/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH meson setup --reconfigure build_android && ninja -C build_android`（NDK 不在 PATH 时 configure 直接 `FileNotFoundError: aarch64-linux-android35-clang`）。cross 文件须含 `cmake = 'cmake'`（cmake 子项目交叉必需）与 `host_machine.system = 'android'`（libfuse 的 librt 豁免开关）；`-Dandroid_{libfuse,json_c,curl}=prebuilt` 需配 `-Dfuse3_root=`/`-Dcurl_dir=`。
 - **告警纪律**：GNU 完整重建（`ninja -C build_gnu -t clean && ninja -C build_gnu`）应**零代码告警**（只剩 `lto-wrapper` 的 LTRANS 提示）。源文件自带的 `#define _GNU_SOURCE` 必须包在 `#ifndef _GNU_SOURCE` 守卫内（GNU 分支 meson 已定义），否则每个 TU 报一次重定义、淹没真告警。debug/ASan 构建另有 ~36 条既有 `-Wformat-truncation`，判定「新增告警」以 `build_gnu` 为准。
 - Zygisk 模块经 `custom_target` 直接调 NDK `clang++` 编双 ABI（`src/zygisk/meson.build`），**不给 `project()` 加 cpp 语言**（否则 GNU 构建也要求 C++ 编译器）；注入 zygote，故禁 STL/RTTI/异常，改动后必须确认 `readelf -d` 无 `libc++_shared.so`。
