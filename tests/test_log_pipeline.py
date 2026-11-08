@@ -81,7 +81,7 @@ BASE = "/tmp/fuse_proxy_test"
 MNT = BASE + "/mnt"
 STORAGE = BASE + "/storage"
 MODDIR = BASE + "/modules"
-CONF = "/tmp/Namespace-Proxy/injector.conf"
+CONF = BASE + "/injector.conf"  # 本套件 BASE 内，勿与其他套件共用
 
 TEST_ID = str(uuid.uuid4())[:8]
 PASS = 0

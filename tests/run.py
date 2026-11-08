@@ -9,7 +9,7 @@
     python3 tests/run.py --layer L0      # 只跑某个验收层（可重复：--layer L0 --layer L1）
     python3 tests/run.py --base <ref>    # 与指定提交对比（默认 HEAD，即未提交改动）
     python3 tests/run.py test_rules.py …  # 显式指定套件（同时跳过自动匹配）
-    python3 tests/run.py --jobs 4        # Tier 0 白名单套件并行，其余仍串行
+    python3 tests/run.py --jobs 4        # 资源感知并行：无冲突的套件同时跑
     python3 tests/run.py --strict        # 验收模式：跳过项（gap）计为失败
 
 改动来源：`git diff --name-only <base>` + 未跟踪文件（新文件按整体内容匹配符号）。
@@ -18,8 +18,14 @@
 仍会跑「通用回归」基线——它对所有改动恒定生效。
 
 两组正交的分类，各有唯一出处，别混用：
-  * **Tier**（`PARALLEL_SAFE` / `TIER_EXCLUSIVE`）= 能否并行，按共享状态冲突划分；
+  * **Tier**（`PARALLEL_SAFE` / `QUIET_ON_HOST` / `TIER_EXCLUSIVE` / `SUITE_RESOURCES`）
+    = 并行与互斥，按共享状态冲突划分（见文件后半「并行调度」段）；
   * **Layer**（`LAYERS`）= 验收分层，按「贴近 Android 的程度」划分，供 `--layer` 用。
+
+并行调度不是「白名单并行、其余全串行」：挂载类套件彼此几乎没有共享（规则文件、
+挂载点、日志全在各自 BASE 下），真正需要互斥的只有 `SUITE_RESOURCES` 里点名的
+那几处；而要求「宿主挂载表零变化」的套件（`QUIET_ON_HOST`）必须独占到没有任何
+别的套件在宿主命名空间里挂/卸。调度器按这两条自动合流：能同时跑的绝不排队。
 `LAYERS` 是 L0/L1/L2 归属的唯一出处（此前只在 AGENTS.md 里是散文，跑不了也对不上
 账：实测 38 个套件里有 13 个没被任何层点名）。新套件必须同时登记进 `SUITE_MAP`
 与 `LAYERS`，否则 `tests/test_docs_sync.py` 失败。
@@ -40,7 +46,7 @@ unlink/rmtree 重定向到回收站）与 BASH_ENV（safe-bin 垫 PATH），会�
   env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin" python3 tests/run.py --all
 """
 import argparse
-import concurrent.futures
+import threading
 import os
 import subprocess
 import sys
@@ -399,7 +405,8 @@ SUITE_MAP = [
 # L0 静态/契约：不挂载、不联网、不起 daemon。多为「直编实际源码 + --wrap 桩/ASan」
 #    的判别性用例，宿主零副作用，可并行。
 # L1 GNU 真实 FUSE：起真 daemon、真挂载（/dev/fuse + fusermount3），部分需 vsftpd
-#    或系统 log_monitor，故串行。
+#    或系统 log_monitor。彼此可并发，共享外部状态的那几对由 SUITE_RESOURCES 互斥；
+#    与断言「宿主 mountinfo 零变化」的套件互斥（QUIET_ON_HOST）。
 # L2 Android 拓扑仿真：rootless unshare 沙箱内仿真安卓挂载拓扑，验收时须核对宿主
 #    mountinfo 前后零变化。
 # L3/L4 不在本文件内：L3 需 emulator/AVD 或真机（SELinux/Bionic/vold/FUSE-BPF/
@@ -453,7 +460,7 @@ LAYERS = {
         ),
     ),
     "L1": (
-        "GNU 真实后端/FUSE（串行；FUSE 类需 /dev/fuse + fusermount3，"
+        "GNU 真实后端/FUSE（按资源并发；FUSE 类需 /dev/fuse + fusermount3，"
         "test_sftp 需本机 sshd 于 127.0.0.1:2222）",
         (
             "test_functional.py",
@@ -603,31 +610,31 @@ def layer_suites(layers):
     return out
 
 
-# ── 共享状态冲突矩阵（逐个审计 tests/test_*.py 得出，2026-10）──
-# 资源 R1 固定 CONF=/tmp/Namespace-Proxy/injector.conf：
-#   test_functional / test_rules / test_ftp / test_ftp_parallel /
-#   test_modules / test_module_circuit / test_decision_enforce /
-#   test_log_pipeline（各写各的规则内容，串行才安全）
-# 资源 R2 /tmp/fuse_proxy_test 基目录复用：
-#   test_functional(mnt/modules/storage) 与 test_log_pipeline(BASE 同名) 直接重合；
-#   test_inject_mount_env(ROOTBASE=…/mnt_env) 同前缀（但跑在 unshare 沙箱内）
-# 资源 R3 全局 pkill：test_functional / test_rules(pkill -f fuse_daemon 会杀掉
-#   别人刚起的 daemon)；test_log_pipeline / test_rule_server(SERVICE 段)
-#   pkill -9 -x log_monitor（会杀掉别人的 monitor）
-# 资源 R4 vsftpd 127.0.0.1:21 + 服务端目录 /home/bdy/ftp/upload（服务端文件互见）：
-#   test_ftp / test_ftp_parallel / test_ftp_stress 三者互斥
-# 资源 R5 固定中继端口 127.0.0.1:2121：test_ftp_parallel 独占绑定
-# 资源 R6 全局 log_monitor（抽象套接字 nsp_log_socket 单例 + 系统 LOG_DIR）：
-#   test_log_pipeline（重启系统实例 + 备份还原 /var/fuse-proxy/log 下 io/sys.log）
-#   与 test_rule_server（SERVICE 启停拉起系统 log_monitor）互斥，
-#   且二者与 test_inject_mount_env（沙箱内自起 log_monitor -p）互斥
-# 资源 R7 系统配置 /var/fuse-proxy/injector.conf：test_inject_mount_env 直接改写
-# 结论：挂载类恒串行；R6 两套件另划独占 Tier（最后跑，收尾把系统 monitor 还原）。
+# ── 共享状态冲突矩阵（逐个审计 tests/test_*.py 得出）──
+# 每个套件的规则文件、挂载点、日志、模块目录都在自己的 BASE 下（规则文件曾被 8 个
+# 套件共用 /tmp/Namespace-Proxy/injector.conf，现已各自搬进 BASE），所以真正共享的
+# 只剩下面几处：
+# 资源 S1 vsftpd 127.0.0.1:21 + 服务端目录（服务端文件互见）：test_ftp 与
+#   test_ftp_parallel（二者还共用 BASE /tmp/fuse_ftp_test 和中继端口 2121）；
+#   test_ftp_stress 同属这一组，但它是按需套件，不进 --all。
+# 资源 S2 系统级 log_monitor（抽象套接字 nsp_log_socket 单例 + 系统 LOG_DIR）：
+#   test_log_pipeline（重启系统实例 + 备份还原 /var/fuse-proxy/log 下 io/sys.log）、
+#   test_rule_server（SERVICE 段 pkill -9 -x log_monitor 并拉起系统实例）、
+#   test_inject_mount_env（沙箱内自起 log_monitor -p）。
+# 资源 S3 BASE /tmp/fuse_proxy_test：test_functional 与 test_log_pipeline 同名。
+# 宿主挂载表：L1 的 FUSE 挂载就落在宿主命名空间里，故断言「宿主 mountinfo 全程零
+#   变化」的套件（QUIET_ON_HOST）必须独占到没有别的套件正在挂/卸；它们彼此之间也
+#   互斥——对方的一次挂载对它就是一次变化。
+# 曾经的全局副作用已就地收窄：test_functional / test_rules 的收尾清理改成只杀
+#   自己起的 daemon（按 --rules=<本套件 CONF> 精确匹配，原来的 pkill -f fuse_daemon
+#   会杀掉并发套件的 daemon）；全局 pkill -x log_monitor 只剩 Tier2 两套件。
+# 结论：除 S1/S2/S3 与宿主挂载表外，套件之间没有共享状态，可以并发。
 #
-# Tier 0 并行白名单：逐个核对过无共享状态的套件（判据：CONF/挂载点全由 mkdtemp
-# 派生自管或根本不挂载；无固定端口；无全局 pkill；不碰系统 log_monitor 与
-# 真实日志文件）。命中 --jobs 时仅这些进线程池并行，其余按 Tier 串行。
-# 新套件默认串行，要加入须先核对判据。
+# Tier 0 = 宿主零副作用的套件：判据是「不进宿主命名空间挂载、不 bind 固定端口、
+# 不做全局 pkill、不碰系统 log_monitor 与真实日志文件」（规则文件/工作目录自管即可，
+# mkdtemp 或自有 BASE 都算）。这类套件与谁都能同时跑，故不受挂载互斥约束。
+# 不在本名单里的套件按「会动宿主挂载」对待，与其他挂载类并发、与 QUIET_ON_HOST
+# 互斥（见下面「并行调度」段）。新套件默认按挂载类对待，要进白名单须先核对判据。
 PARALLEL_SAFE = frozenset({
     "test_docs_sync.py",          # 纯静态读文件（文档/台账一致性），无子进程/无挂载
     "test_acl.py",                # cc 直编 fw_acl.c + 纯逻辑驱动，TemporaryDirectory，无挂载
@@ -680,6 +687,26 @@ TIER_EXCLUSIVE = frozenset({
 # 注意：test_rule_server.py 主体已隔离（临时 conf_dir + PID 后缀 socket），但
 # SERVICE 用例会 pkill -9 全局 log_monitor 并拉起系统实例，故仍归 Tier 2。
 
+# 断言「宿主 mountinfo 全程零变化」的套件：运行期间不允许任何别的套件在宿主命名
+# 空间里挂/卸（L1 的 FUSE 挂载就落在宿主 ns），它们彼此之间也一样。调度器先让它们
+# 独占跑完，再放挂载类进来——否则写锁永远等不到「零读者」那个瞬间。
+QUIET_ON_HOST = frozenset({
+    "test_inject_mount_env.py",
+    "test_global_replace.py",
+    "test_mnt_watch.py",
+})
+
+# 互斥资源：同名资源的套件不并发，不同资源之间可以。只登记「真的共享外部状态」的
+# 那几处（见文件上方冲突矩阵），别把「同一类的」当资源——那等于退回全串行。
+SUITE_RESOURCES = {
+    "test_ftp.py": {"vsftpd-21", "ftp-base"},
+    "test_ftp_parallel.py": {"vsftpd-21", "ftp-base"},  # 中继口 2121 只有它用
+    "test_functional.py": {"base-fuse-proxy-test"},
+    "test_log_pipeline.py": {"base-fuse-proxy-test", "system-log-monitor"},
+    "test_rule_server.py": {"system-log-monitor"},
+    "test_inject_mount_env.py": {"system-log-monitor"},
+}
+
 
 # Tier 0 默认 worker 数：cc 编译型小套件为主，4 足够吃满；上限 8 防 fork 炸弹。
 # Tier 1/2（挂载/独占类）恒串行，不受 --jobs 影响。
@@ -721,7 +748,8 @@ def gap_note(rc):
 
 
 def tier_of(name):
-    """套件分 Tier：0=并行白名单，2=独占（全局 log_monitor），其余 1=挂载类串行。"""
+    """套件分 Tier：0=宿主零副作用，1=会动宿主挂载（彼此可并发），2=独占收尾
+    （系统 log_monitor）。互斥由 SUITE_RESOURCES / QUIET_ON_HOST 另行给出。"""
     if name in PARALLEL_SAFE:
         return 0
     if name in TIER_EXCLUSIVE:
@@ -755,23 +783,89 @@ def run_suite(name, capture=False):
     return rc, dt, ""
 
 
-def run_parallel(safe, jobs):
-    """Tier 0 套件并行：输出截获、按完成顺序打印，返回 {套件名: (rc, dt)}。"""
+def claim_of(name):
+    """套件要独占的资源集合与宿主挂载姿态：("quiet"|"mount"|"free")。
+
+    quiet = 要求宿主挂载表全程零变化（独占，写锁）；mount = 会进宿主命名空间挂载
+    （可互相并发，读锁）；free = 宿主零副作用（Tier 0 白名单，不参与挂载锁）。
+    """
+    if name in QUIET_ON_HOST:
+        mode = "quiet"
+    elif name in PARALLEL_SAFE:
+        mode = "free"
+    else:
+        mode = "mount"
+    return SUITE_RESOURCES.get(name, frozenset()), mode
+
+
+def report_parallel(name, rc, dt, out):
+    """并行套件的输出：整块打印，避免多套件在终端里交错。"""
+    print(f"\n{'━' * 60}\n▶ {name}（并行，{dt:.1f}s）\n{'━' * 60}", flush=True)
+    print(out, end="", flush=True)
+    if classify(rc) == "FAIL":
+        print(f"\n❌ {name} 失败（退出码 {rc}，{dt:.1f}s）")
+    elif is_gap(rc):
+        print(f"\n⏭ {name} 跳过（退出码 {rc}，gap 不计通过）")
+
+
+def run_pool(suites, jobs):
+    """按资源门调度：能立刻开跑的套件才占 worker，返回 {套件名: (rc, dt, out)}。
+
+    与「白名单并行、其余串行」的区别：worker 不再空等。资源冲突只让**那一个**
+    套件排队（挂载类彼此不冲突，照样并发），要求宿主挂载表零变化的套件则等到
+    没有任何挂载类在跑；写者等待期间不再放新的挂载类进来，免得安静套件饿死。
+    """
     done = {}
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(jobs, len(safe))) as pool:
-        futs = {pool.submit(run_suite, s, True): s for s in safe}
-        for fut in concurrent.futures.as_completed(futs):
-            s = futs[fut]
-            rc, dt, out = fut.result()
-            print(f"\n{'━' * 60}\n▶ {s}（并行，{dt:.1f}s）\n{'━' * 60}",
-                  flush=True)
-            print(out, end="", flush=True)
-            if classify(rc) == "FAIL":
-                print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
-            elif is_gap(rc):
-                print(f"\n⏭ {s} 跳过（退出码 {rc}，gap 不计通过）")
-            done[s] = (rc, dt)
+    cv = threading.Condition()
+    st = {"running": 0, "readers": 0, "writer": False, "busy": set()}
+    pending = list(suites)
+    quiet_left = sum(1 for s in pending if claim_of(s)[1] == "quiet")
+
+    def startable(name):
+        res, mode = claim_of(name)
+        if st["busy"] & res:
+            return False
+        if mode == "quiet":
+            return not st["writer"] and st["readers"] == 0
+        if mode == "mount":
+            return not st["writer"] and quiet_left == 0
+        return True
+
+    def worker(name, res, mode):
+        rc, dt, out = run_suite(name, True)
+        with cv:
+            st["busy"] = st["busy"] - res
+            if mode == "quiet":
+                st["writer"] = False
+            elif mode == "mount":
+                st["readers"] -= 1
+            st["running"] -= 1
+            done[name] = (rc, dt, out)
+            report_parallel(name, rc, dt, out)
+            cv.notify_all()
+
+    with cv:
+        while pending or st["running"]:
+            launched = False
+            for name in list(pending):
+                if st["running"] >= jobs:
+                    break
+                if not startable(name):
+                    continue
+                res, mode = claim_of(name)
+                pending.remove(name)
+                st["busy"] = st["busy"] | res
+                if mode == "quiet":
+                    st["writer"] = True
+                    quiet_left -= 1
+                elif mode == "mount":
+                    st["readers"] += 1
+                st["running"] += 1
+                threading.Thread(target=worker, args=(name, res, mode),
+                                 daemon=True).start()
+                launched = True
+            if not launched:
+                cv.wait()
     return done
 
 
@@ -787,9 +881,8 @@ def main():
     ap.add_argument("--base", default="HEAD",
                     help="与该提交对比以确定改动（默认 HEAD = 暂存+未暂存+未跟踪）")
     ap.add_argument("--jobs", "-j", type=int, default=DEFAULT_JOBS,
-                    help=f"Tier 0 套件（PARALLEL_SAFE 白名单）并行worker数，"
-                         f"默认{DEFAULT_JOBS}（上限{MAX_JOBS}）；"
-                         "Tier 1/2（挂载/独占类）恒串行")
+                    help=f"并发 worker 数，默认{DEFAULT_JOBS}（上限{MAX_JOBS}）；"
+                         "共享资源的套件按 SUITE_RESOURCES 互斥，其余照常并发")
     ap.add_argument("--strict", action="store_true",
                     help="验收模式：跳过项（环境不具备，gap）计为失败，rc=1")
     args = ap.parse_args()
@@ -819,43 +912,47 @@ def main():
         suites, rows = select_suites(syms_text, paths)
 
     print("\n选中套件：")
-    t0 = [s for s in suites if tier_of(s) == 0]
-    t1 = [s for s in suites if tier_of(s) == 1]
-    t2 = [s for s in suites if tier_of(s) == 2]
+    mounted = [s for s in suites if tier_of(s) == 1]
+    free = [s for s in suites if tier_of(s) == 0]
+    exclusive = [s for s in suites if tier_of(s) == 2]
     for s in suites:
-        tag = {0: "Tier0并行", 1: "Tier1串行", 2: "Tier2独占"}[tier_of(s)]
+        tag = {0: "无挂载", 1: "挂载类", 2: "独占收尾"}[tier_of(s)]
+        if s in QUIET_ON_HOST:
+            tag = "挂载类·宿主静默"
         print(f"  [{tag}][{layer_of(s) or '未分层'}] {s}")
     print("命中条目：" + ("、".join(rows) if rows else "无"))
     if args.list:
         return 0
 
-    results = []
-    # Tier 0 恒执行（此前 `if args.jobs > 1 and t0` 使 --jobs 1 时整组 Tier0
-    # 被漏跑，且 t1+t2 为空时汇总仍「共 0、通过」、rc=0）。--jobs 1 走串行分支
-    # 以保留输出透传；>1 时进线程池并行。
-    if t0 and args.jobs > 1:
-        # 先并行 Tier 0，再串行 Tier 1，最后独占 Tier 2：挂载类/独占类之间
-        # 仍保持选中顺序语义，且独占类（log_monitor/vsftpd/userns）不受
-        # 并行任务干扰，收尾时系统 log_monitor 已还原
-        para = run_parallel(t0, args.jobs)
-        for s in t0:
-            rc, dt = para[s]
-            results.append((s, rc, dt))
+    # 调度顺序即优先级：要求宿主挂载表零变化的套件要独占跑，排后面会一直等挂载类
+    # 落地，所以放最前；无挂载的小套件随后塞满剩余 worker；最后放开挂载类并发。
+    # Tier 0 恒执行（此前 `if args.jobs > 1 and t0` 让 --jobs 1 时整组 Tier0 被
+    # 漏跑，t1+t2 为空时汇总仍是「共 0、通过」、rc=0）。
+    order = ([s for s in mounted if s in QUIET_ON_HOST] +
+             free +
+             [s for s in mounted if s not in QUIET_ON_HOST])
+    got = {}
+    if args.jobs > 1 and order:
+        for s, (rc, dt, _) in run_pool(order, args.jobs).items():
+            got[s] = (rc, dt)
     else:
-        for s in t0:
+        for s in order:
             rc, dt, _ = run_suite(s)
-            results.append((s, rc, dt))
+            got[s] = (rc, dt)
             if classify(rc) == "FAIL":
                 print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
             elif is_gap(rc):
                 print(f"\n⏭ {s} 跳过（退出码 {rc}，gap 不计通过）")
-    for s in t1 + t2:
+    # Tier 2 仍最后串行：这些套件碰系统 log_monitor，收尾时把系统实例还原回原状，
+    # 不与任何并发任务交叉（含它们自己的 pkill -9 -x log_monitor）。
+    for s in exclusive:
         rc, dt, _ = run_suite(s)
-        results.append((s, rc, dt))
+        got[s] = (rc, dt)
         if classify(rc) == "FAIL":
             print(f"\n❌ {s} 失败（退出码 {rc}，{dt:.1f}s）")
         elif is_gap(rc):
             print(f"\n⏭ {s} 跳过（退出码 {rc}，gap 不计通过）")
+    results = [(s, got[s][0], got[s][1]) for s in suites if s in got]
 
     print(f"\n{'═' * 60}")
     passed = [r for r in results if classify(r[1]) == "PASS"]
