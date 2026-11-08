@@ -237,6 +237,44 @@ def run_tests():
     else:
         fail("替换后 status", f"期望 replaced 实际 {st}")
 
+    # 3b. 族根的「有就挂、没有就跳过」：vold 会回收某个用户的卷（族根整个消失），
+    #     也会在替换之后把它重建回系统视图（切用户、卷重挂、FUSE 崩溃恢复都会）。
+    #     (a) 消失的那条只跳过，不进判据——不能因为缺一族就把整体判成 mixed/unknown；
+    #     (b) 重建出来的那条必须被下一次 replace 接管，否则那一族的应用看到的还是
+    #         系统视图，「有就挂」就只在开机那一刻成立。
+    log("场景3b: 族根缺失只跳过 / 重建后必须被下一次 replace 接管")
+    sh("umount", "/mnt/androidwritable/999/emulated", check=False)
+    st = ctl_status(pid)
+    if st == "replaced":
+        ok("一条族根整个消失时 status 仍为 replaced（缺族不参与判定）")
+    else:
+        fail("缺族导致状态变化", f"期望 replaced 实际 {st}")
+    mount_tmpfs("/mnt/installer/999/emulated")
+    mount_tmpfs("/mnt/androidwritable/999/emulated")
+    st = ctl_status(pid)
+    if st == "mixed":
+        ok("族根被重建为系统视图后 status == mixed（缺族仍不参与判定）")
+    else:
+        fail("重建族根后 status", f"期望 mixed 实际 {st}")
+    r = sh(CTL, "replace", str(pid), FUSE_SRC, BACKUP_ROOT, check=False)
+    if r.returncode == 0:
+        ok("再次 replace 返回 0")
+    else:
+        fail("再次 replace", f"rc={r.returncode} {r.stdout.strip()}")
+    late_ok = True
+    for fam in ("installer", "androidwritable"):
+        d = mount_dev(pid, f"/mnt/{fam}/999/emulated")
+        if d != src_dev:
+            late_ok = False
+            fail(f"重建族根替换: /mnt/{fam}/999/emulated", f"dev={d} != src_dev={src_dev}")
+    if late_ok:
+        ok("重建的 installer/androidwritable 族根已替换为项目 FUSE")
+    st = ctl_status(pid)
+    if st == "replaced":
+        ok("接管后 status == replaced")
+    else:
+        fail("接管后 status", f"期望 replaced 实际 {st}")
+
     # 4. app-restore：非目标应用命名空间还原
     log("场景4: 非目标应用还原 (app-restore)")
     child = os.fork()
