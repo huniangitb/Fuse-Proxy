@@ -1567,6 +1567,62 @@ static void maybe_reconcile_global_replace(void) {
     }
 }
 
+/* 运行期注入方法切换 ========================================================
+ * g_inject_method 只在启动时由 argv 决定。运行期改方法不是改一个标志位：
+ * v2/v3 把三族族根整体换成了项目 FUSE（MS_SHARED 传播给所有应用命名空间），
+ * v1 是逐应用进命名空间挂载——直接改标志会让「已替换的全局视图」失去维护者，
+ * 系统停在代理视图上而没人卸载/还原，这正是过去只能重启设备的原因。
+ *
+ * 这里把切换做成一次显式迁移：
+ *   切到 v1：先按备份树把三族还原成系统视图（与退出/崩溃恢复同一条原语），
+ *            再清全局替换记账；随后的应用对账按 v1 逐应用挂载目标。
+ *   切到 v2/v3：先改标志位，立即对账一次全局替换，让存量命名空间马上接管。
+ * 还原失败时保持原方法不动——半新半旧比全旧更难排查。
+ * 方法来源是 INJECT_METHOD_PATH（内容 v1|v2|v3）。文件缺失或无法识别一律
+ * 保持当前方法：配置目录被误删不该把注入方法重置成默认值。 */
+static InjectMethod read_inject_method_file(void) {
+    FILE* fp = fopen(INJECT_METHOD_PATH, "re");
+    if (!fp) return (InjectMethod)0;
+    char buf[8] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    if (n == 0) return (InjectMethod)0;
+    const char* p = buf;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (strncmp(p, "v1", 2) == 0) return INJECT_METHOD_V1;
+    if (strncmp(p, "v2", 2) == 0) return INJECT_METHOD_V2;
+    if (strncmp(p, "v3", 2) == 0) return INJECT_METHOD_V3;
+    return (InjectMethod)0;
+}
+
+static void apply_inject_method_switch(void) {
+    InjectMethod want = read_inject_method_file();
+    if (want == 0 || want == g_inject_method) return;
+    InjectMethod had = g_inject_method;
+    if (want == INJECT_METHOD_V1) {
+        if (inject_is_global_replace() && g_global_fuse.pid > 0) {
+            if (ns_global_restore_system(g_global_fuse.pid, GLOBAL_BACKUP_ROOT) != 0) {
+                LOG_ERR("注入方法切换 v%d -> v1: 系统视图还原失败，保持 v%d 不变", (int)had,
+                        (int)had);
+                return;
+            }
+        }
+        g_grepl_next_sec = 0;
+        g_grepl_replaced_once = false;
+        g_global_replace_scanned_once = true; /* v1 不做全局兜底扫描 */
+        g_inject_method = INJECT_METHOD_V1;
+        LOG("注入方法切换: v%d -> v1（系统 emulated 视图已还原，运行中应用改走逐应用挂载）",
+            (int)had);
+        return;
+    }
+    g_inject_method = want;
+    g_grepl_next_sec = 0;
+    g_grepl_replaced_once = false;
+    g_global_replace_scanned_once = false; /* 新方法下对存量应用重新审查一次 */
+    LOG("注入方法切换: v%d -> v%d（立即对账全局替换）", (int)had, (int)want);
+    maybe_reconcile_global_replace();
+}
+
 static void on_timer_event(int timer_fd) {
     uint64_t expirations;
     if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
@@ -1693,6 +1749,7 @@ static void handle_pending_reload(void) {
         config_lock_write();
         int changed_count = reload_config_rules_diff(INJECTOR_CONFIG_PATH, out_changed, 128);
         config_unlock_write();
+        apply_inject_method_switch();
         if (config_has_category_rules()) sys_pkg_refresh();
         setup_inotify_watches();
         config_publisher_broadcast();

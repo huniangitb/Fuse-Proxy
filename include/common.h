@@ -40,6 +40,8 @@
 #define MONITOR_IGNORE_PATH  CONFIG_DIR "/monitor_ignore.conf"
 #define APP_RULES_DIR        CONFIG_DIR "/" NSP_APP_RULES_DIRNAME
 #define INJECTOR_PID_PATH    CONFIG_DIR "/injector.pid"
+/* 运行期注入方法（v1|v2|v3）：存在时 SIGHUP 即按它切换，缺失/非法保持当前值 */
+#define INJECT_METHOD_PATH   CONFIG_DIR "/inject_method"
 /* 热插拔模块目录：模块 = 一个子目录，内含 <name>.so（规则/后端模块）与可选配置 */
 #define MODULES_DIR CONFIG_DIR "/modules"
 
