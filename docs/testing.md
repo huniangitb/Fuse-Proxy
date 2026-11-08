@@ -347,7 +347,7 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
 
 ### 2026-10-18 审计修复的判别性要点
 
-本轮清空 `review-findings-20261018.md` 的 15 条（R1–R15）。新增/扩展用例的判别信号
+本轮清空 2026-10-18 审计记录的 15 条（R1–R15）。新增/扩展用例的判别信号
 （旧实现均为 `34c68a5`；直编类均支持 `*_SRC=` 指向旧源码副本复验）：
 
 - **R1/R2 跨设备 rename**：`test_functional.py` 模块 6b 从实际源码逐字抽取
