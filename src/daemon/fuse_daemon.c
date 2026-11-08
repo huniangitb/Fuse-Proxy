@@ -1657,7 +1657,9 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
             VFS_RETURN(0);
         }
     }
-    int fd = open(p, fi->flags | O_CLOEXEC, is_redir ? 0666 : 0);
+    /* open 不创建文件（O_CREAT 由 create 回调处理），mode 参数无意义；旧实现在
+       is_redir 时传 0666，只会在 O_CREAT 意外出现时替调用方决定权限。 */
+    int fd = open(p, fi->flags | O_CLOEXEC, 0);
     if (fd == -1) {
         int err = errno;
         log_fuse_err("OPEN", path, err);
@@ -1709,13 +1711,16 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
             VFS_RETURN(0);
         }
     }
-    int fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, is_redir ? 0666 : mode);
+    /* 创建 mode 一律用调用方的：ALLOW 命中与 SANDBOX 重定向下 is_redir 恒为真，
+       旧实现据此固定 0666，等于把调用方 mode（内核已按 umask 归一）整个丢掉，
+       umask 与应用指定的 0600 在 create 路径上永远不生效。 */
+    int fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, mode);
     if (fd == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *p_dir = dirname(p_dup);
             /* 父目录补建走守卫出口：永不创建存储根一级条目（见 common.h） */
             if (common_mkdir_within_storage(p_dir, 0775) == 0)
-                fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, is_redir ? 0666 : mode);
+                fd = open(p, fi->flags | O_CREAT | O_EXCL | O_CLOEXEC, mode);
             free(p_dup);
         }
         if (fd == -1) {
@@ -1767,13 +1772,15 @@ static int vfs_mkdir(const char* path, mode_t mode) {
     /* fallback：lookup 成功但未走后端分支时释放引用，防止 backend_refs 泄漏
        导致模块无法热卸载（loader 等待 backend_refs == 0） */
     if (bops) module_backend_put(bops);
-    int ret = mkdir(p, is_redir ? 0775 : mode);
+    /* 同 create：is_redir 时固定 0775 会把内核按 umask 归一过的 mode 丢掉
+       （父目录补建另有自己的 mode，见 common_mkdir_within_storage）。 */
+    int ret = mkdir(p, mode);
     if (ret == -1) {
         if (errno == ENOENT) {
             char *p_dup = strdup(p), *parent = dirname(p_dup);
             /* 父目录补建走守卫出口：永不创建存储根一级条目（见 common.h） */
             if (common_mkdir_within_storage(parent, 0775) == 0)
-                ret = mkdir(p, is_redir ? 0775 : mode);
+                ret = mkdir(p, mode);
             free(p_dup);
         }
         if (ret == -1) {
