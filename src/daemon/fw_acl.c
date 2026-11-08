@@ -10,8 +10,11 @@
  */
 #include "fw_acl.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <strings.h>
 #include <stdatomic.h>
@@ -145,6 +148,82 @@ NspPathClass fw_acl_classify(const char* path, char* owner_pkg, size_t size) {
     }
     (void)after3;
     return NSP_PATH_OWNED;
+}
+
+/* 用户根下一级默认目录（AOSP MediaProvider 建的那 12 个）的期望权限：
+   drwxrwx---。属组是 media_rw，同组进程（含 MediaProvider、下载器）靠组位写入；
+   组位一被收走，同组应用就 DAC 失败。 */
+#define NSP_ACL_TOPLEVEL_EXPECT_MODE 0770
+
+/* 启动期体检：<base>/<uid> 下一级目录的权限是否符合期望。
+   - 名字在 k_default_toplevel 表内（Android 除外，见下）且 mode 不是 0770：
+     记 WRN 并改回 0770——这些目录的权限是被写坏的，不是用户设的；
+   - 其余名字：只记 WRN 不自动改。非默认名字是用户自己建的目录，权限是用户/应用
+     的选择，daemon 没有依据替他改。
+   Android 不在修正范围内：它是骨架根（/Android/data|obb|media 的容器），由 vold
+   建、权限 2771、属主 media_rw，与那 12 个用户目录不是一回事。
+   挂载点尚未就绪（opendir 失败）时静默跳过：这是体检，不是依赖。 */
+void fw_acl_repair_storage_toplevel(const char* base) {
+    if (!base || !base[0]) return;
+    DIR* vol = opendir(base);
+    if (!vol) return;
+    struct dirent* ve;
+    while ((ve = readdir(vol)) != NULL) {
+        /* 卷根下只有 <uid> 数字目录，其余（lost+found 之类）不归本模块管 */
+        if (ve->d_name[0] < '0' || ve->d_name[0] > '9') continue;
+        const char* c = ve->d_name;
+        bool all_digits = true;
+        for (; *c; c++)
+            if (*c < '0' || *c > '9') all_digits = false;
+        if (!all_digits) continue;
+        char udir[PATH_MAX];
+        if (snprintf(udir, sizeof(udir), "%s/%s", base, ve->d_name) >= (int)sizeof(udir)) continue;
+        DIR* ud = opendir(udir);
+        if (!ud) continue;
+        struct dirent* de;
+        while ((de = readdir(ud)) != NULL) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+                continue;
+            char cpath[PATH_MAX];
+            if (snprintf(cpath, sizeof(cpath), "%s/%s", udir, de->d_name) >= (int)sizeof(cpath))
+                continue;
+            struct stat st;
+            if (lstat(cpath, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            mode_t cur = st.st_mode & 07777;
+            if (strcasecmp(de->d_name, "Android") == 0) continue;
+            if (!acl_is_default_toplevel(de->d_name, strlen(de->d_name))) {
+                if (cur != NSP_ACL_TOPLEVEL_EXPECT_MODE)
+                    LOG_WRN("顶层目录权限非期望值（非默认目录，不自动修正）: path=%s 当前=%04o "
+                            "期望=%04o",
+                            cpath, (unsigned)cur, (unsigned)NSP_ACL_TOPLEVEL_EXPECT_MODE);
+                continue;
+            }
+            if (cur == NSP_ACL_TOPLEVEL_EXPECT_MODE) continue;
+            LOG_WRN("顶层目录权限异常: path=%s 当前=%04o 期望=%04o，按期望值修正", cpath,
+                    (unsigned)cur, (unsigned)NSP_ACL_TOPLEVEL_EXPECT_MODE);
+            if (chmod(cpath, NSP_ACL_TOPLEVEL_EXPECT_MODE) != 0)
+                LOG_WRN("顶层目录权限修正失败: path=%s errno=%d (%s)", cpath, errno,
+                        strerror(errno));
+        }
+        closedir(ud);
+    }
+    closedir(vol);
+}
+
+/* 存储结构条目：卷根、用户根、/Android/{data,obb,media} 本身、用户根下一级条目。
+   这些条目的 mode 由存储层决定，不属于任何一个应用；调用方对它们的 mode/属主
+   变更一律丢弃（见 vfs_chmod/vfs_chown），与 AOSP 的 handle_setattr 一致。 */
+bool fw_acl_is_structure_entry(const char* path) {
+    switch (fw_acl_classify(path, nullptr, 0)) {
+    case NSP_PATH_ROOT:
+    case NSP_PATH_USER_ROOT:
+    case NSP_PATH_SKELETON:
+    case NSP_PATH_TOPLEVEL:
+        return true;
+    default:
+        return false;
+    }
 }
 
 int fw_acl_errno(NspAclVerdict v) {
