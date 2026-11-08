@@ -937,10 +937,6 @@ static bool app_rule_is_enabled(const char* pkg, int uid) {
     return (access(path, F_OK) == 0);
 }
 
-static void injector_pid_path(char* out, size_t sz) {
-    snprintf(out, sz, "%s/injector.pid", g_config_dir);
-}
-
 /* ==================== JSON 应答 ====================
    mkdir/send 全量发送经 nsp_util 公共库复用（nsp_mkdir_p / nsp_send_all，
    见 nsp_util.h），禁私刻副本（旧 mkdir_p/send_all 已删除） */
@@ -1814,11 +1810,96 @@ static void handle_set(int fd, json_object* req) {
     handle_add(fd, req, "SET");
 }
 
-static int read_injector_pid(void);
+static bool proc_alive(int pid);
+static int find_proc_pid(const char* name);
+
+/* 注入器会 fork 同名子进程（媒体 FUSE 实例与逐应用挂载助手）；
+   只要主实例的 PID 时取父进程不是注入器的那个，没有则退回第一个匹配 */
+static int find_injector_pid(void) {
+    int pid = find_proc_pid("injector");
+    if (pid <= 0) return pid;
+    char stat_path[64];
+    char buf[512];
+    snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+    FILE* fp = fopen(stat_path, "r");
+    if (!fp) return pid;
+    int ppid = -1;
+    if (fgets(buf, sizeof(buf), fp)) {
+        char* rp = strrchr(buf, ')');
+        int field = 0;
+        if (rp && sscanf(rp + 1, " %*c %d", &field) == 1) ppid = field;
+    }
+    fclose(fp);
+    if (ppid <= 1) return pid;
+    char comm_path[64];
+    char comm[64] = {0};
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", ppid);
+    fp = fopen(comm_path, "r");
+    if (!fp) return pid;
+    if (fgets(comm, sizeof(comm), fp)) {
+        size_t n = strlen(comm);
+        while (n > 0 && (comm[n - 1] == '\n' || comm[n - 1] == ' ')) comm[--n] = '\0';
+    }
+    fclose(fp);
+    if (strcmp(comm, "injector") != 0) return pid;
+    /* 命中子实例：扫描全部注入器，挑父进程不是注入器的那个 */
+    DIR* d = opendir("/proc");
+    if (!d) return pid;
+    struct dirent* de;
+    int top = -1;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int cand = atoi(de->d_name);
+        if (cand <= 0 || cand == (int)getpid()) continue;
+        char cp[64];
+        snprintf(cp, sizeof(cp), "/proc/%d/comm", cand);
+        FILE* cf = fopen(cp, "r");
+        if (!cf) continue;
+        char cb[64] = {0};
+        bool is_inj = false;
+        if (fgets(cb, sizeof(cb), cf)) {
+            size_t n = strlen(cb);
+            while (n > 0 && (cb[n - 1] == '\n' || cb[n - 1] == ' ')) cb[--n] = '\0';
+            is_inj = (strcmp(cb, "injector") == 0);
+        }
+        fclose(cf);
+        if (!is_inj) continue;
+        char sp[64];
+        snprintf(sp, sizeof(sp), "/proc/%d/stat", cand);
+        FILE* sf = fopen(sp, "r");
+        if (!sf) continue;
+        char sb[512];
+        int cppid = -1;
+        if (fgets(sb, sizeof(sb), sf)) {
+            char* rp = strrchr(sb, ')');
+            int field = 0;
+            if (rp && sscanf(rp + 1, " %*c %d", &field) == 1) cppid = field;
+        }
+        fclose(sf);
+        if (cppid > 1) {
+            char pc[64];
+            snprintf(pc, sizeof(pc), "/proc/%d/comm", cppid);
+            FILE* pf = fopen(pc, "r");
+            if (pf) {
+                char pb[64] = {0};
+                bool par_inj = false;
+                if (fgets(pb, sizeof(pb), pf)) {
+                    size_t n = strlen(pb);
+                    while (n > 0 && (pb[n - 1] == '\n' || pb[n - 1] == ' ')) pb[--n] = '\0';
+                    par_inj = (strcmp(pb, "injector") == 0);
+                }
+                fclose(pf);
+                if (!par_inj) { top = cand; break; }
+            }
+        }
+    }
+    closedir(d);
+    return top > 0 ? top : pid;
+}
 
 /* 向 injector 发送信号（SIGHUP 重载 / SIGTERM 停止） */
 static void signal_injector(int fd, const char* cmd, int sig) {
-    int pid = read_injector_pid();
+    int pid = find_injector_pid();
     if (pid <= 0) {
         reply_error(fd, cmd, "未找到注入器进程");
         return;
@@ -1891,22 +1972,6 @@ static int find_proc_pid(const char* name) {
     return found;
 }
 
-/* injector PID：优先 PID 文件（精确），失效则回退 /proc 按名匹配 */
-static int read_injector_pid(void) {
-    char path[PATH_MAX];
-    injector_pid_path(path, sizeof(path));
-    FILE* fp = fopen(path, "r");
-    if (fp) {
-        int pid = -1;
-        if (fscanf(fp, "%d", &pid) == 1 && pid > 0 && proc_alive(pid)) {
-            fclose(fp);
-            return pid;
-        }
-        fclose(fp);
-    }
-    return find_proc_pid("injector");
-}
-
 /* 构建单个进程状态对象 {pid, alive} */
 static json_object* build_proc_json(int pid) {
     json_object* o = json_object_new_object();
@@ -1918,7 +1983,7 @@ static json_object* build_proc_json(int pid) {
 /* SERVICE status：查询 log_monitor / injector / fuse_daemon / rule_server 状态 */
 static void handle_service_status(int fd, json_object* req) {
     (void)req;
-    int injector_pid = read_injector_pid();
+    int injector_pid = find_injector_pid();
     int fuse_pid = find_proc_pid("fuse_daemon");
     int log_pid = find_proc_pid("log_monitor");
     json_object* data = json_object_new_object();
@@ -1995,7 +2060,7 @@ static int spawn_daemon(const char* path, char* const argv[]) {
 /* 停止全部服务：injector（SIGTERM，其自行清理 fuse_daemon）、log_monitor、fuse_daemon。
    执行层：不发送响应，统计结果写入 out_stopped / out_failed */
 static void service_stop_all_exec(int* out_stopped, int* out_failed) {
-    int injector_pid = read_injector_pid();
+    int injector_pid = find_injector_pid();
     int log_pid = find_proc_pid("log_monitor");
     int fuse_pid = find_proc_pid("fuse_daemon");
     int stopped = 0, failed = 0;
@@ -2042,7 +2107,7 @@ static void service_start_all_exec(int* out_started, int* out_failed) {
     snprintf(inj_path, sizeof(inj_path), "%s/injector", bin_dir);
 
     /* 清理残留：killall -9 等价（fuse_daemon 残留由 stop 兜底） */
-    int old_inj = read_injector_pid();
+    int old_inj = find_injector_pid();
     int old_fuse = find_proc_pid("fuse_daemon");
     int old_log = find_proc_pid("log_monitor");
     if (old_inj > 0) kill(old_inj, SIGKILL);
@@ -2127,7 +2192,7 @@ static void handle_stop(int fd, json_object* req) {
 
 static void handle_status(int fd, json_object* req) {
     (void)req;
-    int injector_pid = read_injector_pid();
+    int injector_pid = find_injector_pid();
     bool injector_alive = proc_alive(injector_pid);
     json_object* data = json_object_new_object();
     json_object_object_add(data, "version", json_object_new_string(RULE_VERSION));

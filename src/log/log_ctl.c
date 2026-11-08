@@ -110,19 +110,6 @@ static void json_api_error(bool api_mode, const char* cmd, const char* error_msg
 }
 
 /* ========== 配置文件读写辅助 ========== */
-static void injector_pid_path(char* out, size_t size) {
-    snprintf(out, size, "%s/injector.pid", g_config_dir);
-}
-
-static int read_pid_file(const char* path) {
-    FILE* fp = fopen(path, "r");
-    if (!fp) return -1;
-    int pid = -1;
-    if (fscanf(fp, "%d", &pid) != 1) pid = -1;
-    fclose(fp);
-    return pid;
-}
-
 /* /proc/<pid>/comm 是内核写死的任务名，PID 被回收后必然对不上，
    比仅凭 kill(pid,0) 判活更可靠 */
 static bool proc_comm_is(int pid, const char* name) {
@@ -141,31 +128,48 @@ static bool proc_comm_is(int pid, const char* name) {
     return match;
 }
 
-static int scan_pid_by_name(const char* name) {
+static int read_proc_ppid(int pid) {
+    char path[64];
+    char buf[512];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return -1;
+    int ppid = -1;
+    if (fgets(buf, sizeof(buf), fp)) {
+        /* pid (comm) state ppid ...：comm 可能含空格与括号，从最后一个 ')' 往后数 */
+        char* rp = strrchr(buf, ')');
+        if (rp) {
+            int ppid_field = 0;
+            if (sscanf(rp + 1, " %*c %d", &ppid_field) == 1) ppid = ppid_field;
+        }
+    }
+    fclose(fp);
+    return ppid;
+}
+
+/* 注入器 PID 一律从 /proc 现查：进程名由内核维护，进程退出即消失，
+   不会像落盘的 PID 文件那样留下指向已回收进程的死号。
+   注入器会 fork 同名的子进程（媒体 FUSE 实例与逐应用挂载助手），
+   这里只认父进程不是注入器的那一个——信号与状态查询都要落在主实例上 */
+static int resolve_injector_pid(void) {
     DIR* d = opendir("/proc");
     if (!d) return -1;
     struct dirent* de;
-    int found = -1;
+    int top = -1;
+    int any = -1;
     while ((de = readdir(d)) != NULL) {
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         int pid = atoi(de->d_name);
-        if (pid > 0 && proc_comm_is(pid, name)) {
-            found = pid;
+        if (pid <= 0 || !proc_comm_is(pid, "injector")) continue;
+        if (any < 0) any = pid;
+        int ppid = read_proc_ppid(pid);
+        if (ppid > 0 && !proc_comm_is(ppid, "injector")) {
+            top = pid;
             break;
         }
     }
     closedir(d);
-    return found;
-}
-
-/* PID 文件是精确入口；文件缺失、内容损坏或进程已退出时退回 /proc 按名扫描，
-   否则注入器明明在跑，状态查询与信号命令却报它不在 */
-static int resolve_injector_pid(void) {
-    char path[PATH_MAX];
-    injector_pid_path(path, sizeof(path));
-    int pid = read_pid_file(path);
-    if (pid > 0 && proc_comm_is(pid, "injector")) return pid;
-    return scan_pid_by_name("injector");
+    return top > 0 ? top : any;
 }
 
 static const char* send_reload_signal(void) {
@@ -709,7 +713,6 @@ static void handle_status(bool api_mode) {
 
         json_object* system = json_object_new_object();
         json_object_object_add(system, "config_dir", json_object_new_string(g_config_dir));
-        json_object_object_add(system, "pid_file", json_object_new_string(INJECTOR_PID_PATH));
         json_object_object_add(root, "system", system);
 
         events_json_add(root, &events_st);
