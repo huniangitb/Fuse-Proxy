@@ -377,6 +377,17 @@ int main(void) {
     expect_v("建非默认目录（/MyStuff）→ EACCES",
              mkdecide("/0/MyStuff", NSP_ACL_OP_MKDIR, "com.mine", false, true, true, 0, true),
              NSP_ACL_DENY_EACCES);
+    /* AOSP 旁路 shouldBypassFuseRestrictions()：持有 All files access 的应用在整段
+       结构规则之前就被放行（原生系统里它压根不经过 MediaProvider 的 FUSE）。只放开
+       创建——删除/改名仍按结构规则拒。 */
+    expect_v("All files access 建非默认目录（/MyStuff）→ ALLOW",
+             mkdecide_manage("/0/MyStuff", NSP_ACL_OP_MKDIR, "com.installer.app", false, true, true,
+                             true, 0, true),
+             NSP_ACL_ALLOW);
+    expect_v("All files access 删顶层目录 → 仍 EACCES",
+             mkdecide_manage("/0/Download", NSP_ACL_OP_RMDIR, "com.installer.app", false, true, true,
+                             true, 0, true),
+             NSP_ACL_DENY_EACCES);
     expect_v("删顶层目录 → EACCES",
              mkdecide("/0/Download", NSP_ACL_OP_RMDIR, "com.mine", false, true, true, 0, true),
              NSP_ACL_DENY_EACCES);

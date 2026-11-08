@@ -255,8 +255,16 @@ NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id) {
 
     case NSP_PATH_TOPLEVEL:
         /* 顶层条目的结构规则（AOSP isDirAccessAllowedForFuse）：
-           - 只能建默认目录；- 任何顶层目录不可删；- 顶层目录不可改名。 */
+           - 只能建默认目录；- 任何顶层目录不可删；- 顶层目录不可改名。
+           建目录另有一条 AOSP 旁路：isDirAccessAllowedForFuse 在整段结构规则之前
+           先问 shouldBypassFuseRestrictions()，命中即放行——原生系统里持有
+           All files access 的应用根本不经过 MediaProvider 的 FUSE（vold 给它的是
+           lowerfs 直通视图），结构规则对它从来没有生效过。本项目把所有应用都收进
+           自己的代理视图，这条旁路必须由这里补回来，否则持有该能力的文件管理器
+           建不了顶层目录——比原生更严，且与同一目录下建文件成功自相矛盾（文件
+           创建不走这条规则）。 */
         if (q->op == NSP_ACL_OP_MKDIR) {
+            if (id->manage_external) return NSP_ACL_ALLOW;
             /* 先剥掉 <user_id> 层再取一级名：回调收到的是 "/0/Download" 这种形态，
                直接取首段会把 "0" 当名字，任何新建都被误拒。 */
             const char* seg = nullptr;
@@ -325,6 +333,14 @@ static void acl_log_deny(uid_t uid, const char* pkg, const char* path, NspAclOp 
             pkg ? pkg : "unknown", (int)op, path ? path : "nullptr", err);
 }
 
+/* 这次调用会不会用到「持有 All files access」这个事实：只有顶层目录的创建
+   会（见 fw_acl_decide 的 NSP_PATH_TOPLEVEL）。身份组装默认不填这一位——能力
+   查询是一次 appops 子进程调用（缓存见 fw_pkg.h），不该让每个 FUSE 回调为它
+   付钱——所以在这一条分支上按需补一次。 */
+static bool acl_wants_capability(const NspAclQuery* q) {
+    return q->op == NSP_ACL_OP_MKDIR && fw_acl_classify(q->path, nullptr, 0) == NSP_PATH_TOPLEVEL;
+}
+
 int fw_acl_check(uid_t uid, pid_t pid, const char* path, NspAclOp op, bool is_dir, int access_mask) {
     if (g_acl_test_uid) uid = g_acl_test_uid;
     if ((unsigned)uid < NSP_ACL_AID_APP_START) return 0;
@@ -333,6 +349,7 @@ int fw_acl_check(uid_t uid, pid_t pid, const char* path, NspAclOp op, bool is_di
     NspAclIdentity id;
     fw_acl_identity(uid, pid, &id);
     NspAclQuery q = {.uid = uid, .path = path, .op = op, .access_mask = access_mask, .is_dir = is_dir};
+    if (!id.manage_external && acl_wants_capability(&q)) id.manage_external = fw_pkg_manages_external(uid);
     NspAclVerdict v = fw_acl_decide(&q, &id);
     if (v == NSP_ACL_ALLOW) return 0;
     int err = fw_acl_errno(v);
