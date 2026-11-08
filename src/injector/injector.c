@@ -80,6 +80,11 @@ static int g_grepl_churn_n;
 static int g_grepl_churn_pos;
 static bool g_grepl_replaced_once;
 static int g_grepl_watch_fd = -1;
+/* 事件源不可用是持续状态而不是一次性事件：注册函数每个 tick 都被调用，
+   不加这两个标志就会按秒刷同一条告警。它们在「事件源重新可用」或对账记账
+   复位时清掉，于是一次不可用只留一条 WRN + 一条回落 INFO。 */
+static bool g_grepl_watch_warned;
+static bool g_grepl_fallback_logged;
 struct GlobalFuseInfo g_global_fuse = {.pid = 1,
                                        .fuse_pid = 0,
                                        .mnt_path = "/mnt/nsp_global",
@@ -1539,20 +1544,28 @@ static void grepl_watch_arm(void) {
     if (g_grepl_watch_fd >= 0 || g_epoll_fd < 0) return;
     int fd = ns_mnt_watch_open(g_global_fuse.pid);
     if (fd < 0) {
-        LOG_WRN("全局替换对账: 挂载表变化事件源不可用(%s)，稳态按 %ds 周期复查",
-                strerror(errno), GREPL_STEADY_SEC);
+        if (!g_grepl_watch_warned) {
+            g_grepl_watch_warned = true;
+            LOG_WRN("全局替换对账: 挂载表变化事件源不可用(%s)，稳态按 %ds 周期复查",
+                    strerror(errno), GREPL_STEADY_SEC);
+        }
         return;
     }
     /* 掩码必须为 0：mounts_poll 恒置 EPOLLIN（文件恒可读），带进掩码就是忙轮询；
        EPOLLERR 不受掩码约束，只留它才是「挂载表变了」的纯通知。 */
     struct epoll_event ev = {.events = 0, .data.fd = fd};
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0) {
-        LOG_WRN("全局替换对账: 事件源注册失败(%s)，稳态按 %ds 周期复查", strerror(errno),
-                GREPL_STEADY_SEC);
+        if (!g_grepl_watch_warned) {
+            g_grepl_watch_warned = true;
+            LOG_WRN("全局替换对账: 事件源注册失败(%s)，稳态按 %ds 周期复查", strerror(errno),
+                    GREPL_STEADY_SEC);
+        }
         close(fd);
         return;
     }
     g_grepl_watch_fd = fd;
+    g_grepl_watch_warned = false;  /* 事件源回来了：下次再坏值得重新报一条 */
+    g_grepl_fallback_logged = false;
     LOG_DBG("全局替换对账: 挂载表变化事件源就绪(/proc/%d/mountinfo)", g_global_fuse.pid);
 }
 
@@ -1579,6 +1592,15 @@ static void maybe_reconcile_global_replace(void) {
     int st = ns_global_status(g_global_fuse.pid, g_global_fuse.mnt_path);
     if (st == NSP_GLOBAL_STATUS_REPLACED) {
         g_grepl_next_sec = (g_grepl_watch_fd >= 0) ? GREPL_STEADY_EVENT : GREPL_STEADY_SEC;
+        if (g_grepl_watch_fd < 0 && !g_grepl_fallback_logged) {
+            /* 事件源不可用：此后没有任何东西会主动唤醒对账，族根变化只能等一个
+               周期才被发现。稳态判定每个周期都会走到这一行，故只报一次——这条
+               是现场判断「为什么新用户要等一个周期才接管」的唯一线索，级别 INFO
+               而不是 DEBUG。 */
+            g_grepl_fallback_logged = true;
+            LOG("全局替换对账: 事件源不可用，稳态回落到 %ds 周期复查（族根变化发现延迟上限为该周期）",
+                GREPL_STEADY_SEC);
+        }
         g_grepl_backoff = GREPL_RETRY_MIN_SEC;
         g_grepl_replace_gap = GREPL_RETRY_MIN_SEC;
         g_grepl_churn_n = 0; /* 收敛了：间隔闸的观察窗口清零 */

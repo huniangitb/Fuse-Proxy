@@ -269,6 +269,39 @@ def check_contracts():
     else:
         fail("稳态哨兵/兜底常量缺失")
 
+    # 事件源不可用是**持续状态**：注册函数每个 tick 都被调用，回落判定每个周期都
+    # 会走到。两处都必须自己防重，否则现场日志按秒刷同一条，真出问题时反而淹没。
+    arm = func_body(src, "grepl_watch_arm")
+    if re.search(r"if\s*\(!g_grepl_watch_warned\)", arm):
+        ok("事件源不可用的告警只报一次（注册每个 tick 都调用，否则按秒刷屏）")
+    else:
+        fail("事件源告警没有防重", "grepl_watch_arm 每 tick 调用一次，LOG_WRN 会按秒重复")
+    if "g_grepl_watch_warned = false" in arm and "g_grepl_fallback_logged = false" in arm:
+        ok("事件源恢复后复位标志，下次再坏重新报一条")
+    else:
+        fail("事件源恢复后没有复位", "一次失败会把后续所有回落都静音")
+
+    body = func_body(src, "maybe_reconcile_global_replace")
+    m = re.search(r"if\s*\(g_grepl_watch_fd\s*<\s*0\s*&&\s*!g_grepl_fallback_logged\)\s*\{(.*?)\n        \}",
+                  body, re.S)
+    if not m:
+        fail("回落周期复查时没有日志",
+             "现场看不出「族根变化为什么得等一个周期」，排查只能靠猜")
+    else:
+        blk = m.group(1)
+        if re.search(r"(^|\n)\s*LOG\(", blk):
+            ok("回落打的是 INFO 级日志（LOG），不是 DEBUG")
+        else:
+            fail("回落日志级别不对", "回落是现场排查线索，DEBUG 级在量产日志里看不到")
+        if "GREPL_STEADY_SEC" in blk:
+            ok("回落日志带上兜底周期秒数")
+        else:
+            fail("回落日志没写周期", "只说「回落到周期」等于没说多久一轮")
+        if blk.count("= true;") == 1 and "_logged" in blk:
+            ok("回落日志带一次性守卫（稳态判定每周期都会走到这一行）")
+        else:
+            fail("回落日志没有一次性守卫", "不防重就是按周期刷屏")
+
 
 # ── 沙箱执行体 ──────────────────────────────────────────────────────────────
 
