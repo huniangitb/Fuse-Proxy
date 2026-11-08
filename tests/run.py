@@ -392,6 +392,17 @@ SUITE_MAP = [
      ("nsp_retry_schedule", "nsp_retry_next", "nsp_retry_done", "nsp_retry_backoff_ms",
       "nsp_retry_next_due_ms", "nsp_retry_now_ms"),
      "挂载失败重试记账（重试收敛 / 毫秒三档退避 / 放弃 / 清账 / 到期时刻）"),
+
+    # 新建条目的权限值：mode 以调用方为准，父目录只提供属主与 setgid。
+    # 判别点在「谁说了算」——旧实现用父目录整份 mode 覆盖调用方 mode，于是
+    # umask 与应用显式的 0600/0700 一起失效，父目录被写成 2700 后还会自我繁殖
+    # （2700 下再 mkdir 还是 2700）。真挂载上按不同 umask 建目录/建文件取值，
+    # 并验证顶层目录的 chmod 被丢弃。
+    (("test_entry_perms.py",),
+     ("src/core/common.c", "include/common.h", "src/daemon/fuse_daemon.c",
+      "src/daemon/fw_acl.c", "src/daemon/fw_acl.h"),
+     ("nsp_new_entry_attrs", "fw_acl_is_structure_entry", "fw_acl_repair_storage_toplevel"),
+     "新建条目权限值(mode 以调用方为准) / 顶层目录 chmod 丢弃"),
 ]
 
 
@@ -471,6 +482,7 @@ LAYERS = {
             "test_negative_timeout.py",
             "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
+            "test_entry_perms.py",
             "test_modules.py",
             "test_module_circuit.py",
             "test_backend_lifecycle.py",
