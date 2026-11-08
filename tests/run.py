@@ -644,9 +644,13 @@ def layer_suites(layers):
 #
 # Tier 0 = 宿主零副作用的套件：判据是「不进宿主命名空间挂载、不 bind 固定端口、
 # 不做全局 pkill、不碰系统 log_monitor 与真实日志文件」（规则文件/工作目录自管即可，
-# mkdtemp 或自有 BASE 都算）。这类套件与谁都能同时跑，故不受挂载互斥约束。
-# 不在本名单里的套件按「会动宿主挂载」对待，与其他挂载类并发、与 QUIET_ON_HOST
-# 互斥（见下面「并行调度」段）。新套件默认按挂载类对待，要进白名单须先核对判据。
+# mkdtemp 或自有 BASE 都算）。这类套件彼此之间、以及与其他挂载类都能同时跑。
+# 「自管 daemon、只杀自己那个 pid」不构成豁免：daemon 一挂载就落进宿主命名空间，
+# 那一次挂载对断言 mountinfo 零变化的套件就是实打实的污染（判据里「不进宿主命名
+# 空间挂载」就是这一条）。所以起 daemon 的套件一律按挂载类对待，哪怕它自己收尾
+# 收得干净。
+# 不在本名单里的套件按「会动宿主挂载」对待，与 QUIET_ON_HOST 互斥（见「并行调度」段）。
+# 新套件默认按挂载类对待，要进白名单须先核对判据。
 PARALLEL_SAFE = frozenset({
     "test_docs_sync.py",          # 纯静态读文件（文档/台账一致性），无子进程/无挂载
     "test_acl.py",                # cc 直编 fw_acl.c + 纯逻辑驱动，TemporaryDirectory，无挂载
@@ -667,7 +671,6 @@ PARALLEL_SAFE = frozenset({
     "test_events_owner.py",       # cc 直编 nsp_events_status.c + 只读 /proc 快照，不起 daemon
     "test_crash_tail.py",         # cc 直编 crash_tail.c 纯函数，无文件/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
-    "test_backend_lifecycle.py",  # MNT/CONF 全由 mkdtemp 派生，自管 daemon（精确杀自身 pid）
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
     "test_pending_close.py",      # cc 直编队列实现 + 驱动，TemporaryDirectory，无挂载
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
@@ -810,6 +813,19 @@ def claim_of(name):
     return SUITE_RESOURCES.get(name, frozenset()), mode
 
 
+def can_start(mode, st, quiet_left):
+    """调度门：现在能不能再放一个套件进来。
+
+    quiet 是「断言宿主挂载表全程零变化」的姿态，必须全场没有别人在跑——别的套件
+    一次挂载对它就是一次变化，所以连另一个 quiet 也不能并存（它们各自比对自己
+    那份 mountinfo 快照）。mount / free 反过来要等安静套件跑完且队列清空，否则
+    安静套件永远等不到「零读者」那一刻（写者优先，防饥饿）。
+    """
+    if mode == "quiet":
+        return st["running"] == 0
+    return not st["writer"] and quiet_left == 0
+
+
 def report_parallel(name, rc, dt, out):
     """并行套件的输出：整块打印，避免多套件在终端里交错。"""
     print(f"\n{'━' * 60}\n▶ {name}（并行，{dt:.1f}s）\n{'━' * 60}", flush=True)
@@ -824,8 +840,9 @@ def run_pool(suites, jobs):
     """按资源门调度：能立刻开跑的套件才占 worker，返回 {套件名: (rc, dt, out)}。
 
     与「白名单并行、其余串行」的区别：worker 不再空等。资源冲突只让**那一个**
-    套件排队（挂载类彼此不冲突，照样并发），要求宿主挂载表零变化的套件则等到
-    没有任何挂载类在跑；写者等待期间不再放新的挂载类进来，免得安静套件饿死。
+    套件排队（挂载类彼此不冲突，照样并发）。安静姿态（要求宿主挂载表零变化）是
+    排他的：它开跑时全场必须已经空了，跑的过程中也不再放任何套件进来——一次外来
+    挂载就能把它的前后快照比对搞红，且这种红是间歇的、很难复现。
     """
     done = {}
     cv = threading.Condition()
@@ -837,11 +854,7 @@ def run_pool(suites, jobs):
         res, mode = claim_of(name)
         if st["busy"] & res:
             return False
-        if mode == "quiet":
-            return not st["writer"] and st["readers"] == 0
-        if mode == "mount":
-            return not st["writer"] and quiet_left == 0
-        return True
+        return can_start(mode, st, quiet_left)
 
     def worker(name, res, mode):
         rc, dt, out = run_suite(name, True)

@@ -247,6 +247,47 @@ def check_tiers(run, mapped):
     for r, names in sorted(owners.items()):
         if len(names) < 2:
             print(f"  ⚠ 资源 {r} 只有 {names[0]} 使用（不与任何人互斥，可从表里删掉）")
+    check_sched_gate(run)
+    checked += 1
+
+
+def check_sched_gate(run):
+    """调度门的语义与「无挂载白名单」的准入判据。
+
+    这两件事都不靠肉眼：门写松了只在特定交错下假红（间歇失败最难查），白名单写
+    宽了只在别处有并发时才露馅。"""
+    global checked
+    gate = getattr(run, "can_start", None)
+    if gate is None:
+        fail("[调度] run.py 缺少 can_start()——调度门必须是一个可单独断言的纯函数")
+        return
+    empty = {"running": 0, "readers": 0, "writer": False}
+    busy = {"running": 1, "readers": 0, "writer": False}
+    quiet_running = {"running": 1, "readers": 0, "writer": True}
+    if not gate("quiet", empty, 0):
+        fail("[调度] 全场空闲时安静套件也开不了跑")
+    if gate("quiet", busy, 0):
+        fail("[调度] 安静套件与别的套件并存——一次外来挂载就会把它的 mountinfo 比对搞红")
+    if gate("quiet", quiet_running, 0):
+        fail("[调度] 两个安静套件并存：它们各自比对，彼此就是对方的污染源")
+    if gate("mount", quiet_running, 1):
+        fail("[调度] 安静套件在跑时放进了挂载类")
+    if gate("mount", empty, 1):
+        fail("[调度] 安静套件还在排队时放进了挂载类（写者会被饿死）")
+    if not gate("mount", empty, 0):
+        fail("[调度] 没有安静套件时挂载类被挡住")
+    if not gate("free", empty, 0):
+        fail("[调度] 没有安静套件时 Tier 0 套件被挡住")
+    # 准入判据：白名单声称「不进宿主命名空间挂载」，因此真正起挂载的套件不能待在
+    # 里面（Tier 0 的意义是「与谁都能同时跑」，破了这条它就是宿主挂载表上的不定时
+    # 污染源）。判据取「命令列表首元素」这一调用形态——工具名被引号括住、紧跟逗号：
+    # 只是 shutil.which() 探前置、或在文档字符串里提到工具名的套件不算。
+    MOUNT_CALL = re.compile(r"""["']fusermount3["']\s*,""")
+    for s in sorted(run.PARALLEL_SAFE):
+        body = read(os.path.join("tests", s))
+        if body and MOUNT_CALL.search(body):
+            fail(f"[Tier] tests/{s} 会自己做挂载，不能进 PARALLEL_SAFE"
+                 f"（按挂载类调度即可，挂载类彼此照常并发）")
     checked += 1
 
 
