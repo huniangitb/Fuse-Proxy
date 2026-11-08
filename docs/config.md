@@ -20,6 +20,8 @@
 
 `CONFIG_DIR` Android 为 `/data/Namespace-Proxy`、GNU 为 `/var/fuse-proxy`（见 `include/nsp_constants.h`，`common.h` 以别名暴露）。目录名约定：**uid 0 用 `App-rules`，uid 非 0 用 `App-rules-<uid>`**（由 `nsp_app_rule_dir` 合成）。主文件先加载，再扫描各 `App-rules*/` 目录；一个 `<pkg>.conf` 对应一个应用；目录缺失时仅 injector 会创建（只读加载方不 mkdir）。
 
+**注入方法（v1/v2/v3）是运行期控制项，不写在配置里**：文件 `<CONFIG_DIR>/inject_method` 写一行 `v1`/`v2`/`v3`，再 `kill -HUP <injector pid>` 即生效，不用重启设备。切换是一次显式迁移：切到 v1 先把三族族根从备份还原成系统视图（失败则保持原方法不动），切到 v2/v3 立刻对账一次全局替换；随后应用对账按新方法执行。启动时该文件优先于 `--inject-method=` 参数，缺失或写错保持当前方法。
+
 **所有功能都可只写在单一 `injector.conf` 内**（全局段 + 各应用段并列），规则膨胀后再平滑迁移到分文件，解析语义一致。
 
 ## 2. 段头

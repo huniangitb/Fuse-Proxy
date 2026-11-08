@@ -1855,6 +1855,14 @@ int main(int argc, char* argv[]) {
     bool start_passive = false;
     parse_cli_args(argc, argv, &start_passive);
     injector_early_init();
+    /* 运行期方法文件优先于 argv：切换过一次就是持久选择（argv 只是首次默认值），
+       否则重启会把用户显式切到的方法悄悄改回去。日志在 early_init 之后才可用。 */
+    InjectMethod persisted_method = read_inject_method_file();
+    if (persisted_method != 0 && persisted_method != g_inject_method) {
+        LOG("注入方法: 覆盖启动参数 v%d -> v%d（来自 %s）", (int)g_inject_method,
+            (int)persisted_method, INJECT_METHOD_PATH);
+        g_inject_method = persisted_method;
+    }
     const char* method_desc = g_inject_method == INJECT_METHOD_V1   ? "逐应用挂载"
                               : g_inject_method == INJECT_METHOD_V2 ? "全局替换，非目标应用还原"
                                                                     : "全局替换，不还原非目标（默认全局挂载）";
