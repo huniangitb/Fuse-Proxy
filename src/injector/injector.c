@@ -1362,36 +1362,6 @@ static void injector_setup_epoll(InjectorFds* fds) {
     fds->due_fd = due_fd;
 }
 
-/* 管理面（log_ctl / rule_server / 前端 UDS）靠该文件定位注入器：内容只有一行
-   PID，先写临时文件再 rename，读方不会读到半截数字，也不会读到被截断的旧值 */
-static void write_injector_pid_file(void) {
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", INJECTOR_PID_PATH);
-    FILE* fp = fopen(tmp, "w");
-    if (!fp) {
-        PERROR("无法写入注入器 PID 文件");
-        return;
-    }
-    fprintf(fp, "%d\n", (int)getpid());
-    fflush(fp);
-    fsync(fileno(fp));
-    fclose(fp);
-    if (rename(tmp, INJECTOR_PID_PATH) != 0) {
-        unlink(tmp);
-        PERROR("无法更新注入器 PID 文件");
-    }
-}
-
-/* 退出时清理；文件里不是本进程号时不动——热重启期间那可能是新实例刚写的 */
-static void remove_injector_pid_file(void) {
-    int pid = -1;
-    FILE* fp = fopen(INJECTOR_PID_PATH, "r");
-    if (!fp) return;
-    if (fscanf(fp, "%d", &pid) != 1) pid = -1;
-    fclose(fp);
-    if (pid == (int)getpid()) unlink(INJECTOR_PID_PATH);
-}
-
 static void injector_start_fuses(bool start_passive) {
     g_config_pub_fd = config_publisher_init();
     strcpy(g_real_root, STORAGE_BASE);
@@ -1404,8 +1374,6 @@ static void injector_start_fuses(bool start_passive) {
        允许 mkdir App-rules / App-rules-<uid>；fuse_daemon/log_ctl 等
        只读加载方保持默认 false，杜绝伪用户目录固化 */
     config_set_allow_app_rules_mkdir(true);
-    write_injector_pid_file();
-    atexit(remove_injector_pid_file);
     reload_injector_config();
     int wait_count = 0;
     while (faccessat(g_global_root_fd, "data/media/0", F_OK, 0) != 0 && wait_count < 120 &&
