@@ -183,6 +183,13 @@ int common_mkdir_within_storage(const char* p, mode_t m) {
     return 0;
 }
 
+/* 落位属性重挂（实际实现见 src/core/common.c，vfs_rename 在 rename 成功后调用）：
+   本驱动只判跨设备回退的 R1/R2 语义，属性收尾与 rename 的成败无关，故给空实现；
+   落位属性本身由 test_move_landing.py 在真挂载上验。 */
+void nsp_rehome_moved_entry(const char* p) {
+    (void)p;
+}
+
 /* ---- --wrap=rename：第一次调用强制 EXDEV，进入跨设备回退 ---- */
 static int g_force_exdev;
 int __real_rename(const char*, const char*);

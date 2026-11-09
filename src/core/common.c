@@ -319,6 +319,82 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
 #endif
 }
 
+/* 条目落位后的属性重挂（rename 的唯一收尾）。
+
+   rename(2) 只换名字、不换属性：条目会带着**来源树**的属主与 mode 落地。应用私有
+   树的条目属主是应用 uid、mode 常被应用自己的 umask 削到 0600；一旦被搬进共享
+   存储（"下载到 /sdcard"这类另存动作就是 rename），MediaProvider 会以调用方凭证
+   去读这个**他属主**的文件——实测同一目录里属主为应用的 0600 条目，除写入者自己
+   以外的应用全部 open EACCES，而属主为存储卷所有者的同名条目可读。新建条目没有
+   这个问题（属主本就跟随父目录），
+   缺口只在 rename 这条「不产生新条目」的路径上。
+
+   口径：属主/属组跟随目标父目录（与 nsp_new_entry_attrs 同一条规则），共享存储的
+   落点再补上存储层的历史 mode 形状（文件 0660、目录 0770——只加位、不减位，调用方
+   显式的 0644/0755 与其它位都保留；目录的 setgid 跟随父目录）。SELinux 上下文照抄
+   父目录，与新建条目同一个来源。
+
+   只在「属主或属组与目标父目录不同」时动手：共享存储内部的改名不该顺手放宽 mode
+   （那是应用自己的文件，mode 是它选的）。应用私有树（<存储根>/<uid>/Android/
+   {data,obb,media}）的落点一律不动——那里的属主由 installd 的 ACL 体系决定，把这
+   一套搬进去只会造出第二个共享存储。
+
+   失败不致命：属性没挂上是可访问性问题，不该让 rename 本身失败（源可能已删，回滚
+   只会连搬移一起丢掉），故只记日志。符号链接跳过：chmod 会穿透链接改到目标文件。 */
+void nsp_rehome_moved_entry(const char* real_path) {
+    if (!real_path || real_path[0] != '/') return;
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof(base));
+    size_t blen = strlen(base);
+    if (blen == 0 || strncmp(real_path, base, blen) != 0 || real_path[blen] != '/') return;
+    /* 用户层之后的相对路径判私有树：只认根层的 Android/{data,obb,media}，
+       同名深层目录（应用自己建的 /sdcard/x/Android/data）不算私有树 */
+    int user_id = -1;
+    const char* sub = NULL;
+    if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return;
+    static const char* const k_private_trees[] = {"/Android/data", "/Android/obb", "/Android/media"};
+    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
+        size_t tlen = strlen(k_private_trees[i]);
+        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
+            return;
+    }
+    struct stat est;
+    if (lstat(real_path, &est) != 0) return; /* 已不在（并发删）：无事可做 */
+    if (S_ISLNK(est.st_mode)) return;
+    char parent[PATH_MAX];
+    int wn = snprintf(parent, sizeof(parent), "%s", real_path);
+    if (wn <= 0 || (size_t)wn >= sizeof(parent)) return;
+    char* slash = strrchr(parent, '/');
+    if (!slash || slash == parent) return;
+    *slash = '\0';
+    struct stat pst;
+    if (lstat(parent, &pst) != 0) return;
+    if (est.st_uid == pst.st_uid && est.st_gid == pst.st_gid) return;
+    if (lchown(real_path, pst.st_uid, pst.st_gid) != 0)
+        LOG_WRN("落位条目改属主失败: path=%s uid=%u gid=%u errno=%d", real_path,
+                (unsigned)pst.st_uid, (unsigned)pst.st_gid, errno);
+    mode_t want = est.st_mode & 07777;
+    mode_t final_mode = want | (S_ISDIR(est.st_mode) ? 0770 : 0660);
+    if (S_ISDIR(est.st_mode))
+        final_mode =
+            (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
+    if (final_mode != want && chmod(real_path, final_mode) != 0)
+        LOG_WRN("落位条目改 mode 失败: path=%s mode=%04o errno=%d", real_path,
+                (unsigned)final_mode, errno);
+#ifdef TARGET_ANDROID
+    char context[256];
+    ssize_t ctx_len = lgetxattr(parent, "security.selinux", context, sizeof(context));
+    if (ctx_len > 0) {
+        lsetxattr(real_path, "security.selinux", context, (size_t)ctx_len, 0);
+    } else if (strncmp(real_path, STORAGE_BASE, sizeof(STORAGE_BASE) - 1) == 0) {
+        lsetxattr(real_path, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
+                  sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
+    }
+#endif
+    LOG("落位条目重挂属性: path=%s uid=%u gid=%u mode=%04o -> %04o", real_path,
+        (unsigned)pst.st_uid, (unsigned)pst.st_gid, (unsigned)want, (unsigned)final_mode);
+}
+
 /* 父目录补建时的收尾：中间目录没有「调用方 mode」，用 mkdir 时给的 mode 作
    权威值（同一趟循环里的 mode 参数），语义与其余创建路径完全一致。 */
 static void inherit_from_parent(const char* real_path, mode_t mode) {
