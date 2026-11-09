@@ -73,8 +73,10 @@ RESOLVE_CASES = [
     ("sandbox.conf", 10123, "/0/Documents/d.docx", "/0/Android/data/com.demo.app/sandbox/Documents/d.docx", None),
     # 自己的 data/obb 不重定向（沙盒是隔离"别的应用的数据"，不是自己的）
     ("sandbox.conf", 10123, "/0/Android/data/com.demo.app/own.txt", "/0/Android/data/com.demo.app/own.txt", None),
-    # /Android 下非 data/obb（如 media）不重定向
-    ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin", "/0/Android/media/com.other.app/m.bin", None),
+    # 他包 media 不在让位清单内（让位只有 /Android/data|obb|media 三个容器本身与
+    # 应用自己的 /Android/{data,obb,media}/<pkg>）：整树进镜像
+    ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin",
+     "/0/Android/data/com.demo.app/sandbox/Android/media/com.other.app/m.bin", None),
     # 别的应用的 data 子树不归沙盒改写：沙盒对它让位，落回真实路径交隔离层按调用方
     # 能力档裁决——没有能力/显式声明的调用方在这里被隔离（missing），镜像里不出现
     # 他包路径

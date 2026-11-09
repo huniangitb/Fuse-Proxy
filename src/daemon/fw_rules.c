@@ -324,6 +324,38 @@ static bool br_path_other_app_subtree(const char* sub_path, const char* current_
     return false;
 }
 
+/* Android 树里必须留在真实目录上的部分——沙盒不接管，落回原生裁决：
+   1. `/Android/data|obb|media` 三个容器本身：ACL 当骨架目录（readdir 由 ACL
+      拒绝），容器内每个 `<pkg>` 要单独按调用方能力裁决，镜像化后这些裁决全部
+      对着空目录做，等于把容器的语义抹掉；
+   2. 调用方自己在三个容器里的私有目录：原生在这里提供挂载点、引用、媒体扫描
+      等行为，镜像会把它降级成一个普通目录；
+   3. 他包 `Android/data|obb` 子树：由调用方另行经 br_path_other_app_subtree
+      让位，交回隔离判据（沙盒不参与跨应用裁决）。
+
+   `/Android` 本身不在让位之列：它必须和应用新建的条目一样指向镜像，否则应用
+   创建完再列举会发现条目不见了（镜像里有、真实目录里没有）。 */
+static bool br_path_android_passthrough(const char* sub_path, const char* current_pkg) {
+    if (!sub_path || !current_pkg || !current_pkg[0]) return false;
+    if (strncmp(sub_path, "/Android", 8) != 0) return false;
+    if (sub_path[8] != '\0' && sub_path[8] != '/') return false;
+    static const char* const k_containers[] = {"/Android/data", "/Android/obb", "/Android/media"};
+    const size_t pkg_len = strlen(current_pkg);
+    for (size_t i = 0; i < sizeof(k_containers) / sizeof(k_containers[0]); i++) {
+        const char* container = k_containers[i];
+        const size_t clen = strlen(container);
+        if (strncmp(sub_path, container, clen) != 0) continue;
+        if (sub_path[clen] == '\0' || (sub_path[clen] == '/' && sub_path[clen + 1] == '\0'))
+            return true; /* 容器本身（含尾斜杠写法） */
+        if (sub_path[clen] != '/') continue; /* /Android/database 之类：不是这个容器 */
+        const char* rest = sub_path + clen + 1;
+        if (strncmp(rest, current_pkg, pkg_len) == 0 &&
+            (rest[pkg_len] == '\0' || rest[pkg_len] == '/'))
+            return true; /* 自己包名的私有目录 */
+    }
+    return false;
+}
+
 /* 目标是否落在 Android/obb 下：安装器那一档的放行面只有这一类。 */
 static bool br_path_is_obb_subtree(const char* sub_path) {
     return sub_path && strncmp(sub_path, "/Android/obb/", 13) == 0;
@@ -812,27 +844,10 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
 
     if (!skip_sandbox && c->sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
         strcmp(current_pkg, "unknown") != 0) {
-        if (strncmp(sub_path, "/Android", 8) == 0) {
-            if (sub_path[8] == '\0' || sub_path[8] == '/') {
-                bool is_data = (strncmp(sub_path, "/Android/data", 13) == 0 &&
-                                (sub_path[13] == '\0' || sub_path[13] == '/'));
-                bool is_obb = (strncmp(sub_path, "/Android/obb", 12) == 0 &&
-                               (sub_path[12] == '\0' || sub_path[12] == '/'));
-                if (!is_data && !is_obb) return false;
-            }
-        }
-        char exp_data[MAX_PATH_LEN], exp_obb[MAX_PATH_LEN];
-        snprintf(exp_data, sizeof(exp_data), "/Android/data/%s", current_pkg);
-        snprintf(exp_obb, sizeof(exp_obb), "/Android/obb/%s", current_pkg);
-        size_t elen_data = strlen(exp_data), elen_obb = strlen(exp_obb);
-        if (strcmp(sub_path, "/Android/data") == 0 || strcmp(sub_path, "/Android/data/") == 0 ||
-            strcmp(sub_path, "/Android/obb") == 0 || strcmp(sub_path, "/Android/obb/") == 0 ||
-            (strncmp(sub_path, exp_data, elen_data) == 0 &&
-             (sub_path[elen_data] == '\0' || sub_path[elen_data] == '/')) ||
-            (strncmp(sub_path, exp_obb, elen_obb) == 0 &&
-             (sub_path[elen_obb] == '\0' || sub_path[elen_obb] == '/'))) {
-            return false;
-        }
+        /* Android 树下只有三处留在真实目录上（见 br_path_android_passthrough
+           的说明），其余整树进镜像：应用在这里新建的条目必须落镜像，否则沙盒
+           形同虚设。 */
+        if (br_path_android_passthrough(sub_path, current_pkg)) return false;
         /* 他包 Android/data|obb 子树不归沙盒管：原生这里由 MediaProvider 按调用方
            能力/挂载模式裁决（放行，或者 ENOENT），沙盒把它改写成自己的镜像会掩盖
            那个裁决——能力放行者读到空目录，非放行者拿到的 ENOENT 也不是原生的原因。

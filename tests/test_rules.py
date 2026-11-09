@@ -212,6 +212,47 @@ def isolation_section():
         ("/0/Android/data/com.other.app/f",{"resolve":1,"probe":1,"sandbox":0}),
         ("/0/Download/q.txt",{"resolve":0,"probe":0,"sandbox":1}),
     ],uid_map=own,global_want=1)
+    # (4b) SANDBOX ON 下的 /Android：三个容器与调用方自己的私有目录留在真实
+    #      目录，其余（含 /Android 本身）整树进镜像——应用在这里新建的条目必须
+    #      改写到镜像落点，写进真实目录就等于沙盒没开。
+    sb = BASE + "[com.demo.app]\nSANDBOX ON\n"
+    case("沙盒整树:/Android 非私有路径", sb, 10123, [
+        ("/0/Android/123.txt",{"sandbox":1}),
+        ("/0/Android/xxx",{"sandbox":1}),
+        ("/0/Android/obj/dex/classes.dex",{"sandbox":1}),
+        ("/0/Android/media/com.other.app/x",{"sandbox":1}),
+        ("/0/Android/media/com.demo.app2/x",{"sandbox":1}),
+        ("/0/Android",{"sandbox":1}),
+        ("/0/Android/data",{"sandbox":0}),
+        ("/0/Android/obb",{"sandbox":0}),
+        ("/0/Android/media",{"sandbox":0}),
+        ("/0/Android/data/com.demo.app/files/x",{"sandbox":0}),
+        ("/0/Android/obb/com.demo.app/x",{"sandbox":0}),
+        ("/0/Android/media/com.demo.app/x",{"sandbox":0}),
+        ("/0/Android/data/com.other.app/f",{"sandbox":0}),
+    ], uid_map=own)
+    # 落点逐条钉住：sandbox 位只说"改了"，改到哪必须对上（镜像落点 = 应用沙盒
+    # 目录下同一个 sub_path；让位的路径则原样落真实目录）。
+    glob,got = drive(sb, 10123, ["/0/Android/123.txt","/0/Android/xxx",
+                                 "/0/Android/data/com.demo.app/files/x",
+                                 "/0/Android/media/com.demo.app/x"], uid_map=own)
+    if glob is not None:
+        for path,suffix in (
+                ("/0/Android/123.txt","/0/Android/data/com.demo.app/sandbox/Android/123.txt"),
+                ("/0/Android/xxx","/0/Android/data/com.demo.app/sandbox/Android/xxx"),
+                ("/0/Android/data/com.demo.app/files/x","/0/Android/data/com.demo.app/files/x"),
+                ("/0/Android/media/com.demo.app/x","/0/Android/media/com.demo.app/x"),
+        ):
+            real = (got.get(path) or {}).get("real","")
+            if real.endswith(suffix): ok(f"沙盒落点｜{path}")
+            else: fail(f"沙盒落点｜{path}", f"期望落点以 {suffix} 结尾，实测 '{real}'")
+    # HIDE 与 ALLOW 在沙盒之前/之后都要按原语义生效：HIDE 仍不可见，ALLOW 仍回
+    # 真实路径（不因"整树进镜像"把两条显式规则吃掉）。
+    case("沙盒整树:HIDE 优先", BASE + "[com.demo.app]\nSANDBOX ON\nHIDE /Android/123.txt\n",
+         10123, [("/0/Android/123.txt",{"resolve":1,"probe":1})], uid_map=own)
+    case("沙盒整树:同段 ALLOW 豁免",
+         BASE + "[com.demo.app]\nSANDBOX ON\nALLOW /Android/123.txt\n", 10123,
+         [("/0/Android/123.txt",{"redir":1,"sandbox":0})], uid_map=own)
     # (5) 多开/隔离进程后缀（<pkg>:push，走 /proc 回退）：基础包名比较不得把
     #     自己的包判成他包（否则应用连自己的 data 都打不开）
     case("进程后缀",BASE,10123,[

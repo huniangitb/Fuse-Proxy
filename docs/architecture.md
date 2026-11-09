@@ -178,7 +178,7 @@ FUSE 回调（如 getattr）
 1. **应用段**：先静态（Trie 命中，`TrieMatch.redir`/`redir_scope`），再线性（含通配/变量的 `redir_rules`）。
 2. **类别段**（`USER_APPS[:uid]` / `SYSTEM_APPS`）：同上。
 3. **`[GLOBAL]`**：同上。
-4. **sandbox 重定向**：`SANDBOX ON` 时，除应用自身 `/Android/data|obb/<pkg>` 外的访问重定向到 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox/`（目录名默认 `sandbox`，可经 `[GLOBAL]` 段 `SANDBOX_DIR` 配置项覆盖，配置发布单点下发；三层 OFF 否决语义见 `config.md` §2/§3）。
+4. **sandbox 重定向**：`SANDBOX ON` 时，除让位路径（`/Android/data|obb|media` 三个容器本身、应用自身 `/Android/{data,obb,media}/<pkg>`、他包 `Android/data|obb` 子树）之外的访问一律重定向到 `<STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox/`（目录名默认 `sandbox`，可经 `[GLOBAL]` 段 `SANDBOX_DIR` 配置项覆盖，配置发布单点下发；三层 OFF 否决语义见 `config.md` §2/§3）。`/Android` 本身也在镜像内——应用在它下面新建的条目（`/Android/123.txt`、`/Android/<自己建的目录>`）必须落镜像，落真实目录等于沙盒没开。
 5. **fallback**：`STORAGE_BASE/<user_id><sub_path>`。
 
 > Trie 与线性通道是**同一作用域内的等价实现**——Trie 只是静态规则的加速索引，不是更高的优先级层：同层内静态命中先于该层线性规则，但**跨作用域不得互相压过**。旧实现先取「任一作用域的静态命中」再才看线性，于是 `[GLOBAL]` 的静态 REDIRECT 会压过应用/类别段的通配/变量规则（与 `config.md` §2 相反，`test_rules.py` §21 守护）。
@@ -192,7 +192,7 @@ FUSE 回调（如 getattr）
 
 能力档 `NspXAppAccess`（`fw_rules.h` 的 `nsp_xapp_access_of()` 是排序的唯一出处）：`FULL`（白名单 / platform 签名 / `MANAGE_EXTERNAL_STORAGE`）放行 `data` 与 `obb`，`OBB`（能装包：`INSTALL_PACKAGES` 权限或 `REQUEST_INSTALL_PACKAGES` appop）只放行 `obb`，`NONE` 隔离。这三档对应原生挂载模式的两档（`PASS_THROUGH` 与他包 `obb` 的 `INSTALLER`），逐格依据见 `reports/2026-11-09-cross-app-allow-and-sandbox.md`。resolve 侧（`br_isolation_blocks`）与 readdir 列举（`br_isolation_hides`）是同一实现 `br_isolation_impl` 的两个入口，差别只在隔离命中时记不记日志；`fuse_daemon` 的列举过滤与 ACL 的 `NSP_PATH_OWNED` 分支调同一判据（前者 `fw_rules_cross_app_access`，后者经 `nsp_xapp_access_of`），三处不会分叉。
 
-**沙盒不再参与跨应用裁决**：`SANDBOX ON` 的调用方访问他包 `Android/data|obb` 子树时，`br_to_real_path` 的沙盒分支直接落回真实路径（`br_path_other_app_subtree` 判定），不做镜像改写——改写会把原生的判据整个掩盖掉（能力放行者读到空目录，非放行者拿到的 ENOENT 也不是原生那个原因）。旧实现是「沙盒生效即无条件豁免隔离」，那条口子随沙盒让位一并删掉，否则沙盒 ON 反而比原生更松。已知边界：`uid.map` 是 uid→单包名，旧 `sharedUserId` 共享 uid 的两个应用会互判「他包」——现代 Android 上罕见，逃生阀同上（见 `config.md` §4.1）。
+**沙盒不参与跨应用裁决，也不接管 `/Android` 的原生子树**：`SANDBOX ON` 的调用方访问下面四类路径时，`br_to_real_path` 的沙盒分支直接落回真实路径，不做镜像改写——他包 `Android/data|obb` 子树（`br_path_other_app_subtree`）、三个容器本身 `/Android/data|obb|media`、应用自己在三个容器里的私有目录（后两者由 `br_path_android_passthrough` 判定）。改写会把原生的判据整个掩盖掉（能力放行者读到空目录，非放行者拿到的 ENOENT 也不是原生那个原因）；容器本身让位还有一层：ACL 把三者当骨架目录（readdir 由 ACL 拒绝），容器里每个 `<pkg>` 要单独按调用方裁决，镜像化后这些裁决全部对着空目录做。这四类之外的 `/Android` 路径（`/Android/123.txt`、`/Android/<自己建的目录>`、他包 `/Android/media/<他包>`）与其它共享目录一样进镜像。旧实现是「沙盒生效即无条件豁免隔离」，那条口子随沙盒让位一并删掉，否则沙盒 ON 反而比原生更松。已知边界：`uid.map` 是 uid→单包名，旧 `sharedUserId` 共享 uid 的两个应用会互判「他包」——现代 Android 上罕见，逃生阀同上（见 `config.md` §4.1）。
 
 **backing 直通只在 media 实例里开**（`vfs_backing_setup`）：全局实例（服务所有被注入应用，dentry 全应用共用）**一个 dentry 也不挂 backing**，全部回落 daemon 全权 mediation。两条理由：① 隔离开生效时 `data`/`obb` 的可见性取决于调用方，backing 之后内核绕过 daemon，per-caller 裁决无从落地（该子树此前直通等于隔离整体失效）；② 更要紧的是 DAC——backing 之后的下层 I/O 由内核在**发起请求的应用进程上下文**里直接打到真实文件（lookup/create/opendir 都按调用方凭证判），而 `/data/media/0` 整棵树归 MediaProvider（`10277:1023`、顶层目录 `0770`、属组 `media_rw`），任何应用都过不了。backing 结论按 dentry 缓存、无法按调用方分别裁决，故共享实例上这条路只能整体关掉（线上实测：只写 `ALLOW /Download` 或不写路径规则时，注入后的应用写 `/Download` 反被内核 EACCES 拒绝）。media 实例（`--media-fuse`，调用方恒为 MediaProvider）保留直通，按路径门 `fw_backing_mediation_required_for()` 逐路径裁决。
 
