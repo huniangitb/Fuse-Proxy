@@ -241,6 +241,23 @@ public final class ProbeApp extends Application {
                 "NSP_PROBE_ISO_DOWNLOAD:" + stamp);
         steps += isoFileStep("pictures", new File(base, "Pictures/nsp_probe_sandbox.jpg"),
                 "NSP_PROBE_ISO_PICTURES:" + stamp);
+        // /Android 本身也在镜像内：应用在它下面新建的条目必须落镜像，并且能在
+        // 自己的列举里看到——写完就丢的条目等于没写成功。
+        File androidDir = new File(base, "Android");
+        steps += isoFileStep("android_root", new File(androidDir, "nsp_probe_sandbox.txt"),
+                "NSP_PROBE_ISO_ANDROID:" + stamp);
+        steps += listDirStep(androidDir, "android_list");
+        // 三处私有目录让位到真实目录（宿主预建并 chown 给本应用）。
+        steps += isoFileStep("android_obb_own",
+                new File(base, "Android/obb/" + pkg + "/nsp_probe_obb.txt"),
+                "NSP_PROBE_ISO_OBB:" + stamp);
+        steps += isoFileStep("android_media_own",
+                new File(base, "Android/media/" + pkg + "/nsp_probe_media.txt"),
+                "NSP_PROBE_ISO_MEDIA:" + stamp);
+        // ALLOW 豁免：宿主预建 /Android/nsp_probe_allow 并 chown 给本应用。
+        steps += isoFileStep("android_allow",
+                new File(base, "Android/nsp_probe_allow/nsp_probe_allow.txt"),
+                "NSP_PROBE_ISO_ALLOW:" + stamp);
         return steps;
     }
 
@@ -518,6 +535,11 @@ public final class ProbeApp extends Application {
 
     /** 列目录并输出 step=list：detail 为逗号分隔条目，空目录为 "-"。 */
     private int listDirStep(File dir) {
+        return listDirStep(dir, "list");
+    }
+
+    /** 同上，step 名可指定（同一场景里要列两个目录时装机侧才好区分）。 */
+    private int listDirStep(File dir, String step) {
         boolean ok = false;
         String detail;
         try {
@@ -532,7 +554,7 @@ public final class ProbeApp extends Application {
         } catch (Throwable t) {
             detail = "error=" + describe(t);
         }
-        emit("list", ok, detail);
+        emit(step, ok, detail);
         return 1;
     }
 
