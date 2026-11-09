@@ -202,19 +202,52 @@ bool fw_rules_path_has_uid_layer(const char* path);
    fw_acl 的「他包私有目录不可见」沿用同一开关，避免两处各自解释这条配置。 */
 bool fw_rules_cross_app_isolated(void);
 
-/* 跨应用隔离的**放行**判定（隔离生效时才有意义）。三条独立来源：
-   - 白名单：[GLOBAL] ALLOW_CROSS_APP_PKGS 里列了调用方包名（按调用方**自身**
-     包名精确比较，不做 uid 兜底，故同 uid 的兄弟包不会被顺带放行）；
-   - 特权：platform 签名应用（packages.list 的 seinfo）；
-   - 能力：MANAGE_EXTERNAL_STORAGE / legacy storage，**仅在**
-     [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON 时生效（默认关）。
-   fw_rules_cross_app_exempt() 是这条判定的**唯一**出口：resolve 侧
-   （br_isolation_blocks/hides）与 readdir 列举（vfs_entry_visibility）都调它，
-   三处各写一份组合会漏，漏一处的表现就是「列表里看不到、按名打开却成功」或反之。 */
-bool fw_rules_cross_app_exempt(const char* pkg, uid_t uid);
+/* 跨应用放行的**能力档**——对齐 Android 给调用方的挂载模式裁决：
+   NSP_XAPP_NONE = 无（MOUNT_MODE_EXTERNAL_DEFAULT：他包 data/obb 一律不可见）
+   NSP_XAPP_OBB  = 仅 Android/obb（MOUNT_MODE_EXTERNAL_INSTALLER：安装器读 obb 里的包）
+   NSP_XAPP_FULL = data 与 obb 全放（PASS_THROUGH / ANDROID_WRITABLE 等价） */
+typedef enum {
+    NSP_XAPP_NONE = 0,
+    NSP_XAPP_OBB = 1,
+    NSP_XAPP_FULL = 2,
+} NspXAppAccess;
+
+/* 能力判定的输入事实：fw_rules 的生产路径与 fw_acl 的身份组装各有一套来源，
+   但**排序只写一次**（下面的 nsp_xapp_access_of），避免出现
+   「规则层放行、ACL 层拒绝」这类割裂。 */
+typedef struct {
+    bool whitelisted;     /* [GLOBAL] ALLOW_CROSS_APP_PKGS 命中调用方自身包名 */
+    bool privileged;      /* platform 签名（对应 ANDROID_WRITABLE/PASS_THROUGH 那群宿主） */
+    bool gate;            /* [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY */
+    bool manage_external; /* MANAGE_EXTERNAL_STORAGE 授权 */
+    bool installer;       /* 能装包（INSTALL_PACKAGES / REQUEST_INSTALL_PACKAGES） */
+    bool is_obb;          /* 目标在 Android/obb 下：installer 只放行这一类 */
+} NspXAppFacts;
+
+/* 事实 → 有效档位（纯函数）。顺序：显式配置 > 签名特权 > 能力总闸之下
+   「MES 全放、安装器仅 obb」。总闸关掉时能力轴整体不生效（只剩前两条）。 */
+static inline NspXAppAccess nsp_xapp_access_of(const NspXAppFacts* f) {
+    if (!f) return NSP_XAPP_NONE;
+    if (f->whitelisted || f->privileged) return NSP_XAPP_FULL;
+    if (!f->gate) return NSP_XAPP_NONE;
+    if (f->manage_external) return NSP_XAPP_FULL;
+    if (f->installer && f->is_obb) return NSP_XAPP_OBB;
+    return NSP_XAPP_NONE;
+}
+
+/* 生产路径：按调用方包名/uid 现场取事实（appops 查询按需取、带 30s 缓存），
+   套上面那张表。is_obb 由调用方按目标路径给出。
+   fw_rules 的隔离判定（br_isolation_blocks/hides）与 readdir 列举
+   （vfs_entry_visibility）都走它；fw_acl 走 nsp_xapp_access_of + 身份字段。 */
+NspXAppAccess fw_rules_cross_app_access(const char* pkg, uid_t uid, bool is_obb);
 /* 白名单查询（仅包名维度，供日志/诊断与单测断言使用） */
 bool fw_rules_cross_app_pkg_allowed(const char* pkg);
-/* 能力豁免总闸（[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY，默认 OFF） */
+/* 能力开关（[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY，默认 ON = 与原生一致） */
 bool fw_rules_cross_app_capability(void);
+
+/* 该路径上是否存在**显式声明**（ALLOW / HIDE / RO / REDIRECT，任一作用域，
+   含通配与变量规则）。跨应用隔离是"没有规则时的默认边界"，显式规则优先于它：
+   ACL 侧在拒绝前回查这一条，规则侧在隔离判定里让位。 */
+bool fw_rules_path_declared(uid_t uid, pid_t pid, const char* path);
 
 #endif /* FW_RULES_H */

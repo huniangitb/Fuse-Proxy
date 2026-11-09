@@ -1453,6 +1453,9 @@ void config_build_from_view(const NspCfgRec* recs, int count) {
     memset(&g_global_cfg_stage, 0, sizeof(AppConfig));
     g_global_cfg_stage.trie_root = trie_create_node(NULL);
     g_global_cfg_stage.skip_system_apps = true; /* 默认跳过系统应用 */
+    /* 跨应用访问按能力放行默认开：原生对「持有 All files access / 能装包」的调用方
+       就放行对应目录，默认关着会变成比原生更严的边界。要更严就在 [GLOBAL] 显式关。 */
+    g_global_cfg_stage.allow_cross_by_capability = true;
     g_app_cfgs_stage = nullptr;
     g_app_cfg_count_stage = 0;
     g_app_cfg_capacity_stage = 0;

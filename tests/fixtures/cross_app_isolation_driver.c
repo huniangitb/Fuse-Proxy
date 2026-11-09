@@ -47,11 +47,11 @@ int g_epoll_fd = -1;
 int g_global_root_fd = -1;
 InjectMethod g_inject_method = INJECT_METHOD_V1;
 
-/* 存储类 appop 夹具：环境变量 NSP_MANAGE_EXTERNAL / NSP_LEGACY_STORAGE 里
+/* 存储类 appop 夹具：环境变量 NSP_MANAGE_EXTERNAL / NSP_INSTALLER 里
    逗号或空格分隔的包名视为持有该 appop（生产实现查 appops，宿主测试环境没有
    该命令）。两个钩子各自独立，未设的那个按 false 处理。 */
 static const char* g_manage_external_pkgs;
-static const char* g_legacy_storage_pkgs;
+static const char* g_installer_pkgs;
 
 static bool pkg_list_contains(const char* list, const char* pkg) {
     if (!list || !pkg || !pkg[0]) return false;
@@ -71,8 +71,8 @@ static bool manage_external_probe(const char* pkg) {
     return pkg_list_contains(g_manage_external_pkgs, pkg);
 }
 
-static bool legacy_storage_probe(const char* pkg) {
-    return pkg_list_contains(g_legacy_storage_pkgs, pkg);
+static bool installer_probe(const char* pkg) {
+    return pkg_list_contains(g_installer_pkgs, pkg);
 }
 
 int main(int argc, char** argv) {
@@ -93,8 +93,8 @@ int main(int argc, char** argv) {
     /* 存储类 appop 夹具（生产查 appops，宿主没有） */
     g_manage_external_pkgs = getenv("NSP_MANAGE_EXTERNAL");
     if (g_manage_external_pkgs) fw_pkg_set_manage_external_probe(manage_external_probe);
-    g_legacy_storage_pkgs = getenv("NSP_LEGACY_STORAGE");
-    if (g_legacy_storage_pkgs) fw_pkg_set_legacy_storage_probe(legacy_storage_probe);
+    g_installer_pkgs = getenv("NSP_INSTALLER");
+    if (g_installer_pkgs) fw_pkg_set_installer_probe(installer_probe);
     /* 生产链路上 fw_config 发布时会 fw_pkg_reload()（装载 CONFIG_DIR/uid.map）；
        本驱动不经 fw_config，须显式装一次，否则 uid→包名 恒走 /proc 回退 */
     fw_pkg_reload();

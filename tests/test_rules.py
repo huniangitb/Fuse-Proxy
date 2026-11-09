@@ -147,6 +147,7 @@ def isolation_section():
     BASE="[GLOBAL]\nMONITOR OFF\n"
     ALLOW="[GLOBAL]\nMONITOR OFF\nALLOW_CROSS_APP_DATA ON\n"
     CAP="[GLOBAL]\nMONITOR OFF\nALLOW_CROSS_APP_BY_CAPABILITY ON\n"
+    CAP_OFF="[GLOBAL]\nMONITOR OFF\nALLOW_CROSS_APP_BY_CAPABILITY OFF\n"
     WL=BASE+"ALLOW_CROSS_APP_PKGS com.demo.app\n"
 
     def drive(conf,uid,paths,uid_map=None,argv0=None):
@@ -204,12 +205,12 @@ def isolation_section():
     case("root 不隔离",BASE,0,[
         ("/0/Android/data/com.other.app/files/x",{"resolve":0,"probe":0,"backing":1}),
     ],uid_map=own,global_want=1)
-    # (4) SANDBOX ON 的调用方不放行隔离——其 data/obb 访问本就被重定向进
-    #     **自己的**沙盒镜像（读不到他包内容），故 resolve 放行、列举照旧过滤
-    #     （沙盒语义优先；test_monitor_layers 守护镜像路径可用）
-    case("沙盒豁免隔离",BASE+"[com.demo.app]\nSANDBOX ON\n",10123,[
-        ("/0/Android/data/com.other.app/f",{"resolve":0,"probe":1}),
-        ("/0/Download/q.txt",{"resolve":0,"probe":0}),
+    # (4) SANDBOX ON 的调用方：他包 Android/data|obb 子树不归沙盒改写（沙盒对它
+    #     让位），落回真实路径交隔离层——没有能力/显式声明时照旧看不见，与原生同
+    #     口径；其余路径（/Download 等）仍进沙盒镜像。
+    case("沙盒让位:他包仍隔离",BASE+"[com.demo.app]\nSANDBOX ON\n",10123,[
+        ("/0/Android/data/com.other.app/f",{"resolve":1,"probe":1,"sandbox":0}),
+        ("/0/Download/q.txt",{"resolve":0,"probe":0,"sandbox":1}),
     ],uid_map=own,global_want=1)
     # (5) 多开/隔离进程后缀（<pkg>:push，走 /proc 回退）：基础包名比较不得把
     #     自己的包判成他包（否则应用连自己的 data 都打不开）
@@ -261,48 +262,67 @@ def isolation_section():
     case("特权豁免:uid 无 packages.list 行 fail-safe",BASE,10999,[
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
     ],uid_map="10999 com.ghost.app\n",global_want=1)
-    # ── All files access 自动豁免（MANAGE_EXTERNAL_STORAGE，生产查 appops）：
-    # 安装器/文件管理器/应用商店的本职就是读他包 /Android/data（安装器读 IM
-    # 落盘的安装包、商店写自己的下载目录），按 Android 自己的授权放行；未持有
-    # 该权限的应用照常隔离；豁免只针对跨应用隔离，HIDE 等显式规则照旧生效。
+    # ── All files access（MANAGE_EXTERNAL_STORAGE，生产查 appops）= 原生的
+    # PASS_THROUGH 档：持该能力的调用方读他包 data/obb 一律放行（安装器读 IM
+    # 落盘的安装包、文件管理器读别的应用目录）。默认配置就生效（总闸默认 ON，
+    # 与原生一致）；豁免只针对跨应用隔离，HIDE 等显式规则照旧。
     os.environ["NSP_MANAGE_EXTERNAL"]="com.installer.app"
-    case("AllFiles 豁免:data/obb 放行",CAP,10339,[
+    case("AllFiles 豁免:data/obb 放行",BASE,10339,[
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
         ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
         ("/0/Android/data",{"resolve":0,"probe":0,"backing":1}),
         ("/0/Download/a.apk",{"resolve":0,"probe":0}),
     ],uid_map="10339 com.installer.app\n",global_want=1)
-    case("AllFiles 豁免:不豁免 HIDE",CAP+"HIDE /Download\n",10339,[
+    case("AllFiles 豁免:显式 ON 与默认一致",CAP,10339,[
+        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    ],uid_map="10339 com.installer.app\n",global_want=1)
+    case("AllFiles 豁免:不豁免 HIDE",BASE+"HIDE /Download\n",10339,[
         ("/0/Download/a.apk",{"resolve":1,"probe":1}),
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
     ],uid_map="10339 com.installer.app\n",global_want=1)
+    # 显式关掉总闸 = 主动选择「比原生更严」：持有能力也不再放行跨应用读取。
+    case("AllFiles 总闸关:仍隔离",CAP_OFF,10339,[
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10339 com.installer.app\n",global_want=1)
+    # 沙盒 + 能力档：他包目录按能力放行（沙盒让位后落回真实路径），自身路径照旧进
+    # 沙盒——这正是安装器读另一应用落盘安装包的场景。
+    os.environ["NSP_MANAGE_EXTERNAL"]="com.demo.app"
+    case("沙盒+能力:他包放行自身仍沙盒",BASE+"[com.demo.app]\nSANDBOX ON\n",10123,[
+        ("/0/Android/data/com.other.app/f",{"resolve":0,"probe":0,"sandbox":0}),
+        ("/0/Download/q.txt",{"resolve":0,"probe":0,"sandbox":1}),
+    ],uid_map=own,global_want=1)
     del os.environ["NSP_MANAGE_EXTERNAL"]
     case("AllFiles 未持有:照常隔离",BASE,10339,[
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
     ],uid_map="10339 com.installer.app\n",global_want=1)
-    # ── legacy storage 自动豁免（appop LEGACY_STORAGE）：targetSdk ≤ 29 的旧式
-    # 整盘访问在 AOSP 里本来就看得见他包 /Android/data，口径与 All files access
-    # 一致；同样只豁免跨应用隔离，HIDE 等显式规则照旧。
-    os.environ["NSP_LEGACY_STORAGE"]="com.plain.app"
-    case("Legacy 豁免:data 放行",CAP,10500,[
-        ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
+    # ── 能装包（INSTALL_PACKAGES 权限 / REQUEST_INSTALL_PACKAGES appop）= 原生的
+    # INSTALLER 档：只放行 obb，data 不在其列（原生给的是 EXT_OBB_RW_GID 而非
+    # 整盘）。legacy storage 不再作为跨应用放行依据——Android 16 已无 legacy 挂载
+    # 模式，它只影响非私有路径的写入语义。
+    os.environ["NSP_INSTALLER"]="com.plain.app"
+    case("能装包:obb 放行 data 仍隔离",BASE,10500,[
+        ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
+        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10500 com.plain.app\n",global_want=1)
+    case("能装包:不豁免 HIDE",BASE+"HIDE /Download\n",10500,[
+        ("/0/Download/a.apk",{"resolve":1,"probe":1}),
         ("/0/Android/obb/com.other.app/y",{"resolve":0,"probe":0}),
     ],uid_map="10500 com.plain.app\n",global_want=1)
-    case("Legacy 豁免:不豁免 HIDE",CAP+"HIDE /Download\n",10500,[
-        ("/0/Download/a.apk",{"resolve":1,"probe":1}),
+    case("能装包:总闸关 obb 也隔离",CAP_OFF,10500,[
+        ("/0/Android/obb/com.other.app/y",{"resolve":1,"probe":1}),
+    ],uid_map="10500 com.plain.app\n",global_want=1)
+    del os.environ["NSP_INSTALLER"]
+    # ── 显式规则优先于隔离这条默认边界：他在他包路径上写了规则，按规则走，
+    # 隔离只是"没有规则时的默认边界"。HIDE 仍是 HIDE，ALLOW 才是放行。
+    case("显式 ALLOW 压过隔离",
+         BASE+"[com.demo.app]\nALLOW /Android/data/com.other.app\n",10123,[
         ("/0/Android/data/com.other.app/x",{"resolve":0,"probe":0}),
-    ],uid_map="10500 com.plain.app\n",global_want=1)
-    del os.environ["NSP_LEGACY_STORAGE"]
-    case("Legacy 未持有:照常隔离",BASE,10500,[
+        ("/0/Android/data/com.third.app/x",{"resolve":1,"probe":1}),
+    ],uid_map="10123 com.demo.app\n",global_want=1)
+    case("显式 HIDE 仍拒绝",
+         BASE+"[com.demo.app]\nHIDE /Android/data/com.other.app\n",10123,[
         ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
-    ],uid_map="10500 com.plain.app\n",global_want=1)
-    # ── 能力豁免默认关：系统授权（All files access / legacy storage）不等于允许跨
-    # 应用读取，必须由 [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON 显式打开。
-    os.environ["NSP_MANAGE_EXTERNAL"]="com.installer.app"
-    case("能力豁免默认关:持 All files 仍隔离",BASE,10339,[
-        ("/0/Android/data/com.other.app/x",{"resolve":1,"probe":1}),
-    ],uid_map="10339 com.installer.app\n",global_want=1)
-    del os.environ["NSP_MANAGE_EXTERNAL"]
+    ],uid_map="10123 com.demo.app\n",global_want=1)
     # ── 按包名白名单：列出的调用方可访问他包 data/obb，与 appops 授权无关；未列出
     # 的照常隔离；匹配按调用方自身包名，同 uid 的兄弟包不会被顺带放行；白名单只
     # 解除隔离，HIDE 等显式规则照旧生效（非法包名项跳过、整行仍生效）。
@@ -352,8 +372,9 @@ def isolation_section():
     MEDIA_MAP="10277 com.android.providers.media.module\n"+own
     case("媒体提供者:全局沙盒不生效",BASE+"SANDBOX ON\n",10277,[
         ("/0/Download/hi.txt",{"resolve":0,"sandbox":0,"redir":0}),
-        # 隔离让位保持（v1 不挂载即无此判定）
-        ("/0/Android/data/com.other.app/f",{"resolve":0,"probe":1}),
+        # 它不是"别的应用"，例外在打开与列举两侧同口径（原生里它的挂载模式是
+        # PASS_THROUGH、签名是 platform，本来就看得到全部）
+        ("/0/Android/data/com.other.app/f",{"resolve":0,"probe":0}),
     ],uid_map=MEDIA_MAP)
     case("媒体提供者:普通应用照常进沙盒",BASE+"SANDBOX ON\n",10123,[
         ("/0/Download/hi.txt",{"sandbox":1,"redir":1}),

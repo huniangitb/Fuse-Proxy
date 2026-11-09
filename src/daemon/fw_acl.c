@@ -262,6 +262,28 @@ static bool acl_op_is_rename(NspAclOp op) {
     return op == NSP_ACL_OP_RENAME_SRC || op == NSP_ACL_OP_RENAME_DST;
 }
 
+/* 目标是否落在 obb 私有目录里（对齐 AOSP 的 isObbOrChildRelativePath）：能力档里
+   的 installer 只放行 obb，data 一律按未授权处理。 */
+static bool acl_path_in_obb(const char* path) {
+    const char* p = acl_skip_user_layer(path);
+    if (strncasecmp(p, "Android/obb/", 12) != 0) return false;
+    return p[12] != '\0';
+}
+
+/* 跨应用放行档位判定：排序只有一份（fw_rules.h 的 nsp_xapp_access_of），这里
+   只把身份字段搬过去，不另写一套 if 链。 */
+static bool acl_xapp_allowed(const NspAclIdentity* id, bool is_obb) {
+    NspXAppFacts f;
+    memset(&f, 0, sizeof f);
+    f.whitelisted = id->cross_app_allowed;
+    f.privileged = id->privileged;
+    f.gate = id->cross_app_by_capability;
+    f.manage_external = id->manage_external;
+    f.installer = id->installer;
+    f.is_obb = is_obb;
+    return nsp_xapp_access_of(&f) != NSP_XAPP_NONE;
+}
+
 NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id) {
     if (!q || !id || !q->path) return NSP_ACL_ALLOW;
 
@@ -298,8 +320,8 @@ NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id) {
 
     case NSP_PATH_OWNED:
         /* 他包私有目录：看不见（AOSP 一律 ENOENT）。自己包 / 同 uid 包 /
-           白名单包（[GLOBAL] ALLOW_CROSS_APP_PKGS）/ 特权签名 / 能力豁免（开关开时）
-           放行。 */
+           白名单包（[GLOBAL] ALLOW_CROSS_APP_PKGS）/ 特权签名 / 能力档（见
+           nsp_xapp_access_of 的排序）放行。 */
         /* 包名解析不出来时一律放行：ACL 是「多一道门」，不能变成单点故障。
            与 fw_rules 的跨应用隔离同口径（current_pkg 为 system/unknown 即不隔离），
            否则解析失败会把应用挡在自己的 data 目录外（真实故障，比越权更难排查）。 */
@@ -310,13 +332,7 @@ NspAclVerdict fw_acl_decide(const NspAclQuery* q, const NspAclIdentity* id) {
            app 身份：/Android/data/<包> 的属主 uid 等于调用方 uid。只按包名比较会把
            它们误判成跨应用（现场表现：下载器读不到 Downloads 的私有目录，ENOENT）。 */
         if (owner[0] && acl_owner_shares_uid(owner, q->uid)) return NSP_ACL_ALLOW;
-        if (id->cross_app_allowed) return NSP_ACL_ALLOW;
-        if (id->privileged) return NSP_ACL_ALLOW;
-        /* 能力豁免（All files access / legacy storage）默认关：系统授权只是"用户
-           给了这个能力"，不等于同意读别的应用的私有目录，故由
-           [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY 显式开启。 */
-        if (id->cross_app_by_capability && (id->manage_external || id->legacy))
-            return NSP_ACL_ALLOW;
+        if (acl_xapp_allowed(id, acl_path_in_obb(q->path))) return NSP_ACL_ALLOW;
         /* 隔离开关沿用既有配置口径（默认生效）；关闭时按旧行为放行，
            否则这条 AOSP 默认会让 ALLOW_CROSS_APP_DATA ON 的用户突然失效。 */
         return id->cross_app_isolated ? NSP_ACL_DENY_ENOENT : NSP_ACL_ALLOW;
@@ -387,11 +403,6 @@ void fw_acl_identity(uid_t uid, pid_t pid, NspAclIdentity* out) {
         out->privileged = fw_pkg_is_privileged(uid);
         out->cross_app_allowed = fw_rules_cross_app_pkg_allowed(out->pkg);
         out->cross_app_by_capability = fw_rules_cross_app_capability();
-        /* 总闸关着就不查 appops（一次子进程查询），免得为一条不生效的豁免付代价 */
-        if (out->cross_app_by_capability) {
-            out->manage_external = fw_pkg_manages_external(uid);
-            out->legacy = fw_pkg_has_legacy_storage(uid);
-        }
         out->cross_app_isolated = fw_rules_cross_app_isolated();
     }
 }
@@ -406,12 +417,22 @@ static void acl_log_deny(uid_t uid, const char* pkg, const char* path, NspAclOp 
             pkg ? pkg : "unknown", (int)op, path ? path : "nullptr", err);
 }
 
-/* 这次调用会不会用到「持有 All files access」这个事实：只有顶层目录的创建
-   会（见 fw_acl_decide 的 NSP_PATH_TOPLEVEL）。身份组装默认不填这一位——能力
-   查询是一次 appops 子进程调用（缓存见 fw_pkg.h），不该让每个 FUSE 回调为它
-   付钱——所以在这一条分支上按需补一次。 */
-static bool acl_wants_capability(const NspAclQuery* q) {
-    return q->op == NSP_ACL_OP_MKDIR && fw_acl_classify(q->path, nullptr, 0) == NSP_PATH_TOPLEVEL;
+/* 这次调用会不会用到能力事实：只有「他包私有目录」与「顶层目录创建」两处会
+   （见 fw_acl_decide）。身份组装默认不填——能力查询是一次 appops 子进程调用
+   （缓存见 fw_pkg.h），不该让每个 FUSE 回调为它付钱——故在这一步按需补齐。
+   白名单/特权已经能放行的调用方不必再查；总闸关着时跨应用一侧也不查（那条路
+   本来就不按能力放行）。返回路径分类，调用方复用以省一次分类。 */
+static NspPathClass acl_fill_capabilities(const NspAclQuery* q, NspAclIdentity* id) {
+    NspPathClass cls = fw_acl_classify(q->path, nullptr, 0);
+    if (id->cross_app_allowed || id->privileged) return cls;
+    if (cls == NSP_PATH_OWNED) {
+        if (!id->cross_app_by_capability) return cls;
+        id->manage_external = fw_pkg_manages_external(id->uid);
+        if (!id->manage_external) id->installer = fw_pkg_can_install_packages(id->uid);
+    } else if (cls == NSP_PATH_TOPLEVEL && q->op == NSP_ACL_OP_MKDIR) {
+        id->manage_external = fw_pkg_manages_external(id->uid);
+    }
+    return cls;
 }
 
 int fw_acl_check(uid_t uid, pid_t pid, const char* path, NspAclOp op, bool is_dir, int access_mask) {
@@ -422,9 +443,14 @@ int fw_acl_check(uid_t uid, pid_t pid, const char* path, NspAclOp op, bool is_di
     NspAclIdentity id;
     fw_acl_identity(uid, pid, &id);
     NspAclQuery q = {.uid = uid, .path = path, .op = op, .access_mask = access_mask, .is_dir = is_dir};
-    if (!id.manage_external && acl_wants_capability(&q)) id.manage_external = fw_pkg_manages_external(uid);
+    NspPathClass cls = acl_fill_capabilities(&q, &id);
     NspAclVerdict v = fw_acl_decide(&q, &id);
     if (v == NSP_ACL_ALLOW) return 0;
+    /* 显式规则（ALLOW/HIDE/RO/REDIRECT，任一作用域）优先于隔离这条默认边界：
+       ACL 跑在规则决策之前，这里回查一次「这条路径上有没有人写过规则」，有就
+       把裁决交回规则层（ALLOW 放行、HIDE 照旧 ENOENT）。回查只在拒绝路径上，
+       不给每个请求加一次 Trie 下降。 */
+    if (cls == NSP_PATH_OWNED && fw_rules_path_declared(uid, pid, path)) return 0;
     int err = fw_acl_errno(v);
     acl_log_deny(uid, id.pkg, path, op, err);
     return err;

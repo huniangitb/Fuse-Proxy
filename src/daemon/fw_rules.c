@@ -275,40 +275,70 @@ bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
 
 bool fw_rules_cross_app_capability(void) { return g_global_cfg.allow_cross_by_capability; }
 
-bool fw_rules_cross_app_exempt(const char* pkg, uid_t uid) {
-    if (fw_rules_cross_app_pkg_allowed(pkg)) return true;
-    if (fw_pkg_is_privileged(uid)) return true;
-    if (!fw_rules_cross_app_capability()) return false;
-    return fw_pkg_manages_external(uid) || fw_pkg_has_legacy_storage(uid);
+/* 现场取能力事实：白名单/特权命中就不再问 appops——那是一次 fork 子进程的代价
+   （虽然按 uid 缓存 30s），不该为已被前几档否决的判定去付。 */
+static NspXAppFacts br_xapp_facts(const char* pkg, uid_t uid, bool is_obb) {
+    NspXAppFacts f = {0};
+    f.is_obb = is_obb;
+    f.whitelisted = fw_rules_cross_app_pkg_allowed(pkg);
+    if (f.whitelisted) return f;
+    f.privileged = fw_pkg_is_privileged(uid);
+    if (f.privileged) return f;
+    f.gate = fw_rules_cross_app_capability();
+    if (!f.gate) return f;
+    f.manage_external = fw_pkg_manages_external(uid);
+    if (f.manage_external) return f;
+    f.installer = fw_pkg_can_install_packages(uid);
+    return f;
 }
 
-static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg, uid_t uid) {
-    if (!current_pkg || !current_pkg[0]) return false;
+NspXAppAccess fw_rules_cross_app_access(const char* pkg, uid_t uid, bool is_obb) {
+    NspXAppFacts f = br_xapp_facts(pkg, uid, is_obb);
+    return nsp_xapp_access_of(&f);
+}
+
+/* 纯路径判定：是否指向**他包**的 Android/data|obb 子树。不看开关也不看能力——
+   沙盒让位与跨应用隔离都要先认出这条路径形状，两处必须同一口径。
+   .nomedia 是 Android 认的标记名而不是包名，不算他包（原生同样放行它）。
+   target_out 回填属主包名（可为 NULL），供调用方查 uid。 */
+static bool br_path_other_app_subtree(const char* sub_path, const char* current_pkg,
+                                      char* target_out, size_t target_size) {
+    if (target_out && target_size) target_out[0] = '\0';
+    if (!sub_path || !current_pkg || !current_pkg[0]) return false;
     if (strcmp(current_pkg, "system") == 0 || strcmp(current_pkg, "unknown") == 0) return false;
-    if (g_global_cfg.allow_cross_app_data) return false;
     const char* prefixes[] = {"/Android/data/", "/Android/obb/"};
     for (int i = 0; i < 2; i++) {
         size_t plen = strlen(prefixes[i]);
-        if (strncmp(sub_path, prefixes[i], plen) == 0) {
-            const char* pkg_start = sub_path + plen;
-            if (*pkg_start == '\0') return false;
-            const char* slash = strchr(pkg_start, '/');
-            size_t pkg_len = slash ? (size_t)(slash - pkg_start) : strlen(pkg_start);
-            if (pkg_len > 0 && pkg_len < 256) {
-                char target_pkg[256];
-                memcpy(target_pkg, pkg_start, pkg_len);
-                target_pkg[pkg_len] = '\0';
-                if (br_pkg_same_base(target_pkg, current_pkg)) break;
-                /* 同 uid 多包 = 同一 app 身份（见上方注释）：目标目录属主 uid 等于
-                   调用方 uid 时不算"他应用"。解析不到属主 uid 则维持隔离。 */
-                uid_t owner_uid = 0;
-                if (fw_pkg_uid_for_package(target_pkg, &owner_uid) && owner_uid == uid) break;
-                return true;
-            }
-            break;
-        }
+        if (strncmp(sub_path, prefixes[i], plen) != 0) continue;
+        const char* pkg_start = sub_path + plen;
+        const char* slash = strchr(pkg_start, '/');
+        size_t pkg_len = slash ? (size_t)(slash - pkg_start) : strlen(pkg_start);
+        if (pkg_len == 0 || pkg_len >= 256) return false;
+        char target[256];
+        memcpy(target, pkg_start, pkg_len);
+        target[pkg_len] = '\0';
+        if (strcmp(target, ".nomedia") == 0) return false;
+        if (target_out && target_size > pkg_len) snprintf(target_out, target_size, "%s", target);
+        return !br_pkg_same_base(target, current_pkg);
     }
     return false;
+}
+
+/* 目标是否落在 Android/obb 下：安装器那一档的放行面只有这一类。 */
+static bool br_path_is_obb_subtree(const char* sub_path) {
+    return sub_path && strncmp(sub_path, "/Android/obb/", 13) == 0;
+}
+
+static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg, uid_t uid) {
+    char target_pkg[256];
+    if (!br_path_other_app_subtree(sub_path, current_pkg, target_pkg, sizeof target_pkg))
+        return false;
+    if (g_global_cfg.allow_cross_app_data) return false;
+    /* 同 uid 多包 = 同一 app 身份（见上方注释）：目标目录属主 uid 等于调用方 uid
+       时不算"他应用"。解析不到属主 uid 则维持隔离。 */
+    uid_t owner_uid = 0;
+    if (fw_pkg_uid_for_package(target_pkg, &owner_uid) && owner_uid == uid) return false;
+    return true;
 }
 
 static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path, FwRulesTrieMatch* out) {
@@ -424,10 +454,11 @@ static AppConfig* br_scope_cfg(AppConfig* cfg, AppConfig* cat, BrRuleScope scope
    tm.hidden（trie 结果）。
    动态 hide 线性扫描（访问 hide_rules 数组）不在此列。
    注意：跨应用隔离（br_is_other_app_pkg）与隐藏**同口径**，但不在本函数
-   判定——隐藏是"所有访问者一视同仁"的静态事实，隔离依赖调用方身份与沙盒
-   状态：resolve 侧走 br_isolation_blocks()（沙盒生效时让位），probe 侧各路径
-   显式叠加同一判据（readdir 条目过滤）。旧实现只在 probe 过滤列举、resolve
-   放过，等于任何按名打开都能读到 /Android/data/<他包>/ 的内容。 */
+   判定——隐藏是"所有访问者一视同仁"的静态事实，隔离依赖调用方身份与能力档：
+   resolve 侧走 br_isolation_blocks()，probe 侧走 br_isolation_hides()，两者
+   只是同一实现（br_isolation_impl）的两个入口，差别仅在隔离命中时记不记日志。
+   旧实现只在 probe 过滤列举、resolve 放过，等于任何按名打开都能读到
+   /Android/data/<他包>/ 的内容。 */
 static bool br_hidden_static_part(const char* sub_path, const char* current_pkg,
                                   const FwRulesTrieMatch* tm, bool* is_skel_out) {
     if (is_skel_out) *is_skel_out = false;
@@ -609,25 +640,9 @@ static void br_note_media_sandbox_ignored(const char* pkg) {
         LOG_WRN("媒体提供者不参与沙盒：忽略 %s 的 SANDBOX ON（picker 取字节会 ENOENT）", pkg);
 }
 
-/* 该调用方的沙盒是否生效（三层合并，口径与 br_to_real_path 的 sandbox 分支
-   一致）：应用显式 OFF 否决类别与全局；类别显式 OFF 否决全局；
-   --disable-sandbox 全局关闭；媒体提供者恒不生效。沙盒生效时 data/obb 下的他包
-   访问会被重定向到**自己的**沙盒镜像（读不到他包内容），故隔离让位（见
-   br_isolation_blocks）。 */
-static bool br_sandbox_active(AppConfig* cfg, AppConfig* cat, const char* current_pkg) {
-    if (g_br_disable_sandbox) return false;
-    if (br_media_provider_exempt(current_pkg)) return false;
-    if (cfg && cfg->sandbox_explicit && !cfg->sandbox) return false;
-    if (cfg && cfg->sandbox) return true;
-    if (cat) {
-        if (cat->sandbox_explicit) return cat->sandbox;
-        if (cat->sandbox) return true;
-    }
-    return g_global_cfg.sandbox;
-}
-
-/* 生效沙盒的**声明作用域**（与上面 br_sandbox_active 同序同口径）：
-   应用显式 > 应用非显式 ON > 类别显式 > 类别 ON > [GLOBAL]。BR_SCOPE_NONE =
+/* 生效沙盒的**声明作用域**（三层合并：应用显式 > 应用非显式 ON > 类别显式 >
+   类别 ON > [GLOBAL]；--disable-sandbox 全局关闭；媒体提供者恒不生效）。
+   BR_SCOPE_NONE =
    沙盒不生效。供 br_to_real_path 比较「ALLOW 能否豁免沙盒」：ALLOW 的作用域必须
    不低于沙盒的声明作用域，否则全局 ALLOW 会把应用段显式声明的沙盒整个取消。 */
 static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* current_pkg) {
@@ -645,36 +660,49 @@ static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* 
     return g_global_cfg.sandbox ? BR_SCOPE_GLOBAL : BR_SCOPE_NONE;
 }
 
-/* 跨应用隔离是否拦下本路径（resolve 侧唯一调用点）：沙盒生效时放行——此时的
-   "他包 data" 已被 br_to_real_path 改写成自己的沙盒镜像，读不到他包内容，
-   把它判成 ENOENT 会让沙盒镜像整体不可用（test_monitor_layers 守护）。
-   放行分三类（组合判定统一在 fw_rules_cross_app_exempt）：显式白名单
-   （[GLOBAL] ALLOW_CROSS_APP_PKGS，按调用方自身包名）、platform 签名特权应用
-   （packages.list seinfo）、能力豁免（appops 的 MANAGE_EXTERNAL_STORAGE /
-   LEGACY_STORAGE，受 [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY 控制，**默认关**：
-   授权不等于同意读取别的应用的私有目录）。同 uid 内的多包（sharedUserId / 系统
-   同进程宿主）在 br_is_other_app_pkg 里已按 uid 视为同一应用。其余情形：
-   看不见 = 打不开（与 probe 列举过滤同口径）。 */
-static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
-                                const char* current_pkg, uid_t uid) {
+/* 前向声明：隔离判定要问「这条路径上有没有显式声明」，实现排在规则求值函数
+   （br_scope_decl 是"某作用域对某路径的结论"的唯一出口）之后。 */
+static bool br_decl_present(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                            const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
+                            uid_t uid);
+
+/* 跨应用隔离是否拦下本路径。resolve 与列举共用同一份实现，只差"要不要记一条
+   拒绝日志"，故两处判定不会分叉（分叉的现场表现：列表看得到、按名打开却 ENOENT）。
+
+   放行链，顺序即优先级，每一档都对应原生的一条判据：
+   1. 不是他包路径 → 不归这条规则管；
+   2. 媒体提供者 → 不参与（它按设计读 /Android/data 里的媒体内容，拦下会让
+      picker 取不到字节）；
+   3. **显式声明优先**：该路径上任何作用域写了 ALLOW / HIDE / RO / REDIRECT，
+      隔离让位，交给规则层自己裁决——隔离是"没有规则时的默认边界"，不是能压过
+      用户配置的硬墙；
+   4. 能力档（NspXAppAccess）：显式白名单、platform 签名、MANAGE_EXTERNAL_STORAGE
+      全放，能装包的应用只放 Android/obb；组合排序只写在 nsp_xapp_access_of 一处。
+   同 uid 内的多包（sharedUserId / 系统同进程宿主）在 br_is_other_app_pkg 里已按
+   uid 视为同一应用。其余情形：看不见 = 打不开（与 HIDE 同口径）。 */
+static bool br_isolation_impl(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                              const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
+                              int user_id, bool note) {
     if (!br_is_other_app_pkg(sub_path, current_pkg, uid)) return false;
-    /* 媒体提供者：沙盒本身已豁免，隔离让位仍保持——它读 /Android/data 里的媒体
-       内容不该因为「不再沙盒」而新被拦（v1 不挂载即无此判定）。 */
-    if (br_sandbox_active(cfg, cat, current_pkg)) return false;
     if (br_media_provider_exempt(current_pkg)) return false;
-    if (fw_rules_cross_app_exempt(current_pkg, uid)) return false;
-    br_note_isolation(current_pkg, sub_path);
+    if (br_decl_present(cfg, cat, sub_path, current_pkg, tm, user_id, uid)) return false;
+    if (fw_rules_cross_app_access(current_pkg, uid, br_path_is_obb_subtree(sub_path)) !=
+        NSP_XAPP_NONE)
+        return false;
+    if (note) br_note_isolation(current_pkg, sub_path);
     return true;
 }
 
-/* 列举侧（probe/目录缓存）的隔离判据：与 br_isolation_blocks 共用同一组
-   豁免（fw_rules_cross_app_exempt：白名单 + 特权签名 + 能力开关），但不含沙盒让位——
-   沙盒生效时 resolve 放行是为了让重定向进自己镜像的路径可用，列举照旧只显示
-   自身包名（test_rules 的「沙盒豁免隔离」用例守护这一差异）。 */
-static bool br_isolation_hides(const char* sub_path, const char* current_pkg, uid_t uid) {
-    if (!br_is_other_app_pkg(sub_path, current_pkg, uid)) return false;
-    if (fw_rules_cross_app_exempt(current_pkg, uid)) return false;
-    return true;
+static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                                const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
+                                int user_id) {
+    return br_isolation_impl(cfg, cat, sub_path, current_pkg, uid, tm, user_id, true);
+}
+
+static bool br_isolation_hides(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                               const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
+                               int user_id) {
+    return br_isolation_impl(cfg, cat, sub_path, current_pkg, uid, tm, user_id, false);
 }
 
 static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const char* path,
@@ -805,6 +833,11 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
              (sub_path[elen_obb] == '\0' || sub_path[elen_obb] == '/'))) {
             return false;
         }
+        /* 他包 Android/data|obb 子树不归沙盒管：原生这里由 MediaProvider 按调用方
+           能力/挂载模式裁决（放行，或者 ENOENT），沙盒把它改写成自己的镜像会掩盖
+           那个裁决——能力放行者读到空目录，非放行者拿到的 ENOENT 也不是原生的原因。
+           交回隔离层按同一套能力判据裁决（见 br_isolation_impl）。 */
+        if (br_path_other_app_subtree(sub_path, current_pkg, NULL, 0)) return false;
         int effective_uid = user_id;
         if (effective_uid < 0) {
             if (uid >= NSP_SYSTEM_APP_UID_MIN) effective_uid = (int)(uid / NSP_PER_USER_UID_STRIDE);
@@ -909,6 +942,23 @@ static void br_scope_decl(AppConfig* c, BrRuleScope scope, const char* sub_path,
         out->has_redir = true;
         snprintf(out->redir, sizeof out->redir, "%s", dyn_redir);
     }
+}
+
+/* 三个作用域里有没有显式声明（只问"有/无"，不问是哪一种）：跨应用隔离用它在
+   隔离与放行之间做第一道分岔。逐层独立求值而不是取合并视图——低作用域的规则
+   同样算"用户说过话"，不该被 [GLOBAL] 的沉默抹掉。 */
+static bool br_decl_present(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                            const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
+                            uid_t uid) {
+    static const BrRuleScope k_order[] = {BR_SCOPE_APP, BR_SCOPE_CAT, BR_SCOPE_GLOBAL};
+    for (size_t i = 0; i < sizeof(k_order) / sizeof(k_order[0]); i++) {
+        AppConfig* c = br_scope_cfg(cfg, cat, k_order[i]);
+        if (!c) continue;
+        BrScopeDecl d;
+        br_scope_decl(c, k_order[i], sub_path, current_pkg, tm, user_id, uid, NULL, 0, &d);
+        if (d.allow || d.hide || d.ro || d.has_redir) return true;
+    }
+    return false;
 }
 
 /* 作用域优先（docs/config.md §2）：从应用段向 [GLOBAL] 逐层询问，**第一个**在查询轴
@@ -1043,6 +1093,30 @@ static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, -1, 0, NULL, 0,
                     BR_WANT_RO | BR_WANT_LOC, &scope, &decl);
     return decl.ro;
+}
+
+/* 该路径上有没有显式声明（对外口径，ACL 侧在拒绝前回查）。守卫与 resolve 同款：
+   没有 <uid>/ 层的路径不参与规则，也就不存在"声明"。读配置走快照协议（
+   config_read_begin/end），读取期间发生发布则整体重试——与 fw_rules_resolve 同一套
+   无锁读约定，故本函数可以在 ACL 回调里安全调用。 */
+bool fw_rules_path_declared(uid_t uid, pid_t pid, const char* path) {
+    if (!path || !fw_rules_path_has_uid_layer(path)) return false;
+    for (;;) {
+        uint64_t cfg_gen = config_read_begin();
+        char current_pkg[128] = "unknown";
+        AppConfig* cat = nullptr;
+        AppConfig* cfg = br_get_app_cfg(uid, pid, current_pkg, &cat);
+        int path_user_id = -1;
+        char sub_path[PATH_MAX];
+        bool declared = false;
+        if (br_strip_and_sanitize(path, &path_user_id, sub_path, sizeof sub_path) == 0) {
+            FwRulesTrieMatch tm;
+            memset(&tm, 0, sizeof tm);
+            br_trie_resolve(cfg, cat, sub_path, &tm);
+            declared = br_decl_present(cfg, cat, sub_path, current_pkg, &tm, path_user_id, uid);
+        }
+        if (config_read_end(cfg_gen)) return declared;
+    }
 }
 
 /* ============ 虚拟目录合成 ============ */
@@ -1264,7 +1338,9 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         bool hidden = br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                                   sizeof sub_path, current_pkg, q->uid, &tm) != 0;
         /* 隔离只在未命中隐藏时判定（保持原短路语义），并单独标注成因 */
-        bool isolated = !hidden && br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid);
+        bool isolated =
+            !hidden && br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid, &tm,
+                                           path_user_id);
         if (hidden || isolated) {
             out->valid = true;
             out->appear_missing = true;
@@ -1391,8 +1467,10 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                               !pc->app_dir_node && !pc->cat_dir_node && !pc->g_dir_node;
             if (all_static) {
                 /* 跨应用隔离与隐藏同口径（br_sanitize_and_check_hidden 亦判，
-               此处为同一判据的读取侧：列举过滤走本路径） */
-                bool iso = br_isolation_hides(sub_path, current_pkg, q->uid);
+               此处为同一判据的读取侧：列举过滤走本路径）。tm 传 NULL：快路径本就不
+               建 trie 匹配视图，由被判据自己按层现查 */
+                bool iso =
+                    br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, NULL, path_user_id);
                 /* 作用域优先语义下**不能**再用合并视图（tm.hidden 并集）做静态短路：
                    GLOBAL 的 HIDE 会因此压过应用段 ALLOW，列举与打开判定分叉。all_static
                    下无线性规则扫描，逐层现查 trie（每作用域一次下降）的成本远低于一次
@@ -1414,7 +1492,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                应用段 ALLOW 取消不掉全局 HIDE。ca/cc/cg 只留给下面的虚拟目录判定。
                跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
                同判据：看不见 = 打不开） */
-            bool iso = br_isolation_hides(sub_path, current_pkg, q->uid);
+            bool iso = br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, NULL,
+                                          path_user_id);
             if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid) || iso) {
                 out->valid = true;
                 out->appear_missing = true;
@@ -1445,7 +1524,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
         FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
                                          sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
-            br_isolation_hides(sub_path, current_pkg, q->uid)) {
+            br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, &tm, path_user_id)) {
             out->valid = true;
             out->appear_missing = true;
             if (config_read_end(cfg_gen)) return;
