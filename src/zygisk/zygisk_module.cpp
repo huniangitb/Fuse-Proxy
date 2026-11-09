@@ -225,16 +225,18 @@ static int connect_with_timeout(int fd, const struct sockaddr* addr, socklen_t a
 }
 
 /* 从 injector 读应答动词（OK/ERR/DEFER），超时或无应答一律回落 "ERR"。
-   应答是短字符串且不带换行，读到即返回。 */
+   应答是短字符串且不带换行，读到即返回。DEFER 后可跟 post 等待预算
+   （"DEFER <ms>"），必须整串原样转给应用侧——预算就是由这里带过去的，
+   截断或改写成裸 DEFER 会让应用按"不等待"处理。 */
 static void companion_wait_reply(int fd, int timeout_ms, char* out, size_t outsz) {
     snprintf(out, outsz, "ERR");
     struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
     if (poll(&pfd, 1, timeout_ms) <= 0) return;
-    char buf[16] = {0};
+    char buf[32] = {0};
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     if (n <= 0) return;
     buf[n] = '\0';
-    if (strcmp(buf, "OK") == 0 || strcmp(buf, "DEFER") == 0) {
+    if (strncmp(buf, "OK", 2) == 0 || strncmp(buf, "DEFER", 5) == 0) {
         snprintf(out, outsz, "%s", buf);
     }
 }
@@ -312,7 +314,7 @@ static void companion_handler(int client_fd) {
            写回会命中 EPIPE——默认 SIGPIPE 会把 companion 线程连带进程打死。 */
         send(client_fd, reply, strlen(reply), MSG_NOSIGNAL);
         /* 只有 DEFER 才继续留在连接上等 POST；OK/ERR 即本条连接使命结束 */
-        if (strcmp(reply, "DEFER") != 0) break;
+        if (strncmp(reply, "DEFER", 5) != 0) break;
     } /* for (;;) */
     close(client_fd);
 }
@@ -356,7 +358,7 @@ class AppReporterModule : public zygisk::ModuleBase {
                    DEFER = 目标应用，injector 已在后台盯着本 pid 的命名空间，本进程
                    到 post 再等自己的视图出现。pre 通道只裁决不挂载——此刻还在
                    zygote 的挂载 ns 里，挂上去会被之后 fork 的每个应用继承。 */
-                char reply[16] = {0};
+                char reply[32] = {0};
                 struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
                 if (poll(&pfd, 1, MODULE_REQ_TIMEOUT_MS) > 0) {
                     ssize_t rn = read(fd, reply, sizeof(reply) - 1);
