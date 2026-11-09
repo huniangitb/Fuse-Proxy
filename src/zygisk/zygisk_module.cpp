@@ -37,6 +37,7 @@
 #include <time.h>
 
 #include "zygisk.hpp"
+#include "post_wait.h"
 
 #define LOG_TAG   "Zygisk_NSProxy"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -55,8 +56,12 @@
    而 ZygiskNext 1.3.4+ 会把 preAppSpecialize 返回后仍持有的 companion fd 直接
    关闭（Companion API 使用不当），post 再写就是写已关闭的 fd。v3 改为 pre 拿完
    判决即关闭连接，post 在本地等待自己的命名空间出现代理视图（injector 收到
-   pre 通知后就在后台盯着这个进程的 ns，一变即挂）。 */
-#define NSP_ZYGISK_PROTO 3
+   pre 通知后就在后台盯着这个进程的 ns，一变即挂）。
+   3 → 4 的差别只在一处：3 把 post 等待时长写死，4 改为听 injector 的（DEFER 应答
+   带 "DEFER <ms>"，0 = 不等）。读挂载表的成本随挂载表条目数走，写死的时长在条目
+   多的设备上要么白等、要么白读，只能交给掌握设备侧成本的一方决定。injector 对
+   proto>=3 的模块照旧派发补挂载盯梢，故 4 与 3 在 injector 侧的路径完全相同。 */
+#define NSP_ZYGISK_PROTO 4
 
 /* 各段等待上限（都必须有界，任何一段超时都按"放行应用"处理，绝不挂死）。
    唯一硬约束：**injector 没有应答（未启动/崩溃/忙）时，本模块不得产生任何等待**。
@@ -76,10 +81,15 @@
    非阻塞 connect + 有界轮询把这段封死。 */
 #define COMPANION_CONNECT_TIMEOUT_MS 100
 #define MODULE_REQ_TIMEOUT_MS     100
-/* post-specialize 本地等待"自己的命名空间出现代理视图"的上限。injector 的盯梢线程
-   在 ns 切换后立即挂载（实测 0–9ms），这里等 100ms 只覆盖慢设备上的装配窗口；
-   等不到就放行（应用继续用原生视图），由 injector 的后台重试队列补挂。 */
-#define MODULE_PROXY_WAIT_MS      100
+/* post-specialize 本地等待"自己的命名空间出现代理视图"的上限（毫秒）。实际预算
+   由 injector 在 pre 的 DEFER 应答里给出（"DEFER <ms>"，解析见 post_wait.h），
+   这里只是模块侧允许的最大值。
+
+   为什么不写死一个固定值：读一份 /proc/self/mountinfo 的成本与挂载表条目数成
+   正比，小表设备零点几毫秒，大表设备几十毫秒。固定上限在后者上就是"每次冷启动
+   多读几十到几百毫秒的表"，而这段等待落在应用 specialize 的热路径上。预算 0
+   表示不等——此时模块一次 mountinfo 都不读，补挂载交给 injector 的后台收敛。 */
+#define MODULE_PROXY_WAIT_MAX_MS  1000
 
 /* 抽象命名空间 UDS 地址填充。等价于项目的 nsp_uds_abstract_addr()
    （src/core/nsp_util.c），含同一处修正：地址长度按**截断后**实际写入的
@@ -116,19 +126,59 @@ static bool storage_is_proxied(void) {
     return found;
 }
 
-/* 有界等待代理视图就绪（10ms 步进）。返回已等待的毫秒数；0 = 立即可用。
-   步长不宜再小：每次探测都要整表解析 mountinfo，2ms 步进在上限 1.5s 时等于每个
-   进程做 750 次全表解析，启动高峰会把 CPU 和 mountinfo 读锁一起打满。10ms 步进
-   在上限 100ms 内只做 10 次，足够覆盖"挂载在 0–9ms 内完成"的常态。 */
-static long wait_storage_proxied(int timeout_ms) {
-    long waited = 0;
-    while (!storage_is_proxied()) {
-        if (waited >= timeout_ms) break;
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
-        nanosleep(&ts, nullptr);
-        waited += 10;
+/* 单调毫秒时钟（只做差值，不与任何别的时钟比较） */
+static long monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* 有界等待本进程的命名空间出现代理视图。返回已等待的毫秒数，*ready 给出结束时
+   的事实（调用方不必再读一次表）。
+
+   预算 <= 0：**一次 mountinfo 都不读**直接返回——这是默认路径，读整份挂载表在
+   条目多的设备上是几十毫秒量级，不能让每次冷启动都付这笔钱。
+
+   预算 > 0：先探测一次（视图可能已就绪），之后用 poll 等挂载表变化事件，事件
+   来了才再探测一次。等待期间既不读表也不占 CPU。
+
+   预算按**墙钟**算，不按步进次数：探测自身耗时同样吃预算。旧实现累加的只是
+   nanosleep 的时长，于是"100ms 预算"实际是约 11 次整表解析，在大表设备上等于
+   每次冷启动多花几百毫秒；按墙钟计之后，同一份实现在小表设备上能等到视图、
+   在大表设备上第一次探测就把预算花光并立刻放行。 */
+static long wait_storage_proxied(int budget_ms, bool* ready) {
+    *ready = false;
+    if (budget_ms <= 0) return 0;
+
+    long start = monotonic_ms();
+    if (storage_is_proxied()) {
+        *ready = true;
+        return monotonic_ms() - start;
     }
-    return waited;
+
+    /* 只当事件源用，从不读它（读表由 storage_is_proxied 负责）。
+       events 必须为 0：mountinfo 的 EPOLLIN 恒真，置位就是忙轮询；命名空间的
+       挂载表一变，内核回 EPOLLERR（项目侧同一机制见 src/injector/ns_mnt_watch.c）。 */
+    int event_fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+    if (event_fd < 0) return monotonic_ms() - start;
+
+    for (;;) {
+        long spent = monotonic_ms() - start;
+        if (spent >= budget_ms) break;
+        struct pollfd pfd = {.fd = event_fd, .events = 0, .revents = 0};
+        int pr = poll(&pfd, 1, (int)(budget_ms - spent));
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) break; /* 预算耗尽 */
+        if (storage_is_proxied()) {
+            *ready = true;
+            break;
+        }
+    }
+    close(event_fd);
+    return monotonic_ms() - start;
 }
 
 /* 是否上报该进程给 injector。
@@ -292,6 +342,7 @@ class AppReporterModule : public zygisk::ModuleBase {
         pending_ = false;
         answered_ = false;
         reply_ok_ = false;
+        post_wait_ms_ = 0;
 
         struct timespec t_pre0;
         clock_gettime(CLOCK_MONOTONIC, &t_pre0);
@@ -301,7 +352,7 @@ class AppReporterModule : public zygisk::ModuleBase {
             int req_len = snprintf(req_buf, sizeof(req_buf), "REQ %s %d %u %d", final_name,
                                    getpid(), args->uid, NSP_ZYGISK_PROTO);
             if (write(fd, req_buf, req_len) > 0) {
-                /* 等 injector 的判决（上限 200ms）：OK = 无需挂载，可直接继续；
+                /* 等 injector 的判决（上限 MODULE_REQ_TIMEOUT_MS）：OK = 无需挂载，可直接继续；
                    DEFER = 目标应用，injector 已在后台盯着本 pid 的命名空间，本进程
                    到 post 再等自己的视图出现。pre 通道只裁决不挂载——此刻还在
                    zygote 的挂载 ns 里，挂上去会被之后 fork 的每个应用继承。 */
@@ -318,8 +369,12 @@ class AppReporterModule : public zygisk::ModuleBase {
                    / 崩溃 / 忙）或收到 ERR 时一律直接放行：等待在这种情形下毫无意义，
                    而启动高峰期每个进程多等上界就会把开机拖成"卡死"。
                    注意不能反过来"没应答算 pending"——这正是上一版的缺陷。 */
-                pending_ = (answered_ && strcmp(reply, "DEFER") == 0);
+                pending_ = (answered_ && strncmp(reply, "DEFER", 5) == 0);
                 reply_ok_ = (answered_ && strcmp(reply, "OK") == 0);
+                /* DEFER 应答可带 post 等待预算（"DEFER <ms>"）：>0 = 在 post 里
+                   等到视图就绪（墙钟预算、事件驱动）；0 或缺省 = 不等、不读表。
+                   旧 injector 只回裸 DEFER，按 0 处理。 */
+                post_wait_ms_ = pending_ ? nsp_post_wait_budget(reply) : 0;
             }
             /* 连接只在本回调内使用，返回前必须关闭（见 NSP_ZYGISK_PROTO 注释：
                ZygiskNext 1.3.4+ 会关掉 preAppSpecialize 返回后仍持有的 companion
@@ -357,22 +412,26 @@ class AppReporterModule : public zygisk::ModuleBase {
     void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
         /* v1 补挂载：pre-specialize 时 injector 回 DEFER 的进程在这里等自己的
            /storage/emulated 变成项目 FUSE（injector 侧在 ns 切换的瞬间挂载）。
-           本回调仍早于应用 Java 代码（Application.onCreate）执行，因此应用的
-           首次写入就能看到代理视图。只在 pending_ 时等待：未命中配置的应用、
-           v2/v3（全局替换）与 injector 不在线的情况都不会多一次等待。 */
+           本回调仍早于应用 Java 代码（Application.onCreate）执行，因此预算内的
+           首次写入能看到代理视图。只在 pending_ 时处理：未命中配置的应用、
+           v2/v3（全局替换）与 injector 不在线的情况都不会多一次读取或等待。
+
+           等多久由 injector 下发（post_wait_ms_）：0 = 不等、一次 mountinfo 都不
+           读；>0 = 墙钟预算内等到视图就绪。等不到就放行——应用继续用原生视图，
+           injector 的后台重试队列随后补挂，绝不把应用卡死在 specialize 上。 */
         if (pending_) {
             pending_ = false;
-            /* 本进程已在自己的挂载命名空间里：injector 在收到 pre 通知后就盯着这个
-               pid 的 ns，切换完成的第一时间挂载。这里只等"自己的视图就绪"这个
-               本地事实（不访问任何 fd/IPC），等到即继续，等不到由 injector 的后台
-               重试队列补挂——绝不把应用卡死在 specialize 上。 */
-            long waited = wait_storage_proxied(MODULE_PROXY_WAIT_MS);
-            if (storage_is_proxied()) {
+            bool ready = false;
+            long waited = wait_storage_proxied(post_wait_ms_, &ready);
+            if (ready) {
                 LOGI("App [%s] (PID:%d) 补挂载完成: 代理视图在 %ldms 内就绪", pkg_, getpid(),
                      waited);
-            } else {
+            } else if (post_wait_ms_ > 0) {
                 LOGI("App [%s] (PID:%d) 补挂载未就绪: %dms 内未见代理视图，已放行（后台重试补挂）",
-                     pkg_, getpid(), MODULE_PROXY_WAIT_MS);
+                     pkg_, getpid(), post_wait_ms_);
+            } else {
+                LOGD("App [%s] (PID:%d) 补挂载不等待（预算 0ms），由 injector 后台收敛", pkg_,
+                     getpid());
             }
         }
         /* 上报已完成，卸载自身以保持应用进程纯净 */
@@ -390,6 +449,8 @@ class AppReporterModule : public zygisk::ModuleBase {
     /* pre 是否真的收到 injector 的应答（区分"ERR/超时放行"与"明确 OK"） */
     bool answered_ = false;
     bool reply_ok_ = false;
+    /* post 等待预算（毫秒，0 = 不等）：由 injector 在 DEFER 应答里下发 */
+    int post_wait_ms_ = 0;
 };
 
 REGISTER_ZYGISK_MODULE(AppReporterModule)

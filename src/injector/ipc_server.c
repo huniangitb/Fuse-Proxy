@@ -897,7 +897,21 @@ void handle_ipc_client_readable(int client_fd) {
            - 旧模块（无 proto）/ REQ：就地挂载，语义不变。 */
         IpcChannel chan = ipc_plan_channel(is_post, is_report, proto);
         if (chan == IPC_CHAN_DEFER) {
-            ipc_reply_and_close(client_fd, "DEFER");
+            /* 应答文本随 proto 分叉：proto>=4 的模块按 "DEFER <ms>" 里的数字决定
+               post 等多久（0 = 不等、一次 mountinfo 都不读）；旧模块用 strcmp 只
+               认裸 "DEFER"，带数字会让它整段等待失效。 */
+            int wait_ms = 0;
+            char defer_reply[32];
+            if (proto >= IPC_PROTO_POST_WAIT) {
+                wait_ms = g_global_cfg.zygisk_post_wait_ms;
+                snprintf(defer_reply, sizeof defer_reply, "DEFER %d", wait_ms);
+            } else {
+                snprintf(defer_reply, sizeof defer_reply, "DEFER");
+            }
+            ipc_reply_and_close(client_fd, defer_reply);
+            LOG_DBG("IPC裁决: %s(PID:%d) DEFER（proto %d，post 等待预算 %s）", clean_pkg, pid, proto,
+                    proto >= IPC_PROTO_POST_WAIT ? (wait_ms > 0 ? "见配置" : "0ms，不等")
+                                                 : "由旧模块自己决定");
             /* 新模块（proto>=3）post 阶段不再回连，改由这里盯它的命名空间：
                应答先发出去（模块在等），盯梢线程随后建，不拖慢判决。 */
             if (proto >= IPC_PROTO_LOCAL_WAIT) {
