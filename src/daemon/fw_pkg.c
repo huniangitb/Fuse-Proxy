@@ -177,16 +177,19 @@ bool fw_pkg_is_privileged(uid_t uid) {
 }
 
 
-/* ---- uid → 存储类 appop（All files access / legacy storage） ----
+/* ---- uid → 存储类 appop（All files access / 安装器） ----
    Android 11+ 的 All files access 是一个 appop，没有可读的状态文件：AOSP 14+
    已不再写 /data/system/appops.xml，本机 /data/system/appops/ 下只有 discrete/
-   与 history/（访问历史，不是 mode）。legacy storage（targetSdk ≤ 29 的旧式
-   整盘访问）同样是 appop。唯一可靠来源是 AppOpsService 自身，故按 uid 解析出
-   包名后跑一次 `cmd appops get <pkg>`（root 直跑，实测约 40ms；不带 op 参数
-   时只输出非默认项，一屏以内），一次拿两个结论：
+   与 history/（访问历史，不是 mode）。应用"能装包"同样是一个 appop
+   （REQUEST_INSTALL_PACKAGES；系统应用另有同名权限 INSTALL_PACKAGES）。
+   唯一可靠来源是 AppOpsService 自身，故按 uid 解析出包名后跑一次
+   `cmd appops get <pkg>`（root 直跑，实测约 40ms；不带 op 参数时只输出非默认项，
+   一屏以内），一次拿两个结论：
      Uid mode: MANAGE_EXTERNAL_STORAGE: allow   —— uid 模式（共享 uid 的应用）
      MANAGE_EXTERNAL_STORAGE: allow             —— 包模式
-     LEGACY_STORAGE: allow                      —— legacy storage
+     INSTALL_PACKAGES: allow                    —— 覆盖 REQUEST_INSTALL_PACKAGES
+                                                   appop 与 INSTALL_PACKAGES 权限
+                                                   （两者都以同一子串结尾）
    "default" / "deny" / "ignore" 都不算。
 
    结果按 uid 缓存（命中/未命中都缓存，只有命令失败时不缓存以免每次请求都 fork），
@@ -199,29 +202,29 @@ typedef struct {
     uid_t uid;
     bool known; /* 本代已有结果（命令失败 → false，下次重查） */
     bool manage_external;
-    bool legacy;
+    bool installer;
 } FwPkgExtSlot;
 
 static FwPkgExtSlot g_ext_slots[FW_PKG_CACHE_SIZE];
 static pthread_mutex_t g_ext_fill_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool (*g_manage_external_probe)(const char* pkg);
-static bool (*g_legacy_storage_probe)(const char* pkg);
+static bool (*g_installer_probe)(const char* pkg);
 
 void fw_pkg_set_manage_external_probe(bool (*fn)(const char* pkg)) {
     g_manage_external_probe = fn;
 }
 
-void fw_pkg_set_legacy_storage_probe(bool (*fn)(const char* pkg)) {
-    g_legacy_storage_probe = fn;
+void fw_pkg_set_installer_probe(bool (*fn)(const char* pkg)) {
+    g_installer_probe = fn;
 }
 
 /* 跑 `cmd appops get <pkg>` 并解析输出。
    子进程用 posix_spawn（vfork + execve，不经过 shell）；stdout 收到管道，
    stderr 丢 /dev/null。返回 false = 命令本身失败（调用方不写缓存，下次重试）。 */
 static bool appops_query_storage_ops(const char* pkg, bool* manage_external_out,
-                                     bool* legacy_out) {
+                                     bool* installer_out) {
     *manage_external_out = false;
-    *legacy_out = false;
+    *installer_out = false;
     int fds[2];
     if (pipe(fds) != 0) return false;
     posix_spawn_file_actions_t fa;
@@ -264,7 +267,7 @@ static bool appops_query_storage_ops(const char* pkg, bool* manage_external_out,
     } while (waited < 0 && errno == EINTR);
     if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
     *manage_external_out = strstr(buf, "MANAGE_EXTERNAL_STORAGE: allow") != nullptr;
-    *legacy_out = strstr(buf, "LEGACY_STORAGE: allow") != nullptr;
+    *installer_out = strstr(buf, "INSTALL_PACKAGES: allow") != nullptr;
     return true;
 }
 
@@ -281,7 +284,7 @@ static uint64_t ext_clock_ms(void) {
 
 /* 命中槽位即返回；未命中/过期则解析包名并查一次 appops（两个 op 共用一次查询），
    写回槽位后再返回。两个结论同进同出，避免为第二个 op 再 fork 一次。 */
-static void ext_lookup(uid_t uid, bool* manage_external_out, bool* legacy_out) {
+static void ext_lookup(uid_t uid, bool* manage_external_out, bool* installer_out) {
     FwPkgExtSlot* s = &g_ext_slots[uid % FW_PKG_CACHE_SIZE];
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
     uint64_t now = ext_clock_ms();
@@ -291,7 +294,7 @@ static void ext_lookup(uid_t uid, bool* manage_external_out, bool* legacy_out) {
             if (v1 == atomic_load_explicit(&s->seq, memory_order_acquire) && s->gen == gen &&
                 s->uid == uid && s->known && now - s->stamp_ms < FW_PKG_EXT_TTL_MS) {
                 *manage_external_out = s->manage_external;
-                *legacy_out = s->legacy;
+                *installer_out = s->installer;
                 return;
             }
         }
@@ -300,16 +303,16 @@ static void ext_lookup(uid_t uid, bool* manage_external_out, bool* legacy_out) {
         char pkg[FW_PKG_NAME_MAX];
         bool resolved = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, nullptr, 0);
         bool manage_external = false;
-        bool legacy = false;
+        bool installer = false;
         bool done = resolved;
         if (resolved) {
-            if (g_manage_external_probe || g_legacy_storage_probe) {
+            if (g_manage_external_probe || g_installer_probe) {
                 manage_external = g_manage_external_probe && g_manage_external_probe(pkg);
-                legacy = g_legacy_storage_probe && g_legacy_storage_probe(pkg);
+                installer = g_installer_probe && g_installer_probe(pkg);
             } else {
                 /* 命令本身失败（无 /system/bin/cmd 等）不写缓存：交给下次请求重试。
                    解析不到包名同样不缓存。 */
-                done = appops_query_storage_ops(pkg, &manage_external, &legacy);
+                done = appops_query_storage_ops(pkg, &manage_external, &installer);
             }
         }
         atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
@@ -317,30 +320,30 @@ static void ext_lookup(uid_t uid, bool* manage_external_out, bool* legacy_out) {
         s->uid = uid;
         s->known = done;
         s->manage_external = manage_external;
-        s->legacy = legacy;
+        s->installer = installer;
         s->gen = gen;
         s->stamp_ms = ext_clock_ms();
         atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
                               memory_order_release); /* 偶：写完 */
         pthread_mutex_unlock(&g_ext_fill_lock);
         *manage_external_out = manage_external;
-        *legacy_out = legacy;
+        *installer_out = installer;
         return;
     }
 }
 
 bool fw_pkg_manages_external(uid_t uid) {
     bool manage_external = false;
-    bool legacy = false;
-    ext_lookup(uid, &manage_external, &legacy);
+    bool installer = false;
+    ext_lookup(uid, &manage_external, &installer);
     return manage_external;
 }
 
-bool fw_pkg_has_legacy_storage(uid_t uid) {
+bool fw_pkg_can_install_packages(uid_t uid) {
     bool manage_external = false;
-    bool legacy = false;
-    ext_lookup(uid, &manage_external, &legacy);
-    return legacy;
+    bool installer = false;
+    ext_lookup(uid, &manage_external, &installer);
+    return installer;
 }
 
 /* ---- 包名 → uid（FUSE 事件通道的白名单自动解析用） ----

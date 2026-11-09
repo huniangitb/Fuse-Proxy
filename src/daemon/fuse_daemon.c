@@ -328,10 +328,11 @@ static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse
         return NSP_VIS_TOO_LONG;
 
     /* Android/data|obb 只显示自身包名（沙盒/无用户层时该语义不适用）。
-       与 resolve 侧 br_isolation_blocks 共用同一组豁免（fw_rules_cross_app_exempt：
-       白名单 ALLOW_CROSS_APP_PKGS、特权签名、能力豁免开关），三处判定只写一份，
-       否则会出现「列表看得到、按名打开却 ENOENT」的割裂。appops 查询有代价（一次
-       调用，按 uid 缓存 30s），且能力总闸默认关时根本不查。
+       与 resolve 侧 br_isolation_blocks 共用同一条判据（fw_rules_cross_app_access：
+       白名单、特权签名、能力档），三处判定只写一份，否则会出现「列表看得到、
+       按名打开却 ENOENT」的割裂。能力档区分完整访问与只读 obb，故这里要按当前
+       列举的父目录传 is_obb。appops 查询有代价（一次调用，按 uid 缓存 30s），
+       档位判定内部对已命中白名单/特权的调用方早退，不查。
        同 uid 多包（sharedUserId / 系统同进程宿主）按 uid 视为同一应用：目录名与
        调用方解析出的包名不同，但属主 uid 相同，列举不能把它滤掉。 */
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
@@ -343,7 +344,9 @@ static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse
         uid_t owner_uid = 0;
         bool same_app = (strcmp(name, current_pkg) == 0) ||
                         (fw_pkg_uid_for_package(name, &owner_uid) && owner_uid == uid);
-        if (!same_app && !fw_rules_cross_app_exempt(current_pkg, uid)) return NSP_VIS_SKIP;
+        bool is_obb = (strncmp(sub_path, "/Android/obb", 12) == 0);
+        if (!same_app && fw_rules_cross_app_access(current_pkg, uid, is_obb) == NSP_XAPP_NONE)
+            return NSP_VIS_SKIP;
     }
 
     /* 子项轻量探测：只判 hidden/redirect_target，不构建真实路径、不触发

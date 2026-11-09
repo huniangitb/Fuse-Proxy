@@ -75,8 +75,10 @@ RESOLVE_CASES = [
     ("sandbox.conf", 10123, "/0/Android/data/com.demo.app/own.txt", "/0/Android/data/com.demo.app/own.txt", None),
     # /Android 下非 data/obb（如 media）不重定向
     ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin", "/0/Android/media/com.other.app/m.bin", None),
-    # 别的应用的 data 进自己的沙盒
-    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", "com.demo.app/sandbox/Android/data/com.other.app/f", None),
+    # 别的应用的 data 子树不归沙盒改写：沙盒对它让位，落回真实路径交隔离层按调用方
+    # 能力档裁决——没有能力/显式声明的调用方在这里被隔离（missing），镜像里不出现
+    # 他包路径
+    ("sandbox.conf", 10123, "/0/Android/data/com.other.app/f", None, "/sandbox/", True),
     # ALLOW 豁免：显式放行 → 落回真实路径，不进沙盒
     ("sandbox.conf", 10500, "/0/Download/keep/k.txt", "/0/Download/keep/k.txt", "/sandbox/"),
     # 该应用其它共享目录仍进沙盒
@@ -231,17 +233,22 @@ def main():
             for uid, path, real, missing in parse_resolve(r.stdout):
                 resolve_results[(conf, uid, path)] = (real, missing)
 
-        for conf, uid, path, want_in, want_not in RESOLVE_CASES:
+        for case in RESOLVE_CASES:
+            conf, uid, path, want_in, want_not = case[:5]
+            want_missing = case[5] if len(case) > 5 else None
             entry = resolve_results.get((conf, uid, path))
             name = f"{conf} uid={uid} {path}"
             if entry is None:
                 print(f"FAIL {name}: 无解析输出")
                 failed += 1
                 continue
-            real = entry[0]
+            real, missing = entry[0], entry[1]
             okp = (want_in is None or want_in in real) and (want_not is None or want_not not in real)
+            if want_missing is not None:
+                okp = okp and missing == want_missing
             if not okp:
-                print(f"FAIL {name}: real={real}（期望含 {want_in!r} / 不含 {want_not!r}）")
+                print(f"FAIL {name}: real={real} missing={missing}（期望含 {want_in!r} / 不含 "
+                      f"{want_not!r} / missing={want_missing!r}）")
                 failed += 1
             else:
                 print(f"PASS {name}: real={real}")

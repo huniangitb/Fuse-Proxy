@@ -32,14 +32,22 @@ bool fw_pkg_is_privileged(uid_t uid) {
     (void)uid;
     return g_stub_priv;
 }
-/* All files access / legacy storage 在驱动里由 mkdecide 的 manage/legacy 参数
-   直接给定，桩恒 false */
+/* 能力事实（All files access / 能装包）在驱动里由 mkdecide* 的参数直接给定，
+   桩恒 false */
 bool fw_pkg_manages_external(uid_t uid) {
     (void)uid;
     return false;
 }
-bool fw_pkg_has_legacy_storage(uid_t uid) {
+bool fw_pkg_can_install_packages(uid_t uid) {
     (void)uid;
+    return false;
+}
+/* 显式声明回查（生产走规则层）：驱动里恒 false，判定链保持纯 ACL 语义；
+   声明优先的用例在 tests/test_rules.py 里走真实规则层覆盖。 */
+bool fw_rules_path_declared(uid_t uid, pid_t pid, const char* path) {
+    (void)uid;
+    (void)pid;
+    (void)path;
     return false;
 }
 /* 包名 → uid：生产实现读 /data/system/packages.list，驱动里给一张最小表，
@@ -144,14 +152,14 @@ static NspAclVerdict mkdecide_manage(const char* path, NspAclOp op, const char* 
     return fw_acl_decide(&q, &id);
 }
 
-/* legacy storage 豁免用例（All files access 之外的第二种存储类 appop） */
-static NspAclVerdict mkdecide_legacy(const char* path, NspAclOp op, const char* pkg) {
+/* 能装包（INSTALLER 档）：只有 obb 放行，data 不放行 */
+static NspAclVerdict mkdecide_installer(const char* path, NspAclOp op, const char* pkg) {
     NspAclIdentity id;
     memset(&id, 0, sizeof(id));
     id.uid = 10123;
     id.pkg_known = true;
     snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
-    id.legacy = true;
+    id.installer = true;
     id.cross_app_by_capability = true;
     id.cross_app_isolated = true;
     NspAclQuery q;
@@ -201,14 +209,14 @@ static NspAclVerdict mkdecide_allow(const char* path, NspAclOp op, const char* p
 
 /* 能力豁免总闸关闭：能力位仍为真也不得放行（默认配置下的行为） */
 static NspAclVerdict mkdecide_cap_off(const char* path, NspAclOp op, const char* pkg, bool manage,
-                                     bool legacy) {
+                                     bool installer) {
     NspAclIdentity id;
     memset(&id, 0, sizeof(id));
     id.uid = 10123;
     id.pkg_known = true;
     snprintf(id.pkg, sizeof(id.pkg), "%s", pkg ? pkg : "unknown");
     id.manage_external = manage;
-    id.legacy = legacy;
+    id.installer = installer;
     id.cross_app_isolated = true;
     NspAclQuery q;
     memset(&q, 0, sizeof(q));
@@ -275,10 +283,14 @@ int main(void) {
              mkdecide_manage("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
                              "com.installer.app", false, true, true, true, 0, false),
              NSP_ACL_ALLOW);
-    expect_v("legacy storage（LEGACY_STORAGE）→ ALLOW",
-             mkdecide_legacy("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
-                             "com.legacy.app"),
+    expect_v("能装包（INSTALLER 档）读他包 obb → ALLOW",
+             mkdecide_installer("/0/Android/obb/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                                "com.installer.app"),
              NSP_ACL_ALLOW);
+    expect_v("能装包（INSTALLER 档）读他包 data → ENOENT",
+             mkdecide_installer("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+                                "com.installer.app"),
+             NSP_ACL_DENY_ENOENT);
     /* 按包名白名单放行：命中者与 appops 授权无关；未列出的一律隔离，且匹配按调用方
        自身包名 —— 同 uid 的兄弟包不会被顺带放行。 */
     expect_v("白名单命中 → ALLOW",
@@ -293,14 +305,14 @@ int main(void) {
              mkdecide_allow("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
                             "com.allow.app:push"),
              NSP_ACL_ALLOW);
-    /* 能力豁免默认关：持 All files access / legacy storage 也不再自动放行，必须由
-       [GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY ON 显式打开。 */
-    expect_v("能力豁免关（All files access）→ ENOENT",
+    /* 能力总闸显式关（[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY OFF）：持 All files
+       access / 能装包也不再放行——这是"比原生更严"的显式选择。 */
+    expect_v("能力总闸关（All files access）→ ENOENT",
              mkdecide_cap_off("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
                               "com.installer.app", true, false),
              NSP_ACL_DENY_ENOENT);
-    expect_v("能力豁免关（legacy storage）→ ENOENT",
-             mkdecide_cap_off("/0/Android/data/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
+    expect_v("能力总闸关（能装包）读 obb → ENOENT",
+             mkdecide_cap_off("/0/Android/obb/com.other.app/x", NSP_ACL_OP_GENERIC_READ,
                               "com.plain.app", false, true),
              NSP_ACL_DENY_ENOENT);
     /* 同 uid 多包 = 同一 app 身份（Linux DAC 只认 uid）：系统里 MediaProvider 与
