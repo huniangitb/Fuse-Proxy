@@ -100,6 +100,15 @@ def main():
     assert "monotonic_ms()" in module, "预算必须按墙钟算（探测自身的耗时也吃预算）"
     assert "poll(&pfd, 1," in module, "等的是挂载表变化事件，不是步进轮询"
 
+    # ── 契约：companion 中转必须原样带上预算 ──
+    # 应用侧拿到的应答是 companion 转发来的：这里若用整串比较，带预算的
+    # "DEFER 0" 会被判成无法识别的动词而回落 "ERR"，应用侧就完全收不到
+    # DEFER（真机表现：injector 日志判 DEFER、模块日志记 ERR 直接放行）。
+    assert 'strncmp(buf, "DEFER", 5)' in module, \
+        "companion 必须接受带预算的 DEFER，不能整串比较"
+    assert 'strncmp(reply, "DEFER", 5) != 0' in module, \
+        "留下连接等 POST 的判据同样按前缀，否则带预算的连接会被提前关掉"
+
     # ── 契约：injector 侧下发 ──
     ipc = read("src/injector/ipc_server.c")
     assert '"DEFER %d"' in ipc, "proto>=4 的 DEFER 必须带毫秒数"
