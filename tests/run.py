@@ -417,6 +417,15 @@ SUITE_MAP = [
       "src/daemon/fw_acl.c", "src/daemon/fw_acl.h"),
      ("nsp_new_entry_attrs", "fw_acl_is_structure_entry", "fw_acl_repair_storage_toplevel"),
      "新建条目权限值(mode 以调用方为准) / 顶层目录 chmod 丢弃"),
+
+    # 跨树搬移的落位属性：rename 不产生新条目，来源树的属主与 mode 会跟着落地，
+    # 共享存储里「属主是某个应用、mode 0600」的条目除写入者外谁也打不开（另存到
+    # /sdcard/Download 的文件在文件管理器里 EACCES 就是这个形状）。判别点在「落位
+    # 时按目标父目录重挂」：旧实现 A 组全失败；同属主改名与私有树落点必须原样不动。
+    (("test_move_landing.py",),
+     ("src/core/common.c", "include/common.h", "src/daemon/fuse_daemon.c"),
+     ("nsp_rehome_moved_entry", "nsp_new_entry_attrs"),
+     "跨树搬移的落位属性(rename 后按目标父目录重挂属主/mode)"),
 ]
 
 
@@ -498,6 +507,7 @@ LAYERS = {
             "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
             "test_entry_perms.py",
+            "test_move_landing.py",
             "test_modules.py",
             "test_module_circuit.py",
             "test_backend_lifecycle.py",

@@ -2512,6 +2512,10 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     if (flags) {
 #ifdef SYS_renameat2
         if (syscall(SYS_renameat2, AT_FDCWD, p_from, AT_FDCWD, p_to, flags) == 0) {
+            /* EXCHANGE 两个名字都换了树，故两端都重挂（普通 rename 下 from 已不存在，
+               重挂函数按 lstat 失败直接返回）；属主与目标父目录一致的条目一律不动 */
+            nsp_rehome_moved_entry(p_to);
+            nsp_rehome_moved_entry(p_from);
             vfs_rename_event(from, to, ctx->uid, ctx->pid);
             return 0;
         }
@@ -2537,6 +2541,9 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
         return -mkdir_err; /* 旧实现 free 后用 p_to_dir 打日志（UAF）且取残留 errno */
     }
     if (rename(p_from, p_to) == 0) {
+        /* 跨树搬移（应用私有树 -> /sdcard）落位后重挂属性：rename 不产生新条目，
+           否则条目带着来源树的属主与 0600 落地，共享存储里除写入者谁也打不开 */
+        nsp_rehome_moved_entry(p_to);
         vfs_rename_event(from, to, ctx->uid, ctx->pid);
         return 0;
     }
@@ -2599,6 +2606,10 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
             LOG_ERR("跨设备搬移：临时产物就位失败: %s -> %s (err=%d)", tmp_to, p_to, e);
             return -e;
         }
+        /* 就位即落进目标树：复制阶段带回的是源条目的属主与 mode（fchown/fchmod 照抄
+           源属性），这里与同设备 rename 一样按目标父目录重挂；在删源之前做，失败也
+           不影响搬移结果 */
+        nsp_rehome_moved_entry(p_to);
         /* 就位成功后才删源；删源失败**不得**回删目标（否则两边都不完整），
            如实回报错误并保留完整的目标 */
         int rm_res = src_is_dir ? recursive_rmdir(p_from)
