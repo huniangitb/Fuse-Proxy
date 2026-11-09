@@ -58,7 +58,7 @@ case=<ftp|sftp|hide|iso|plain|unlink>|step=<name>|ok=<0|1>|detail=<...>
 | 除 race 外 | `start`, `ready`（`ms=` 就绪耗时；超时则 `ok=0`） |
 | ftp / sftp | `mkdir`, `write`, `read`, `list`, `canary`, `done` |
 | hide | `phase_a` 或（`phase_b` + `write_denied`）, `list`, `done` |
-| iso | `download`, `pictures`, `done` |
+| iso | `download`, `pictures`, `android_root`, `android_list`, `android_obb_own`, `android_media_own`, `android_allow`, `done` |
 | plain | `write`, `read`, `done` |
 | unlink | `delete`, `hidden_open`, `fstat`, `read`, `hidden_closed`, `exists_closed`, `hidden_legacy`, `done` |
 | race | `attempt`×N, `summary`, `done`（**无 ready**：不等就绪，见下） |
@@ -79,6 +79,12 @@ case=<ftp|sftp|hide|iso|plain|unlink>|step=<name>|ok=<0|1>|detail=<...>
 - `iso`：`Environment.getExternalStorageDirectory()` 下的
   `Download/nsp_probe_sandbox.txt` 与 `Pictures/nsp_probe_sandbox.jpg`，写入含
   包名+时间戳的内容并读回；detail 带实际绝对路径。
+  其后是 /Android 整树的判别步骤：`android_root` 写 `Android/nsp_probe_sandbox.txt`
+  （沙盒开启时应落镜像），`android_list` 列 `/sdcard/Android`（detail 为条目，
+  用来确认自建条目在自己视图里可见），`android_obb_own`/`android_media_own`
+  写 `Android/obb|media/<pkg>/`（私有目录让位，应落真实目录），`android_allow`
+  写 ALLOW 豁免路径。后三个目录由宿主预建并 chown 给本应用——真实设备上它们由
+  系统或安装器建立，以免把「目录不存在」误判成重定向错误。
 - `plain`：写 `/sdcard/Android/data/<pkg>/files/plain.txt` 并读回。
 - `unlink`：在 `/sdcard/nsp_verify/unlink/` 写 `nsp_probe_unlink.txt` 并保持读句柄，
   删除后立即列举目录（`hidden_open`，期望**新增** `.fuse_hidden` 计数为 0）、用

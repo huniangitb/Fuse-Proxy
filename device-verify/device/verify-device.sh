@@ -143,6 +143,13 @@ clean-fixtures)
     rm -rf /data/media/0/nsp_race_b
     rm -f /data/media/0/Download/nsp_probe_sandbox.txt /data/media/0/Pictures/nsp_probe_sandbox.jpg
     rm -f /data/media/0/Download/nsp_race_a*.txt
+    # iso 探针的沙盒判别夹具：真实 /Android 下必须留空、镜像里的旧结果要先清掉，
+    # 否则上一轮的落点会让这一轮的「有没有落真实目录」判断失效。
+    rm -f /data/media/0/Android/nsp_probe_sandbox.txt
+    rm -rf /data/media/0/Android/data/nsp.probe.iso/sandbox/Android
+    rm -f /data/media/0/Android/obb/nsp.probe.iso/nsp_probe_obb.txt
+    rm -f /data/media/0/Android/media/nsp.probe.iso/nsp_probe_media.txt
+    rm -rf /data/media/0/Android/nsp_probe_allow
     echo "FIXTURES_CLEANED"
     ;;
 race-fixture)
@@ -173,6 +180,27 @@ race-scan)
     echo "REAL_DL=$(_list_ids /data/media/0/Download nsp_race_a)"
     echo "SB_DL=$(_list_ids "/data/media/0/Android/data/$_pkg/sandbox/Download" nsp_race_a)"
     echo "REAL_HID=$(_list_ids /data/media/0/nsp_race_b nsp_race_b)"
+    ;;
+iso-fixture)
+    need_root
+    [ -n "${2:-}" ] || die "用法: iso-fixture <pkg>"
+    _pkg=$2
+    _uid=$(stat -c %u "/data/data/$_pkg" 2>/dev/null)
+    [ -n "$_uid" ] || _uid=$(dumpsys package "$_pkg" 2>/dev/null | sed -n 's/.*userId=\([0-9][0-9]*\).*/\1/p' | head -1)
+    [ -n "$_uid" ] || die "无法取得 $_pkg 的 uid"
+    # 三处私有目录：沙盒对它们让位，写进去必须落真实目录。真实设备上这些目录由
+    # 系统或安装器预建，这里照同样形态造出来，免得把「目录不存在」误判成重定向错。
+    for _d in "/data/media/0/Android/obb/$_pkg" "/data/media/0/Android/media/$_pkg" \
+              /data/media/0/Android/nsp_probe_allow; do
+        case "$_d" in /data/media/0/Android/*) ;; *) die "夹具路径异常: $_d" ;; esac
+        mkdir -p "$_d" || die "创建夹具目录失败: $_d"
+        chown "$_uid:$_uid" "$_d" || die "chown 夹具目录失败: $_d"
+        chmod 0771 "$_d"
+        if command -v chcon >/dev/null 2>&1; then
+            chcon u:object_r:media_rw_data_file:s0 "$_d" 2>/dev/null || true
+        fi
+    done
+    echo "ISO_FIXTURE_READY $_pkg uid=$_uid"
     ;;
 make-hide-fixture)
     need_root

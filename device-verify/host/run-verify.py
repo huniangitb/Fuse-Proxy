@@ -16,8 +16,10 @@
 覆盖
 ----
 - ftp / sftp：探针启动即在虚拟前缀写文件，宿主核对后端落盘 + 真实存储零侧漏。
-- iso：SANDBOX ON，探针写 Download/Pictures，核对真实共享目录无文件、
-  文件落在 <STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox/ 下。
+- iso：SANDBOX ON，探针写 Download/Pictures 与 /Android（含它下面的 obb/media
+  私有目录与一条 ALLOW 豁免路径），核对真实共享目录无文件、文件落在
+  <STORAGE_BASE>/<uid>/Android/data/<pkg>/sandbox/ 下，且三处私有目录与 ALLOW
+  豁免仍落真实目录。
 - hide：两阶段——先由探针创建 canary，热重载配置加 HIDE，再启动必须 ENOENT
   且真实文件仍在。
 - plain：对照组，普通外部目录读写不受影响。
@@ -346,6 +348,8 @@ def render_injector_conf(phase):
         "",
         "[nsp.probe.iso]",
         "SANDBOX ON",
+        # 豁免路径与沙盒同段：证明 ALLOW 优先于 SANDBOX，且豁免后落真实目录。
+        "ALLOW /Android/nsp_probe_allow",
         "",
         "[nsp.probe.plain]",
         "HIDE /nsp_verify/plain_noop",
@@ -429,6 +433,13 @@ def step_ok(events, case, step):
         if e.get("step") == step and e.get("ok") == "1":
             return True
     return False
+
+
+def step_detail(events, case, step):
+    for e in events_for(events, case):
+        if e.get("step") == step:
+            return e.get("detail") or ""
+    return ""
 
 
 class Checker:
@@ -658,6 +669,7 @@ def main():
             adb.install(apk)
             adb.sh_root("prepare-app-dirs", pkg(case))
             apks_installed.append(pkg(case))
+        adb.sh_root("iso-fixture", pkg("iso"))
 
         print("== 保持唤醒（避免探针进程被系统冻结）==")
         awake = {
@@ -834,7 +846,8 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
         checker.check("%s 未侧漏到真实存储" % case, not exists, "exists=%s size=%s" % (exists, size))
 
     # ---- iso：SANDBOX 隔离（真实共享目录零写入 + 文件落沙盒）
-    for step in ("download", "pictures"):
+    for step in ("download", "pictures", "android_root", "android_list",
+                 "android_obb_own", "android_media_own", "android_allow"):
         checker.check("iso 探针 %s 成功" % step, step_ok(phase_a, "iso", step))
     uid_out = adb.sh_root("get-uid", pkg("iso")).stdout
     uid = parse_kv(uid_out).get("UID")
@@ -853,6 +866,52 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
         sb2 = "%s/Android/data/%s/sandbox/Pictures/nsp_probe_sandbox.jpg" % (REAL_ROOT, pkg("iso"))
         exists2, size2 = device_file(adb, sb2)
         checker.check("iso 文件落在沙盒 Pictures", exists2, sb2)
+
+        # /Android 本身在镜像内：真实目录不得落盘、镜像里必须有，且应用自己的列举
+        # 要看得见——写进镜像却列不出来，等于写完就丢。
+        real_android = REAL_ROOT + "/Android/nsp_probe_sandbox.txt"
+        exists, size = device_file(adb, real_android)
+        checker.check("iso 未写入真实 /Android", not exists,
+                      "exists=%s size=%s" % (exists, size))
+        sb_a = "%s/Android/data/%s/sandbox/Android/nsp_probe_sandbox.txt" % (REAL_ROOT, pkg("iso"))
+        exists, size = device_file(adb, sb_a)
+        checker.check("iso /Android 条目落在沙盒镜像", exists, sb_a)
+        if exists:
+            body = adb.sh_root("read-file", sb_a, check=False).stdout
+            checker.check("iso 沙盒 /Android 内容正确",
+                          body.startswith("NSP_PROBE_ISO_ANDROID:"), body[:120])
+        listing = step_detail(phase_a, "iso", "android_list")
+        checker.check("iso 列举能看到自建的 /Android 条目",
+                      "nsp_probe_sandbox.txt" in listing, listing[:200])
+
+        # 三处私有目录与 ALLOW 豁免都让位到真实目录：真实文件必须存在，镜像里不得
+        # 出现同名落点（出现了说明该路径被当成普通条目重定向了）。
+        for step, real, mirror, prefix in (
+            ("android_obb_own",
+             "%s/Android/obb/%s/nsp_probe_obb.txt" % (REAL_ROOT, pkg("iso")),
+             "%s/Android/data/%s/sandbox/Android/obb/%s/nsp_probe_obb.txt"
+             % (REAL_ROOT, pkg("iso"), pkg("iso")),
+             "NSP_PROBE_ISO_OBB:"),
+            ("android_media_own",
+             "%s/Android/media/%s/nsp_probe_media.txt" % (REAL_ROOT, pkg("iso")),
+             "%s/Android/data/%s/sandbox/Android/media/%s/nsp_probe_media.txt"
+             % (REAL_ROOT, pkg("iso"), pkg("iso")),
+             "NSP_PROBE_ISO_MEDIA:"),
+            ("android_allow",
+             "%s/Android/nsp_probe_allow/nsp_probe_allow.txt" % REAL_ROOT,
+             "%s/Android/data/%s/sandbox/Android/nsp_probe_allow/nsp_probe_allow.txt"
+             % (REAL_ROOT, pkg("iso")),
+             "NSP_PROBE_ISO_ALLOW:"),
+        ):
+            exists, size = device_file(adb, real)
+            checker.check("iso %s 落真实目录" % step, exists, real)
+            if exists:
+                body = adb.sh_root("read-file", real, check=False).stdout
+                checker.check("iso %s 真实目录内容正确" % step,
+                              body.startswith(prefix), body[:120])
+            exists_m, size_m = device_file(adb, mirror)
+            checker.check("iso %s 未进镜像" % step, not exists_m,
+                          "exists=%s size=%s" % (exists_m, size_m))
 
     # ---- plain：对照组（普通外部目录读写不受影响）
     for step in ("write", "read"):

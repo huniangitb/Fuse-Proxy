@@ -66,7 +66,7 @@ case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>
 |---|---|---|
 | `nsp.probe.ftp` | ready, write, read, list, canary | 写 `/sdcard/ftp_probe/probe_ftp.txt` → FTP 后端；回读比对；列举；REAL_CANARY 不可见 |
 | `nsp.probe.sftp` | 同上 | 写 `/sdcard/sftp_probe/probe_sftp.txt` → SFTP 后端 |
-| `nsp.probe.iso` | ready, download, pictures | SANDBOX ON：写 Download/Pictures，应落沙盒、真实共享目录零写入 |
+| `nsp.probe.iso` | ready, download, pictures, android_root, android_list, android_obb_own, android_media_own, android_allow | SANDBOX ON：写 Download/Pictures 与 /Android（含自身 obb/media 私有目录、一条 ALLOW 豁免路径）。Download/Pictures 与 /Android 下的普通条目应落沙盒、真实目录零写入且能在自己的列举里看到；三处私有目录与 ALLOW 豁免仍落真实目录 |
 | `nsp.probe.hide` | ready, phase_a / phase_b+write_denied, list | 阶段 A 真实夹具可见可读；阶段 B（换配置重启）stat/写均 ENOENT、列举不含 hide |
 | `nsp.probe.plain` | ready, write, read | 对照组：普通外部目录读写不受影响 |
 | `nsp.probe.unlink` | ready, delete, hidden_open, fstat, read, hidden_closed, exists_closed, hidden_legacy | 打开中删除：写文件并保持读句柄 → 删除 → 目录里不得**新增** `.fuse_hidden`；删除后 fstat/读仍可用；关闭后路径消失；宿主预置的历史隐藏名夹具必须**看得见**（不做列举过滤，保留取证能力） |
@@ -140,6 +140,11 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
   **真实存储 `/data/media/0/{ftp_probe,sftp_probe}/` 无同名文件**（写侧漏 = 0）。
 - SANDBOX：真实 `Download`/`Pictures` 无探针文件；`/data/media/0/Android/data/nsp.probe.iso/sandbox/`
   下存在且内容正确（`NSP_PROBE_ISO_DOWNLOAD:`）。
+- SANDBOX 的 /Android 整树：真实 `/data/media/0/Android/nsp_probe_sandbox.txt` 不存在，
+  镜像里 `…/sandbox/Android/nsp_probe_sandbox.txt` 存在且内容为 `NSP_PROBE_ISO_ANDROID:`，
+  探针列举 `/sdcard/Android` 时能看到自己刚建的条目；三处私有目录
+  （`Android/obb/<pkg>`、`Android/media/<pkg>`）与 `ALLOW /Android/nsp_probe_allow`
+  豁免的写入必须落真实目录、镜像里不得出现同名落点。
 - HIDE：阶段 A 夹具内容匹配；阶段 B stat 与写均 ENOENT；真实夹具仍在；阶段 A 列举含 `hide`、
   阶段 B 列举不含。
 - plain：真实外部目录 `Android/data/nsp.probe.plain/files/plain.txt` 存在。
