@@ -175,6 +175,20 @@ SUITE_MAP = [
       "g_grepl_replace_gap"),
      "稳态对账由挂载表变化事件驱动"),
 
+    # ── zygisk 模块 post-specialize 的等待预算（src/zygisk/post_wait.h + 下发链）──
+    # pre 的 DEFER 应答带毫秒预算（proto 4 起），模块据此决定 post 等多久：0 = 不等待、
+    # 一次 mountinfo 都不读；>0 = 按墙钟预算等挂载表变化事件再复探。解析逻辑单独成头
+    # 文件，宿主 cc 直编跑真函数（矩阵含裸 DEFER/0/负数/乱码/超上限）；静态契约锁住
+    # 「带数字的应答只发给认识它的模块」「模块用应答预算而不是编译期常量」「等的是
+    # 事件不是步进」「两处上限同值」。
+    (("test_zygisk_post_wait.py",),
+     ("src/zygisk/post_wait.h", "src/zygisk/zygisk_module.cpp",
+      "src/injector/ipc_server.c", "src/config/config_parser.c",
+      "include/config_parser.h", "include/ipc_server.h"),
+     ("nsp_post_wait_budget", "NSP_ZYGISK_PROTO", "IPC_PROTO_POST_WAIT",
+      "ZYGISK_POST_WAIT_MS"),
+     "zygisk post 等待预算由 injector 下发"),
+
     # ── 已挂载视图的连接活性（ns_mount_health.c）+ 启动扫描修复 ──
     # 直编探测原语 + --wrap=statfs：判据矩阵，以及「没有项目挂载时一次探测都不做」
     # （健康进程零行为变化）。静态契约锁住三处接线：两条挂载路径都必须先要求
@@ -458,6 +472,7 @@ LAYERS = {
             "test_mount_liveness.py",
             "test_mountinfo_dynamic.py",
             "test_mount_state_read.py",
+            "test_zygisk_post_wait.py",
             "test_grepl_status_fast.py",
             "test_events_owner.py",
             "test_crash_tail.py",
@@ -666,6 +681,7 @@ PARALLEL_SAFE = frozenset({
     "test_mountinfo_dynamic.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap=fopen，
                                   # 合成 mountinfo，无挂载/无 daemon
     "test_mount_state_read.py",   # cc 直编 mount_manager.c + 桩，合成 mountinfo，无挂载/无 daemon
+    "test_zygisk_post_wait.py",   # cc 直编 post_wait.h + 静态读源码，无挂载/无 daemon
     "test_grepl_status_fast.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap 桩
                                   # stat/opendir/readdir/fopen，合成族目录，无挂载/无 daemon
     "test_events_owner.py",       # cc 直编 nsp_events_status.c + 只读 /proc 快照，不起 daemon

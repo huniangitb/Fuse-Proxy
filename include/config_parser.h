@@ -6,6 +6,10 @@
 #define MAX_PATH_LEN 256
 #define MAX_USERS 64
 #define MAX_REASONABLE_UID 1000
+/* [GLOBAL] ZYGISK_POST_WAIT_MS 的上限（毫秒）。与 src/zygisk/post_wait.h 的
+   NSP_POST_WAIT_MAX_MS 同值：模块侧按同一上限截断，多写一个 0 不该把应用冻在
+   specialize 上几十秒。 */
+#define NSP_ZYGISK_POST_WAIT_MAX_MS 1000
 
 typedef struct {
     char virtual_prefix[MAX_PATH_LEN]; 
@@ -79,6 +83,13 @@ typedef struct {
        显式指定；-1 = 交回 libfuse 默认（10）。启动期参数：改它需要重启
        daemon（与 FUSE_EVENTS / FUSE_EXTRA_ARGS 同为启动期设置）。 */
     int fuse_threads;
+    /* [GLOBAL] ZYGISK_POST_WAIT_MS <0..NSP_ZYGISK_POST_WAIT_MAX_MS>：v1 目标
+       应用在 post-specialize 等自己命名空间出现代理视图的**墙钟**预算，随 pre 的
+       DEFER 应答下发给 zygisk 模块（0，默认 = 不等，模块一次 mountinfo 都不读）。
+       存在的意义是"读挂载视图成本高的设备"：整份 mountinfo 的成本与挂载表条目数
+       成正比（小表设备零点几毫秒、大表设备几十毫秒），而这段等待落在应用
+       specialize 的热路径上，不能写死一个对所有设备都合适的值。 */
+    int zygisk_post_wait_ms;
     /* HIDE 命中时对外返回的 errno（0 = ENOENT）。应用普遍把 ENOENT 当「还没建好」
        而重试，遇到这类重试风暴可在 [GLOBAL] 写 HIDE_ERRNO EACCES 换成拒绝语义。 */
     int hide_errno;

@@ -41,9 +41,15 @@ void handle_ipc_client_readable(int client_fd);
 #define IPC_MOUNT_INLINE_MS 20
 
 /* v3 补挂载盯梢：pre 通道收到目标应用通知后，后台以 2ms 步进盯
- * /proc/<pid>/ns/mnt，命名空间一变（specialize 完成）就立刻挂载；模块侧在
- * post-specialize 里等自己视图出现（上限 1500ms，见 zygisk 模块）。 */
+ * /proc/<pid>/ns/mnt，命名空间一变（specialize 完成）就立刻挂载。模块侧在
+ * post-specialize 里是否等、等多久由 [GLOBAL] ZYGISK_POST_WAIT_MS 决定，随
+ * DEFER 应答下发（默认 0 = 不等，模块一次 mountinfo 都不读）。 */
 #define IPC_POST_WAIT_MS 1200
+
+/* proto>=4 的模块按 DEFER 应答里的数字决定 post 等待预算："DEFER <ms>"。
+ * 旧模块用 strcmp 只认裸 "DEFER"，对它们带数字会让整段等待失效，故按 proto
+ * 分支回不同文本。预算上限见 NSP_ZYGISK_POST_WAIT_MAX_MS（config_parser.h）。 */
+#define IPC_PROTO_POST_WAIT 4
 
 /* 模块 proto 版本：>=3 的模块在 pre 阶段拿完判决即关闭 companion 连接，
  * post 不再回连（ZygiskNext 1.3.4+ 会关掉跨回调遗留的 companion fd）。

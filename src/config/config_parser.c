@@ -643,6 +643,33 @@ static void parse_fuse_threads_rule(AppConfig* cur, char* p_ptr, int line_num,
     cur->fuse_threads = (int)n;
 }
 
+/* ZYGISK_POST_WAIT_MS <0..NSP_ZYGISK_POST_WAIT_MAX_MS>：仅 [GLOBAL] 段有效；
+   v1 目标应用在 post-specialize 等自己命名空间出现代理视图的**墙钟**预算（毫秒），
+   随 pre 的 DEFER 应答下发给 zygisk 模块：0 = 不等（模块一次 mountinfo 都不读），
+   >0 = 在预算内等到视图就绪、等不到就放行。
+
+   为什么要有这个键：整份 /proc/self/mountinfo 的读取成本与挂载表条目数成正比，
+   小表设备零点几毫秒、大表设备几十毫秒，而这段等待落在应用 specialize 的热路径
+   上——写死一个值必然在某一类设备上变成"每次冷启动白等/白读"。默认 0 取
+   docs/architecture.md 的红线口径（POST 上不等存储视图，补挂载交后台收敛）。 */
+static void parse_zygisk_post_wait_rule(AppConfig* cur, char* p_ptr, int line_num,
+                                        const char* file_path) {
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("ZYGISK_POST_WAIT_MS 仅 [GLOBAL] 段有效（行 %d, 文件 %s），已忽略", line_num,
+                file_path);
+        return;
+    }
+    char* val = get_next_token(&p_ptr);
+    char* end = nullptr;
+    long n = val ? strtol(val, &end, 10) : 0;
+    if (!val || end == val || (end && *end != '\0') || n < 0 || n > NSP_ZYGISK_POST_WAIT_MAX_MS) {
+        LOG_WRN("ZYGISK_POST_WAIT_MS 取值非法 \"%s\"（行 %d, 文件 %s），已保持 0（不等）",
+                val ? val : "", line_num, file_path);
+        return;
+    }
+    cur->zygisk_post_wait_ms = (int)n;
+}
+
 /* HIDE_ERRNO <ENOENT|EACCES|EPERM>：仅 [GLOBAL] 段有效；隐藏规则命中时对外返回
    的 errno（缺省 ENOENT）。存在意义是应用侧语义：ENOENT 表示「没有这个文件」，
    多数应用会当作「还没生成」反复重试（重试风暴会把 FUSE 请求量放大成倍）；EACCES
@@ -887,6 +914,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_fuse_events_uids_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_THREADS") == 0)
         parse_fuse_threads_rule(cur, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "ZYGISK_POST_WAIT_MS") == 0)
+        parse_zygisk_post_wait_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "HIDE_ERRNO") == 0)
         parse_hide_errno_rule(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "FUSE_EXTRA_ARGS") == 0)
