@@ -8,7 +8,7 @@
  * 用法：cross_app_isolation <main_conf> <uid> <path>...
  * 输出（每行一条，便于 Python 逐项比对）：
  *   global=<0|1>                                  —— fw_data_mediation_required()
- *   <path> resolve=<0|1> probe=<0|1> other=<0|1> valid=<0|1> backing=<0|1> sandbox=<0|1> redir=<0|1>
+ *   <path> resolve=<0|1> probe=<0|1> other=<0|1> valid=<0|1> backing=<0|1> sandbox=<0|1> redir=<0|1> real=<落点>
  *     resolve = fw_rules_resolve().appear_missing（打开/getattr 侧裁决）
  *     probe   = fw_rules_probe().appear_missing  （readdir 列举侧裁决）
  *     other   = fw_rules_probe().is_other_app_pkg
@@ -108,11 +108,11 @@ int main(int argc, char** argv) {
         NspProbeResult p;
         memset(&p, 0, sizeof p);
         fw_rules_probe(&q, &p);
-        printf("%s resolve=%d probe=%d other=%d valid=%d backing=%d sandbox=%d redir=%d\n",
+        printf("%s resolve=%d probe=%d other=%d valid=%d backing=%d sandbox=%d redir=%d real=%s\n",
                argv[i], d.appear_missing ? 1 : 0, p.appear_missing ? 1 : 0,
                p.is_other_app_pkg ? 1 : 0, d.valid ? 1 : 0,
                fw_backing_mediation_required_for(argv[i]) ? 1 : 0, d.is_sandbox ? 1 : 0,
-               d.is_redirect ? 1 : 0);
+               d.is_redirect ? 1 : 0, d.real_path);
     }
     return 0;
 }
