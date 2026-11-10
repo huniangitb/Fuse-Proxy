@@ -903,6 +903,8 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
         parse_global_switch_rule(cur, &cur->skip_system_apps, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "ALLOW_CROSS_APP_DATA") == 0)
         parse_global_switch_rule(cur, &cur->allow_cross_app_data, tok, p_ptr, line_num, file_path);
+    else if (strcmp(tok, "SANDBOX_ANDROID_TREE") == 0)
+        parse_global_switch_rule(cur, &cur->sandbox_android_tree, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "ALLOW_CROSS_APP_BY_CAPABILITY") == 0)
         parse_global_switch_rule(cur, &cur->allow_cross_by_capability, tok, p_ptr, line_num,
                                  file_path);

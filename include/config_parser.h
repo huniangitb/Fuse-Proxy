@@ -39,6 +39,13 @@ typedef struct {
        （resolve/probe 同口径，隔离与隐藏一致）；ALLOW_CROSS_APP_DATA ON
        = 恢复旧行为（只过滤列举、不限制打开，等于不隔离） */
     bool allow_cross_app_data;
+    /* `/Android` 整树是否纳入沙盒镜像（仅 [GLOBAL] 段有效）：
+       false（默认）= `/Android` 下只有 `data`/`obb` 两棵子树进镜像，`/Android`
+       本身、`/Android/media` 等留在真实目录；
+       true = 除三个容器本身与调用方私有目录外整树进镜像（应用在这里新建的
+       条目落沙盒，真实目录不落盘）。两种取值都不影响 `data`/`obb` 的跨应用
+       裁决与三处容器的让位。 */
+    bool sandbox_android_tree;
     char** hide_rules;
     int hide_count;
     int hide_capacity;

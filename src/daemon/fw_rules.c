@@ -356,6 +356,40 @@ static bool br_path_android_passthrough(const char* sub_path, const char* curren
     return false;
 }
 
+/* 旧口径（[GLOBAL] SANDBOX_ANDROID_TREE 关，默认）：/Android 下只有 data/obb
+   两棵子树参与沙盒，其余路径（/Android 本身、/Android/media、应用在 /Android
+   下新建的任何条目）一律留在真实目录；三个容器本身与调用方自己的私有目录同样
+   让位（原生在这里按调用方裁决）。
+   存在的意义：整树进镜像要把 /Android 的每一级条目当成可写虚拟目录，而它在存储
+   层是受管目录树（媒体扫描、包管理器交互都走这一层），镜像化后这些交互对着镜像
+   做；遇到逐条目属性/属主敏感的 ROM，整树镜像会让沙盒里的应用连普通目录都写不
+   动——此时退回本口径（见 docs/config.md 的 SANDBOX_ANDROID_TREE）。 */
+static bool br_path_android_legacy_passthrough(const char* sub_path, const char* current_pkg) {
+    if (!sub_path || !current_pkg || !current_pkg[0]) return false;
+    if (strncmp(sub_path, "/Android", 8) != 0) return false;
+    if (sub_path[8] != '\0' && sub_path[8] != '/') return false;
+    const bool is_data = strncmp(sub_path, "/Android/data", 13) == 0 &&
+                         (sub_path[13] == '\0' || sub_path[13] == '/');
+    const bool is_obb = strncmp(sub_path, "/Android/obb", 12) == 0 &&
+                        (sub_path[12] == '\0' || sub_path[12] == '/');
+    if (!is_data && !is_obb) return true; /* /Android 本身与 media 等：不进镜像 */
+    static const char* const k_containers[] = {"/Android/data", "/Android/obb"};
+    const size_t pkg_len = strlen(current_pkg);
+    for (size_t i = 0; i < sizeof(k_containers) / sizeof(k_containers[0]); i++) {
+        const char* container = k_containers[i];
+        const size_t clen = strlen(container);
+        if (strncmp(sub_path, container, clen) != 0) continue;
+        if (sub_path[clen] == '\0' || (sub_path[clen] == '/' && sub_path[clen + 1] == '\0'))
+            return true; /* 容器本身（含尾斜杠写法） */
+        if (sub_path[clen] != '/') continue;
+        const char* rest = sub_path + clen + 1;
+        if (strncmp(rest, current_pkg, pkg_len) == 0 &&
+            (rest[pkg_len] == '\0' || rest[pkg_len] == '/'))
+            return true; /* 自己包名的私有目录 */
+    }
+    return false;
+}
+
 /* 目标是否落在 Android/obb 下：安装器那一档的放行面只有这一类。 */
 static bool br_path_is_obb_subtree(const char* sub_path) {
     return sub_path && strncmp(sub_path, "/Android/obb/", 13) == 0;
@@ -844,10 +878,15 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
 
     if (!skip_sandbox && c->sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
         strcmp(current_pkg, "unknown") != 0) {
-        /* Android 树下只有三处留在真实目录上（见 br_path_android_passthrough
-           的说明），其余整树进镜像：应用在这里新建的条目必须落镜像，否则沙盒
-           形同虚设。 */
-        if (br_path_android_passthrough(sub_path, current_pkg)) return false;
+        /* /Android 树是否整树进镜像由 [GLOBAL] SANDBOX_ANDROID_TREE 决定：ON 只
+           让位三个容器本身与调用方私有目录（br_path_android_passthrough），OFF
+           （默认）则 /Android 下只有 data/obb 两棵子树进镜像，其余留在真实目录
+           （br_path_android_legacy_passthrough）。 */
+        const bool android_passthrough =
+            g_global_cfg.sandbox_android_tree
+                ? br_path_android_passthrough(sub_path, current_pkg)
+                : br_path_android_legacy_passthrough(sub_path, current_pkg);
+        if (android_passthrough) return false;
         /* 他包 Android/data|obb 子树不归沙盒管：原生这里由 MediaProvider 按调用方
            能力/挂载模式裁决（放行，或者 ENOENT），沙盒把它改写成自己的镜像会掩盖
            那个裁决——能力放行者读到空目录，非放行者拿到的 ENOENT 也不是原生的原因。

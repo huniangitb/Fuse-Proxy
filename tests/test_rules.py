@@ -212,10 +212,11 @@ def isolation_section():
         ("/0/Android/data/com.other.app/f",{"resolve":1,"probe":1,"sandbox":0}),
         ("/0/Download/q.txt",{"resolve":0,"probe":0,"sandbox":1}),
     ],uid_map=own,global_want=1)
-    # (4b) SANDBOX ON 下的 /Android：三个容器与调用方自己的私有目录留在真实
-    #      目录，其余（含 /Android 本身）整树进镜像——应用在这里新建的条目必须
-    #      改写到镜像落点，写进真实目录就等于沙盒没开。
-    sb = BASE + "[com.demo.app]\nSANDBOX ON\n"
+    # (4b) SANDBOX_ANDROID_TREE ON + SANDBOX ON 下的 /Android：三个容器与调用方
+    #      自己的私有目录留在真实目录，其余（含 /Android 本身）整树进镜像——应用
+    #      在这里新建的条目必须改写到镜像落点，写进真实目录就等于沙盒没开。
+    sb = BASE + "SANDBOX_ANDROID_TREE ON\n[com.demo.app]\nSANDBOX ON\n"
+    sb_default = BASE + "[com.demo.app]\nSANDBOX ON\n"
     case("沙盒整树:/Android 非私有路径", sb, 10123, [
         ("/0/Android/123.txt",{"sandbox":1}),
         ("/0/Android/xxx",{"sandbox":1}),
@@ -231,6 +232,34 @@ def isolation_section():
         ("/0/Android/media/com.demo.app/x",{"sandbox":0}),
         ("/0/Android/data/com.other.app/f",{"sandbox":0}),
     ], uid_map=own)
+    # (4c) 默认（不写 SANDBOX_ANDROID_TREE = OFF）：/Android 下只有 data|obb 两棵
+    #      子树进镜像，/Android 本身、/Android/media、应用在它下面新建的条目一律
+    #      留真实目录（旧口径）；普通路径照旧进沙盒，两级互不牵连。
+    case("沙盒整树:默认 OFF 时 /Android 不进镜像", sb_default, 10123, [
+        ("/0/Android",{"sandbox":0}),
+        ("/0/Android/123.txt",{"sandbox":0}),
+        ("/0/Android/xxx",{"sandbox":0}),
+        ("/0/Android/obj/dex/classes.dex",{"sandbox":0}),
+        ("/0/Android/media/com.other.app/x",{"sandbox":0}),
+        ("/0/Android/media/com.demo.app/x",{"sandbox":0}),
+        ("/0/Android/data/com.demo.app/files/x",{"sandbox":0}),
+        ("/0/Android/obb/com.demo.app/x",{"sandbox":0}),
+        ("/0/Android/data/com.other.app/f",{"sandbox":0}),
+        ("/0/Download/q.txt",{"sandbox":1,"redir":1}),
+        ("/0/Pictures/p.jpg",{"sandbox":1}),
+    ], uid_map=own)
+    # 显式写 OFF 与不写同口径；落点逐条钉住（/Android 落真实目录，/Download 落镜像）。
+    case("沙盒整树:显式 OFF", BASE + "SANDBOX_ANDROID_TREE OFF\n[com.demo.app]\nSANDBOX ON\n",
+         10123, [("/0/Android/123.txt",{"sandbox":0})], uid_map=own)
+    glob,got = drive(sb_default, 10123, ["/0/Android/123.txt","/0/Download/q.txt"], uid_map=own)
+    if glob is not None:
+        for path,suffix in (
+                ("/0/Android/123.txt","/0/Android/123.txt"),
+                ("/0/Download/q.txt","/0/Android/data/com.demo.app/sandbox/Download/q.txt"),
+        ):
+            real = (got.get(path) or {}).get("real","")
+            if real.endswith(suffix): ok(f"默认 OFF 落点｜{path}")
+            else: fail(f"默认 OFF 落点｜{path}", f"期望落点以 {suffix} 结尾，实测 '{real}'")
     # 落点逐条钉住：sandbox 位只说"改了"，改到哪必须对上（镜像落点 = 应用沙盒
     # 目录下同一个 sub_path；让位的路径则原样落真实目录）。
     glob,got = drive(sb, 10123, ["/0/Android/123.txt","/0/Android/xxx",
