@@ -113,7 +113,15 @@ static void case_skel_and_user_layer(void) {
           "骨架目录判定含用户层");
     check(is_android_skel_dir("/Android/data") && is_android_skel_dir("/Android/obb"),
           "骨架目录判定覆盖 data/obb");
-    check(!is_android_skel_dir("/Android/media"), "/Android/media 不是骨架");
+    check(!is_android_skel_dir("/Android/media"),
+          "/Android/media 是条件骨架（整树镜像口径才合成），不进无条件骨架判定");
+    check(sub_path_is_android_media_container("/Android/media") &&
+              sub_path_is_android_media_container("/0/Android/media/"),
+          "media 容器判定：根层命中，带用户层与尾斜杠同样命中");
+    check(!sub_path_is_android_media_container("/Android/media/com.example") &&
+              !sub_path_is_android_media_container("/Android/mediax") &&
+              !sub_path_is_android_media_container("/DCIM/files/Lua/Android/media"),
+          "media 容器判定：容器内条目、同前缀目录、嵌套同名目录都不命中");
     check(strcmp(sub_path_strip_user_layer("/0/Android"), "/Android") == 0,
           "剥用户层：/0/Android -> /Android");
     check(strcmp(sub_path_strip_user_layer("/Android"), "/Android") == 0,

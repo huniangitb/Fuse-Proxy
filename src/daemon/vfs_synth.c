@@ -49,6 +49,10 @@ bool sub_path_is_android_container(const char* sub_path) {
            path_is_stripped(sub_path, "/Android/obb");
 }
 
+bool sub_path_is_android_media_container(const char* sub_path) {
+    return path_is_stripped(sub_path, "/Android/media");
+}
+
 bool is_android_skel_dir(const char* sub_path) {
     return sub_path_is_storage_android_dir(sub_path) ||
            sub_path_is_android_container(sub_path);

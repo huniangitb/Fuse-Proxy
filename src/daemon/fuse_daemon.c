@@ -883,6 +883,15 @@ static ino_t vfs_readdir_child_ino(const char* parent_sub, const char* name) {
     return synthetic_inode(child);
 }
 
+/* /Android/media 的骨架兜底：只在整树镜像口径下成立——镜像里的 /Android 没有
+   真实的 media 条目（列举时由 vfs_readdir_fill_android_children 补这一条），而
+   容器本身按真实目录让位，两处口径必须同时成立，否则又回到「列表里看得见、按名
+   stat 却 ENOENT」。它只是骨架容器：容器内的 <pkg> 是按名裁决的真实目录，没有
+   own_pkg 合成，故不进数据容器那套判定。 */
+static bool android_media_skel(const char* sub_path) {
+    return g_global_cfg.sandbox_android_tree && sub_path_is_android_media_container(sub_path);
+}
+
 static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
     vfs_flush_pending_closes();
     (void)fi;
@@ -950,7 +959,7 @@ static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info*
             VFS_RETURN(0);
         }
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) ||
+            (is_android_skel_dir(sub_path) || android_media_skel(sub_path) ||
              (is_virtual_own_pkg_dir(sub_path, current_pkg) &&
               nsp_listed_own_pkg(ctx->uid, sub_path, current_pkg)) ||
              rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
@@ -1031,7 +1040,7 @@ static int vfs_access(const char* path, int mask) {
     if (access(p, mask) == -1) {
         int err = errno;
         if ((err == ENOENT || err == EACCES) &&
-            (is_android_skel_dir(sub_path) ||
+            (is_android_skel_dir(sub_path) || android_media_skel(sub_path) ||
              (is_virtual_own_pkg_dir(sub_path, current_pkg) &&
               nsp_listed_own_pkg(ctx->uid, sub_path, current_pkg)) ||
              rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {
@@ -1111,9 +1120,10 @@ typedef struct {
     uint64_t emit_skip; /* 仍需跳过的已发条目数（= 入参 offset） */
     bool is_root;    /* sub_path 为挂载点根 */
     bool is_android_dir;
+    bool media_skel; /* /Android/media 这一条由框架合成：仅整树镜像口径 */
     bool hide_others; /* 跨应用隔离生效（沙盒开启 + 非 root/未知访问者） */
     int path_user_id; /* 路由解析出的 user_id（<0 = 无用户层）；可见性单点用 */
-    bool has_data, has_obb, has_android, has_pkg;
+    bool has_data, has_obb, has_media, has_android, has_pkg;
 } VfsReaddirCtx;
 
 /* 本地路径发射 choke 点：编号 → 跳过（断点续扫）→ filler。
@@ -1293,9 +1303,13 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
     /* 骨架补齐不能依赖用户层是否剥离：无用户层的挂载上同样要补 data/obb */
     d->is_android_dir = (!skip_sandbox && sub_path_is_storage_android_dir(sub_path));
+    /* 整树镜像口径下 /Android 本身取自镜像，镜像里没有真实的 media 目录——那一条
+       由框架补；旧口径 /Android 就是真实目录，媒体目录本来就在，不需要合成。 */
+    d->media_skel = (!skip_sandbox && g_global_cfg.sandbox_android_tree &&
+                     sub_path_is_storage_android_dir(sub_path));
     d->hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
                       strcmp(current_pkg, "unknown") != 0);
-    d->has_data = d->has_obb = d->has_android = d->has_pkg = false;
+    d->has_data = d->has_obb = d->has_media = d->has_android = d->has_pkg = false;
 }
 
 /* 合成/虚拟条目 d_ino 与 getattr 同源解析（f7169be 不变量：目录项 d_ino
@@ -1408,6 +1422,7 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
         bool skel = (d->is_root && strcmp(de->d_name, "Android") == 0) ||
                     ((strcmp(de->d_name, "data") == 0 || strcmp(de->d_name, "obb") == 0) &&
                      (d->is_android_dir || sub_path_is_storage_android_dir(d->sub_path))) ||
+                    (d->media_skel && strcmp(de->d_name, "media") == 0) ||
                     (d->hide_others && strcmp(de->d_name, d->current_pkg) == 0 &&
                      sub_path_is_android_container(d->sub_path));
         struct stat st;
@@ -1427,6 +1442,8 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
                     d->has_data = true;
                 else if (strcmp(de->d_name, "obb") == 0)
                     d->has_obb = true;
+                else if (strcmp(de->d_name, "media") == 0)
+                    d->has_media = true;
                 else
                     d->has_pkg = true;
                 if (!vfs_readdir_emit_dedup(d, de->d_name)) return false;
@@ -1458,6 +1475,8 @@ static bool vfs_readdir_scan_local(VfsReaddirCtx* d, DIR* dp) {
                 d->has_data = true;
             else if (strcmp(de->d_name, "obb") == 0)
                 d->has_obb = true;
+            else if (strcmp(de->d_name, "media") == 0)
+                d->has_media = true; /* 镜像里真有这一条时不再补 */
         }
         if (d->hide_others && strcmp(de->d_name, d->current_pkg) == 0 &&
             sub_path_is_android_container(d->sub_path))
@@ -1477,11 +1496,15 @@ static bool vfs_readdir_fill_android_skel(VfsReaddirCtx* d) {
     return vfs_readdir_emit_dedup(d, "Android");
 }
 
-/* /Android 下 data/obb 骨架补齐（无用户层/沙盒关闭时不合成） */
+/* /Android 下 data/obb 骨架补齐（无用户层/沙盒关闭时不合成）。
+   整树镜像口径另补 media：镜像里的 /Android 只有应用自己建过的条目，三个容器
+   中只有它没有对应真实目录，缺了这一条应用就少看一个容器（容器本身按真实目录
+   让位，故 stat 由 getattr 的骨架兜底同口径给结果）。 */
 static bool vfs_readdir_fill_android_children(VfsReaddirCtx* d) {
     if (!d->is_android_dir) return true;
     if (!d->has_data && !vfs_readdir_emit_raw(d, "data")) return false;
     if (!d->has_obb && !vfs_readdir_emit_raw(d, "obb")) return false;
+    if (d->media_skel && !d->has_media && !vfs_readdir_emit_raw(d, "media")) return false;
     return true;
 }
 
@@ -2163,7 +2186,7 @@ static int vfs_opendir(const char* path, struct fuse_file_info* fi) {
     }
     int err = errno;
     if ((err == ENOENT || err == EACCES) &&
-        (is_android_skel_dir(sub_path) ||
+        (is_android_skel_dir(sub_path) || android_media_skel(sub_path) ||
          (is_virtual_own_pkg_dir(sub_path, current_pkg) &&
           nsp_listed_own_pkg(ctx->uid, sub_path, current_pkg)) ||
          rr.virtual_kind == NSP_VK_ANCESTOR || rr.virtual_kind == NSP_VK_TARGET)) {

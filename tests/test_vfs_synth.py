@@ -67,17 +67,33 @@ def static_contract():
         if "nsp_listed_own_pkg" not in body:
             errs.append(fn + " 的 own_pkg 兜底未要求列举登记"
                         "（路径形状像就放行＝凭空变出目录）")
+        if "android_media_skel" not in body:
+            errs.append(fn + " 的 media 骨架兜底未接入 android_media_skel"
+                        "（整树镜像口径下列表里有 media、按名 stat 却 ENOENT）")
+    media_guard = func_body(src, "static bool android_media_skel", 400)
+    if not media_guard or "sub_path_is_android_media_container" not in media_guard:
+        errs.append("android_media_skel 未用 sub_path_is_android_media_container 判定"
+                    "（自己拼字符串会漏掉用户层/尾斜杠形态）")
+    elif "sandbox_android_tree" not in media_guard:
+        errs.append("android_media_skel 未按 SANDBOX_ANDROID_TREE 守门"
+                    "（旧口径会凭空多出一条 media）")
     init = func_body(src, "static void vfs_readdir_ctx_init", 1800)
     if not init:
         errs.append("找不到 vfs_readdir_ctx_init")
     elif "sub_path_is_storage_android_dir" not in init:
         errs.append("vfs_readdir_ctx_init 的 is_android_dir 未用存储根判定"
                     "（尾段匹配会让嵌套 Android 目录也补 data/obb）")
+    if init and "sandbox_android_tree" not in init:
+        errs.append("vfs_readdir_ctx_init 未按 SANDBOX_ANDROID_TREE 决定 media 骨架"
+                    "（旧口径会凭空多出一条 media）")
     if "sub_path_is_android_dir(" in src:
         errs.append("fuse_daemon 仍引用尾段匹配的 sub_path_is_android_dir")
-    children = func_body(src, "static bool vfs_readdir_fill_android_children", 900)
+    children = func_body(src, "static bool vfs_readdir_fill_android_children", 1400)
     if not children or "d->is_android_dir" not in children:
         errs.append("vfs_readdir_fill_android_children 未由 d->is_android_dir 守门")
+    elif '"media"' not in children or "media_skel" not in children:
+        errs.append("vfs_readdir_fill_android_children 未补 media 条目"
+                    "（整树镜像口径下应用少看一个容器）")
     vis = func_body(src, "static NspVisibility vfs_entry_visibility", 9000)
     for need in ('"/Android/data"', '"/Android/obb"'):
         if vis and need not in vis:
