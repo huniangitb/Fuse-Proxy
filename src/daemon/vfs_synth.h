@@ -16,6 +16,11 @@ bool sub_path_tail_is(const char* sub_path, const char* name);
 bool sub_path_is_storage_android_dir(const char* sub_path);
 /* 存储根下的 /Android/data|obb（同样只认根层，嵌套同名目录不算）。 */
 bool sub_path_is_android_container(const char* sub_path);
+/* 存储根下的 /Android/media（同样只认根层）。它与上面两个容器不同：容器内的
+   <pkg> 不是沙盒合成的 own_pkg 目录（ACL 另按 Android/media 裁决），只有「/Android
+   整树进镜像」口径下 /Android 才由框架补出这一条——镜像里没有真实的 media 目录。
+   故它的骨架兜底必须与该口径同时成立，不能无条件当作骨架。 */
+bool sub_path_is_android_media_container(const char* sub_path);
 bool is_android_skel_dir(const char* sub_path);
 
 /* 沙盒合成的「容器/当前包名」目录：/Android/data/<pkg> 或 /Android/obb/<pkg>。

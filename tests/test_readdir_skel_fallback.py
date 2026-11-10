@@ -24,6 +24,11 @@ getdents64 解析（Python 的 scandir/is_dir 在 UNKNOWN 时会 stat 兜底，
     构成「条目类型取自 getdents 而非 lstat」的证据，证明垫片确实生效、
     测试非空转。
 
+第二个场景覆盖 `[GLOBAL] SANDBOX_ANDROID_TREE ON`（/Android 整树进镜像）：
+镜像里没有真实的 media 目录，`/Android` 读侧必须补出 data/obb/media 三条，
+且三条按名 stat 都是目录（不是文件、时间戳不是 1970）；未列举过的 media 子路径
+仍按真实结果 ENOENT。旧口径（开关默认关）不合成 media，一个字节都不变。
+
 前置：GNU 产物 build_gnu/fuse_daemon、fusermount3、/dev/fuse、cc；
 缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
 """
@@ -175,10 +180,22 @@ def fail(desc, detail=""):
     ERRORS.append((desc, detail))
 
 
-CONFIG_TEXT = """
+CONFIG_LEGACY = """
 [GLOBAL]
 MONITOR OFF
 """
+
+# /Android 整树进镜像：/Android 读的是镜像目录，里面没有真实条目
+CONFIG_MIRRORED = """
+[GLOBAL]
+MONITOR OFF
+SANDBOX_ANDROID_TREE ON
+"""
+
+
+def write_conf(text):
+    with open(CONF, "w") as fh:
+        fh.write(text.strip())
 
 
 def setup_env():
@@ -190,8 +207,7 @@ def setup_env():
         fh.write("seed_" + TEST_ID)
     os.makedirs(MNT, exist_ok=True)
     os.makedirs(MODDIR, exist_ok=True)
-    with open(CONF, "w") as fh:
-        fh.write(CONFIG_TEXT.strip())
+    write_conf(CONFIG_LEGACY)
     with open(SHIM_C, "w") as fh:
         fh.write(SHIM_SRC)
     r = subprocess.run(["cc", "-shared", "-fPIC", "-o", SHIM_SO, SHIM_C, "-ldl"],
@@ -252,6 +268,120 @@ def stop_daemon(proc):
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
 
 
+def scenario_legacy():
+    """旧口径（SANDBOX_ANDROID_TREE 默认关）骨架名回退合成的既有断言。
+
+    /Android 在该口径下读的是真实目录，media 由真实文件系统提供，
+    框架不得合成这一条：凭空多出来会让旧安装的列表多一条影子目录。"""
+    log("场景 1: lstat EACCES 下骨架名回退合成（LD_PRELOAD 模拟 lower 层拒绝）")
+    rc = 0
+    proc = start_daemon()
+    try:
+        if proc is None or proc.poll() is not None:
+            fail("daemon 挂载成功", "daemon 提前退出")
+            return 1
+        ok("daemon 挂载成功")
+        dtypes = raw_dtypes(MNT + "/0/Android")
+        # 1. 骨架名：d_type 必须为 DIR（修复前为 UNKNOWN，即线上“显示为文件”）
+        if dtypes.get("data") == DT_DIR:
+            ok("骨架 data 条目 d_type == DT_DIR")
+        else:
+            fail("骨架 data 条目 d_type == DT_DIR",
+                 f"实测={dtypes.get('data')}（UNKNOWN 即复现），全表={dtypes}")
+            rc = 1
+        # 2. 按名 stat 一致为可进入目录（线上“子目录可进入”侧）
+        try:
+            st = os.stat(MNT + "/0/Android/data")
+            if statmod.S_ISDIR(st.st_mode) and st.st_mode & statmod.S_IXUSR:
+                ok("按名 stat 为可进入目录")
+            else:
+                fail("按名 stat 为可进入目录", f"mode={oct(st.st_mode)}")
+                rc = 1
+        except OSError as e:
+            fail("按名 stat 为可进入目录", repr(e))
+            rc = 1
+        # 3. 非骨架对照名：lstat 被拒但 getdents 给了类型，按该类型合成
+        if dtypes.get("otherdir") == DT_DIR:
+            ok("非骨架对照名按 d_type 合成 DIR（不再上架 UNKNOWN 条目）")
+        else:
+            fail("非骨架对照名按 d_type 合成 DIR", f"实测={dtypes.get('otherdir')}")
+            rc = 1
+        # 4. 同一被拒目录里的普通文件：类型必须取自 d_type（REG），
+        #    证明垫片拦住了 lstat 且 readdir 不靠 lstat 定类型
+        data_dtypes = raw_dtypes(MNT + "/0/Android/data")
+        if data_dtypes.get("seed.txt") == DT_REG:
+            ok("被拒目录内的普通文件按 d_type 上报 DT_REG（类型不依赖 lstat）")
+        else:
+            fail("被拒目录内的普通文件上报 DT_REG",
+                 f"实测={data_dtypes.get('seed.txt')}，全表={data_dtypes}")
+            rc = 1
+        # 5. 旧口径不合成 media：夹具里没有 media 目录，列表里就不该出现
+        if "media" not in dtypes:
+            ok("旧口径不合成 media 条目")
+        else:
+            fail("旧口径不合成 media 条目", f"实测 d_type={dtypes.get('media')}")
+            rc = 1
+        try:
+            os.stat(MNT + "/0/Android/media")
+            fail("旧口径 media 无骨架兜底", "按名 stat 成功（凭空变出目录）")
+            rc = 1
+        except OSError:
+            ok("旧口径 media 无骨架兜底（按真实结果 ENOENT）")
+    finally:
+        stop_daemon(proc)
+    return rc
+
+
+def scenario_mirrored():
+    """整树镜像口径｜/Android 读侧三个容器条目齐全，且各自 stat 正常。
+
+    镜像目录里没有真实的 data/obb/media，三条都要由 readdir 合成；合成条目
+    按名 stat 必须是目录（不是文件、时间戳不落到 1970），而镜像里没列举过的
+    子路径仍要 ENOENT（不能因为父路径像容器就放行）。"""
+    log("场景 2: 整树镜像口径（SANDBOX_ANDROID_TREE ON）下补出 media 骨架")
+    rc = 0
+    write_conf(CONFIG_MIRRORED)
+    proc = start_daemon()
+    try:
+        if proc is None or proc.poll() is not None:
+            fail("daemon 挂载成功（镜像口径）", "daemon 提前退出")
+            return 1
+        ok("daemon 挂载成功（镜像口径）")
+        dtypes = raw_dtypes(MNT + "/0/Android")
+        for name in ("data", "obb", "media"):
+            if dtypes.get(name) == DT_DIR:
+                ok(f"镜像口径 {name} 条目 d_type == DT_DIR")
+            else:
+                fail(f"镜像口径 {name} 条目 d_type == DT_DIR",
+                     f"实测={dtypes.get(name)}，全表={dtypes}")
+                rc = 1
+        for name in ("data", "obb", "media"):
+            try:
+                st = os.stat(MNT + "/0/Android/" + name)
+            except OSError as e:
+                fail(f"镜像口径 {name} 按名 stat 为目录", repr(e))
+                rc = 1
+                continue
+            if not statmod.S_ISDIR(st.st_mode):
+                fail(f"镜像口径 {name} 按名 stat 为目录", f"mode={oct(st.st_mode)}")
+                rc = 1
+            elif st.st_mtime <= 0:
+                fail(f"镜像口径 {name} 按名 stat 为目录",
+                     f"mtime={st.st_mtime}（1970 即无兜底）")
+                rc = 1
+            else:
+                ok(f"镜像口径 {name} 按名 stat 为目录（mtime 正常）")
+        try:
+            os.stat(MNT + "/0/Android/media/com.example")
+            fail("镜像里未列举的 media 子路径仍 ENOENT", "按名 stat 成功（凭空变出目录）")
+            rc = 1
+        except OSError:
+            ok("镜像里未列举的 media 子路径仍 ENOENT")
+    finally:
+        stop_daemon(proc)
+    return rc
+
+
 def main():
     rc = 0
     if not os.path.exists(DAEMON):
@@ -269,50 +399,10 @@ def main():
         log(f"跳过：{e}")
         return SKIP_RC
 
-    log("场景: lstat EACCES 下骨架名回退合成（LD_PRELOAD 模拟 lower 层拒绝）")
-    proc = start_daemon()
     try:
-        if proc is None or proc.poll() is not None:
-            fail("daemon 挂载成功", "daemon 提前退出")
-            rc = 1
-        else:
-            ok("daemon 挂载成功")
-            dtypes = raw_dtypes(MNT + "/0/Android")
-            # 1. 骨架名：d_type 必须为 DIR（修复前为 UNKNOWN，即线上“显示为文件”）
-            if dtypes.get("data") == DT_DIR:
-                ok("骨架 data 条目 d_type == DT_DIR")
-            else:
-                fail("骨架 data 条目 d_type == DT_DIR",
-                     f"实测={dtypes.get('data')}（UNKNOWN 即复现），全表={dtypes}")
-                rc = 1
-            # 2. 按名 stat 一致为可进入目录（线上“子目录可进入”侧）
-            try:
-                st = os.stat(MNT + "/0/Android/data")
-                if statmod.S_ISDIR(st.st_mode) and st.st_mode & statmod.S_IXUSR:
-                    ok("按名 stat 为可进入目录")
-                else:
-                    fail("按名 stat 为可进入目录", f"mode={oct(st.st_mode)}")
-                    rc = 1
-            except OSError as e:
-                fail("按名 stat 为可进入目录", repr(e))
-                rc = 1
-            # 3. 非骨架对照名：lstat 被拒但 getdents 给了类型，按该类型合成
-            if dtypes.get("otherdir") == DT_DIR:
-                ok("非骨架对照名按 d_type 合成 DIR（不再上架 UNKNOWN 条目）")
-            else:
-                fail("非骨架对照名按 d_type 合成 DIR", f"实测={dtypes.get('otherdir')}")
-                rc = 1
-            # 4. 同一被拒目录里的普通文件：类型必须取自 d_type（REG），
-            #    证明垫片拦住了 lstat 且 readdir 不靠 lstat 定类型
-            data_dtypes = raw_dtypes(MNT + "/0/Android/data")
-            if data_dtypes.get("seed.txt") == DT_REG:
-                ok("被拒目录内的普通文件按 d_type 上报 DT_REG（类型不依赖 lstat）")
-            else:
-                fail("被拒目录内的普通文件上报 DT_REG",
-                     f"实测={data_dtypes.get('seed.txt')}，全表={data_dtypes}")
-                rc = 1
+        rc |= scenario_legacy()
+        rc |= scenario_mirrored()
     finally:
-        stop_daemon(proc)
         subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
         shutil.rmtree(BASE, ignore_errors=True)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
