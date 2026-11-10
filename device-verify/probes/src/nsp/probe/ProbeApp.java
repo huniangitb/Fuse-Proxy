@@ -247,6 +247,11 @@ public final class ProbeApp extends Application {
         steps += isoFileStep("android_root", new File(androidDir, "nsp_probe_sandbox.txt"),
                 "NSP_PROBE_ISO_ANDROID:" + stamp);
         steps += listDirStep(androidDir, "android_list");
+        // 容器条目本身也由框架合成（镜像里没有真实目录）：三条都要是目录、
+        // 时间戳不能是 1970，否则文件管理器会把它们画成文件或未知条目。
+        steps += statContainerStep(new File(androidDir, "data"), "android_skel_data");
+        steps += statContainerStep(new File(androidDir, "obb"), "android_skel_obb");
+        steps += statContainerStep(new File(androidDir, "media"), "android_skel_media");
         // 三处私有目录让位到真实目录（宿主预建并 chown 给本应用）。
         steps += isoFileStep("android_obb_own",
                 new File(base, "Android/obb/" + pkg + "/nsp_probe_obb.txt"),
@@ -534,6 +539,22 @@ public final class ProbeApp extends Application {
     // ------------------------------------------------------------------- helpers
 
     /** 列目录并输出 step=list：detail 为逗号分隔条目，空目录为 "-"。 */
+    /** 容器条目自身：必须是目录（不是文件），时间戳不得落到 1970。 */
+    private int statContainerStep(File dir, String step) {
+        boolean ok = false;
+        String detail;
+        try {
+            boolean isDir = dir.isDirectory();
+            long mtime = dir.lastModified();
+            ok = isDir && mtime > 0;
+            detail = "isDir=" + (isDir ? 1 : 0) + " mtime=" + mtime;
+        } catch (Throwable t) {
+            detail = describe(t);
+        }
+        emit(step, ok, detail);
+        return 1;
+    }
+
     private int listDirStep(File dir) {
         return listDirStep(dir, "list");
     }
