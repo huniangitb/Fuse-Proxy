@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""新建条目的权限值：mode 以调用方为准，父目录只提供属主与 setgid。
+"""新建条目的权限值：mode 以调用方为准，共享存储再按固定形状补位。
 
 VFS 在进 FUSE 回调之前已按请求者 umask 归一过 mode（本模块不置
 FUSE_CAP_DONT_MASK），daemon 不得再用父目录 mode 覆盖它——否则 umask 与
 应用显式指定的 0600/0700 一起失效，父目录一旦被写成 2700 还会自我繁殖。
 
-判别性用例（旧实现下前四条的 1/2/4 失败）：
-  1. umask 022 建目录 → 0755
-  2. umask 077 建目录 → 0700
+另一头是共享存储：条目最终要能被树里的其他应用打开（MediaProvider 按调用方
+凭证做 DAC，0600 的条目除写入者谁也打不开），故落点在 <存储根>/<用户层> 且
+不在 Android/{data,obb,media} 三棵私有树里时，mode 再按固定形状补位：文件
+0660、目录 0770，只加位不减位。私有树不补。
+
+判别性用例（父目录 mode 覆盖实现下 1/4/7 失败，不补位的实现下 5/6 失败）：
+  1. umask 022 建目录 → 0755 | 0770 = 0775
+  2. umask 077 建目录 → 0700 | 0770 = 0770
   3. 父目录无 setgid 时，新建子目录不带 S_ISGID
   4. 父目录是 2700 时，新建子目录不是 2700
-附加（同一根因的另一面）：
-  5. umask 077 建文件 → 0600
-  6. umask 022 建文件 → 0644
+  5. umask 077 建文件 → 0600 | 0660 = 0660
+  6. umask 022 建文件 → 0644 | 0660 = 0664
+  7. 私有树里 umask 077 建目录/文件 → 0700 / 0600（不补位）
+附加：
+  8. 结构条目的 chmod 被丢弃（AOSP 口径）
 
 前置：build_gnu/ 产物、/dev/fuse、fusermount3。
 """
@@ -33,6 +40,7 @@ MODDIR = BASE / "modules"
 CONF = BASE / "injector.conf"
 DLOG = BASE / "daemon.log"
 DAEMON = os.environ.get("FUSE_DAEMON") or str(ROOT / "build_gnu" / "fuse_daemon")
+PRIV_PKG = "com.example.app"
 
 PASS = 0
 FAIL = 0
@@ -79,13 +87,16 @@ def with_umask(um, fn):
 def setup():
     subprocess.run(["fusermount3", "-u", str(MNT)], capture_output=True)
     shutil.rmtree(BASE, ignore_errors=True)
-    # 三种父目录：默认目录（属组可写）、无 setgid 的普通目录、被写成 2700 的目录
+    # 四种父目录：共享存储的默认目录（属组可写）、无 setgid 的普通目录、
+    # 被写成 2700 的目录，以及应用私有树里的一层
     (STORAGE / "0" / "Download").mkdir(parents=True)
     (STORAGE / "0" / "Plain").mkdir(parents=True)
     (STORAGE / "0" / "Poison").mkdir(parents=True)
+    (STORAGE / "0" / "Android" / "data" / PRIV_PKG).mkdir(parents=True)
     os.chmod(STORAGE / "0" / "Download", 0o770)
     os.chmod(STORAGE / "0" / "Plain", 0o755)
     os.chmod(STORAGE / "0" / "Poison", 0o2700)
+    os.chmod(STORAGE / "0" / "Android" / "data" / PRIV_PKG, 0o770)
     MNT.mkdir(parents=True)
     MODDIR.mkdir(parents=True, exist_ok=True)
     CONF.write_text("[GLOBAL]\nMONITOR OFF\nSANDBOX OFF\n")
@@ -129,17 +140,18 @@ def main():
         dl = u0 / "Download"
         plain = u0 / "Plain"
         poison = u0 / "Poison"
+        priv = u0 / "Android" / "data" / PRIV_PKG
 
-        print("\n── A. 目录：mode 由调用方 umask 决定 ──")
+        print("\n── A. 共享存储的目录：umask 决定其它位，组位由树补齐 ──")
         with_umask(0o022, lambda: os.mkdir(dl / "d022"))
-        expect_mode("umask 022 mkdir", 0o755, dl / "d022")
+        expect_mode("umask 022 mkdir（0755 | 0770）", 0o775, dl / "d022")
 
         with_umask(0o077, lambda: os.mkdir(dl / "d077"))
-        expect_mode("umask 077 mkdir", 0o700, dl / "d077")
+        expect_mode("umask 077 mkdir（0700 | 0770）", 0o770, dl / "d077")
 
         print("\n── B. setgid 只在父目录带它时继承 ──")
         with_umask(0o022, lambda: os.mkdir(plain / "child"))
-        expect_mode("父目录无 setgid（0755）时子目录", 0o755, plain / "child")
+        expect_mode("父目录无 setgid（0755）时子目录", 0o775, plain / "child")
 
         print("\n── C. 毒化不复现：2700 父目录不再把 2700 复制给子目录 ──")
         with_umask(0o022, lambda: os.mkdir(poison / "probe"))
@@ -152,14 +164,21 @@ def main():
         except OSError as e:
             fail("2700 父目录下新建子目录", f"lstat 失败: {e}")
 
-        print("\n── D. 文件：umask 同样生效 ──")
+        print("\n── D. 共享存储的文件：umask 生效，组位照补 ──")
         with_umask(0o077, lambda: open(dl / "f077", "w").close())
-        expect_mode("umask 077 create", 0o600, dl / "f077")
+        expect_mode("umask 077 create（0600 | 0660）", 0o660, dl / "f077")
 
         with_umask(0o022, lambda: open(dl / "f022", "w").close())
-        expect_mode("umask 022 create", 0o644, dl / "f022")
+        expect_mode("umask 022 create（0644 | 0660）", 0o664, dl / "f022")
 
-        print("\n── E. 结构条目：应用改不动顶层目录的 mode ──")
+        print("\n── E. 私有树不补位：mode 就是应用自己给的值 ──")
+        with_umask(0o077, lambda: os.mkdir(priv / "d077"))
+        expect_mode("私有树 umask 077 mkdir", 0o700, priv / "d077")
+
+        with_umask(0o077, lambda: open(priv / "f077", "w").close())
+        expect_mode("私有树 umask 077 create", 0o600, priv / "f077")
+
+        print("\n── F. 结构条目：应用改不动顶层目录的 mode ──")
         before = mode_of(STORAGE / "0" / "Download")
         try:
             os.chmod(dl, 0o700)

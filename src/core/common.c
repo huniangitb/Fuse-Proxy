@@ -262,6 +262,51 @@ char* read_file_dynamic(const char* path, size_t* out_size, size_t max_size) {
     return buf;
 }
 
+/* 共享存储的落点形状：父目录给属主、属组，以及「组/其他」的读写位。
+
+   共享存储里的条目由 MediaProvider 以**调用方凭证**去读（本模块不置
+   FUSE_CAP_DONT_MASK，也不开 default_permissions，DAC 只在 access(2) 与
+   MediaProvider 侧生效），所以条目最终长什么样，直接决定别的应用能不能打开它：
+   实测同一目录里属主是应用、mode 0600 的条目，除写入者以外的应用 open 全部
+   EACCES；补上组位（0660，属组仍是树属组）或 o+r 之后即可读。
+
+   宽度取共享存储的固定形状（文件 0660、目录 0770），与 MediaProvider 自己建条目
+   时用的位一致：那是一层与 umask 无关的「这棵树里彼此可读写」声明，按父目录实际
+   位去推反而会让 0775/0771 这类目录传出 0664/0661 的第四条形状。
+
+   只加位、不减位：调用方显式的 0644/0755 与其它位都保留。目录的 setgid 仍跟随
+   父目录（POSIX：父目录带 S_ISGID 才继承），文件不加执行位。 */
+static mode_t shared_storage_mode(mode_t want, const struct stat* pst, bool is_dir) {
+    mode_t final_mode = want | (is_dir ? 0770 : 0660);
+    if (is_dir)
+        final_mode = (pst->st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
+    return final_mode;
+}
+
+/* 条目是否落在「共享存储」：<存储根>/<用户层> 之下，且不在根层的
+   Android/{data,obb,media} 三棵私有树里。判定只认根层那三个名字，同名深层目录
+   （应用自己建的 /sdcard/x/Android/data）照共享存储对待。
+
+   存储根之外的路径（后端、临时目录）一律不算共享存储：那里的属主与 mode 由调用方
+   与后端自己决定，套共享存储的形状没有依据。 */
+static bool path_in_shared_storage(const char* real_path) {
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof(base));
+    size_t blen = strlen(base);
+    if (blen == 0 || strncmp(real_path, base, blen) != 0 || real_path[blen] != '/') return false;
+    int user_id = -1;
+    const char* sub = NULL;
+    if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return false;
+    static const char* const k_private_trees[] = {"/Android/data", "/Android/obb",
+                                                 "/Android/media"};
+    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
+        size_t tlen = strlen(k_private_trees[i]);
+        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
+            return false;
+    }
+    return true;
+}
+
 /* 新建条目的属性收尾（唯一出口）：create / mkdir / mknod / symlink / 父目录补建 /
    沙盒落点全部经这里定最终 mode 与属主，各回调不得再自己 chmod。
 
@@ -272,6 +317,11 @@ char* read_file_dynamic(const char* path, size_t* out_size, size_t max_size) {
    两件事：属主（新建条目归父目录属主，与 MediaProvider 建条目一致）与 setgid
    （POSIX：父目录带 S_ISGID 时子目录继承，否则不带——反过来把 setgid 送给不带它的
    父目录下的一切，就会造出 setgid 目录树，其中所有条目都归 _media_rw 组）。
+
+   共享存储的落点另加一层：调用方 mode 只说明「它自己想给多少」，条目还要能被树里的
+   其他应用打开，故最终 mode 再按父目录的组位与其他位补齐（见 shared_storage_mode），
+   与 MediaProvider 自己建条目的形状一致。私有树（Android/{data,obb,media}）不补：
+   那里的属主与 ACL 由 installd 体系决定，放宽只会造出第二个共享存储。
 
    caller_mode 为 0 表示调用点确实没有 mode 可传（符号链接的 mode 在内核恒为 0777，
    真实值无意义）：此时回落父目录 mode，只作「值未知」的缺省，不用来覆盖已知值。
@@ -298,9 +348,12 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
         /* 失败不致命（例如后端目标不支持 chown）：mode 照旧收敛，errno 留给调用点 */
     }
     if (!S_ISLNK(est.st_mode)) {
+        bool is_dir = S_ISDIR(est.st_mode);
         mode_t final_mode = caller_mode & 07777;
         if (final_mode == 0) final_mode = pst.st_mode & 07777;
-        if (S_ISDIR(est.st_mode))
+        if (path_in_shared_storage(real_path))
+            final_mode = shared_storage_mode(final_mode, &pst, is_dir);
+        else if (is_dir)
             final_mode =
                 (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
         chmod(real_path, final_mode);
@@ -329,35 +382,24 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
    这个问题（属主本就跟随父目录），
    缺口只在 rename 这条「不产生新条目」的路径上。
 
-   口径：属主/属组跟随目标父目录（与 nsp_new_entry_attrs 同一条规则），共享存储的
-   落点再补上存储层的历史 mode 形状（文件 0660、目录 0770——只加位、不减位，调用方
-   显式的 0644/0755 与其它位都保留；目录的 setgid 跟随父目录）。SELinux 上下文照抄
-   父目录，与新建条目同一个来源。
+   口径与 nsp_new_entry_attrs 一致：属主/属组跟随目标父目录，mode 再按父目录的组位
+   与其他位补齐（shared_storage_mode 是两条路径的唯一出处）。二者的差别只在时机：
+   新建条目是「daemon 替应用造出来的」，落位条目是「应用自己造完搬过来的」，但落到
+   共享存储之后，别的应用能不能打开只看最终属性，来源无关。
 
-   只在「属主或属组与目标父目录不同」时动手：共享存储内部的改名不该顺手放宽 mode
-   （那是应用自己的文件，mode 是它选的）。应用私有树（<存储根>/<uid>/Android/
-   {data,obb,media}）的落点一律不动——那里的属主由 installd 的 ACL 体系决定，把这
-   一套搬进去只会造出第二个共享存储。
+   判据必须按落点归类、不能按「属主是否与父目录相同」：应用私有树与共享存储可能被
+   同一个 uid 拥有（私有树里的文件本来就归应用，父目录也可能归应用），此时属主一致
+   却正是「来源树 mode 削到 0600」的典型现场。故这里不设「属主一致就早退」，只判
+   落点在不在共享存储；应用私有树的落点一律不动——那里的属主由 installd 的 ACL
+   体系决定，把共享存储的形状搬进去只会造出第二个共享存储。
+
+   同属共享存储内部的改名也照同一口径收敛：宽度由树决定，不由上一次是谁写的决定。
 
    失败不致命：属性没挂上是可访问性问题，不该让 rename 本身失败（源可能已删，回滚
    只会连搬移一起丢掉），故只记日志。符号链接跳过：chmod 会穿透链接改到目标文件。 */
 void nsp_rehome_moved_entry(const char* real_path) {
     if (!real_path || real_path[0] != '/') return;
-    char base[PATH_MAX];
-    common_storage_base(base, sizeof(base));
-    size_t blen = strlen(base);
-    if (blen == 0 || strncmp(real_path, base, blen) != 0 || real_path[blen] != '/') return;
-    /* 用户层之后的相对路径判私有树：只认根层的 Android/{data,obb,media}，
-       同名深层目录（应用自己建的 /sdcard/x/Android/data）不算私有树 */
-    int user_id = -1;
-    const char* sub = NULL;
-    if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return;
-    static const char* const k_private_trees[] = {"/Android/data", "/Android/obb", "/Android/media"};
-    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
-        size_t tlen = strlen(k_private_trees[i]);
-        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
-            return;
-    }
+    if (!path_in_shared_storage(real_path)) return;
     struct stat est;
     if (lstat(real_path, &est) != 0) return; /* 已不在（并发删）：无事可做 */
     if (S_ISLNK(est.st_mode)) return;
@@ -369,15 +411,12 @@ void nsp_rehome_moved_entry(const char* real_path) {
     *slash = '\0';
     struct stat pst;
     if (lstat(parent, &pst) != 0) return;
-    if (est.st_uid == pst.st_uid && est.st_gid == pst.st_gid) return;
-    if (lchown(real_path, pst.st_uid, pst.st_gid) != 0)
+    if ((est.st_uid != pst.st_uid || est.st_gid != pst.st_gid) &&
+        lchown(real_path, pst.st_uid, pst.st_gid) != 0)
         LOG_WRN("落位条目改属主失败: path=%s uid=%u gid=%u errno=%d", real_path,
                 (unsigned)pst.st_uid, (unsigned)pst.st_gid, errno);
     mode_t want = est.st_mode & 07777;
-    mode_t final_mode = want | (S_ISDIR(est.st_mode) ? 0770 : 0660);
-    if (S_ISDIR(est.st_mode))
-        final_mode =
-            (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
+    mode_t final_mode = shared_storage_mode(want, &pst, S_ISDIR(est.st_mode));
     if (final_mode != want && chmod(real_path, final_mode) != 0)
         LOG_WRN("落位条目改 mode 失败: path=%s mode=%04o errno=%d", real_path,
                 (unsigned)final_mode, errno);

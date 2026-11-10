@@ -3,16 +3,18 @@
 
 rename(2) 只换名字不换属性，被搬进 /sdcard 的条目会带着来源树的属主与 mode 落地。
 共享存储里属主是「某个应用」的条目，MediaProvider 按调用方凭证走 DAC：0600 就意味
-着除写入者自己，别的应用全部 open EACCES（文件管理器打不开在「QQ 另存到
-/sdcard/Download」的文件上就是这个形状）。新建条目没有这个问题——属主本就跟随
-父目录——缺口只在 rename 这条不产生新条目的路径上。
+着除写入者自己，别的应用全部 open EACCES（文件管理器打不开「另存到
+/sdcard/Download」的文件就是这个形状）。
 
-判别性用例（旧实现下 A 组全失败）：
+判据按落点归类，不按「属主是否与父目录相同」：应用私有树与共享存储可能同属一个
+uid（私有树里的文件本就归应用），属主一致却正是来源树 mode 被削到 0600 的现场。
+
+判别性用例（旧实现下 A 组与 B5 失败）：
   A1. 0600 文件搬进共享目录 → 0660 且属组跟随父目录
   A2. 0644 文件搬进共享目录 → 0664（只加位不减位，o+r 保留）
   A3. 0700 目录搬进带 setgid 的共享目录 → 02770
   A4. 0700 目录搬进不带 setgid 的共享目录 → 0770（不带 S_ISGID）
-  B5. 同一棵树内改名（属主/属组已一致）→ mode 原样不动，不放宽
+  B5. 属主/属组与目标父目录一致的搬移 → 仍按树补齐 0660（旧实现按属主早退得 0600）
   C6. 搬进应用私有树（/Android/data/<包>）→ 属性原样不动
   D7. 符号链接搬进共享目录 → 仍是链接，链接自身 mode 不动、不改到目标文件
 
@@ -203,12 +205,12 @@ def main():
         expect_attrs("A4 0700 目录搬进不带 setgid 的目录", 0o770, share_gid,
                      nosg_backing / "dir700b")
 
-        print("\n── B. 同一棵树内改名：mode 原样不动 ──")
+        print("\n── B. 属主与父目录一致的搬移：仍按树补齐 ──")
         mine = own / "keep600"
         open(mine, "w").close()
         os.chmod(mine, 0o600)
         os.rename(str(mine), str(own / "keep600.renamed"))
-        expect_attrs("B5 同属主改名后仍 0600", 0o600, os.getgid(),
+        expect_attrs("B5 同属主改名后补到 0660", 0o660, os.getgid(),
                      own_backing / "keep600.renamed")
 
         print("\n── C. 私有树落点不动 ──")
