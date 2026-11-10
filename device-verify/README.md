@@ -66,7 +66,7 @@ case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>
 |---|---|---|
 | `nsp.probe.ftp` | ready, write, read, list, canary | 写 `/sdcard/ftp_probe/probe_ftp.txt` → FTP 后端；回读比对；列举；REAL_CANARY 不可见 |
 | `nsp.probe.sftp` | 同上 | 写 `/sdcard/sftp_probe/probe_sftp.txt` → SFTP 后端 |
-| `nsp.probe.iso` | ready, download, pictures, android_root, android_list, android_obb_own, android_media_own, android_allow | SANDBOX ON：写 Download/Pictures 与 /Android（含自身 obb/media 私有目录、一条 ALLOW 豁免路径）。Download/Pictures 与 /Android 下的普通条目应落沙盒、真实目录零写入且能在自己的列举里看到；三处私有目录与 ALLOW 豁免仍落真实目录 |
+| `nsp.probe.iso` | ready, download, pictures, android_root, android_list, android_skel_data, android_skel_obb, android_skel_media, android_obb_own, android_media_own, android_allow | SANDBOX ON + 整树镜像口径：写 Download/Pictures 与 /Android（含自身 obb/media 私有目录、一条 ALLOW 豁免路径）。Download/Pictures 与 /Android 下的普通条目应落沙盒、真实目录零写入且能在自己的列举里看到；三个容器条目由框架合成，列举里都在且按名 stat 是目录、时间戳非 1970；三处私有目录与 ALLOW 豁免仍落真实目录 |
 | `nsp.probe.hide` | ready, phase_a / phase_b+write_denied, list | 阶段 A 真实夹具可见可读；阶段 B（换配置重启）stat/写均 ENOENT、列举不含 hide |
 | `nsp.probe.plain` | ready, write, read | 对照组：普通外部目录读写不受影响 |
 | `nsp.probe.unlink` | ready, delete, hidden_open, fstat, read, hidden_closed, exists_closed, hidden_legacy | 打开中删除：写文件并保持读句柄 → 删除 → 目录里不得**新增** `.fuse_hidden`；删除后 fstat/读仍可用；关闭后路径消失；宿主预置的历史隐藏名夹具必须**看得见**（不做列举过滤，保留取证能力） |

@@ -339,6 +339,9 @@ class SftpServer:
 def render_injector_conf(phase):
     lines = [
         "[GLOBAL]",
+        # iso 段断言「/Android 本身与其下条目进镜像」，那正是整树镜像口径；
+        # 该开关默认关，不写在这里 iso 的 /Android 条目就会落回真实目录。
+        "SANDBOX_ANDROID_TREE ON",
         "",
         "[nsp.probe.ftp]",
         "FTP /ftp_probe ftp_probe",
@@ -847,6 +850,7 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
 
     # ---- iso：SANDBOX 隔离（真实共享目录零写入 + 文件落沙盒）
     for step in ("download", "pictures", "android_root", "android_list",
+                 "android_skel_data", "android_skel_obb", "android_skel_media",
                  "android_obb_own", "android_media_own", "android_allow"):
         checker.check("iso 探针 %s 成功" % step, step_ok(phase_a, "iso", step))
     uid_out = adb.sh_root("get-uid", pkg("iso")).stdout
@@ -883,6 +887,18 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
         listing = step_detail(phase_a, "iso", "android_list")
         checker.check("iso 列举能看到自建的 /Android 条目",
                       "nsp_probe_sandbox.txt" in listing, listing[:200])
+
+        # 镜像里没有真实容器目录：三条容器条目都由框架合成。列不出来＝应用少看
+        # 一个容器；按名 stat 落到文件或 1970＝只有 readdir 合成、getattr 没兜底。
+        names = [t for t in listing.split(",") if t]
+        for name in ("data", "obb", "media"):
+            checker.check("iso 列举含容器 %s" % name, name in names, listing[:200])
+        for name in ("data", "obb", "media"):
+            detail = step_detail(phase_a, "iso", "android_skel_" + name)
+            m = re.search(r"mtime=(\d+)", detail)
+            checker.check("iso 容器 %s 按名 stat 为目录" % name,
+                          "isDir=1" in detail and bool(m) and int(m.group(1)) > 0,
+                          detail)
 
         # 三处私有目录与 ALLOW 豁免都让位到真实目录：真实文件必须存在，镜像里不得
         # 出现同名落点（出现了说明该路径被当成普通条目重定向了）。
@@ -1085,6 +1101,7 @@ def self_test():
        "[nsp.probe.race]" in conf_a and "SANDBOX ON" in conf_a and "HIDE /nsp_race_b" in conf_a)
     ck("FTP 规则存在（前缀须等于模块段名）", "FTP /ftp_probe ftp_probe" in conf_a)
     ck("SANDBOX 规则存在", "SANDBOX ON" in conf_a)
+    ck("验证配置启用整树镜像口径", "SANDBOX_ANDROID_TREE ON" in conf_a)
     mod = render_module_conf(2121, 2222, "/tmp/x/upload")
     ck("模块配置含 ftp/sftp 段", "[ftp_probe]" in mod and "[sftp_probe]" in mod)
     ck("模块配置 proto=sftp", "proto = sftp" in mod)
