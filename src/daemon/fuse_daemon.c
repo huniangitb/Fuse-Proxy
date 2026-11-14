@@ -50,6 +50,7 @@
 #include "fw_acl.h"
 #include "vfs_synth.h" /* 访问控制唯一判定点（对齐 Android 原生 FUSE 用户态策略层） */
 #include "fw_events.h"
+#include "fw_ingest.h" /* 后端落点物化：让媒体刷新请求有一个真实本地文件可扫 */
 #include "fuse_threads.h" /* FUSE 事件通道（默认 OFF，关闭时埋点只剩一次原子读） */
 #include "fw_config.h"
 #include "fw_pkg.h"
@@ -2140,7 +2141,11 @@ static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path, bool
         const bool writable = write_intent && ctx && ctx->pid != 0;
         /* 写意图句柄的数据收尾 = 后端侧的文件已经"落地"（FTP 上传完成）。此刻补一条
            媒体刷新请求：后端内容不产生本地 write 事件，扫描侧没有别的时机会知道这个
-           路径刚长出媒体文件。只在有活订阅者时发布（见 fw_events_note_media_refresh）。 */
+           路径刚长出媒体文件。只在有活订阅者时发布（见 fw_events_note_media_refresh）。
+           刷新请求必须建立在一个**本地**文件之上——扫描侧的每一跳都按本地路径工作，
+           落点下没有真实文件时它只会扫到空；顺序也不能换，新文件出现后旧 dentry/
+           属性要先丢掉（物化见 fw_ingest.h）。 */
+        if (writable) (void)fw_ingest_materialize(slot, path, ctx->uid, ctx->pid);
         if (ctx) vfs_inval_path(ctx->fuse, path);
         if (writable) fw_events_note_media_refresh(ctx->uid, ctx->pid, path, FW_REFRESH_FTP_UPLOAD);
     }

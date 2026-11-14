@@ -89,6 +89,15 @@ void fw_events_note_write_done(uid_t uid, pid_t pid, const char* fuse_path, FwEv
 void fw_events_note_write_denied(uid_t uid, pid_t pid, const char* fuse_path, NspAclOp acl_op,
                                  int err);
 
+/* 扩展名 → 媒体类别（FW_MEDIA_NONE = 非媒体）。发布侧按它决定一条刷新请求发不发，
+   后端落点物化按它决定要不要在本地留一份副本（见 fw_ingest.h）：两处必须同一份表。 */
+uint8_t fw_media_kind_of(const char* path);
+
+/* FUSE 视角路径 → 真实落盘路径：只经 fw_rules_resolve（决策单点），解析不出
+   用户层时退回默认存储路径。事件的 rpath 与后端落点物化都用它，两处必须是
+   同一个答案——副本落在事件没说的目录里，扫描侧就永远看不到它。 */
+void fw_resolve_real(uid_t uid, pid_t pid, const char* fuse_path, char* out, size_t sz);
+
 /* 埋点：主动要求对端补一次媒体扫描。fuse_path 为落点对应的 FUSE 视角路径
    （"/<user>/<sub>"），reason 取 FwRefreshReason。媒体类别由扩展名判定，非媒体
    文件整条不发。内部再判一次通道开关与订阅者，因此调用方可以直接调用——与
