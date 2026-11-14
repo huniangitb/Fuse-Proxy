@@ -12,7 +12,7 @@
 #   6. 打包后自动验证（文件数/关键文件/权限位）
 #
 # 用法：
-#   scripts/pack-module.sh                        # 使用默认路径（版本自动为 2.0）
+#   scripts/pack-module.sh -m <模块目录>       # 输出 zip 默认落到 $REPO/.cache/module-zip/
 #   scripts/pack-module.sh -m <模块目录> -b <构建目录> -o <输出zip>
 #
 # 选项：
@@ -85,6 +85,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "未知参数: $1" >&2; usage ;;
     esac
 done
+
+[[ -n "$MODULE_DIR" ]] || { echo "错误: 须用 -m 或 MODULE_DIR 指定模块骨架目录" >&2; exit 1; }
 
 # 非发布模式：module.prop 的 version 一律写当前仓库提交哈希（-v 被忽略）
 if [[ "$RELEASE_MODE" != "1" ]]; then

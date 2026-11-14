@@ -640,7 +640,7 @@ static void inject_global_fuse() {
            无条件追加 -f / -o / 挂载选项 / NULL 共 4 项。旧守卫 ai < 31 会让
            末条 token 落到 args[31] 之后（FUSE_EXTRA_ARGS 上限 512 字节，24 个
            空格分隔 token 轻易达到），fork 后子进程栈损坏、execv 参数不可控
-           （review-findings §A11）。超限 loud 告警并截断。 */
+           （历史审计项 A11：分词守卫越界）。超限 loud 告警并截断。 */
         const int fuse_args_cap = (int)(sizeof args / sizeof args[0]);
         const int fuse_args_tail = 4; /* -f / -o / 挂载选项 / NULL */
         bool extra_truncated = false;

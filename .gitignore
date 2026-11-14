@@ -28,6 +28,9 @@ subprojects/.wraplock
 # 验收报告（本机生成，scripts/acceptance.sh）
 .acceptance/
 
+# 本机真机验收报告与交付包（含设备序列号，不入库）
+reports/
+
 # 设备端验证产物（本机生成，不入库）
 device-verify/dist/
 device-verify/build/.gen/

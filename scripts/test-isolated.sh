@@ -27,8 +27,9 @@
 #      数据（test_ftp 的"读现有文件"是自己先写再读），故用最小合成树。
 #
 # 用法：
-#   scripts/test-isolated.sh                  # 跑全量（等价于 --all）
-#   scripts/test-isolated.sh test_ftp.py ...   # 只跑指定套件
+#   NSP_FTP_ROOT=/path/to/anon_root scripts/test-isolated.sh   # 跑全量（等价于 --all）
+#   NSP_FTP_ROOT=/path/to/anon_root scripts/test-isolated.sh test_ftp.py ...
+#                                                          # 只跑指定套件
 #
 # 注意：不传套件名时**必须显式 --all**——run.py 默认是「按本次改动匹配」，而本脚本
 # 自身是新文件，匹配结果只跑通用回归基线（2 套），容易误以为跑过全量。
@@ -52,6 +53,13 @@ RM=/bin/rm
 
 die() { echo "[iso] FATAL: $*" >&2; exit 1; }
 log() { echo "[iso] $*"; }
+
+# 宿主 vsftpd 匿名根：必须显式给，脚本不写死任何机器路径。快照、bind 与沙箱内
+# vsftpd 的 anon_root 都用同一个值，避免测试打到的树与取证比对的树不是同一份。
+NSP_FTP_ROOT=${NSP_FTP_ROOT:-}
+[ -n "$NSP_FTP_ROOT" ] && [ -d "$NSP_FTP_ROOT" ] || \
+    die "须用 NSP_FTP_ROOT 显式指向宿主 vsftpd 匿名根（现有目录）"
+export NSP_FTP_ROOT
 
 # ---------- 宿主不变量快照 ----------
 # 三项与 AGENTS「验收标准」一致：挂载表、配置/日志目录、FTP 树。
@@ -127,6 +135,7 @@ pasv_max_port=30100
 allow_writeable_chroot=YES
 use_localtime=YES
 VSEOF
+printf 'anon_root=%s\n' "$NSP_FTP_ROOT" >> "$STAGE/vsftpd.conf"
 printf 'secure_chroot_dir=%s\n' "$STAGE/vsftpd-empty" >> "$STAGE/vsftpd.conf"
 vsftpd "$STAGE/vsftpd.conf" 2>"$STAGE/vsftpd.err"
 sleep 2
@@ -178,7 +187,7 @@ chmod 755 "$INNER"
 
 log "进入沙箱（stage=$STAGE，客户端 uid=$CLIENT_UID）"
 unshare --user --map-root-user --map-auto --mount --pid --fork --mount-proc --net \
-    /bin/sh -c "STAGE=$STAGE REPO=$REPO SUITES='$SUITES' CLIENT_UID=$CLIENT_UID sh $INNER"
+    /bin/sh -c "STAGE=$STAGE REPO=$REPO NSP_FTP_ROOT='$NSP_FTP_ROOT' SUITES='$SUITES' CLIENT_UID=$CLIENT_UID sh $INNER"
 TEST_RC=$?
 
 # ---------- 宿主不变量比对 ----------

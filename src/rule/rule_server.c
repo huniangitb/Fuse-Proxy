@@ -2210,7 +2210,7 @@ static void handle_status(int fd, json_object* req) {
    把 <CONFIG_DIR>/log 整目录 tar.gz 到 <CONFIG_DIR>/export/（root 私有 0700），
    只保留最新 LOG_EXPORT_KEEP 份；供前端经 UDS 取回或 root 侧显式 copy-out。
 
-   落点为何**不在**共享存储（review-findings §A7-0 / §A7-4）：
+   落点为何**不在**共享存储（历史审计项 A7-0 / A7-4）：
    1. io.log 记录全部应用的文件访问路径，投递到 /sdcard 等于对所有有存储权限的
       应用公开，与本栈既有脱敏姿态（模块配置密码只写不读、nsp_ini_save 收紧
       0600）方向相反；

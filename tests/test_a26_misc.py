@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """A26 杂项判别（ftp_conf `#`/port + nsp_ini_store 落盘/读失败语义）
 
-背景（review-findings-20261007 §A26 / 20261018 §R12、§R13）：
+背景（历史审计项 A26 / R12 / R13；以下逐条给出修复前行为与判别性要点）：
   ⑤ ftp_conf.c 的 strip_comment 曾用 `strchr(line,'#')` 无条件截断——含 `#` 的
      密码（`pass = p#ssw0rd`）被静默改成首段，服务器 530 拒绝而配置看不出异常；
      `port = 0/-1/65536/abc` 也被 atoi 照收，最终以 `ftp://host:0/` 交给 libcurl。

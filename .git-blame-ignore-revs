@@ -5,5 +5,5 @@
 #   或单次：git blame --ignore-revs-file .git-blame-ignore-revs <file>
 # GitHub 亦自动识别本文件。
 
-# chore(format): 引入 .clang-format/.editorconfig 并全量格式化
-bcf2b87b42577c877f7a6d088a3c7f7b77ffe938
+# chore(build): 引入 .clang-format/.editorconfig 并全量格式化
+314b9e48d83009718fff583c007eef544f8e3a1f

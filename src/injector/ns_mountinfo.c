@@ -4,7 +4,7 @@
 #define _GNU_SOURCE
 #endif
 /*
- * ns_mountinfo.c — /proc/<pid>/mountinfo 的**唯一**扫描实现（review-todo §C7）
+ * ns_mountinfo.c — /proc/<pid>/mountinfo 的**唯一**扫描实现（历史审计项 C7）
  *
  * 背景：ns_utils.c 内四处手写扫描（do_umount_recursive / do_umount_and_rmdir /
  * do_force_umount_stale / do_combined_mount）与 ns_global_replace.c 的

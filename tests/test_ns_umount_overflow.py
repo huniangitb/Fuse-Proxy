@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ns_utils mountinfo 扫描栈越界判别测试（review-findings §A9）
+"""ns_utils mountinfo 扫描栈越界判别测试（历史审计项 A9）
 
 做法：直编 tests/fixtures/ns_umount_overflow_driver.c —— 它把实际源码
 src/injector/ns_utils.c 整体 #include（-DNS_UTILS_SRC=），只把 fopen

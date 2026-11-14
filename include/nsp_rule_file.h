@@ -53,7 +53,7 @@ typedef enum {
  * 成功返回数组（调用方经 nsp_rule_file_free 释放）。
  * **注意**：NULL 同时表示「不存在」与「读失败」——编辑类入口须改用
  * nsp_rule_file_read_ex 区分，否则读失败会被当空文件、用「段头 + 1 条」覆盖
- * 整份规则文件（review-findings §A10）。本函数保留给只读视图使用。 */
+ * 整份规则文件（历史审计项 A10：读失败当空文件覆盖）。本函数保留给只读视图使用。 */
 char** nsp_rule_file_read(const char* path, int* out_count, int* out_cap);
 
 /* 同 nsp_rule_file_read，但经 out_err 区分「文件不存在」与「读取失败」：

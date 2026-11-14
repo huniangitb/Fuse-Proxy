@@ -28,7 +28,7 @@
 判别性：fw_events.c 是新增模块（旧树上整个文件不存在）；此外每条断言都对着
 契约的具体条款——把窗口改成 0ms、把 dropped 改成累计值、把 ok=0 复用成
 denied=1、把 TTL 去掉，都会让本套件失败。白名单自动项与 ENOSPC 两条在
-HEAD=bda2f1f（旧实现）上必失败：旧实现既不解析 packages.list 的 pkg→uid，
+修复前 HEAD（旧实现）上必失败：旧实现既不解析 packages.list 的 pkg→uid，
 write_denied 的 errno 集合也没有 ENOSPC/EDQUOT。
 
 前置：本机 cc。失败退出码 1（勿用管道吞掉退出码）。

@@ -79,7 +79,7 @@ void add_tracked(int pid) {
     }
     pthread_mutex_unlock(&g_tracked_mutex);
 
-    /* 此处不再预热挂载状态缓存（080fcd2 引入，现已无收益且有害）：
+    /* 此处不再预热挂载状态缓存（历史实现曾引入，现已无收益且有害）：
        1) 收益消失——预热的唯一目的是让 LIST_INJECTED 首次请求命中缓存，
           但注入状态改为显式标志维护后，handle_list_injected /
           get_injected_snapshot 已完全不查挂载缓存；
