@@ -73,12 +73,11 @@ RESOLVE_CASES = [
     ("sandbox.conf", 10123, "/0/Documents/d.docx", "/0/Android/data/com.demo.app/sandbox/Documents/d.docx", None),
     # 自己的 data/obb 不重定向（沙盒是隔离"别的应用的数据"，不是自己的）
     ("sandbox.conf", 10123, "/0/Android/data/com.demo.app/own.txt", "/0/Android/data/com.demo.app/own.txt", None),
-    # 默认口径（[`SANDBOX_ANDROID_TREE`] 不写 = OFF）：/Android 下只有 data|obb
-    # 两棵子树进镜像，他包 media 子树留真实目录
+    # /Android 只有一种口径：他包 media 子树不在让位清单内（让位只有三个容器
+    # 本身与应用自己的 /Android/{data,obb,media}/<pkg>），落进沙盒镜像
     ("sandbox.conf", 10123, "/0/Android/media/com.other.app/m.bin",
-     "/0/Android/media/com.other.app/m.bin", "/sandbox/"),
-    # 整树进镜像口径：他包 media 子树不在让位清单内（让位只有三个容器本身与
-    # 应用自己的 /Android/{data,obb,media}/<pkg>），落进沙盒镜像
+     "/0/Android/data/com.demo.app/sandbox/Android/media/com.other.app/m.bin", None),
+    # 遗留开关行的夹具：行被忽略，落点与上一行完全一致（同一组断言再跑一遍）
     ("sandbox_android_tree.conf", 10123, "/0/Android/media/com.other.app/m.bin",
      "/0/Android/data/com.demo.app/sandbox/Android/media/com.other.app/m.bin", None),
     # 同一口径下 /Android 本身与应用新建的条目也进镜像

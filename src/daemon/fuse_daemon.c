@@ -883,13 +883,13 @@ static ino_t vfs_readdir_child_ino(const char* parent_sub, const char* name) {
     return synthetic_inode(child);
 }
 
-/* /Android/media 的骨架兜底：只在整树镜像口径下成立——镜像里的 /Android 没有
-   真实的 media 条目（列举时由 vfs_readdir_fill_android_children 补这一条），而
-   容器本身按真实目录让位，两处口径必须同时成立，否则又回到「列表里看得见、按名
-   stat 却 ENOENT」。它只是骨架容器：容器内的 <pkg> 是按名裁决的真实目录，没有
-   own_pkg 合成，故不进数据容器那套判定。 */
+/* /Android/media 的骨架兜底：沙盒里的 /Android 取自镜像，镜像里没有 media 条目
+   （列举时由 vfs_readdir_fill_android_children 补这一条），而容器本身按真实目录
+   让位——两处口径必须同时成立，否则又回到「列表里看得见、按名 stat 却 ENOENT」。
+   它只是骨架容器：容器内的 <pkg> 是按名裁决的真实目录，没有 own_pkg 合成，故不
+   进数据容器那套判定。 */
 static bool android_media_skel(const char* sub_path) {
-    return g_global_cfg.sandbox_android_tree && sub_path_is_android_media_container(sub_path);
+    return sub_path_is_android_media_container(sub_path);
 }
 
 static int vfs_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
@@ -1303,10 +1303,10 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     bool skip_sandbox = (path_user_id < 0) || g_disable_sandbox;
     /* 骨架补齐不能依赖用户层是否剥离：无用户层的挂载上同样要补 data/obb */
     d->is_android_dir = (!skip_sandbox && sub_path_is_storage_android_dir(sub_path));
-    /* 整树镜像口径下 /Android 本身取自镜像，镜像里没有真实的 media 目录——那一条
-       由框架补；旧口径 /Android 就是真实目录，媒体目录本来就在，不需要合成。 */
-    d->media_skel = (!skip_sandbox && g_global_cfg.sandbox_android_tree &&
-                     sub_path_is_storage_android_dir(sub_path));
+    /* 沙盒里的 /Android 取自镜像，镜像里没有真实的 media 目录——那一条由框架补；
+       未开沙盒时 /Android 就是真实目录，媒体目录本来就在，列举自然带上（补一条也
+       只是与 data/obb 同一套骨架口径）。 */
+    d->media_skel = (!skip_sandbox && sub_path_is_storage_android_dir(sub_path));
     d->hide_others = (!skip_sandbox && current_pkg[0] && strcmp(current_pkg, "system") != 0 &&
                       strcmp(current_pkg, "unknown") != 0);
     d->has_data = d->has_obb = d->has_media = d->has_android = d->has_pkg = false;
