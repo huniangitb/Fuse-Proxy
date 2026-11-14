@@ -317,7 +317,7 @@ FUSE 回调（如 getattr）
 
 - **事件源**是 `ns_mnt_watch_open(pid)` 打开的 `/proc/<pid>/mountinfo`（`mounts_poll`），注册掩码**必须为 0**：`EPOLLIN` 在 seq_file 上恒真，带上就是把等待变成忙轮询；`EPOLLERR` 不受掩码约束，挂载表一变内核就回报。
 - **命名空间切换本身不产生任何 poll 事件**（实测：子进程 `unshare(CLONE_NEWNS)` 前后，父进程早已打开的那份 mountinfo fd 一次都不醒；旧 ns 的 fd 也看不到新 ns 的挂载变化；inotify 盯 `/proc/<pid>/ns` 同样静默）。所以事件只能回答「这个 ns 的挂载表动了」，**切换与否一律靠醒来后 `stat` 复核 `(dev, ino)`**——事件不是充分条件，它只是把「挂载表动了」这一刻提前叫醒。
-- **精度由 `ppoll` 的纳秒超时给出**：切换发生在打开 fd 之后、旧 fd 又永远不会醒，故每轮醒来都 `close` 并重新 `ns_mnt_watch_open(pid)`（换一份盯新 ns 的事件源）；超时取 `NS_MNT_WAIT_ARM_FAST_US`（200µs）在 `NS_MNT_WAIT_FAST_WINDOW_US`（16ms，实测切换落点）之内，之后退到 `NS_MNT_WAIT_ARM_US`（2ms，与旧步进同粒度，长等待的唤醒次数不增加）。
+- **精度由 `ppoll` 的纳秒超时给出**：切换发生在打开 fd 之后、旧 fd 又永远不会醒，故每轮醒来都 `close` 并重新 `ns_mnt_watch_open(pid)`（换一份盯新 ns 的事件源）；超时取 `NS_MNT_WAIT_ARM_FAST_US`（200µs）在 `NS_MNT_WAIT_FAST_WINDOW_US`（16ms，实测切换落点）之内，之后退到 `NS_MNT_WAIT_ARM_US`（2ms，与旧步进同粒度，长等待的唤醒次数不增加）。取样点**对齐到等待起点**（第 k 个取样点是 `k × 节拍`），一次晚唤醒只缩短下一跳、不把后续取样整体推后——否则几百微秒的唤醒延迟会把细节拍一点点拖成粗节拍。
 - **兜底与退路**：`IPC_POST_WAIT_MS` 仍是硬上限（预算耗尽 → 既有「跳过 + 交后台重试队列」），`kill(pid, 0)` 的进程死亡判断保留；事件源打不开、`ppoll` 出错 → 关掉 fd 退回纯节拍等待，补挂载能力不押在事件源上。
 
 **后台重试必须收敛（真机回归）**：重试记账在 `src/injector/retry_queue.c`。旧实现把"异步派发成功"当成"挂载成功"——派发后立即摘条目，真正的失败由完成回调重新入队（新条目尝试次数归零），退避与 5 次上限因此永远不生效：挂不上的应用以 **1Hz 永久重试**，每轮写一条 错误日志 + WARN + ERROR，并持续 fork/读 mountinfo。现在尝试次数随条目保存，且记账精度从**秒**降到**毫秒**（`nsp_retry_now_ms()` = CLOCK_MONOTONIC；秒粒度装不下真机 135–150ms 的视图窗口，旧的首档退避 1s 等于白等一整秒）：三档退避 **20ms×10 → 100ms×5 → 1/2/4/8s（封顶 8s）**，同一 pid 最多 `NSP_RETRY_MAX_ATTEMPTS`（20）次，超限 loud 一次后放弃（应用继续用原生视图），成功才清账。主循环为此多了一枚**一次性毫秒定时器**（`g_due_fd`，臂到"重试队列下一个到期"与"重载去抖窗口到期"中最近者），否则 20ms 快档只能等 1s 周期 tick。后台通道（异步扫描 / 失败重试）的"目标未就绪"用负值哨兵 `NSP_READINESS_QUIET` 只记 DEBUG——错误日志 只留给权威尝试。

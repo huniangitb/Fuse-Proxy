@@ -69,9 +69,13 @@ long ns_mnt_wait_switch(int pid, dev_t ns_dev, ino_t ns_ino, long budget_ms, boo
         long waited_us = mono_elapsed_us(&t0, &tn);
         long left_us = budget_us - waited_us;
         if (left_us <= 0) break;
-        long arm_us = (watch_fd >= 0 && waited_us < NS_MNT_WAIT_FAST_WINDOW_US)
-                          ? NS_MNT_WAIT_ARM_FAST_US
-                          : NS_MNT_WAIT_ARM_US;
+        long base_us = (watch_fd >= 0 && waited_us < NS_MNT_WAIT_FAST_WINDOW_US)
+                           ? NS_MNT_WAIT_ARM_FAST_US
+                           : NS_MNT_WAIT_ARM_US;
+        /* 节拍对齐到等待起点：一次晚唤醒不该把后面的取样点整体推后，否则
+           细节拍会一步步退化成粗节拍（唤醒延迟本身就在几百微秒量级）。 */
+        long arm_us = (waited_us / base_us + 1) * base_us - waited_us;
+        if (arm_us <= 0 || arm_us > base_us) arm_us = base_us;
         if (arm_us > left_us) arm_us = left_us; /* 最后一跳只睡到预算 */
         struct timespec arm;
         arm_to_timespec(&arm, arm_us);
