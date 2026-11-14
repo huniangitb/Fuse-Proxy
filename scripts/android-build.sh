@@ -25,6 +25,14 @@ done
 export PATH
 unset _nsp_pd
 
+# 调用方的环境也可能不给 HOME：下面的 NDK 搜索（以及 git 子模块）都要用它，
+# 缺了会在 set -u 下直接 unbound variable 退出，故按 passwd 兜底。
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    [ -n "$HOME" ] || HOME=/
+    export HOME
+fi
+
 cd "$(dirname "$0")/.."
 BUILD_DIR="${1:-build_android}"
 shift 2>/dev/null || true

@@ -22,6 +22,25 @@
 # 便于离线/复用），否则 git clone 到临时目录（mbedTLS 需 --recurse-submodules）。
 set -euo pipefail
 
+# 调用方的环境不一定导出 PATH（子进程继承不到）：工具链与 cmake 都要用它，
+# 缺了会退回到相对 exec prefix 或找不到 ld，故自行补齐并导出。
+for _nsp_pd in /usr/local/sbin /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+    case ":${PATH:-}:" in
+        *":$_nsp_pd:"*) ;;
+        *) PATH="${PATH:+$PATH:}$_nsp_pd" ;;
+    esac
+done
+export PATH
+unset _nsp_pd
+
+# 同样可能不给 HOME：本脚本的默认输出目录与 NDK 搜索都要用它，缺了会在
+# set -u 下直接 unbound variable 退出，故按 passwd 兜底。
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    [ -n "$HOME" ] || HOME=/
+    export HOME
+fi
+
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 # 显式传空串也要能识别：":-" 形式会把空串当未提供而落回默认，危险路径检查就失效
