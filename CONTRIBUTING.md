@@ -24,6 +24,10 @@ Android 13+ 用户态 FUSE 存储代理，C23 + Meson/Ninja。仓库文档与提
 | `dev` | 开发/集成分支，日常工作的默认目标 | **禁止直接提交**；功能必须经 PR 合入 |
 | `feature/*` | 短期功能分支，从 `dev` 切出 | 完成后合回 `dev`，随即删除 |
 
+**GitHub 默认分支是 `dev`**：clone 下来就在这条线上，日常只需 `git pull --ff-only`；
+所有改动一律开分支，不要直接提交到 `dev` 或 `main`——两个长期分支都开了保护，直接
+`git push` 会被拒（见本节末段）。
+
 整洁度靠 `feature/* → dev` 的 **squash** 达成；长期分支健康靠 `dev → main` 的
 **常规 merge commit** 维持——不要把 `dev` squash 进 `main`，否则两条历史分叉，
 下次合并要重复解同样的冲突。
@@ -31,10 +35,13 @@ Android 13+ 用户态 FUSE 存储代理，C23 + Meson/Ninja。仓库文档与提
 本地流转：
 
 ```sh
-git switch dev                     # 日常工作在 dev 上同步
-git switch -c feature/<名> dev     # 开功能分支
-git commit ...                     # 在 feature/* 上提交，过 §4 验收门
-# 推 feature/* 开 PR，squash 合入 dev；随后删除该分支
+git switch dev                              # 默认分支，先同步
+git pull --ff-only
+git switch -c feature/<名> dev              # 新功能一律开分支
+git commit ...                              # 在 feature/* 上提交，过 §4 验收门
+git push -u origin feature/<名>
+gh pr create --base dev --head feature/<名> # 开 PR
+gh pr merge --squash --delete-branch        # squash 合入 dev，源分支随即删除
 ```
 
 分支保护（GitHub 仓库设置，`main` 与 `dev` 各一份，2026-11-15 已启用）：默认分支

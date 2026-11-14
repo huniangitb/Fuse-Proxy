@@ -35,6 +35,8 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 
 子模块均为上游 pin 版，`git submodule update --init --recursive` 即可补齐。强制指定来源见 `meson_options.txt`（如 `-Dlibfuse_source=system`、`-Dandroid_curl=prebuilt`）。
 
+分支：默认分支 `dev`，新功能从 `dev` 切 `feature/*`、开 PR 合回 `dev`，`main` 只存放稳定版本。提交规范与验收门见 `CONTRIBUTING.md`。
+
 ## 产物
 
 构建目录根下（`meson install` 后按下表落位）：
