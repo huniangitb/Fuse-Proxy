@@ -928,8 +928,8 @@ static void br_scope_decl(AppConfig* c, BrRuleScope scope, const char* sub_path,
        形态），从字符串上区分不出「放行到自身真实路径」与「重写到另一路径」。二者
        语义不同（只有 ALLOW 才是可被高作用域沙盒压过的"透传"，REDIRECT 永远改写），
        故落点一律走线性实现 br_check_redir_rule —— 它的 is_allow 是唯一权威。
-       代价：该层有 redir 规则时每请求一次 O(redir_count) 扫描（无 redir 规则时零
-       成本；隐藏命中时提前跳过）。 */
+       代价：该层有 redir 规则时每请求一次 O(redir_count) 线性扫描；无 redir 规则
+       时零成本。静态隐藏命中也要扫这一遍——跳过就不知道这一层有没有点名放行。 */
     bool dyn_hide = false;
     bool dyn_ro = false;
     bool dyn_allow = false;
