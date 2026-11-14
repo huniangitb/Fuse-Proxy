@@ -233,7 +233,7 @@ static const char* fw_media_kind_name(unsigned kind) {
 
 /* 按落点扩展名判媒体类别。判不出就返回 NONE，调用方据此不发刷新事件——宁可少
    一次扫描，也不把非媒体文件推进对端的扫描队列。 */
-static uint8_t fw_media_kind_of(const char* path) {
+uint8_t fw_media_kind_of(const char* path) {
     static const struct {
         const char* ext;
         uint8_t kind;
@@ -602,7 +602,7 @@ static void fw_update_hot(void) {
 
 /* FUSE 视角路径 → 真实落盘路径：**只经 fw_rules_resolve**（决策单点）。
    解析失败（无用户层）时退回默认存储路径，仍走 common_default_real_path。 */
-static void fw_resolve_real(uid_t uid, pid_t pid, const char* fuse_path, char* out, size_t sz) {
+void fw_resolve_real(uid_t uid, pid_t pid, const char* fuse_path, char* out, size_t sz) {
     if (!out || sz == 0) return;
     out[0] = '\0';
     NspQueryCtx q;

@@ -126,8 +126,10 @@ SUITE_MAP = [
 
     (("test_ftp.py", "test_ftp_read_restart.py", "test_ftp_truncate_list.py",
       "test_ftp_upload_lock.py", "test_sftp.py"),
-     ("src/modules/ftp/",),
+     # 后端落点物化（fw_ingest.c）：把后端字节回读成本地文件，供扫描侧入库
+     ("src/modules/ftp/", "src/daemon/fw_ingest.c"),
      ("module_backend_lookup", "module_backend_put", "backend_rename", "backend_read",
+      "fw_ingest_materialize",
       "ftp_backend_truncate", "ftp_list_cache_clear", "ftp_backend_upload",
       # fsync 与 FLUSH 共用后端收尾（vfs_fsync 不再是空操作）→ 改这些行必须跑 ftp
       "vfs_backend_finish_data", "vfs_fsync", "backend_flush",

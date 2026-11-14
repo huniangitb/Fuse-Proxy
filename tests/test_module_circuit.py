@@ -231,9 +231,10 @@ def storm(kw, n=9):
 # ── §0 L0 直编契约：后端收尾既不能假成功，也不能漏发媒体刷新 ──
 # 直编实际源码的 vfs_backend_finish_data，把 module_backend_acquire_slot
 # 桩成返回 -1（槽位被置毒/卸载后快照置空）；旧实现 return 0（假成功），
-# 新实现必须 -EIO。同一个探针再验两件事：写意图句柄收尾成功时发一次
-# media_refresh（reason=ftp_upload，带上调用方 uid/pid 与落点路径），只读
-# 句柄收尾不发——后端内容不产生本地 write 事件，这是扫描侧唯一的机会。
+# 新实现必须 -EIO。同一个探针再验三件事：写意图句柄收尾成功时先物化落点、
+# 再发一次 media_refresh（reason=ftp_upload，带上调用方 uid/pid 与落点路径），
+# 只读句柄收尾两件事都不做——后端内容不产生本地 write 事件，这是扫描侧唯一的
+# 机会，而扫描侧只认本地文件。
 # FUSE_DAEMON_SRC=<旧源码副本> 可复现失败。
 FINISH_DATA_DRIVER = r'''
 #define _GNU_SOURCE
@@ -284,12 +285,28 @@ static uid_t g_refresh_uid;
 static pid_t g_refresh_pid;
 static uint8_t g_refresh_reason;
 static char g_refresh_path[PATH_MAX];
+/* 物化替身（fw_ingest.c）：发布刷新请求时必须已经调过它——扫描侧按本地路径
+   工作，落点下没有真实文件就只能扫到空 */
+static int g_ingest;
+static int g_refresh_saw_ingest;
+static uid_t g_ingest_uid;
+static pid_t g_ingest_pid;
+static char g_ingest_path[PATH_MAX];
 void fw_events_note_media_refresh(uid_t uid, pid_t pid, const char* path, uint8_t reason) {
     g_refresh++;
     g_refresh_uid = uid;
     g_refresh_pid = pid;
     g_refresh_reason = reason;
+    g_refresh_saw_ingest = g_ingest;
     snprintf(g_refresh_path, sizeof g_refresh_path, "%s", path);
+}
+int fw_ingest_materialize(int slot, const char* fuse_path, uid_t uid, pid_t pid) {
+    (void)slot;
+    g_ingest++;
+    g_ingest_uid = uid;
+    g_ingest_pid = pid;
+    snprintf(g_ingest_path, sizeof g_ingest_path, "%s", fuse_path);
+    return 0;
 }
 __FINISH_FN__
 int main(void) {
@@ -298,35 +315,52 @@ int main(void) {
 
     int rc_dead = vfs_backend_finish_data(0, 1, "/0/probe.jpg", true);
     int refresh_dead = g_refresh;
+    int ingest_dead = g_ingest;
 
     g_slot_ok = 1;
     g_refresh = 0;
+    g_ingest = 0;
     int rc_write = vfs_backend_finish_data(0, 1, "/0/probe.mp3", true);
     int refresh_write = g_refresh;
+    int ingest_write = g_ingest;
+    int ordered_write = g_refresh_saw_ingest;
+    uid_t ingest_uid_write = g_ingest_uid;
+    pid_t ingest_pid_write = g_ingest_pid;
     uid_t uid_write = g_refresh_uid;
     pid_t pid_write = g_refresh_pid;
     uint8_t reason_write = g_refresh_reason;
     char path_write[PATH_MAX];
+    char ingest_path_write[PATH_MAX];
     snprintf(path_write, sizeof path_write, "%s", g_refresh_path);
+    snprintf(ingest_path_write, sizeof ingest_path_write, "%s", g_ingest_path);
 
     g_refresh = 0;
+    g_ingest = 0;
     int rc_read = vfs_backend_finish_data(0, 1, "/0/probe.mp3", false);
     int refresh_read = g_refresh;
+    int ingest_read = g_ingest;
 
-    printf("dead_slot_rc=%d dead_refresh=%d\n", rc_dead, refresh_dead);
-    printf("write_rc=%d write_refresh=%d uid=%u pid=%d reason=%u path=%s\n",
+    printf("dead_slot_rc=%d dead_refresh=%d dead_ingest=%d\n", rc_dead, refresh_dead, ingest_dead);
+    printf("write_rc=%d write_refresh=%d uid=%u pid=%d reason=%u path=%s ingest=%d "
+           "ingest_path=%s ordered=%d ingest_uid=%u ingest_pid=%d\n",
            rc_write, refresh_write, (unsigned)uid_write, (int)pid_write,
-           (unsigned)reason_write, path_write);
-    printf("read_rc=%d read_refresh=%d\n", rc_read, refresh_read);
+           (unsigned)reason_write, path_write, ingest_write, ingest_path_write, ordered_write,
+           (unsigned)ingest_uid_write, (int)ingest_pid_write);
+    printf("read_rc=%d read_refresh=%d read_ingest=%d\n", rc_read, refresh_read, ingest_read);
 
     int bad = 0;
-    if (rc_dead != -EIO || refresh_dead != 0) bad = 1;
+    if (rc_dead != -EIO || refresh_dead != 0 || ingest_dead != 0) bad = 1;
     if (rc_write != 0 || refresh_write != 1) bad = 1;
     if (uid_write != 10123 || pid_write != 4242) bad = 1;
     if (reason_write != FW_REFRESH_FTP_UPLOAD) bad = 1;
     if (strcmp(path_write, "/0/probe.mp3") != 0) bad = 1;
-    /* 只读句柄收尾不宣称写入：不得发媒体刷新 */
-    if (rc_read != 0 || refresh_read != 0) bad = 1;
+    /* 物化先于刷新、作用于同一个落点：否则扫描侧拿到的是一个本地不存在的路径 */
+    if (ingest_write != 1 || strcmp(ingest_path_write, "/0/probe.mp3") != 0) bad = 1;
+    /* 物化落点要按调用方的规则解析：uid/pid 传错就会落到别人扫不到的目录 */
+    if (ingest_uid_write != 10123 || ingest_pid_write != 4242) bad = 1;
+    if (ordered_write != 1) bad = 1;
+    /* 只读句柄收尾不宣称写入：不得物化，也不得发媒体刷新 */
+    if (rc_read != 0 || refresh_read != 0 || ingest_read != 0) bad = 1;
     return bad;
 }
 

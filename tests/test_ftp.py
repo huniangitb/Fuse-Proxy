@@ -10,7 +10,7 @@
 并直接核对 vsftpd 匿名根（默认 ~/ftp，可用 NSP_FTP_ROOT 覆盖）验证 FTP 服务器实际变化。
 V5 分页回归：700 文件大目录一次列全（旧 512 整批上限会静默丢尾）。
 """
-import subprocess, os, sys, time, shutil, errno, ctypes, shlex
+import subprocess, os, sys, time, shutil, errno, ctypes, shlex, json, socket
 from pathlib import Path
 
 MNT      = "/tmp/fuse_ftp_test/mnt"
@@ -122,14 +122,18 @@ def wait_ftp_ready(timeout=10.0):
         time.sleep(0.3)
     return False
 
-def start_fuse():
+def start_fuse(events=False):
     # FTP 规则：`FTP <虚拟前缀> <段名>` 写在 [GLOBAL]（全局生效）。
     # /0/云盘 剥离 /0/ 后命中规则 → 框架分派给 ftp_module（段名=SERVER）
     # HIDE 规则供 A4 用例：后端列举必须与本地列举同一可见性过滤（旧实现后端
     # 零过滤 → HIDE 条目在列表里可见而 stat ENOENT，既是反向形态也是名字泄露）
+    # events=True 只给物化用例：事件通道缺省 OFF，打开后后端写收尾才发布
+    # media_refresh（并用它作为物化的门）
     with open(CONF, "w") as fh:
         fh.write(f"[GLOBAL]\nFTP /{SERVER} {SERVER}\nFTP /{SERVER2} {SERVER2}\n"
                  f"HIDE /{SERVER}/nsp_hide_secret.txt\n")
+        if events:
+            fh.write(f"FUSE_EVENTS ON\nFUSE_EVENTS_UIDS {os.getuid()}\n")
     p = subprocess.Popen([DAEMON, "--root="+STORAGE, "--rules="+CONF,
                           "--modules-dir="+MODDIR, "-f", MNT, "info"],
                          stdout=open("/tmp/fuse_ftp_test/fuse.log", "w"),
@@ -179,6 +183,47 @@ def wait_ftp_content(rel, want, timeout=6.0):
             pass
         time.sleep(0.2)
     return False
+
+EV_ADDR = b"\0nsp_fs_events"
+
+def subscribe_events(types=("media_refresh",), timeout=8.0):
+    """抽象命名空间 DGRAM 订阅者（事件通道契约里客户端侧的唯一形态）。
+    监听 socket 要等 FUSE_EVENTS 生效后才存在，故带重试。"""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.bind(f"\0nsp_fs_events.py.{os.getpid()}")
+    s.settimeout(timeout)
+    req = {"cmd": "SUBSCRIBE", "reply": f"nsp_fs_events.py.{os.getpid()}",
+           "filter": {"types": list(types)}}
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            s.sendto(json.dumps(req).encode(), EV_ADDR)
+            time.sleep(0.3)   # 让 daemon 事件线程处理订阅帧
+            return s
+        except OSError:
+            time.sleep(0.3)
+    s.close()
+    return None
+
+def read_events(sock, want_types, timeout=6.0):
+    """返回首条 type 属于 want_types 的帧（跳过其它类型）"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            data = sock.recv(4096)
+        except (socket.timeout, OSError):
+            break
+        for line in data.decode(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") in want_types:
+                return ev
+    return None
 
 def main():
     global PASS, FAIL
@@ -633,6 +678,76 @@ def main():
             fail("大目录分页", str(e))
         finally:
             shutil.rmtree(Path(FTP_UPLOAD)/"nsp_bigdir", ignore_errors=True)
+
+        # 13. 后端写收尾：落点物化 + media_refresh（FUSE_EVENTS ON）
+        #     扫描侧只认本地路径（QUERY 的 exists 探针对落点 lstat、MediaStore 的
+        #     scan_file 也只打开本地文件），后端字节留在远端 ⇒ 收尾成功后必须先在
+        #     落点长出真实文件，否则刷新请求扫到的是空。缺省（OFF，即 1-12 的链路）
+        #     本地一个字节都不落——那正是"未侧漏"用例覆盖的形态。
+        print("\n── 13. 后端写收尾的落点物化 + media_refresh（FUSE_EVENTS ON）──")
+        img_name  = "nsp_ingest_probe.jpg"
+        note_name = "nsp_ingest_note.txt"
+        img_bytes = b"\xff\xd8\xff\xe0" + b"nsp-ingest-probe" * 8 + b"\xff\xd9"
+        local_dir = Path(STORAGE) / "0" / SERVER
+        try:
+            stop_fuse(p)
+            p = start_fuse(events=True)
+            if not p:
+                fail("FUSE_EVENTS ON 起 daemon", "启动失败")
+            else:
+                sock = subscribe_events()
+                if sock is None:
+                    fail("事件订阅", "nsp_fs_events 不可连（FUSE_EVENTS 未生效？）")
+                else:
+                    try:
+                        (m/"0"/SERVER/img_name).write_bytes(img_bytes)
+                        ev = read_events(sock, {"media_refresh"})
+                        if not ev:
+                            fail("STOR 媒体后应收到 media_refresh",
+                                 "6s 内没有事件（写意图没传到收尾？）")
+                        else:
+                            for name, good in [
+                                ("reason=ftp_upload", ev.get("reason") == "ftp_upload"),
+                                ("media=image", ev.get("media") == "image"),
+                                ("vpath 相对用户根", ev.get("vpath") == f"/{SERVER}/{img_name}"),
+                                ("spath 存储视图",
+                                 ev.get("spath") == f"/storage/emulated/0/{SERVER}/{img_name}"),
+                                ("rpath 指向落点",
+                                 str(ev.get("rpath", "")).startswith(str(local_dir))),
+                                ("uid 为调用方", ev.get("uid") == os.getuid()),
+                            ]:
+                                if good:
+                                    ok(f"media_refresh 字段 {name}")
+                                else:
+                                    fail(f"media_refresh 字段 {name}",
+                                         json.dumps(ev, ensure_ascii=False)[:200])
+                        lp = local_dir / img_name
+                        got = lp.read_bytes() if lp.exists() else None
+                        if got == img_bytes:
+                            ok("落点已物化（本地副本与写入内容一致）")
+                        else:
+                            fail("落点物化",
+                                 f"{lp} 存在={lp.exists()} 内容一致={got == img_bytes}")
+                        remote = Path(FTP_UPLOAD) / img_name
+                        if remote.exists() and remote.read_bytes() == img_bytes:
+                            ok("远端内容一致（物化是回读后端，不是旁路写）")
+                        else:
+                            fail("远端内容", f"{remote} 与写入内容不一致")
+                        # 非媒体：不物化、也不发刷新——刷新请求对扫描侧没有意义
+                        (m/"0"/SERVER/note_name).write_bytes(b"nsp ingest text")
+                        ev2 = read_events(sock, {"media_refresh"}, timeout=2.0)
+                        note_local = (local_dir / note_name).exists()
+                        if ev2 is None and not note_local:
+                            ok("非媒体 STOR：不物化、不发 media_refresh")
+                        else:
+                            fail("非媒体 STOR",
+                                 f"event={ev2} 本地存在={note_local}")
+                    finally:
+                        sock.close()
+        except Exception as e:
+            fail("落点物化用例", str(e))
+        finally:
+            shutil.rmtree(local_dir, ignore_errors=True)   # 物化出的本地副本属本套件产物
 
     finally:
         stop_fuse(p)   # fuse_daemon 退出 → 模块 exit 清理后端
