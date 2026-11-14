@@ -13,6 +13,18 @@
 #       ANDROID_NDK_HOME=/opt/ndk scripts/android-build.sh build_android -Denable_debug=true
 set -euo pipefail
 
+# 调用方的环境不一定导出 PATH（子进程继承不到）：此时 cc 会退回相对的 exec
+# prefix，报 "cannot execute 'cc1'"、collect2 "cannot find 'ld'"——工具链本身是
+# 好的，缺的只是 PATH。脚本自己补齐标准系统目录并导出，不要求调用方包一层 env。
+for _nsp_pd in /usr/local/sbin /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+    case ":${PATH:-}:" in
+        *":$_nsp_pd:"*) ;;
+        *) PATH="${PATH:+$PATH:}$_nsp_pd" ;;
+    esac
+done
+export PATH
+unset _nsp_pd
+
 cd "$(dirname "$0")/.."
 BUILD_DIR="${1:-build_android}"
 shift 2>/dev/null || true
