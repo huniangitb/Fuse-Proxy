@@ -37,8 +37,24 @@ git commit ...                     # 在 feature/* 上提交，过 §4 验收门
 # 推 feature/* 开 PR，squash 合入 dev；随后删除该分支
 ```
 
-分支保护（GitHub 仓库设置，`main` 与 `dev` 都开）：Require a pull request before
-merging、禁止 force-push 与删除；`main` 的合并来源限定 `dev`（紧急修复另开 PR）。
+分支保护（GitHub 仓库设置，`main` 与 `dev` 各一份，2026-11-15 已启用）：默认分支
+是 `dev`；两个分支都要求先开 PR（`required_approving_review_count = 0`，自己可以合并
+自己的 PR）、禁止 force-push 与删除、要求解决对话、合并后自动删源分支
+（`delete_branch_on_merge = true`）、`enforce_admins = true`（管理员不豁免）。
+
+「`main` 只从 `dev` 合并」只能靠评审把关：GitHub 的分支保护没有「限定来源分支」
+这项设置。紧急修复可以从 `feature/*` 直接开 PR 到 `main`，但要在 PR 描述里写明
+为什么跳过 `dev`；其余情况一律走 `dev`。
+
+本节写错要就地改时，先临时关保护、改完再开回来，别用 `--force` 硬顶：
+
+```sh
+gh api -X DELETE repos/<owner>/<repo>/branches/dev/protection
+# …改完推上去…
+gh api -X PUT repos/<owner>/<repo>/branches/dev/protection --input -
+```
+
+最后那条的 stdin 是关闭保护前 `gh api …/branches/dev/protection` 打出来的同一份 JSON。
 
 ## 2. 代码归属
 
