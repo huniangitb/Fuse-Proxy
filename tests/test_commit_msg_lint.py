@@ -66,6 +66,7 @@ CASES = [
     ("Revert 跳过", 'Revert "fix: 改点东西"\n\nThis reverts commit 0123456789abcdef.\n', 0, None),
     ("fixup! 跳过", "fixup! fix(fuse): 改点东西\n", 0, None),
     ("引用未入库的本地材料", "fix(fuse): 改点东西\n\n见 review-findings-20261007.md。\n", 1, "本机材料"),
+    ("引用本机报告目录", "fix(fuse): 改点东西\n\n见 reports/2026-11-09-x.md。\n", 1, "本机材料"),
 ]
 
 

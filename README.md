@@ -20,7 +20,7 @@ git clone --recurse-submodules https://github.com/huniangitb/Fuse-Proxy && cd Fu
 |---|---|---|
 | GNU（本机测试） | `scripts/build.sh` | 构建到 `build_gnu/`；等价 `meson setup build_gnu -Dtarget_os=gnu && ninja -C build_gnu` |
 | Android（NDK 交叉） | `scripts/android-build.sh` | NDK 自动搜索（`ANDROID_NDK_HOME` 优先），API 默认 35（`ANDROID_API` 覆盖） |
-| 打包 | `scripts/pack-module.sh` | 同步 Android 产物到模块骨架并打包 zip（`-h` 查看选项） |
+| 打包 | `scripts/pack-module.sh -m <模块目录>` | 同步 Android 产物到模块骨架并打包 zip；模块骨架目录须显式给（`-h` 查看选项） |
 
 前置：`meson`、`ninja`、`cmake`、`pkg-config`、`gcc`；Android 另需 NDK。
 

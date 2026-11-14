@@ -1319,7 +1319,7 @@ static void vfs_readdir_ctx_init(VfsReaddirCtx* d, struct fuse_context* ctx, con
     d->has_data = d->has_obb = d->has_media = d->has_android = d->has_pkg = false;
 }
 
-/* 合成/虚拟条目 d_ino 与 getattr 同源解析（f7169be 不变量：目录项 d_ino
+/* 合成/虚拟条目 d_ino 与 getattr 同源解析（inode 同源不变量：目录项 d_ino
    == getattr st_ino）。vfs_readdir_child_ino 的纯 synthetic 只在「真实路径
    不存在」时与 getattr 一致；重定向虚拟目录（如 /网盘 → /Download）的
    getattr 直接 lstat 解析后的真实目标并报告真实 ino，故此处逐条目镜像

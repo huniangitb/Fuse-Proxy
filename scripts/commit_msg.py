@@ -32,7 +32,7 @@ HEADER_MAX = 72
 LINE_MAX = 72
 
 # 仓库外的本机材料：读者解析不了，等于噪声
-LOCAL_REFS = (".workbuddy-ai", "review-findings-", "review-todo-", ".zcode", "会话记忆")
+LOCAL_REFS = (".workbuddy-ai", "review-findings-", "review-todo-", ".zcode", "reports/", "会话记忆")
 # git 自己生成的提交信息不校验
 SKIP_PREFIXES = ("Merge ", 'Revert "', "fixup!", "squash!")
 

@@ -126,7 +126,11 @@ case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>
 要强保证需改用 v2/v3（开机早期替换全局视图），或把 v1 补挂载移到 Zygisk `postAppSpecialize`
 并同步等待。
 
-### 修复后：两段式补挂载（`pre` 回 DEFER → `post` 发 POST）
+### 修复后：两段式补挂载（2026-10-24 历史验收，proto<3）
+
+> 以下为 proto<3 旧模块两段式的实测记录；当前 `NSP_ZYGISK_PROTO=4`，默认
+> `ZYGISK_POST_WAIT_MS=0`、post 不回连，见 `docs/architecture.md` §5.3。保留
+> 99/99 与 ~0.6–1s 代价，用于说明为何改成不等待。
 
 v1 的补挂载已从 injector 的异步重试队列搬到 Zygisk：`preAppSpecialize` 收到 `DEFER` 时
 模块保留 companion 连接，在 `postAppSpecialize`（仍早于应用 Java 代码）发 `POST`，injector
@@ -171,19 +175,20 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
   「就绪前侧漏」默认只告警（`--strict-race` 计失败）。
 - 安全：生产配置 sha256 前后一致；生产 injector 已恢复；屏幕常亮设置已还原。
 
-## 本次验收结果（2026-10-24，OPD2404 / Android 16 / KernelSU）
+## 本次验收结果（2026-10-24，proto<3 历史记录；OPD2404 / Android 16 / KernelSU）
 
-- `python3 device-verify/host/run-verify.py --serial 64a4bad0 --skip-build` → **99/99 通过，退出码 0**
+- `python3 device-verify/host/run-verify.py --serial <设备序列号> --skip-build` → **99/99 通过，退出码 0**
   （57 项功能 + 12 项 open-unlink + 30 项竞态；竞态侧漏为告警，见上节实测表）。
-- 两段式补挂载后探针在应用 Java 代码前即就绪（unlink 探针实测 ready=22ms），不再依赖 1s 重试队列。
+- 当时两段式补挂载后探针在应用 Java 代码前即就绪（unlink 探针实测 ready=22ms），不再依赖 1s 重试队列；当前 proto 4 默认不等，见 `docs/architecture.md` §5.3。
 - FTP/SFTP 后端落盘内容一致；真实存储零侧漏。SANDBOX 真实共享目录零写入、沙盒内容正确。
   HIDE 两阶段 ENOENT 且真实夹具仍在；plain 对照正常；生产配置未变、服务已恢复。
 
 ## 已知边界与排障
 
 - **注入时序**：ColorOS/OPD2404 上 vold 在进程启动后 0.6–0.9s 才把 `/storage/emulated` 装配进
-  应用命名空间。两段式补挂载修复后，该窗口内的写入已由 Zygisk 在 `postAppSpecialize` 阻塞
-  等待（实测首写前即就绪）；`nsp.probe.race` 用于持续回归这一点，`--strict-race` 可把
+  应用命名空间。2026-10-24 的 proto<3 历史验收里，该窗口由 Zygisk 在 `postAppSpecialize`
+  阻塞等待覆盖（实测首写前即就绪，代价 ~0.6–1s）；当前 proto 4 默认不等，改由 injector
+  后台盯梢与有界重试收敛。`nsp.probe.race` 用于持续回归这一点，`--strict-race` 可把
   「就绪前侧漏」计为失败。
 - **屏幕休眠会冻结探针进程**：实测 `mWakefulness=Asleep` 时探针进程 `isFrozen=true`，
   `onCreate` 停在中途既不报错也不继续（现象：只有 `start` 行、之后 25s 无输出）。

@@ -1,8 +1,9 @@
 #!/system/bin/sh
 # B1 真机取证：backing 直通与 MONITOR / 热重载不闭合
 # ============================================================
-# 背景：GNU 侧已修（提交 e865b47，backing 仲裁门补 MONITOR 维度），但「已挂接
-# dentry 对运行期新增规则不感知」只能真机判定。见 review-todo-20261007.md §二 B1。
+# 背景：GNU 侧已修（backing 仲裁门补 MONITOR 维度，判别见
+# tests/test_backing_gate.py），但「已挂接 dentry 对运行期新增规则不感知」
+# 只能真机判定；下面 A/B 两项给出取证方法与判别标准，不依赖本机评审记录。
 #
 # 三项取证（全部落在 SAFE_ROOT scratch：假 backing + scratch 挂载点，生产
 # backing/路径永不进测试挂载；经 adb-safe harness 守卫，rm/umount/kill 默认过检）：

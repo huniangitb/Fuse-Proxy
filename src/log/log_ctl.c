@@ -1120,7 +1120,7 @@ static void handle_list_injected(bool api_mode) {
     }
     /* 循环读到 EOF + 动态增长：注入应用可达数百，固定 8192 的单次 read 会截断
        末尾 APP 行与 DONE 行，DONE 解析失败即"共计 0 个"误报（injector 侧
-       781fc94 已改为动态缓冲，此处是同一问题的接收端）；且 SOCK_STREAM 上
+       注入侧已改为动态缓冲，此处是同一问题的接收端）；且 SOCK_STREAM 上
        单次 read 本身不保证读全，内核可分段投递——与本文件其它 IPC 读取同范式 */
     size_t cap = 65536;
     char* resp = malloc(cap);

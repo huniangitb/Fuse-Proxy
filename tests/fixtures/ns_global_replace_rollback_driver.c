@@ -10,7 +10,7 @@
  * (source,target) 的那次 bind 失败。代码路径全走真实实现，只有内核裁决被替换成
  * 可控返回值 —— 不依赖命名空间、FUSE、特权与调度运气。
  *
- * 缺陷形态（review-findings §A19）：替换步骤先卸族根全部挂载再 bind fuse_src，
+ * 缺陷形态（历史审计项 A19）：替换步骤先卸族根全部挂载再 bind fuse_src，
  * 旧实现任一步失败直接 `return -1` —— 族根停在**裸挂载点**（/mnt/{user,
  * androidwritable,installer}/… 下系统存储视图整体消失），而备份树就在手边却
  * 不 bind 回去。新实现把本次已动过的族根逐一根从备份树还原。

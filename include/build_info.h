@@ -43,7 +43,7 @@
 
 const char* nsp_git_hash(void);
 
-/* 构建头行：[0..n)，每行如 "build: git=2d1f49c version=1.0.0 ..."（不带
+/* 构建头行：[0..n)，每行如 "build: git=<short> version=1.0.0 ..."（不带
  * [proc] 前缀：LOG() 路径由帧协议自动加，直推 log_monitor 的调用方自行拼）。
  * proc 参数保留供未来扩展，当前实现忽略。返回写入行数（0 表示非法）。 */
 int nsp_collect_build_headers(const char* proc, char out[][NSP_BUILD_LINE_MAX],

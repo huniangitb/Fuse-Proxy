@@ -179,7 +179,7 @@ def test_basic_operations():
 # ═══════════════════════════════════════════════════════
 # 模块 1.5：inode 非零一致性（use_ino=1 下 0 会原样进内核）
 # 回归：后端/合成路径曾回 st_ino=0（libfuse 报 node 0 not found 后 SIGABRT，
-# 见 f7169be）；合成条目 d_ino 曾用裸名哈希，与 getattr 全路径哈希不一致。
+# 历史回归同项）；合成条目 d_ino 曾用裸名哈希，与 getattr 全路径哈希不一致。
 # ═══════════════════════════════════════════════════════
 def test_inode_nonzero():
     log("\n━━━ 模块1.5: inode 非零一致性 ━━━")
@@ -492,7 +492,7 @@ RMDIR_DIR = "0/网盘/rmdir_sem"
 def test_rmdir_nonempty_semantics():
     """rmdir 非空目录必须返回 ENOTEMPTY，且**不得**递归删除子树（POSIX）。
 
-    旧实现（51abd2c 引入）在 ENOTEMPTY 时静默递归删掉整个子树，等于 rmdir
+    旧实现（修复前版本）在 ENOTEMPTY 时静默递归删掉整个子树，等于 rmdir
     变成 rm -r：依赖 rmdir 失败的调用方（rmdir(1)、清理逻辑、探测空目录）
     会误以为目录已空，并连带丢失全部内容。同一函数的虚拟路径分支本就返回
     ENOTEMPTY，两条分支语义不一致。本用例在旧实现上必失败
@@ -891,7 +891,7 @@ def test_open_unlink_no_hidden():
 def test_open_unlink_recreate_no_hidden():
     """打开中删除 + 同名重建：真实目标目录在操作瞬间与关闭后都不得出现隐藏名。
 
-    判别性：旧实现（libfuse 默认 hide 语义，6367d2d 之前）在「文件仍打开时
+    判别性：旧实现（libfuse 默认 hide 语义，修复前版本）在「文件仍打开时
     unlink」会把名字改成 .fuse_hidden<16hex> 等 RELEASE 再删，于是真实目录
     出现「本体 + 一个 .fusexx」；新实现（vfs_rename 识别隐藏名后直删源文件）
     在 unlink 瞬间真实目录就没有隐藏名。末尾再验证「旧版本/下层 FUSE 遗留的
