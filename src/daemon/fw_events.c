@@ -295,6 +295,10 @@ static int g_ring_tail = 0;
 static int g_ring_count = 0;
 static uint32_t g_ring_dropped = 0;      /* 累计丢弃（进程生命周期内） */
 static uint32_t g_ping_last_dropped = 0; /* 上次心跳时的累计值 */
+/* 超长路径丢弃：入队时 fuse_path 装不下就整条不发。截断后的路径仍能解析出
+   sub/vpath/spath，但对端拿去扫描的是**另一个**路径（漏原文件、还查错文件），
+   所以宁可丢这条并计入 dropped——它和环满一样是"订阅者漏了事件"。 */
+static _Atomic uint32_t g_ev_oversize_dropped = 0;
 static pthread_mutex_t g_ring_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void fw_ring_push(const FwEventRec* rec) {
@@ -389,6 +393,17 @@ static int fw_exists_lookup(const char* fuse_path, const char* real_path) {
     return ex;
 }
 
+/* 路径整串入缓存；放不下返回 false（调用方丢事件并计数）。
+   不用 snprintf 的静默截断：FUSE 视角 /0/Pictures/<244B>.jpg 截成 255 字节后，
+   后缀已经变成 .jp，派生出的 spath 指向一个不存在或别的文件。 */
+static bool fw_copy_path(char* dst, size_t cap, const char* src) {
+    if (!dst || cap == 0 || !src) return false;
+    size_t n = strlen(src);
+    if (n == 0 || n >= cap) return false;
+    memcpy(dst, src, n + 1);
+    return true;
+}
+
 /* ================== 埋点（IO 热路径） ================== */
 
 void fw_events_note_write_done(uid_t uid, pid_t pid, const char* fuse_path, FwEventOp op,
@@ -407,8 +422,14 @@ void fw_events_note_write_done(uid_t uid, pid_t pid, const char* fuse_path, FwEv
     rec.ts = fw_wall_ms();
     rec.uid = uid;
     rec.pid = pid;
-    snprintf(rec.fuse_path, sizeof rec.fuse_path, "%s", fuse_path);
-    if (src_fuse) snprintf(rec.src_fuse, sizeof rec.src_fuse, "%s", src_fuse);
+    if (!fw_copy_path(rec.fuse_path, sizeof rec.fuse_path, fuse_path)) {
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
+        return;
+    }
+    if (src_fuse && !fw_copy_path(rec.src_fuse, sizeof rec.src_fuse, src_fuse)) {
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
+        return;
+    }
     fw_ring_push(&rec);
     fw_ring_wake();
 }
@@ -442,7 +463,10 @@ void fw_events_note_write_denied(uid_t uid, pid_t pid, const char* fuse_path, Ns
     rec.ts = fw_wall_ms();
     rec.uid = uid;
     rec.pid = pid;
-    snprintf(rec.fuse_path, sizeof rec.fuse_path, "%s", fuse_path);
+    if (!fw_copy_path(rec.fuse_path, sizeof rec.fuse_path, fuse_path)) {
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
+        return;
+    }
     fw_ring_push(&rec);
     fw_ring_wake();
 }
@@ -540,8 +564,16 @@ static void fw_emit(const FwEventRec* rec) {
     ev.uid = rec->uid;
     ev.err = rec->err;
     fw_pkg_resolve(rec->uid, rec->pid, ev.pkg, sizeof ev.pkg);
-    snprintf(ev.vpath, sizeof ev.vpath, "%s", sub);
+    if (!fw_copy_path(ev.vpath, sizeof ev.vpath, sub)) {
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
+        return;
+    }
     common_view_path(user_id, sub, ev.spath, sizeof ev.spath);
+    if (ev.spath[0] == '\0') {
+        /* 视图路径放不下时 common_view_path 清空输出（失败闭合）——没有可信 spath 就不发 */
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
+        return;
+    }
     if (rec->kind == FW_EV_WRITE_DONE) {
         fw_resolve_real(rec->uid, rec->pid, rec->fuse_path, ev.rpath, sizeof ev.rpath);
         if (rec->src_fuse[0]) {
@@ -549,14 +581,21 @@ static void fw_emit(const FwEventRec* rec) {
             const char* src_sub = NULL;
             if (common_parse_user_layer(rec->src_fuse, &src_user, &src_sub) == 1 && src_user >= 0 &&
                 src_sub) {
-                snprintf(ev.src_vpath, sizeof ev.src_vpath, "%s", src_sub);
-                common_view_path(src_user, src_sub, ev.src_spath, sizeof ev.src_spath);
+                /* rename 的源只驱动"清旧行"：它放不下就整对 src_* 都不发，而不是发半个
+                   路径让对端去清错行；目的端事件本身仍然有效 */
+                if (fw_copy_path(ev.src_vpath, sizeof ev.src_vpath, src_sub)) {
+                    common_view_path(src_user, src_sub, ev.src_spath, sizeof ev.src_spath);
+                    if (ev.src_spath[0] == '\0') ev.src_vpath[0] = '\0';
+                }
+                if (!ev.src_vpath[0]) atomic_fetch_add(&g_ev_oversize_dropped, 1);
             }
         }
     }
     char frame[FW_EVENTS_FRAME_MAX];
     size_t n = fw_format_event(&ev, frame, sizeof frame - 2);
     if (n == 0 || n + 1 >= sizeof frame) {
+        /* 帧装不下整条都不发：半截 JSON 会被对端当坏帧丢掉，还占着订阅者队列 */
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
         LOG_DBG("事件帧超长已丢弃 (seq=%llu, path=%s)", (unsigned long long)rec->seq,
                 rec->fuse_path);
         return;
@@ -831,7 +870,9 @@ static void fw_maybe_ping(void) {
     pthread_mutex_lock(&g_ring_mu);
     drop_now = g_ring_dropped;
     pthread_mutex_unlock(&g_ring_mu);
-    uint32_t delta = drop_now - g_ping_last_dropped;
+    /* 超长路径/超长帧的丢弃与环满同口径计入本区间：对订阅者而言都是"你漏了这个事件" */
+    uint32_t oversize = atomic_exchange(&g_ev_oversize_dropped, 0);
+    uint32_t delta = drop_now - g_ping_last_dropped + oversize;
     g_ping_last_dropped = drop_now;
     FwEvent ev;
     memset(&ev, 0, sizeof ev);

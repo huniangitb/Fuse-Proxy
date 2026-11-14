@@ -26,6 +26,11 @@
 #define PUBSUB_SOCKET_NAME CONFIG_BROADCAST_SOCKET
 #define MAX_SUBSCRIBERS    32
 #define MAX_SNAPSHOT_APPS  256
+/* 单条应答/广播的 JSON 字节上限。对端（MPM 的 nsp_bridge.c）用同值判超长，
+   两侧必须一致：小于内核 UNIX DGRAM 的 wmem 默认值（208KiB）留出余量，
+   又大到装得下正常配置。超限不截断——截断的 JSON 对端解析失败会退回旧值，
+   但"发出去一半"在 SOCK_DGRAM 下还可能被对端当完整帧读到，所以宁可显式拒发。 */
+#define CONFIG_REPLY_MAX   (192 * 1024)
 struct Subscriber {
     struct sockaddr_un addr;
     socklen_t addr_len;
@@ -288,6 +293,10 @@ static int cfgpub_emit(void* ctx, const void* data, size_t len) {
     if (p[0] != 'J') return 0;
     const char* json = (const char*)(p + 1);
     size_t jlen = len - 1;
+    if (jlen > CONFIG_REPLY_MAX) {
+        LOG_WRN("配置广播 %zu 字节超过单帧上限 %d，本次不投递", jlen, CONFIG_REPLY_MAX);
+        return 0;
+    }
     LOG_DBG("配置广播: %d 订阅者, JSON 大小 %zu 字节", g_subscriber_count, jlen);
     for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
         if (!g_subscribers[i].active) continue;
@@ -397,6 +406,31 @@ static void build_static_apps_json(json_object* root) {
     json_object_object_add(root, "apps", apps);
 }
 
+/* 应答统一出口：超限显式拒发（带 size/limit，便于对端区分"配置太大"与
+   "模块没起来"），正常则检查 sendto 返回值——被内核拒收时不能当成功。 */
+static void send_json_reply(int fd, struct sockaddr_un* cli_addr, socklen_t cli_len,
+                           const char* json, size_t len, const char* cmd) {
+    if (!json || len == 0) return;
+    if (len > CONFIG_REPLY_MAX) {
+        LOG_WRN("%s 应答 %zu 字节超过单帧上限 %d，已拒发", cmd, len, CONFIG_REPLY_MAX);
+        json_object* err = json_object_new_object();
+        json_object_object_add(err, "type", json_object_new_string("error"));
+        json_object_object_add(err, "cmd", json_object_new_string(cmd));
+        json_object_object_add(err, "error", json_object_new_string("oversize"));
+        json_object_object_add(err, "size", json_object_new_int64((int64_t)len));
+        json_object_object_add(err, "limit", json_object_new_int64(CONFIG_REPLY_MAX));
+        const char* e = json_object_to_json_string_ext(err, JSON_C_TO_STRING_PLAIN);
+        if (e)
+            sendto(fd, e, strlen(e), MSG_NOSIGNAL | MSG_DONTWAIT, (struct sockaddr*)cli_addr, cli_len);
+        json_object_put(err);
+        return;
+    }
+    ssize_t sent = sendto(fd, json, len, MSG_NOSIGNAL | MSG_DONTWAIT,
+                          (struct sockaddr*)cli_addr, cli_len);
+    if (sent < 0 || (size_t)sent != len)
+        LOG_WRN("%s 应答发送不完整: %zd/%zu (%s)", cmd, sent, len,
+                sent < 0 ? strerror(errno) : "部分写入");
+}
 static void handle_static_request(int sock_fd, struct sockaddr_un* cli_addr, socklen_t cli_len) {
     json_object* root = json_object_new_object();
     json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
@@ -449,15 +483,30 @@ static void handle_static_request(int sock_fd, struct sockaddr_un* cli_addr, soc
 
     const char* json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN |
                                                                     JSON_C_TO_STRING_NOSLASHESCAPE);
-    sendto(sock_fd, json_str, strlen(json_str), MSG_NOSIGNAL | MSG_DONTWAIT,
-           (struct sockaddr*)cli_addr, cli_len);
+    send_json_reply(sock_fd, cli_addr, cli_len, json_str, json_str ? strlen(json_str) : 0, "static");
+    json_object_put(root);
+}
+/* 只回 global+apps 的轻量快照：规则文件内容（app_rules）是 STATIC 里最大的
+   一块，订阅方每次冷启动都要它只会把响应顶到帧上限。老模块不认这条命令，
+   对端会回退 STATIC。 */
+static void handle_switches_request(int sock_fd, struct sockaddr_un* cli_addr, socklen_t cli_len) {
+    json_object* root = json_object_new_object();
+    json_object_object_add(root, "timestamp", json_object_new_int64(time(NULL)));
+    json_object_object_add(root, "type", json_object_new_string("switches"));
+    config_lock_read();
+    build_static_global_json(root);
+    build_static_apps_json(root);
+    config_unlock_read();
+    const char* json_str = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN |
+                                                                    JSON_C_TO_STRING_NOSLASHESCAPE);
+    send_json_reply(sock_fd, cli_addr, cli_len, json_str, json_str ? strlen(json_str) : 0, "switches");
     json_object_put(root);
 }
 static void handle_get_request(int sock_fd, struct sockaddr_un* cli_addr, socklen_t cli_len) {
     int len;
     char* json = build_config_json_payload(&len);
     if (!json) return;
-    sendto(sock_fd, json, len, MSG_NOSIGNAL | MSG_DONTWAIT, (struct sockaddr*)cli_addr, cli_len);
+    send_json_reply(sock_fd, cli_addr, cli_len, json, (size_t)len, "get");
     free(json);
 }
 /* 订阅注册经 comm 线程（集合归 comm 所有，去重在 sub_add 内幂等）；
@@ -498,6 +547,8 @@ void config_publisher_handle_readable(int fd) {
         handle_get_request(fd, &cli_addr.un, cli_len);
     } else if (strcmp(buf, "STATIC") == 0 || strcmp(buf, "static") == 0) {
         handle_static_request(fd, &cli_addr.un, cli_len);
+    } else if (strcmp(buf, "SWITCHES") == 0 || strcmp(buf, "switches") == 0) {
+        handle_switches_request(fd, &cli_addr.un, cli_len);
     } else if (strcmp(buf, "SUBSCRIBE") == 0 || strcmp(buf, "subscribe") == 0) {
         handle_subscribe(fd, &cli_addr.un, cli_len);
     } else if (strcmp(buf, "UNSUBSCRIBE") == 0 || strcmp(buf, "unsubscribe") == 0) {
