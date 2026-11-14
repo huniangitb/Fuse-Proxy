@@ -13,13 +13,19 @@
 /* 后端句柄 fh 布局（open 时绑定，read/write 免路径解析直接定位模块 ops）：
    - bit40：后端句柄标志（沿用）
    - bit41-50：模块槽位（V5 注册表动态化，上限 1024，10 位）
+   - bit51：写意图（open/create 按调用方 flags 记下，FLUSH/FSYNC 读回，见下）
    - bit0-39：后端句柄 ID（模块分配的小整数）
    低 40 位掩码用于提取句柄 ID（不含标志与槽位）。
-   bit51-55 空闲；bit56-63 禁用（Android tagged-pointer 检测，见上）。 */
+   bit56-63 禁用（Android tagged-pointer 检测，见上）。 */
 #define NSP_FH_BACKEND_SLOT_SHIFT 41
 #define NSP_FH_BACKEND_SLOT_MASK  (0x3FFULL << NSP_FH_BACKEND_SLOT_SHIFT)
 #define NSP_FH_BACKEND_SLOT_MAX   1024
 #define NSP_FH_HANDLE_MASK        ((1ULL << 40) - 1)
+/* 写意图位：open/create 时按调用方 flags 记录在这个句柄上，FLUSH/FSYNC 读回。
+   FUSE 的 FLUSH/FSYNC 请求不带 open 标志，libfuse 把 fi->flags 填 0——在回调里
+   重算 (fi->flags & O_ACCMODE) != O_RDONLY 恒为"只读"，后端写收尾据此判定的
+   媒体刷新事件因此一条都发不出。句柄是唯一能跨回调带着这个事实的地方。 */
+#define NSP_FH_WRITE_INTENT_FLAG (1ULL << 51)
 #include <fuse3/fuse.h>
 #include <fuse3/fuse_lowlevel.h>
 #include <stdio.h>
@@ -1686,6 +1692,7 @@ static int vfs_open(const char* path, struct fuse_file_info* fi) {
                与线性扫描（模块卸载时快照置空→快速失败，不悬垂） */
             fi->fh =
                 h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & (NSP_FH_BACKEND_SLOT_MAX - 1)) << NSP_FH_BACKEND_SLOT_SHIFT);
+            if ((fi->flags & O_ACCMODE) != O_RDONLY) fi->fh |= NSP_FH_WRITE_INTENT_FLAG;
             fi->direct_io = 1;
             FTP_DBG("vfs_open: 后端命中 sub=%s fh=%llu slot=%d flags=%o direct_io=1\n", sub_path,
                     (unsigned long long)fi->fh, bslot, fi->flags);
@@ -1743,6 +1750,7 @@ static int vfs_create(const char* path, mode_t mode, struct fuse_file_info* fi) 
                 VFS_RETURN(drc);
             fi->fh =
                 h | NSP_FH_BACKEND_FLAG | ((uint64_t)(bslot & (NSP_FH_BACKEND_SLOT_MAX - 1)) << NSP_FH_BACKEND_SLOT_SHIFT);
+            if ((fi->flags & O_ACCMODE) != O_RDONLY) fi->fh |= NSP_FH_WRITE_INTENT_FLAG;
             VFS_RETURN(0);
         }
     }
@@ -2074,7 +2082,7 @@ static int vfs_fsync(const char* path, int datasync, struct fuse_file_info* fi) 
     if (fi->fh & NSP_FH_BACKEND_FLAG) {
         int slot = (int)((fi->fh & NSP_FH_BACKEND_SLOT_MASK) >> NSP_FH_BACKEND_SLOT_SHIFT);
         return vfs_backend_finish_data(slot, fi->fh, path,
-                                       (fi->flags & O_ACCMODE) != O_RDONLY);
+                                       (fi->fh & NSP_FH_WRITE_INTENT_FLAG) != 0);
     }
     if (!fi || fi->fh <= 0) return 0;
     int ret = (datasync ? fdatasync(fi->fh) : fsync(fi->fh));
@@ -2129,13 +2137,12 @@ static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path, bool
         module_guard_error(slot, "backend_flush", rc, path, "flush 返回异常");
     if (rc == 0) {
         struct fuse_context* ctx = fuse_get_context();
-        if (ctx) vfs_inval_path(ctx->fuse, path);
+        const bool writable = write_intent && ctx && ctx->pid != 0;
         /* 写意图句柄的数据收尾 = 后端侧的文件已经"落地"（FTP 上传完成）。此刻补一条
            媒体刷新请求：后端内容不产生本地 write 事件，扫描侧没有别的时机会知道这个
            路径刚长出媒体文件。只在有活订阅者时发布（见 fw_events_note_media_refresh）。 */
-        if (write_intent && ctx && ctx->pid != 0) {
-            fw_events_note_media_refresh(ctx->uid, ctx->pid, path, FW_REFRESH_FTP_UPLOAD);
-        }
+        if (ctx) vfs_inval_path(ctx->fuse, path);
+        if (writable) fw_events_note_media_refresh(ctx->uid, ctx->pid, path, FW_REFRESH_FTP_UPLOAD);
     }
     return rc < 0 ? rc : 0;
 }
@@ -2150,7 +2157,7 @@ static int vfs_flush(const char* path, struct fuse_file_info* fi) {
     if (fi->fh & NSP_FH_BACKEND_FLAG) {
         int slot = (int)((fi->fh & NSP_FH_BACKEND_SLOT_MASK) >> NSP_FH_BACKEND_SLOT_SHIFT);
         return vfs_backend_finish_data(slot, fi->fh, path,
-                                       (fi->flags & O_ACCMODE) != O_RDONLY);
+                                       (fi->fh & NSP_FH_WRITE_INTENT_FLAG) != 0);
     }
     /* 非后端文件：仅写模式 open 才在 close 时同步落盘（只读 open 无需
        写回，避免每次 close 无条件 fsync 的热路径吞吐回归）；fsync 失败

@@ -402,9 +402,55 @@ def check_finish_data_contract():
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def check_write_intent_handle():
+    """L0 静态契约：写意图必须记在句柄上，不能在 FLUSH/FSYNC 里重算。
+
+    FUSE 的 FLUSH/FSYNC 请求不带 open 标志，libfuse 把 fi->flags 填 0。旧实现
+    在这两个回调里算 (fi->flags & O_ACCMODE) != O_RDONLY，后端写句柄的收尾因此
+    恒按只读处理：数据照样交给 backend_flush，但"这个落点刚长出媒体文件"的刷新
+    请求一条都发不出（真机插桩原文 flags=0 wi=0）。端到端行为回归见 test_ftp.py
+    的物化一节。
+    """
+    print("\n── 0b. L0 静态契约：写意图随句柄走（FLUSH/FSYNC 不带 open 标志）──")
+    src_path = os.environ.get("FUSE_DAEMON_SRC") or str(ROOT / "src/daemon/fuse_daemon.c")
+    try:
+        src_text = Path(src_path).read_text()
+    except OSError as e:
+        fail("读写意图契约源码", f"{src_path}: {e}")
+        return
+    bodies = {}
+    for name in ("vfs_open", "vfs_create", "vfs_flush", "vfs_fsync"):
+        fn = _extract_one_function(src_text, name)
+        if fn:
+            bodies[name] = fn
+        else:
+            fail(f"抽取 {name}", f"{src_path} 中未找到定义")
+    if len(bodies) != 4:
+        return
+    for name in ("vfs_open", "vfs_create"):
+        if "|= NSP_FH_WRITE_INTENT_FLAG" in bodies[name]:
+            ok(f"{name}：按调用方 flags 记录写意图")
+        else:
+            fail(f"{name} 未记录写意图", "后端句柄置位里没有 NSP_FH_WRITE_INTENT_FLAG")
+    for name in ("vfs_flush", "vfs_fsync"):
+        body = bodies[name]
+        i = body.find("vfs_backend_finish_data(")
+        if i < 0:
+            fail(f"{name} 收尾调用", "未见 vfs_backend_finish_data 调用")
+            continue
+        seg = body[i:body.find(");", i) + 2]
+        if "O_ACCMODE" in seg:
+            fail(f"{name} 收尾写意图", f"仍从 fi->flags 重算（FLUSH/FSYNC 恒为 0）：{seg[:80]!r}")
+        elif "NSP_FH_WRITE_INTENT_FLAG" not in seg:
+            fail(f"{name} 收尾写意图", f"实参既不是句柄位也不是表达清楚的组合：{seg[:80]!r}")
+        else:
+            ok(f"{name}：收尾写意图取自句柄")
+
+
 def main():
     global PASS, FAIL
     check_finish_data_contract()
+    check_write_intent_handle()
     setup()
     build_modules()
 
