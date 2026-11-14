@@ -780,8 +780,8 @@ void handle_ipc_client_readable(int client_fd) {
         if (uid >= NSP_SYSTEM_APP_UID_MIN) update_uid_map(uid, clean_pkg);
         /* 全量应用注册（配置热对账的候选来源）：被动模式停掉了周期扫描，
            这里是「运行中应用」唯一的登记入口——不登记就无法回答「这个应用
-           已经在跑、配置现在把它变成目标了，挂给谁」，只能等应用重启（正是
-           用户报障的现场）。裸 clean_pkg 即可：对账时会重新读 /proc cmdline。 */
+           已经在跑、配置现在把它变成目标了，挂给谁」，只能等应用重启。裸
+           clean_pkg 即可：对账时会重新读 /proc cmdline。 */
         all_apps_upsert(pid, uid, clean_pkg);
 
         /* ACK 的语义是"目标进程的存储视图已就绪，可以继续 specialize"。

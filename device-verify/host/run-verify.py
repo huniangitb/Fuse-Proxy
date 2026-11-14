@@ -941,7 +941,7 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
         checker.check("unlink 探针 %s 成功" % step, step_ok(phase_a, "unlink", step))
     exists, size = device_file(adb, REAL_ROOT + "/nsp_verify/unlink/nsp_probe_unlink.txt")
     checker.check("unlink 删除后真实文件不存在", not exists, "exists=%s size=%s" % (exists, size))
-    # 历史残留夹具：按用户要求不做列举过滤——物理上存在、且必须看得见（可取证），
+    # 历史残留夹具：不做列举过滤——物理上存在、且必须看得见（可取证），
     # 同时不得被自动清理；残留判定只看「新增」
     # 用 shell 的 test -e（经 FUSE 的 getattr）而不是 check-file：后者走 adb-sh
     # 的文本预检，路径里的 "hidden" 含 "dd" 会被误判成变更动词。

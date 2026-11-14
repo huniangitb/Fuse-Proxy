@@ -404,7 +404,7 @@ public final class ProbeApp extends Application {
         steps++;
         emit("exists_closed", !file.exists(), "exists=" + file.exists());
         steps++;
-        // 预置的历史残留夹具：按用户要求不再做列举过滤，必须可见、可取证，
+        // 预置的历史残留夹具：不做列举过滤，必须可见、可取证，
         // 且不得被本层自动清理（清理会抬高取证难度）。
         boolean legacyExists = new File(dir, LEGACY_HIDDEN_NAME).exists();
         boolean legacyListed = countHidden(dir, true) > 0;

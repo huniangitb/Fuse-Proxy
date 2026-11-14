@@ -186,7 +186,7 @@ FUSE 回调（如 getattr）
 
 ### 4.4 跨应用隔离
 
-`br_is_other_app_pkg` 判定调用方访问 `/Android/data|obb/<他包>/`。范围只有这两棵子树（`media`/`obj` 历史上不隔离，扩范围会改变既有行为）。隔离与 `HIDE` **同口径**：判定落在 `br_sanitize_and_check_hidden()` 单一出口上，`resolve`（getattr/open）与 `probe`（readdir 条目过滤）共用它，故「看不见 = 打不开」。旧实现只在 probe 侧过滤，任何按名打开的命令都能读到内容（用户报障：特殊命令绕过；当时只能靠 `HIDE Android` + 逐包 `ALLOW` 临时兜住），修复时把判定上移到该出口，probe 各路径仍显式叠加同一判据（快路径不经过 sanitize）。
+`br_is_other_app_pkg` 判定调用方访问 `/Android/data|obb/<他包>/`。范围只有这两棵子树（`media`/`obj` 历史上不隔离，扩范围会改变既有行为）。隔离与 `HIDE` **同口径**：判定落在 `br_sanitize_and_check_hidden()` 单一出口上，`resolve`（getattr/open）与 `probe`（readdir 条目过滤）共用它，故「看不见 = 打不开」。旧实现只在 probe 侧过滤，任何按名打开的命令都能读到内容（当时只能靠 `HIDE Android` + 逐包 `ALLOW` 临时兜住）。判定现已上移到该出口，probe 各路径仍显式叠加同一判据（快路径不经过 sanitize）。
 
 放行链（顺序即优先级）：目标目录名等于调用方**基础包名**（`com.x:push` 与 `com.x` 同包，`br_pkg_same_base`）时放行；调用方包名不可解析（`system`/`unknown`，即 root 与系统工具）不隔离；`[GLOBAL] ALLOW_CROSS_APP_DATA ON` 全局关闭隔离（默认 OFF = 生效）；**该路径上有显式声明**（`ALLOW`/`HIDE`/`RO`/`REDIRECT` 任一作用域，`br_decl_present`）时隔离让位，交规则层自己裁决——隔离是「没有规则时的默认边界」，不是压过用户配置的硬墙；调用方命中白名单（`[GLOBAL] ALLOW_CROSS_APP_PKGS`，按调用方自身包名，不做 uid 兜底）、platform 签名、或能力档（`fw_rules_cross_app_access`，见下节）即放行。
 

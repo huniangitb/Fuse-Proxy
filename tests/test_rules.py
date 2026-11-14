@@ -96,7 +96,7 @@ def run(conf,checks,label=""):
 # ═══════ 跨应用隔离（直编真源码的驱动段） ═══════
 # 旧实现只在 probe（readdir 条目过滤）判跨应用隔离，resolve（getattr/open）
 # 放过——于是任何"按名打开"的命令都能读到 /Android/data/<他包>/ 的内容
-# （用户报障：特殊命令可访问他包 Android/data）。本段把真实 fw_rules.c 直编
+# （特殊命令能读到 /Android/data/<他包>/ 就是这条缺口）。本段把真实 fw_rules.c 直编
 # 成驱动（同 test_backing_gate 配方，不发 FUSE），用 uid.map 夹具把 10123
 # 映射成 com.demo.app，逐路径比对 resolve/probe/backing 三项裁决——因为宿主机
 # 调用者 uid=1000（fw_pkg 对 uid<10000 一律返回 system）无法在真 FUSE 上
@@ -482,7 +482,7 @@ def isolation_section():
     case("存储别名:字面 /mnt/sdcard 规则", BASE +
          "HIDE /mnt/sdcard/Android/data/com.demo.app/files\n",
          10123, [(VP, {"resolve":1,"probe":1})], uid_map=own)
-    # ── 作用域优先 / 沙盒作用域（用户报障 A/B 的回归）：
+    # ── 作用域优先 / 沙盒作用域（下面 A/B 两个形态的回归）：
     #   A「[GLOBAL] SANDBOX ON + ALLOW /Pictures/… 后，应用段再写 SANDBOX ON 仍不沙盒」
     #   B「应用段 HIDE 压不过 [GLOBAL] ALLOW（反过来 ALLOW 压 HIDE 却可以）」
     # 旧实现只有 REDIRECT 做过跨作用域比较：HIDE/RO 是三层并集（GLOBAL 恒赢），

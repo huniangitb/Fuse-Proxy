@@ -7,7 +7,7 @@
   fuse_daemon：/0/云盘/xxx → storage/0/云盘/xxx → FTP 服务器（vsftpd 匿名）
 
 覆盖：列目录 / 读现有文件 / 创建写入 / 读回 / mkdir / rename / unlink / rmdir，
-并直接核对 vsftpd 匿名根（/home/bdy/ftp）验证 FTP 服务器实际变化。
+并直接核对 vsftpd 匿名根（默认 ~/ftp，可用 NSP_FTP_ROOT 覆盖）验证 FTP 服务器实际变化。
 V5 分页回归：700 文件大目录一次列全（旧 512 整批上限会静默丢尾）。
 """
 import subprocess, os, sys, time, shutil, errno, ctypes, shlex
@@ -16,7 +16,8 @@ from pathlib import Path
 MNT      = "/tmp/fuse_ftp_test/mnt"
 STORAGE  = "/tmp/fuse_ftp_test/storage"
 FTP_BASE = "/tmp/fuse_ftp_test/storage/0"     # ftp_module --mount-base
-FTP_ROOT = "/home/bdy/ftp"                     # vsftpd anon_root（chroot 根，须对 ftp 用户不可写）
+FTP_ROOT = os.environ.get("NSP_FTP_ROOT") or os.path.join(os.path.expanduser("~"), "ftp")
+                                               # vsftpd anon_root（chroot 根，须对 ftp 用户不可写）
 FTP_UPLOAD = f"{FTP_ROOT}/upload"              # 匿名可写区（777），ftp.conf remote_dir=/upload
 FTP_UPLOAD2 = f"{FTP_ROOT}/upload2"            # 第二个 server 的可写区（A13 跨 server rename）
 MODDIR   = "/tmp/fuse_ftp_test/modules"

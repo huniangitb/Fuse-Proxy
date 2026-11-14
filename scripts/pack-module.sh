@@ -16,11 +16,11 @@
 #   scripts/pack-module.sh -m <模块目录> -b <构建目录> -o <输出zip>
 #
 # 选项：
-#   -m, --module-dir <dir>   模块骨架目录（含 bin/ conf/ zygisk/ 等，默认 /home/bdy/nsp_module）
+#   -m, --module-dir <dir>   模块骨架目录（含 bin/ conf/ zygisk/ 等，默认 $HOME/nsp_module）
 #   -b, --build-dir <dir>    Android 交叉构建目录（默认 $REPO/build_android）
 #   -r, --rules-dir <dir>    模块 .rules 注册文件源目录（默认 $REPO/src/modules）
 #   -c, --conf-dir <dir>     conf 配置源目录（默认 $REPO/conf）
-#   -o, --out <file>         输出 zip 路径（默认 /home/bdy/ftp/upload/Namespace-Proxy-<git校验码>.zip）
+#   -o, --out <file>         输出 zip 路径（默认 $HOME/ftp/upload/Namespace-Proxy-<git校验码>.zip）
 #   -v, --version <str>      版本号（仅发布模式生效，默认 2.0；非发布模式
 #                            version 一律写当前仓库提交哈希，-v 被忽略）
 #   -s, --symbols-dir <dir>  unstripped 符号构建目录（默认 $REPO/build_android_sym；
@@ -54,7 +54,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---- 默认参数 ----
-MODULE_DIR="${MODULE_DIR:-/home/bdy/nsp_module}"
+MODULE_DIR="${MODULE_DIR:-$HOME/nsp_module}"
 BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build_android}"
 RULES_DIR="${RULES_DIR:-$REPO_DIR/src/modules}"
 CONF_DIR_SRC="${CONF_DIR_SRC:-$REPO_DIR/conf}"
@@ -99,9 +99,9 @@ fi
 #   默认（非发布）：Namespace-Proxy-<git 提交校验码>.zip（git rev-parse --short HEAD）
 if [[ -z "$OUT_ZIP" ]]; then
     if [[ "$RELEASE_MODE" == "1" ]]; then
-        OUT_ZIP="/home/bdy/ftp/upload/Namespace-Proxy-$MODULE_VERSION.zip"
+        OUT_ZIP="$HOME/ftp/upload/Namespace-Proxy-$MODULE_VERSION.zip"
     else
-        OUT_ZIP="/home/bdy/ftp/upload/Namespace-Proxy-$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown).zip"
+        OUT_ZIP="$HOME/ftp/upload/Namespace-Proxy-$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown).zip"
     fi
 fi
 

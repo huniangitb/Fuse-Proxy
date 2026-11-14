@@ -316,7 +316,7 @@ static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse
        过滤**：本层本地路径已改为直删（vfs_rename 的 open-unlink 分支，不再产生
        新隐藏名），磁盘上出现的残留来自旧版本 daemon 或下层 FUSE（/data/media
        由 MediaProvider 提供时，本层 unlink 会触发下层 libfuse 的 hide 语义）。
-       按用户要求按普通条目可见、可 getattr/open——保留取证与手工回收能力，
+       按普通条目可见、可 getattr/open——保留取证与手工回收能力，
        既不做列举过滤，也不在列举时就地删除。 */
     char norm_base[2048], norm_fuse_base[2048];
     /* base 先剥尾部 '/'（与 getattr/child_ino 同一合成语义）：非规范 sub_path

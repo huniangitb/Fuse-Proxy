@@ -10,7 +10,7 @@
 #   - --net    私有 netns：抽象 Unix 套接字（nsp_log_socket）随之隔离，
 #              测试对 log_monitor 的启停不再波及宿主实例
 #   - 私有 /var：绑定 stage 副本，/var/fuse-proxy 的配置与日志不落宿主
-#   - 私有 FTP 树：绑定 stage 里的**最小合成树**（见下），不碰用户的 /home/bdy/ftp
+#   - 私有 FTP 树：绑定 stage 里的**最小合成树**（见下），不碰用户的 ~/ftp
 #   - 私有 vsftpd：--net 之后宿主 21 口不可达，故在沙箱内起一份
 #
 # 三个实测坑（都已在此脚本内修掉，改动前请先看这里）：
@@ -22,7 +22,7 @@
 #   2. vsftpd 需要 secure_chroot_dir，且**守护化后错误只进 syslog**（stderr 恒空）。
 #      私有 /var 里没有 /var/run/vsftpd/empty，子进程连上即挂——现象是"端口在听但
 #      curl rc=8"，极易误判成网络问题。故显式指定到 stage 下。
-#   3. FTP 树**不能整树复制**：/home/bdy/ftp 有 4.7G（upload 2.6G），每轮复制既慢
+#   3. FTP 树**不能整树复制**：~/ftp 有 4.7G（upload 2.6G），每轮复制既慢
 #      又占盘。测试只要求 anon chroot 根不可写、upload/upload2 可写，且自建全部
 #      数据（test_ftp 的"读现有文件"是自己先写再读），故用最小合成树。
 #
@@ -40,7 +40,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 export REPO
 
-STAGE=${NSP_ISO_STAGE:-/home/bdy/.nsp-iso-$$}
+STAGE=${NSP_ISO_STAGE:-${HOME:?HOME 未设置}/.nsp-iso-$$}
+FTP_TREE=${NSP_ISO_FTP_TREE:-${HOME:?HOME 未设置}/ftp}
+export NSP_FTP_ROOT="$FTP_TREE"
 SUITES="$*"
 CLIENT_UID=${NSP_ISO_UID:-1000}
 # 显式走绝对路径的 rm：某些宿主 shell 会把 rm 垫成删除守卫（本项目开发机上就有），
@@ -64,8 +66,8 @@ snap() { # $1=输出文件
             echo "(不存在)"
         fi
         echo "### ftp-tree"
-        if [ -d /home/bdy/ftp ]; then
-            (cd /home/bdy/ftp && find . -maxdepth 2 -printf '%p %s\n' 2>/dev/null | sort)
+        if [ -d "$FTP_TREE" ]; then
+            (cd "$FTP_TREE" && find . -maxdepth 2 -printf '%p %s\n' 2>/dev/null | sort)
         else
             echo "(不存在)"
         fi
@@ -102,13 +104,13 @@ mount -t tmpfs -o mode=1777,size=6g tmpfs /tmp || { echo "[iso-inner] 私有 /tm
 
 # 私有 /var 与 FTP 树（必须在起 vsftpd 之前完成绑定）
 mount --bind "$STAGE/var" /var || { echo "[iso-inner] 绑定 /var 失败"; exit 1; }
-mount --bind "$STAGE/ftp" /home/bdy/ftp || { echo "[iso-inner] 绑定 FTP 树失败"; exit 1; }
+mount --bind "$STAGE/ftp" "$FTP_TREE" || { echo "[iso-inner] 绑定 FTP 树失败"; exit 1; }
 
 # 私有 vsftpd（secure_chroot_dir 必须显式给：私有 /var 里没有 /var/run/vsftpd/empty）
-cat > "$STAGE/vsftpd.conf" <<'VSEOF'
+cat > "$STAGE/vsftpd.conf" <<VSEOF
 anonymous_enable=YES
 no_anon_password=YES
-anon_root=/home/bdy/ftp
+anon_root=$FTP_TREE
 local_enable=NO
 background=YES
 write_enable=YES
@@ -140,7 +142,7 @@ fi
 #   2) 仓库 build_gnu/：test_modules / test_module_circuit / test_module_abi 要把现场
 #      编译的测试模块写进去，覆盖宿主属主的同名文件会被拒 → 整目录连同文件一并
 #      chown 给客户端 uid（收尾再归还，见下）
-chown -R "$CLIENT_UID:$CLIENT_UID" /home/bdy/ftp 2>/dev/null
+chown -R "$CLIENT_UID:$CLIENT_UID" "$FTP_TREE" 2>/dev/null
 chown -R "$CLIENT_UID:$CLIENT_UID" "$REPO/build_gnu" 2>/dev/null
 
 # 客户端降权到 uid 1000 并给 ambient CAP_SYS_ADMIN：

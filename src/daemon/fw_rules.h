@@ -138,7 +138,7 @@ typedef struct {
        的唯一数据源。合并视图（下面 hidden/ro）只能回答"有没有"，答不了"是哪一层
        声明的"，而作用域优先要求逐层比较：应用段 HIDE 必须压过 GLOBAL ALLOW，应用段
        ALLOW 也必须压过 GLOBAL HIDE/RO（旧实现把 HIDE/RO 做三层并集，于是 GLOBAL
-       恒赢，用户报障即此）。三组标志同样由 br_trie_resolve 的一次下降填入。 */
+       恒赢）。三组标志同样由 br_trie_resolve 的一次下降填入。 */
     bool hidden_app;
     bool hidden_cat;
     bool hidden_global;
