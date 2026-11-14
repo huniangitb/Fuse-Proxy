@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -165,27 +166,41 @@ static int mode_dead(void) {
     return 0;
 }
 
-/* 切换：子进程 unshare 换命名空间身份，父进程从基线开始等 */
+/* 切换：子进程 unshare 换命名空间身份，父进程从基线开始等。
+   基线必须在放开子进程之前取：若让子进程先报「我起来了」再取基线，负载重时
+   父进程会被推迟几百微秒，基线就落在切换之后——那一轮永远等不到变化，量出来
+   是整个预算（并发跑全量时偶发）。start 管道把顺序钉死：先取基线，后放行。 */
 static int mode_switch(long delay_us, int reps, const char* label) {
     long best = -1, worst = 0, sum = 0;
     int switched_n = 0, unshare_fail = 0, capture_fail = 0, child_gone = 0;
     /* 无效轮（unshare 不可用、子进程自己退出）不计入 reps，重跑一轮补上；
        上限给到 3 倍，环境一直不正常时不会变成死循环。 */
     int done = 0, attempts = 0;
+    long best_lag = -1, worst_lag = 0, sum_lag = 0;
+    /* 子进程记下自己真的换了命名空间的时刻：fork/唤醒/调度都把「切换」推后，
+       那是子进程的事，不该算进「检测得多快」。共享页把零点交给子进程写。 */
+    struct shared_clock {
+        volatile long long t_start;
+        volatile long long t_switched;
+    }* sh = mmap(NULL, sizeof *sh, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (sh == MAP_FAILED) return 1;
     while (done < reps && attempts < reps * 3 + 5) {
         attempts++;
-        int sync_pipe[2];
-        if (pipe(sync_pipe) != 0) return 1;
+        sh->t_start = 0;
+        sh->t_switched = 0;
+        int start_pipe[2];
+        if (pipe(start_pipe) != 0) return 1;
         pid_t child = fork();
         if (child == 0) {
-            close(sync_pipe[0]);
-            char c = 'r';
-            if (write(sync_pipe[1], &c, 1) != 1) _exit(92);
-            close(sync_pipe[1]);
+            close(start_pipe[1]);
+            char c;
+            if (read(start_pipe[0], &c, 1) != 1) _exit(92);
+            close(start_pipe[0]);
             struct timespec step = {.tv_sec = delay_us / 1000000L,
                                     .tv_nsec = (delay_us % 1000000L) * 1000L};
             nanosleep(&step, NULL);
             if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(91);
+            sh->t_switched = now_us();
             /* 屏蔽全部信号再等：pause() 被任何信号打断就会返回，落回父进程那段
                代码里自己退出——等待方于是看到「进程已死」提前收工，量出来的延迟
                变成一次节拍（并发负载下偶发）。SIGKILL 不受屏蔽影响，父进程收尾照旧。 */
@@ -194,23 +209,26 @@ static int mode_switch(long delay_us, int reps, const char* label) {
             sigprocmask(SIG_BLOCK, &all, NULL);
             for (;;) pause();
         }
-        close(sync_pipe[1]);
-        char c;
-        ssize_t rd = read(sync_pipe[0], &c, 1);
-        close(sync_pipe[0]);
-        if (rd != 1) {
-            kill(child, SIGKILL);
-            waitpid(child, NULL, 0);
-            continue;
-        }
+        close(start_pipe[0]);
         dev_t d;
         ino_t i;
         if (!ns_mnt_wait_capture((int)child, &d, &i)) {
             capture_fail++;
             kill(child, SIGKILL);
             waitpid(child, NULL, 0);
+            close(start_pipe[1]);
             continue;
         }
+        /* 基线已在手，这时才放子进程去换命名空间 */
+        sh->t_start = now_us();
+        char c = 'g';
+        if (write(start_pipe[1], &c, 1) != 1) {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+            close(start_pipe[1]);
+            continue;
+        }
+        close(start_pipe[1]);
         bool sw = false;
         long us = ns_mnt_wait_switch((int)child, d, i, 500, &sw);
         int st = 0;
@@ -226,25 +244,34 @@ static int mode_switch(long delay_us, int reps, const char* label) {
             child_gone++;
             continue;
         }
+        long long off = (sh->t_switched > 0 && sh->t_start > 0) ? sh->t_switched - sh->t_start : 0;
+        long lag = (long)(us > off ? us - off : 0);
         if (sw) {
             switched_n++;
             sum += us;
             if (best < 0 || us < best) best = us;
             if (us > worst) worst = us;
+            sum_lag += lag;
+            if (best_lag < 0 || lag < best_lag) best_lag = lag;
+            if (lag > worst_lag) worst_lag = lag;
         }
-        printf("run%d switched=%d waited_us=%ld\n", done, sw ? 1 : 0, us);
+        printf("run%d switched=%d waited_us=%ld lag_us=%ld switch_at_us=%lld\n", done, sw ? 1 : 0, us,
+               lag, off);
         done++;
     }
-    printf("%s switched_n=%d reps=%d best_us=%ld worst_us=%ld avg_us=%ld unshare_fail=%d "
-           "capture_fail=%d child_gone=%d\n",
-           label, switched_n, reps, best, worst, switched_n ? sum / switched_n : -1, unshare_fail,
-           capture_fail, child_gone);
+    printf("%s switched_n=%d reps=%d best_us=%ld worst_us=%ld avg_us=%ld best_lag_us=%ld "
+           "worst_lag_us=%ld avg_lag_us=%ld unshare_fail=%d capture_fail=%d child_gone=%d\n",
+           label, switched_n, reps, best, worst, switched_n ? sum / switched_n : -1, best_lag,
+           worst_lag, switched_n ? sum_lag / switched_n : -1, unshare_fail, capture_fail, child_gone);
+    munmap(sh, sizeof *sh);
     return 0;
 }
 
-/* 一次「挂载表变了」的假事件，并且对齐到某一次 arm 刚开始之后 100µs 投递。
-   于是「投递后隔多久才复核」就成了「醒得早不早」的直接读数：真被事件叫醒是百
-   微秒量级，纯节拍则是 2ms 档本身（fire=0 是对照组，只对齐不投递）。 */
+/* 一次「挂载表变了」的假事件，投递在一次节拍刚开始之后约 100µs。
+   gap_us = 投递时刻 → 下一次 arm 的间隔：真被事件叫醒是百微秒量级（醒来立刻复
+   核、立刻重新 arm），纯节拍则要睡满剩下的节拍（fire=0 是对照组，只对齐不投递）。
+   投递点必须落在这一个节拍里：先跨过一次 arm 边界再睡 100µs，于是投递时刻最多
+   在 arm 开始后 ~400µs，离下一次节拍还远。 */
 struct fire_arg {
     int fire;
     long t_arm;
@@ -258,16 +285,18 @@ static void* fire_thread(void* raw) {
     struct timespec warm = {.tv_sec = 0, .tv_nsec = 20 * 1000L * 1000L};
     nanosleep(&warm, NULL);
     int seen = g_arms;
-    while (g_arms == seen) sched_yield(); /* 对齐到下一次 arm 开始 */
-    long t_arm = g_arm_at[g_arms - 1];
+    long stop = now_us() + 20 * 1000L;
+    while (g_arms == seen && now_us() < stop) sched_yield(); /* 跨过一次 arm 边界 */
+    if (g_arms == seen) return NULL;
     struct timespec into = {.tv_sec = 0, .tv_nsec = 100 * 1000L};
-    nanosleep(&into, NULL); /* 睡进这次 arm 的中间，事件才「早」于节拍 */
+    nanosleep(&into, NULL); /* 睡进这次 arm 里，事件才「早」于下一次节拍 */
+    long t_fire = now_us();
     if (a->fire) fire_event();
     int after = g_arms;
-    long hard_stop = now_us() + 10 * 1000L;
+    long hard_stop = t_fire + 10 * 1000L;
     while (g_arms == after && now_us() < hard_stop) sched_yield();
-    a->t_arm = t_arm;
-    if (g_arms != after) a->gap_us = g_arm_at[g_arms - 1] - t_arm;
+    a->t_arm = t_fire;
+    if (g_arms != after) a->gap_us = g_arm_at[g_arms - 1] - t_fire;
     return NULL;
 }
 

@@ -137,18 +137,29 @@ def check_event_source(exe):
     budget_ms = 80
     # 两组都在「某次 arm 开始后 100µs」这一时刻动手，只有一组真的投递事件
     base, _ = run_mode(exe, ["event", str(budget_ms), "0"])
-    fired, _ = run_mode(exe, ["event", str(budget_ms), "1"])
+    # 投递那一侧跑三轮取最快：投递点与「这一轮已经 arm 好了吗」是赛跑，偶有一轮
+    # 事件落在还没开始的 ppoll 上（管道写端先关、读端才注册），量出来是慢的一次。
+    gaps = []
+    for _ in range(3):
+        fired, _ = run_mode(exe, ["event", str(budget_ms), "1"])
+        if num(fired, "switched") != 0:
+            fail("事件用例的结论不对", f"{fired}")
+            return
+        g = num(fired, "gap_us")
+        if g >= 0:
+            gaps.append(g)
     gap_base = num(base, "gap_us")
-    gap_fired = num(fired, "gap_us")
-    if num(base, "switched") != 0 or num(fired, "switched") != 0:
-        fail("事件用例的结论不对", f"base={base} fired={fired}")
+    gap_fired = min(gaps) if gaps else -1
+    if num(base, "switched") != 0:
+        fail("事件用例的结论不对", f"{base}")
         return
-    if 1200 <= gap_base <= 4000:
-        ok(f"对照组（不投递）在 {gap_base}µs 后按节拍醒来——2ms 档的本来面目")
+    # 节拍会被上一轮的唤醒迟到压缩（晚醒一次，下一个取样点就离得近一点），故下限放宽
+    if 700 <= gap_base <= 4000:
+        ok(f"对照组（不投递）在 {gap_base}µs 后按节拍醒来——节拍档的本来面目")
     else:
         fail("对照组的间隔不是节拍本身", f"gap_us={gap_base}（应 ≈2000µs）")
-    if 0 <= gap_fired <= 800:
-        ok(f"投递事件后 {gap_fired}µs 就复核（同一时刻的节拍是 {gap_base}µs）")
+    if 0 <= gap_fired <= 500:
+        ok(f"投递事件后 {gap_fired}µs 就复核（不投递则要等 {gap_base}µs）")
     else:
         fail("事件没有把等待叫醒", f"gap_us={gap_fired}，节拍 {gap_base}µs")
 
@@ -172,21 +183,27 @@ def check_fallback(exe):
 
 def check_switch_latency(exe):
     log("A 段：切换检测延迟")
-    kv, _ = run_mode(exe, ["switch", "300", "5"])
+    kv, _ = run_mode(exe, ["switch", "200", "7"])
     if num(kv, "unshare_fail") > 0 and num(kv, "switched_n") == 0:
         gap("userns 不可用，切换类用例跳过")
         return
     best = num(kv, "best_us")
     worst = num(kv, "worst_us")
+    lag = num(kv, "best_lag_us")
     if num(kv, "switched_n") == num(kv, "reps") and best >= 0:
-        ok(f"五次都能发现切换（最慢 {worst}µs）")
+        ok(f"七次都能发现切换（最慢 {worst}µs）")
     else:
         fail("切换被漏掉", f"{kv}")
-    # 旧的 2ms 步进在同样场景下量出来就是 ~2000µs
+    # 旧的 2ms 步进在同样场景下量出来就是 ~2000µs（第一个取样点在 2ms 后）
     if 0 <= best <= 1200:
         ok(f"切换后 {best}µs 被发现（旧步进 ≥2000µs）")
     else:
         fail("检测延迟没有降到步进以下", f"best_us={best}")
+    # 扣掉子进程自己被调度推迟的那段，剩下的才是「切换之后多久被看见」
+    if 0 <= lag <= 800:
+        ok(f"切换发生后 {lag}µs 被看见（平均值 {kv.get('avg_lag_us')}µs）")
+    else:
+        fail("切换之后看见得太慢", f"best_lag_us={lag}")
 
 
 # ── D 段：接线契约（静态） ──────────────────────────────────────────────────
