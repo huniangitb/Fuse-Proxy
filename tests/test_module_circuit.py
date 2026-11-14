@@ -228,10 +228,13 @@ def storm(kw, n=9):
         except OSError: pass
         time.sleep(0.12)
 
-# ── §0 L0 直编契约：后端槽位失效时 fsync/flush 不得假成功（R10） ──
+# ── §0 L0 直编契约：后端收尾既不能假成功，也不能漏发媒体刷新 ──
 # 直编实际源码的 vfs_backend_finish_data，把 module_backend_acquire_slot
 # 桩成返回 -1（槽位被置毒/卸载后快照置空）；旧实现 return 0（假成功），
-# 新实现必须 -EIO。FUSE_DAEMON_SRC=<旧源码副本> 可复现失败。
+# 新实现必须 -EIO。同一个探针再验两件事：写意图句柄收尾成功时发一次
+# media_refresh（reason=ftp_upload，带上调用方 uid/pid 与落点路径），只读
+# 句柄收尾不发——后端内容不产生本地 write 事件，这是扫描侧唯一的机会。
+# FUSE_DAEMON_SRC=<旧源码副本> 可复现失败。
 FINISH_DATA_DRIVER = r'''
 #define _GNU_SOURCE
 #define FUSE_USE_VERSION 317
@@ -247,6 +250,7 @@ FINISH_DATA_DRIVER = r'''
 #include <unistd.h>
 #include "fw_rules.h"
 #include "module_loader.h"
+#include "fw_events.h"
 #define NSP_FH_HANDLE_MASK ((1ULL << 40) - 1)
 #define LOG_ERR(...) ((void)0)
 #define LOG_WRN(...) ((void)0)
@@ -255,24 +259,77 @@ struct fuse_context* fuse_get_context(void) { return &g_ctx; }
 #define NSP_FENCE_FAULT (-5000)
 #define NSP_FENCE_BADFN (-5001)
 static bool backend_rc_is_business(int rc) { return rc < 0 && rc >= -4095; }
+/* 槽位可用性由场景变量控制：0 = 置毒（acquire 失败） */
+static int g_slot_ok;
+static int fake_flush(uint64_t fh) { (void)fh; return 0; }
+static const NspModuleOps g_ops = { .backend_flush = fake_flush };
 int module_backend_acquire_slot(int slot, const NspModuleOps** out) {
-    (void)slot; (void)out; return -1; /* 槽位失效 */
+    (void)slot;
+    if (!g_slot_ok) return -1;
+    *out = &g_ops;
+    return 0;
 }
 void module_backend_release_slot(int slot) { (void)slot; }
 int nsp_fence_backend_flush(int a, const char* b, int (*f)(uint64_t), uint64_t c) {
-    (void)a; (void)b; (void)f; (void)c; return 0;
+    (void)a; (void)b; return f(c);
 }
 static void vfs_inval_path(struct fuse* f, const char* p) { (void)f; (void)p; }
 void module_guard_fault(int a, const char* b, const char* c) { (void)a; (void)b; (void)c; }
 void module_guard_error(int a, const char* b, int c, const char* d, const char* e) {
     (void)a; (void)b; (void)c; (void)d; (void)e;
 }
+/* 媒体刷新埋点的替身：只记次数与入参，证明调用点在该调时调、不该调时不调 */
+static int g_refresh;
+static uid_t g_refresh_uid;
+static pid_t g_refresh_pid;
+static uint8_t g_refresh_reason;
+static char g_refresh_path[PATH_MAX];
+void fw_events_note_media_refresh(uid_t uid, pid_t pid, const char* path, uint8_t reason) {
+    g_refresh++;
+    g_refresh_uid = uid;
+    g_refresh_pid = pid;
+    g_refresh_reason = reason;
+    snprintf(g_refresh_path, sizeof g_refresh_path, "%s", path);
+}
 __FINISH_FN__
 int main(void) {
-    int rc = vfs_backend_finish_data(0, 1, "/0/probe");
-    printf("unavailable_backend_flush_rc=%d\n", rc);
-    return rc == -EIO ? 0 : 1;
+    g_ctx.uid = 10123;
+    g_ctx.pid = 4242;
+
+    int rc_dead = vfs_backend_finish_data(0, 1, "/0/probe.jpg", true);
+    int refresh_dead = g_refresh;
+
+    g_slot_ok = 1;
+    g_refresh = 0;
+    int rc_write = vfs_backend_finish_data(0, 1, "/0/probe.mp3", true);
+    int refresh_write = g_refresh;
+    uid_t uid_write = g_refresh_uid;
+    pid_t pid_write = g_refresh_pid;
+    uint8_t reason_write = g_refresh_reason;
+    char path_write[PATH_MAX];
+    snprintf(path_write, sizeof path_write, "%s", g_refresh_path);
+
+    g_refresh = 0;
+    int rc_read = vfs_backend_finish_data(0, 1, "/0/probe.mp3", false);
+    int refresh_read = g_refresh;
+
+    printf("dead_slot_rc=%d dead_refresh=%d\n", rc_dead, refresh_dead);
+    printf("write_rc=%d write_refresh=%d uid=%u pid=%d reason=%u path=%s\n",
+           rc_write, refresh_write, (unsigned)uid_write, (int)pid_write,
+           (unsigned)reason_write, path_write);
+    printf("read_rc=%d read_refresh=%d\n", rc_read, refresh_read);
+
+    int bad = 0;
+    if (rc_dead != -EIO || refresh_dead != 0) bad = 1;
+    if (rc_write != 0 || refresh_write != 1) bad = 1;
+    if (uid_write != 10123 || pid_write != 4242) bad = 1;
+    if (reason_write != FW_REFRESH_FTP_UPLOAD) bad = 1;
+    if (strcmp(path_write, "/0/probe.mp3") != 0) bad = 1;
+    /* 只读句柄收尾不宣称写入：不得发媒体刷新 */
+    if (rc_read != 0 || refresh_read != 0) bad = 1;
+    return bad;
 }
+
 '''
 
 
@@ -307,7 +364,7 @@ def check_finish_data_contract():
     同族的 vfs_read/vfs_write 在同样状态下返回 -EIO；vfs_release 的宽容
     返回 0 保留（release 是幂等销毁，不宣称数据落盘）。
     """
-    print("\n── 0. L0 直编契约：槽位失效时 fsync/flush 返回 EIO（R10） ──")
+    print("\n── 0. L0 直编契约：后端收尾的 EIO 与媒体刷新 ──")
     src_path = os.environ.get("FUSE_DAEMON_SRC") or str(ROOT / "src/daemon/fuse_daemon.c")
     try:
         src_text = Path(src_path).read_text()
@@ -338,9 +395,9 @@ def check_finish_data_contract():
         p = subprocess.run([exe], capture_output=True, text=True, timeout=30)
         out = (p.stdout + p.stderr).strip()
         if p.returncode == 0:
-            ok("槽位失效时 fsync/flush 返回 EIO（不再假成功）")
+            ok("槽位失效返回 EIO；写意图收尾发一次 ftp_upload 刷新，只读不收尾不发")
         else:
-            fail("槽位失效时 fsync/flush 假成功", out[-300:] or f"rc={p.returncode}")
+            fail("后端收尾契约不成立（EIO / 媒体刷新计数）", out[-300:] or f"rc={p.returncode}")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 

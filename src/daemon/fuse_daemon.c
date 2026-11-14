@@ -2133,7 +2133,7 @@ static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path, bool
         /* 写意图句柄的数据收尾 = 后端侧的文件已经"落地"（FTP 上传完成）。此刻补一条
            媒体刷新请求：后端内容不产生本地 write 事件，扫描侧没有别的时机会知道这个
            路径刚长出媒体文件。只在有活订阅者时发布（见 fw_events_note_media_refresh）。 */
-        if (write_intent && fw_events_active() && ctx && ctx->pid != 0) {
+        if (write_intent && ctx && ctx->pid != 0) {
             fw_events_note_media_refresh(ctx->uid, ctx->pid, path, FW_REFRESH_FTP_UPLOAD);
         }
     }
