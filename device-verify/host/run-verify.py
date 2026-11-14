@@ -73,8 +73,9 @@ def pkg(case):
     return "nsp.probe." + case
 
 
-def run(cmd, *, check=True, env=None, input=None):
-    p = subprocess.run(cmd, text=True, capture_output=True, env=env, input=input)
+def run(cmd, *, check=True, env=None, input=None, timeout=None):
+    p = subprocess.run(cmd, text=True, capture_output=True, env=env, input=input,
+                       timeout=timeout)
     if check and p.returncode != 0:
         raise VerifyError(
             "命令失败(%d): %s\n--- stdout ---\n%s\n--- stderr ---\n%s"
@@ -84,11 +85,11 @@ def run(cmd, *, check=True, env=None, input=None):
 
 
 def parse_kv(text):
+    """拆 "KEY=value ... KEY2=value2" 形态的回包：一行里可能带多个键。"""
     out = {}
     for line in text.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            out[k.strip()] = v.strip()
+        for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)=(\S*)", line):
+            out[m.group(1)] = m.group(2)
     return out
 
 
@@ -136,14 +137,15 @@ class Adb:
     def shell(self, cmd, check=True):
         return run(self.base + ["shell", cmd], check=check, env=self.env)
 
-    def sh_root(self, action, *args, check=True):
+    def sh_root(self, action, *args, check=True, timeout=None):
         inner = "sh %s %s" % (DEV_SCRIPT_REMOTE, action)
         for a in args:
             inner += " " + shlex.quote(a)
         if self.dry:
             print("[dry] adb-sh: su -c %r" % inner)
             return subprocess.CompletedProcess([], 0, "", "")
-        return run([str(ADB_SH), "su -c '%s'" % inner], check=check, env=self.env)
+        return run([str(ADB_SH), "su -c '%s'" % inner], check=check, env=self.env,
+                   timeout=timeout)
 
     def push(self, local, remote):
         if self.dry:
@@ -342,12 +344,21 @@ def render_injector_conf(phase):
         # 遗留键：/Android 只有单一口径，这行照常解析但不改变落点。留在验证配置里
         # 是为了让每次跑都覆盖「存量配置带这一行仍能正常起服务」这一条。
         "SANDBOX_ANDROID_TREE ON",
+        # 事件通道是「上传落库」链路的起点：FUSE_EVENTS 关闭时守护进程不建 socket，
+        # 下游（MPM/FuseEvent）收不到 media_refresh，链路的最后一跳根本无从观测。
+        "FUSE_EVENTS ON",
         "",
+        # 后端映射（FTP/SFTP）本身不进 injector 的「活动规则」判定：裁决只看
+        # redirect/hide/ro/sandbox，光有映射段时 v1 会走「无规则冲突 → 保留原生
+        # 视图」直接跳过挂载，映射永远用不上。这里配一条指向不存在路径的 HIDE，
+        # 只为了让该应用被挂载；探针不碰该路径，不影响 FTP/SFTP 自身的断言。
         "[nsp.probe.ftp]",
         "FTP /ftp_probe ftp_probe",
+        "HIDE /nsp_verify/ftp_noop",
         "",
         "[nsp.probe.sftp]",
         "FTP /sftp_probe sftp_probe",
+        "HIDE /nsp_verify/sftp_noop",
         "",
         "[nsp.probe.iso]",
         "SANDBOX ON",
@@ -414,9 +425,13 @@ def parse_probe_log(text):
     events = []
     for line in text.splitlines():
         idx = line.find("NSP_PROBE:")
-        if idx < 0:
+        if idx >= 0:
+            payload = line[idx + len("NSP_PROBE:"):].strip()
+        elif line.startswith("case="):
+            # 结果文件里存的是裸行（没有 logcat 的 tag 前缀），两种形态都要认
+            payload = line.strip()
+        else:
             continue
-        payload = line[idx + len("NSP_PROBE:"):].strip()
         kv = {}
         for part in payload.split("|"):
             if "=" in part:
@@ -520,38 +535,90 @@ def push_config(adb, phase):
     adb.sh_root("reload-config")
 
 
-def wait_done(adb, case, timeout):
-    """轮询 logcat 直到探针发出 done，返回最后一份日志。"""
-    logs = ""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.5)
-        logs = adb.logcat_dump()
-        if any(e.get("case") == case and e.get("step") == "done"
-               for e in parse_probe_log(logs)):
-            return logs, True
-    return logs, False
+class Stage:
+    """阶段计时账本：只记墙钟，用来回答「耗时花在哪一段」。"""
+
+    def __init__(self):
+        self.rows = []
+        self.t0 = time.time()
+
+    def add(self, name, seconds):
+        self.rows.append((name, seconds))
+
+    def mark(self, name, since):
+        now = time.time()
+        self.add(name, now - since)
+        return now
+
+    def report(self):
+        print("== 耗时（墙钟）==")
+        for name, sec in self.rows:
+            print("  %-30s %7.2fs" % (name, sec))
+        total = time.time() - self.t0
+        print("  %-30s %7.2fs" % ("合计", total))
+        return total
 
 
-def launch_probe(adb, case, wait=3.0, logdir=None, tag="", timeout=25.0, retries=1):
-    """拉起探针并等 done；未收尾则重试一次。
+WAIT_STATUS_RE = re.compile(r"^WAIT=(\S+)$", re.M)
+LOG_PATH_RE = re.compile(r"^LOG=(.+)$", re.M)
 
-    屏幕休眠会让进程被系统冻结（isFrozen=true），探针停在中途既不发日志也不退出。
+
+def wait_probe_log(adb, case, timeout_ms):
+    """等设备侧把结果文件写到 done，一次 adb 调用收回全文。
+
+    结果文件在公共临时目录里（FUSE 坏掉也写得进去），设备脚本按 100ms 轮询；宿主
+    不再按 0.5s dump 整份 logcat——那是上一版每个探针都要付几十次的固定开销，也是
+    验收路径最贵的一段。只有拿不到结果文件时才补一次 logcat，用于区分「探针崩了」
+    与「探针没崩但卡住」。
+    """
+    p = adb.sh_root("wait-probe-log", pkg(case), str(int(timeout_ms)),
+                    check=False, timeout=timeout_ms / 1000.0 + 30.0)
+    return parse_wait_output(p.stdout or "")
+
+
+def parse_wait_output(out):
+    """拆设备侧 wait-probe-log 的回包：WAIT=<状态> / LOG=<文件> / 正文。"""
+    m = WAIT_STATUS_RE.search(out)
+    status = m.group(1) if m else "no_output"
+    lm = LOG_PATH_RE.search(out)
+    log_path = lm.group(1).strip() if lm else "-"
+    body = []
+    started = False
+    for line in out.splitlines():
+        if not started:
+            if line.startswith("LOG="):
+                started = True
+            continue
+        body.append(line)
+    return status, log_path, "\n".join(body)
+
+
+def launch_probe(adb, case, logdir=None, tag="", timeout=25.0, retries=1, stage=None):
+    """拉起探针并等它把 done 写进结果文件；未收尾则重试一次。
+
+    屏幕休眠会让进程被系统冻结（isFrozen=true），探针停在中途既不写结果也不退出。
     设备脚本的 launch 已先唤醒解锁，这里再兜一层重试，避免把系统调度误判成模块缺陷。
     """
     logs = ""
     out = None
+    status = "no_output"
+    log_path = "-"
     for attempt in range(retries + 1):
-        adb.logcat_clear()
+        t0 = time.time()
         out = adb.sh_root("launch", pkg(case)).stdout
-        logs, done = wait_done(adb, case, timeout)
-        if done:
+        status, log_path, logs = wait_probe_log(adb, case, timeout * 1000)
+        if stage is not None:
+            stage.add("探针 %s%s" % (tag, case), time.time() - t0)
+        if status == "done":
             break
         if attempt < retries:
-            print("  ⚠ %s 未在 %.0fs 内收尾（进程可能被冻结），重试一次" % (pkg(case), timeout))
+            print("  ⚠ %s 未在 %.0fs 内收尾（%s），重试一次" % (pkg(case), timeout, status))
+    if status != "done":
+        logs += "\n===== logcat(NSP_PROBE) =====\n" + adb.logcat_dump()
     if logdir is not None:
         try:
-            (logdir / ("%s%s.log" % (tag, case))).write_text(logs)
+            (logdir / ("%s%s.log" % (tag, case))).write_text(
+                "device_log=%s wait=%s\n%s" % (log_path, status, logs))
         except OSError:
             pass
     return out, logs
@@ -576,7 +643,15 @@ def main():
     ap.add_argument("--ftp-port", type=int, default=2121)
     ap.add_argument("--sftp-port", type=int, default=2222)
     ap.add_argument("--pasv-base", type=int, default=30200)
-    ap.add_argument("--wait", type=float, default=3.0, help="每次启动探针后等待秒数")
+    ap.add_argument("--wait", type=float, default=25.0, help="单个探针从拉起等到收尾的上限秒数")
+    ap.add_argument("--smoke", action="store_true",
+                    help="快速模式：只跑 ftp 一条上传链（就绪 + STOR + 后端落盘 + 媒体库）")
+    ap.add_argument("--no-fail-fast", action="store_true",
+                    help="探针没就绪也把全部用例跑完（默认早停：验证实例没起来时，剩下的用例只是重复同一个失败）")
+    ap.add_argument("--wait-subscriber", type=int, default=0, metavar="MS",
+                    help="起验证实例后等事件通道出现订阅者的上限毫秒数（0=不等）")
+    ap.add_argument("--no-ready-retry", action="store_true",
+                    help="探针没等到 FUSE 视图时重起一次（默认开；关掉可看原始失败率）")
     ap.add_argument("--strict-race", action="store_true",
                     help="竞态探针的「就绪前侧漏」计为失败（默认只告警：v1 已知覆盖窗口）")
     args = ap.parse_args()
@@ -609,13 +684,16 @@ def main():
         print("跳过：未检测到可用设备（%s）" % str(e).splitlines()[0], file=sys.stderr)
         return 77
 
+    stage = Stage()
     if not args.skip_build:
         print("== 构建验证产物 ==")
+        t0 = time.time()
         for script in (DV / "build" / "build-verify-binaries.sh", DV / "probes" / "build-probes.sh"):
             if not script.exists():
                 print("缺少构建脚本 %s（先完成构建或加 --skip-build）" % script, file=sys.stderr)
                 return 1
             run([str(script)])
+        stage.mark("构建", t0)
 
     required = [DIST / "bin" / b for b in ("injector", "fuse_daemon", "log_monitor", "rule_server", "ftp_module.so")]
     required += [DIST / "apks" / ("nsp.probe.%s.apk" % c) for c in CASES + (RACE,)]
@@ -661,6 +739,7 @@ def main():
             reverses.append(port)
 
         print("== 设备准备（隔离配置根 %s）==" % CFG)
+        t_prep = time.time()
         stage_files(adb, ftp, sftp, "A")
         adb.sh_root("clean-fixtures")
         adb.sh_root("make-hide-fixture")
@@ -673,6 +752,7 @@ def main():
             adb.sh_root("prepare-app-dirs", pkg(case))
             apks_installed.append(pkg(case))
         adb.sh_root("iso-fixture", pkg("iso"))
+        stage.mark("设备准备（推文件+装 APK）", t_prep)
 
         print("== 保持唤醒（避免探针进程被系统冻结）==")
         awake = {
@@ -684,50 +764,110 @@ def main():
               % (awake["timeout"], awake["stayon"]))
 
         print("== 停生产服务 / 启验证实例（v1）==")
+        t_switch = time.time()
         prod_stop_attempted = True
         adb.sh_root("stop-prod")
-        adb.sh_root("start-verify")
+        # 生产实例退出后，它做的全局替换挂载还留在视图上（fuse_daemon 已退出，
+        # 这些挂载点一律 ENOTCONN），并会经共享传播出现在新起的应用命名空间里。
+        # 验证实例是逐应用挂载（v1），必须先在原生树上工作，否则探针永远等不到
+        # 自己的 FUSE 视图，全部用例会以 ready 超时 + ENOTCONN 收场。
+        view = parse_kv(adb.sh_root("restore-system-view").stdout)
+        checker.check("停生产后系统存储视图恢复为原生树",
+                      view.get("SYSTEM_VIEW_READY") == "1",
+                      "detached=%s bound=%s fuse_left=%s"
+                      % (view.get("SYSTEM_VIEW_DETACHED"), view.get("SYSTEM_VIEW_BOUND"),
+                         view.get("SYSTEM_VIEW_FUSE_LEFT")))
+        raw_started = adb.sh_root("start-verify").stdout
+        started = parse_kv(raw_started)
         verify_started = True
+        stage.mark("停生产+恢复视图+起验证", t_switch)
+        if "ready_ms" in started:
+            print("  验证实例就绪 %sms（视图 detached=%s bound=%s）"
+                  % (started.get("ready_ms"), view.get("SYSTEM_VIEW_DETACHED"),
+                     view.get("SYSTEM_VIEW_BOUND")))
+        else:
+            print("  验证实例已起（无 ready_ms；回包 %r）" % (raw_started or "")[:200])
+
+        if args.wait_subscriber > 0:
+            sub = parse_kv(adb.sh_root("wait-subscriber", str(args.wait_subscriber),
+                                       check=False).stdout)
+            print("  事件通道订阅者：%s" % (sub.get("SUBSCRIBER", "?")))
+            if sub.get("SUBSCRIBER") != "yes":
+                print("  ⚠ %.1fs 内没有订阅者，这期间的 media_refresh 会被丢弃"
+                      % (args.wait_subscriber / 1000.0))
 
         logdir = base / "logs"
         logdir.mkdir(parents=True, exist_ok=True)
         phase_a_events = []
         print("== 阶段 A：拉起探针 ==")
-        for case in CASES:
-            out, logs = launch_probe(adb, case, args.wait, logdir, "A-")
-            phase_a_events.extend(parse_probe_log(logs))
-            print("  - %s" % pkg(case))
+        cases = CASES[:1] if args.smoke else CASES
+        first_case_status = None
+        aborted = False
+        for case in cases:
+            out, logs = launch_probe(adb, case, logdir, "A-", timeout=args.wait, stage=stage)
+            evs = parse_probe_log(logs)
+            if ready_ms(evs, case) is None and not args.no_ready_retry:
+                # 注入视图是异步建立的，进程若在自己的就绪预算里没等到它，后面每一步
+                # 都会在同一条断链上失败。这里按探针自己看到的挂载源判定，重起一次让
+                # 它重新走一遍注入时序；第一次的日志另存，失败时两份都在。
+                print("  ↻ %s 未拿到 FUSE 视图，重起一次" % pkg(case))
+                out, logs = launch_probe(adb, case, logdir, "A-retry-", timeout=args.wait,
+                                         stage=stage)
+                evs = parse_probe_log(logs)
+            phase_a_events.extend(evs)
+            ready = ready_ms(evs, case)
+            if case == cases[0]:
+                first_case_status = ready
+            print("  - %s%s" % (pkg(case), "" if ready is not None else "（未就绪）"))
+            # 早停：第一个探针连 FUSE 视图都没等到，后面的用例只会重复同一个失败。
+            # 断言强度不变——跳过的是重复采样，不是检查项（跳过的用例会在断言里显式失败）。
+            if ready is None and not args.no_fail_fast:
+                print("⏹ 早停：%s 未就绪，跳过其余探针（--no-fail-fast 可全跑）" % pkg(case))
+                aborted = True
+                break
 
-        print("== 竞态窗口：不等待就绪的立即写入（%d 轮冷启动）==" % RACE_ITERATIONS)
         races = []
-        for n in range(RACE_ITERATIONS):
-            logs = ""
-            for attempt in range(2):
-                adb.sh_root("force-stop", pkg(RACE))
-                adb.sh_root("race-fixture", pkg(RACE))
-                adb.logcat_clear()
-                adb.sh_root("launch", pkg(RACE))
-                logs, done = wait_done(adb, RACE, 30.0)
-                if done:
-                    break
-                if attempt == 0:
-                    print("  ⚠ race#%d 未收尾（进程可能被冻结），重试一次" % (n + 1))
-            scan = parse_kv(adb.sh_root("race-scan", pkg(RACE)).stdout)
-            races.append({"events": parse_probe_log(logs), "scan": scan})
-            try:
-                (logdir / ("race-%d.log" % (n + 1))).write_text(logs)
-            except OSError:
-                pass
-            print("  - race#%d 采样完成" % (n + 1))
+        if args.smoke or aborted:
+            print("== 竞态窗口：跳过（%s）==" % ("smoke" if args.smoke else "探针未就绪"))
+        else:
+            print("== 竞态窗口：不等待就绪的立即写入（%d 轮冷启动）==" % RACE_ITERATIONS)
+            t_race = time.time()
+            for n in range(RACE_ITERATIONS):
+                for attempt in range(2):
+                    adb.sh_root("force-stop", pkg(RACE))
+                    adb.sh_root("race-fixture", pkg(RACE))
+                    adb.sh_root("launch", pkg(RACE))
+                    status, log_path, logs = wait_probe_log(adb, RACE, 30000)
+                    if status == "done":
+                        break
+                    if attempt == 0:
+                        print("  ⚠ race#%d 未收尾（%s），重试一次" % (n + 1, status))
+                if status != "done":
+                    logs += "\n===== logcat(NSP_PROBE) =====\n" + adb.logcat_dump()
+                scan = parse_kv(adb.sh_root("race-scan", pkg(RACE)).stdout)
+                races.append({"events": parse_probe_log(logs), "scan": scan})
+                try:
+                    (logdir / ("race-%d.log" % (n + 1))).write_text(
+                        "device_log=%s wait=%s\n%s" % (log_path, status, logs))
+                except OSError:
+                    pass
+                print("  - race#%d 采样完成" % (n + 1))
+            stage.mark("竞态（%d 轮）" % RACE_ITERATIONS, t_race)
 
-        print("== 阶段 B：换配置重启验证实例后重跑 hide 探针 ==")
-        for case in CASES:
-            adb.sh_root("force-stop", pkg(case))
-        adb.sh_root("stop-verify")
-        push_config(adb, "B")
-        adb.sh_root("start-verify")
-        out, logs = launch_probe(adb, "hide", args.wait, logdir, "B-")
-        phase_b_events = parse_probe_log(logs)
+        phase_b_events = []
+        if args.smoke or aborted:
+            print("== 阶段 B：跳过（%s）==" % ("smoke" if args.smoke else "探针未就绪"))
+        else:
+            print("== 阶段 B：换配置重启验证实例后重跑 hide 探针 ==")
+            t_b = time.time()
+            for case in CASES:
+                adb.sh_root("force-stop", pkg(case))
+            adb.sh_root("stop-verify")
+            push_config(adb, "B")
+            adb.sh_root("start-verify")
+            out, logs = launch_probe(adb, "hide", logdir, "B-", timeout=args.wait, stage=stage)
+            phase_b_events = parse_probe_log(logs)
+            stage.mark("阶段 B（换配置+重起+hide）", t_b)
         events = phase_a_events + phase_b_events
 
         try:
@@ -736,8 +876,13 @@ def main():
             pass
 
         print("== 断言 ==")
-        assert_all(adb, checker, phase_a_events, phase_b_events, ftp, sftp)
+        t_assert = time.time()
+        if args.smoke:
+            assert_smoke(adb, checker, phase_a_events, ftp)
+        else:
+            assert_all(adb, checker, phase_a_events, phase_b_events, ftp, sftp)
         assert_race(checker, races, strict_leak=args.strict_race)
+        stage.mark("断言", t_assert)
         if races:
             print("== 竞态测量小结（v1 补挂载 vs 应用首写）==")
             for n, r in enumerate(races):
@@ -761,6 +906,24 @@ def main():
         checker.check("流程无异常中止", False, str(e)[:300])
     finally:
         print("== 清理与恢复 ==")
+        # 设备侧日志必须在 cleanup 之前取回宿主：验证实例的 sys.log /
+        # verify_injector.out 是「为什么没就绪」的唯一证据，而 cleanup 会把验证根
+        # 目录整个删掉（上一版就卡在这里：跑完什么也没留下）。
+        dev_logs = base / "logs" / "device"
+        if prepared:
+            try:
+                dev_logs.mkdir(parents=True, exist_ok=True)
+                exp = parse_kv(adb.sh_root("export-logs", check=False).stdout)
+                remote = exp.get("EXPORT_DIR")
+                if remote and remote != "-":
+                    adb.raw("pull", remote, str(dev_logs), check=False)
+                    pulled = [str(f.relative_to(dev_logs)) for f in sorted(dev_logs.glob("**/*"))
+                              if f.is_file()]
+                    print("  设备日志已回传 %d 个文件 -> %s" % (len(pulled), dev_logs))
+            except Exception as e:
+                print("  ⚠ 设备日志回传失败：%s" % str(e)[:200])
+            # 宿主已经留了副本，设备侧按「收集完就删」处理（成功失败都一样）。
+            adb.sh_root("probe-log-drop", check=False)
         if prod_stop_attempted:
             if verify_started:
                 adb.sh_root("stop-verify", check=False)
@@ -791,10 +954,13 @@ def main():
         if not args.keep_apks:
             for p in apks_installed:
                 adb.uninstall(p)
+        stage.report()
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
         else:
             print("保留宿主临时目录：%s" % base)
+            print("  探针结果文件：%s" % (base / "logs"))
+            print("  设备侧日志：  %s" % dev_logs)
 
     print()
     print("通过 %d，失败 %d" % (checker.pass_n, checker.fail_n))
@@ -824,6 +990,72 @@ def ready_ms(events, case):
     return None
 
 
+def probe_logs_sink_ok(events, case):
+    """探针结果文件是否真写进了公共临时目录（按探针自己回报的 sink 行判定）。"""
+    detail = step_detail(events, case, "sink")
+    for part in detail.split(";"):
+        part = part.strip()
+        if "probe-logs" in part:
+            return part.endswith("=ok")
+    return False
+
+
+def media_rows(adb, pattern):
+    """查 MediaStore 里 _data 命中 pattern 的行。返回 (原始输出, 行列表)。"""
+    out = adb.sh_root("media-row", pattern, check=False).stdout
+    rows = [line for line in out.splitlines() if line.startswith("Row:")]
+    return out, rows
+
+
+def check_media_row(adb, checker, name, pattern, want=True, timeout=15.0):
+    """媒体库是否真的建了行——上传链路最后一跳的可观测判据。
+
+    事件发出去只证明前半段；「相册里看得见」是独立事实，只能按 MediaStore 的查询
+    结果判定。索引有节奏，所以给一小段轮询窗口，而不是查一次就下结论。
+    """
+    end = time.time() + timeout
+    out, rows = "", []
+    while True:
+        out, rows = media_rows(adb, pattern)
+        if bool(rows) == want or time.time() >= end:
+            break
+        time.sleep(0.5)
+    if not rows:
+        # 传不上去的时候最想知道的是「事件走了没有」：把事件通道的现场一起留在
+        # 明细里（订阅、扫描请求），比只有一句 No result found 有用。
+        trace = adb.sh_root("logcat-grep", "FuseEvent|media_refresh|nsp_fs_events",
+                            check=False).stdout or ""
+        out = (out or "") + "\n----- 事件通道现场 -----\n" + trace[-800:]
+    checker.check(name, bool(rows) == want, (out or "")[-1200:])
+    return out, rows
+
+
+def assert_smoke(adb, checker, phase_a, ftp):
+    """smoke：只验 ftp 上传链（就绪 → STOR → 宿主后端 → 媒体库）。"""
+    ms = ready_ms(phase_a, "ftp")
+    checker.check("ftp 探针 FUSE 视图就绪", ms is not None,
+                  "未看到 ready 行（注入未完成？）" if ms is None else "ms=%s" % ms)
+    if ms is not None and ms >= 0:
+        checker.check("ftp 注入就绪耗时 <= 12000ms", ms <= 12000, "实际 %dms" % ms)
+    for step in ("write", "read", "list", "canary"):
+        checker.check("ftp 探针 %s 成功" % step, step_ok(phase_a, "ftp", step),
+                      step_detail(phase_a, "ftp", step)[:200])
+    checker.check("ftp 探针正常收尾", step_ok(phase_a, "ftp", "done"))
+    checker.check("ftp 结果文件写入公共临时目录", probe_logs_sink_ok(phase_a, "ftp"),
+                  step_detail(phase_a, "ftp", "sink")[:300])
+    remote = ftp.upload / "probe_ftp.txt"
+    ok = wait_file(remote)
+    checker.check("ftp 文件已落到宿主 FTP 后端", ok, str(remote))
+    if ok:
+        body = remote.read_text(errors="replace")
+        checker.check("ftp 后端内容正确", body.startswith("NSP_PROBE:nsp.probe.ftp:"), body[:120])
+    exists, size = device_file(adb, "%s/ftp_probe/probe_ftp.txt" % REAL_ROOT)
+    checker.check("ftp 未侧漏到真实存储", not exists, "exists=%s size=%s" % (exists, size))
+    out, rows = check_media_row(adb, checker, "ftp 上传后媒体库出现该行（相册可见）",
+                                "ftp_probe", True, 15.0)
+    checker.check("ftp 媒体库查询本身可用", "MEDIA_QUERY_DONE" in out, (out or "")[-200:])
+
+
 def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
     # ---- 注入就绪：v1 在 ColorOS 上由注入器在进程启动后重试完成，探针等待 FUSE 视图出现
     for case in CASES:
@@ -834,6 +1066,9 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
             checker.check("%s 注入就绪耗时 <= 12000ms" % case, ms <= 12000, "实际 %dms" % ms)
         checker.check("%s 探针正常收尾" % case, step_ok(phase_a, case, "done"))
     checker.check("hide(阶段B) FUSE 视图就绪", ready_ms(phase_b, "hide") is not None)
+    for case in CASES:
+        checker.check("%s 结果文件写入公共临时目录" % case, probe_logs_sink_ok(phase_a, case),
+                      step_detail(phase_a, case, "sink")[:300])
 
     # ---- ftp / sftp：后端落盘 + 真实存储零侧漏
     for case in ("ftp", "sftp"):
@@ -847,6 +1082,9 @@ def assert_all(adb, checker, phase_a, phase_b, ftp, sftp):
             checker.check("%s 后端内容正确" % case, body.startswith("NSP_PROBE:nsp.probe.%s:" % case), body[:120])
         exists, size = device_file(adb, "%s/%s_probe/probe_%s.txt" % (REAL_ROOT, case, case))
         checker.check("%s 未侧漏到真实存储" % case, not exists, "exists=%s size=%s" % (exists, size))
+        if case == "ftp":
+            check_media_row(adb, checker, "ftp 上传后媒体库出现该行（相册可见）",
+                            "ftp_probe", True, 15.0)
 
     # ---- iso：SANDBOX 隔离（真实共享目录零写入 + 文件落沙盒）
     for step in ("download", "pictures", "android_root", "android_list",
@@ -1141,6 +1379,19 @@ def self_test():
        "attempts=%d first=%s" % (len(st["attempts"]), st["first_fuse_ms"]))
     ck("race 就绪前/后分组", len(st["pre"]) == 1 and len(st["post"]) == 2,
        "pre=%d post=%d" % (len(st["pre"]), len(st["post"])))
+
+    # 结果文件通道的解析：WAIT/LOG/正文三段，正文原样当探针事件解析
+    wait_out = ("WAIT=done\nLOG=/data/local/tmp/nsp_verify/probe-logs/nsp.probe.ftp.log\n"
+                "case=ftp|step=start|ok=1|detail=pkg=nsp.probe.ftp\n"
+                "case=ftp|step=done|ok=1|detail=steps=5\n")
+    st_wait, path_wait, body_wait = parse_wait_output(wait_out)
+    ck("wait 回包状态", st_wait == "done", st_wait)
+    ck("wait 回包路径", path_wait.endswith("nsp.probe.ftp.log"), path_wait)
+    ck("wait 正文按事件解析", len(parse_probe_log(body_wait)) == 2
+       and parse_probe_log(body_wait)[0]["step"] == "start")
+    st_to, path_to, body_to = parse_wait_output("WAIT=timeout\nLOG=-\n")
+    ck("wait 超时样本", st_to == "timeout" and path_to == "-" and body_to == "")
+    ck("wait 空回包", parse_wait_output("")[0] == "no_output")
 
     clean = Checker(quiet=True)
     assert_race(clean, [{"events": race_ev,
