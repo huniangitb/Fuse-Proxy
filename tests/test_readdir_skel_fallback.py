@@ -24,10 +24,13 @@ getdents64 解析（Python 的 scandir/is_dir 在 UNKNOWN 时会 stat 兜底，
     构成「条目类型取自 getdents 而非 lstat」的证据，证明垫片确实生效、
     测试非空转。
 
-第二个场景覆盖 `[GLOBAL] SANDBOX_ANDROID_TREE ON`（/Android 整树进镜像）：
-镜像里没有真实的 media 目录，`/Android` 读侧必须补出 data/obb/media 三条，
-且三条按名 stat 都是目录（不是文件、时间戳不是 1970）；未列举过的 media 子路径
-仍按真实结果 ENOENT。旧口径（开关默认关）不合成 media，一个字节都不变。
+沙盒对 /Android 只有一种口径：三个容器本身与该应用自己的私有目录让位真实目录，
+其余整树进镜像。镜像里没有真实的容器目录，`/Android` 读侧必须补出 data/obb/media
+三条，且三条按名 stat 都是目录（不是文件、时间戳不是 1970）；未列举过的 media
+子路径仍 ENOENT——「readdir 列过才允许按名 stat」的口径不能因为补齐骨架而放宽。
+第二、第三两个场景跑同一组断言：前者不带任何开关（单一口径的默认形态），后者带
+一行遗留的 `SANDBOX_ANDROID_TREE OFF`（该行已弃用，须照常解析、不报错、不改变
+任何落点，daemon 日志里有且仅有一条告警）。
 
 前置：GNU 产物 build_gnu/fuse_daemon、fusermount3、/dev/fuse、cc；
 缺失则以 SKIP_RC 退出（环境不具备 = gap，不计通过）。
@@ -180,17 +183,13 @@ def fail(desc, detail=""):
     ERRORS.append((desc, detail))
 
 
-CONFIG_LEGACY = """
+CONFIG_PLAIN = """
 [GLOBAL]
 MONITOR OFF
 """
 
-# /Android 整树进镜像：/Android 读的是镜像目录，里面没有真实条目
-CONFIG_MIRRORED = """
-[GLOBAL]
-MONITOR OFF
-SANDBOX_ANDROID_TREE ON
-"""
+# 存量配置的形态：/Android 口径已不设开关，这一行只剩兼容解析
+CONFIG_RETIRED_LINE = CONFIG_PLAIN + "SANDBOX_ANDROID_TREE OFF\n"
 
 
 def write_conf(text):
@@ -207,7 +206,7 @@ def setup_env():
         fh.write("seed_" + TEST_ID)
     os.makedirs(MNT, exist_ok=True)
     os.makedirs(MODDIR, exist_ok=True)
-    write_conf(CONFIG_LEGACY)
+    write_conf(CONFIG_PLAIN)
     with open(SHIM_C, "w") as fh:
         fh.write(SHIM_SRC)
     r = subprocess.run(["cc", "-shared", "-fPIC", "-o", SHIM_SO, SHIM_C, "-ldl"],
@@ -268,11 +267,11 @@ def stop_daemon(proc):
     subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
 
 
-def scenario_legacy():
-    """旧口径（SANDBOX_ANDROID_TREE 默认关）骨架名回退合成的既有断言。
+def scenario_skel_fallback():
+    """lstat 被拒时骨架名的回退合成（单一口径下的读侧基线）。
 
-    /Android 在该口径下读的是真实目录，media 由真实文件系统提供，
-    框架不得合成这一条：凭空多出来会让旧安装的列表多一条影子目录。"""
+    夹具的 /Android 是真实目录（data、otherdir 都在），media 不存在：
+    三条容器里前两条来自真实文件系统，缺的那条由框架补齐。"""
     log("场景 1: lstat EACCES 下骨架名回退合成（LD_PRELOAD 模拟 lower 层拒绝）")
     rc = 0
     proc = start_daemon()
@@ -315,38 +314,50 @@ def scenario_legacy():
             fail("被拒目录内的普通文件上报 DT_REG",
                  f"实测={data_dtypes.get('seed.txt')}，全表={data_dtypes}")
             rc = 1
-        # 5. 旧口径不合成 media：夹具里没有 media 目录，列表里就不该出现
-        if "media" not in dtypes:
-            ok("旧口径不合成 media 条目")
+        # 5. 三个容器条目齐备：夹具里没有 media 目录，也要由框架补出来
+        #    （容器条目取自镜像，镜像里没有真实目录，缺的那条就整条不见）
+        if dtypes.get("media") == DT_DIR:
+            ok("骨架 media 条目 d_type == DT_DIR")
         else:
-            fail("旧口径不合成 media 条目", f"实测 d_type={dtypes.get('media')}")
+            fail("骨架 media 条目 d_type == DT_DIR", f"实测={dtypes.get('media')}，全表={dtypes}")
             rc = 1
         try:
-            os.stat(MNT + "/0/Android/media")
-            fail("旧口径 media 无骨架兜底", "按名 stat 成功（凭空变出目录）")
+            st = os.stat(MNT + "/0/Android/media")
+            if statmod.S_ISDIR(st.st_mode):
+                ok("按名 stat media 为目录")
+            else:
+                fail("按名 stat media 为目录", f"mode={oct(st.st_mode)}")
+                rc = 1
+        except OSError as e:
+            fail("按名 stat media 为目录", repr(e))
+            rc = 1
+        # 6. 未列举过的 media 子路径仍按真实结果 ENOENT：补齐骨架不等于放行任意子路径
+        try:
+            os.stat(MNT + "/0/Android/media/com.example")
+            fail("未列举的 media 子路径仍 ENOENT", "按名 stat 成功（凭空变出目录）")
             rc = 1
         except OSError:
-            ok("旧口径 media 无骨架兜底（按真实结果 ENOENT）")
+            ok("未列举的 media 子路径仍 ENOENT")
     finally:
         stop_daemon(proc)
     return rc
 
 
-def scenario_mirrored():
-    """整树镜像口径｜/Android 读侧三个容器条目齐全，且各自 stat 正常。
+def scenario_containers(conf, label):
+    """单一口径｜/Android 读侧三个容器条目齐全，且各自 stat 正常。
 
-    镜像目录里没有真实的 data/obb/media，三条都要由 readdir 合成；合成条目
-    按名 stat 必须是目录（不是文件、时间戳不落到 1970），而镜像里没列举过的
-    子路径仍要 ENOENT（不能因为父路径像容器就放行）。"""
-    log("场景 2: 整树镜像口径（SANDBOX_ANDROID_TREE ON）下补出 media 骨架")
+    容器条目取自镜像，镜像里没有真实的 data/obb/media，三条都要由 readdir
+    合成；合成条目按名 stat 必须是目录（不是文件、时间戳不落到 1970），而
+    镜像里没列举过的子路径仍要 ENOENT（不能因为父路径像容器就放行）。"""
+    log(f"场景: {label}")
     rc = 0
-    write_conf(CONFIG_MIRRORED)
+    write_conf(conf)
     proc = start_daemon()
     try:
         if proc is None or proc.poll() is not None:
-            fail("daemon 挂载成功（镜像口径）", "daemon 提前退出")
+            fail(f"daemon 挂载成功（{label}）", "daemon 提前退出")
             return 1
-        ok("daemon 挂载成功（镜像口径）")
+        ok(f"daemon 挂载成功（{label}）")
         dtypes = raw_dtypes(MNT + "/0/Android")
         for name in ("data", "obb", "media"):
             if dtypes.get(name) == DT_DIR:
@@ -382,6 +393,42 @@ def scenario_mirrored():
     return rc
 
 
+def scenario_retired_line():
+    """存量配置里遗留的 SANDBOX_ANDROID_TREE 行只做兼容解析。
+
+    该开关已弃用：值不再切换任何口径，行也不能让解析失败。故本场景与不带开关
+    的那一轮断言必须一致，唯一的额外证据是 daemon 日志里那条告警——它证明行
+    被读到过（不是被当成未知规则丢掉），也证明了值没有生效。"""
+    rc = 0
+    write_conf(CONFIG_RETIRED_LINE)
+    proc = start_daemon()
+    try:
+        if proc is None or proc.poll() is not None:
+            fail("daemon 挂载成功（遗留开关行）", "daemon 提前退出（解析报错？）")
+            return 1
+        ok("daemon 挂载成功（遗留开关行）")
+        dtypes = raw_dtypes(MNT + "/0/Android")
+        for name in ("data", "obb", "media"):
+            if dtypes.get(name) == DT_DIR:
+                ok(f"遗留开关行 {name} 条目 d_type == DT_DIR")
+            else:
+                fail(f"遗留开关行 {name} 条目 d_type == DT_DIR",
+                     f"实测={dtypes.get(name)}，全表={dtypes}")
+                rc = 1
+        try:
+            os.stat(MNT + "/0/Android/media/com.example")
+            fail("遗留开关行｜未列举的 media 子路径仍 ENOENT", "按名 stat 成功")
+            rc = 1
+        except OSError:
+            ok("遗留开关行｜未列举的 media 子路径仍 ENOENT")
+        # 该行「被读到且只告警一次」这一半在 test_vfs_synth 的源码契约里查：
+        # 配置期日志进环形缓冲（log_monitor / sys.log），不出现在进程 stderr，
+        # 在这里断 stderr 只会永远空手。落点不变这一半由上面的断言给出。
+    finally:
+        stop_daemon(proc)
+    return rc
+
+
 def main():
     rc = 0
     if not os.path.exists(DAEMON):
@@ -400,8 +447,9 @@ def main():
         return SKIP_RC
 
     try:
-        rc |= scenario_legacy()
-        rc |= scenario_mirrored()
+        rc |= scenario_skel_fallback()
+        rc |= scenario_containers(CONFIG_PLAIN, "单一口径｜/Android 三容器齐备")
+        rc |= scenario_retired_line()
     finally:
         subprocess.run(["fusermount3", "-u", MNT], capture_output=True)
         shutil.rmtree(BASE, ignore_errors=True)

@@ -74,18 +74,41 @@ def static_contract():
     if not media_guard or "sub_path_is_android_media_container" not in media_guard:
         errs.append("android_media_skel 未用 sub_path_is_android_media_container 判定"
                     "（自己拼字符串会漏掉用户层/尾斜杠形态）")
-    elif "sandbox_android_tree" not in media_guard:
-        errs.append("android_media_skel 未按 SANDBOX_ANDROID_TREE 守门"
-                    "（旧口径会凭空多出一条 media）")
+    elif "sandbox_android_tree" in media_guard:
+        errs.append("android_media_skel 仍按已废弃的 SANDBOX_ANDROID_TREE 守门"
+                    "（开关删了以后 /Android/media 骨架就不再补齐）")
     init = func_body(src, "static void vfs_readdir_ctx_init", 1800)
     if not init:
         errs.append("找不到 vfs_readdir_ctx_init")
     elif "sub_path_is_storage_android_dir" not in init:
         errs.append("vfs_readdir_ctx_init 的 is_android_dir 未用存储根判定"
                     "（尾段匹配会让嵌套 Android 目录也补 data/obb）")
-    if init and "sandbox_android_tree" not in init:
-        errs.append("vfs_readdir_ctx_init 未按 SANDBOX_ANDROID_TREE 决定 media 骨架"
-                    "（旧口径会凭空多出一条 media）")
+    if init and "sandbox_android_tree" in init:
+        errs.append("vfs_readdir_ctx_init 仍按已废弃的 SANDBOX_ANDROID_TREE 决定 media 骨架"
+                    "（三个容器必须一律齐备）")
+    # ── 配置侧契约：/Android 只有一种口径，旧开关只剩兼容解析 ──
+    parser_c = os.path.join(ROOT, "src", "config", "config_parser.c")
+    parser_h = os.path.join(ROOT, "include", "config_parser.h")
+    try:
+        pc = open(parser_c, encoding="utf-8").read()
+    except OSError as e:
+        errs.append(f"读不到 {parser_c}: {e}")
+        pc = ""
+    if pc:
+        if "parse_retired_sandbox_android_tree" not in pc:
+            errs.append("config_parser 没有 SANDBOX_ANDROID_TREE 的兼容解析：存量配置里"
+                        "留着这一行会让整行按未知规则处理")
+        if pc.count("parse_retired_sandbox_android_tree") < 2:
+            errs.append("parse_retired_sandbox_android_tree 只有定义、没有派发点")
+        if "g_global_cfg.sandbox_android_tree" in pc:
+            errs.append("config_parser 仍在写 sandbox_android_tree：该字段已退役")
+    try:
+        ph = open(parser_h, encoding="utf-8").read()
+    except OSError as e:
+        errs.append(f"读不到 {parser_h}: {e}")
+        ph = ""
+    if ph and "sandbox_android_tree" in ph:
+        errs.append("AppConfig 仍有 sandbox_android_tree 字段：口径不该有第二个来源")
     if "sub_path_is_android_dir(" in src:
         errs.append("fuse_daemon 仍引用尾段匹配的 sub_path_is_android_dir")
     children = func_body(src, "static bool vfs_readdir_fill_android_children", 1400)

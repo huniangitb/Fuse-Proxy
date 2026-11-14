@@ -577,6 +577,23 @@ static void parse_global_switch_rule(AppConfig* cur, bool* field, const char* na
     *field = nsp_switch_on(val);
 }
 
+/* SANDBOX_ANDROID_TREE：旧版的 /Android 口径开关，存量配置里可能还留着这一行。
+   沙盒对 /Android 只有一种口径（非私有目录一律进镜像），故本行只做兼容：照常
+   吃掉值与行尾、不报错、不影响任何行为，每个命中行告警一条，便于取证时确认
+   该行已不再生效。 */
+static void parse_retired_sandbox_android_tree(AppConfig* cur, char* p_ptr, int line_num,
+                                               const char* file_path) {
+    (void)get_next_token(&p_ptr);
+    if (cur != &g_global_cfg_stage) {
+        LOG_WRN("SANDBOX_ANDROID_TREE 已废弃且仅 [GLOBAL] 段有效，已忽略（行 %d, 文件 %s）",
+                line_num, file_path);
+        return;
+    }
+    LOG_WRN("SANDBOX_ANDROID_TREE 已废弃并忽略（行 %d, 文件 %s）：沙盒对 /Android 只有"
+            "一种口径，不再由该开关切换",
+            line_num, file_path);
+}
+
 /* FUSE_EXTRA_ARGS：仅 [GLOBAL] 段有效；取行尾原样内容（不分词，上限 512 字节） */
 static void parse_fuse_extra_args_rule(AppConfig* cur, char* p_ptr, int line_num,
                                        const char* file_path) {
@@ -904,7 +921,7 @@ static void parse_config_line(AppConfig* cur, char* line, int user_id, int line_
     else if (strcmp(tok, "ALLOW_CROSS_APP_DATA") == 0)
         parse_global_switch_rule(cur, &cur->allow_cross_app_data, tok, p_ptr, line_num, file_path);
     else if (strcmp(tok, "SANDBOX_ANDROID_TREE") == 0)
-        parse_global_switch_rule(cur, &cur->sandbox_android_tree, tok, p_ptr, line_num, file_path);
+        parse_retired_sandbox_android_tree(cur, p_ptr, line_num, file_path);
     else if (strcmp(tok, "ALLOW_CROSS_APP_BY_CAPABILITY") == 0)
         parse_global_switch_rule(cur, &cur->allow_cross_by_capability, tok, p_ptr, line_num,
                                  file_path);
