@@ -8,10 +8,38 @@ CFG=$VR/config
 BIN=$VR/bin
 STAGE=$VR/staging
 MODCFG=$CFG/modules/ftp_module
+PLOG=$VR/probe-logs
 PROD_MOD=/data/adb/modules/Namespace-Proxy
 DAEMONS="rule_server log_monitor injector fuse_daemon"
+EMU=/storage/emulated
+PASS_THROUGH=/mnt/pass_through
+PROBE_PKGS="nsp.probe.ftp nsp.probe.sftp nsp.probe.iso nsp.probe.plain nsp.probe.hide nsp.probe.unlink nsp.probe.race"
 
 die() { echo "VERIFY-FATAL: $*" >&2; exit 1; }
+log() { echo "VERIFY: $*"; }
+
+# 项目 FUSE 挂在外部存储视图上的挂载点。判据与探针一致：挂载点本身被换成项目的
+# fuse_daemon（fstype 为 fuse 或 fuse.fuse_daemon）。/mnt/nsp_global 不在判据内。
+fuse_view_points() {
+    awk '$0 ~ / - fuse/ { print $5 }' /proc/self/mountinfo 2>/dev/null \
+        | grep -E "^(${EMU}|/mnt/(user|installer|androidwritable)/[0-9]+/emulated)$"
+}
+
+# 挂载点当前是否有任何挂载（自底向上任一层都算）
+mount_point_present() {
+    awk -v mp="$1" '{ n = split($0, f, " "); if (n >= 5 && f[5] == mp) { found = 1 } } END { exit(found ? 0 : 1) }' \
+        /proc/self/mountinfo 2>/dev/null
+}
+
+# 探针结果文件的候选落点，顺序即优先级：
+#   1. 公共临时目录（root 预建、目录 777，文件按包预建后交给该应用 uid）
+#   2. 应用内部私有目录（不经 FUSE，任何视图故障都写得进去）
+#   3. 外部私有目录（经 FUSE；只作兼容兜底，视图故障时本来就写不进去）
+probe_log_candidates() {
+    echo "$PLOG/$1.log"
+    echo "/data/data/$1/files/nsp_probe.log"
+    echo "/data/media/0/Android/data/$1/files/nsp_probe.log"
+}
 
 # 探针在设备上可能留下的全部落点。每次验证结束（含异常中止）都按这张表清一遍，
 # 设计目标是「跑完即净」——不需要人再手工收拾上一轮的残留。
@@ -27,14 +55,15 @@ clean_artifacts() {
           /data/media/0/Pictures/nsp_probe_sandbox.jpg \
           /data/media/0/Android/nsp_probe_sandbox.txt
     rm -f /data/media/0/Download/nsp_race_a*.txt
-    for _pkg in nsp.probe.iso nsp.probe.race nsp.probe.plain; do
+    for _pkg in $PROBE_PKGS; do
         _base=/data/media/0/Android/data/$_pkg
         case "$_base" in /data/media/0/*) ;; *) die "清理路径异常: $_base" ;; esac
-        rm -rf "$_base/sandbox" "$_base/files/nsp_probe.log"
+        rm -rf "$_base/sandbox" "$_base/files/nsp_probe.log" \
+               "/data/data/$_pkg/files/nsp_probe.log"
         rm -rf "/data/media/0/Android/obb/$_pkg" "/data/media/0/Android/media/$_pkg"
     done
+    rm -f "$PLOG"/*.log
 }
-log() { echo "VERIFY: $*"; }
 
 need_root() { [ "$(id -u)" = 0 ] || die "需要 root 执行"; }
 
@@ -51,7 +80,7 @@ wait_gone() {
             [ -n "$_pid" ] && _left="$_left $_p:$_pid"
         done
         [ -z "$_left" ] && return 0
-        sleep 1
+        sleep 0.2
         _n=$((_n + 1))
     done
     echo "$_left"
@@ -68,13 +97,13 @@ stop_all() {
             kill -TERM $_pid 2>/dev/null
         fi
     done
-    if ! _left=$(wait_gone "$_names" 10); then
+    if ! _left=$(wait_gone "$_names" 50); then
         log "强制结束 $_label 残留:$_left"
         for _p in $_names; do
             _pid=$(pid_of "$_p")
             [ -n "$_pid" ] && kill -9 $_pid 2>/dev/null
         done
-        sleep 1
+        sleep 0.5
     fi
     for _p in $_names; do
         _pid=$(pid_of "$_p")
@@ -100,15 +129,24 @@ preflight)
     echo "prod_rulesrv=$(pid_of rule_server)"
     [ -f "$PROD_MOD/service.sh" ] && echo "prod_service=1" || echo "prod_service=0"
     echo "prod_cfg_sha=$(sha256sum /data/Namespace-Proxy/injector.conf 2>/dev/null | cut -d' ' -f1)"
+    echo "view_fuse=$(fuse_view_points | tr '\n' ',' | sed 's/,$//')"
+    echo "inject_method=$(cat /data/Namespace-Proxy/inject_method 2>/dev/null | tr -d '[:space:]')"
     ;;
 prepare-dirs)
     need_root
     [ -L "$VR" ] && die "拒绝：$VR 是符号链接"
-    mkdir -p "$VR" "$BIN" "$CFG/log" "$MODCFG" "$STAGE/bin" "$STAGE/modules/ftp_module" || die "mkdir 失败"
+    mkdir -p "$VR" "$BIN" "$CFG/log" "$MODCFG" "$STAGE/bin" "$STAGE/modules/ftp_module" "$PLOG" \
+        || die "mkdir 失败"
     chmod 755 "$VR"
-    chmod 777 "$STAGE" "$STAGE/bin" "$STAGE/modules" "$STAGE/modules/ftp_module"
+    chmod 777 "$STAGE" "$STAGE/bin" "$STAGE/modules" "$STAGE/modules/ftp_module" "$PLOG"
     chmod 700 "$CFG"
-    echo "PREPARED_DIRS"
+    # 探针是 untrusted_app：/data/local/tmp 的默认标签（shell_data_file）对它只读，
+    # 写结果文件会 EACCES。目录按 app_data_file 贴标后，配上 777 与逐文件 chown，
+    # 探针才能以自己身份追加（改标前 EACCES、改标后可写，实测两态都验过）。
+    if command -v chcon >/dev/null 2>&1; then
+        chcon u:object_r:app_data_file:s0 "$PLOG" 2>/dev/null || true
+    fi
+    echo "PREPARED_DIRS probe_log_dir=$PLOG"
     ;;
 prepare)
     need_root
@@ -156,7 +194,21 @@ prepare-app-dirs)
     if command -v chcon >/dev/null 2>&1; then
         chcon -R u:object_r:media_rw_data_file:s0 "$_base" 2>/dev/null || true
     fi
+    # 公共日志落点按包预建空文件并交给该应用 uid：目录本身是 777，探针进程以
+    # 自己身份追加，宿主（root）负责取回与删除。
+    : > "$PLOG/$_pkg.log" 2>/dev/null || die "预建 $_pkg 日志文件失败"
+    chown "$_uid:$_uid" "$PLOG/$_pkg.log" || die "chown $_pkg 日志文件失败"
+    chmod 600 "$PLOG/$_pkg.log"
     echo "APP_DIRS_READY $_pkg uid=$_uid"
+    ;;
+# 公共日志落点是否真能被该应用 uid 写入——SELinux 对 /data/local/tmp 下的
+# untrusted_app 写入有自己的口径，这里只报事实（ls -Z 的上下文 + 目录权限），
+# 能不能写由探针自己回报。
+probe-log-perm)
+    need_root
+    [ -n "${2:-}" ] || die "用法: probe-log-perm <pkg>"
+    ls -ldZ "$PLOG" "$PLOG/$2.log" 2>&1
+    echo "SELINUX=$(getenforce 2>/dev/null || echo unknown)"
     ;;
 clean-fixtures)
     need_root
@@ -186,7 +238,7 @@ race-scan)
     need_root
     _pkg=${2:-nsp.probe.race}
     _list_ids() {
-        _out=$(ls "$1" 2>/dev/null | grep -E "^$2[0-9]+\.txt\$" | sed -E "s/^$2//; s/\.txt\$//" | tr '\n' ',')
+        _out=$(ls "$1" 2>/dev/null | grep -E "^$2[0-9]+\.txt$" | sed -E "s/^$2//; s/\.txt$//" | tr '\n' ',')
         _out=${_out%,}
         [ -n "$_out" ] && echo "$_out" || echo "-"
     }
@@ -232,8 +284,7 @@ unlink-fixture)
     # hidden_legacy 两步）。
     _d=/data/media/0/nsp_verify/unlink
     mkdir -p "$_d" || die "创建 unlink 夹具目录失败"
-    printf 'NSP_LEGACY_HIDDEN
-' > "$_d/.fuse_hidden0000000000000001" || die "写隐藏名夹具失败"
+    printf 'NSP_LEGACY_HIDDEN\n' > "$_d/.fuse_hidden0000000000000001" || die "写隐藏名夹具失败"
     chmod 755 /data/media/0/nsp_verify "$_d"
     chmod 644 "$_d/.fuse_hidden0000000000000001"
     echo "UNLINK_FIXTURE_READY"
@@ -251,6 +302,52 @@ stop-prod)
     stop_all "$DAEMONS" "生产"
     echo "PROD_STOPPED"
     ;;
+# 停掉生产实例后，外部存储视图上留着的是它做的全局替换挂载：fuse_daemon 已退出，
+# 这些挂载点一律 ENOTCONN，而它们又经共享传播出现在新起的应用命名空间里，探针
+# 进程因此永远等不到 v1 挂载。本动作把视图恢复成 vold 的原生树（pass_through 是
+# 真实 f2fs 树），验证实例随后才能在干净的底上做逐应用挂载。
+# 只卸本项目自己的 fuse 挂载点、只补 bind，不动任何数据；生产实例重启后会从这层
+# 原生视图重新做全局替换。
+restore-system-view)
+    need_root
+    _detached=0
+    _bound=0
+    _users=""
+    # 四条挂载点同属一个 peer group：卸掉共享顶点后其余几条会一起消失，因此先卸
+    # /storage/emulated，再按剩余列表补卸（已消失的会报 EINVAL，属预期）。
+    if fuse_view_points | grep -qx "$EMU"; then
+        umount -l "$EMU" 2>/dev/null && _detached=$((_detached + 1))
+    fi
+    for _mp in $(fuse_view_points); do
+        case "$_mp" in
+            /mnt/user/*/emulated|/mnt/installer/*/emulated|/mnt/androidwritable/*/emulated)
+                umount -l "$_mp" 2>/dev/null && _detached=$((_detached + 1))
+                ;;
+        esac
+    done
+    for _mp in $EMU /mnt/user/*/emulated /mnt/installer/*/emulated /mnt/androidwritable/*/emulated; do
+        [ -d "$_mp" ] || continue
+        _user=$(echo "$_mp" | sed -n 's|.*/\([0-9][0-9]*\)/emulated$|\1|p')
+        [ -n "$_user" ] || _user=0
+        _src=$PASS_THROUGH/$_user/emulated
+        [ -d "$_src" ] || continue
+        mount_point_present "$_mp" && continue
+        mount --bind "$_src" "$_mp" 2>/dev/null && _bound=$((_bound + 1))
+        mount --make-shared "$_mp" 2>/dev/null
+        _users="$_users $_user"
+    done
+    _left=$(fuse_view_points | wc -l | tr -d ' ')
+    _ready=0
+    if [ "$_left" = 0 ] && ls "$EMU/0" >/dev/null 2>&1; then
+        _ready=1
+    fi
+    echo "SYSTEM_VIEW_DETACHED=$_detached"
+    echo "SYSTEM_VIEW_BOUND=$_bound"
+    echo "SYSTEM_VIEW_FUSE_LEFT=$_left"
+    echo "SYSTEM_VIEW_USERS=$(echo $_users | tr ' ' ',')"
+    echo "SYSTEM_VIEW_READY=$_ready"
+    [ "$_ready" = 1 ] || die "系统存储视图未能恢复（残留 FUSE 挂载 $_left 条）"
+    ;;
 start-verify)
     need_root
     [ -x "$BIN/injector" ] || die "缺少 $BIN/injector"
@@ -260,18 +357,25 @@ start-verify)
         [ -n "$_pid" ] && die "$_p 已在运行（验证前必须为空）"
     done
     cd "$BIN" || die "cd $BIN 失败"
+    _t0=$(date +%s%N 2>/dev/null | cut -c1-13)
     if [ -x "$BIN/log_monitor" ]; then
         "$BIN/log_monitor" >/dev/null 2>&1 &
     fi
-    sleep 1
+    _n=0
+    while [ "$_n" -lt 50 ]; do
+        [ -n "$(pid_of log_monitor)" ] && break
+        sleep 0.1
+        _n=$((_n + 1))
+    done
     "$BIN/injector" --passive --inject-method=v1 debug >"$CFG/log/verify_injector.out" 2>&1 &
     _n=0
-    while [ "$_n" -lt 20 ]; do
+    while [ "$_n" -lt 200 ]; do
         if [ -n "$(pid_of injector)" ] && [ -n "$(pid_of fuse_daemon)" ]; then
-            echo "VERIFY_STARTED injector=$(pid_of injector) fuse=$(pid_of fuse_daemon)"
+            _t1=$(date +%s%N 2>/dev/null | cut -c1-13)
+            echo "VERIFY_STARTED injector=$(pid_of injector) fuse=$(pid_of fuse_daemon) ready_ms=$((_t1 - _t0))"
             exit 0
         fi
-        sleep 1
+        sleep 0.1
         _n=$((_n + 1))
     done
     echo "--- verify_injector.out ---" >&2
@@ -286,17 +390,29 @@ stop-verify)
 start-prod)
     need_root
     [ -f "$PROD_MOD/service.sh" ] || die "未找到 $PROD_MOD/service.sh"
+    _t0=$(date +%s%N 2>/dev/null | cut -c1-13)
     sh "$PROD_MOD/service.sh" >/dev/null 2>&1 &
     _n=0
-    while [ "$_n" -lt 40 ]; do
-        if [ -n "$(pid_of injector)" ]; then
-            echo "PROD_STARTED injector=$(pid_of injector)"
-            exit 0
-        fi
-        sleep 1
+    while [ "$_n" -lt 400 ]; do
+        [ -n "$(pid_of injector)" ] && break
+        sleep 0.1
         _n=$((_n + 1))
     done
-    die "生产服务未在 40s 内启动"
+    [ -n "$(pid_of injector)" ] || die "生产服务未在 40s 内启动"
+    # 全局替换是异步补上的：注入器起来之后还要等它把视图换回去。宿主据此判断
+    # 「生产服务恢复」是否真的恢复到了项目视图，而不是只有进程在。
+    _view=native
+    _n=0
+    while [ "$_n" -lt 150 ]; do
+        if fuse_view_points | grep -qx "$EMU"; then
+            _view=fuse
+            break
+        fi
+        sleep 0.1
+        _n=$((_n + 1))
+    done
+    _t1=$(date +%s%N 2>/dev/null | cut -c1-13)
+    echo "PROD_STARTED injector=$(pid_of injector) view=$_view ready_ms=$((_t1 - _t0))"
     ;;
 keep-awake)
     need_root
@@ -326,16 +442,140 @@ launch)
     need_root
     [ -n "${2:-}" ] || die "用法: launch <pkg>"
     am force-stop "$2" >/dev/null 2>&1
-    sleep 1
+    # 先清掉上几轮的结果文件：不清的话宿主可能读到上一轮的 done 行，把没跑完的
+    # 这一轮当成已收尾。日志逐行独立追加，进程中途被杀也留得住已产出的行。
+    for _f in $(probe_log_candidates "$2"); do
+        rm -f "$_f"
+    done
+    sleep 0.2
     # 广播触发，不起界面：进程被拉起时 Application.onCreate 就把整例检查跑完，
-    # 结果同时进 logcat 与该应用私有目录下的 nsp_probe.log。走界面会被屏幕休眠
-    # 冻结（isFrozen=true）卡在中途——广播没有这个依赖，也不占前台。
+    # 结果写进公共临时目录里的结果文件（logcat 只留一份副本做崩溃取证）。走界面会
+    # 被屏幕休眠冻结（isFrozen=true）卡在中途——广播没有这个依赖，也不占前台。
     _out=$(am broadcast -a nsp.probe.RUN -n "$2/nsp.probe.ProbeReceiver" 2>&1)
     echo "$_out"
     case "$_out" in
         *"Broadcast completed"*) echo "TRIGGERED $2" ;;
         *) die "触发 $2 失败" ;;
     esac
+    ;;
+# 等待探针把 done 行写进结果文件。整轮等待在设备侧完成：宿主一次调用就能拿到
+# 结果，不必按秒 dump 整份 logcat（那是上一版验收路径最大的时间黑洞）。
+wait-probe-log)
+    need_root
+    [ -n "${2:-}" ] || die "用法: wait-probe-log <pkg> [timeout_ms]"
+    _pkg=$2
+    _to=${3:-25000}
+    _max=$((_to / 100))
+    _n=0
+    _gone=0
+    while [ "$_n" -lt "$_max" ]; do
+        for _f in $(probe_log_candidates "$_pkg"); do
+            if [ -f "$_f" ] && grep -q '|step=done|' "$_f" 2>/dev/null; then
+                echo "WAIT=done"
+                echo "LOG=$_f"
+                cat "$_f"
+                exit 0
+            fi
+        done
+        if [ -z "$(pid_of "$_pkg")" ]; then
+            _gone=$((_gone + 1))
+            # 进程没了、done 还没出现：可能正好在收尾，给 0.5s 宽限再判死。
+            if [ "$_gone" -ge 5 ]; then
+                echo "WAIT=proc_gone"
+                break
+            fi
+        else
+            _gone=0
+        fi
+        sleep 0.1
+        _n=$((_n + 1))
+    done
+    if [ "$_n" -ge "$_max" ]; then
+        echo "WAIT=timeout"
+    fi
+    for _f in $(probe_log_candidates "$_pkg"); do
+        if [ -f "$_f" ]; then
+            echo "LOG=$_f"
+            cat "$_f"
+            exit 0
+        fi
+    done
+    echo "LOG=-"
+    ;;
+probe-log)
+    need_root
+    [ -n "${2:-}" ] || die "用法: probe-log <pkg>"
+    for _f in $(probe_log_candidates "$2"); do
+        [ -f "$_f" ] || continue
+        echo "===== $_f ====="
+        cat "$_f"
+    done
+    echo "===== END ====="
+    ;;
+# 等事件通道出现订阅者：下游（MPM）是按退避重连的，守护进程刚起来时它可能还没连上，
+# 此刻发生的 media_refresh 会被直接丢弃（无活订阅者不排队）。
+wait-subscriber)
+    need_root
+    _ms=${2:-25000}
+    _ticks=$((_ms / 200))
+    _i=0
+    _line=""
+    while [ "$_i" -lt "$_ticks" ]; do
+        _line=$(grep -F "事件订阅已登记" "$CFG/log/sys.log" 2>/dev/null | tail -1)
+        [ -n "$_line" ] && break
+        sleep 0.2
+        _i=$((_i + 1))
+    done
+    if [ -n "$_line" ]; then
+        echo "SUBSCRIBER=yes"
+        echo "SUBSCRIBER_LINE=$_line"
+    else
+        echo "SUBSCRIBER=no"
+    fi
+    ;;
+# logcat 里找与事件通道相关的行（只作崩溃/链路证据，不作数据通道）。
+logcat-grep)
+    need_root
+    [ -n "${2:-}" ] || die "用法: logcat-grep <regex>"
+    echo "LOGCAT_PATTERN=$2"
+    logcat -d -t 4000 2>/dev/null | grep -E "$2" | tail -25
+    echo "LOGCAT_GREP_DONE"
+    ;;
+# 在验证实例自己的 sys.log 里找事件行（宿主断言用）。用固定字符串匹配，不当正则。
+sys-log-grep)
+    need_root
+    [ -n "${2:-}" ] || die "用法: sys-log-grep <text>"
+    echo "GREP_PATTERN=$2"
+    grep -F -- "$2" "$CFG/log/sys.log" 2>/dev/null | tail -40
+    echo "GREP_DONE"
+    ;;
+# 把验证实例的日志（sys.log / io.log / error.log / verify_injector.out …）复制到
+# 一个 shell 身份读得到的目录，供宿主 adb pull 取回。cleanup 会删掉验证根目录，
+# 所以这一步必须在清理之前做。
+export-logs)
+    need_root
+    _ex=$VR/export
+    rm -rf "$_ex"
+    mkdir -p "$_ex" || die "创建导出目录失败"
+    for _f in "$CFG"/log/*; do
+        [ -f "$_f" ] || continue
+        cp -f "$_f" "$_ex/" 2>/dev/null
+    done
+    chmod 755 "$VR"
+    chmod 755 "$_ex"
+    chmod 644 "$_ex"/* 2>/dev/null
+    echo "EXPORT_DIR=$_ex"
+    echo "EXPORT_FILES=$(ls "$_ex" 2>/dev/null | tr '
+' ',' | sed 's/,$//')"
+    ;;
+probe-log-drop)
+    need_root
+    for _pkg in $PROBE_PKGS; do
+        for _f in $(probe_log_candidates "$_pkg"); do
+            rm -f "$_f"
+        done
+    done
+    echo "PROBE_LOGS_DROPPED"
     ;;
 get-uid)
     need_root
@@ -381,6 +621,21 @@ hash-file)
         echo "SHA=-"
     fi
     ;;
+# MediaStore 查询：上传链路的最后一跳（FTP STOR 之后媒体库是否真的建了行）。
+# 只在验证链路里读，不写。
+media-row)
+    need_root
+    _pat=${2:-ftp_probe}
+    echo "===== media/external/file where _data like %$_pat% ====="
+    content query --uri content://media/external/file \
+        --projection _id:_data:_display_name:_size \
+        --where "_data LIKE '%$_pat%'" 2>&1 | head -20
+    echo "===== media/external/images where _data like %$_pat% ====="
+    content query --uri content://media/external/images/media \
+        --projection _id:_data:_display_name:_size \
+        --where "_data LIKE '%$_pat%'" 2>&1 | head -20
+    echo "MEDIA_QUERY_DONE"
+    ;;
 cleanup)
     need_root
     # 独立清理（验证根目录不存在）时，设备上跑着的是生产实例：它不能因为一次清理
@@ -397,9 +652,9 @@ cleanup)
     if [ "$_standalone" = 1 ] && [ -z "$(pid_of injector)" ] && [ -f "$PROD_MOD/service.sh" ]; then
         sh "$PROD_MOD/service.sh" >/dev/null 2>&1 &
         _n=0
-        while [ "$_n" -lt 40 ]; do
+        while [ "$_n" -lt 400 ]; do
             [ -n "$(pid_of injector)" ] && break
-            sleep 1
+            sleep 0.1
             _n=$((_n + 1))
         done
         if [ -n "$(pid_of injector)" ]; then
@@ -415,12 +670,17 @@ dump-logs)
     for _f in "$CFG/log/sys.log" "$CFG/log/io.log" "$CFG/log/module_errors.log" "$CFG/log/error.log" "$CFG/log/fuse_crash.log" "$CFG/log/verify_injector.out"; do
         [ -f "$_f" ] || continue
         echo "===== $_f ====="
-        tail -400 "$_f"
+        tail -200 "$_f"
+    done
+    for _pkg in $PROBE_PKGS; do
+        for _f in $(probe_log_candidates "$_pkg"); do
+            [ -f "$_f" ] || continue
+            echo "===== $_f ====="
+            tail -60 "$_f"
+        done
     done
     echo "===== logcat-NSP_PROBE ====="
-    logcat -d -v threadtime -s NSP_PROBE:I 2>/dev/null | tail -100
-    echo "===== logcat-injector ====="
-    logcat -d -v threadtime 2>/dev/null | grep -iE 'injector|fuse_daemon|Namespace' | tail -80
+    logcat -d -v threadtime -s NSP_PROBE:I 2>/dev/null | tail -60
     ;;
 status)
     echo "injector=$(pid_of injector)"
@@ -428,9 +688,10 @@ status)
     echo "log_monitor=$(pid_of log_monitor)"
     echo "rule_server=$(pid_of rule_server)"
     if [ -d "$VR" ]; then echo "verify_root=1"; else echo "verify_root=0"; fi
+    echo "view_fuse=$(fuse_view_points | tr '\n' ',' | sed 's/,$//')"
     ;;
 *)
-    echo "用法: $0 {preflight|prepare-dirs|prepare|reload-config|stop-prod|start-verify|stop-verify|start-prod|force-stop <pkg>|launch <pkg>|get-uid <pkg>|check-file <path>|read-file <path>|hash-file <path>|race-fixture <pkg>|race-scan [pkg]|keep-awake [timeout] [stayon]|restore-awake [timeout] [stayon]|cleanup|status}" >&2
+    echo "用法: $0 {preflight|prepare-dirs|prepare|prepare-app-dirs <pkg>|probe-log-perm <pkg>|reload-config|stop-prod|restore-system-view|start-verify|stop-verify|start-prod|force-stop <pkg>|launch <pkg>|wait-probe-log <pkg> [ms]|probe-log <pkg>|probe-log-drop|export-logs|get-uid <pkg>|check-file <path>|read-file <path>|hash-file <path>|media-row [pat]|race-fixture <pkg>|race-scan [pkg]|keep-awake [timeout] [stayon]|restore-awake [timeout] [stayon]|cleanup|dump-logs|status}" >&2
     exit 2
     ;;
 esac
