@@ -252,7 +252,7 @@ static bool br_pkg_same_base(const char* a, const char* b) {
    调用方既不可列举也不可打开（resolve 与 probe 同口径，与 HIDE 的"看不见 =
    打不开"一致）。旧实现只在 probe（readdir 条目过滤）生效，任何按名打开的
    命令（ls /sdcard/Android/data/<他包>、cat、copy、find -exec…）都能读到内容
-   ——用户报障的绕过点即在此，故 resolve 侧必须同样判。
+   ——这就是绕过点，故 resolve 侧必须同样判。
    不隔离的情形：调用方包名不可解析（空/system/unknown，root 与系统工具）、
    目录属主包与调用方**同 uid**（sharedUserId / 系统同进程宿主：Linux DAC 里就是
    同一个 app 身份，只按包名比较会把 android.process.media 读 Downloads 私有目录
@@ -567,8 +567,8 @@ static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path
 
 /* 生效沙盒的**声明作用域**（BR_SCOPE_NONE = 沙盒不生效）。ALLOW 能否豁免沙盒要用
    它：只有「不低於沙盒声明作用域」的 ALLOW 才放行——应用段显式 SANDBOX ON 时，
-   [GLOBAL] 的 ALLOW 不得在该应用里凿洞（用户报障：全局 ALLOW 一动，应用段沙盒/
-   HIDE 全体失效）。 */
+   [GLOBAL] 的 ALLOW 不得在该应用里凿洞（否则全局 ALLOW 一动，应用段沙盒/
+   HIDE 就全体失效）。 */
 static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* current_pkg);
 
 static void br_note_hide_rule(uid_t uid, const char* pkg, const char* sub_path);
@@ -988,8 +988,8 @@ static bool br_decl_present(AppConfig* cfg, AppConfig* cat, const char* sub_path
 
 /* 作用域优先（docs/config.md §2）：从应用段向 [GLOBAL] 逐层询问，**第一个**在查询轴
    上"说了话"的作用域决定结果。旧实现把 HIDE/RO 做三层并集、只有 REDIRECT 逐层比较，
-   于是「[GLOBAL] 的 HIDE 恒赢」——应用段 ALLOW 永远取消不掉全局 HIDE，用户报障
-   「单应用规则优先级没全局高」即此。 */
+   于是「[GLOBAL] 的 HIDE 恒赢」——应用段 ALLOW 永远取消不掉全局 HIDE，看起来
+   就像单应用规则的优先级低于全局。 */
 static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                             const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
                             uid_t uid, char* mkdir_out, size_t mkdir_sz, unsigned want,
@@ -1021,7 +1021,16 @@ static void br_ensure_sandbox_dir(const char* dir) {
     /* 落点经守卫出口补建：effective_uid 来自路径解析（无存在性校验的历史形态），
        若一级组件缺失不得替应用在存储根下 materialize 出目录（见 common.h）。
        非存储根落点（自定义 REDIRECT 目标）照旧递归创建。 */
-    if (access(dir, F_OK) != 0) common_mkdir_within_storage(dir, 0775);
+    if (access(dir, F_OK) == 0) return;
+    if (common_mkdir_within_storage(dir, 0775) == 0) return;
+    /* 补建失败不改裁决（后续 open/mkdir 以真实 errno 收场），但要留观测：
+       落点是我们自己改写的，应用侧只会看到「文件不在」，分不清是规则问题还是
+       目录没建起来。限速与本文件其它观测同节奏：首个命中与每 1024 次各一条。 */
+    int mkdir_errno = errno;
+    static atomic_ulong fail_seq;
+    unsigned long n = atomic_fetch_add_explicit(&fail_seq, 1, memory_order_relaxed) + 1;
+    if (n == 1 || (n & 1023u) == 0)
+        LOG_WRN("沙盒落点补建失败: %s errno=%d（累计 %lu 次）", dir, mkdir_errno, n);
 }
 
 /* 沙盒重定向的限速观测（WARN）：现场遇到 ENOENT 时先看这里——路径是被我们改写
@@ -1057,7 +1066,7 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
        关键修正：**低作用域的 ALLOW 不得豁免高作用域声明的沙盒**——应用段显式
        SANDBOX ON 时，[GLOBAL] 的 ALLOW 不能在该应用里凿洞（旧实现只要 phase ①
        命中 ANY ALLOW 就整体跳过 sandbox 分支，于是全局 ALLOW 一动，全局/应用段
-       声明的沙盒对同路径全线失效，用户报障「全局开沙盒时单应用不能继承」）。 */
+       声明的沙盒对同路径全线失效，应用段看起来就继承不到全局沙盒）。 */
     BrRuleScope decl_scope = BR_SCOPE_NONE;
     BrScopeDecl decl;
     br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, user_id, uid, mkdir_out, mkdir_sz,
