@@ -339,8 +339,8 @@ class SftpServer:
 def render_injector_conf(phase):
     lines = [
         "[GLOBAL]",
-        # iso 段断言「/Android 本身与其下条目进镜像」，那正是整树镜像口径；
-        # 该开关默认关，不写在这里 iso 的 /Android 条目就会落回真实目录。
+        # 遗留键：/Android 只有单一口径，这行照常解析但不改变落点。留在验证配置里
+        # 是为了让每次跑都覆盖「存量配置带这一行仍能正常起服务」这一条。
         "SANDBOX_ANDROID_TREE ON",
         "",
         "[nsp.probe.ftp]",
@@ -1101,7 +1101,7 @@ def self_test():
        "[nsp.probe.race]" in conf_a and "SANDBOX ON" in conf_a and "HIDE /nsp_race_b" in conf_a)
     ck("FTP 规则存在（前缀须等于模块段名）", "FTP /ftp_probe ftp_probe" in conf_a)
     ck("SANDBOX 规则存在", "SANDBOX ON" in conf_a)
-    ck("验证配置启用整树镜像口径", "SANDBOX_ANDROID_TREE ON" in conf_a)
+    ck("验证配置带遗留开关行", "SANDBOX_ANDROID_TREE ON" in conf_a)
     mod = render_module_conf(2121, 2222, "/tmp/x/upload")
     ck("模块配置含 ftp/sftp 段", "[ftp_probe]" in mod and "[sftp_probe]" in mod)
     ck("模块配置 proto=sftp", "proto = sftp" in mod)

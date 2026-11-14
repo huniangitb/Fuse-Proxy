@@ -52,6 +52,8 @@ public final class ProbeApp extends Application {
 
     private String pkg = "unknown";
     private String caseName = "plain";
+    /** 结果文件句柄（见 {@link #initSink()}），null 表示本进程不落文件。 */
+    private File sink;
 
     @Override
     public void onCreate() {
@@ -64,6 +66,7 @@ public final class ProbeApp extends Application {
             pkg = "unknown";
         }
         caseName = normalizeCase(lastSegment(pkg));
+        initSink();
         emit("start", true, "pkg=" + pkg);
         int steps = 0;
         try {
@@ -624,8 +627,51 @@ public final class ProbeApp extends Application {
     }
 
     private void emit(String step, boolean ok, String detail) {
-        Log.i(TAG, "case=" + caseName + "|step=" + sanitize(step)
-                + "|ok=" + (ok ? 1 : 0) + "|detail=" + sanitize(detail));
+        String line = "case=" + caseName + "|step=" + sanitize(step)
+                + "|ok=" + (ok ? 1 : 0) + "|detail=" + sanitize(detail);
+        Log.i(TAG, line);
+        appendSink(line);
+    }
+
+    /**
+     * 结果同时落一份文件：一行 logcat 一对一一行文件，宿主可直接 cat 取回，
+     * 不必再 dump 整份 logcat 过滤。每行独立 open/append，进程中途被杀也能留下
+     * 已经产出的行。
+     */
+    private void appendSink(String line) {
+        if (sink == null) {
+            return;
+        }
+        try (FileOutputStream out = new FileOutputStream(sink, true)) {
+            out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+            // 结果文件只是取回通道，写失败不影响检查本身。
+        }
+    }
+
+    /** 结果文件的位置；拿不到外部私有目录时退回内部私有目录。 */
+    private void initSink() {
+        File dir = null;
+        try {
+            dir = getExternalFilesDir(null);
+        } catch (Throwable ignored) {
+            dir = null;
+        }
+        if (dir == null) {
+            dir = getFilesDir();
+        }
+        if (dir == null) {
+            return;
+        }
+        //noinspection ResultOfMethodCallIgnored
+        dir.mkdirs();
+        File f = new File(dir, "nsp_probe.log");
+        try (FileOutputStream out = new FileOutputStream(f, false)) {
+            out.write(new byte[0]);
+        } catch (IOException ignored) {
+            return;
+        }
+        sink = f;
     }
 
     /** detail/step 内不得含 '|'；换行折成空格，超长截断。 */

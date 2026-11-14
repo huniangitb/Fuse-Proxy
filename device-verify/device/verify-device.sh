@@ -12,6 +12,28 @@ PROD_MOD=/data/adb/modules/Namespace-Proxy
 DAEMONS="rule_server log_monitor injector fuse_daemon"
 
 die() { echo "VERIFY-FATAL: $*" >&2; exit 1; }
+
+# 探针在设备上可能留下的全部落点。每次验证结束（含异常中止）都按这张表清一遍，
+# 设计目标是「跑完即净」——不需要人再手工收拾上一轮的残留。
+# 只删本验证链路自己造的东西：探针根目录、竞态夹具、沙盒镜像、三条私有目录样本、
+# 以及探针的结果文件。真实共享目录里的用户数据一律不碰。
+clean_artifacts() {
+    for _p in /data/media/0/nsp_verify /data/media/0/ftp_probe /data/media/0/sftp_probe \
+              /data/media/0/nsp_race_b /data/media/0/Android/nsp_probe_allow; do
+        case "$_p" in /data/media/0/*) ;; *) die "清理路径异常: $_p" ;; esac
+        rm -rf "$_p"
+    done
+    rm -f /data/media/0/Download/nsp_probe_sandbox.txt \
+          /data/media/0/Pictures/nsp_probe_sandbox.jpg \
+          /data/media/0/Android/nsp_probe_sandbox.txt
+    rm -f /data/media/0/Download/nsp_race_a*.txt
+    for _pkg in nsp.probe.iso nsp.probe.race nsp.probe.plain; do
+        _base=/data/media/0/Android/data/$_pkg
+        case "$_base" in /data/media/0/*) ;; *) die "清理路径异常: $_base" ;; esac
+        rm -rf "$_base/sandbox" "$_base/files/nsp_probe.log"
+        rm -rf "/data/media/0/Android/obb/$_pkg" "/data/media/0/Android/media/$_pkg"
+    done
+}
 log() { echo "VERIFY: $*"; }
 
 need_root() { [ "$(id -u)" = 0 ] || die "需要 root 执行"; }
@@ -138,18 +160,9 @@ prepare-app-dirs)
     ;;
 clean-fixtures)
     need_root
-    case /data/media/0/nsp_verify in /data/media/0/*) ;; *) die "夹具路径异常" ;; esac
-    rm -rf /data/media/0/nsp_verify /data/media/0/ftp_probe /data/media/0/sftp_probe
-    rm -rf /data/media/0/nsp_race_b
-    rm -f /data/media/0/Download/nsp_probe_sandbox.txt /data/media/0/Pictures/nsp_probe_sandbox.jpg
-    rm -f /data/media/0/Download/nsp_race_a*.txt
-    # iso 探针的沙盒判别夹具：真实 /Android 下必须留空、镜像里的旧结果要先清掉，
-    # 否则上一轮的落点会让这一轮的「有没有落真实目录」判断失效。
-    rm -f /data/media/0/Android/nsp_probe_sandbox.txt
-    rm -rf /data/media/0/Android/data/nsp.probe.iso/sandbox/Android
-    rm -f /data/media/0/Android/obb/nsp.probe.iso/nsp_probe_obb.txt
-    rm -f /data/media/0/Android/media/nsp.probe.iso/nsp_probe_media.txt
-    rm -rf /data/media/0/Android/nsp_probe_allow
+    # 每轮开始前先清干净上一轮的落点：镜像里的旧结果不清，「有没有落真实目录」
+    # 会被上一轮的残留判成命中。
+    clean_artifacts
     echo "FIXTURES_CLEANED"
     ;;
 race-fixture)
@@ -314,21 +327,14 @@ launch)
     [ -n "${2:-}" ] || die "用法: launch <pkg>"
     am force-stop "$2" >/dev/null 2>&1
     sleep 1
-    # 屏幕休眠时进程会被系统冻结（isFrozen=true），onCreate 停在中途不报错也不继续——
-    # 探针因此「只发了 start 就没了下文」。每次启动前唤醒并解锁，保证探针真在跑。
-    input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
-    wm dismiss-keyguard >/dev/null 2>&1
-    _out=$(am start -W -n "$2/nsp.probe.ProbeActivity" 2>&1)
+    # 广播触发，不起界面：进程被拉起时 Application.onCreate 就把整例检查跑完，
+    # 结果同时进 logcat 与该应用私有目录下的 nsp_probe.log。走界面会被屏幕休眠
+    # 冻结（isFrozen=true）卡在中途——广播没有这个依赖，也不占前台。
+    _out=$(am broadcast -a nsp.probe.RUN -n "$2/nsp.probe.ProbeReceiver" 2>&1)
     echo "$_out"
     case "$_out" in
-        *"Status: ok"*) echo "LAUNCHED $2" ;;
-        *"Status: timeout"*)
-            # 预期：v1 两段式补挂载把进程阻塞在 post-specialize（仍早于应用 Java
-            # 代码），am start -W 的 10s 等待可能先超时。探针是否跑完由宿主按
-            # logcat 的 done 行判定，不以此处为准。
-            echo "LAUNCHED_ASYNC $2"
-            ;;
-        *) die "启动 $2 失败" ;;
+        *"Broadcast completed"*) echo "TRIGGERED $2" ;;
+        *) die "触发 $2 失败" ;;
     esac
     ;;
 get-uid)
@@ -381,11 +387,7 @@ cleanup)
     if [ -d "$VR" ] && [ ! -L "$VR" ]; then
         rm -rf "$VR" || die "清理 $VR 失败"
     fi
-    rm -rf /data/media/0/nsp_verify /data/media/0/ftp_probe /data/media/0/sftp_probe
-    rm -rf /data/media/0/nsp_race_b
-    rm -rf /data/media/0/Android/data/nsp.probe.race/sandbox
-    rm -f /data/media/0/Download/nsp_probe_sandbox.txt /data/media/0/Pictures/nsp_probe_sandbox.jpg
-    rm -f /data/media/0/Download/nsp_race_a*.txt
+    clean_artifacts
     echo "CLEANED"
     ;;
 dump-logs)
