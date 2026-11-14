@@ -7,7 +7,7 @@ option('android_libfuse', type: 'combo', choices: ['subproject', 'prebuilt'], va
        description: 'Android 下 libfuse 来源：subproject=项目内子模块随主项目交叉编译（默认）；prebuilt=经 fuse3_root 传入预构建静态库')
 option('android_json_c', type: 'combo', choices: ['subproject', 'prebuilt'], value: 'subproject',
        description: 'Android 下 json-c 来源：subproject=项目内子模块经 cmake 随主项目交叉编译（默认）；prebuilt=经 fuse3_root 传入预构建静态库')
-option('curl_dir', type: 'string', value: '/home/bdy/curl-8.21.0', description: '预构建 libcurl 根（仅 android_curl=prebuilt 有效，含 lib/.libs/libcurl.a 与 include/）')
+option('curl_dir', type: 'string', value: '', description: '预构建 libcurl 根（仅 android_curl=prebuilt 有效，含 lib/.libs/libcurl.a 与 include/；默认留空，须经 -Dcurl_dir= 显式传入）')
 option('android_curl', type: 'combo', choices: ['subproject', 'prebuilt'], value: 'subproject',
        description: 'Android 下 libcurl 来源：subproject=项目内子模块经 cmake 随主项目交叉编译（默认）；prebuilt=经 curl_dir 传入预构建静态库')
 option('android_ndk_root', type: 'string', value: '',

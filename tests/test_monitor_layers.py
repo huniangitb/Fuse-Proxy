@@ -67,7 +67,7 @@ CONFIG_DIR_PAT = re.compile(
 # uid 参数带 "@self" 表示以驱动自身 pid 作 tid，覆盖 uid.map 未收录时的 /proc 回退
 # (配置, 原始路径, 期望 real 中的片段, 期望不在 real 中的片段) —— 沙盒/ALLOW 契约
 RESOLVE_CASES = [
-    # 应用显式 SANDBOX ON：共享目录也进沙盒（用户反馈的"Download/Pictures 该隔离"）
+    # 应用显式 SANDBOX ON：共享目录也进沙盒（Download/Pictures 同样隔离）
     ("sandbox.conf", 10123, "/0/Download/q.txt", "/0/Android/data/com.demo.app/sandbox/Download/q.txt", None),
     ("sandbox.conf", 10123, "/0/Pictures/p.jpg", "/0/Android/data/com.demo.app/sandbox/Pictures/p.jpg", None),
     ("sandbox.conf", 10123, "/0/Documents/d.docx", "/0/Android/data/com.demo.app/sandbox/Documents/d.docx", None),

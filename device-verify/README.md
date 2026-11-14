@@ -179,7 +179,7 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 - **SANDBOX 落点**是 `<STORAGE_BASE>/<user_id>/Android/data/<pkg>/sandbox`（`user_id` 为 0，不是应用 uid）。
 - **FTP 虚拟前缀必须等于模块配置段名**（如 `FTP /ftp_probe ftp_probe`）：模块按 `/<段名>` 匹配后端。
 - **SFTP 认证**：Android 侧 libssh2 以 mbedTLS 为后端，不解析 OpenSSH 私钥、也不从私钥提取公钥，
-  需 PEM 私钥 + 同目录 `<key_file>.pub`；模块已自动使用该 .pub（本次修复），`host_key_check` 保持 on。
+  需 PEM 私钥 + 同目录 `<key_file>.pub`；模块已自动使用该 .pub，`host_key_check` 保持 on。
 - 验证期间生产服务被暂停（v1 注入验证的前提）；已注入的其他应用需重启才能重新获得视图——仅在测试机执行。
 - 排障：`--keep` 保留 `/tmp/nsp_dev_verify.*/`（含 `logs/`、后端目录、`device-dump.txt`）；
   `--keep-apks` 保留探针。设备侧日志在 `/data/local/tmp/nsp_verify/config/log/`

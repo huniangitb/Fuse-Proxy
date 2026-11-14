@@ -818,8 +818,8 @@ def test_open_unlink_no_hidden():
     # 历史残留：磁盘上直接放一个 libfuse 隐藏名文件。本地路径已改为直删，不会
     # 产生新隐藏名；但这个文件可能来自「旧版本 daemon」或「下层 FUSE」
     # （设备上 /data/media 由 MediaProvider 的 FUSE 提供时，我们在下层 unlink
-    # 会让下层 libfuse 把名字改成 .fuse_hidden 等 RELEASE 再删——正是用户报的
-    # 「本体 + 一个 .fusexx」）。按用户要求：隐藏名不再隐藏、也不再清理，
+    # 会让下层 libfuse 把名字改成 .fuse_hidden 等 RELEASE 再删，于是同一个文件
+    # 在列举里出现两次：本体 + 一个 .fusexx）。隐藏名不隐藏、也不清理，
     # 列举里看得见、磁盘上留着，便于取证与手工回收。
     legacy = realdir / ".fuse_hidden0000000000000001"
     legacy.write_bytes(b"legacy")

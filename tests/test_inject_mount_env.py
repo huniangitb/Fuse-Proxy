@@ -1178,8 +1178,8 @@ def inner_main(argv):
                        dev_is(STORAGE_EMU, sys_dev, app2), timeout=10)
 
         # ── R15：v1 配置热生效（运行中应用热卸载 / 热挂载，无需杀进程） ──
-        # 用户报障（原话）：「不能实时生效 比如打开以后可修改配置必须得杀进程，
-        # V1挂载模式下，injector需要改进。」旧实现的两个缺口：
+        # 目标语义：运行中的应用跟随配置实时变化，不要求先杀进程（V1 挂载模式
+        # 最明显）。旧实现的两个缺口：
         #   ① src/config/config_parser.c:1416 的 diff 只比较「应用段 inject_enable
         #      翻转 / 全局开关」；规则内容、类别段与 App-rules 子文件的增删一律
         #      changed_count==0 → src/injector/injector.c:1459-1463 什么都不做 →
@@ -1320,8 +1320,6 @@ def inner_main(argv):
                        timeout=8)
 
         # ── R17：SKIP_SYSTEM_APPS 只在全局注入打开时才允许跳过 ──
-        # 用户报障（原话）：「会跳过对所有系统应用的处理，这个开关应该是只有在
-        # 全局注入打开的时候才生效，目前用户对其中应用手动设置规则也不会生效」。
         # 语义：v1 + GLOBAL_INJECT OFF + SKIP_SYSTEM_APPS ON（默认）时，被应用段
         # 显式点名的系统应用（uid<10000）必须照常注入——SKIP_SYSTEM_APPS 只管
         # "通配/全局注入波及"路径，不是"系统应用一律不处理"的总闸。

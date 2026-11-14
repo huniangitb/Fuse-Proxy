@@ -885,8 +885,8 @@ void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
 }
 
 /* ================= 配置热对账（v1 逐应用挂载的实时生效路径） =================
-   用户报障：「不能实时生效 比如打开以后可修改配置必须得杀进程，V1挂载模式下，
-   injector 需要改进。」旧实现只在 reload_config_rules_diff 判出「应用段
+   语义：运行中的应用也要立即跟随配置变化，不许要求先杀进程（V1 挂载模式下
+   最明显）。旧实现只在 reload_config_rules_diff 判出「应用段
    inject_enable 翻转 / 全局开关变化」时才动挂载：规则内容变化、类别段与
    App-rules 子文件的增删都被判成 changed_count==0 → handle_pending_reload
    什么都不做；而被动模式（真机必有 zygisk 上报）停掉周期扫描后，运行中的应用
