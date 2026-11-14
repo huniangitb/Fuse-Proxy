@@ -17,6 +17,8 @@ Android 13+ 用户态 FUSE 存储代理（root 模块二进制核心），C23 �
 
 ## 开发流程
 
+**分支**：默认分支是 `dev`（GitHub 默认分支，两个长期分支都开了保护，直接 `git push` 会被拒）。新功能一律从 `dev` 切 `feature/<名>`，做完开 PR **squash** 合回 `dev`，源分支随即删除；`main` 只接收 `dev` 的合并，不接直接提交。`dev` 是集成分支、不保证随时可交付，对外稳定版以 `main` 为准。完整规则见 `CONTRIBUTING.md` §1.1。
+
 1. 先读对应文档（见文首地图）。
 2. 按归属写代码：纯 libc 工具进 `src/core/nsp_util.c`；依赖全局（`g_real_root`/日志）进 `src/core/common.c`；跨进程常量进 `include/nsp_constants.h`、日志级别进 `include/nsp_log.h`（各自唯一出处，禁私刻副本）；新跨文件函数带域前缀。
 3. 改行为就地补用例：`python3 tests/run.py` 按改动自动选套件。**新套件须同时登记进 `tests/run.py` 的 `SUITE_MAP` 与 `LAYERS`**，否则 `test_docs_sync.py` 失败。
