@@ -22,10 +22,16 @@ import java.util.Arrays;
  * <p>在 {@link #onCreate()} 里同步执行（主线程，不新起线程）：Application 创建时
  * FUSE 视图已按 v1 注入本进程，探针因此看到的就是模块最终暴露给应用的存储视图。
  *
- * <p>每条结果是一行 logcat（tag = {@code NSP_PROBE}）：
+ * <p>每条结果同时写两处：公共临时目录里的结果文件（主通道）与 logcat（tag =
+ * {@code NSP_PROBE}，只作崩溃取证的副本）：
  * <pre>case=&lt;ftp|sftp|hide|iso|plain|unlink&gt;|step=&lt;name&gt;|ok=&lt;0|1&gt;|detail=&lt;...&gt;</pre>
  * {@code detail} 内不会出现 {@code '|'}（会被替换成 {@code '/'}），可含空格与逗号。
- * 最后一行 {@code step=done} 表示探针执行完毕，宿主可据此结束等待。
+ * 最后一行 {@code step=done} 表示探针执行完毕，宿主据此结束等待。
+ *
+ * <p>结果文件按 {@link #initSink()} 的候选顺序落盘：优先公共临时目录（
+ * {@code /data/local/tmp/nsp_verify/probe-logs}），其次应用内部私有目录，最后才是
+ * 经 FUSE 的外部私有目录。前两者不在被验证的存储视图内，FUSE 连接断掉时照样写得
+ * 进去——logcat 与外部目录都会在那种故障下一起失效，只有它们能留下证据。
  *
  * <p>场景由 {@code getPackageName()} 最后一段决定（nsp.probe.ftp → ftp）。
  *
@@ -50,10 +56,31 @@ public final class ProbeApp extends Application {
     /** 探针公共根目录（FUSE 视图内的路径）。 */
     public static final String ROOT = "/sdcard/nsp_verify";
 
+    /**
+     * 1x1 JPEG（160 字节）：媒体刷新链路只对媒体扩展名的落点发事件，
+     * 所以 ftp/sftp 场景除了文本探针还要上传一个真正的图片。
+     */
+    private static final byte[] JPEG_1PX = {
+            (byte)0xFF, (byte)0xD8, (byte)0xFF, (byte)0xE0, (byte)0x00, (byte)0x10, (byte)0x4A, (byte)0x46, (byte)0x49, (byte)0x46, (byte)0x00, (byte)0x01,
+            (byte)0x01, (byte)0x01, (byte)0x00, (byte)0x60, (byte)0x00, (byte)0x60, (byte)0x00, (byte)0x00, (byte)0xFF, (byte)0xDB, (byte)0x00, (byte)0x43,
+            (byte)0x00, (byte)0x08, (byte)0x06, (byte)0x06, (byte)0x07, (byte)0x06, (byte)0x05, (byte)0x08, (byte)0x07, (byte)0x07, (byte)0x07, (byte)0x09,
+            (byte)0x09, (byte)0x08, (byte)0x0A, (byte)0x0C, (byte)0x14, (byte)0x0D, (byte)0x0C, (byte)0x0B, (byte)0x0B, (byte)0x0C, (byte)0x19, (byte)0x12,
+            (byte)0x13, (byte)0x0F, (byte)0x14, (byte)0x1D, (byte)0x1A, (byte)0x1F, (byte)0x1E, (byte)0x1D, (byte)0x1A, (byte)0x1C, (byte)0x1C, (byte)0x20,
+            (byte)0x24, (byte)0x2E, (byte)0x27, (byte)0x20, (byte)0x22, (byte)0x2C, (byte)0x23, (byte)0x1C, (byte)0x1C, (byte)0x28, (byte)0x37, (byte)0x29,
+            (byte)0x2C, (byte)0x30, (byte)0x31, (byte)0x34, (byte)0x34, (byte)0x34, (byte)0x1F, (byte)0x27, (byte)0x39, (byte)0x3D, (byte)0x38, (byte)0x32,
+            (byte)0x3C, (byte)0x2E, (byte)0x33, (byte)0x34, (byte)0x32, (byte)0xFF, (byte)0xC0, (byte)0x00, (byte)0x0B, (byte)0x08, (byte)0x00, (byte)0x01,
+            (byte)0x00, (byte)0x01, (byte)0x01, (byte)0x01, (byte)0x11, (byte)0x00, (byte)0xFF, (byte)0xC4, (byte)0x00, (byte)0x14, (byte)0x00, (byte)0x01,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x09, (byte)0xFF, (byte)0xC4, (byte)0x00, (byte)0x14, (byte)0x10, (byte)0x01, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00, (byte)0x00,
+            (byte)0x00, (byte)0x00, (byte)0xFF, (byte)0xDA, (byte)0x00, (byte)0x08, (byte)0x01, (byte)0x01, (byte)0x00, (byte)0x00, (byte)0x3F, (byte)0x00,
+            (byte)0x2A, (byte)0x9F, (byte)0xFF, (byte)0xD9,
+    };
+
     private String pkg = "unknown";
     private String caseName = "plain";
-    /** 结果文件句柄（见 {@link #initSink()}），null 表示本进程不落文件。 */
-    private File sink;
+    /** 结果文件（见 {@link #initSink()}）：全部成功打开的落点都写一份。 */
+    private final java.util.ArrayList<File> sinks = new java.util.ArrayList<>();
 
     @Override
     public void onCreate() {
@@ -136,6 +163,20 @@ public final class ProbeApp extends Application {
             detail = "path=" + probe.getAbsolutePath() + " error=" + describe(t);
         }
         emit("read", ok, detail);
+        steps++;
+
+        // 媒体落点：daemon 只在扩展名是媒体时发 media_refresh，文本文件不会触发
+        // （见 fw_events.c 里「落点不是媒体…整条不发」），所以这里必须真写一张图。
+        File media = new File(dir, "probe_" + cs + ".jpg");
+        ok = false;
+        try {
+            writeBytes(media, JPEG_1PX);
+            ok = true;
+            detail = "path=" + media.getAbsolutePath() + " bytes=" + JPEG_1PX.length;
+        } catch (Throwable t) {
+            detail = "path=" + media.getAbsolutePath() + " error=" + describe(t);
+        }
+        emit("media", ok, detail);
         steps++;
 
         steps += listDirStep(dir);
@@ -634,44 +675,70 @@ public final class ProbeApp extends Application {
     }
 
     /**
-     * 结果同时落一份文件：一行 logcat 一对一一行文件，宿主可直接 cat 取回，
-     * 不必再 dump 整份 logcat 过滤。每行独立 open/append，进程中途被杀也能留下
-     * 已经产出的行。
+     * 结果同时落文件：一行 logcat 一对一一行文件，宿主可直接 cat 取回，不必再
+     * dump 整份 logcat 过滤。每行独立 open/append，进程中途被杀也能留下已经产出
+     * 的行；所有打开成功的落点都写一份，任一通道坏掉都还有别的能取回。
      */
     private void appendSink(String line) {
-        if (sink == null) {
-            return;
-        }
-        try (FileOutputStream out = new FileOutputStream(sink, true)) {
-            out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
-        } catch (IOException ignored) {
-            // 结果文件只是取回通道，写失败不影响检查本身。
+        for (File f : sinks) {
+            try (FileOutputStream out = new FileOutputStream(f, true)) {
+                out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+            } catch (IOException ignored) {
+                // 结果文件只是取回通道，写失败不影响检查本身。
+            }
         }
     }
 
-    /** 结果文件的位置；拿不到外部私有目录时退回内部私有目录。 */
+    /**
+     * 结果文件的位置，按优先级：
+     * <ol>
+     *   <li>{@code /data/local/tmp/nsp_verify/probe-logs/<pkg>.log}：公共临时目录，
+     *       由设备脚本预建并交给本应用 uid；不在被验证的存储视图内。</li>
+     *   <li>应用内部私有目录：不经 FUSE，FUSE 连接断掉时照样写得进去。</li>
+     *   <li>外部私有目录：经 FUSE，视图故障时写不进去，只作兼容兜底。</li>
+     * </ol>
+     * 每个落点的成败都会记进 {@code step=sink} 那一行：SELinux 允许写到哪里是设备
+     * 的事实，不能靠猜。全部失败时宿主只能退到 logcat（本进程仍会打一份）。
+     */
     private void initSink() {
-        File dir = null;
+        java.util.ArrayList<File> candidates = new java.util.ArrayList<>();
+        candidates.add(new File("/data/local/tmp/nsp_verify/probe-logs/" + pkg + ".log"));
         try {
-            dir = getExternalFilesDir(null);
+            File dir = getFilesDir();
+            if (dir != null) {
+                //noinspection ResultOfMethodCallIgnored
+                dir.mkdirs();
+                candidates.add(new File(dir, "nsp_probe.log"));
+            }
         } catch (Throwable ignored) {
-            dir = null;
+            // 取不到内部目录就少一个落点，不影响其余候选
         }
-        if (dir == null) {
-            dir = getFilesDir();
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir != null) {
+                //noinspection ResultOfMethodCallIgnored
+                dir.mkdirs();
+                candidates.add(new File(dir, "nsp_probe.log"));
+            }
+        } catch (Throwable ignored) {
+            // 同上
         }
-        if (dir == null) {
-            return;
+        java.util.ArrayList<String> status = new java.util.ArrayList<>();
+        for (File f : candidates) {
+            File parent = f.getParentFile();
+            if (parent != null) {
+                //noinspection ResultOfMethodCallIgnored
+                parent.mkdirs();
+            }
+            try (FileOutputStream out = new FileOutputStream(f, true)) {
+                out.write(new byte[0]);
+                sinks.add(f);
+                status.add(f.getAbsolutePath() + "=ok");
+            } catch (Throwable t) {
+                status.add(f.getAbsolutePath() + "=" + describe(t));
+            }
         }
-        //noinspection ResultOfMethodCallIgnored
-        dir.mkdirs();
-        File f = new File(dir, "nsp_probe.log");
-        try (FileOutputStream out = new FileOutputStream(f, false)) {
-            out.write(new byte[0]);
-        } catch (IOException ignored) {
-            return;
-        }
-        sink = f;
+        emit("sink", !sinks.isEmpty(), join(status.toArray(new String[0]), "; "));
     }
 
     /** detail/step 内不得含 '|'；换行折成空格，超长截断。 */

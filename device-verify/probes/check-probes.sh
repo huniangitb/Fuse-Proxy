@@ -71,6 +71,8 @@ DEX_LITERALS=(
     "hide/secret.txt"
     "fuse_daemon"
     "timeout_ms="
+    "probe-logs"
+    "nsp_probe.log"
     "phase_a"
     "phase_b"
     "write_denied"
@@ -223,6 +225,7 @@ done
 
 line "== probe log contract (runtime, logcat tag NSP_PROBE) =="
 line "line: case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>  (detail never contains '|')"
+line "all:      sink (结果文件落点与成败，见 ProbeApp.initSink)"
 line "ftp/sftp: start, mkdir, write, read, list, canary, done"
 line "hide:     start, phase_a OR (phase_b, write_denied), list, done"
 line "iso:      start, download, pictures, android_root, android_list, android_skel_data, android_skel_obb, android_skel_media, android_obb_own, android_media_own, android_allow, done"
