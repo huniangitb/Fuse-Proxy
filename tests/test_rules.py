@@ -512,6 +512,23 @@ def isolation_section():
          10123, [
         ("/0/Download/hi.txt", {"redir":1,"sandbox":0}),
     ], uid_map=own)
+    # ALLOW 与 HIDE 命中同一路径时的层内次序：ALLOW 优先，作用域比较不变
+    case("同层次序:应用段 ALLOW 压应用段 HIDE",
+         BASE + "[com.demo.app]\nHIDE /Download\nALLOW /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"resolve":0,"probe":0}),
+    ], uid_map=own)
+    case("同层次序:应用段仅 HIDE 仍隐藏",
+         BASE + "[com.demo.app]\nHIDE /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"resolve":1,"probe":1}),
+    ], uid_map=own)
+    case("同层次序:GLOBAL ALLOW 压 GLOBAL HIDE",
+         BASE + "HIDE /Download\nALLOW /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"resolve":0,"probe":0}),
+    ], uid_map=own)
+    case("同层次序:跨层仍按作用域（应用 HIDE 压 GLOBAL ALLOW）",
+         BASE + "ALLOW /Download\n[com.demo.app]\nHIDE /Download\n", 10123, [
+        ("/0/Download/hi.txt", {"resolve":1,"probe":1}),
+    ], uid_map=own)
     del os.environ["NSP_REAL_ROOT"]
     shutil.rmtree(ISO_DIR,ignore_errors=True)
 
@@ -546,6 +563,22 @@ REDIRECT /盘/图/ /Download/Pics/""", [
         ("嵌套:根文件","0/盘/hi.txt","hello"),
         ("嵌套:子文件","0/盘/图/1.jpg","img1"),
     ],"2.嵌套REDIRECT")
+
+    # ── ALLOW 与 HIDE 命中同一路径（同一作用域）：ALLOW 优先 ──
+    # 旧次序 HIDE > ALLOW 会把下面这条放行重新压回隐藏
+    run("""[GLOBAL] MONITOR OFF
+HIDE /Download
+ALLOW /Download""", [
+        ("AH:同层ALLOW目录可见","0/Download","EXISTS"),
+        ("AH:同层ALLOW读文件","0/Download/hi.txt","hello"),
+        ("AH:同层ALLOW列举","0/Download","LIST","hi.txt"),
+    ],"3a.ALLOW压HIDE")
+    # 对照：没有 ALLOW 时 HIDE 照旧（ALLOW 优先不得把 HIDE 一并放过）
+    run("""[GLOBAL] MONITOR OFF
+HIDE /Download""", [
+        ("AH:仅HIDE仍隐藏","0/Download/hi.txt","NOT_EXISTS"),
+        ("AH:仅HIDE不列举","0","NOT_LISTED","Download"),
+    ],"3b.仅HIDE")
 
     # ── ALLOW + REDIRECT ──
     run("""[GLOBAL] MONITOR OFF

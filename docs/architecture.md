@@ -257,8 +257,8 @@ FUSE 回调（如 getattr）
 
 | socket | 类型 | 方向 | 用途 |
 |---|---|---|---|
-| `nsp_fs_events` | `SOCK_DGRAM` | 服务端推送 | 客户端 `{"cmd":"SUBSCRIBE","reply":"<自己的抽象地址>","filter":{"types":[...]}}`，此后收 NDJSON 单行（≤1KB）：`write_done`/`write_denied`/`ping` |
-| `nsp_fs_query` | `SOCK_SEQPACKET` | 一问一答 | `{"cmd":"QUERY","v":1,"spath":"<绝对存储视图路径>","uid":N,"seq":N}` → `{"v","seq","ok","exists","denied","reason","spath","rpath","vol"}` |
+| `nsp_fs_events` | `SOCK_DGRAM` | 服务端推送 | 客户端 `{"cmd":"SUBSCRIBE","reply":"<自己的抽象地址>","filter":{"types":[...]}}`，此后收 NDJSON 单行（≤1KB）：`write_done`/`write_denied`/`media_refresh`/`ping` |
+| `nsp_fs_query` | `SOCK_SEQPACKET` | 一问一答 | `{"cmd":"QUERY","v":1,"spath":"<绝对存储视图路径>","uid":N,"seq":N}` → `{"v","seq","ok","exists","denied","reason","scope","rule","spath","rpath","vol"}`（`scope`/`rule` 是归因，见下） |
 
 **通道身份 ≠ 被查询身份**：两条 socket 都用 `SO_PEERCRED`/`SCM_CREDENTIALS` 校白名单（root(0)/system(1000)/media_rw(1023) + **自动解析的 MediaProvider 进程 uid** + `[GLOBAL] FUSE_EVENTS_UIDS` 追加），**只回答"对端有没有资格连"**；事件里的 `uid/pkg` 由 daemon 按被代理的调用者解析，QUERY 里的 `uid` 直接采信请求方声明的值（调用者是 MediaProvider 一侧，它知道真正发起扫描的应用是谁）。
 
@@ -273,11 +273,14 @@ FUSE 回调（如 getattr）
 | `rpath` | 真实落盘路径（仅诊断，**write_denied 不带**——文件没落盘） | `/data/media/0/Pictures/a.jpg` |
 
 `spath` 恒为**视图**口径（不受 `--root` 影响，唯一出口 `common_view_path()`），这样 REDIRECT 落点在对方看来仍是应用以为的那个路径域。`rename` 额外带 `src_vpath`/`src_spath`；`write_denied` 额外带 `errno`（`EROFS`/`ENOENT`/`EACCES`/`EPERM`/`ENAMETOOLONG`/`ENOSPC`/`EDQUOT`——容量不足也是"写没落盘"的可解释原因，而 `EIO` 一类瞬态错误属噪声不发）且**必须也带 `spath`**（写被拒时告诉对方"本应落在哪"）。
+**`media_refresh`：FUSE 侧主动要求「补一次媒体扫描」**（`write_done` 只说「有人写过」，本条说「这个落点现在需要立刻进媒体库」）。字段：`reason`（`redirect_write` = 写经 REDIRECT/沙盒改写了落点；`ftp_upload` = 后端模块（FTP）上传收尾成功）、`media`（`image`/`audio`/`video`，按落点扩展名判定，**非媒体文件整条不发**）、三域路径同上（`spath` 是喂扫描的视图路径）。触发点两处：命中改写的写操作在发布 `write_done` 后追发一条（落点与默认真实路径不同才算改写）；后端（FTP）写意图句柄的 FLUSH/FSYNC 收尾成功后发一条——后端内容不产生本地 `write` 事件，没有别的时机。订阅要显式在 `filter.types` 里带 `media_refresh`，不带就只收旧两类（新类型不会让旧订阅者出错）。
+
+**`scope`/`rule`：这条结论由谁裁决**（QUERY 的归因字段，目的是让对端在冲突时按 FUSE 真值让位，而不是自己另判）。`scope` ∈ `app`/`cat`/`global`/`none`（空 = 无规则/沙盒/隔离等无作用域声明的情形），`rule` ∈ `allow`/`hide`/`ro`/`redirect`/`sandbox`/`isolation`/`none`。两者**只描述归因、不参与判定**，与 `reason` 并列：`reason` 说「表现成什么」，`rule` 说「是谁让它这样」（`allow` 与 `redirect` 在 `is_redirect` 上都是 true，只有 `rule` 能分开「放行到自身」与「改写到别处」）。旧 daemon 的响应里没有这两个字段，对端按未知处理。
 
 **不变式**：
 
 - **IO 路径绝不阻塞**：埋点只做一次 `memcpy` 进 4096 槽有界环（满则丢最旧并累加 `dropped`），由独立线程 drain；发送一律 `MSG_DONTWAIT`，订阅者塞满就计数、连续失败 16 次摘除。无订阅者时事件不入环。
-- **200ms 同路径合并**：窗口自首次到达起算，last-wins（一次 open→多次 4KB 写→close 收敛成一条，扫描侧不会被逐块写放大成事件风暴）。`seq` 在发布时分配，丢弃/合并都会让它**跳号**——这正是消费端识别丢帧的信号；`ping` 每 5s 带"自上次心跳以来"的 `dropped` 增量。
+- **200ms 同路径合并**：窗口自首次到达起算，last-wins（一次 open→多次 4KB 写→close 收敛成一条，扫描侧不会被逐块写放大成事件风暴）。合并键是**事件类型 + 路径**：同一路径的 `write_done` 与 `media_refresh` 是两条独立事件，不互相覆盖。`seq` 在发布时分配，丢弃/合并都会让它**跳号**——这正是消费端识别丢帧的信号；`ping` 每 5s 带"自上次心跳以来"的 `dropped` 增量。
 - **判定不在这里**：QUERY 只调 `fw_acl_check`（访问控制）与 `fw_rules_resolve`（规则），自己不写任何 hidden/ro 判定；六类响应互不混淆，`ok=0`（不认识/无规则）与 `denied=1`（被规则拒绝）**不得复用**，拥塞另用 `busy=1`。
 - **exists 有 200ms TTL 缓存，且在该路径 `write_done` 时立即失效**——否则"刚写完立刻查"会拿到 `exists=0` 漏扫。处理器内除缓存未命中的一次 `lstat` 外不做阻塞 IO，绝不回调 MediaProvider。
 

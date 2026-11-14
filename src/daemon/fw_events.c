@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -73,7 +74,7 @@
 #define FW_EVENTS_RING_CAP 4096
 #define FW_EVENTS_PATH_MAX 256       /* fuse 视角路径 */
 #define FW_EVENTS_SPATH_MAX (MAX_PATH_LEN + 64) /* 视图绝对路径 */
-#define FW_EVENTS_RPATH_MAX 1024     /* 真实落盘路径（仅供诊断） */
+#define FW_EVENTS_RPATH_MAX 1024     /* 真实落盘路径（刷新事件的回退落点） */
 #define FW_EVENTS_FRAME_MAX 1024     /* 契约：单帧 ≤1KB */
 #define FW_EVENTS_MAX_REQ 512        /* 订阅帧上限（超长直接忽略） */
 
@@ -102,6 +103,7 @@
 #define FW_EV_MASK_DONE 0x1u
 #define FW_EV_MASK_DENIED 0x2u
 #define FW_EV_MASK_PING 0x4u
+#define FW_EV_MASK_REFRESH 0x8u
 
 #define FW_JPUT_FAIL ((size_t)-1)
 
@@ -204,12 +206,67 @@ static const char* fw_errno_name(int e) {
     }
 }
 
+static const char* fw_event_type_name(unsigned kind) {
+    switch (kind) {
+        case FW_EV_WRITE_DENIED: return "write_denied";
+        case FW_EV_PING: return "ping";
+        case FW_EV_MEDIA_REFRESH: return "media_refresh";
+        default: return "write_done";
+    }
+}
+
+static const char* fw_refresh_reason_name(unsigned reason) {
+    switch (reason) {
+        case FW_REFRESH_FTP_UPLOAD: return "ftp_upload";
+        default: return "redirect_write";
+    }
+}
+
+static const char* fw_media_kind_name(unsigned kind) {
+    switch (kind) {
+        case FW_MEDIA_IMAGE: return "image";
+        case FW_MEDIA_AUDIO: return "audio";
+        case FW_MEDIA_VIDEO: return "video";
+        default: return "other";
+    }
+}
+
+/* 按落点扩展名判媒体类别。判不出就返回 NONE，调用方据此不发刷新事件——宁可少
+   一次扫描，也不把非媒体文件推进对端的扫描队列。 */
+static uint8_t fw_media_kind_of(const char* path) {
+    static const struct {
+        const char* ext;
+        uint8_t kind;
+    } k_ext[] = {
+        {"jpg", FW_MEDIA_IMAGE},  {"jpeg", FW_MEDIA_IMAGE}, {"png", FW_MEDIA_IMAGE},
+        {"gif", FW_MEDIA_IMAGE},  {"webp", FW_MEDIA_IMAGE}, {"bmp", FW_MEDIA_IMAGE},
+        {"heic", FW_MEDIA_IMAGE}, {"heif", FW_MEDIA_IMAGE}, {"dng", FW_MEDIA_IMAGE},
+        {"avif", FW_MEDIA_IMAGE}, {"mp3", FW_MEDIA_AUDIO},  {"m4a", FW_MEDIA_AUDIO},
+        {"aac", FW_MEDIA_AUDIO},  {"flac", FW_MEDIA_AUDIO}, {"ogg", FW_MEDIA_AUDIO},
+        {"wav", FW_MEDIA_AUDIO},  {"opus", FW_MEDIA_AUDIO}, {"amr", FW_MEDIA_AUDIO},
+        {"awb", FW_MEDIA_AUDIO},  {"mp4", FW_MEDIA_VIDEO},  {"mkv", FW_MEDIA_VIDEO},
+        {"mov", FW_MEDIA_VIDEO},  {"3gp", FW_MEDIA_VIDEO},  {"webm", FW_MEDIA_VIDEO},
+        {"m4v", FW_MEDIA_VIDEO},  {"ts", FW_MEDIA_VIDEO},
+    };
+    if (!path) return FW_MEDIA_NONE;
+    const char* dot = strrchr(path, '.');
+    if (!dot || dot[1] == '\0') return FW_MEDIA_NONE;
+    /* 点必须落在最后一个路径分隔符之后：目录名里的点不算扩展名 */
+    if (strchr(dot, '/')) return FW_MEDIA_NONE;
+    const char* ext = dot + 1;
+    for (size_t i = 0; i < sizeof k_ext / sizeof k_ext[0]; i++) {
+        if (strcasecmp(ext, k_ext[i].ext) == 0) return k_ext[i].kind;
+    }
+    return FW_MEDIA_NONE;
+}
+
 /* ================== 事件记录与渲染 ================== */
 
 typedef struct {
-    uint8_t kind; /* FwEventKind */
-    uint8_t op;   /* FwEventOp */
-    int32_t err;  /* 正 errno（仅 write_denied） */
+    uint8_t kind;   /* FwEventKind */
+    uint8_t op;     /* FwEventOp */
+    uint8_t reason; /* FwRefreshReason（仅 media_refresh） */
+    int32_t err;    /* 正 errno（仅 write_denied） */
     uint64_t seq;
     int64_t ts;
     uid_t uid;
@@ -226,6 +283,8 @@ typedef struct {
     uid_t uid;
     int err;
     uint32_t dropped;
+    uint8_t reason;     /* FwRefreshReason（仅 media_refresh） */
+    uint8_t media_kind; /* FwMediaKind（仅 media_refresh，按落点扩展名判定） */
     char pkg[128];
     char vpath[FW_EVENTS_PATH_MAX];
     char spath[FW_EVENTS_SPATH_MAX];
@@ -239,9 +298,7 @@ static size_t fw_format_event(const FwEvent* ev, char* out, size_t cap) {
     if (!ev || !out || cap < 2) return 0;
     out[0] = '\0';
     size_t n;
-    const char* type = (ev->kind == FW_EV_PING)
-                           ? "ping"
-                           : ((ev->kind == FW_EV_WRITE_DENIED) ? "write_denied" : "write_done");
+    const char* type = fw_event_type_name(ev->kind);
     n = fw_putf(out, cap, 0, "{\"v\":1,\"seq\":%llu,\"ts\":%lld,\"type\":\"%s\"",
                 (unsigned long long)ev->seq, (long long)ev->ts, type);
     if (n == FW_JPUT_FAIL) return 0;
@@ -253,6 +310,26 @@ static size_t fw_format_event(const FwEvent* ev, char* out, size_t cap) {
     if (n == FW_JPUT_FAIL) return 0;
     n = fw_put_str(out, cap, n, ev->pkg);
     if (n == FW_JPUT_FAIL) return 0;
+    if (ev->kind == FW_EV_MEDIA_REFRESH) {
+        /* 媒体刷新只带"扫哪里、哪一类、为什么"：op 是变更操作的口径，对刷新无意义 */
+        n = fw_putf(out, cap, n, ",\"reason\":\"%s\",\"media\":\"%s\"",
+                    fw_refresh_reason_name(ev->reason), fw_media_kind_name(ev->media_kind));
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_putf(out, cap, n, ",\"vpath\":");
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_put_str(out, cap, n, ev->vpath);
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_putf(out, cap, n, ",\"spath\":");
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_put_str(out, cap, n, ev->spath);
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_putf(out, cap, n, ",\"rpath\":");
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_put_str(out, cap, n, ev->rpath);
+        if (n == FW_JPUT_FAIL) return 0;
+        n = fw_putf(out, cap, n, "}");
+        return n == FW_JPUT_FAIL ? 0 : n;
+    }
     n = fw_putf(out, cap, n, ",\"op\":\"%s\"", fw_op_name(ev->op));
     if (n == FW_JPUT_FAIL) return 0;
     n = fw_putf(out, cap, n, ",\"vpath\":");
@@ -471,6 +548,29 @@ void fw_events_note_write_denied(uid_t uid, pid_t pid, const char* fuse_path, Ns
     fw_ring_wake();
 }
 
+void fw_events_note_media_refresh(uid_t uid, pid_t pid, const char* fuse_path, uint8_t reason) {
+    /* 与 write_done 同一道上限：关着通道时只花一次 relaxed 读；开着也要先看有没有
+       活订阅者，没有就不进队列（媒体扫描请求没有"事后补发"的意义） */
+    if (!atomic_load_explicit(&g_events_on, memory_order_relaxed)) return;
+    if (!fuse_path || !fuse_path[0]) return;
+    fw_exists_invalidate(fuse_path);
+    if (!fw_events_active()) return;
+    FwEventRec rec;
+    memset(&rec, 0, sizeof rec);
+    rec.kind = (uint8_t)FW_EV_MEDIA_REFRESH;
+    rec.reason = reason;
+    rec.seq = atomic_fetch_add(&g_seq, 1) + 1;
+    rec.ts = fw_wall_ms();
+    rec.uid = uid;
+    rec.pid = pid;
+    if (!fw_copy_path(rec.fuse_path, sizeof rec.fuse_path, fuse_path)) {
+        atomic_fetch_add(&g_ev_oversize_dropped, 1);
+        return;
+    }
+    fw_ring_push(&rec);
+    fw_ring_wake();
+}
+
 /* ================== 订阅者 ================== */
 
 typedef struct {
@@ -547,6 +647,44 @@ static void fw_send_to_subs(const char* frame, size_t len, unsigned mask_bit) {
     fw_update_hot();
 }
 
+/* 渲染 + 发送一帧。装不下返回 false（调用方决定丢帧还是裁字段重试）：
+   半截 JSON 会被对端当坏帧丢掉，还占着订阅者队列——所以绝不发半帧。 */
+static bool fw_emit_frame(const FwEvent* ev, unsigned mask_bit) {
+    char frame[FW_EVENTS_FRAME_MAX];
+    size_t n = fw_format_event(ev, frame, sizeof frame - 2);
+    if (n == 0 || n + 1 >= sizeof frame) return false;
+    frame[n++] = '\n'; /* NDJSON：一帧一行 */
+    frame[n] = '\0';
+    fw_send_to_subs(frame, n, mask_bit);
+    return true;
+}
+
+/* 在 base 的落点信息上补发一条 media_refresh。seq 单独取号：两条帧是两件事，
+   共用序号会让按 seq 去重的对端吃掉后一条。 */
+static void fw_emit_media_refresh(const FwEvent* base, uint8_t media_kind, uint8_t reason,
+                                  const char* fuse_path) {
+    FwEvent rev;
+    memset(&rev, 0, sizeof rev);
+    rev.kind = (FwEventKind)FW_EV_MEDIA_REFRESH;
+    rev.reason = reason;
+    rev.media_kind = media_kind;
+    rev.seq = atomic_fetch_add(&g_seq, 1) + 1;
+    rev.ts = fw_wall_ms();
+    rev.uid = base->uid;
+    snprintf(rev.pkg, sizeof rev.pkg, "%s", base->pkg);
+    snprintf(rev.vpath, sizeof rev.vpath, "%s", base->vpath);
+    snprintf(rev.spath, sizeof rev.spath, "%s", base->spath);
+    snprintf(rev.rpath, sizeof rev.rpath, "%s", base->rpath);
+    if (fw_emit_frame(&rev, FW_EV_MASK_REFRESH)) return;
+    /* 装不下先去掉 rpath 重试：它只是"FUSE 未注入时"的回退落点，spath 才是扫描必需项 */
+    if (rev.rpath[0]) {
+        rev.rpath[0] = '\0';
+        if (fw_emit_frame(&rev, FW_EV_MASK_REFRESH)) return;
+    }
+    atomic_fetch_add(&g_ev_oversize_dropped, 1);
+    LOG_DBG("媒体刷新帧超长已丢弃 (seq=%llu, path=%s)", (unsigned long long)rev.seq, fuse_path);
+}
+
 static void fw_emit(const FwEventRec* rec) {
     if (g_sub_count == 0) return;
     int user_id = -1;
@@ -559,6 +697,7 @@ static void fw_emit(const FwEventRec* rec) {
     memset(&ev, 0, sizeof ev);
     ev.kind = (FwEventKind)rec->kind;
     ev.op = (FwEventOp)rec->op;
+    ev.reason = rec->reason;
     ev.seq = rec->seq;
     ev.ts = rec->ts;
     ev.uid = rec->uid;
@@ -574,8 +713,14 @@ static void fw_emit(const FwEventRec* rec) {
         atomic_fetch_add(&g_ev_oversize_dropped, 1);
         return;
     }
-    if (rec->kind == FW_EV_WRITE_DONE) {
+    if (rec->kind == FW_EV_WRITE_DONE || rec->kind == FW_EV_MEDIA_REFRESH) {
         fw_resolve_real(rec->uid, rec->pid, rec->fuse_path, ev.rpath, sizeof ev.rpath);
+        ev.media_kind = fw_media_kind_of(ev.rpath);
+    }
+    /* 落点不是媒体（或根本解析不出落点）：刷新请求没有意义，整条不发——
+       对端多一次扫描就是多一次 MediaProvider 唤醒，宁可漏也别误报 */
+    if (rec->kind == FW_EV_MEDIA_REFRESH && ev.media_kind == FW_MEDIA_NONE) return;
+    if (rec->kind == FW_EV_WRITE_DONE) {
         if (rec->src_fuse[0]) {
             int src_user = -1;
             const char* src_sub = NULL;
@@ -591,19 +736,27 @@ static void fw_emit(const FwEventRec* rec) {
             }
         }
     }
-    char frame[FW_EVENTS_FRAME_MAX];
-    size_t n = fw_format_event(&ev, frame, sizeof frame - 2);
-    if (n == 0 || n + 1 >= sizeof frame) {
-        /* 帧装不下整条都不发：半截 JSON 会被对端当坏帧丢掉，还占着订阅者队列 */
+    unsigned mask = FW_EV_MASK_DONE;
+    if (rec->kind == FW_EV_WRITE_DENIED) mask = FW_EV_MASK_DENIED;
+    else if (rec->kind == FW_EV_MEDIA_REFRESH) mask = FW_EV_MASK_REFRESH;
+    if (!fw_emit_frame(&ev, mask)) {
         atomic_fetch_add(&g_ev_oversize_dropped, 1);
-        LOG_DBG("事件帧超长已丢弃 (seq=%llu, path=%s)", (unsigned long long)rec->seq,
-                rec->fuse_path);
+        LOG_DBG("事件帧超长已丢弃 (seq=%llu, path=%s)", (unsigned long long)ev.seq, rec->fuse_path);
         return;
     }
-    frame[n++] = '\n'; /* NDJSON：一帧一行 */
-    frame[n] = '\0';
-    fw_send_to_subs(frame, n,
-                    rec->kind == FW_EV_WRITE_DENIED ? FW_EV_MASK_DENIED : FW_EV_MASK_DONE);
+
+    /* 写落到"视图路径之外"才补一条 media_refresh：直通写在原地的文件本来就在扫描
+       器眼里，只有改写落点（REDIRECT/沙盒）才会让媒体库漏掉它。落点与默认存储
+       路径相同即未改写，此时 write_done 已经足够。 */
+    if (rec->kind == FW_EV_WRITE_DONE && ev.rpath[0] && ev.media_kind != FW_MEDIA_NONE) {
+        char def[FW_EVENTS_RPATH_MAX];
+        def[0] = '\0';
+        common_default_real_path(user_id, sub, def, sizeof def);
+        if (def[0] && strcmp(def, ev.rpath) != 0) {
+            fw_emit_media_refresh(&ev, ev.media_kind, (uint8_t)FW_REFRESH_REDIRECT_WRITE,
+                                  rec->fuse_path);
+        }
+    }
 }
 
 /* ================== 200ms 合并（drain 侧） ================== */
@@ -623,7 +776,10 @@ static void fw_coalesce_push(const FwEventRec* rec) {
     int free_slot = -1;
     for (int i = 0; i < FW_EVENTS_COALESCE_SLOTS; i++) {
         if (g_coalesce[i].used) {
-            if (strcmp(g_coalesce[i].rec.fuse_path, rec->fuse_path) == 0) {
+            /* 同路径同类别才合并：write_done 与 media_refresh 对同一文件是两件事
+               （一个说"写了"，一个说"现在必须进媒体库"），合并会吃掉后者 */
+            if (g_coalesce[i].rec.kind == rec->kind &&
+                strcmp(g_coalesce[i].rec.fuse_path, rec->fuse_path) == 0) {
                 g_coalesce[i].rec = *rec;
                 return;
             }
@@ -771,10 +927,12 @@ static void fw_handle_subscribe(const char* buf, const struct sockaddr_un* from,
     unsigned mask = FW_EV_MASK_PING;
     if (strstr(buf, "\"write_done\"")) mask |= FW_EV_MASK_DONE;
     if (strstr(buf, "\"write_denied\"")) mask |= FW_EV_MASK_DENIED;
+    if (strstr(buf, "\"media_refresh\"")) mask |= FW_EV_MASK_REFRESH;
     if (strstr(buf, "\"types\"")) {
-        if ((mask & (FW_EV_MASK_DONE | FW_EV_MASK_DENIED)) == 0) return; /* 空过滤：不登记 */
+        if ((mask & (FW_EV_MASK_DONE | FW_EV_MASK_DENIED | FW_EV_MASK_REFRESH)) == 0)
+            return; /* 空过滤：不登记 */
     } else {
-        mask |= FW_EV_MASK_DONE | FW_EV_MASK_DENIED; /* 无 filter = 全收 */
+        mask |= FW_EV_MASK_DONE | FW_EV_MASK_DENIED | FW_EV_MASK_REFRESH; /* 无 filter = 全收 */
     }
     /* reply 是客户端的**抽象**地址名：必须经 nsp_uds_abstract_addr 合成
        （sun_path[0]='\0' 才是抽象命名空间；直接把名字拷到 sun_path[0] 会变成
@@ -985,12 +1143,37 @@ static void fw_real_to_view(const char* real, int user_id, const char* fallback,
     snprintf(out, sz, "%s", fallback ? fallback : "");
 }
 
+static const char* fw_scope_name(uint8_t scope) {
+    switch (scope) {
+        case BR_SCOPE_APP: return "app";
+        case BR_SCOPE_CAT: return "cat";
+        case BR_SCOPE_GLOBAL: return "global";
+        default: return "none";
+    }
+}
+
+static const char* fw_rule_name(uint8_t kind) {
+    switch (kind) {
+        case NSP_RULE_ALLOW: return "allow";
+        case NSP_RULE_HIDE: return "hide";
+        case NSP_RULE_RO: return "ro";
+        case NSP_RULE_REDIRECT: return "redirect";
+        case NSP_RULE_SANDBOX: return "sandbox";
+        case NSP_RULE_ISOLATION: return "isolation";
+        default: return "none";
+    }
+}
+
 typedef struct {
     bool busy;
     bool ok;
     bool exists;
     bool denied;
     const char* reason;
+    /* 归因（引擎给的"谁说了算"）：reason 说明现象，scope/rule 说明来源。
+       对端据此判断"这条结论来自 FUSE 的规则裁决"还是"只是默认边界"。 */
+    const char* scope;
+    const char* rule;
     uint64_t seq;
     char spath[FW_EVENTS_SPATH_MAX];
     char rpath[FW_EVENTS_RPATH_MAX];
@@ -1013,6 +1196,9 @@ static size_t fw_format_query(const FwQueryResult* r, char* out, size_t cap) {
     n = fw_putf(out, cap, 0,
                 "{\"v\":1,\"seq\":%llu,\"ok\":1,\"exists\":%d,\"denied\":%d,\"reason\":\"%s\"",
                 (unsigned long long)r->seq, r->exists ? 1 : 0, r->denied ? 1 : 0, r->reason);
+    if (n == FW_JPUT_FAIL) return 0;
+    n = fw_putf(out, cap, n, ",\"scope\":\"%s\",\"rule\":\"%s\"", r->scope ? r->scope : "none",
+                r->rule ? r->rule : "none");
     if (n == FW_JPUT_FAIL) return 0;
     n = fw_putf(out, cap, n, ",\"spath\":");
     if (n == FW_JPUT_FAIL) return 0;
@@ -1047,6 +1233,8 @@ static size_t fw_query_handle(const char* req, char* out, size_t cap, bool conge
     memset(&r, 0, sizeof r);
     r.seq = has_seq ? seq : 0;
     r.reason = "none";
+    r.scope = "none";
+    r.rule = "none";
     if (!has_cmd || strcmp(cmd, "QUERY") != 0 || !has_spath || !has_uid) {
         /* 不认识的请求 / 缺字段：ok=0（与 denied 严格区分） */
         return fw_format_query(&r, out, cap);
@@ -1074,15 +1262,23 @@ static size_t fw_query_handle(const char* req, char* out, size_t cap, bool conge
     if (!d.valid || d.is_ftp) return fw_format_query(&r, out, cap); /* 无规则 / 后端：ok=0 */
 
     r.ok = true;
+    r.scope = fw_scope_name(d.rule_scope);
+    r.rule = fw_rule_name(d.rule_kind);
     if (acl == -ENOENT) {
         r.denied = true;
         /* 跨应用隔离与 HIDE 在 ACL 侧同口径（都回 ENOENT），但成因不同：
            隔离的判据在引擎（is_other_app_pkg），这里据实报告——否则真机上
            「他包 Android/data」会被误报成 hide，扫描侧看不出是隔离。 */
         r.reason = d.is_other_app_pkg ? "isolation" : "hide";
+        if (d.rule_kind == NSP_RULE_NONE) {
+            /* ACL 先于规则拒绝（例如骨架路径）：成因不在规则表里，据实报 */
+            r.rule = d.is_other_app_pkg ? "isolation" : "hide";
+        }
     } else if (acl != 0) {
         r.denied = true;
         r.reason = "isolation"; /* 存在但不许 */
+        r.scope = "none";       /* 访问控制是默认边界，不归任何规则作用域 */
+        r.rule = "isolation";
     } else if (d.appear_missing) {
         r.denied = true;
         r.reason = "hide";

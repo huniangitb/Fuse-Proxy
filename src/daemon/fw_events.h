@@ -25,6 +25,11 @@
  *     src_spath）、写句柄 release（op=close_write）。200ms 内同路径合并。
  *   - write_denied：fw_route 因 RO/HIDE/ACL 语义返回负 errno（带 errno 与
  *     spath）。只在变更操作上发布——读被拒不是「写没落盘」，扫描侧不关心。
+ *   - media_refresh：**主动**要求对端补一次媒体扫描（reason=redirect_write 由
+ *     落点被改写的写操作触发；reason=ftp_upload 由 FTP 后端写收尾触发）。与 write_done
+ *     的区别是语义：write_done 说「有人写了」，media_refresh 说「这个落点现在
+ *     需要立刻进媒体库」，后者带 kind（image/audio/video）供对端排优先级。
+ *     spath 是落点对应的存储视图路径（喂扫描的唯一正确路径域）。
  */
 #include "fw_acl.h"
 #include <stdatomic.h>
@@ -45,7 +50,24 @@ typedef enum {
     FW_EV_WRITE_DONE = 0,
     FW_EV_WRITE_DENIED,
     FW_EV_PING,
+    FW_EV_MEDIA_REFRESH,
 } FwEventKind;
+
+/* media_refresh 的媒体类别（按落点扩展名判定）。对端只按它排优先级，不做其它
+   推断：分类错误最多让一次扫描晚一点，不会让扫错路径。 */
+typedef enum {
+    FW_MEDIA_NONE = 0,
+    FW_MEDIA_IMAGE = 1,
+    FW_MEDIA_AUDIO = 2,
+    FW_MEDIA_VIDEO = 3,
+} FwMediaKind;
+
+/* media_refresh 的触发来源（对应契约的 reason 字段） */
+typedef enum {
+    FW_REFRESH_NONE = 0,
+    FW_REFRESH_REDIRECT_WRITE = 1, /* 写经 REDIRECT/沙盒改写到落点后触发 */
+    FW_REFRESH_FTP_UPLOAD = 2,     /* 后端（FTP）上传完成，本地无对应写事件 */
+} FwRefreshReason;
 
 /* 「通道活着且至少有一个订阅者」标志：埋点热路径只读它一次。
    关闭 / 无订阅者时为 false，埋点立即返回（无锁、无系统调用、无分配）。 */
@@ -66,6 +88,12 @@ void fw_events_note_write_done(uid_t uid, pid_t pid, const char* fuse_path, FwEv
    err 为 fw_route 返回的负 errno（正数入参按原样取绝对值）。 */
 void fw_events_note_write_denied(uid_t uid, pid_t pid, const char* fuse_path, NspAclOp acl_op,
                                  int err);
+
+/* 埋点：主动要求对端补一次媒体扫描。fuse_path 为落点对应的 FUSE 视角路径
+   （"/<user>/<sub>"），reason 取 FwRefreshReason。媒体类别由扩展名判定，非媒体
+   文件整条不发。内部再判一次通道开关与订阅者，因此调用方可以直接调用——与
+   fw_events_note_write_done 同一套热路径约束（有界队列，绝不阻塞调用方）。 */
+void fw_events_note_media_refresh(uid_t uid, pid_t pid, const char* fuse_path, uint8_t reason);
 
 /* 启动/停止通道。start 读 [GLOBAL] FUSE_EVENTS（默认 OFF，直接返回 0 且
    不创建任何线程/socket/内存）；必须在 fuse_daemonize 之后调用（fork 不保留

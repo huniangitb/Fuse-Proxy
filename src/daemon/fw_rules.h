@@ -51,6 +51,21 @@ typedef enum {
     NSP_VK_TARGET = 2,   /* 本身是某 REDIRECT 的虚拟前缀（会被重定向） */
 } NspVirtualKind;
 
+/* 裁决类别：这条路径的结论由哪一类规则给出。与 appear_missing/read_only/
+   is_redirect 三个语义位互补——那些回答"该怎么表现"，本枚举回答"是谁让它这样"，
+   供对外通道（nsp_fs_query 的 rule 字段）归因：ALLOW 与 REDIRECT 在 is_redirect 上
+   都是 true（ALLOW 也记作放行到自身真实路径），只有本枚举能把"点名放行"与
+   "改写到别处"分开。 */
+typedef enum {
+    NSP_RULE_NONE = 0,      /* 无规则命中（默认存储路径、直通） */
+    NSP_RULE_ALLOW = 1,     /* ALLOW：放行到自身真实路径 */
+    NSP_RULE_HIDE = 2,      /* HIDE：视为不存在 */
+    NSP_RULE_RO = 3,        /* RO：只读 */
+    NSP_RULE_REDIRECT = 4,  /* REDIRECT：改写到目标路径 */
+    NSP_RULE_SANDBOX = 5,   /* 沙盒重定向（应用私有副本） */
+    NSP_RULE_ISOLATION = 6, /* 跨应用隔离（默认边界，不是用户规则） */
+} NspRuleKind;
+
 /* 声明式决策：引擎只声明"这个路径该怎么表现"，由框架单点强制（fw_route），
    errno 映射与权限策略不在引擎里。
 
@@ -83,6 +98,12 @@ typedef struct NspPathDecision {
        规则所在段决定作用域（[GLOBAL]=全局，[应用段]=仅该应用）；
        命中后框架将该路径操作分派给对应 FTP 后端模块。 */
     bool is_ftp;
+    /* 归因（只描述"谁说了算"，不参与决策）：给出上面结论的作用域与规则类别。
+       作用域数值见 BrRuleScope（本字段类型用 uint8_t，避免结构体依赖引擎内部枚举
+       的声明顺序）。rule_scope=BR_SCOPE_NONE 表示没有作用域声明（沙盒/隔离/直通
+       或内建隐藏）。 */
+    uint8_t rule_scope;
+    uint8_t rule_kind; /* NspRuleKind */
 } NspPathDecision;
 
 /* ================= 轻量路径探测 =================

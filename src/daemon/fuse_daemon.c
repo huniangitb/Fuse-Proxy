@@ -207,7 +207,7 @@ static int recursive_rmdir(const char* path);
 static int recursive_copy_dir(const char* src, const char* dst, uid_t uid, gid_t gid,
                               bool* created);
 /* FSYNC 与 FLUSH 共用的后端数据收尾（定义在 vfs_inval_path 之后） */
-static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path);
+static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path, bool write_intent);
 
 /* open-unlink 本地直删的观测限速（范式同 fw_rules.c 的 br_note_isolation：
    首个命中 + 每 1024 次各一条）。真机 20:05:18 一秒 633 行（com.taobao.idlefish
@@ -2073,7 +2073,8 @@ static int vfs_fsync(const char* path, int datasync, struct fuse_file_info* fi) 
        缓冲里。语义与 FLUSH 一致：调用 backend_flush 收尾数据、不销毁句柄。 */
     if (fi->fh & NSP_FH_BACKEND_FLAG) {
         int slot = (int)((fi->fh & NSP_FH_BACKEND_SLOT_MASK) >> NSP_FH_BACKEND_SLOT_SHIFT);
-        return vfs_backend_finish_data(slot, fi->fh, path);
+        return vfs_backend_finish_data(slot, fi->fh, path,
+                                       (fi->flags & O_ACCMODE) != O_RDONLY);
     }
     if (!fi || fi->fh <= 0) return 0;
     int ret = (datasync ? fdatasync(fi->fh) : fsync(fi->fh));
@@ -2109,7 +2110,7 @@ static void vfs_inval_path(struct fuse* f, const char* path) {
    句柄**），成功则失效路径缓存（否则紧随的读取会命中旧属性/旧 dentry）。
    FSYNC 与 FLUSH 共用——两者都要求「数据已落盘」，且 backend_flush 可重复调用
    （FUSE 的 FLUSH 会因 dup/fork 对同一句柄多次触发）。返回 0 或负 errno。 */
-static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path) {
+static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path, bool write_intent) {
     const NspModuleOps* bops = NULL;
     /* 槽位已被置毒/卸载（快照置空）：数据从未交给后端，**不能**报成功——
        依赖 fsync 持久化的调用方（SQLite synchronous=FULL、编辑器保存）会
@@ -2129,6 +2130,12 @@ static int vfs_backend_finish_data(int slot, uint64_t fh, const char* path) {
     if (rc == 0) {
         struct fuse_context* ctx = fuse_get_context();
         if (ctx) vfs_inval_path(ctx->fuse, path);
+        /* 写意图句柄的数据收尾 = 后端侧的文件已经"落地"（FTP 上传完成）。此刻补一条
+           媒体刷新请求：后端内容不产生本地 write 事件，扫描侧没有别的时机会知道这个
+           路径刚长出媒体文件。只在有活订阅者时发布（见 fw_events_note_media_refresh）。 */
+        if (write_intent && fw_events_active() && ctx && ctx->pid != 0) {
+            fw_events_note_media_refresh(ctx->uid, ctx->pid, path, FW_REFRESH_FTP_UPLOAD);
+        }
     }
     return rc < 0 ? rc : 0;
 }
@@ -2142,7 +2149,8 @@ static int vfs_flush(const char* path, struct fuse_file_info* fi) {
     /* 后端分派：flush 由模块方法收尾数据（不销毁句柄） */
     if (fi->fh & NSP_FH_BACKEND_FLAG) {
         int slot = (int)((fi->fh & NSP_FH_BACKEND_SLOT_MASK) >> NSP_FH_BACKEND_SLOT_SHIFT);
-        return vfs_backend_finish_data(slot, fi->fh, path);
+        return vfs_backend_finish_data(slot, fi->fh, path,
+                                       (fi->flags & O_ACCMODE) != O_RDONLY);
     }
     /* 非后端文件：仅写模式 open 才在 close 时同步落盘（只读 open 无需
        写回，避免每次 close 无条件 fsync 的热路径吞吐回归）；fsync 失败
