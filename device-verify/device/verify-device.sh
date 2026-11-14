@@ -383,11 +383,31 @@ hash-file)
     ;;
 cleanup)
     need_root
+    # 独立清理（验证根目录不存在）时，设备上跑着的是生产实例：它不能因为一次清理
+    # 就停在那里不回来。先记住清理前的状态，清完再按需拉起来。
+    _standalone=0
+    if [ ! -d "$VR" ]; then
+        _standalone=1
+    fi
     stop_all "$DAEMONS" "验证" >/dev/null 2>&1 || true
     if [ -d "$VR" ] && [ ! -L "$VR" ]; then
         rm -rf "$VR" || die "清理 $VR 失败"
     fi
     clean_artifacts
+    if [ "$_standalone" = 1 ] && [ -z "$(pid_of injector)" ] && [ -f "$PROD_MOD/service.sh" ]; then
+        sh "$PROD_MOD/service.sh" >/dev/null 2>&1 &
+        _n=0
+        while [ "$_n" -lt 40 ]; do
+            [ -n "$(pid_of injector)" ] && break
+            sleep 1
+            _n=$((_n + 1))
+        done
+        if [ -n "$(pid_of injector)" ]; then
+            echo "PROD_RESTARTED injector=$(pid_of injector)"
+        else
+            die "清理后生产服务未恢复"
+        fi
+    fi
     echo "CLEANED"
     ;;
 dump-logs)
