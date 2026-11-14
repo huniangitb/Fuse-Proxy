@@ -574,13 +574,15 @@ static BrRuleScope br_sandbox_scope(AppConfig* cfg, AppConfig* cat, const char* 
 static void br_note_hide_rule(uid_t uid, const char* pkg, const char* sub_path);
 
 /* 隐藏判定：作用域优先（应用段 > 类别段 > [GLOBAL]）。
-   每层按 HIDE > ALLOW > RO > REDIRECT 的固定次序取一个结论（同层冲突 fail-closed，
-   与旧实现「hide 无条件优先」一致）；**第一个有声明的作用域说了算**，下层的声明
-   不再参与。旧实现把三层 HIDE 做并集，于是 GLOBAL 恒赢、应用段 ALLOW 永远无法
-   取消下层 HIDE（docs/config.md §2 的优先级只在 REDIRECT 上落实过）。 */
+   每层按 ALLOW > HIDE > RO > REDIRECT 取一个结论（同层放行优先，见 br_scope_decl）；
+   **第一个有声明的作用域说了算**，下层的声明不再参与。旧实现把三层 HIDE 做并集，
+   于是 GLOBAL 恒赢、应用段 ALLOW 永远无法取消下层 HIDE（docs/config.md §2 的优先级
+   只在 REDIRECT 上落实过）。scope_out 回填给出该结论的作用域（骨架/CONFIG_DIR 等
+   内建隐藏不属于任何规则作用域，保持 BR_SCOPE_NONE）。 */
 static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                        const char* current_pkg, const FwRulesTrieMatch* tm,
-                                       uid_t uid) {
+                                       uid_t uid, BrRuleScope* scope_out) {
+    if (scope_out) *scope_out = BR_SCOPE_NONE;
     bool is_skel = false;
     /* 静态部分只保留 CONFIG_DIR 前缀与 Android 骨架两支：**不能**传 tm 下去，因为
        br_hidden_static_part 内部的 tm->hidden 是跨作用域并集，会让全局 HIDE 在逐层
@@ -592,7 +594,10 @@ static bool br_is_path_hidden_internal(AppConfig* cfg, AppConfig* cat, const cha
     BrScopeDecl decl;
     br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, -1, 0, NULL, 0, BR_WANT_VIS, &scope,
                     &decl);
-    if (decl.hide) br_note_hide_rule(uid, current_pkg, sub_path);
+    if (decl.hide) {
+        br_note_hide_rule(uid, current_pkg, sub_path);
+        if (scope_out) *scope_out = scope;
+    }
     return decl.hide;
 }
 
@@ -740,13 +745,14 @@ static bool br_isolation_hides(AppConfig* cfg, AppConfig* cat, const char* sub_p
 static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const char* path,
                                         int* path_user_id_out, char* sub_path_out,
                                         size_t sub_path_size, const char* current_pkg, uid_t uid,
-                                        FwRulesTrieMatch* tm_out) {
+                                        FwRulesTrieMatch* tm_out, BrRuleScope* scope_out) {
+    if (scope_out) *scope_out = BR_SCOPE_NONE;
     if (br_strip_and_sanitize(path, path_user_id_out, sub_path_out, sub_path_size) != 0)
         return -ENOENT;
     if (tm_out) br_trie_resolve(cfg, cat, sub_path_out, tm_out);
     /* 隐藏判定对所有访问者生效（含 root，与 vfs_readdir probe 过滤一致）：
        HIDE 规则配置后，root ls 也不应看到被隐藏条目 */
-    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out, uid))
+    if (br_is_path_hidden_internal(cfg, cat, sub_path_out, current_pkg, tm_out, uid, scope_out))
         return -nsp_hide_errno_of(g_global_cfg.hide_errno);
     return 0;
 }
@@ -877,9 +883,12 @@ static bool br_check_redir_rule(AppConfig* c, const char* sub_path, char* temp, 
 }
 
 /* 单作用域对该路径的声明（作用域优先判定的原子结论）。整合该层静态（Trie）与线性
-   （通配/变量）两个通道——Trie 只是静态规则的加速索引，**不是**更高的优先级层；
-   同层冲突按固定次序裁决：HIDE > ALLOW > RO > REDIRECT（fail-closed，与旧实现
-   「hide 无条件优先」一致，避免同层自相矛盾配置下可见性抖动）。 */
+   （通配/变量）两个通道——Trie 只是静态规则的加速索引，**不是**更高的优先级层。
+   同层冲突按 ALLOW > HIDE > RO > REDIRECT 裁决：同一层里 ALLOW 与 HIDE 同时命中时
+   放行生效。放行是"用户点名要这条路径可用"的声明，比拒绝更具体；反过来让 HIDE 压过
+   ALLOW，同层一条路级 HIDE 就能把精心写的 ALLOW 全部作废（跨进程两侧也因此对同一份
+   配置给出相反结论——MPM 侧本就是放行优先）。**作用域次序不受影响**：应用段 HIDE
+   仍然压过 [GLOBAL] ALLOW，只有同一层内部的冲突按本规则裁决。 */
 static void br_scope_decl(AppConfig* c, BrRuleScope scope, const char* sub_path,
                           const char* current_pkg, const FwRulesTrieMatch* tm, int user_id,
                           uid_t uid, char* mkdir_out, size_t mkdir_sz, BrScopeDecl* out) {
@@ -926,29 +935,31 @@ static void br_scope_decl(AppConfig* c, BrRuleScope scope, const char* sub_path,
     bool dyn_allow = false;
     char dyn_redir[PATH_MAX];
     dyn_redir[0] = '\0';
-    if (!static_hide) {
-        if (c->dyn_hide && c->hide_rules)
-            dyn_hide = br_linear_match(c->hide_rules, c->hide_count, sub_path, current_pkg, c);
-        if (!dyn_hide && c->redir_rules && c->redir_count > 0) {
-            bool is_allow = false;
-            if (br_check_redir_rule(c, sub_path, dyn_redir, user_id, current_pkg, true,
-                                    sizeof dyn_redir, uid, mkdir_out, mkdir_sz, NULL,
-                                    &is_allow)) {
-                if (is_allow) {
-                    dyn_redir[0] = '\0';
-                    dyn_allow = true;
-                }
+    /* ALLOW 先算，且**不受 static_hide 短路**：放行压过同层隐藏，静态隐藏命中时仍要
+       知道这一层有没有点名放行（旧实现在此处整段跳过动态判定，于是「静态 HIDE +
+       通配/变量 ALLOW」永远落在 HIDE，同层放行优先根本无从生效）。 */
+    if (c->redir_rules && c->redir_count > 0) {
+        bool is_allow = false;
+        if (br_check_redir_rule(c, sub_path, dyn_redir, user_id, current_pkg, true,
+                                sizeof dyn_redir, uid, mkdir_out, mkdir_sz, NULL, &is_allow)) {
+            if (is_allow) {
+                dyn_redir[0] = '\0';
+                dyn_allow = true;
             }
         }
-        if (!dyn_hide && !dyn_allow && c->dyn_ro && c->ro_rules)
-            dyn_ro = br_linear_match(c->ro_rules, c->ro_count, sub_path, current_pkg, c);
     }
-    if (static_hide || dyn_hide) {
-        out->hide = true;
-        return;
+    if (!dyn_allow) {
+        if (c->dyn_hide && c->hide_rules)
+            dyn_hide = br_linear_match(c->hide_rules, c->hide_count, sub_path, current_pkg, c);
+        if (!static_hide && !dyn_hide && c->dyn_ro && c->ro_rules)
+            dyn_ro = br_linear_match(c->ro_rules, c->ro_count, sub_path, current_pkg, c);
     }
     if (dyn_allow) {
         out->allow = true;
+        return;
+    }
+    if (static_hide || dyn_hide) {
+        out->hide = true;
         return;
     }
     out->ro = static_ro || dyn_ro;
@@ -1025,14 +1036,20 @@ static void br_note_sandbox_redirect(uid_t uid, const char* pkg, const char* sub
                 pkg && pkg[0] ? pkg : "?", sub_path, target, n);
 }
 
+/* scope_out/kind_out：回填"落点结论由哪个作用域、哪类规则给出"（对外通道的
+   归因，不参与决策）。ALLOW 与 REDIRECT 在 is_redir_out 上都是 true——两者都改写了
+   落点，只有本函数的 kind_out 能把"放行到自身"与"改写到别处"分开。 */
 static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path, char* out_buf,
                            size_t size, int user_id, bool* is_redir_out, bool* is_sandbox_out,
                            const char* current_pkg, const FwRulesTrieMatch* tm, uid_t uid,
-                           char* mkdir_out, size_t mkdir_sz) {
+                           char* mkdir_out, size_t mkdir_sz, BrRuleScope* scope_out,
+                           uint8_t* kind_out) {
     char temp[PATH_MAX] = {0};
     bool redir = false;
     bool sandbox = false;
     if (is_sandbox_out) *is_sandbox_out = false;
+    if (scope_out) *scope_out = BR_SCOPE_NONE;
+    if (kind_out) *kind_out = NSP_RULE_NONE;
 
     /* 落点解析：作用域优先（docs/config.md §2）。先取「最高声明作用域」的落点结论：
        ALLOW → 放行到自身存储；REDIRECT → 改写目标；都没有 → 按 sandbox 三层
@@ -1057,9 +1074,13 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
         /* 与旧实现一致：ALLOW 记为「重定向」，真实路径就是默认路径 */
         common_default_real_path(user_id, sub_path, temp, sizeof(temp));
         redir = true;
+        if (scope_out) *scope_out = decl_scope;
+        if (kind_out) *kind_out = NSP_RULE_ALLOW;
     } else if (decl.has_redir) {
         snprintf(temp, sizeof temp, "%s", decl.redir);
         redir = true;
+        if (scope_out) *scope_out = decl_scope;
+        if (kind_out) *kind_out = NSP_RULE_REDIRECT;
     } else if (decl.hide) {
         return -ENOENT; /* 防御：隐藏应由调用方先行判定，走到这里说明判定被绕过 */
     }
@@ -1086,6 +1107,11 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
     }
     if (!redir) {
         common_default_real_path(user_id, sub_path, temp, sizeof(temp));
+    } else if (sandbox) {
+        /* 沙盒分支产出的落点与显式 REDIRECT 同形（都是改写），成因用沙盒声明作用域
+           标注；显式规则的落点已在上面写好，这里只覆盖沙盒成因 */
+        if (scope_out) *scope_out = sandbox_scope;
+        if (kind_out) *kind_out = NSP_RULE_SANDBOX;
     }
     strncpy(out_buf, temp, size - 1);
     out_buf[size - 1] = '\0';
@@ -1101,11 +1127,13 @@ static int br_to_real_path(AppConfig* cfg, AppConfig* cat, const char* sub_path,
    改写成别处，低层再判只读没有意义），但 HIDE 不参与本查询——它已在可见性判定里
    先行返回 ENOENT，此处不必重复。 */
 static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
-                          const char* current_pkg, const FwRulesTrieMatch* tm) {
+                          const char* current_pkg, const FwRulesTrieMatch* tm,
+                          BrRuleScope* scope_out) {
     BrRuleScope scope = BR_SCOPE_NONE;
     BrScopeDecl decl;
     br_resolve_decl(cfg, cat, sub_path, current_pkg, tm, -1, 0, NULL, 0,
                     BR_WANT_RO | BR_WANT_LOC, &scope, &decl);
+    if (scope_out && decl.ro) *scope_out = scope;
     return decl.ro;
 }
 
@@ -1320,6 +1348,8 @@ static inline void br_result_init(NspPathDecision* out) {
     out->is_sandbox = false;
     out->virtual_kind = NSP_VK_NONE;
     out->is_ftp = false;
+    out->rule_scope = BR_SCOPE_NONE;
+    out->rule_kind = NSP_RULE_NONE;
 }
 
 /* 路径是否含 <uid>/ 用户层（如 /0/foo、/10/、或 /0 本身）：挂载点根（/、/obb
@@ -1349,8 +1379,10 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         int path_user_id = -1;
         char sub_path[PATH_MAX];
         FwRulesTrieMatch tm;
+        BrRuleScope hidden_scope = BR_SCOPE_NONE;
         bool hidden = br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
-                                                  sizeof sub_path, current_pkg, q->uid, &tm) != 0;
+                                                  sizeof sub_path, current_pkg, q->uid, &tm,
+                                                  &hidden_scope) != 0;
         /* 隔离只在未命中隐藏时判定（保持原短路语义），并单独标注成因 */
         bool isolated =
             !hidden && br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid, &tm,
@@ -1359,6 +1391,8 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
             out->valid = true;
             out->appear_missing = true;
             out->is_other_app_pkg = isolated;
+            out->rule_scope = hidden ? hidden_scope : BR_SCOPE_NONE;
+            out->rule_kind = hidden ? NSP_RULE_HIDE : NSP_RULE_ISOLATION;
             /* 只有 HIDE 规则命中才改返回码；隔离恒 ENOENT（见 fw_rules.h 字段注释） */
             out->deny_errno = hidden ? nsp_hide_errno_of(g_global_cfg.hide_errno) : 0;
             if (config_read_end(cfg_gen)) return;
@@ -1369,14 +1403,28 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
         sandbox_mkdir[0] = '\0';
         bool is_redir = false;
         bool is_sandbox = false;
+        BrRuleScope loc_scope = BR_SCOPE_NONE;
+        uint8_t loc_kind = NSP_RULE_NONE;
         if (br_to_real_path(cfg, cat, sub_path, p, sizeof p, path_user_id, &is_redir, &is_sandbox,
-                            current_pkg, &tm, q->uid, sandbox_mkdir, sizeof sandbox_mkdir) != 0) {
+                            current_pkg, &tm, q->uid, sandbox_mkdir, sizeof sandbox_mkdir,
+                            &loc_scope, &loc_kind) != 0) {
             out->valid = false;
             if (config_read_end(cfg_gen)) return;
             continue;
         }
         out->valid = true;
-        out->read_only = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm);
+        BrRuleScope ro_scope = BR_SCOPE_NONE;
+        out->read_only = br_is_path_ro(cfg, cat, sub_path, current_pkg, &tm, &ro_scope);
+        /* 归因只报一条：落点结论优先（ALLOW/沙盒/REDIRECT），无落点声明时才归到 RO。
+           两者同时成立时（例如只读 + 重定向）以落点为准——对端关心的是"文件在哪"，
+           写侧另有 read_only 位单独表达 */
+        if (loc_kind != NSP_RULE_NONE) {
+            out->rule_scope = loc_scope;
+            out->rule_kind = loc_kind;
+        } else if (out->read_only) {
+            out->rule_scope = ro_scope;
+            out->rule_kind = NSP_RULE_RO;
+        }
         out->is_redirect = is_redir;
         out->is_sandbox = is_sandbox;
         strcpy(out->real_path, p); /* 源为 PATH_MAX 栈缓冲，NUL 结尾 */
@@ -1490,7 +1538,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                    下无线性规则扫描，逐层现查 trie（每作用域一次下降）的成本远低于一次
                    syscall，故直接走权威判定 */
                 bool hidden =
-                    br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid) || iso;
+                    br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid, NULL) ||
+                    iso;
                 out->valid = true;
                 out->appear_missing = hidden;
                 out->is_other_app_pkg = iso;
@@ -1508,7 +1557,8 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                同判据：看不见 = 打不开） */
             bool iso = br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, NULL,
                                           path_user_id);
-            if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid) || iso) {
+            if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid, NULL) ||
+                iso) {
                 out->valid = true;
                 out->appear_missing = true;
                 if (config_read_end(cfg_gen)) return;
@@ -1537,7 +1587,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
         cfg = br_get_app_cfg(q->uid, q->pid, current_pkg, &cat);
         FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
-                                         sizeof sub_path, current_pkg, q->uid, &tm) != 0 ||
+                                         sizeof sub_path, current_pkg, q->uid, &tm, NULL) != 0 ||
             br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, &tm, path_user_id)) {
             out->valid = true;
             out->appear_missing = true;

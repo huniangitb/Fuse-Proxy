@@ -193,18 +193,33 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     }
     if (strncmp(sub, "/Android/data/com.other.app/", 27) == 0) {
         out->is_other_app_pkg = true; /* 隔离成因标注 */
+        out->rule_kind = NSP_RULE_ISOLATION;
         return;
     }
     if (strncmp(sub, "/Hidden/", 8) == 0) {
         out->appear_missing = true;
+        out->rule_kind = NSP_RULE_HIDE;
+        out->rule_scope = BR_SCOPE_GLOBAL;
+        return;
+    }
+    if (strncmp(sub, "/Allow/", 7) == 0) {
+        /* 显式放行：落点就是默认存储路径（is_redirect=1 但 rpath 不变），
+           归因必须是 allow —— 这是"有裁决"与"无规则"的唯一区分点 */
+        out->is_redirect = true;
+        out->rule_kind = NSP_RULE_ALLOW;
+        out->rule_scope = BR_SCOPE_APP;
         return;
     }
     if (strncmp(sub, "/RO/", 4) == 0) {
         out->read_only = true;
+        out->rule_kind = NSP_RULE_RO;
+        out->rule_scope = BR_SCOPE_CAT;
         return;
     }
     if (user == 0 && strncmp(sub, "/DCIM/redir.jpg", 15) == 0) {
         out->is_redirect = true;
+        out->rule_kind = NSP_RULE_REDIRECT;
+        out->rule_scope = BR_SCOPE_APP;
         snprintf(out->real_path, sizeof out->real_path, "%s/0/Movies/redir.jpg", g_fake_base);
         return;
     }
@@ -216,6 +231,7 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (strncmp(sub, "/Sandbox/", 9) == 0) {
         out->is_redirect = true;
         out->is_sandbox = true;
+        out->rule_kind = NSP_RULE_SANDBOX;
         snprintf(out->real_path, sizeof out->real_path,
                  "%s/%d/Android/data/com.test.app/sandbox/x.jpg", g_fake_base, user);
         return;
@@ -522,6 +538,8 @@ static void test_query_six(void) {
     CHECK(has(resp, "\"reason\":\"none\""), "① reason 错: %s", resp);
     CHECK(has(resp, "\"seq\":11,"), "① seq 未回显: %s", resp);
     CHECK(has(resp, "\"rpath\":\""), "① 缺 rpath: %s", resp);
+    /* 归因：无规则命中时必须明确是 none，不是空串也不是缺字段 */
+    CHECK(has(resp, "\"scope\":\"none\",\"rule\":\"none\""), "① 归因应为 none: %s", resp);
 
     /* ② ok=1 / exists=1 / denied=1（RO）——RO 优先于 redirect */
     snprintf(req, sizeof req,
@@ -531,6 +549,7 @@ static void test_query_six(void) {
     CHECK(has(resp, "\"ok\":1") && has(resp, "\"denied\":1,"), "② ok/denied 错: %s", resp);
     CHECK(has(resp, "\"reason\":\"ro\""), "② reason 应为 ro: %s", resp);
     CHECK(has(resp, "\"exists\":1,"), "② exists 错: %s", resp);
+    CHECK(has(resp, "\"scope\":\"cat\",\"rule\":\"ro\""), "② 归因应为 cat/ro: %s", resp);
 
     /* ③ ok=1 / exists=0（路径不存在） */
     snprintf(req, sizeof req,
@@ -548,6 +567,8 @@ static void test_query_six(void) {
     CHECK(has(resp, "\"ok\":1") && has(resp, "\"denied\":1,"), "④ 错: %s", resp);
     CHECK(has(resp, "\"reason\":\"hide\""), "④ reason 应为 hide: %s", resp);
     CHECK(has(resp, "\"exists\":0,"), "④ exists 错: %s", resp);
+    CHECK(has(resp, "\"scope\":\"global\",\"rule\":\"hide\""), "④ 归因应为 global/hide: %s",
+          resp);
 
     /* ⑤ ok=0（无规则/不认识）——**不得**回 denied=1 */
     snprintf(req, sizeof req,
@@ -594,6 +615,7 @@ static void test_query_reasons(void) {
     CHECK(has(resp, "\"denied\":0,"), "redirect 不是拒绝: %s", resp);
     CHECK(has(resp, "\"spath\":\"/storage/emulated/0/Movies/redir.jpg\""), "spath 应为落点: %s",
           resp);
+    CHECK(has(resp, "\"scope\":\"app\",\"rule\":\"redirect\""), "redirect 归因错: %s", resp);
 
     /* SANDBOX：成因与普通 redirect 区分 */
     snprintf(req, sizeof req,
@@ -601,6 +623,18 @@ static void test_query_reasons(void) {
              "\"uid\":10337,\"seq\":22}");
     query(req, resp, sizeof resp, false);
     CHECK(has(resp, "\"reason\":\"sandbox\""), "reason 应为 sandbox: %s", resp);
+    CHECK(has(resp, "\"rule\":\"sandbox\""), "sandbox 归因错: %s", resp);
+
+    /* ALLOW：显式放行。spath 不变，但 rule 必须报 allow —— 对端据此"让位" */
+    snprintf(req, sizeof req,
+             "{\"cmd\":\"QUERY\",\"v\":1,\"spath\":\"/storage/emulated/0/Allow/a.jpg\","
+             "\"uid\":10337,\"seq\":26}");
+    query(req, resp, sizeof resp, false);
+    CHECK(has(resp, "\"ok\":1"), "ALLOW 应 ok=1: %s", resp);
+    CHECK(has(resp, "\"denied\":0,"), "ALLOW 不是拒绝: %s", resp);
+    CHECK(has(resp, "\"scope\":\"app\",\"rule\":\"allow\""), "ALLOW 归因错: %s", resp);
+    CHECK(has(resp, "\"spath\":\"/storage/emulated/0/Allow/a.jpg\""), "ALLOW 落点应为自身: %s",
+          resp);
 
     /* ACL 拒绝：隔离（EACCES） */
     snprintf(req, sizeof req,
@@ -609,6 +643,8 @@ static void test_query_reasons(void) {
     query(req, resp, sizeof resp, false);
     CHECK(has(resp, "\"denied\":1,"), "ACL 拒绝应 denied=1: %s", resp);
     CHECK(has(resp, "\"reason\":\"isolation\""), "reason 应为 isolation: %s", resp);
+    /* 访问控制先于规则拒绝：归因不许借用某个规则作用域 */
+    CHECK(has(resp, "\"scope\":\"none\",\"rule\":\"isolation\""), "ACL 归因错: %s", resp);
 
     /* ACL 拒绝：假装不存在（ENOENT）→ hide */
     snprintf(req, sizeof req,
@@ -677,6 +713,82 @@ static void test_user10_and_ttl(void) {
     while (fw_ring_pop(&(FwEventRec){0}, 1) > 0) {
     }
     memset(g_coalesce, 0, sizeof g_coalesce);
+}
+
+/* media_refresh：daemon **主动**要求对端补一次媒体扫描（落点被改写的写操作）。
+   四条：① 显式请求的字段齐全且不带 op；② 非媒体扩展名整条不发；③ 落点被改写的
+   write_done 额外补一条 media_refresh；④ 未改写的 write_done 不补（否则每次写都
+   变成两次扫描）。 */
+static void test_media_refresh(void) {
+    channel_up();
+    char buf[2048];
+    while (drv_recv(buf, sizeof buf) >= 0) {
+    }
+    g_subs[0].mask = FW_EV_MASK_DONE | FW_EV_MASK_DENIED | FW_EV_MASK_REFRESH | FW_EV_MASK_PING;
+    atomic_store(&g_fw_events_hot, true);
+
+    /* ① 显式请求 */
+    memset(g_coalesce, 0, sizeof g_coalesce);
+    fw_events_set_test_now_ms(900000);
+    fw_events_note_media_refresh(10337, 0, "/0/Pictures/a.jpg", FW_REFRESH_REDIRECT_WRITE);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(900300);
+    fw_coalesce_flush_due();
+    CHECK(drv_recv(buf, sizeof buf) > 0, "媒体刷新请求应发出");
+    CHECK(has(buf, "\"type\":\"media_refresh\""), "type 错: %s", buf);
+    CHECK(has(buf, "\"reason\":\"redirect_write\""), "reason 错: %s", buf);
+    CHECK(has(buf, "\"media\":\"image\""), "media 应 image: %s", buf);
+    CHECK(has(buf, "\"vpath\":\"/Pictures/a.jpg\""), "vpath 错: %s", buf);
+    CHECK(has(buf, "\"spath\":\"/storage/emulated/0/Pictures/a.jpg\""), "spath 错: %s", buf);
+    CHECK(has(buf, "\"rpath\":\"/tmp/"), "rpath 缺失: %s", buf);
+    CHECK(!has(buf, "\"op\":"), "刷新不是变更操作，不应带 op: %s", buf);
+    CHECK(strlen(buf) < FW_EVENTS_FRAME_MAX, "单帧必须 ≤1KB（实际 %zu）", strlen(buf));
+
+    /* ② 非媒体扩展名：整条不发 */
+    fw_events_set_test_now_ms(910000);
+    fw_events_note_media_refresh(10337, 0, "/0/B/x.txt", FW_REFRESH_FTP_UPLOAD);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(910300);
+    fw_coalesce_flush_due();
+    CHECK(drv_recv(buf, sizeof buf) < 0, "非媒体落点不得发出刷新事件");
+
+    /* ③ REDIRECT 落点：write_done + media_refresh 两条 */
+    memset(g_coalesce, 0, sizeof g_coalesce);
+    fw_events_set_test_now_ms(920000);
+    fw_events_note_write_done(10337, 0, "/0/DCIM/redir.jpg", FW_EV_OP_CLOSE_WRITE, NULL);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(920300);
+    fw_coalesce_flush_due();
+    char f1[2048];
+    char f2[2048];
+    long n1 = drv_recv(f1, sizeof f1);
+    long n2 = drv_recv(f2, sizeof f2);
+    CHECK(n1 > 0 && n2 > 0, "改写落点应发两条（实际 %ld/%ld）", n1, n2);
+    if (n1 > 0 && n2 > 0) {
+        const char* done = has(f1, "\"write_done\"") ? f1 : f2;
+        const char* ref = (done == f1) ? f2 : f1;
+        CHECK(has(done, "\"type\":\"write_done\""), "缺少 write_done: %s%s", f1, f2);
+        CHECK(has(ref, "\"type\":\"media_refresh\""), "缺少 media_refresh: %s%s", f1, f2);
+        CHECK(has(ref, "\"reason\":\"redirect_write\""), "刷新 reason 错: %s", ref);
+        CHECK(has(ref, "\"media\":\"image\""), "刷新 media 错: %s", ref);
+        CHECK(has(ref, "\"spath\":\"/storage/emulated/0/DCIM/redir.jpg\""), "刷新 spath 错: %s",
+              ref);
+        CHECK(has(ref, "\"rpath\":\"/tmp/"), "刷新缺 rpath: %s", ref);
+    }
+
+    /* ④ 未改写落点：只有 write_done */
+    memset(g_coalesce, 0, sizeof g_coalesce);
+    fw_events_set_test_now_ms(930000);
+    fw_events_note_write_done(10337, 0, "/0/Pictures/b.jpg", FW_EV_OP_CLOSE_WRITE, NULL);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(930300);
+    fw_coalesce_flush_due();
+    CHECK(drv_recv(buf, sizeof buf) > 0, "直通写应发 write_done");
+    CHECK(has(buf, "\"type\":\"write_done\""), "直通写 type 错: %s", buf);
+    CHECK(drv_recv(buf, sizeof buf) < 0, "未改写落点不得补刷新事件");
+
+    /* 夹具自愈：恢复默认订阅掩码，后面的 filter 用例自己会再改 */
+    drv_subscribe();
 }
 
 static void test_sub_filters(void) {
@@ -927,6 +1039,10 @@ int main(void) {
     touch(p);
     snprintf(p, sizeof p, "%s/0/Movies", g_fake_base);
     mkdir_p(p);
+    snprintf(p, sizeof p, "%s/0/Allow", g_fake_base);
+    mkdir_p(p);
+    snprintf(p, sizeof p, "%s/0/Allow/a.jpg", g_fake_base);
+    touch(p);
 
     test_early_exit();
     test_event_fields();
@@ -935,6 +1051,7 @@ int main(void) {
     test_query_six();
     test_query_reasons();
     test_user10_and_ttl();
+    test_media_refresh();
     test_sub_filters();
     test_no_sub_coalesce_drain();
     test_oversize_path();
