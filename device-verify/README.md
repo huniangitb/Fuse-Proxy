@@ -51,8 +51,13 @@ python3 device-verify/host/run-verify.py --serial <serial>
 
 常用选项：`--skip-build`（复用 dist 产物）、`--keep`（保留宿主临时目录/日志）、
 `--keep-apks`（保留探针 APK）、`--dry-run`（只打印配置与计划）、`--self-test`（离线自检）、
-`--ftp-port/--sftp-port/--pasv-base`、`--wait`。
+`--ftp-port/--sftp-port/--pasv-base`、`--wait`、`--smoke`（只跑 FTP STOR 一条链）、
+`--no-fail-fast`（探针未就绪也把其余用例跑完）、`--no-ready-retry`（关掉首次未就绪时的自动重起）、
+`--wait-subscriber MS`（起验证实例后等事件通道出现订阅者再跑用例，0=不等）。
 退出码：`0` 全过 / `1` 有失败 / `77` 环境不满足（无设备等）。
+
+每次运行结束都会打印各阶段墙钟（构建 / 设备准备 / 停生产+恢复视图+起验证 / 每个探针 /
+竞态 / 阶段 B / 断言 / 合计）——提速的对照数据直接取自这里，不靠人肉掐表。
 
 ## 探针契约
 
@@ -64,7 +69,7 @@ case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>
 
 | 探针 | 关键步骤 | 语义 |
 |---|---|---|
-| `nsp.probe.ftp` | ready, write, read, list, canary | 写 `/sdcard/ftp_probe/probe_ftp.txt` → FTP 后端；回读比对；列举；REAL_CANARY 不可见 |
+| `nsp.probe.ftp` | sink, ready, write, read, media, list, canary | 写 `/sdcard/ftp_probe/probe_ftp.txt` → FTP 后端；回读比对；再写一张 1×1 JPEG（媒体刷新只认媒体扩展名的落点）；列举；REAL_CANARY 不可见 |
 | `nsp.probe.sftp` | 同上 | 写 `/sdcard/sftp_probe/probe_sftp.txt` → SFTP 后端 |
 | `nsp.probe.iso` | ready, download, pictures, android_root, android_list, android_skel_data, android_skel_obb, android_skel_media, android_obb_own, android_media_own, android_allow | SANDBOX ON + 整树镜像口径：写 Download/Pictures 与 /Android（含自身 obb/media 私有目录、一条 ALLOW 豁免路径）。Download/Pictures 与 /Android 下的普通条目应落沙盒、真实目录零写入且能在自己的列举里看到；三个容器条目由框架合成，列举里都在且按名 stat 是目录、时间戳非 1970；三处私有目录与 ALLOW 豁免仍落真实目录 |
 | `nsp.probe.hide` | ready, phase_a / phase_b+write_denied, list | 阶段 A 真实夹具可见可读；阶段 B（换配置重启）stat/写均 ENOENT、列举不含 hide |
@@ -74,6 +79,14 @@ case=<ftp|sftp|hide|iso|plain|unlink|race>|step=<name>|ok=<0|1>|detail=<...>
 
 `ready` 步表示探针在 `Application.onCreate` 内轮询到本进程 `/storage/emulated` 的挂载源已变为
 `fuse_daemon`（detail 记 `ms=`）；之后才执行 I/O，避免把「尚未注入」误判成模块缺陷。
+
+结果通道：`sink` 是每次运行的第一行，逐个列出候选结果文件的打开结果
+（`/data/local/tmp/nsp_verify/probe-logs/<pkg>.log` → 应用私有目录 → 外部私有目录）。
+**公共临时目录是主通道**，logcat 只作崩溃/链路证据——logcat 会被别的进程刷掉，也会在
+`ENOTCONN` 时一起看不见，而结果文件不受 FUSE 状态影响。公共目录由设备脚本以 root 预建、
+`chmod 777` 并 `chcon u:object_r:app_data_file:s0`（默认的 `shell_data_file` 对
+`untrusted_app` 只读，实测 `open failed: EACCES`）；宿主在断言前把日志 `adb pull` 回
+`<base>/logs/device/`，随后设备侧文件**成功失败一律删除**，宿主留副本。
 
 ## 竞态探针：v1 能不能抢在应用首写之前？
 
@@ -136,6 +149,8 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 ## 断言（57 项功能 + 12 项 open-unlink + 30 项竞态）
 
 - 注入就绪：5 个功能探针 + hide 阶段 B 各一条，耗时 ≤ 12s。
+- 结果通道：每个探针的 `sink` 行必须含 `/data/local/tmp/nsp_verify/probe-logs/<pkg>.log=ok`
+  （只认公共临时目录，私有目录成功不算）。
 - FTP / SFTP：探针 write/read/list/canary 成功；宿主后端文件存在且内容为 `NSP_PROBE:<pkg>:<ts>`；
   **真实存储 `/data/media/0/{ftp_probe,sftp_probe}/` 无同名文件**（写侧漏 = 0）。
 - SANDBOX：真实 `Download`/`Pictures` 无探针文件；`/data/media/0/Android/data/nsp.probe.iso/sandbox/`
@@ -181,7 +196,31 @@ zygisk post-specialize 重试」→ `Companion: POST ... → OK`。
 - **SFTP 认证**：Android 侧 libssh2 以 mbedTLS 为后端，不解析 OpenSSH 私钥、也不从私钥提取公钥，
   需 PEM 私钥 + 同目录 `<key_file>.pub`；模块已自动使用该 .pub，`host_key_check` 保持 on。
 - 验证期间生产服务被暂停（v1 注入验证的前提）；已注入的其他应用需重启才能重新获得视图——仅在测试机执行。
+- **生产是 v3（全局替换）时，必须先恢复系统存储视图再起验证实例**。v3 在
+  `/storage/emulated` 与 `/mnt/{user,installer,androidwritable}/<user>/emulated` 上挂的是
+  `fuse_daemon`，四个挂载点共享同一个 peer group；停掉生产进程后这些挂载点在 zygote 命名空间里
+  **仍在**、且已无人服务，新起的应用进程会继承它们（`ENOTCONN`），v1 再也挂不上去，
+  探针只能等满 15s 就绪预算。设备脚本的 `restore-system-view` 动作先 `umount -l /storage/emulated`
+  （peer group 会把另外三个一起带走），再把 `/mnt/pass_through/<user>/emulated` 逐个 bind 回去；
+  编排器在 `stop-prod` 之后、`start-verify` 之前调用它，并断言 `SYSTEM_VIEW_READY=1`。
+- **首次拉起仍可能抢不到挂载**（注入器的 post 命名空间盯梢有竞态：应用若在盯梢线程起跑前就完成
+  了 `unshare`，线程等 1200ms 也「未见命名空间切换」，直接跳过补挂载）。现象是单个探针
+  `ready ok=0 detail=timeout_ms=15000`，其余步骤全 `ENOTCONN`。编排器对「首探针未拿到 FUSE 视图」
+  自动重起一次（`--no-ready-retry` 可关），实测重起后 `ready=48ms` 正常通过。
+  该竞态在 `src/injector/ipc_server.c`（生产代码），验证工具链只做规避、不改它。
+- **后端映射不算「活规则」**：`src/injector/mount_manager.c` 里 `app_has_active_rules()` 只数
+  重定向/隐藏/只读/沙盒，FTP/SFTP 后端映射不在其中；只配 `FTP /ftp_probe ftp_probe` 的应用会被判
+  「无规则冲突，保留原生视图」，于是根本不挂载、后端也就用不上（实测写入 `EACCES`）。
+  验证配置因此给 ftp/sftp 段各加一条 `HIDE /nsp_verify/<case>_noop`，把应用拉进挂载范围。
+- **FTP 上传的 `media_refresh` 目前发不出来**：`src/daemon/fuse_daemon.c` 的
+  `vfs_backend_finish_data()` 用 `(fi->flags & O_ACCMODE) != O_RDONLY` 判「写意图」，而 FUSE 的
+  FLUSH/FSYNC 请求不带 open 标志，libfuse 填给回调的 `fi->flags` 是 0 ——实测 FLUSH 到达、
+  `backend_flush` 返回 0，但 `write_intent=0`，`fw_events_note_media_refresh()` 从未被调用，
+  事件通道侧一行都没有。这属于生产侧缺口（不是验证工具链），本仓库当前不改；
+  需要「上传即入相册」时按「open 时记录写意图、FLUSH 用记录值」修，影响面仅后端句柄。
 - 排障：`--keep` 保留 `/tmp/nsp_dev_verify.*/`（含 `logs/`、后端目录、`device-dump.txt`）；
-  `--keep-apks` 保留探针。设备侧日志在 `/data/local/tmp/nsp_verify/config/log/`
-  （`sys.log` / `module_errors.log` / `error.log` / `fuse_crash.log` / `verify_injector.out`）。
+  `--keep-apks` 保留探针。**验证实例日志现在先回传再清理**：收尾时设备脚本 `export-logs` 把
+  `/data/local/tmp/nsp_verify/config/log/`（`sys.log` / `module_errors.log` / `error.log` /
+  `fuse_crash.log` / `verify_injector.out`）连同探针结果文件拷到 `<base>/logs/device/`，
+  之后才 `rm -rf` 验证目录——`--keep` 结束就能读到实例日志，不再随清理一起消失。
   若生产服务未自动恢复：`su -c 'sh /data/adb/modules/Namespace-Proxy/service.sh &'`。
