@@ -32,5 +32,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 广播触发：不启动界面，进程被拉起即跑完整例检查（结果见 logcat 与结果文件）。 -->
+        <receiver
+            android:name="nsp.probe.ProbeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="nsp.probe.RUN" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
