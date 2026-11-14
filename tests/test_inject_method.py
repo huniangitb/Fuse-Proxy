@@ -203,6 +203,9 @@ def direct_compile_group():
     log(f"直编组 R8：被测 ipc_server 源 = {ipc_src}")
     exe, build = build_fixture(tmp, "ipc_binding", "ipc_binding.c", [
         ipc_src,
+        # 补挂载盯梢的等待体与其事件源（ipc_server 直接调用）
+        os.path.join(ROOT, "src", "injector", "ns_mnt_wait.c"),
+        os.path.join(ROOT, "src", "injector", "ns_mnt_watch.c"),
         os.path.join(ROOT, "src", "injector", "inject_target.c"),
         os.path.join(ROOT, "src", "core", "uid_map.c"),
         os.path.join(ROOT, "src", "core", "fast_pid.c"),
