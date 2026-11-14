@@ -813,6 +813,94 @@ static void test_whitelist(void) {
     fw_pkg_set_packagelist_path(NULL); /* 还原默认路径（生产代码从不设钩子） */
 }
 
+/* 路径长度契约：整串发布或整条不发，绝不发布截断后的"另一个路径"。
+   FUSE 视角路径合法长度可到 PATH_MAX，事件缓存只有 FW_EVENTS_PATH_MAX：
+   截断后 /0/Pictures/<244B>.jpg 的后缀会变成别的名字，派生出的 spath 指向不存在
+   或别人的文件，扫描侧据此扫描等于漏原文件 + 查错文件。 */
+static void fill_path(char* out, size_t total, char ch) {
+    static const char head[] = "/0/Pictures/";
+    size_t h = sizeof head - 1;
+    memcpy(out, head, h);
+    memset(out + h, ch, total - h);
+    out[total] = '\0';
+}
+
+static void test_oversize_path(void) {
+    channel_up();
+    char buf[2048];
+    while (drv_recv(buf, sizeof buf) >= 0) {
+    }
+    while (fw_ring_pop(&(FwEventRec){0}, 1) > 0) {
+    }
+    memset(g_coalesce, 0, sizeof g_coalesce);
+    atomic_store(&g_fw_events_hot, true);
+    atomic_store(&g_ev_oversize_dropped, 0);
+
+    /* ① 255 字节（缓存 256 含 NUL）刚好装得下 → 照常发布且一字不差 */
+    char fits[400];
+    fill_path(fits, 255, 'a');
+    fw_events_set_test_now_ms(1000000);
+    fw_events_note_write_done(10337, 0, fits, FW_EV_OP_CLOSE_WRITE, NULL);
+    CHECK(g_ring_count == 1, "255 字节路径应入队（实际 count=%d）", g_ring_count);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(1000300);
+    fw_coalesce_flush_due();
+    CHECK(drv_recv(buf, sizeof buf) > 0, "255 字节路径应发出");
+    CHECK(has(buf, fits + 2), "255 字节路径必须整串发布（不得截断）");
+    CHECK(atomic_load(&g_ev_oversize_dropped) == 0, "装得下的路径不得计丢弃");
+
+    /* ② 256 字节（缓存装不下）→ 整条不发，计入 dropped */
+    char too_long[400];
+    fill_path(too_long, 256, 'b');
+    fw_events_note_write_done(10337, 0, too_long, FW_EV_OP_CLOSE_WRITE, NULL);
+    CHECK(g_ring_count == 0, "超长路径不得入队（实际 count=%d）", g_ring_count);
+    CHECK(atomic_load(&g_ev_oversize_dropped) == 1, "超长路径应计入丢弃（实际 %u）",
+          atomic_load(&g_ev_oversize_dropped));
+    fw_drain_ring();
+    fw_coalesce_flush_due();
+    CHECK(drv_recv(buf, sizeof buf) < 0, "超长路径不得发布任何帧");
+
+    /* ③ write_denied 同一口径（否则拒绝事件会带着截断路径） */
+    fw_events_note_write_denied(10337, 0, too_long, NSP_ACL_OP_CREATE, -EROFS);
+    CHECK(g_ring_count == 0, "超长路径的写拒绝也不得入队");
+    CHECK(atomic_load(&g_ev_oversize_dropped) == 2, "写拒绝同样计入丢弃（实际 %u）",
+          atomic_load(&g_ev_oversize_dropped));
+
+    /* ④ rename 的源超长：目的端事件仍然有效，源字段整对不发（不能清错行） */
+    fw_events_set_test_now_ms(1010000);
+    fw_events_note_write_done(10337, 0, "/0/Pictures/dst.jpg", FW_EV_OP_RENAME, too_long);
+    CHECK(g_ring_count == 0, "rename 源超长时整条不发（实际 count=%d）", g_ring_count);
+    CHECK(atomic_load(&g_ev_oversize_dropped) == 3, "rename 源超长计入丢弃（实际 %u）",
+          atomic_load(&g_ev_oversize_dropped));
+
+    /* ⑤ 路径装得下但 JSON 转义后超帧：一样整条不发（引号/反斜杠是合法文件名字符） */
+    char esc[400];
+    size_t h = sizeof "/0/Pictures/" - 1;
+    memcpy(esc, "/0/Pictures/", h);
+    memset(esc + h, '\\', 255 - h);
+    esc[255] = '\0';
+    fw_events_set_test_now_ms(1020000);
+    fw_events_note_write_done(10337, 0, esc, FW_EV_OP_CLOSE_WRITE, NULL);
+    CHECK(g_ring_count == 1, "转义型路径本身装得下（实际 count=%d）", g_ring_count);
+    fw_drain_ring();
+    fw_events_set_test_now_ms(1020300);
+    fw_coalesce_flush_due();
+    CHECK(drv_recv(buf, sizeof buf) < 0, "转义后超帧不得发出半截 JSON");
+    CHECK(atomic_load(&g_ev_oversize_dropped) == 4, "超帧计入丢弃（实际 %u）",
+          atomic_load(&g_ev_oversize_dropped));
+
+    /* ⑥ 丢弃数如实进入心跳，订阅者能知道自己漏了事件 */
+    g_next_ping_ms = 0;
+    fw_maybe_ping();
+    CHECK(drv_recv(buf, sizeof buf) > 0, "心跳应发出");
+    CHECK(has(buf, "\"type\":\"ping\""), "心跳 type 错: %s", buf);
+    CHECK(has(buf, "\"dropped\":4"), "心跳应上报 4 条丢弃（实际: %s）", buf);
+
+    memset(g_coalesce, 0, sizeof g_coalesce);
+    while (fw_ring_pop(&(FwEventRec){0}, 1) > 0) {
+    }
+}
+
 int main(void) {
     snprintf(g_fake_base, sizeof g_fake_base, "/tmp/fw_ev_drv_%d", (int)getpid());
     rm_rf(g_fake_base);
@@ -849,6 +937,7 @@ int main(void) {
     test_user10_and_ttl();
     test_sub_filters();
     test_no_sub_coalesce_drain();
+    test_oversize_path();
     test_whitelist();
 
     rm_rf(g_fake_base);

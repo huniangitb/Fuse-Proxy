@@ -1273,6 +1273,27 @@ static void dump_buf_to_client(int fd, LogBuffer* buf, const DiskLogBuf* disk, i
         idx = (idx + 1) % buf->max;
     }
 }
+/* QUERY_* 的 key 字段在「固定前缀 + 冒号分段」的行协议里，关键字自身含冒号会把
+   limit/offset 顶到错误分段（a:b:500:0 → key=a / limit=0 / offset=500）；含换行
+   则直接注入一行新命令。客户端把 % : CR LF 转义成 %XX，这里原地还原：解码后不会
+   比原文更长，可以就地写。非十六进制或 %00 的序列原样保留，不吞字符。 */
+static void query_key_decode(char* s) {
+    char* w = s;
+    for (char* p = s; *p; p++) {
+        if (*p == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], 0 };
+            unsigned long byte = strtoul(hex, nullptr, 16);
+            if (byte != 0) {
+                *w++ = (char)byte;
+                p += 2;
+                continue;
+            }
+        }
+        *w++ = *p;
+    }
+    *w = '\0';
+}
+
 static int process_line(ClientCtx* ctx, char* line, const char* leftover, int leftover_len) {
     int fd = ctx->fd;
     if (strncmp(line, "LOG_IO:", 7) == 0 || strncmp(line, "LOG_SYS:", 8) == 0 ||
@@ -1441,6 +1462,7 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
                 limit = atoi(limit_s);
             }
         }
+        query_key_decode(key);
         search_log_paged(fd,
                          ch == CH_IO ? &g_io_buf
                                      : (ch == CH_LOGCAT ? &g_logcat_buf : &g_sys_buf),

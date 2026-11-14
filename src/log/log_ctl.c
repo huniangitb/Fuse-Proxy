@@ -172,6 +172,47 @@ static int resolve_injector_pid(void) {
     return top > 0 ? top : any;
 }
 
+/* fuse_daemon 实例的 PID：与 resolve_injector_pid 同一口径，按 /proc 里的进程名取。
+   **不**从 mountinfo 取——那里的第 5 列是挂载点路径，atoi 出来是 0 或任意数字，
+   拿去 kill() 探测只会得到「服务已停」的假阴性。mountinfo 只回答「全局视图是否
+   已挂上」，两个问题分开。 */
+static int resolve_fuse_pid(void) {
+    DIR* d = opendir("/proc");
+    if (!d) return -1;
+    struct dirent* de;
+    int top = -1;
+    int any = -1;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int pid = atoi(de->d_name);
+        if (pid <= 0 || !proc_comm_is(pid, "fuse_daemon")) continue;
+        if (any < 0) any = pid;
+        int ppid = read_proc_ppid(pid);
+        if (ppid > 0 && !proc_comm_is(ppid, "fuse_daemon")) {
+            top = pid;
+            break;
+        }
+    }
+    closedir(d);
+    return top > 0 ? top : any;
+}
+
+/* 全局视图（nsp_global）是否已挂进本进程的挂载表：只做挂载存在性判断。 */
+static bool global_view_mounted(void) {
+    FILE* fp = fopen("/proc/self/mountinfo", "r");
+    if (!fp) return false;
+    bool mounted = false;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "fuse") && strstr(line, "nsp_global")) {
+            mounted = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return mounted;
+}
+
 static const char* send_reload_signal(void) {
     int pid = resolve_injector_pid();
     if (pid <= 0) return "未找到注入器进程";
@@ -633,23 +674,8 @@ static void handle_status(bool api_mode) {
     nsp_events_status_collect(&events_st, events_on, LOG_DIR);
     int injector_pid = resolve_injector_pid();
     bool injector_alive = (injector_pid > 0);
-    int fuse_pid = 0;
-    FILE* fp = fopen("/proc/self/mountinfo", "r");
-    if (fp) {
-        char line[512];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "fuse") && strstr(line, "nsp_global")) {
-                /* strtok_r：bionic 无条件弃用 strtok（非线程安全）；非嵌套使用，
-                   行为等价 */
-                char* save = NULL;
-                char* tok = strtok_r(line, " ", &save);
-                for (int i = 0; tok && i < 4; i++) tok = strtok_r(NULL, " ", &save);
-                if (tok) fuse_pid = atoi(tok);
-                break;
-            }
-        }
-        fclose(fp);
-    }
+    int fuse_pid = resolve_fuse_pid();
+    const bool fuse_mounted = global_view_mounted();
     bool fuse_alive = (fuse_pid > 0 && kill(fuse_pid, 0) == 0);
     int main_conf_size = 0;
     struct stat st;
@@ -702,6 +728,7 @@ static void handle_status(bool api_mode) {
         json_object* fuse = json_object_new_object();
         json_object_object_add(fuse, "pid", json_object_new_int(fuse_pid));
         json_object_object_add(fuse, "alive", json_object_new_boolean(fuse_alive));
+        json_object_object_add(fuse, "global_mounted", json_object_new_boolean(fuse_mounted));
         json_object_object_add(root, "fuse", fuse);
 
         json_object* config = json_object_new_object();
@@ -724,7 +751,8 @@ static void handle_status(bool api_mode) {
         printf("===== 系统状态概览 =====\n");
         printf("时间: %lld\n", (long long)time(NULL));
         printf("注入器: PID %d [%s]\n", injector_pid, injector_alive ? "运行中" : "未运行");
-        printf("FUSE 守护进程: PID %d [%s]\n", fuse_pid, fuse_alive ? "运行中" : "未运行");
+        printf("FUSE 守护进程: PID %d [%s]，全局视图: %s\n", fuse_pid,
+               fuse_alive ? "运行中" : "未运行", fuse_mounted ? "已挂载" : "未挂载");
         printf("主配置文件: %s (%d 字节)\n", g_main_conf, main_conf_size);
         printf("应用规则文件数: %d\n", app_rule_files);
         printf("内存中已解析应用: %d\n", mem_app_count);

@@ -1190,7 +1190,6 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
         return -EIO;
     }
 
-    // 先尝试作为文件（SIZE + MDTM）
     struct WriteBuf wb = {0};
     wb.auto_grow = true;
     long resp_code = 0;
@@ -1218,7 +1217,6 @@ int ftp_backend_getattr(const char* path, struct stat* st) {
     }
     curl_easy_cleanup(fc);
     if (file_ok) {
-        // 文件存在
         /* SFTP：libssh2 对**0 字节文件**把大小报成未知（CONTENT_LENGTH 返回
            -1，见 curl libssh2.c 的 sftp_download_stat：filesize==0 时
            Curl_pgrsSetDownloadSize(data,-1)）。那是「0 字节」而不是「大小
@@ -1415,7 +1413,6 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
     char* line = wb.buf;
     char* end = wb.buf + wb.len;
     while (line < end) {
-        // 跳过空行
         while (line < end && (*line == '\n' || *line == '\r')) line++;
         if (line >= end) break;
         if (count >= FTP_LIST_CACHE_MAX) {
@@ -1447,12 +1444,9 @@ int ftp_backend_readdir(const char* path, NspDirEntry* entries, int max, uint64_
                 size_str[n] = '\0';
             }
         }
-        // 跳过空格
         while (p < nl && (*p == ' ' || *p == '\t')) p++;
-        // 剩余部分为文件名
         if (p < nl) {
             name = p;
-            // 去掉末尾的 \r
             char* e = nl;
             if (e > name && *(e - 1) == '\r') e--;
             size_t nlen = (size_t)(e - name);
@@ -1751,7 +1745,6 @@ int ftp_backend_open(const char* path, int flags, uint64_t* h) {
     }
     f->read_curl = rc;
 
-    // 初始化滑动缓冲并启动下载线程
     f->rbuf_cap = FTP_RBUF_MIN;
     f->rbuf = malloc(f->rbuf_cap);
     if (!f->rbuf) {
@@ -1805,7 +1798,6 @@ int ftp_backend_create(const char* path, mode_t mode, uint64_t* h) {
     build_url(bk, path, url, sizeof url);
     if (url[0] == '\0') return -ENAMETOOLONG; /* 路径过长组不出 URL（业务 errno，不熔断） */
 
-    // STOR 上传空文件
     struct ReadBuf rb = {"", 0, 0};
     CURL* c = ftp_easy_new(&bk->cfg);
     if (!c) return -EIO;
@@ -1912,7 +1904,6 @@ static void* ftp_dl_thread(void* arg) {
         curl_easy_setopt(f->read_curl, CURLOPT_WRITEDATA, &wb);
 
         CURLcode res = curl_easy_perform(f->read_curl);
-        // 重置选项，防残留影响下次续传
         curl_easy_setopt(f->read_curl, CURLOPT_RANGE, NULL);
         curl_easy_setopt(f->read_curl, CURLOPT_CUSTOMREQUEST, NULL);
         curl_easy_setopt(f->read_curl, CURLOPT_RESUME_FROM, 0L);
@@ -1958,7 +1949,6 @@ int ftp_backend_read(uint64_t h, char* buf, size_t size, off_t off, size_t* got)
     if (!f) return -EINVAL;
 
     if (f->tmp_fd >= 0) {
-        // 写模式：本地临时文件
         ssize_t n = pread(f->tmp_fd, buf, size, off);
         int r = (n < 0) ? -errno : 0;
         if (n >= 0) *got = (size_t)n;
