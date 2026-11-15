@@ -177,6 +177,19 @@ SUITE_MAP = [
       "g_grepl_replace_gap"),
      "稳态对账由挂载表变化事件驱动"),
 
+    # ── 补挂载盯梢的等待：有界 + 事件驱动（ns_mnt_wait.c + 盯梢线程接线）──
+    # pre 阶段拿到的 pid 还在 zygote 的挂载 ns 里，真正的挂载要等应用自己的 ns 成立。
+    # 过去是「睡 2ms、stat 一次」，检测滞后被步进锁死。驱动直编等待体（自备事件源
+    # stub，可注入「打不开」与「挂载表变了」两种情形）：量切换检测延迟、预算到点必退、
+    # CPU 不随预算增长、进程已死立刻收工、事件能把等待叫醒、没有事件源时退回节拍；
+    # 静态契约锁住「等的是事件+纳秒节拍而不是固定步进」「注册掩码为 0」「超时仍走
+    # 跳过 + 后台重试」「每轮醒来都用 stat 复核」。
+    (("test_ns_mnt_wait.py",),
+     ("src/injector/ns_mnt_wait.c", "src/injector/ns_mnt_wait.h",
+      "src/injector/ipc_server.c"),
+     ("ns_mnt_wait_switch", "ns_mnt_wait_capture", "NS_MNT_WAIT_ARM_US"),
+     "补挂载盯梢的等待有界且由挂载表事件驱动"),
+
     # ── zygisk 模块 post-specialize 的等待预算（src/zygisk/post_wait.h + 下发链）──
     # pre 的 DEFER 应答带毫秒预算（proto 4 起），模块据此决定 post 等多久：0 = 不等待、
     # 一次 mountinfo 都不读；>0 = 按墙钟预算等挂载表变化事件再复探。解析逻辑单独成头
@@ -484,6 +497,7 @@ LAYERS = {
             "test_mountinfo_dynamic.py",
             "test_mount_state_read.py",
             "test_zygisk_post_wait.py",
+            "test_ns_mnt_wait.py",
             "test_grepl_status_fast.py",
             "test_events_owner.py",
             "test_crash_tail.py",
