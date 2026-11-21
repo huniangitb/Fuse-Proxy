@@ -297,6 +297,55 @@ NspXAppAccess fw_rules_cross_app_access(const char* pkg, uid_t uid, bool is_obb)
     return nsp_xapp_access_of(&f);
 }
 
+static int br_strip_and_sanitize(const char* path, int* path_user_id_out, char* sub_path_out,
+                                 size_t sub_path_size);
+
+/* 槽外预取（实现见 fw_pkg_prefetch_isolation_facts）：能力事实来自一次外部
+   命令查询（实测 40ms 量级），放在 config_read_begin/end 槽里就会拖住配置发布
+   的读者排空，让之后进入决策的**每个** worker 在 config_read_begin 上自旋——
+   单次慢查询放大成整池停顿。故在取槽之前预取。
+
+   预取必须比判定更保守地"少付代价"，否则会把常态请求变成子进程风暴：
+   1. 两个总闸（跨应用隔离、按能力放行）关掉时判定根本不问能力，直接不预取；
+   2. 调用方自己的子树（含 sharedUserId 兄弟包）在 br_isolation_impl 第一档就
+      放行，从不问能力，故先用只读 uid.map 的廉价命名（无 IO）判同包，同名跳过；
+      命名拿不到时保守预取——代价只是一次按 uid 缓存 30s 的查询，漏预取却会把
+      慢查询放回槽里；
+   3. 路径必须按判定同一口径清理后再认前缀：判定用的是 br_strip_and_sanitize
+      的 sub_path，而 path_sanitize 会删字节，直接扫原始路径会漏掉"删字节才凑出
+      /Android/data/ 前缀"的写法，那种写法能把慢查询原样送回槽内。 */
+static void br_prefetch_xapp_facts(const NspQueryCtx* q, const char* path) {
+    if (!q || !path) return;
+    /* 两个总闸在槽外读：它们在重载窗口内可能正被整结构体发布（撕裂读），
+       但这里只读两个 bool，最坏是窗口内多付或少付一次预取（少付那次即修复前
+       行为），裁决仍在槽内重读同一开关，不受影响。 */
+    if (!fw_rules_cross_app_isolated() || !fw_rules_cross_app_capability()) return;
+    char sub_path[PATH_MAX];
+    if (br_strip_and_sanitize(path, NULL, sub_path, sizeof sub_path) != 0) return;
+    const char* prefixes[] = {"/Android/data/", "/Android/obb/"};
+    const char* target = nullptr;
+    for (int i = 0; i < 2 && !target; i++) {
+        const size_t plen = strlen(prefixes[i]);
+        if (strncmp(sub_path, prefixes[i], plen) == 0) target = sub_path + plen;
+    }
+    /* 容器本身（"…/Android/data"）不预取：条目级 readdir 与按名打开都走
+       fw_rules_probe/resolve（已在上面预取），容器级的 fw_rules_readdir_extra
+       只处理配置声明的虚拟目录、从不问能力（能力过滤在 fuse_daemon 的槽外），
+       故为容器常态 fork 一次不划算。 */
+    if (!target) return;
+    size_t len = strcspn(target, "/");
+    if (len == 0 || len >= 256) return;
+    /* .nomedia 是 Android 认的标记名而不是包名：判定在 br_path_other_app_subtree
+       里直接当"不是他包"放行、从不问能力，预取也不该为它 fork。 */
+    if (len == sizeof(".nomedia") - 1 && memcmp(target, ".nomedia", len) == 0) return;
+    char want[256];
+    memcpy(want, target, len);
+    want[len] = '\0';
+    char self[128];
+    if (fw_pkg_uid_map_name(q->uid, self, sizeof self) && br_pkg_same_base(want, self)) return;
+    fw_pkg_prefetch_isolation_facts(q->uid);
+}
+
 /* 纯路径判定：是否指向**他包**的 Android/data|obb 子树。不看开关也不看能力——
    沙盒让位与跨应用隔离都要先认出这条路径形状，两处必须同一口径。
    .nomedia 是 Android 认的标记名而不是包名，不算他包（原生同样放行它）。
@@ -1383,6 +1432,7 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (!out) return;
     br_result_init(out);
     if (!q || !fw_rules_path_has_uid_layer(q->path)) return; /* 直通：不参与规则 */
+    br_prefetch_xapp_facts(q, q->path); /* 槽外预取：慢查询不许落在读槽里 */
     /* S1 无锁快照读：替代 rwlock 读锁。config_read_begin 持槽期间旧配置
        不会被发布者释放；config_read_end 返回 false（读期间发生发布）则
        整体重试——热重载极低频，重试代价可忽略 */
@@ -1484,6 +1534,7 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
     memset(out, 0, sizeof *out);
     out->valid = false;
     if (!q || !fw_rules_path_has_uid_layer(q->path)) return; /* 直通：不过滤 */
+    br_prefetch_xapp_facts(q, q->path); /* 槽外预取：慢查询不许落在读槽里 */
     /* S1 无锁快照读：替代 rwlock 读锁。config_read_begin 持槽期间旧配置
        不会被发布者释放；config_read_end 返回 false（读期间发生发布）则
        整体重试（probe 是 readdir 条目级热路径，重载极低频可忽略） */

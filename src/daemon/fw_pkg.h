@@ -33,6 +33,11 @@ bool fw_pkg_resolve(uid_t uid, pid_t tid, char* out, size_t size);
    false 且 out 写入尽力得到的名称。 */
 bool fw_pkg_resolve_exact(uid_t uid, pid_t tid, char* out, size_t size);
 
+/* uid → 包名，**只查 uid.map**：不摸 /proc、不读 packages.list，锁内只有二分与
+   一次有界拷贝。用于在 config 读槽之外做廉价判断（如"这条路径是不是调用方
+   自己的 /Android/data 子树"），拿不到时返回 false，调用方须保守处理。 */
+bool fw_pkg_uid_map_name(uid_t uid, char* out, size_t size);
+
 /* uid 是否为**特权应用**：来源 /data/system/packages.list 的 seinfo 字段
    （SELinux MAC 标签，由系统按签名/分区判定），以 "platform" 开头即 platform
    签名（system/priv-app/共享签名；实测 DocumentsUI/Settings 为
@@ -71,6 +76,13 @@ bool fw_pkg_manages_external(uid_t uid);
    跨应用隔离据此有"仅 obb"这一档，而不是非黑即白。
    fail-safe 与缓存策略同 fw_pkg_manages_external。 */
 bool fw_pkg_can_install_packages(uid_t uid);
+
+/* 槽外预取跨应用隔离所需的能力事实：系统 uid 与特权应用不付查询代价。规则决策
+   在 config_read_begin **之前**调用——槽内的外部命令会拖住配置发布者的读者
+   排空，把单次慢查询放大成此后进入决策的所有 worker 在 config_read_begin 上的
+   自旋等待。白名单只能按调用方包名判（要解析 uid→包名=IO，槽外拿不到），故白名单
+   应用会多付一次按 uid 缓存 30s 的查询，裁决不变。 */
+void fw_pkg_prefetch_isolation_facts(uid_t uid);
 
 /* 仅测试：替换 appop 查询实现（GNU 测试环境没有 /system/bin/cmd）。传 nullptr
    恢复生产查询；两个钩子任一非空即走钩子路径，未设的那个按 false 处理。 */

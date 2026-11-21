@@ -452,11 +452,14 @@ FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_prob
 - Android backing FD 由创建它的 worker 持有，不能放入其他 worker 可清理的全局队列。当前 legacy 同步回复完成后，本 worker 下次回调才清理上一 FD；线程退出由 TSD 清尾，主线程 loop 返回后显式清尾。Android 显式禁用 io-uring，因为批量异步回复不能用“下一回调”证明上一回复已提交。TSD 初始化或第二次未清尾的 defer 失败时，backing 字段尚未发布，调用者关闭自己的 FD 并返回错误。
 - [fw_pkg.c](../src/daemon/fw_pkg.c) 的包 UID / 特权缓存读取文件在填充锁外，发布时复核键、代际与槽 revision；旧代结果不能覆盖新缓存。已有 AppOps 输出与退出预算不变。单次读取本身仍可能慢，但不占用无关查询的填充锁。
 - [sys_pkg.c](../src/core/sys_pkg.c) 在状态锁外构建完整表，锁内仅查找、reserve ticket 与整体换表；磁盘保存使用独立 writer 锁。epoch 阻止 cleanup / init / refresh 后迟到候选复活。首次 lazy owner 仍可能同步加载，其他 cold reader 返回既有未知结果；不能把这个 API 泛称为所有 cold 路径都非阻塞。
+- 跨应用隔离的能力事实（`cmd appops get`，实测 40ms 量级）在取配置读槽**之前**预取（`fw_pkg_prefetch_isolation_facts`，调用点在 `fw_rules_resolve` / `fw_rules_probe` 的槽外）：槽内的外部命令会拖住 `config_drain_readers`，把单次慢查询放大成此后每个 worker 在 `config_read_begin` 上的自旋（旧实现实测 300ms 查询 → 发布与迟到读者各等 270ms，回归 `test_cfg_slot_isolation.py`）。
+  预取必须比判定更少付代价，否则会把常态请求变成子进程风暴：① 跨应用隔离、按能力放行两个总闸关掉时判定根本不问能力，预取也直接返回；② 先用只读 `uid.map` 的廉价命名（`fw_pkg_uid_map_name`，无 IO）跳过调用方自身子树（含 sharedUserId 兄弟包），命名拿不到时保守预取；③ 路径要按判定同一口径清理后再认前缀（判定用 `br_strip_and_sanitize` 的 `sub_path`，而 `path_sanitize` 会删字节——直接扫原始路径会漏掉「删掉一个 0x01 才凑出 `/Android/data/`」这类写法，慢查询就原样留在槽里）。命中缓存时只是一次按 uid 的槽位查找。
+  白名单只能按调用方包名判（解析 uid→包名要 IO），故白名单应用会多付一次按 uid 缓存 30s 的查询，裁决不变；容器级 `readdir_extra` 只处理配置声明的虚拟目录、从不问能力（能力过滤在 `fuse_daemon` 的槽外），故不为容器预取。仍留在槽内的慢事实是调用方身份与目标属主解析（`br_get_app_cfg` 读 `/proc/<pid>/cmdline`、`fw_pkg_uid_for_package` 扫 `packages.list`），属下一批。
 
 - [ftp_backend_libcurl.c](../src/modules/ftp/ftp_backend_libcurl.c) 将 add / clear 生命周期串行锁与服务元数据锁分开；构造、扩容、退出 join 和资源释放不持服务锁。clear 先退休全表，再清理旧 mux；已退休 pool 的晚到 release 不能重新入池。同一 backend 的锁和网络调用仍可能慢。
 - [log_monitor.c](../src/log/log_monitor.c) 用固定 128 行队列交给专属持久化 worker；主事件循环只做有界复制，队满记录 drop。CLEAR 独立代际命令不受数据队列满影响，OK 只表示逻辑清空；正常 owner 后台删除磁盘文件，启动失败则保留旧磁盘内容，重启可能重新加载。退出 join 不取消活跃写，只排空 owner 已接收的命令；既有异步接收环与批队列在 main 退出时未全部转交 owner，不承诺服务全链路退出无丢失。
 
-这些保证针对已分离的用户态共享状态，不是 syscall 超时。`close`、满队列调用者自己的旧批次、退出 join 仍没有硬时间上界。配置发布仍需在非原子 globals 换入前 drain 读者；不能简单把 drain 移到 swap 后。仍持配置读槽的慢外部调用、控制面的同步文件编辑和同一后端的网络阻塞须分别审计。
+这些保证针对已分离的用户态共享状态，不是 syscall 超时。`close`、满队列调用者自己的旧批次、退出 join 仍没有硬时间上界。配置发布仍需在非原子 globals 换入前 drain 读者；不能简单把 drain 移到 swap 后。仍持配置读槽的慢外部调用（除已外移的 AppOps 能力查询）、控制面的同步文件编辑和同一后端的网络阻塞须分别审计。
 
 ## 7. 维护规范
 

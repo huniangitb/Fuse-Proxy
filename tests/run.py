@@ -362,6 +362,16 @@ SUITE_MAP = [
      ("uid_map_copy", "uid_map_build"),
      "uid.map 换表与请求借表所有权（锁内拷贝）"),
 
+    # 配置读槽 × 槽内慢能力查询：readdir/getattr 决策在 config_read_begin/end 槽里
+     # fork 查 appops，发布者排空旧读者时被它拖住，随后每个 worker 都在
+     # config_read_begin 上自旋（旧实现实测单次 300ms 查询 → 发布与迟到读者
+     # 各等 270ms）。预取移到取槽之前。
+     (("test_cfg_slot_isolation.py",),
+      ("src/daemon/fw_rules.c", "src/daemon/fw_pkg.c", "src/config/config_parser.c",
+       "tests/test_cfg_slot_isolation.py", "tests/fixtures/cfg_slot_isolation.c"),
+      ("fw_pkg_prefetch_isolation_facts", "br_prefetch_xapp_facts", "fw_pkg_uid_map_name"),
+      "配置读槽内的慢能力查询（槽外预取）"),
+
     (("test_sys_pkg_isolation.py",),
      ("src/core/sys_pkg.c", "tests/test_sys_pkg_isolation.py",
       "tests/fixtures/sys_pkg_isolation.c"),
@@ -542,6 +552,7 @@ LAYERS = {
             "test_pending_close.py",
             "test_pkg_cache_isolation.py",
             "test_pkg_map_lifetime.py",
+            "test_cfg_slot_isolation.py",
             "test_sys_pkg_isolation.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
@@ -795,6 +806,7 @@ PARALLEL_SAFE = frozenset({
     "test_pending_close.py",      # 真实队列/FD/线程与 daemon wrapper，临时目录，无挂载
     "test_pkg_cache_isolation.py", # 真实 fw_pkg + 定向文件 gate，临时目录，无挂载
     "test_pkg_map_lifetime.py",   # 真实 fw_pkg/uid_map + 私有 uid.map，临时目录，无挂载
+    "test_cfg_slot_isolation.py",  # 真实 fw_rules/fw_pkg/parser + 测试钩子，临时目录，无挂载
     "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志

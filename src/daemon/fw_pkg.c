@@ -90,6 +90,16 @@ static bool uid_map_copy(uid_t uid, char* out, size_t size) {
     return found;
 }
 
+/* uid → 包名，**只查 uid.map**：不摸 /proc、不读 packages.list，纯内存（锁内
+   二分 + 一次有界拷贝）。FUSE 请求的 uid→包名绝大多数命中这里；调用方用它做
+   "这条请求是不是调用方自己的子树"的廉价判断（在 config 读槽之外）。 */
+bool fw_pkg_uid_map_name(uid_t uid, char* out, size_t size) {
+    if (!out || size == 0) return false;
+    out[0] = '\0';
+    if (!uid_map_copy(uid, out, size)) return false;
+    return out[0] != '\0';
+}
+
 /* uid.map 条目数随已启动应用增长：按需扩容装载（同模块 load_uid_map） */
 static void load_uid_map(void) {
     int count = 0;
@@ -614,6 +624,18 @@ bool fw_pkg_can_install_packages(uid_t uid) {
     bool installer = false;
     ext_lookup(uid, &manage_external, &installer);
     return installer;
+}
+
+/* 槽外预取入口：调用方在 config_read_begin 之前调，把外部命令查询赶出配置读槽。
+   语义与 br_xapp_facts 前两档一致——系统 uid 与特权应用不会再问 appops，预取
+   同样跳过，不为已被否决的判定付子进程代价。总闸（跨应用隔离/按能力放行）与
+   路径形状由调用方 br_prefetch_xapp_facts 先判，本函数只管 uid 侧的跳过。
+   命中缓存时只是一次槽位查找。 */
+void fw_pkg_prefetch_isolation_facts(uid_t uid) {
+    if ((unsigned)uid < (unsigned)NSP_SYSTEM_APP_UID_MIN) return;
+    if (fw_pkg_is_privileged(uid)) return;
+    /* 两个 appop 共用同一份查询与同一个 uid 槽：查一次即同时填好两档。 */
+    (void)fw_pkg_manages_external(uid);
 }
 
 /* ---- 包名 → uid（FUSE 事件通道的白名单自动解析用） ----
