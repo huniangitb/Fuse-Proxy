@@ -51,12 +51,15 @@ bool fw_pkg_is_privileged(uid_t uid);
    用途：与 fw_pkg_is_privileged 同一个豁免位——安装器/文件管理器/应用商店这类
    持有 All files access 的应用，本职就是读他包 /Android/data（如安装器读 IM
    落盘的 apk），按 Android 自己的授权放行，而不是逐包写规则。
-   fail-safe：packages.list 查不到该 uid、命令缺失或执行失败 → false（不豁免）。
-   结果按 uid 缓存（命中/未命中都缓存），fw_pkg_reload 后随 gen 失效重查；
-   另有 30s 有效期——appops 模式是运行期可变的（用户在设置里随时授予/撤销），
-   只靠 gen 失效会让授权在重启 daemon 前一直不生效。
-   锁纪律：自持独立互斥量 g_ext_fill_lock，函数体内只碰 packages.list 解析与
-   posix_spawn，不调用任何其它 fw_pkg 缓存函数。 */
+   fail-safe：查不到 uid、命令失败/超时或同 uid 的缓存槽仍在查询 → false。
+   在途去重只对未被碰撞替换的缓存槽有效；总量仍受查询槽限制。
+   spawn 返回后的输出/退出等待受 250ms 预算约束，不是含查包名和同步
+   posix_spawn 的端到端硬上限。未完成回收的子进程交单线程 WNOHANG
+   回收器，最多保留 32 个查询/待回收槽，不另起无界等待线程。
+   成功结果（含未授权）缓存 30s，查询失败缓存 1s；fw_pkg_reload 后随 gen
+   失效重查，避免连续失败请求不断启动 cmd。
+   g_ext_fill_lock 只保护缓存的认领与发布，不跨 packages.list I/O 或外部命令；
+   旧代际结果不得授予权限；同槽被新 uid/claim 替换后，旧完成不得写回。 */
 bool fw_pkg_manages_external(uid_t uid);
 
 /* uid 是否**能装包**（appop REQUEST_INSTALL_PACKAGES 为 allow，或持同名系统权限

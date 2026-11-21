@@ -425,6 +425,9 @@ static void acl_log_deny(uid_t uid, const char* pkg, const char* path, NspAclOp 
 static NspPathClass acl_fill_capabilities(const NspAclQuery* q, NspAclIdentity* id) {
     NspPathClass cls = fw_acl_classify(q->path, nullptr, 0);
     if (id->cross_app_allowed || id->privileged) return cls;
+    /* 自己包/同 uid 包、默认目录等已有确定放行结论，不依赖外部查询。
+       能力位初始为 false：提前放行不扩大权限，只消除无谓的阻塞入口。 */
+    if (fw_acl_decide(q, id) == NSP_ACL_ALLOW) return cls;
     if (cls == NSP_PATH_OWNED) {
         if (!id->cross_app_by_capability) return cls;
         id->manage_external = fw_pkg_manages_external(id->uid);

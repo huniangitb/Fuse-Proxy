@@ -93,6 +93,12 @@ SUITE_MAP = [
      ("fw_acl_decide", "fw_acl_classify", "fw_acl_check", "fw_acl_identity",
       "fw_rules_cross_app_isolated"),
      "访问控制判定表(fw_acl) / 跨应用隔离开关"),
+    (("test_appops_bounded.py",),
+     ("src/daemon/fw_pkg.c", "src/daemon/fw_pkg.h", "src/daemon/fw_acl.c",
+      "tests/fixtures/fw_pkg_appops_driver.c", "tests/fixtures/appops_cmd_fixture.c"),
+     ("ext_lookup", "ext_cached", "appops_query_storage_ops", "appops_child_finish",
+      "appops_children_shutdown", "acl_fill_capabilities"),
+     "AppOps 有界查询 / 锁外缓存填充与失败冷却"),
     # ── ACL 不干扰（验收门 G9）：真 daemon + 真挂载上以普通调用者身份做真实文件
     # 操作，断言「功能预期」而不是 ACL 内部判定——ACL 层不得改变功能语义。
     (("test_acl_nonintrusive.py",),
@@ -537,6 +543,7 @@ LAYERS = {
     "L2": (
         "Android 拓扑仿真（rootless unshare 沙箱，须核对宿主 mountinfo 零变化）",
         (
+            "test_appops_bounded.py",
             "test_inject_mount_env.py",
             "test_global_replace.py",
             "test_mnt_watch.py",
@@ -748,6 +755,7 @@ TIER_EXCLUSIVE = frozenset({
 # 空间里挂/卸（L1 的 FUSE 挂载就落在宿主 ns），它们彼此之间也一样。调度器先让它们
 # 独占跑完，再放挂载类进来——否则写锁永远等不到「零读者」那个瞬间。
 QUIET_ON_HOST = frozenset({
+    "test_appops_bounded.py",
     "test_inject_mount_env.py",
     "test_global_replace.py",
     "test_mnt_watch.py",
