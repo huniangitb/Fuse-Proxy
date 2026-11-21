@@ -9,6 +9,9 @@
  *   inline   —— 旧形态对照：同样的慢审计在调用线程上直接跑，量化被冻住的时长；
  *   mode_v1 / mode_reset_v2 / mode_specific_v2 —— 粒度选择与变更集合语义
  *               （v1 全量对账、reset 走全量审计、具体变更去重后原样送达）；
+ *   mode_both_reset_first / mode_both_specific_first —— 同一轮里既有「整体变化」又有
+ *               具体条目时两路都必须跑（旧实现两路互斥，会把具体条目整轮丢掉）：
+ *               先占住 worker（慢审计 150ms），期间的请求必然合进同一待跑轮；
  *   shutdown —— 退出等手上那一轮跑完，之后的请求不再执行。
  */
 #ifndef _GNU_SOURCE
@@ -88,15 +91,16 @@ void audit_tracked_apps(void) {
 }
 
 void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
+    /* 跨轮累积：mode_both_* 会先跑一轮 warm、再跑含具体条目的合并轮，
+       判据要看两轮合起来的送达集合。 */
+    const int n = count > NSP_AUDIT_MAX_CHANGED ? NSP_AUDIT_MAX_CHANGED : count;
     int seen = atomic_load_explicit(&g_seen_count, memory_order_acquire);
-    if (seen == 0) {
-        const int n = count > NSP_AUDIT_MAX_CHANGED ? NSP_AUDIT_MAX_CHANGED : count;
-        for (int i = 0; i < n; i++) {
-            snprintf(g_seen_pkgs[i], sizeof g_seen_pkgs[i], "%s", changed[i].pkg_name);
-            g_seen_user[i] = changed[i].user_id;
-        }
-        atomic_store_explicit(&g_seen_count, n, memory_order_release);
+    for (int i = 0; i < n && seen < NSP_AUDIT_MAX_CHANGED; i++) {
+        snprintf(g_seen_pkgs[seen], sizeof g_seen_pkgs[seen], "%s", changed[i].pkg_name);
+        g_seen_user[seen] = changed[i].user_id;
+        seen++;
     }
+    atomic_store_explicit(&g_seen_count, seen, memory_order_release);
     int mx = atomic_load_explicit(&g_max_items, memory_order_acquire);
     while (count > mx &&
            !atomic_compare_exchange_weak_explicit(&g_max_items, &mx, count,
@@ -179,6 +183,44 @@ static void run_inline(void) {
     report("inline", 0, total_us, total_runs());
 }
 
+/* 同一待跑轮里同时有「整体变化」与具体条目：两路都必须跑。
+ * 先发一个慢的具体请求占住 worker，随后（必然合进同一待跑轮）按两种顺序各发一次
+ * 「整体变化」+3 条具体条目。旧实现两路互斥：reset 命中就 return，具体条目整轮丢失。 */
+static void run_both(const char* mode, bool reset_first) {
+    g_inject_method = INJECT_METHOD_V2;
+    g_slow_ms = 150;
+    ChangedPkg warm;
+    memset(&warm, 0, sizeof warm);
+    snprintf(warm.pkg_name, sizeof warm.pkg_name, "com.warm.app");
+    warm.user_id = 0;
+    nsp_audit_request(&warm, 1, false);
+    sleep_ms(40); /* worker 已经抓走 warm 并进入慢审计，后续请求只能合进下一待跑轮 */
+    ChangedPkg items[3];
+    memset(items, 0, sizeof items);
+    snprintf(items[0].pkg_name, sizeof items[0].pkg_name, "com.b1.app");
+    items[0].user_id = 0;
+    snprintf(items[1].pkg_name, sizeof items[1].pkg_name, "com.b2.app");
+    items[1].user_id = 10;
+    snprintf(items[2].pkg_name, sizeof items[2].pkg_name, "com.b3.app");
+    items[2].user_id = 0;
+    if (reset_first) {
+        nsp_audit_request(nullptr, 0, true);
+        nsp_audit_request(items, 3, false);
+    } else {
+        nsp_audit_request(items, 3, false);
+        nsp_audit_request(nullptr, 0, true);
+    }
+    settle();
+    report(mode, 0, 0, total_runs());
+    if (atomic_load_explicit(&g_seen_count, memory_order_acquire) > 0) {
+        printf("seen_items=");
+        for (int i = 0; i < atomic_load_explicit(&g_seen_count, memory_order_acquire); i++) {
+            printf("%s:%d,", g_seen_pkgs[i], g_seen_user[i]);
+        }
+        printf("\n");
+    }
+}
+
 static void run_mode(const char* mode) {
     if (strcmp(mode, "mode_v1") == 0) {
         g_inject_method = INJECT_METHOD_V1;
@@ -190,6 +232,12 @@ static void run_mode(const char* mode) {
         snprintf(c.pkg_name, sizeof c.pkg_name, "com.reset.app");
         c.user_id = -1;
         nsp_audit_request(&c, 1, true);
+    } else if (strcmp(mode, "mode_both_reset_first") == 0) {
+        run_both(mode, true);
+        return;
+    } else if (strcmp(mode, "mode_both_specific_first") == 0) {
+        run_both(mode, false);
+        return;
     } else { /* mode_specific_v2：两次请求，第二次带重复条目 */
         g_inject_method = INJECT_METHOD_V2;
         g_slow_ms = 120;

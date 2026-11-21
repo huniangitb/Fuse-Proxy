@@ -81,6 +81,8 @@ def check_call_sites(fails, injector_path):
         if commit >= 0 and request >= 0 and not commit < request:
             fails.append("对账派发必须排在配置提交之后（先发布视图再对账）")
         cell = body[request:body.find(";", request) + 1] if request >= 0 else ""
+        if "out_changed" not in cell:
+            fails.append("派发没有带上 out_changed（具体变更被吞成空集合）")
         if "changed_count == -1" not in cell or "changed_count > 0" not in cell:
             fails.append("changed_count → (变更集合, reset) 映射写错："
                          "整体变化(-1) 必须当 reset，条目只在 >0 时携带")
@@ -183,7 +185,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="audit_defer_") as work:
         plain = build(work, "plain", False)
         values = {m: run_mode(plain, m) for m in
-                  ("defer", "inline", "mode_v1", "mode_reset_v2", "mode_specific_v2", "shutdown")}
+                  ("defer", "inline", "mode_v1", "mode_reset_v2", "mode_specific_v2",
+                   "mode_both_reset_first", "mode_both_specific_first", "shutdown")}
         asan = build(work, "asan", True)
         asan_defer = run_mode(asan, "defer")
         asan_shutdown = run_mode(asan, "shutdown")
@@ -207,15 +210,32 @@ def main():
         if spec is None:
             fails.append("mode_specific_v2 运行失败")
         else:
-            if (spec.get("specific"), spec.get("tracked"), spec.get("running")) != ("1", "0", "0"):
-                fails.append("v2 + 具体变更 没有合并成一次 audit_and_remount_specific_apps()")
+            # 只断言语义（具体变更、不回落整体对账、送达集合与去重），不断言轮数：
+            # 第二份请求可能落在同一待跑轮、也可能被 worker 抓走后另起一轮，两种都合法。
+            if int(spec.get("specific", 0)) < 1 or spec.get("tracked") != "0" \
+                    or spec.get("running") != "0":
+                fails.append("v2 + 具体变更 没有走 audit_and_remount_specific_apps()")
             seen = [x for x in spec.get("seen_items", "").split(",") if x]
             if sorted(seen) != sorted(EXPECTED_SEEN):
                 fails.append(f"变更集合送达不符（去重/合并/user_id 漂移）: {spec.get('seen_items')}")
-            if len(seen) != len(EXPECTED_SEEN):
-                fails.append(f"去重失效：{len(seen)} 条送达，应为 {len(EXPECTED_SEEN)} 条")
-            if spec.get("max_items") != str(len(EXPECTED_SEEN)):
-                fails.append(f"单轮审计集合大小 {spec.get('max_items')}，应为 {len(EXPECTED_SEEN)}")
+            if int(spec.get("max_items", 99)) > len(EXPECTED_SEEN):
+                fails.append(f"单轮审计集合大小 {spec.get('max_items')}，应 <= {len(EXPECTED_SEEN)}")
+        # 同一轮里既整体变化又有具体条目：两路都必须跑（旧实现互斥，条目整轮丢）
+        for mode in ("mode_both_reset_first", "mode_both_specific_first"):
+            both = values[mode]
+            if both is None:
+                fails.append(f"{mode} 运行失败")
+                continue
+            if int(both.get("tracked", 0)) < 1:
+                fails.append(f"{mode}: 整体变化没有走全量对账（tracked=0）")
+            if int(both.get("specific", 0)) < 1:
+                fails.append(f"{mode}: 具体条目整轮丢失（specific=0，两路互斥回归）")
+            if both.get("running") != "0":
+                fails.append(f"{mode}: v2 下不该走 audit_running_apps")
+            seen = [x for x in both.get("seen_items", "").split(",") if x]
+            for want in ("com.b1.app:0", "com.b2.app:10", "com.b3.app:0"):
+                if want not in seen:
+                    fails.append(f"{mode}: 具体条目未送达 {want}（实到 {seen}）")
         shut = values["shutdown"]
         if shut is None:
             fails.append("shutdown 运行失败")
@@ -230,8 +250,16 @@ def main():
             fails.append("ASan/UBSan 版 shutdown 运行失败")
         if spawn_retry is None:
             fails.append("起线程失败后：下一请求没能补跑保留的那一轮（retry 失败）")
-        elif spawn_retry.get("ok") != "1" or int(spawn_retry.get("call_us", 1 << 30)) > 50000:
-            fails.append(f"起线程失败时调用线程被拖住或没补跑: {spawn_retry}")
+        else:
+            if spawn_retry.get("ok") != "1" or int(spawn_retry.get("call_us", 1 << 30)) > 50000:
+                fails.append(f"起线程失败时调用线程被拖住或没补跑: {spawn_retry}")
+            # 失败那一轮是「整体变化」，恢复后的请求带 3 条不同条目：两者都必须送达
+            if int(spawn_retry.get("tracked_runs", 0)) < 1:
+                fails.append("创建失败时排队的那一轮被丢了（tracked_runs=0）")
+            if int(spawn_retry.get("specific_runs", 0)) < 1:
+                fails.append("合并进保留轮的具体变更没送达（两路互斥）")
+            if spawn_retry.get("seen") != "3":
+                fails.append(f"具体变更条数 {spawn_retry.get('seen')}，应为 3")
         if spawn_race is None:
             fails.append("创建慢失败时 nsp_audit_shutdown 未返回（会永久挂住退出）")
         elif spawn_race.get("ok") != "1":
