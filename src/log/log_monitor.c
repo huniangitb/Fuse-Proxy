@@ -339,8 +339,9 @@ static int stream_emit(void* ctx, const void* data, size_t len) {
 /* overflow 应急落盘机制已移除：producer 环满时直接丢弃（见 async 线程注释）；
    持久化统一走 io/sys 自动落盘（persist_*，单文件 2MB 轮转） */
 /* ===== io/sys 自动落盘（懒写入 + 单文件 2MB 轮转） =====
-   写入路径：push_log（主线程单漏斗）→ 行暂存 64KB stage → 刷盘时机：
-   stage 满 / 500ms tick（脏超 1s） / 进程退出。刷盘 open-fstat-rotate-
+   写入路径：push_log（主线程单漏斗）→ 有界行队列 → 独占落盘线程的 64KB stage。
+   主线程不等空间、不做落盘 I/O；满队列拒收并计数。刷盘时机仍为 stage 满、
+   500ms tick 唤醒（脏超 1s，worker 也独立计时）或退出。刷盘 open-fstat-rotate-
    write-close 一次批量写完，杜绝逐条 open/write/close。轮转：cur+本批超
    2MB → cur 改名 .1（删旧 .1），每类最多保留 cur + .1（≤4MB），单文件
    严格 ≤2MB。logcat 不落盘。 */
@@ -348,6 +349,8 @@ static int stream_emit(void* ctx, const void* data, size_t len) {
 #define PERSIST_STAGE_CAP       (64u * 1024u)
 #define PERSIST_LAZY_MS         1000
 #define PERSIST_FAIL_BACKOFF_MS 5000
+#define PERSIST_QUEUE_CAP       128
+#define PERSIST_LINE_CAP        (MAX_MSG_LEN + 128)
 typedef struct {
     char path[PATH_MAX]; /* LOG_DIR/io.log */
     char rot[PATH_MAX];  /* LOG_DIR/io.log.1（单备份轮转） */
@@ -355,10 +358,30 @@ typedef struct {
     size_t staged;
     uint64_t last_flush_ms;
     uint64_t fail_until_ms; /* 磁盘失败退避：到期前跳过 open 尝试 */
-    uint64_t dropped;       /* stage 满且刷盘不可用时被拒收的日志行数 */
+    uint64_t generation;    /* 仅 worker 访问：已应用的 CLEAR 代际 */
+    _Atomic uint64_t dropped; /* 队列/stage 满或 worker 不可用时拒收的行数 */
 } PersistWriter;
 static PersistWriter g_persist_io;
 static PersistWriter g_persist_sys;
+
+typedef struct {
+    unsigned channel;
+    uint64_t generation;
+    size_t length;
+    char line[PERSIST_LINE_CAP];
+} PersistCommand;
+
+/* 只有主漏斗投递。锁内仅固定容量元数据/内存拷贝；worker 的所有文件 I/O
+   和 stage 操作均在锁外，CLEAR 不占 DATA 槽位。 */
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    pthread_t owner;
+    bool started, accepting, stopping;
+    uint64_t generation[2];
+    size_t head, count;
+    PersistCommand commands[PERSIST_QUEUE_CAP];
+} g_persist_queue = {.lock = PTHREAD_MUTEX_INITIALIZER};
 
 /* 链路丢弃累计（跨连接/跨 async 线程）：这些是**唯一**会静默吃掉日志的点，
    不计数就等于"日志凭空消失且无从查起"。由 report_drops_once() 限频上报到
@@ -411,7 +434,8 @@ static void persist_init_writer(PersistWriter* w, const char* name) {
     w->staged = 0;
     w->last_flush_ms = persist_now_ms();
     w->fail_until_ms = 0;
-    w->dropped = 0;
+    w->generation = 0;
+    atomic_store_explicit(&w->dropped, 0, memory_order_relaxed);
 }
 
 /* 刷盘：open → fstat 校准 → 超限轮转 → 全量写出 → close。失败进入退避后重试。
@@ -447,6 +471,7 @@ static void persist_flush(PersistWriter* w) {
             if (errno == EINTR) continue;
             break;
         }
+        if (n == 0) break; /* 无进展也进入退避，不能无限循环占住 owner */
         off += (size_t)n;
     }
     close(fd);
@@ -463,13 +488,27 @@ static void persist_flush(PersistWriter* w) {
     w->last_flush_ms = now;
 }
 
+/* 仅 worker 调用：保留未写尾部和失败退避；满 stage 按整行拒收。 */
+static void persist_append(PersistWriter* w, const PersistCommand* cmd) {
+    if (!w->stage) {
+        atomic_fetch_add_explicit(&w->dropped, 1, memory_order_relaxed);
+        return;
+    }
+    if (w->staged + cmd->length > PERSIST_STAGE_CAP) persist_flush(w);
+    if (w->staged + cmd->length > PERSIST_STAGE_CAP) {
+        atomic_fetch_add_explicit(&w->dropped, 1, memory_order_relaxed);
+        return;
+    }
+    memcpy(w->stage + w->staged, cmd->line, cmd->length);
+    w->staged += cmd->length;
+}
+
 static void persist_stage(PersistWriter* w, const char* msg, int level, time_t t) {
-    if (!w->stage) return;
     struct tm tm_buf;
     localtime_r(&t, &tm_buf);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
-    char line[MAX_MSG_LEN + 128];
+    char line[PERSIST_LINE_CAP];
     int len = snprintf(line, sizeof(line), "%s|%s|%s\n", ts, nsp_log_level_name(level), msg);
     if (len <= 0) return;
     /* 截断时强制尾部换行，避免与下一行拼接成无换行超长行 */
@@ -477,22 +516,162 @@ static void persist_stage(PersistWriter* w, const char* msg, int level, time_t t
         len = sizeof(line) - 1;
         line[len - 1] = '\n';
     }
-    if (w->staged + (size_t)len > PERSIST_STAGE_CAP) persist_flush(w);
-    if (w->staged + (size_t)len > PERSIST_STAGE_CAP) {
-        w->dropped++;
+    unsigned ch = w == &g_persist_io ? 0 : 1;
+    pthread_mutex_lock(&g_persist_queue.lock);
+    if (!g_persist_queue.accepting || g_persist_queue.count == PERSIST_QUEUE_CAP) {
+        pthread_mutex_unlock(&g_persist_queue.lock);
+        atomic_fetch_add_explicit(&w->dropped, 1, memory_order_relaxed);
         return;
     }
-    memcpy(w->stage + w->staged, line, (size_t)len);
-    w->staged += (size_t)len;
+    size_t slot = (g_persist_queue.head + g_persist_queue.count) % PERSIST_QUEUE_CAP;
+    PersistCommand* cmd = &g_persist_queue.commands[slot];
+    cmd->channel = ch;
+    cmd->generation = g_persist_queue.generation[ch];
+    cmd->length = (size_t)len;
+    memcpy(cmd->line, line, (size_t)len);
+    g_persist_queue.count++;
+    pthread_cond_signal(&g_persist_queue.ready);
+    pthread_mutex_unlock(&g_persist_queue.lock);
 }
 
-/* 懒刷盘：500ms tick 调用，脏数据超 1s 未刷则写出（低频场景最多延迟 1s+） */
+/* OK 仅表示内存/启动快照已逻辑清空，不表示磁盘已经删除。
+   owner 已启动时按代际最终清理；启动失败时只有逻辑清空，磁盘保留且不会自动
+   清理（下次进程启动可能再载入）。CLEAR 不占 DATA 槽；去掉本类旧排队行，
+   避免旧满队列挤掉清空后首行。 */
+static void persist_clear(PersistWriter* w) {
+    unsigned ch = w == &g_persist_io ? 0 : 1;
+    pthread_mutex_lock(&g_persist_queue.lock);
+    g_persist_queue.generation[ch]++;
+    size_t kept = 0;
+    for (size_t i = 0; i < g_persist_queue.count; i++) {
+        size_t src = (g_persist_queue.head + i) % PERSIST_QUEUE_CAP;
+        if (g_persist_queue.commands[src].channel == ch) continue;
+        size_t dst = (g_persist_queue.head + kept++) % PERSIST_QUEUE_CAP;
+        if (dst != src) g_persist_queue.commands[dst] = g_persist_queue.commands[src];
+    }
+    g_persist_queue.count = kept;
+    if (g_persist_queue.started) pthread_cond_signal(&g_persist_queue.ready);
+    pthread_mutex_unlock(&g_persist_queue.lock);
+}
+
+/* 原 500ms tick 只唤醒 owner；文件 I/O 不再占主 epoll。 */
 static void persist_lazy_tick(void) {
-    uint64_t now = persist_now_ms();
-    if (g_persist_io.staged > 0 && now - g_persist_io.last_flush_ms >= PERSIST_LAZY_MS)
-        persist_flush(&g_persist_io);
-    if (g_persist_sys.staged > 0 && now - g_persist_sys.last_flush_ms >= PERSIST_LAZY_MS)
-        persist_flush(&g_persist_sys);
+    pthread_mutex_lock(&g_persist_queue.lock);
+    if (g_persist_queue.started) pthread_cond_signal(&g_persist_queue.ready);
+    pthread_mutex_unlock(&g_persist_queue.lock);
+}
+
+static void* persist_worker(void* unused) {
+    (void)unused;
+    nsp_set_thread_name("nsp_logdisk");
+    PersistWriter* writers[2] = {&g_persist_io, &g_persist_sys};
+    for (;;) {
+        uint64_t now = persist_now_ms(), deadline = 0;
+        for (unsigned ch = 0; ch < 2; ch++) {
+            PersistWriter* w = writers[ch];
+            if (!w->stage || !w->staged) continue;
+            uint64_t due = w->last_flush_ms + PERSIST_LAZY_MS;
+            if (due < w->fail_until_ms) due = w->fail_until_ms;
+            if (!deadline || due < deadline) deadline = due;
+        }
+        PersistCommand cmd;
+        uint64_t generation[2];
+        pthread_mutex_lock(&g_persist_queue.lock);
+        generation[0] = g_persist_queue.generation[0];
+        generation[1] = g_persist_queue.generation[1];
+        bool clear_pending = generation[0] != writers[0]->generation ||
+                             generation[1] != writers[1]->generation;
+        bool have_cmd = g_persist_queue.count != 0;
+        bool stopping = g_persist_queue.stopping;
+        if (!have_cmd && !clear_pending && !stopping && (!deadline || deadline > now)) {
+            if (deadline) {
+                struct timespec ts = {.tv_sec = (time_t)(deadline / 1000u),
+                                      .tv_nsec = (long)(deadline % 1000u) * 1000000L};
+                pthread_cond_timedwait(&g_persist_queue.ready, &g_persist_queue.lock, &ts);
+            } else {
+                pthread_cond_wait(&g_persist_queue.ready, &g_persist_queue.lock);
+            }
+            pthread_mutex_unlock(&g_persist_queue.lock);
+            continue; /* 包括虚假唤醒：重新检查谓词和单调截止时间 */
+        }
+        if (have_cmd) {
+            cmd = g_persist_queue.commands[g_persist_queue.head];
+            g_persist_queue.head = (g_persist_queue.head + 1) % PERSIST_QUEUE_CAP;
+            g_persist_queue.count--;
+        }
+        pthread_mutex_unlock(&g_persist_queue.lock);
+        for (unsigned ch = 0; ch < 2; ch++) {
+            PersistWriter* w = writers[ch];
+            if (generation[ch] == w->generation) continue;
+            /* 单 owner：旧 write 即使晚于 ACK 返回，返回后也先清 stage/文件，
+               再接纳新代际；不会由旧排队行复活已清理文件。 */
+            w->staged = 0;
+            w->fail_until_ms = 0;
+            w->last_flush_ms = persist_now_ms();
+            unlink(w->path);
+            unlink(w->rot);
+            w->generation = generation[ch];
+        }
+        if (have_cmd && cmd.generation == writers[cmd.channel]->generation)
+            persist_append(writers[cmd.channel], &cmd);
+        if (stopping && !have_cmd) break;
+        now = persist_now_ms();
+        for (unsigned ch = 0; ch < 2; ch++) {
+            PersistWriter* w = writers[ch];
+            if (w->staged && now - w->last_flush_ms >= PERSIST_LAZY_MS)
+                persist_flush(w);
+        }
+    }
+    for (unsigned ch = 0; ch < 2; ch++) {
+        persist_flush(writers[ch]); /* 仅一次最终尝试，失败仍遵守原退避 */
+        free(writers[ch]->stage);
+        writers[ch]->stage = nullptr;
+    }
+    return nullptr;
+}
+
+/* 每个进程只在初始化时调用一次，不提供 stop→start 复用。
+   stage 初始化/启动快照读取完成后转交所有权；失败不退回同步落盘。 */
+static bool persist_worker_start(void) {
+    pthread_condattr_t attr;
+    if (pthread_condattr_init(&attr) != 0) return false;
+    int rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (rc == 0) rc = pthread_cond_init(&g_persist_queue.ready, &attr);
+    pthread_condattr_destroy(&attr);
+    if (rc != 0) return false;
+    rc = pthread_create(&g_persist_queue.owner, nullptr, persist_worker, nullptr);
+    if (rc != 0) {
+        pthread_cond_destroy(&g_persist_queue.ready);
+        return false;
+    }
+    pthread_mutex_lock(&g_persist_queue.lock);
+    g_persist_queue.started = true;
+    g_persist_queue.accepting = true;
+    pthread_mutex_unlock(&g_persist_queue.lock);
+    return true;
+}
+
+/* 原 async producer 停止并 join、既有 cleanup 完成后停止接纳。join 在锁外；
+   不取消活跃内核 write，不释放活 owner 的 stage，正常退出不承诺硬 deadline。 */
+static void persist_worker_stop(void) {
+    pthread_mutex_lock(&g_persist_queue.lock);
+    bool started = g_persist_queue.started;
+    g_persist_queue.accepting = false;
+    g_persist_queue.stopping = true;
+    if (started) pthread_cond_signal(&g_persist_queue.ready);
+    pthread_mutex_unlock(&g_persist_queue.lock);
+    if (started) {
+        pthread_join(g_persist_queue.owner, nullptr);
+        pthread_mutex_lock(&g_persist_queue.lock);
+        g_persist_queue.started = false;
+        pthread_mutex_unlock(&g_persist_queue.lock);
+        pthread_cond_destroy(&g_persist_queue.ready);
+    } else {
+        free(g_persist_io.stage);
+        g_persist_io.stage = nullptr;
+        free(g_persist_sys.stage);
+        g_persist_sys.stage = nullptr;
+    }
 }
 
 /* ===== 启动时加载落盘快照（只读独立缓冲） =====
@@ -732,7 +911,7 @@ static void push_log(LogBuffer* buf, const char* msg, int type, int level) {
     buf->data[buf->head].msg[MAX_MSG_LEN - 1] = '\0';
     buf->head = (buf->head + 1) % buf->max;
     if (buf->head == buf->tail) buf->full = true;
-    /* io/sys 自动落盘（logcat 除外）：只暂存，刷盘时机见 persist_lazy_tick */
+    /* io/sys 自动落盘（logcat 除外）：只投递有界队列，主线程不等磁盘 */
     if (type == 1)
         persist_stage(&g_persist_io, msg, level, now);
     else if (type == 2)
@@ -1474,20 +1653,16 @@ static int process_line(ClientCtx* ctx, char* line, const char* leftover, int le
     } else if (strcmp(line, "CLEAR_IO") == 0) {
         g_io_buf.head = g_io_buf.tail = 0;
         g_io_buf.full = false;
-        /* 同步清启动快照、暂存与落盘文件（暂存不清会与 tick 刷盘竞态复活文件） */
+        /* OK 仅逻辑清空；owner 存活才最终删磁盘，启动失败时磁盘原样保留。 */
         disk_free(&g_io_disk);
-        g_persist_io.staged = 0;
-        unlink(g_persist_io.path);
-        unlink(g_persist_io.rot);
+        persist_clear(&g_persist_io);
         write(fd, "OK\n", 3);
         return 1;
     } else if (strcmp(line, "CLEAR_SYS") == 0) {
         g_sys_buf.head = g_sys_buf.tail = 0;
         g_sys_buf.full = false;
         disk_free(&g_sys_disk);
-        g_persist_sys.staged = 0;
-        unlink(g_persist_sys.path);
-        unlink(g_persist_sys.rot);
+        persist_clear(&g_persist_sys);
         write(fd, "OK\n", 3);
         return 1;
     } else if (strcmp(line, "CLEAR_LOGCAT") == 0) {
@@ -1600,7 +1775,7 @@ static void handle_client_timeout_tick(int timer_fd) {
     uint64_t expirations;
     ssize_t r = read(timer_fd, &expirations, sizeof(expirations));
     (void)r;
-    persist_lazy_tick(); /* 落盘懒刷盘（500ms tick 驱动） */
+    persist_lazy_tick(); /* 500ms tick 只唤醒独占落盘线程 */
     report_drops_once(); /* 链路丢弃限频告警（500ms tick 限频到 10s 一条） */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1668,6 +1843,8 @@ int main(int argc, char* argv[]) {
     /* 启动加载落盘快照到只读独立缓冲（与内存拼接，客户端获取时合并） */
     disk_load(&g_io_disk, g_persist_io.rot, g_persist_io.path);
     disk_load(&g_sys_disk, g_persist_sys.rot, g_persist_sys.path);
+    if (!persist_worker_start())
+        LOG_WRN("日志落盘线程启动失败：持久化拒收计数，查询服务继续运行");
     load_ignore_rules();
     /* 环境信息仅 injector 输出一次（崩溃归因走 crash_dump 的 Build 行），此处不重复 */
     g_server_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1830,13 +2007,9 @@ int main(int argc, char* argv[]) {
        join 必须在 drain 之前：线程还活着时 drain 完的环仍可能被它继续写，
        那些条目会随 free 一起静默丢失。 */
     while (g_async_clients) cleanup_async(g_async_clients);
-    /* 退出前刷盘残余暂存并释放 */
-    persist_flush(&g_persist_io);
-    persist_flush(&g_persist_sys);
-    free(g_persist_io.stage);
-    g_persist_io.stage = nullptr;
-    free(g_persist_sys.stage);
-    g_persist_sys.stage = nullptr;
+    /* producer 已停止；owner 仅排空已入队命令，未消费接收环/批队列不在此保证内。
+       锁外 join 独占落盘 owner 后才能释放共享状态。 */
+    persist_worker_stop();
     disk_free(&g_io_disk);
     disk_free(&g_sys_disk);
     destroy_buf(&g_io_buf);

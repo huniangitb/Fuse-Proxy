@@ -127,24 +127,23 @@ static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size,
     return found;
 }
 
-/* uid 是否为特权应用（Android 权限体系自动判定，见 fw_pkg.h）。缓存独立于
-   包名解析槽位：privileged 是"uid → 布尔"的稳定事实（packages.list 只在
-   应用安装/升级时变化），包名缓存 gen 失效不影响它。 */
+/* 特权缓存独立于包名缓存，但同样随 g_gen 失效。所有快读字段均为原子，
+   seq_cst 序保证两次 seq 之间读到的是完整发布；文件读取绝不占用填充锁。 */
 typedef struct {
     _Atomic uint64_t seq; /* 奇数 = 写者进行中 */
-    uint64_t gen;
-    uid_t uid;
-    bool known; /* packages.list 有该 uid 的行（不可读/未命中 = false） */
-    bool priv;
+    _Atomic uint64_t gen;
+    _Atomic uid_t uid;
+    _Atomic bool known; /* packages.list 不可读/未命中时不负缓存 */
+    _Atomic bool priv;
 } FwPkgPrivSlot;
 
 static FwPkgPrivSlot g_priv_slots[FW_PKG_CACHE_SIZE];
 static pthread_mutex_t g_priv_fill_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* seinfo 以 "platform" 开头 = platform 签名（system/priv-app/签名共享）。
-   实测 packages.list：DocumentsUI "platform:privapp:…"、Settings "platform:privapp:…"、
-   系统签名覆盖层 "platform:targetSdkVersion=…"；普通应用恒为 "default:…"。
-   "privapp" 子串单独判会漏掉纯 platform 签名应用，故判前缀。 */
+   实测 packages.list：DocumentsUI/Settings "platform:privapp:…"、
+   签名覆盖层 "platform:targetSdkVersion=…"；普通应用恒为 "default:…"。
+   只判 "privapp" 子串会漏掉纯 platform 签名应用，故判前缀。 */
 static bool seinfo_is_privileged(const char* seinfo) {
     return strncmp(seinfo, "platform", 8) == 0 &&
            (seinfo[8] == '\0' || seinfo[8] == ':');
@@ -153,32 +152,50 @@ static bool seinfo_is_privileged(const char* seinfo) {
 bool fw_pkg_is_privileged(uid_t uid) {
     FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
-    for (;;) {
-        uint64_t v1 = atomic_load_explicit(&s->seq, memory_order_acquire);
-        if (!(v1 & 1)) {
-            if (v1 == s->seq && s->gen == gen && s->uid == uid && s->known)
-                return s->priv;
-        }
-        if (atomic_load_explicit(&s->seq, memory_order_acquire) & 1) continue;
-        pthread_mutex_lock(&g_priv_fill_lock);
-        char pkg[FW_PKG_NAME_MAX];
-        char seinfo[128];
-        bool known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo,
-                                                      sizeof seinfo);
-        bool priv = known && seinfo_is_privileged(seinfo);
-        /* 槽位写回只依赖 g_priv_fill_lock（本函数独占路径）+ 自身 seqlock 标记；
-           绝不碰 g_fill_lock——包名填充路径（g_fill_lock）会调用本函数，嵌套即死锁 */
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release); /* 奇：写中 */
+    uint64_t claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    uint64_t slot_gen = atomic_load_explicit(&s->gen, memory_order_seq_cst);
+    uid_t slot_uid = atomic_load_explicit(&s->uid, memory_order_seq_cst);
+    bool known = atomic_load_explicit(&s->known, memory_order_seq_cst);
+    bool priv = atomic_load_explicit(&s->priv, memory_order_seq_cst);
+    if (!(claim & 1) && claim == atomic_load_explicit(&s->seq, memory_order_seq_cst) &&
+        slot_gen == gen && slot_uid == uid && known &&
+        gen == atomic_load_explicit(&g_gen, memory_order_acquire)) return priv;
+
+    /* 只认领版本，不把外部 I/O 变成其它 uid 的等待点。并发同 uid miss 可独立查询。 */
+    pthread_mutex_lock(&g_priv_fill_lock);
+    gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    if (s->gen == gen && s->uid == uid && s->known) {
+        priv = s->priv;
+        pthread_mutex_unlock(&g_priv_fill_lock);
+        return gen == atomic_load_explicit(&g_gen, memory_order_acquire) && priv;
+    }
+    pthread_mutex_unlock(&g_priv_fill_lock);
+
+    char pkg[FW_PKG_NAME_MAX];
+    char seinfo[128];
+    known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo, sizeof seinfo);
+    priv = known && seinfo_is_privileged(seinfo);
+
+    pthread_mutex_lock(&g_priv_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) {
+        pthread_mutex_unlock(&g_priv_fill_lock);
+        return false; /* 旧代查询不发布也不授予权限，不在请求里循环重读。 */
+    }
+    uint64_t current = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    if (current != claim && s->gen == gen && s->uid == uid) {
+        priv = s->priv; /* 同 key 已完成的发布优先，包括一次未命中。 */
+    } else if (current == claim) {
+        /* 版本标记阻止慢 miss 覆盖碰撞槽的新 key（包括 key 来回变化的 ABA）。 */
+        atomic_store_explicit(&s->seq, claim + 1, memory_order_seq_cst);
         s->uid = uid;
         s->known = known;
         s->priv = priv;
         s->gen = gen;
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release); /* 偶：写完 */
-        pthread_mutex_unlock(&g_priv_fill_lock);
-        return priv;
+        atomic_store_explicit(&s->seq, claim + 2, memory_order_seq_cst);
     }
+    pthread_mutex_unlock(&g_priv_fill_lock);
+    return gen == atomic_load_explicit(&g_gen, memory_order_acquire) && priv;
 }
 
 
@@ -563,12 +580,11 @@ bool fw_pkg_can_install_packages(uid_t uid) {
 }
 
 /* ---- 包名 → uid（FUSE 事件通道的白名单自动解析用） ----
-   与上面两条缓存三足鼎立、互不嵌套：本组只用 g_pkguid_fill_lock，且函数体内
-   只解析 packages.list（fopen/fgets，不取任何锁），**不**调用 resolve_uncached
-   → g_fill_lock、也不调用 fw_pkg_is_privileged → g_priv_fill_lock。反过来那两条
-   路径完全不会进本函数，故不存在「持一把锁再取另一把」的环。 */
+   g_pkguid_fill_lock 只保护缓存查找/选槽/发布；packages.list 全程在锁外读取。
+   不嵌套 g_fill_lock/g_priv_fill_lock；并发 miss 用槽版本守卫，旧查询不抢新槽。 */
 typedef struct {
     uint64_t gen;
+    uint64_t revision; /* 每次发布递增；仅在 g_pkguid_fill_lock 下访问 */
     char pkg[FW_PKG_NAME_MAX];
     bool known; /* packages.list 有该包名的行 */
     uid_t uid;
@@ -600,29 +616,55 @@ static bool resolve_uid_from_packagelist(const char* pkg, uid_t* out) {
 
 bool fw_pkg_uid_for_package(const char* pkg, uid_t* out) {
     if (!pkg || !pkg[0]) return false;
-    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
     pthread_mutex_lock(&g_pkguid_fill_lock);
-    int use = -1;
-    for (int i = 0; i < FW_PKG_UID_SLOTS && use < 0; i++) {
-        if (g_pkguid_slots[i].gen == gen && strcmp(g_pkguid_slots[i].pkg, pkg) == 0) use = i;
-    }
-    if (use < 0) {
-        /* 未命中：先找本代外的空槽（代际失效即空槽），都被占则用 0 号 */
-        use = 0;
-        for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
-            if (g_pkguid_slots[i].gen != gen) {
-                use = i;
-                break;
-            }
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    int use = 0;
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        FwPkgUidSlot* s = &g_pkguid_slots[i];
+        if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
+            bool known = s->known;
+            uid_t uid = s->uid;
+            pthread_mutex_unlock(&g_pkguid_fill_lock);
+            if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+            if (known && out) *out = uid;
+            return known;
         }
-        FwPkgUidSlot* s = &g_pkguid_slots[use];
-        snprintf(s->pkg, sizeof s->pkg, "%s", pkg);
-        s->known = resolve_uid_from_packagelist(pkg, &s->uid); /* 失败也缓存，直到下次重载 */
-        s->gen = gen;
     }
-    bool known = g_pkguid_slots[use].known;
-    uid_t uid = g_pkguid_slots[use].uid;
+    /* 未命中：先选本代外的空槽，都被占则选 0；版本不是 key/gen，避免 ABA。 */
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        if (g_pkguid_slots[i].gen != gen) { use = i; break; }
+    }
+    uint64_t claim = g_pkguid_slots[use].revision;
     pthread_mutex_unlock(&g_pkguid_fill_lock);
+
+    uid_t uid = 0;
+    bool known = resolve_uid_from_packagelist(pkg, &uid);
+
+    pthread_mutex_lock(&g_pkguid_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) {
+        pthread_mutex_unlock(&g_pkguid_fill_lock);
+        return false; /* 旧代结果不发布，out 不变；调用者需要时发起新请求。 */
+    }
+    bool published = false;
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        FwPkgUidSlot* s = &g_pkguid_slots[i];
+        if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
+            known = s->known;
+            uid = s->uid;
+            published = true; /* 同 key 已发布值（含负缓存）优先。 */
+            break;
+        }
+    }
+    FwPkgUidSlot* s = &g_pkguid_slots[use];
+    if (!published && s->revision == claim) {
+        snprintf(s->pkg, sizeof s->pkg, "%s", pkg);
+        s->known = known;
+        s->uid = uid;
+        s->gen = gen;
+        s->revision++;
+    }
+    pthread_mutex_unlock(&g_pkguid_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
     if (known && out) *out = uid;
     return known;
 }

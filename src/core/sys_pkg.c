@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdint.h>
 
 /* 系统应用包名缓存：原 inject_target.c 内联实现跨进程共享抽取。
  * 语义不变：pm list packages -s → "package:" 行；失败/无表回退 uid<10000
@@ -20,10 +21,19 @@ typedef struct SysPkgEntry {
     struct SysPkgEntry* next;
 } SysPkgEntry;
 
-static SysPkgEntry* g_sys_pkg_hash[SYS_PKG_HASH_SIZE];
+typedef struct SysPkgTable {
+    SysPkgEntry* hash[SYS_PKG_HASH_SIZE];
+} SysPkgTable;
+
+/* 读者只在此锁内借用 table；构建、日志、文件 I/O 和旧表回收全部在锁外。 */
+static SysPkgTable* g_sys_pkg_table;
 static pthread_mutex_t g_sys_pkg_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* 固定 .tmp 文件名是 inotify 协议；只序列化写者，查询永不取此锁。 */
+static pthread_mutex_t g_sys_pkg_save_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_sys_pkg_loaded = false;
+static bool g_sys_pkg_loading = false;
 static bool g_sys_pkg_allow_pm = false;
+static uint64_t g_sys_pkg_epoch;
 
 static unsigned int sys_pkg_hash(const char* pkg) {
     unsigned int h = 5381;
@@ -31,30 +41,31 @@ static unsigned int sys_pkg_hash(const char* pkg) {
     return h % SYS_PKG_HASH_SIZE;
 }
 
-static void sys_pkg_clear_locked(void) {
+static void sys_pkg_free_table(SysPkgTable* table) {
+    if (!table) return;
     for (int i = 0; i < SYS_PKG_HASH_SIZE; i++) {
-        SysPkgEntry* e = g_sys_pkg_hash[i];
+        SysPkgEntry* e = table->hash[i];
         while (e) {
             SysPkgEntry* n = e->next;
             free(e);
             e = n;
         }
-        g_sys_pkg_hash[i] = NULL;
     }
+    free(table);
 }
 
-static void sys_pkg_add_locked(const char* pkg) {
+static void sys_pkg_add(SysPkgTable* table, const char* pkg) {
     if (!pkg || !pkg[0]) return;
     unsigned int h = sys_pkg_hash(pkg);
-    for (SysPkgEntry* e = g_sys_pkg_hash[h]; e; e = e->next) {
+    for (SysPkgEntry* e = table->hash[h]; e; e = e->next) {
         if (strcmp(e->pkg, pkg) == 0) return;
     }
     SysPkgEntry* n = malloc(sizeof(SysPkgEntry));
     if (!n) return;
     strncpy(n->pkg, pkg, sizeof(n->pkg) - 1);
     n->pkg[sizeof(n->pkg) - 1] = '\0';
-    n->next = g_sys_pkg_hash[h];
-    g_sys_pkg_hash[h] = n;
+    n->next = table->hash[h];
+    table->hash[h] = n;
 }
 
 static void sys_pkg_cache_path(char* out, size_t sz) {
@@ -87,7 +98,7 @@ static bool sys_pkg_same_content(const char* a, const char* b) {
     return same;
 }
 
-static void sys_pkg_save_locked(void) {
+static void sys_pkg_save_file(const SysPkgTable* table) {
     char path[PATH_MAX], tmp[PATH_MAX];
     sys_pkg_cache_path(path, sizeof path);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
@@ -97,7 +108,7 @@ static void sys_pkg_save_locked(void) {
         return;
     }
     for (int i = 0; i < SYS_PKG_HASH_SIZE; i++) {
-        for (SysPkgEntry* e = g_sys_pkg_hash[i]; e; e = e->next) fprintf(fp, "%s\n", e->pkg);
+        for (SysPkgEntry* e = table->hash[i]; e; e = e->next) fprintf(fp, "%s\n", e->pkg);
     }
     fclose(fp);
     /* 内容与目标一致则不动目标文件：避免「刷新 → 落盘 → inotify 事件 → 再刷新」的
@@ -112,7 +123,7 @@ static void sys_pkg_save_locked(void) {
     }
 }
 
-static void sys_pkg_load_file_locked(void) {
+static void sys_pkg_load_file(SysPkgTable* table) {
     char path[PATH_MAX];
     sys_pkg_cache_path(path, sizeof path);
     FILE* fp = fopen(path, "r");
@@ -123,16 +134,14 @@ static void sys_pkg_load_file_locked(void) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
         if (line[0]) {
-            sys_pkg_add_locked(line);
+            sys_pkg_add(table, line);
             n++;
         }
     }
     fclose(fp);
 }
 
-/* P1：pm 查询全程在锁外执行到临时链表，持锁只做合并/落盘——旧版
- * inject_target.c 同理（popen 在锁外、逐行短暂加锁）；否则 binder 阻塞的
- * pm 会卡住 injector 事件循环线程的全部 sys_pkg_is_system 读者 */
+/* pm 查询及候选表构建都在读者锁外；查询期间继续使用已发布表。 */
 typedef struct SysPkgTmp {
     char pkg[128];
     struct SysPkgTmp* next;
@@ -179,56 +188,82 @@ static void sys_pkg_free_tmp(SysPkgTmp* head) {
     }
 }
 
-/* 调用方须持锁：临时链表合并入哈希（拷贝字符串，tmp 由收集方释放） */
-static void sys_pkg_merge_tmp_locked(SysPkgTmp* head) {
-    for (SysPkgTmp* t = head; t; t = t->next) sys_pkg_add_locked(t->pkg);
+/* 构建者独占候选表，无需读者锁。 */
+static void sys_pkg_merge_tmp(SysPkgTable* table, SysPkgTmp* head) {
+    for (SysPkgTmp* t = head; t; t = t->next) sys_pkg_add(table, t->pkg);
+}
+
+static void sys_pkg_build_and_publish(uint64_t epoch, bool allow_pm) {
+    SysPkgTable* table = calloc(1, sizeof(*table));
+    if (table) {
+        if (allow_pm) {
+            SysPkgTmp* tmp = sys_pkg_collect_pm();
+            sys_pkg_merge_tmp(table, tmp);
+            sys_pkg_free_tmp(tmp);
+            pthread_mutex_lock(&g_sys_pkg_save_mutex);
+            pthread_mutex_lock(&g_sys_pkg_mutex);
+            bool current = epoch == g_sys_pkg_epoch && allow_pm == g_sys_pkg_allow_pm;
+            pthread_mutex_unlock(&g_sys_pkg_mutex);
+            /* 已进入内核的缓存写不可撤销；cache 是下次加载的 hint，
+             * 内存表仍由下方 epoch 检查拒绝迟到发布。 */
+            if (current) sys_pkg_save_file(table);
+            pthread_mutex_unlock(&g_sys_pkg_save_mutex);
+        } else {
+            sys_pkg_load_file(table);
+        }
+    }
+    SysPkgTable* old = NULL;
+    pthread_mutex_lock(&g_sys_pkg_mutex);
+    if (epoch == g_sys_pkg_epoch && allow_pm == g_sys_pkg_allow_pm) {
+        if (table) {
+            old = g_sys_pkg_table;
+            g_sys_pkg_table = table;
+            table = NULL;
+            g_sys_pkg_loaded = true;
+        }
+        g_sys_pkg_loading = false;
+    }
+    pthread_mutex_unlock(&g_sys_pkg_mutex);
+    /* 读者不把节点带出 mutex，换表时旧表已无读者。迟到构建也在此回收。 */
+    sys_pkg_free_table(old);
+    sys_pkg_free_table(table);
 }
 
 void sys_pkg_init(bool allow_pm) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    g_sys_pkg_allow_pm = allow_pm;
-    bool need = !g_sys_pkg_loaded;
-    pthread_mutex_unlock(&g_sys_pkg_mutex);
-    if (!need) return;
-    SysPkgTmp* tmp = allow_pm ? sys_pkg_collect_pm() : NULL;
-    pthread_mutex_lock(&g_sys_pkg_mutex);
-    if (!g_sys_pkg_loaded) {
-        if (allow_pm) {
-            sys_pkg_clear_locked();
-            sys_pkg_merge_tmp_locked(tmp);
-            sys_pkg_save_locked();
-        } else {
-            sys_pkg_load_file_locked();
-        }
-        g_sys_pkg_loaded = true;
+    if (g_sys_pkg_allow_pm != allow_pm) {
+        g_sys_pkg_allow_pm = allow_pm;
+        ++g_sys_pkg_epoch;
+        g_sys_pkg_loading = false;
     }
+    if (g_sys_pkg_loaded || g_sys_pkg_loading) {
+        pthread_mutex_unlock(&g_sys_pkg_mutex);
+        return;
+    }
+    g_sys_pkg_loading = true;
+    uint64_t epoch = ++g_sys_pkg_epoch;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
-    sys_pkg_free_tmp(tmp);
+    sys_pkg_build_and_publish(epoch, allow_pm);
 }
 
 void sys_pkg_cleanup(void) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    sys_pkg_clear_locked();
+    ++g_sys_pkg_epoch;
+    SysPkgTable* old = g_sys_pkg_table;
+    g_sys_pkg_table = NULL;
     g_sys_pkg_loaded = false;
+    g_sys_pkg_loading = false;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
+    sys_pkg_free_table(old);
 }
 
 void sys_pkg_refresh(void) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
     bool allow = g_sys_pkg_allow_pm;
+    g_sys_pkg_loading = true;
+    uint64_t epoch = ++g_sys_pkg_epoch;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
-    SysPkgTmp* tmp = allow ? sys_pkg_collect_pm() : NULL;
-    pthread_mutex_lock(&g_sys_pkg_mutex);
-    sys_pkg_clear_locked();
-    if (allow) {
-        sys_pkg_merge_tmp_locked(tmp);
-        sys_pkg_save_locked();
-    } else {
-        sys_pkg_load_file_locked();
-    }
-    g_sys_pkg_loaded = true;
-    pthread_mutex_unlock(&g_sys_pkg_mutex);
-    sys_pkg_free_tmp(tmp);
+    sys_pkg_build_and_publish(epoch, allow);
 }
 
 bool sys_pkg_is_system(const char* pkg) {
@@ -245,14 +280,19 @@ bool sys_pkg_is_system(const char* pkg) {
         q = base;
     }
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    bool loaded = g_sys_pkg_loaded;
-    bool allow = g_sys_pkg_allow_pm;
-    pthread_mutex_unlock(&g_sys_pkg_mutex);
-    if (!loaded) sys_pkg_init(allow);
-    pthread_mutex_lock(&g_sys_pkg_mutex);
+    if (!g_sys_pkg_loaded && !g_sys_pkg_loading) {
+        bool allow = g_sys_pkg_allow_pm;
+        g_sys_pkg_loading = true;
+        uint64_t epoch = ++g_sys_pkg_epoch;
+        pthread_mutex_unlock(&g_sys_pkg_mutex);
+        sys_pkg_build_and_publish(epoch, allow);
+        pthread_mutex_lock(&g_sys_pkg_mutex);
+    }
     unsigned int h = sys_pkg_hash(q);
     bool hit = false;
-    for (SysPkgEntry* e = g_sys_pkg_hash[h]; e; e = e->next) {
+    /* 首次构建未完成时仍按无表回答 false，不让其它请求排队等磁盘。 */
+    SysPkgEntry* first = g_sys_pkg_table ? g_sys_pkg_table->hash[h] : NULL;
+    for (SysPkgEntry* e = first; e; e = e->next) {
         if (strcmp(e->pkg, q) == 0) {
             hit = true;
             break;

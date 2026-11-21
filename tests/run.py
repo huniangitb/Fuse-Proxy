@@ -341,9 +341,37 @@ SUITE_MAP = [
      "监控开关三层合并 / uid→包名（框架权威）"),
 
     (("test_pending_close.py",),
-     ("src/daemon/fd_close_queue.c", "src/daemon/fd_close_queue.h"),
-     ("fdq_defer", "fdq_flush"),
-     "延迟 close 环形队列（Android backing fd 回收）"),
+     ("src/daemon/fd_close_queue.c", "src/daemon/fd_close_queue.h",
+      "src/daemon/fuse_daemon.c", "tests/test_pending_close.py",
+      "tests/fixtures/fd_close_queue_test.c", "tests/fixtures/fd_reply_owner_test.c"),
+     ("fdq_defer", "fdq_flush", "fdq_thread_defer", "fdq_thread_flush",
+      "vfs_backing_setup", "vfs_init"),
+     "慢 close 隔离、worker 回复 FD 所有权与退出回收"),
+
+    (("test_pkg_cache_isolation.py",),
+     ("src/daemon/fw_pkg.c", "tests/test_pkg_cache_isolation.py",
+      "tests/fixtures/pkg_cache_isolation.c"),
+     ("fw_pkg_is_privileged", "fw_pkg_uid_for_package", "fw_pkg_reload"),
+     "包身份缓存锁外读取与代际发布隔离"),
+
+    (("test_sys_pkg_isolation.py",),
+     ("src/core/sys_pkg.c", "tests/test_sys_pkg_isolation.py",
+      "tests/fixtures/sys_pkg_isolation.c"),
+     ("sys_pkg_init", "sys_pkg_refresh", "sys_pkg_cleanup", "sys_pkg_is_system"),
+     "系统包缓存慢构建、刷新与读者隔离"),
+
+    (("test_ftp_lifecycle_isolation.py",),
+     ("src/modules/ftp/ftp_backend_libcurl.c", "src/modules/ftp/ftp_mux.c",
+      "tests/test_ftp_lifecycle_isolation.py",
+      "tests/fixtures/ftp_lifecycle_isolation_test.c"),
+     ("backend_add_server", "backend_clear_servers", "backend_find", "backend_mux_ref"),
+     "FTP 生命周期慢构造及关闭不占服务元数据锁"),
+
+    (("test_log_persist_isolation.py",),
+     ("src/log/log_monitor.c", "tests/test_log_persist_isolation.py",
+      "tests/fixtures/log_persist_isolation.c"),
+     ("persist_stage", "persist_clear", "persist_worker_start", "persist_worker_stop"),
+     "日志慢落盘与主事件循环隔离"),
 
     (("test_cfg_watch.py",),
      ("src/daemon/cfg_watch.c", "src/daemon/cfg_watch.h"),
@@ -504,6 +532,10 @@ LAYERS = {
             "test_monitor_layers.py",
             "test_path_vars.py",
             "test_pending_close.py",
+            "test_pkg_cache_isolation.py",
+            "test_sys_pkg_isolation.py",
+            "test_ftp_lifecycle_isolation.py",
+            "test_log_persist_isolation.py",
             "test_cfg_watch.py",
             "test_cfg_reload_split.py",
             "test_module_cfg_push.py",
@@ -751,7 +783,11 @@ PARALLEL_SAFE = frozenset({
     "test_crash_tail.py",         # cc 直编 crash_tail.c 纯函数，无文件/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
-    "test_pending_close.py",      # cc 直编队列实现 + 驱动，TemporaryDirectory，无挂载
+    "test_pending_close.py",      # 真实队列/FD/线程与 daemon wrapper，临时目录，无挂载
+    "test_pkg_cache_isolation.py", # 真实 fw_pkg + 定向文件 gate，临时目录，无挂载
+    "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
+    "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
+    "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
     "test_rule_file_lock.py",     # cc 直编 nsp_rule_file + 子进程并发写，/tmp 工作目录
     "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权

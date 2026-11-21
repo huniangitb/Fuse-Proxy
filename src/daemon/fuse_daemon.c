@@ -195,18 +195,18 @@ static bool g_fuse_threads_explicit = false;       /* 是否由 --fuse-threads �
 static int g_fuse_threads = 2;                      /* --fuse-threads: FUSE worker 线程数上限
                                                    （默认 2=双线程；0/-s=单线程；-1=libfuse 默认 10） */
 
-/* 延迟 close 队列（Android backing 路径）：daemon 把 backing fd 交给内核后不能
-   立刻 close（内核可能在 reply 发送完成前仍引用它），故入队，等下一次 FUSE
-   回调时机统一回收。并发语义与不变量（多生产者/多消费者、每个 fd 恰好关闭
-   一次、队满不阻塞且不制造被放弃的槽位）见 src/daemon/fd_close_queue.h。
-   静态实例按该头注释直接以 PTHREAD_MUTEX_INITIALIZER 初始化 lock。 */
-static FdCloseQueue g_pending_closes = {.lock = PTHREAD_MUTEX_INITIALIZER};
-
+/* Android backing fd 只由产生它的 worker 回收。legacy lookup 在 bpf_setup
+   后同步发送 reply，期间不再调用 daemon；同 worker 下一 getattr 才能确认
+   上次回复结束。别的 worker 进入回调不是成熟证明。worker 退出由 TSD 清尾。 */
 #ifdef TARGET_ANDROID
-static void vfs_defer_close(int fd) { fdq_defer(&g_pending_closes, fd); }
+static bool vfs_defer_close(int fd) { return fdq_thread_defer(fd); }
 #endif
 
-static void vfs_flush_pending_closes(void) { fdq_flush(&g_pending_closes); }
+static void vfs_flush_pending_closes(void) {
+#ifdef TARGET_ANDROID
+    fdq_thread_flush();
+#endif
+}
 
 static int recursive_rmdir(const char* path);
 /* *created（可为 NULL）只在本次调用**成功创建** dst 时置 true：调用方据此
@@ -3133,6 +3133,12 @@ static int passthrough_enable_fixed_method(int fd) {
 
 static void* vfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     cfg->use_ino = 1;
+#if defined(TARGET_ANDROID) && defined(FUSE_CAP_OVER_IO_URING)
+    /* 同 worker 下一回调清 backing fd 依赖同步 reply。预构建库也必须禁
+       异步 SQE 回复，不能只依赖 Meson 子项目的 enable-io-uring=false。 */
+    fuse_unset_feature_flag(conn, FUSE_CAP_OVER_IO_URING);
+    conn->want &= ~(unsigned)FUSE_CAP_OVER_IO_URING;
+#endif
     /* 缓存超时不在此处写死：`fuse_new` 已按 libfuse 默认值填好 conf
        （entry/attr=1.0、negative=0.0）**并已解析用户经 -o 传入的值**
        （fuse.c: 默认值 → fuse_opt_parse → fuse_fs_init 才回调本函数），
@@ -3320,12 +3326,17 @@ static int vfs_backing_setup(const char* path, struct fuse_entry_param* e) {
         return -errno;
     }
 
+    /* 线程所有权建立失败则保持 mediation；尚未发布的 fd 可以直接关，不能
+       先填 reply 字段再失败（内核可能取得被关闭/复用的 fd 号）。 */
+    if (!vfs_defer_close(bfd)) {
+        close(bfd);
+        return -ENOMEM;
+    }
     /* 只挂 backing，不挂系统策略程序（bpf_action 保持 KEEP=0）：见函数头注释 */
     e->backing_action = FUSE_ACTION_REPLACE;
     e->backing_fd = (uint64_t)bfd;
     LOG_DBG_PERF("FUSE backing: %s (fd=%d, media=%d)", real, bfd, g_is_media_fuse);
 
-    vfs_defer_close(bfd);
     return 0;
 }
 #endif
@@ -3698,6 +3709,8 @@ int main(int argc, char* argv[]) {
                     if (fmain_rc) fmain_rc = 8;
                 }
             }
+            /* 单线程循环由 main 执行，return main 不运行线程 TSD 析构。 */
+            vfs_flush_pending_closes();
             fuse_remove_signal_handlers(se);
         }
         fuse_unmount(f);

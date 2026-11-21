@@ -77,7 +77,7 @@ flowchart TB
 - **打开中删除（open-unlink）**：本地路径由 `vfs_rename` 识别 libfuse 的 `.fuse_hidden<16hex>` 隐藏名并**直接 unlink 源文件**（本地 backing 支持 POSIX 的"先删名、后关句柄"），目录里不再出现隐藏文件——与 Android 自带 FUSE 的可见行为一致；删除前的属性快照供后续 `fstat`（内核 GETATTR 常常不带 fh）。后端路径（FTP/SFTP）仍沿用隐藏名：远端立即删除会让正在下载/上传的句柄失去数据源。此外 `.fuse_hidden*` **不是特殊条目**：`vfs_entry_visibility` 不按隐藏名过滤，readdir 看到就按普通条目列举（可 `getattr`/`open`），也不在列举时就地删除——本层本地路径不产生新隐藏名（上面的直删分支），磁盘上出现的残留来自旧版本 daemon 或下层 FUSE（设备上 `/data/media` 由 MediaProvider 的 FUSE 提供时，我们穿过下层 unlink 会让下层 libfuse 把名字改成 `.fuse_hidden` 等 RELEASE 再删），一律保留可见，便于取证与手工回收。后端路径（FTP/SFTP）仍用隐藏名兜底，其隐藏名同样按普通条目可见（只存活到最后一个句柄关闭）。
 - **uid→包名解析归框架**（`fw_pkg.c` 的 `fw_pkg_resolve`）：uid<10000 判为 `system`；否则查 `uid.map` → 读 `/proc/<tid>/status` 的 `Tgid` + `cmdline`，结果按 uid 缓存（重载时随代际失效）。解析出 `<pre-`/`zygote`/长度<3 的标记为"不可用于段匹配"（只能命中 `[GLOBAL]`），`system`/`unknown` 这类伪包另由 `pkg_resolvable()` 挡在类别层之外。包名是**配置语义的输入**（段匹配键 + 日志 `[pkg(uid)]` 标签），不能只存在于模块里——否则模块缺席时日志写 `unknown`、且 `MONITOR` 的类别层无从计算。规则引擎内部另有一份同源解析（`fw_rules.c` 的 static `br_get_app_cfg`，它需要 pkg 做 `$package` 变量展开与沙箱隔离）：两者同在框架进程内、算法同源、结果一致。
 
-- **worker 线程数**（`include/fuse_threads.h`）：多线程 loop 的 worker 上限默认按宿主核数取 `min(max(2, ncpu/2), 8)`（4 核 → 2、8 核 → 4、16 核及以上 → 8）。单个应用冷启动有成百上千次并发 `getattr/open/read`，2 个 worker 会把同一条 FUSE 连接排满；而按核数一把梭在低端机上只是让线程互抢 CPU。`--fuse-threads=N` 覆盖（`0`=单线程、`-1`=libfuse 默认 10），injector 按 `[GLOBAL] FUSE_THREADS` 下发；启动期参数，改它需重启 daemon。
+- **worker 线程数**（[fuse_threads.h](../include/fuse_threads.h)）：多线程 loop 的 worker 上限默认 `min(max(4, ncpu), 16)`（4 核 → 4、8 核 → 8、16 核及以上 → 16）。该上限只决定并发余量，不能隔离持共享锁的慢调用，也不能保证多个不可取消 I/O 同时阻塞时仍有空闲 worker。`--fuse-threads=N` 覆盖（`0`=单线程、`-1`=libfuse 默认 10），injector 按 `[GLOBAL] FUSE_THREADS` 下发；启动期参数，改它需重启 daemon。
 
 - **COPY_FILE_RANGE 不接**（`fuse_daemon.c` 启动期调 libfuse fork 的 `fuse_disable_copy_file_range()`）：本 daemon 的 `vfs_ops` 没有 `copy_file_range`，libfuse 因此把请求交给高层回退 `fuse_lib_copy_file_range` → `fuse_fs_copy_file_range`，而后者在判断“操作是否存在”**之前**先取线程上下文（`fuse_get_context()`），上下文缺失的收尾窗口里按小偏移解空指针（现场崩溃栈：`pthread_getspecific` → `fuse_get_context_internal` → `fuse_fs_copy_file_range` → `fuse_lib_copy_file_range`，SIGSEGV）。关掉低层派发后，请求在 `copy_file_range_common()` 处直接拿到 `ENOSYS`，内核据此永久改走 read/write 循环（本 daemon 的 `vfs_read`/`vfs_write`，长期在用的路径），崩溃点不可达。GNU 开发构建链接系统 libfuse 3.18.3 无此 API，调用点用弱引用守卫（缺失则跳过）。
 
@@ -445,6 +445,18 @@ entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导
 | `g_global_fuse` / `g_media_fuse` | injector | 各自字段（pid/mnt_path/disabled/crash_count） |
 
 FUSE 回调多线程并发执行。热路径（`fw_rules_resolve`/`fw_rules_probe`）**不取 rwlock**：`config_read_begin()` 持槽返回稳定代际，`config_read_end(gen)` 返回 false（读期间发生发布）则整个 resolve 重试；持槽期间旧配置不会被释放。写者 `config_publish_begin()` 置奇数封锁新读者 → `config_drain_readers()` 等旧代际归零 → 非原子交换 → `config_publish_end()` 放行并再等旧槽归零，之后才释放旧配置。读者计数按代际奇偶分槽、每线程独占 64B 缓存行，并发读不产生缓存行颠簸。**冷路径**（`config_publisher`/`log_ctl` 查询）仍走 `config_lock_read()` rwlock；框架层不再统一加读锁，`VFS_RETURN` 只是普通返回。
+
+### 6.1 单慢调用的隔离边界
+
+- [fd_close_queue.c](../src/daemon/fd_close_queue.c) 的锁只领取、复制有限批次并发布槽位回收；批次由领取者独占，`close` 在锁外。`consumed` 是领取水位，不是关闭完成水位；另一调用者的 `flush` 不等待已被领取的批次。满队列先关闭旧批次再发布本次 FD，不允许满时提前关闭本次 FD。
+- Android backing FD 由创建它的 worker 持有，不能放入其他 worker 可清理的全局队列。当前 legacy 同步回复完成后，本 worker 下次回调才清理上一 FD；线程退出由 TSD 清尾，主线程 loop 返回后显式清尾。Android 显式禁用 io-uring，因为批量异步回复不能用“下一回调”证明上一回复已提交。TSD 初始化或第二次未清尾的 defer 失败时，backing 字段尚未发布，调用者关闭自己的 FD 并返回错误。
+- [fw_pkg.c](../src/daemon/fw_pkg.c) 的包 UID / 特权缓存读取文件在填充锁外，发布时复核键、代际与槽 revision；旧代结果不能覆盖新缓存。已有 AppOps 输出与退出预算不变。单次读取本身仍可能慢，但不占用无关查询的填充锁。
+- [sys_pkg.c](../src/core/sys_pkg.c) 在状态锁外构建完整表，锁内仅查找、reserve ticket 与整体换表；磁盘保存使用独立 writer 锁。epoch 阻止 cleanup / init / refresh 后迟到候选复活。首次 lazy owner 仍可能同步加载，其他 cold reader 返回既有未知结果；不能把这个 API 泛称为所有 cold 路径都非阻塞。
+
+- [ftp_backend_libcurl.c](../src/modules/ftp/ftp_backend_libcurl.c) 将 add / clear 生命周期串行锁与服务元数据锁分开；构造、扩容、退出 join 和资源释放不持服务锁。clear 先退休全表，再清理旧 mux；已退休 pool 的晚到 release 不能重新入池。同一 backend 的锁和网络调用仍可能慢。
+- [log_monitor.c](../src/log/log_monitor.c) 用固定 128 行队列交给专属持久化 worker；主事件循环只做有界复制，队满记录 drop。CLEAR 独立代际命令不受数据队列满影响，OK 只表示逻辑清空；正常 owner 后台删除磁盘文件，启动失败则保留旧磁盘内容，重启可能重新加载。退出 join 不取消活跃写，只排空 owner 已接收的命令；既有异步接收环与批队列在 main 退出时未全部转交 owner，不承诺服务全链路退出无丢失。
+
+这些保证针对已分离的用户态共享状态，不是 syscall 超时。`close`、满队列调用者自己的旧批次、退出 join 仍没有硬时间上界。配置发布仍需在非原子 globals 换入前 drain 读者；不能简单把 drain 移到 swap 后。仍持配置读槽的慢外部调用、控制面的同步文件编辑和同一后端的网络阻塞须分别审计。
 
 ## 7. 维护规范
 

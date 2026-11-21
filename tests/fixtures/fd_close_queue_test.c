@@ -17,8 +17,10 @@
 #include "fd_close_queue.h"
 #include "nsp_log.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -253,13 +255,160 @@ static void test_saturation_no_early_close(void) {
           "腾位回收的批次有 fd 未关闭或重复关闭");
 }
 
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    FdCloseQueue* queue;
+    int slow_fd;
+    int producer_base;
+    int producer_count;
+    unsigned followers_done;
+    bool close_entered;
+    bool released;
+    bool producer_done;
+} SlowClose;
+
+static SlowClose* g_slow_close;
+
+static struct timespec slow_deadline(unsigned ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_nsec += (long)ms * 1000000L;
+    ts.tv_sec += ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    return ts;
+}
+
+static int held_counting_close(int fd) {
+    SlowClose* s = g_slow_close;
+    if (fd == s->slow_fd) {
+        pthread_mutex_lock(&s->lock);
+        s->close_entered = true;
+        pthread_cond_broadcast(&s->changed);
+        while (!s->released) pthread_cond_wait(&s->changed, &s->lock);
+        pthread_mutex_unlock(&s->lock);
+    }
+    return counting_close(fd);
+}
+
+static void* slow_owner(void* raw) {
+    SlowClose* s = raw;
+    fdq_flush(s->queue);
+    return NULL;
+}
+
+static void* slow_follower(void* raw) {
+    SlowClose* s = raw;
+    fdq_flush(s->queue);
+    pthread_mutex_lock(&s->lock);
+    ++s->followers_done;
+    pthread_cond_broadcast(&s->changed);
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+static void* slow_producer(void* raw) {
+    SlowClose* s = raw;
+    for (int i = 0; i < s->producer_count; ++i)
+        fdq_defer(s->queue, s->producer_base + i);
+    fdq_flush(s->queue);
+    pthread_mutex_lock(&s->lock);
+    s->producer_done = true;
+    pthread_cond_broadcast(&s->changed);
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+/* Keep exactly one close paused until after measuring unrelated progress.  The
+ * producer wraps the ring several times while the old batch still owns its fds. */
+static void test_one_slow_close(unsigned followers) {
+    track_reset();
+    FdCloseQueue q;
+    fdq_init(&q);
+    enum { BASE = 600000, OLD_COUNT = 40, NEW_BASE = 601000 };
+    SlowClose s = {.lock = PTHREAD_MUTEX_INITIALIZER, .queue = &q,
+                   .slow_fd = BASE, .producer_base = NEW_BASE,
+                   .producer_count = FD_CLOSE_QUEUE_CAP * 3 + 5};
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&s.changed, &attr);
+    pthread_condattr_destroy(&attr);
+    g_slow_close = &s;
+    fdq_set_close_fn(held_counting_close);
+    for (int i = 0; i < OLD_COUNT; ++i) fdq_defer(&q, BASE + i);
+
+    pthread_t owner, producer_id, follower_ids[7];
+    bool owner_created = pthread_create(&owner, NULL, slow_owner, &s) == 0;
+    pthread_mutex_lock(&s.lock);
+    struct timespec entered = slow_deadline(1000);
+    int wait_rc = 0;
+    while (owner_created && !s.close_entered && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&s.changed, &s.lock, &entered);
+    bool reached_close = s.close_entered;
+    pthread_mutex_unlock(&s.lock);
+
+    unsigned created = 0;
+    bool producer_created = false;
+    if (reached_close) {
+        for (; created < followers; ++created)
+            if (pthread_create(&follower_ids[created], NULL, slow_follower, &s) != 0) break;
+        producer_created = pthread_create(&producer_id, NULL, slow_producer, &s) == 0;
+    }
+    pthread_mutex_lock(&s.lock);
+    struct timespec observe = slow_deadline(300);
+    wait_rc = 0;
+    while (reached_close && (s.followers_done < created ||
+           (producer_created && !s.producer_done)) && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&s.changed, &s.lock, &observe);
+    bool followers_progress = s.followers_done == followers;
+    bool producer_progress = s.producer_done;
+    bool old_still_owned = !was_closed(BASE);
+    printf("slow-close followers=%u completed=%u producer_completed=%d before_release=1\n",
+           followers, s.followers_done, producer_progress);
+    s.released = true;
+    pthread_cond_broadcast(&s.changed);
+    pthread_mutex_unlock(&s.lock);
+
+    if (owner_created) pthread_join(owner, NULL);
+    for (unsigned i = 0; i < created; ++i) pthread_join(follower_ids[i], NULL);
+    if (producer_created) pthread_join(producer_id, NULL);
+    fdq_flush(&q);
+    fdq_set_close_fn(counting_close);
+    g_slow_close = NULL;
+    bool all_closed = true;
+    for (int i = 0; i < OLD_COUNT; ++i)
+        if (!was_closed(BASE + i)) all_closed = false;
+    if (producer_created)
+        for (int i = 0; i < s.producer_count; ++i)
+            if (!was_closed(NEW_BASE + i)) all_closed = false;
+    check("slow_close_threads_and_owner_ready",
+          owner_created && reached_close && created == followers && producer_created,
+          "测试线程未就绪或未命中唯一慢关闭");
+    check("slow_close_other_flushes_progress", followers_progress,
+          "一次慢close让其他flush线程等到它释放");
+    check("slow_close_saturated_producer_progress", producer_progress,
+          "慢close传播到满队列生产者");
+    check("slow_close_owned_fd_not_early_closed", old_still_owned,
+          "旧批次仍在使用的fd被提前关闭");
+    check("slow_close_ring_reuse_exactly_once",
+          all_closed && atomic_load(&g_dup_close) == 0 && atomic_load(&g_bad_fd) == 0,
+          "复用槽位后旧批次或新批次fd漏关/重关");
+    pthread_cond_destroy(&s.changed);
+    pthread_mutex_destroy(&s.lock);
+    pthread_mutex_destroy(&q.lock);
+}
+
 int main(void) {
+    alarm(15);
     fdq_set_close_fn(counting_close);
     test_defer_and_flush();
     test_saturate_then_reuse();
     test_saturation_no_early_close();
     test_two_consumers_exclusive();
     test_concurrent();
+    test_one_slow_close(3);
+    test_one_slow_close(7);
     if (g_fail) {
         printf("RESULT FAIL\n");
         return 1;
