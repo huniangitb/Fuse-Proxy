@@ -303,6 +303,37 @@ int main(int argc, char** argv) {
                                 argc >= 5 ? argv[4] : "/0/Android/data/com.other.app/files/x",
                                 strcmp(mode, "probe-pkgs") == 0);
     }
+    /* 直接钉住新只读入口的契约：冷缓存必须返回 false（=事实还没备好），不能把
+       「没查过」冒充成「无此包」——后者会让同 uid 兄弟包被判成他应用（隔离/ENOENT），
+       而真正查过之后才知道属主 uid。 */
+    if (strcmp(mode, "uidcache") == 0) {
+        if (argc < 3) return 2;
+        setup(conf);
+        bool known = true;
+        uid_t uid = 12345;
+        const bool cold_false = !fw_pkg_uid_cached("com.sibling.app", &known, &uid);
+        uid_t src_uid = 0;
+        const bool warm_src = fw_pkg_uid_for_package("com.sibling.app", &src_uid);
+        bool known2 = false;
+        uid_t cached_uid = 0;
+        const bool warm_true =
+            fw_pkg_uid_cached("com.sibling.app", &known2, &cached_uid) && known2 &&
+            cached_uid == src_uid;
+        bool absent_known = true;
+        const bool absent_cold = !fw_pkg_uid_cached("com.absent.pkg", &absent_known, NULL);
+        const bool absent_src = fw_pkg_uid_for_package("com.absent.pkg", NULL);
+        bool absent_known2 = true;
+        const bool absent_neg =
+            fw_pkg_uid_cached("com.absent.pkg", &absent_known2, NULL) && !absent_known2;
+        const bool bad_args = !fw_pkg_uid_cached(NULL, NULL, NULL) &&
+                              !fw_pkg_uid_cached("", NULL, NULL);
+        printf("cold_false=%d warm_true=%d absent_cold=%d absent_neg=%d bad_args=%d"
+               " warm_src=%d absent_src=%d opens=%d\n",
+               cold_false, warm_true, absent_cold, absent_neg, bad_args, warm_src, absent_src,
+               atomic_load(&g_pkgl_opens));
+        config_destroy_lock();
+        return 0;
+    }
     if (strcmp(mode, "matrix") == 0) {
         if (argc < 4) return 2;
         g_slow_ms = 0;

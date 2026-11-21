@@ -33,6 +33,9 @@ GATE_OFF = BASE + "ALLOW_CROSS_APP_BY_CAPABILITY OFF\n"
 ISOLATE_OFF = BASE + "ALLOW_CROSS_APP_DATA ON\n"
 UID_MAP = "10123 com.demo.app\n10150 com.doc.ui\n"
 PACKAGE_LIST = ("com.demo.app 10123 0 /data/user/0/com.demo.app default:targetSdkVersion=34\n"
+                # 与 com.demo.app 共用 uid（sharedUserId 兄弟包）：判定必须按 uid 当同一
+                # 应用放行，而这只有真查过清单才知道——冷缓存不能冒充「无此包」。
+                "com.sibling.app 10123 0 /data/user/0/com.sibling.app default:targetSdkVersion=34\n"
                 "com.doc.ui 10150 0 /data/user/0/com.doc.ui platform:privapp:targetSdkVersion=34\n")
 OTHER = "/0/Android/data/com.other.app/files/x"
 OTHER_OBB = "/0/Android/obb/com.other.app/pack.bin"
@@ -283,6 +286,30 @@ def check_publish_empty(binary, conf_path, plist, fifo, slow_ms):
     return checks
 
 
+def check_uidcache(binary, conf_path, plist):
+    """新只读入口 `fw_pkg_uid_cached` 的契约：冷缓存返回 false（事实还没备好），
+    已查过的正/负结论返回 true。把它写成「冷缓存 = 无此包」会让**同 uid 兄弟包**
+    被判成他应用（隔离/ENOENT），而 HEAD 是放行——这类漂移只有真查过清单才看得见。"""
+    out, error = run_driver(binary, ["uidcache", str(conf_path)],
+                            {"NSP_PACKAGELIST": str(plist)})
+    if error:
+        return [("uid.map 包名缓存契约", False, error)]
+    f = parse_kv(out)
+    return [
+        ("冷缓存不是「无此包」（必须返回 false 让调用方出槽预热）",
+         f["cold_false"] == 1, f"cold_false={f['cold_false']}"),
+        ("查过的正结论可在槽内命中（含 uid）",
+         f["warm_true"] == 1 and f["warm_src"] == 1,
+         f"warm_true={f['warm_true']} warm_src={f['warm_src']}"),
+        ("未收录包名的冷缓存同样返回 false",
+         f["absent_cold"] == 1 and f["absent_src"] == 0,
+         f"absent_cold={f['absent_cold']} absent_src={f['absent_src']}"),
+        ("查过的负结论可在槽内命中",
+         f["absent_neg"] == 1, f"absent_neg={f['absent_neg']}"),
+        ("空包名/空指针不命中", f["bad_args"] == 1, f"bad_args={f['bad_args']}"),
+    ]
+
+
 def check_matrix(binary, directory, cfg, plist, name, conf, uid, paths, expect):
     conf_path = cfg / "injector.conf"
     conf_path.write_text(conf, encoding="utf-8")
@@ -335,6 +362,7 @@ def run(directory):
     # 负结论窗口：清单恒空时，事实永远是「不知道」。这是第六批验收漏出的残余
     # 路径（预取读到空 → known 假不缓存 → 槽内重读慢清单）。
     checks += check_publish_empty(binary, base_conf, plist, fifo, 250)
+    checks += check_uidcache(binary, base_conf, plist)
     # 语义矩阵（一次进程走多路径；只断言裁决，不看累计查询次数）
     checks += check_matrix(binary, directory, cfg, plist, "默认隔离", BASE, 10123,
                            [OTHER, OTHER_OBB, OWN, PLAIN], {
@@ -356,6 +384,11 @@ def run(directory):
                            ["/0/Android/obb/com.demo.app/pack.bin"],
                            {"/0/Android/obb/com.demo.app/pack.bin": dict(never, resolve=0, probe=0)})
 
+    # 同 uid 兄弟包（sharedUserId）：判定按 uid 当同一应用放行。这条同时是
+    # 「冷缓存不能冒充无此包」的端到端判别——HEAD 放行，伪造负结论会判隔离。
+    sibling = "/0/Android/data/com.sibling.app/files/x"
+    checks += check_matrix(binary, directory, cfg, plist, "同uid兄弟包按同一应用", BASE, 10123,
+                           [sibling], {sibling: {"resolve": 0, "probe": 0}})
     checks += check_matrix(binary, directory, cfg, plist, "普通路径不查询", BASE, 10123,
                            [PLAIN], {PLAIN: dict(never, resolve=0, probe=0)})
     checks += check_matrix(binary, directory, cfg, plist, "特权豁免不查询", BASE, 10150,

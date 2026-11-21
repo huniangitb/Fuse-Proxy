@@ -728,6 +728,7 @@ static bool resolve_uid_from_packagelist(const char* pkg, uid_t* out) {
 bool fw_pkg_uid_cached(const char* pkg, bool* known_out, uid_t* uid_out) {
     if (!pkg || !pkg[0]) return false;
     bool known = false;
+    bool matched = false; /* 没有匹配槽 = 事实还没备好，不是"无此包" */
     uid_t uid = 0;
     pthread_mutex_lock(&g_pkguid_fill_lock);
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
@@ -736,11 +737,13 @@ bool fw_pkg_uid_cached(const char* pkg, bool* known_out, uid_t* uid_out) {
         if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
             known = s->known;
             uid = s->uid;
+            matched = true;
             break;
         }
     }
     pthread_mutex_unlock(&g_pkguid_fill_lock);
     if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (!matched) return false; /* 冷缓存：调用方必须出槽预热（不允许当成负结论） */
     if (known_out) *known_out = known;
     if (known && uid_out) *uid_out = uid;
     return true;
