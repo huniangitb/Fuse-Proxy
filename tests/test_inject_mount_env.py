@@ -1256,7 +1256,7 @@ def inner_main(argv):
         # ── R16：配置重载风暴的去抖/合并 + 风暴期 IPC 及时性 ──
         # 真机现场（sys.log 20:13:00）：一秒 54 条「配置广播: 0 订阅者, JSON
         # 大小 72469 字节」= 每秒 54 次**全量重载**。重载全程在 injector 单线程
-        # 事件循环里（reload_config_rules_diff 全量解析 + setup_inotify_watches
+        # 事件循环里（config_commit_prepared 全量解析 + setup_inotify_watches
         # 重加全部 watch + config_publisher_broadcast 72KB + audit_running_apps
         # 扫 /proc），而 v1 的 POST 挂载请求也在同一循环里排队 → 挂载请求被饿住，
         # 现场表现就是「挂载超时」。旧实现对每个 inotify 事件立刻重载一次，且

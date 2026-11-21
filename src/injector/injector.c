@@ -368,9 +368,16 @@ static bool setup_inotify_watches(void) {
 }
 
 static void reload_injector_config() {
+    /* 真读盘 + 活跃用户扫描（pm，最坏 800ms）放在写锁之外：写锁挡着本进程全部
+       config 读者（pre-hook 判定、发布器、控制面查询），锁内读盘会把一次慢盘放大
+       成整进程无响应；锁内只做解析与 COW 发布。 */
+    NspCfgRec* recs = nullptr;
+    int count = 0;
+    config_read_view(INJECTOR_CONFIG_PATH, &recs, &count);
     config_lock_write();
-    load_config_rules(INJECTOR_CONFIG_PATH);
+    config_build_from_view(recs, count);
     config_unlock_write();
+    config_free_view(recs, count);
     /* 系统应用表刷新（pm→内存+落盘 sys_pkgs.cache，供 fuse_daemon 只读消费；
        仅当类别段存在时查询，避免无谓 popen） */
     if (config_has_category_rules()) sys_pkg_refresh();
@@ -1401,8 +1408,8 @@ static void injector_start_fuses(bool start_passive) {
        BACKUP_DIR 下，生命周期内此处预建一次，各 ns 操作内不再逐次建目录 */
     mkdir_recursive(GLOBAL_BACKUP_ROOT);
     /* 应用规则目录创建权归属 injector 单一进程：显式开启后，后续所有
-       load_config_rules 调用（启动 + 热重载 reload_config_rules_diff）均
-       允许 mkdir App-rules / App-rules-<uid>；fuse_daemon/log_ctl 等
+       config_read_view 调用（启动 reload_injector_config + 热重载
+       handle_pending_reload）均允许 mkdir App-rules / App-rules-<uid>；fuse_daemon/log_ctl 等
        只读加载方保持默认 false，杜绝伪用户目录固化 */
     config_set_allow_app_rules_mkdir(true);
     reload_injector_config();
@@ -1959,9 +1966,16 @@ static void handle_pending_reload(void) {
     {
         fast_pid_cache_clear();
         ChangedPkg out_changed[128];
+        /* 锁外准备视图（真读盘 + pm 扫描），锁内只提交：本函数跑在注入器唯一事件循环
+           线程上，写锁期间 pre-hook 的规则判定与发布器全被挡住。 */
+        NspCfgRec* reload_recs = nullptr;
+        int reload_count = 0;
+        config_read_view(INJECTOR_CONFIG_PATH, &reload_recs, &reload_count);
         config_lock_write();
-        int changed_count = reload_config_rules_diff(INJECTOR_CONFIG_PATH, out_changed, 128);
+        int changed_count =
+            config_commit_prepared(reload_recs, reload_count, out_changed, 128);
         config_unlock_write();
+        config_free_view(reload_recs, reload_count);
         apply_inject_method_switch();
         if (config_has_category_rules()) sys_pkg_refresh();
         setup_inotify_watches();

@@ -139,6 +139,13 @@ const char* config_modules_dir(void);
    视图仅 RULE 记录被逐行复制后解析，其余记录按值读取。
    调用方须持 config_lock_write。 */
 void config_build_from_view(const NspCfgRec* recs, int count);
+/* 两段式重载的提交段：调用方**持 config_lock_write**，本函数只做「快照旧表 →
+   config_build_from_view → COW 发布 → 计算 inject_enable 变更集」，不再碰文件系统。
+   真读盘 + 活跃用户扫描（`pm list users`，最坏 800ms）必须由调用方在取写锁**之前**
+   用 config_read_view 完成：写锁挡着同进程所有 config 读者（注入器的 pre-hook 判定、
+   发布器、控制面查询），把一次慢盘/慢 binder 放大成整进程无响应。
+   返回值同 reload_config_rules_diff：-1 = 全局挂载开关变化，>0 = 变更包数。 */
+int config_commit_prepared(NspCfgRec* recs, int count, ChangedPkg* out_changed, int max_changed);
 
 /* 发布期派生缓存作废钩子（进程内单一注册者：内建规则引擎）：config_publish 在
    「旧代际读者已排空、新读者仍被封锁」的窗口内调用一次，此时没有任何读者能

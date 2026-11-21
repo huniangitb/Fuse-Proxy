@@ -1643,9 +1643,12 @@ void load_config_rules(const char* path) {
     config_build_from_view(recs, count);
     config_free_view(recs, count);
 }
-int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
-    /* S1：load_config_rules 内部完成 COW 发布（旧配置在发布后即被释放），
-       diff 所需旧字段须在加载前快照（旧 AppConfig 指针发布后悬垂） */
+/* 提交段：调用方持 config_lock_write。快照旧表 → 从**已读好的视图**重建并 COW 发布
+   → 计算 inject_enable 变更集。视图由调用方在锁外用 config_read_view 准备。
+   锁内只剩解析与发布：一次慢盘/慢 `pm list users` 不再按写锁时长放大到整个进程。 */
+int config_commit_prepared(NspCfgRec* recs, int count, ChangedPkg* out_changed, int max_changed) {
+    /* S1：config_build_from_view 内部完成 COW 发布（旧配置在发布后即被释放），
+       diff 所需旧字段须在发布前快照（旧 AppConfig 指针发布后悬垂） */
     bool old_global_inject = g_global_cfg.global_inject;
     typedef struct {
         char pkg[128];
@@ -1664,7 +1667,7 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
         }
     }
     /* COW 发布：换入新配置并释放旧配置（含旧 g_app_cfgs 数组） */
-    load_config_rules(path);
+    config_build_from_view(recs, count);
     // 遵循设计：injector不处理单个挂载树内的文件规则变化，仅处理全局挂载ON/OFF与应用开关
     bool global_changed = (old_global_inject != g_global_cfg.global_inject);
     int changed_count = 0;
@@ -1714,6 +1717,17 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
     }
     free(old_snap);
     return changed_count;
+}
+
+int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
+    /* 兼容入口：读盘也在调用方锁内。注入器已改用「锁外 prepare + 锁内 commit」，
+       本入口留给仍在写锁内一次性收尾的调用方（当前无）与测试基线。 */
+    NspCfgRec* recs = nullptr;
+    int count = 0;
+    config_read_view(path, &recs, &count);
+    int rc = config_commit_prepared(recs, count, out_changed, max_changed);
+    config_free_view(recs, count);
+    return rc;
 }
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id) {
     char base_pkg[256];

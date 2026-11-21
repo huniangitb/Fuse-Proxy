@@ -414,6 +414,15 @@ SUITE_MAP = [
      ("common_run_cmd_lines", "scan_active_users", "sys_pkg_collect_pm"),
      "pm 查询的时间上界（有界命令执行）"),
 
+    # 注入器在唯一事件循环线程里重载配置：旧序列把 config_read_view（真读盘 +
+    # scan_active_users 的 pm 探测）放在 config_lock_write 内，写锁期间同进程所有
+    # config 读者一起被挡。两段式：读盘锁外 prepare，锁内只 commit。
+    (("test_cfg_reload_lock.py",),
+     ("src/config/config_parser.c", "src/injector/injector.c",
+      "tests/test_cfg_reload_lock.py", "tests/fixtures/cfg_reload_lock_driver.c"),
+     ("config_commit_prepared", "config_read_view", "reload_config_rules_diff"),
+     "配置重载的慢读盘/慢 pm 不跨配置写锁"),
+
     (("test_ftp_lifecycle_isolation.py",),
      ("src/modules/ftp/ftp_backend_libcurl.c", "src/modules/ftp/ftp_mux.c",
       "tests/test_ftp_lifecycle_isolation.py",
@@ -592,6 +601,7 @@ LAYERS = {
             "test_acl_whitelist_lifetime.py",
             "test_sys_pkg_isolation.py",
             "test_cmd_bounded_pm.py",
+            "test_cfg_reload_lock.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
             "test_cfg_watch.py",
@@ -851,6 +861,7 @@ PARALLEL_SAFE = frozenset({
     "test_acl_whitelist_lifetime.py", # 真实 fw_acl/fw_rules + 真实发布协议，临时目录，无挂载
     "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
     "test_cmd_bounded_pm.py",     # cc 直编真实 common/parser/sys_pkg + PATH 假 pm，临时目录，无挂载
+    "test_cfg_reload_lock.py",    # cc 直编真实 parser + --wrap 慢盘/慢 pm，临时配置目录，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
