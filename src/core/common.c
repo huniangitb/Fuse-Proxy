@@ -289,6 +289,19 @@ static mode_t shared_storage_mode(mode_t want, const struct stat* pst, bool is_d
 
    存储根之外的路径（后端、临时目录）一律不算共享存储：那里的属主与 mode 由调用方
    与后端自己决定，套共享存储的形状没有依据。 */
+static const char* const k_private_trees[] = {"/Android/data", "/Android/obb",
+                                               "/Android/media"};
+
+/* sub 是否正好落在根层三棵私有树之一（相等或以 '/' 接续）。同名深层目录不算。 */
+static bool private_tree_prefix(const char* sub) {
+    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
+        size_t tlen = strlen(k_private_trees[i]);
+        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
+            return true;
+    }
+    return false;
+}
+
 static bool path_in_shared_storage(const char* real_path) {
     char base[PATH_MAX];
     common_storage_base(base, sizeof(base));
@@ -297,14 +310,20 @@ static bool path_in_shared_storage(const char* real_path) {
     int user_id = -1;
     const char* sub = NULL;
     if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return false;
-    static const char* const k_private_trees[] = {"/Android/data", "/Android/obb",
-                                                 "/Android/media"};
-    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
-        size_t tlen = strlen(k_private_trees[i]);
-        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
-            return false;
-    }
-    return true;
+    return !private_tree_prefix(sub);
+}
+
+/* 条目是否落在根层私有树里：与 path_in_shared_storage 同一套解析，判据相反。
+   存储根之外、用户层解析不了的路径都不算。 */
+static bool path_in_private_tree(const char* real_path) {
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof(base));
+    size_t blen = strlen(base);
+    if (blen == 0 || strncmp(real_path, base, blen) != 0 || real_path[blen] != '/') return false;
+    int user_id = -1;
+    const char* sub = NULL;
+    if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return false;
+    return private_tree_prefix(sub);
 }
 
 /* 新建条目的属性收尾（唯一出口）：create / mkdir / mknod / symlink / 父目录补建 /
@@ -320,8 +339,16 @@ static bool path_in_shared_storage(const char* real_path) {
 
    共享存储的落点另加一层：调用方 mode 只说明「它自己想给多少」，条目还要能被树里的
    其他应用打开，故最终 mode 再按父目录的组位与其他位补齐（见 shared_storage_mode），
-   与 MediaProvider 自己建条目的形状一致。私有树（Android/{data,obb,media}）不补：
-   那里的属主与 ACL 由 installd 体系决定，放宽只会造出第二个共享存储。
+   与 MediaProvider 自己建条目的形状一致。
+
+   私有树（Android/{data,obb,media}）另按一条窄口径补位：普通文件补组位（0060），
+   目录保持调用方 mode。这三棵树的属主与属组由 installd 体系给出（包目录 2770 归
+   ext_data_rw），能穿过包目录的身份本来就只有全盘访问能力应用与系统组件（
+   MediaProvider 的直通视图、MES 文件管理器）；应用在下载目录里写下的条目常被自己的
+   umask 削到 0600，这批身份便读不到（实测 MediaProvider 身份读 0600 条目 EACCES、
+   读 0660 条目成功）。补组位只对这批身份生效——不加 o 位（不暴露给任意应用）、不加
+   x 位（不造可执行文件）、不动属主位（应用显式建的 0400 不会变成可写）。
+   目录不补：树的隔离靠目录位，连目录一起放宽才会造出第二个共享存储。
 
    caller_mode 为 0 表示调用点确实没有 mode 可传（符号链接的 mode 在内核恒为 0777，
    真实值无意义）：此时回落父目录 mode，只作「值未知」的缺省，不用来覆盖已知值。
@@ -351,11 +378,14 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
         bool is_dir = S_ISDIR(est.st_mode);
         mode_t final_mode = caller_mode & 07777;
         if (final_mode == 0) final_mode = pst.st_mode & 07777;
-        if (path_in_shared_storage(real_path))
+        if (path_in_shared_storage(real_path)) {
             final_mode = shared_storage_mode(final_mode, &pst, is_dir);
-        else if (is_dir)
+        } else if (is_dir) {
             final_mode =
                 (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
+        } else if (S_ISREG(est.st_mode) && path_in_private_tree(real_path)) {
+            final_mode |= 0060;
+        }
         chmod(real_path, final_mode);
     }
 #ifdef TARGET_ANDROID
