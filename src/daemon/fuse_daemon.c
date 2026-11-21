@@ -2381,6 +2381,17 @@ static bool is_fuse_hidden_name(const char* name) {
     return hex == 16 && *p == '\0';
 }
 
+/* 目标名是 libfuse 的 open-unlink 隐藏名吗？libfuse 只在 unlink 仍打开的文件时
+   生成它（rmdir 不走隐藏名），所以「目标是隐藏名」等价于「这是一次删除」。
+   判定必须放在 fw_route 之前：rename 会按 RENAME_SRC 过 ACL，而顶层条目的
+   「不可改名」结构规则会把「删除仍打开的顶层文件」误拒成 EPERM。 */
+static bool rename_is_open_unlink(const char* to, unsigned int flags) {
+    if (flags != 0 || !to) return false;
+    const char* base = strrchr(to, '/');
+    base = base ? base + 1 : to;
+    return is_fuse_hidden_name(base);
+}
+
 static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* st) {
     int fd_src = open(src, O_RDONLY | O_CLOEXEC);
     if (fd_src < 0) return -errno;
@@ -2479,8 +2490,12 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     bool redir_from = false, redir_to = false;
     char pkg_from[128], pkg_to[128];
     bool mon_from = false, mon_to = false;
+    /* 目标是隐藏名时这次调用其实是 unlink：from 按 DELETE 过 ACL——顶层条目的
+       「不可改名」结构规则不适用于删除，AOSP 也只限制改名。 */
+    const bool open_unlink = rename_is_open_unlink(to, flags);
+    const NspAclOp src_acl_op = open_unlink ? NSP_ACL_OP_DELETE : NSP_ACL_OP_RENAME_SRC;
     int rrc = fw_route(ctx, from, &r1, &ok1, pkg_from, &u_from, sub_from, p_from, &redir_from,
-                       &mon_from, VFS_OP_MUTATE, NSP_ACL_OP_RENAME_SRC, false, 0);
+                       &mon_from, VFS_OP_MUTATE, src_acl_op, false, 0);
     if (rrc != 0) return rrc;
     rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, &mon_to,
                    VFS_OP_MUTATE, NSP_ACL_OP_RENAME_DST, false, 0);
@@ -2495,7 +2510,7 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
        所以直接删源、不产生隐藏名——与 Android 自带 FUSE 的可见行为一致，
        也不会在目录里留下「被改名却没删掉」的文件。后端路径不做此处理：
        远端立即删除会让正在下载/上传的句柄失去数据源，仍由隐藏名兜底。 */
-    if (flags == 0 && !r1.is_ftp && !r2.is_ftp) {
+    if (open_unlink && !r1.is_ftp && !r2.is_ftp) {
         const char* base = strrchr(sub_to, '/');
         base = base ? base + 1 : sub_to;
         if (is_fuse_hidden_name(base)) {
@@ -2503,7 +2518,15 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
                发 GETATTR（fstat）。快照以 FUSE 侧隐藏名为键，getattr/write/
                release 收到的 path 都是同一个名字。 */
             struct stat snap;
-            if (lstat(p_from, &snap) == 0) hidden_stat_put(to, &snap);
+            const bool have_snap = lstat(p_from, &snap) == 0;
+            /* libfuse 不为目录生成隐藏名：真收到目录说明应用自己把隐藏名当
+               改名目标，仍按 AOSP 的结构规则拒绝（源端已按 DELETE 放行，
+               故在此收口），免得「顶层目录改名为隐藏名」绕开不可改名规则。 */
+            if (have_snap && S_ISDIR(snap.st_mode)) {
+                log_fuse_err("RENAME_HIDDEN_DIR", from, EPERM);
+                return -EPERM;
+            }
+            if (have_snap) hidden_stat_put(to, &snap);
             if (unlink(p_from) == 0) {
                 log_open_unlink_direct(sub_from);
                 return 0;

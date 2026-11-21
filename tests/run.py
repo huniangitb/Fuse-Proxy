@@ -105,6 +105,12 @@ SUITE_MAP = [
      ("src/daemon/fw_acl.c", "src/daemon/fw_acl.h", "src/daemon/fuse_daemon.c"),
      ("fw_acl_check", "fw_acl_decide", "fw_route", "vfs_check_read_only"),
      "ACL 不干扰(G9) / 真实挂载视图功能预期"),
+    # 打开中删除（libfuse 隐藏名 rename）的 ACL 语义：隐藏名等价于 unlink，
+    # 源端必须按 DELETE 路由，否则顶层条目的「不可改名」结构规则误拒 EPERM。
+    (("test_open_unlink_toplevel.py",),
+     ("src/daemon/fuse_daemon.c", "tests/test_open_unlink_toplevel.py"),
+     ("rename_is_open_unlink", "is_fuse_hidden_name", "vfs_rename"),
+     "打开中删除的隐藏名改名按删除路由 / 真实挂载视图"),
 
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py", "test_negative_timeout.py",
@@ -616,6 +622,7 @@ LAYERS = {
             "test_decision_enforce.py",
             "test_fw_events_fuse.py",
             "test_acl_nonintrusive.py",
+            "test_open_unlink_toplevel.py",
             "test_negative_timeout.py",
             "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
