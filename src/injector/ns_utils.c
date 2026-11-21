@@ -1280,7 +1280,9 @@ void handle_async_mount_event(void* ptr) {
        "结果不可得"就释放任务——不调度重试、不摘追踪、不清理注入标志；被动模式下
        该应用可能整个生命周期都没有代理视图，列表却仍显示已注入。 */
     int status = 0;
-    pid_t w = waitpid(ctx->child_pid, &status, 0);
+    /* 管道结果就绪不等于子进程已退出；这里运行在 injector 事件循环，不能等待
+       退出收尾。仍存活的子进程由既有 SIGCHLD / timer 的 reap_zombies 回收。 */
+    pid_t w = waitpid(ctx->child_pid, &status, WNOHANG);
     if (w < 0 && errno != ECHILD && errno != EINTR)
         LOG_WRN("异步挂载 waitpid 失败 pid=%d: %s", ctx->child_pid, strerror(errno));
     bool have_status = (r == (ssize_t)sizeof(child_ret));

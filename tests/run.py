@@ -159,6 +159,19 @@ SUITE_MAP = [
      ("inject-method",),
      "injector 目标判定 / 注入方法 / 追踪表并发遍历"),
 
+    (("test_inject_method.py",),
+     ("src/injector/ns_utils.c", "src/injector/ipc_server.c",
+      "tests/fixtures/async_reaped.c", "tests/fixtures/ipc_binding.c"),
+     ("handle_async_mount_event",),
+     "IPC 请求身份与异步完成回调收尾"),
+
+    (("test_submount_rules.py",),
+     ("src/injector/mount_manager.c", "include/mount_manager.h", "src/core/common.c",
+      "src/config/config_parser.c", "include/config_parser.h",
+      "tests/fixtures/submount_rules_driver.c"),
+     ("submount_conflicts_with_rules_locked", "path_prefix_overlap", "common_parse_user_layer"),
+     "原生子挂载显式规则冲突 / 用户层与类别判定"),
+
     (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py",
       "test_ns_global_replace_rollback.py"),
      ("src/injector/ns_utils.c", "include/ns_utils.h", "src/injector/ns_global_replace.c",
@@ -502,6 +515,7 @@ LAYERS = {
             "test_mount_liveness.py",
             "test_mountinfo_dynamic.py",
             "test_mount_state_read.py",
+            "test_submount_rules.py",
             "test_zygisk_post_wait.py",
             "test_ns_mnt_wait.py",
             "test_grepl_status_fast.py",
@@ -714,6 +728,7 @@ PARALLEL_SAFE = frozenset({
     "test_mountinfo_dynamic.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap=fopen，
                                   # 合成 mountinfo，无挂载/无 daemon
     "test_mount_state_read.py",   # cc 直编 mount_manager.c + 桩，合成 mountinfo，无挂载/无 daemon
+    "test_submount_rules.py",     # 直编 mount_manager/common + 合成 mountinfo，无挂载/无 daemon
     "test_zygisk_post_wait.py",   # cc 直编 post_wait.h + 静态读源码，无挂载/无 daemon
     "test_grepl_status_fast.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap 桩
                                   # stat/opendir/readdir/fopen，合成族目录，无挂载/无 daemon
