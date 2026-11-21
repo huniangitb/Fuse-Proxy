@@ -77,6 +77,11 @@ static _Atomic(uint64_t) g_cfg_gen = 0;
 /* 获取本线程读者槽：首次调用经 fetch_add 分配（热路径此后只读 TLS）。
    槽位耗尽时共享最后一个槽（正确性不变，仅退化回有竞争——实际线程数
    （FUSE 线程池 + 监控线程）远小于 CFG_READER_MAX） */
+/* 本线程当前持读槽的嵌套深度：用于识别「已在读槽内」的调用方（槽内的
+   快照入口若再取一层槽，会在并发发布时与外层槽的排空互相等待）。只由
+   config_read_begin/end 维护，深度 0 表示当前线程不持槽。 */
+static _Thread_local int g_cfg_read_depth;
+
 static int cfg_reader_slot(void) {
     int s = g_cfg_reader_slot;
     if (s < 0) {
@@ -97,17 +102,22 @@ uint64_t config_read_begin(void) {
         } /* 写者进行中 */
         int slot = (int)((g1 >> 1) & 1);
         atomic_fetch_add_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1)
+        if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1) {
+            g_cfg_read_depth++;
             return g1; /* 稳定快照，持槽 */
+        }
         atomic_fetch_sub_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_release);
     }
 }
 
 bool config_read_end(uint64_t gen) {
+    if (g_cfg_read_depth > 0) g_cfg_read_depth--;
     int slot = (int)((gen >> 1) & 1);
     atomic_fetch_sub_explicit(&g_cfg_readers[cfg_reader_slot()].cnt[slot], 1, memory_order_release);
     return atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == gen;
 }
+
+bool config_read_in_slot(void) { return g_cfg_read_depth > 0; }
 
 uint64_t config_publish_begin(void) {
     uint64_t g = atomic_load_explicit(&g_cfg_gen, memory_order_relaxed);

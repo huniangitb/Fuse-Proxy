@@ -169,6 +169,10 @@ void config_unlock_write();
    config_publish_end(old_gen) 放行并等待旧代际读者归零（之后方可释放旧配置）。 */
 uint64_t config_read_begin(void);
 bool config_read_end(uint64_t gen);
+/* 本线程当前是否已持读槽（config_read_begin 成功且未 end）。嵌套取槽会在
+   并发发布时与外层槽的排空互相等待，因此需要「槽内/槽外」两套语义的入口
+   用它在槽内走直接读、槽外才取槽。 */
+bool config_read_in_slot(void);
 uint64_t config_publish_begin(void);
 void config_drain_readers(uint64_t old_gen);
 void config_publish_end(uint64_t old_gen);

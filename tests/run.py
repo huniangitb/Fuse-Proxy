@@ -372,6 +372,15 @@ SUITE_MAP = [
       ("fw_pkg_prefetch_isolation_facts", "br_prefetch_xapp_facts", "fw_pkg_uid_map_name"),
       "配置读槽内的慢能力查询（槽外预取）"),
 
+    # 跨应用白名单数组是配置指针：发布者在排空旧读者后释放它，槽外读者若在
+    # 比较途中被发布穿插就会读已释放条目（ASan：fw_acl_identity → strlen(freed)）。
+    # 槽外调用者改走槽内快照入口。
+    (("test_acl_whitelist_lifetime.py",),
+     ("src/daemon/fw_acl.c", "src/daemon/fw_rules.c", "src/daemon/fuse_daemon.c",
+      "tests/test_acl_whitelist_lifetime.py", "tests/fixtures/acl_whitelist_lifetime.c"),
+     ("fw_rules_cross_app_pkg_allowed_snapshot", "fw_rules_cross_app_access_snapshot"),
+     "跨应用白名单数组的槽外借用（槽内快照）"),
+
     (("test_sys_pkg_isolation.py",),
      ("src/core/sys_pkg.c", "tests/test_sys_pkg_isolation.py",
       "tests/fixtures/sys_pkg_isolation.c"),
@@ -553,6 +562,7 @@ LAYERS = {
             "test_pkg_cache_isolation.py",
             "test_pkg_map_lifetime.py",
             "test_cfg_slot_isolation.py",
+            "test_acl_whitelist_lifetime.py",
             "test_sys_pkg_isolation.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
@@ -807,6 +817,7 @@ PARALLEL_SAFE = frozenset({
     "test_pkg_cache_isolation.py", # 真实 fw_pkg + 定向文件 gate，临时目录，无挂载
     "test_pkg_map_lifetime.py",   # 真实 fw_pkg/uid_map + 私有 uid.map，临时目录，无挂载
     "test_cfg_slot_isolation.py",  # 真实 fw_rules/fw_pkg/parser + 测试钩子，临时目录，无挂载
+    "test_acl_whitelist_lifetime.py", # 真实 fw_acl/fw_rules + 真实发布协议，临时目录，无挂载
     "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志

@@ -43,8 +43,9 @@ static bool g_br_disable_sandbox = false;
      读者零原子写，多线程并发读不产生缓存行颠簸（原 rwlock 读路径每次
      rdlock/unlock 均原子改写同一缓存行，高并发下成瓶颈）；
    - 写者（缓存填充/重载失效）取 wlock 互斥 + seq 奇数/偶数翻转。
-   所有调用方（fw_rules_resolve/fw_rules_probe）均持 config_lock_read，
-   cfg 指针不会被重载并发释放；seqlock 仅需防止并发填充互相撕裂。 */
+   所有调用方（fw_rules_resolve/fw_rules_probe 及其槽内辅助）都持配置读槽
+   （config_read_begin），cfg 指针不会被重载并发释放；seqlock 仅需防止并发
+   填充互相撕裂。槽外借用白名单等配置指针须走 *_snapshot 入口。 */
 typedef struct {
     pthread_mutex_t wlock; /* 写者互斥（填充/失效），读侧无锁 */
     _Atomic uint64_t seq;  /* seqlock 序号 */
@@ -273,14 +274,38 @@ bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
     return false;
 }
 
+/* 槽内取白名单决定：内部按配置读槽读、重载窗口内重试。
+   槽外调用者（如 fw_acl_identity 组装身份）必须用这个入口——白名单数组在
+   config_publish 排空旧读者后即随旧配置一起释放，裸读 fw_rules_cross_app_pkg_allowed
+   会在重载窗口里比较已释放的条目（现场：一个 FUSE 请求正在 strlen 条目，发布把
+   旧数组 free 掉）。持槽后发布者的 config_drain_readers 会等它读完，读到的必是活配置。
+   契约：不得在持配置写锁（发布临界区）的线程上调用——那时代际为奇数，
+   config_read_begin 会自旋等发布结束，而发布正等本线程。
+   本线程**已持读槽**时不能再取一层：外层槽仍被本线程占着，发布者的
+   config_drain_readers 等它归零，而内层 config_read_begin 又在等发布结束
+   ——两者互等（实测 3s 仍卡在 config_read_begin）。此时外层槽已经把当前配置
+   钉住（发布者在排空它之前不会释放旧配置），直接裸读即可，语义等价。 */
+bool fw_rules_cross_app_pkg_allowed_snapshot(const char* pkg) {
+    if (!pkg || !pkg[0]) return false;
+    if (config_read_in_slot()) return fw_rules_cross_app_pkg_allowed(pkg);
+    for (;;) {
+        uint64_t gen = config_read_begin();
+        const bool allowed = fw_rules_cross_app_pkg_allowed(pkg);
+        if (config_read_end(gen)) return allowed;
+    }
+}
+
 bool fw_rules_cross_app_capability(void) { return g_global_cfg.allow_cross_by_capability; }
 
 /* 现场取能力事实：白名单/特权命中就不再问 appops——那是一次 fork 子进程的代价
-   （虽然按 uid 缓存 30s），不该为已被前几档否决的判定去付。 */
-static NspXAppFacts br_xapp_facts(const char* pkg, uid_t uid, bool is_obb) {
+   （虽然按 uid 缓存 30s），不该为已被前几档否决的判定去付。
+   have_whitelist=true 时白名单决定由调用方在槽内先取（槽外调用者必须如此：
+   白名单数组随旧配置在发布排空后释放）；组合顺序仍只写在本函数一处。 */
+static NspXAppFacts br_xapp_facts_common(const char* pkg, uid_t uid, bool is_obb,
+                                         bool whitelisted, bool have_whitelist) {
     NspXAppFacts f = {0};
     f.is_obb = is_obb;
-    f.whitelisted = fw_rules_cross_app_pkg_allowed(pkg);
+    f.whitelisted = have_whitelist ? whitelisted : fw_rules_cross_app_pkg_allowed(pkg);
     if (f.whitelisted) return f;
     f.privileged = fw_pkg_is_privileged(uid);
     if (f.privileged) return f;
@@ -292,8 +317,20 @@ static NspXAppFacts br_xapp_facts(const char* pkg, uid_t uid, bool is_obb) {
     return f;
 }
 
+static NspXAppFacts br_xapp_facts(const char* pkg, uid_t uid, bool is_obb) {
+    return br_xapp_facts_common(pkg, uid, is_obb, false, false);
+}
+
 NspXAppAccess fw_rules_cross_app_access(const char* pkg, uid_t uid, bool is_obb) {
     NspXAppFacts f = br_xapp_facts(pkg, uid, is_obb);
+    return nsp_xapp_access_of(&f);
+}
+
+NspXAppAccess fw_rules_cross_app_access_snapshot(const char* pkg, uid_t uid, bool is_obb) {
+    /* 只有白名单一档持有配置指针，故只在槽内取这一档；特权/能力查询是外部命令，
+       必须留在槽外——把 appops 放回槽里就是本轮修掉的整池停顿。 */
+    const bool whitelisted = fw_rules_cross_app_pkg_allowed_snapshot(pkg);
+    NspXAppFacts f = br_xapp_facts_common(pkg, uid, is_obb, whitelisted, true);
     return nsp_xapp_access_of(&f);
 }
 

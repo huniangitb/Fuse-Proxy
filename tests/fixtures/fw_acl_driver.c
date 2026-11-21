@@ -93,6 +93,12 @@ bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
     }
     return false;
 }
+/* 槽内快照入口：驱动不链接 config_parser，等价桩直接转发（真实槽协议由
+   tests/test_acl_whitelist_lifetime.py 直编生产源码覆盖）。 */
+bool fw_rules_cross_app_pkg_allowed_snapshot(const char* pkg) {
+    return fw_rules_cross_app_pkg_allowed(pkg);
+}
+
 bool fw_rules_cross_app_capability(void) { return g_stub_capability; }
 
 /* 拒绝日志走 LOG_DBG → log_internal：驱动里吞掉（判定逻辑与日志无关） */

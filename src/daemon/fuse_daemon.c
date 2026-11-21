@@ -352,7 +352,8 @@ static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse
         bool same_app = (strcmp(name, current_pkg) == 0) ||
                         (fw_pkg_uid_for_package(name, &owner_uid) && owner_uid == uid);
         bool is_obb = (strncmp(sub_path, "/Android/obb", 12) == 0);
-        if (!same_app && fw_rules_cross_app_access(current_pkg, uid, is_obb) == NSP_XAPP_NONE)
+        if (!same_app &&
+            fw_rules_cross_app_access_snapshot(current_pkg, uid, is_obb) == NSP_XAPP_NONE)
             return NSP_VIS_SKIP;
     }
 

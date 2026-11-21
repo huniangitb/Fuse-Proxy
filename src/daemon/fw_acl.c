@@ -401,7 +401,9 @@ void fw_acl_identity(uid_t uid, pid_t pid, NspAclIdentity* out) {
             out->pkg_known = true;
         }
         out->privileged = fw_pkg_is_privileged(uid);
-        out->cross_app_allowed = fw_rules_cross_app_pkg_allowed(out->pkg);
+        /* 槽外读白名单必须走快照版：白名单数组随旧配置在发布排空后释放，
+           裸读会在重载窗口里比较已释放的条目（回归 test_acl_whitelist_lifetime.py）。 */
+        out->cross_app_allowed = fw_rules_cross_app_pkg_allowed_snapshot(out->pkg);
         out->cross_app_by_capability = fw_rules_cross_app_capability();
         out->cross_app_isolated = fw_rules_cross_app_isolated();
     }

@@ -261,8 +261,15 @@ static inline NspXAppAccess nsp_xapp_access_of(const NspXAppFacts* f) {
    fw_rules 的隔离判定（br_isolation_blocks/hides）与 readdir 列举
    （vfs_entry_visibility）都走它；fw_acl 走 nsp_xapp_access_of + 身份字段。 */
 NspXAppAccess fw_rules_cross_app_access(const char* pkg, uid_t uid, bool is_obb);
+/* 槽外调用者用（如 readdir 条目可见性）：白名单在槽内取，能力查询仍在槽外查。
+   直接调上一个是错的——白名单数组随旧配置在发布排空后释放。 */
+NspXAppAccess fw_rules_cross_app_access_snapshot(const char* pkg, uid_t uid, bool is_obb);
 /* 白名单查询（仅包名维度，供日志/诊断与单测断言使用） */
 bool fw_rules_cross_app_pkg_allowed(const char* pkg);
+
+/* 槽内快照版：槽外调用者（如 fw_acl_identity）读白名单必须走它——白名单数组随
+   旧配置在发布排空后释放，裸读会在重载窗口里比较已释放的条目。 */
+bool fw_rules_cross_app_pkg_allowed_snapshot(const char* pkg);
 /* 能力开关（[GLOBAL] ALLOW_CROSS_APP_BY_CAPABILITY，默认 ON = 与原生一致） */
 bool fw_rules_cross_app_capability(void);
 
