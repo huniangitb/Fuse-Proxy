@@ -79,10 +79,14 @@ def build(directory, cfg, headers):
     if pkgconfig.returncode != 0:
         return None, "缺少 json-c"
     binary = directory / "cfg_slot_isolation"
-    command = cc + ["-std=c23", "-DTARGET_GNU=1", "-D_GNU_SOURCE", "-Wall",
-                    "-Wno-unused-parameter", "-I" + str(headers), "-I" + str(ROOT / "include"),
-                    "-I" + str(ROOT / "src/daemon"), str(DRIVER)] + files + [
-                    "-o", str(binary), "-pthread", "-ldl", "-lm"] + pkgconfig.stdout.split()
+    # --wrap=fopen：观测「打开 packages.list 时本线程是否持配置读槽」（见 check_publish_pkgs）
+    command = cc + [
+        "-std=c23", "-DTARGET_GNU=1", "-D_GNU_SOURCE", "-Wall", "-Wno-unused-parameter",
+        "-I" + str(headers), "-I" + str(ROOT / "include"), "-I" + str(ROOT / "src/daemon"),
+        str(DRIVER),
+    ] + files + [
+        "-o", str(binary), "-pthread", "-ldl", "-lm", "-Wl,--wrap=fopen", "-Wl,--wrap=fgets",
+    ] + pkgconfig.stdout.split()
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
     (directory / "compile.log").write_text(result.stdout + result.stderr)
     if result.returncode:
@@ -136,6 +140,105 @@ def check_publish(binary, conf_path, plist, slow_ms, path=None):
     return checks
 
 
+# 发布起始偏移要覆盖到「请求已在读槽里做文件 IO」的那一段：旧实现在 800–1300ms
+# 被拖住（drain 455ms），更早的偏移它还没进槽、更晚已出槽，都看不出来。
+PKG_DELAYS = (0, 200, 400, 600, 800, 900, 1000, 1100, 1200, 1300)
+
+
+def check_publish_pkgs(binary, conf_path, plist, fifo, slow_ms):
+    """packages.list 的**真**慢读：override 是 FIFO，读方 open 阻塞到写方睡完
+    slow_ms 才拿到清单。身份解析（/proc + packages.list）与隔离要的属主 uid、
+    特权档都来自这份文件——它们留在读槽里就等于把发布者按慢读时长钉住。
+    发布器起始时刻按 PKG_DELAYS 扫描：请求先在槽外预取、再进读槽，只有撞上
+    「正持读槽做文件 IO」那一段，旧实现才会把 drain 拖到慢读量级。判别信号
+    两路：--wrap=fopen 统计「打开时本线程持配置读槽」的次数（旧 >0），且每个
+    偏移下 drain 与迟到读者都要留在 LIMIT_US 内（旧在命中窗口时超限）。"""
+    checks = []
+    for delay in PKG_DELAYS:
+        out, error = run_driver(
+            binary, ["publish-pkgs", str(conf_path), str(slow_ms)],
+            {"NSP_PACKAGELIST": str(plist), "NSP_PKGLIST_FIFO": str(fifo),
+             "NSP_PUBLISH_DELAY_MS": str(delay)},
+            timeout=90)
+        label = f"packages.list 慢读[{delay}ms 偏移]"
+        if error:
+            checks.append((label, False, error))
+            continue
+        fields = parse_kv(out)
+        checks += [
+            (label + " 不拖住发布 drain",
+             fields["drain_us"] < LIMIT_US,
+             f"drain_us={fields['drain_us']} 阈值<{LIMIT_US} (慢读 {slow_ms}ms)"),
+            (label + " 不冻住迟到读者",
+             fields["late_reader_us"] < LIMIT_US,
+             f"late_reader_us={fields['late_reader_us']} 阈值<{LIMIT_US}"),
+            (label + " 槽内没有慢读 packages.list",
+             fields["pkgl_slow_in_slot"] == 0,
+             f"pkgl_slow_in_slot={fields['pkgl_slow_in_slot']}"
+             f"（持读槽时读了 {slow_ms}ms 量级 = 旧行为；"
+             f"pkgl_in_slot={fields['pkgl_in_slot']} 含瞬时 EOF 读）"),
+        ]
+        if delay == 0:
+            checks += [
+                ("packages.list 真被读过（事实查询没被删掉）",
+                 fields["pkgl_opens"] >= 1,
+                 f"pkgl_opens={fields['pkgl_opens']}"),
+                ("慢读确实发生",
+                 fields["resolve_us"] >= slow_ms * 800,
+                 f"resolve_us={fields['resolve_us']} 期望>={slow_ms * 800}"),
+                ("他包 data 仍被隔离",
+                 fields["blocked"] == 1 and fields["probed"] == 1,
+                 f"blocked={fields['blocked']} probed={fields['probed']}"),
+            ]
+    return checks
+
+
+# probe 冷路径同样要覆盖「发布撞上读槽内文件 IO」那一段：probe-pkgs 先 probe，
+# 此时 uid→包名缓存全冷，身份解析只能由 probe 自己做。
+PKG_PROBE_DELAYS = (0, 300, 500, 600, 700, 800)
+
+
+def check_probe_pkgs(binary, conf_path, plist, fifo, slow_ms):
+    """fw_rules_probe 的冷路径（readdir 条目级）：旧实现在读槽里解析身份，
+    packages.list 慢读就把发布者连同后续读者一起钉住；新实现槽前解析。"""
+    checks = []
+    for delay in PKG_PROBE_DELAYS:
+        out, error = run_driver(
+            binary, ["probe-pkgs", str(conf_path), str(slow_ms)],
+            {"NSP_PACKAGELIST": str(plist), "NSP_PKGLIST_FIFO": str(fifo),
+             "NSP_PUBLISH_DELAY_MS": str(delay)},
+            timeout=90)
+        label = f"probe 冷路径[{delay}ms 偏移]"
+        if error:
+            checks.append((label, False, error))
+            continue
+        fields = parse_kv(out)
+        checks += [
+            (label + " 不拖住发布 drain",
+             fields["drain_us"] < LIMIT_US,
+             f"drain_us={fields['drain_us']} 阈值<{LIMIT_US} (慢读 {slow_ms}ms)"),
+            (label + " 不冻住迟到读者",
+             fields["late_reader_us"] < LIMIT_US,
+             f"late_reader_us={fields['late_reader_us']} 阈值<{LIMIT_US}"),
+            (label + " 槽内没有慢读 packages.list",
+             fields["pkgl_slow_in_slot"] == 0,
+             f"pkgl_slow_in_slot={fields['pkgl_slow_in_slot']}"
+             f"（持读槽时读了 {slow_ms}ms 量级 = 旧行为；"
+             f"pkgl_in_slot={fields['pkgl_in_slot']} 含瞬时 EOF 读）"),
+        ]
+        if delay == PKG_PROBE_DELAYS[0]:
+            checks += [
+                ("probe 真读了 packages.list（身份查询没被删掉）",
+                 fields["pkgl_opens"] >= 1,
+                 f"pkgl_opens={fields['pkgl_opens']}"),
+                ("probe 冷路径慢读确实发生",
+                 fields["probe_us"] >= slow_ms * 800,
+                 f"probe_us={fields['probe_us']} 期望>={slow_ms * 800}"),
+                ("probe 仍判他包 data 隔离", fields["probed"] == 1,
+                 f"probed={fields['probed']}"),
+            ]
+    return checks
+
 def check_matrix(binary, directory, cfg, plist, name, conf, uid, paths, expect):
     conf_path = cfg / "injector.conf"
     conf_path.write_text(conf, encoding="utf-8")
@@ -177,6 +280,14 @@ def run(directory):
     # 字节——原始写法里 0x01 删掉后才凑出 /Android/data/ 前缀。若预取直接扫原始路径，
     # 这条请求的慢查询会留在槽内（旧实现实测 drain 260ms）。
     checks += check_publish(binary, base_conf, plist, 300, "/0/Android/\x01data/com.other.app/files/x")
+    # packages.list 真慢读：FIFO + --wrap=fopen 观测「持读槽时打开」。身份解析与
+    # 隔离要的属主 uid/特权档都读这份文件；旧实现把读放在槽内 → 发布者被钉住。
+    fifo = directory / "packages.list.fifo"
+    if fifo.exists():
+        fifo.unlink()
+    os.mkfifo(fifo)
+    checks += check_publish_pkgs(binary, base_conf, plist, fifo, 250)
+    checks += check_probe_pkgs(binary, base_conf, plist, fifo, 250)
     # 语义矩阵（一次进程走多路径；只断言裁决，不看累计查询次数）
     checks += check_matrix(binary, directory, cfg, plist, "默认隔离", BASE, 10123,
                            [OTHER, OTHER_OBB, OWN, PLAIN], {
