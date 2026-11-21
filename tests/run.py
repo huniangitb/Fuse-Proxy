@@ -406,6 +406,14 @@ SUITE_MAP = [
      ("sys_pkg_init", "sys_pkg_refresh", "sys_pkg_cleanup", "sys_pkg_is_system"),
      "系统包缓存慢构建、刷新与读者隔离"),
 
+    # `pm` 走 binder 到 system_server：旧 popen+fgets 没有时间上界，一次挂起就把
+    # 配置视图/注入器事件循环/热重载线程整条冻住。新实现按预算跑命令并回退。
+    (("test_cmd_bounded_pm.py",),
+     ("src/core/common.c", "src/core/sys_pkg.c", "src/config/config_parser.c",
+      "tests/test_cmd_bounded_pm.py", "tests/fixtures/cmd_bounded_driver.c"),
+     ("common_run_cmd_lines", "scan_active_users", "sys_pkg_collect_pm"),
+     "pm 查询的时间上界（有界命令执行）"),
+
     (("test_ftp_lifecycle_isolation.py",),
      ("src/modules/ftp/ftp_backend_libcurl.c", "src/modules/ftp/ftp_mux.c",
       "tests/test_ftp_lifecycle_isolation.py",
@@ -583,6 +591,7 @@ LAYERS = {
             "test_cfg_slot_isolation.py",
             "test_acl_whitelist_lifetime.py",
             "test_sys_pkg_isolation.py",
+            "test_cmd_bounded_pm.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
             "test_cfg_watch.py",
@@ -841,6 +850,7 @@ PARALLEL_SAFE = frozenset({
     "test_config_read_wait.py",   # cc 直编真实 parser，纯线程/CPU 计时，无文件或挂载
     "test_acl_whitelist_lifetime.py", # 真实 fw_acl/fw_rules + 真实发布协议，临时目录，无挂载
     "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
+    "test_cmd_bounded_pm.py",     # cc 直编真实 common/parser/sys_pkg + PATH 假 pm，临时目录，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载

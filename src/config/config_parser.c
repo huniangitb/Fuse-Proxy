@@ -38,11 +38,12 @@ int g_active_user_count = 0;
    fuse_daemon（内建规则引擎）、log_ctl 等进程加载配置时只读，
    避免将 scan_active_users 误判出的伪用户固化为目录 */
 static bool g_allow_app_rules_mkdir = false;
-/* pm 探测开关：scan_active_users 默认经 popen("pm list users") 枚举活跃
-   用户——该命令需 binder 通信 system_server，在 fuse_daemon 等受限环境
-   可能长时间挂起（启动/热重载持写锁阻塞 → FUSE 无响应）。只读加载方
-   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 跳过，改由
-   /data/media 与已存在的 App-rules-<uid> 目录推导（无 popen，不会阻塞） */
+/* pm 探测开关：scan_active_users 默认经 common_run_cmd_lines 执行
+   `pm list users`（预算 CFG_PM_USERS_BUDGET_MS=800ms，超预算回退磁盘推导）
+   枚举活跃用户——该命令需 binder 通信 system_server，在 fuse_daemon 等受限
+   环境可能长时间挂起（启动/热重载持写锁阻塞 → FUSE 无响应）。只读加载方
+   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 直接跳过 pm 探测，
+   改由 /data/media 与已存在的 App-rules-<uid> 目录推导（连 fork 都不做） */
 static bool g_scan_users_skip_pm = false;
 static pthread_rwlock_t g_rules_lock;
 #include <sched.h>
@@ -1071,23 +1072,34 @@ static void merge_users_from_app_rules_dirs(void) {
     closedir(dir);
 }
 
+/* pm list users 的预算：命令走 binder 到 system_server，实测几十毫秒，
+   挂起时无上界。800ms 足够慢设备，超预算就按「pm 没结果」回退磁盘推导。 */
+#define CFG_PM_USERS_BUDGET_MS 800
+
+/* 逐行解析 pm 输出（旧实现是 fgets 逐行，语义一致；切行由 common_run_cmd_lines 做） */
+static void cfg_user_line(const char* line, void* ctx) {
+    (void)ctx;
+    int uid = -1;
+    if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
+        if (uid >= 0 && g_active_user_count < MAX_USERS) g_active_users[g_active_user_count++] = uid;
+    }
+}
+
 void scan_active_users() {
     g_active_user_count = 0;
 
     // 优先通过 pm list users 获取真实用户列表（跳过模式：只读加载方
     // 不执行 popen——pm 需 binder 通信 system_server，受限环境会挂起）
     if (!g_scan_users_skip_pm) {
-        FILE* fp = popen("pm list users 2>/dev/null", "r");
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                int uid = -1;
-                if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
-                    if (uid >= 0 && g_active_user_count < MAX_USERS)
-                        g_active_users[g_active_user_count++] = uid;
-                }
-            }
-            pclose(fp);
+        bool timed_out = false;
+        if (common_run_cmd_lines("pm list users 2>/dev/null", CFG_PM_USERS_BUDGET_MS, cfg_user_line,
+                                 NULL, &timed_out) != 0) {
+            LOG_WRN("scan_active_users: pm 探测启动失败，回退磁盘推导");
+        } else if (timed_out) {
+            /* 挂住的 binder 调用不再拖死调用者（旧 popen+fgets 无上界）：放弃本次
+               pm 结果，按「pm 没有结果」走 /data/media 与规则目录推导。 */
+            g_active_user_count = 0; /* 半截用户表会挡掉下面的磁盘推导，先清空 */
+            LOG_WRN("scan_active_users: pm 探测超预算 %dms，回退磁盘推导", CFG_PM_USERS_BUDGET_MS);
         }
     } else {
         LOG_DBG("scan_active_users: 只读模式跳过 pm 探测，仅扫描 /data/media");
@@ -1142,12 +1154,13 @@ void config_set_allow_app_rules_mkdir(bool allow) {
 }
 
 /* pm 探测开关：只读加载方（fuse_daemon 内建引擎、log_ctl）置
-   true——scan_active_users 跳过 popen("pm list users")，改由 /data/media 与
+   true——scan_active_users 跳过 pm 探测，改由 /data/media 与
    已存在的 App-rules-<uid> 目录推导用户列表。
    pm 需 binder 通信 system_server，在 fuse_daemon 受限环境（SELinux/
-   命名空间）可能长时间挂起，而 load_config_rules 在 config_lock_write
-   写锁内执行：启动（br_rules_init，fuse_main 之前）与热重载（inotify
-   线程）都会因 popen 阻塞而卡死 → FUSE 会话无响应。log_ctl 虽是短命 CLI
+   命名空间）可能长时间挂起；虽有 800ms 预算兜底，只读加载方本来也不需要
+   这份列表，省掉一次 fork/exec 更干净。注：injector 侧 load_config_rules
+   仍在 config_lock_write 写锁内执行（启动与热重载都是），预算把「无上界」
+   压成 800ms。log_ctl 虽是短命 CLI
    不至于死锁，但每次 JSON API 调用都付一次 binder 开销同样无必要。
    injector 保持默认 false（主控进程有 pm 环境，需要完整用户列表） */
 void config_set_scan_users_skip_pm(bool skip) {

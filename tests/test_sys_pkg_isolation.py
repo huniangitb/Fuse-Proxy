@@ -40,7 +40,8 @@ def main():
                    str(ROOT / "tests/fixtures/sys_pkg_isolation.c"), str(source),
                    *(str(ROOT / s) for s in SOURCES), "-o", str(tmp / "test"),
                    "-pthread", "-ldl", "-lm", "-Wl,--gc-sections",
-                   "-Wl,--wrap=fopen,--wrap=fgets,--wrap=fclose,--wrap=popen,--wrap=pclose"]
+                   "-Wl,--wrap=fopen,--wrap=fgets,--wrap=fclose,--wrap=popen,--wrap=pclose,"
+                    "--wrap=common_run_cmd_lines"]
         command += shlex.split(os.environ.get("SYS_PKG_TEST_CFLAGS", ""))
         for argv, timeout in [(command, 60), ([str(tmp / "test")], 25)]:
             result = subprocess.run(argv, text=True, capture_output=True, timeout=timeout)

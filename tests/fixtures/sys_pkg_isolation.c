@@ -1,5 +1,6 @@
 /* 原 sys_pkg/config_parser TU + 可释放 libc gate：锁实现和发布逻辑不打桩。
- * popen 唯一替身返回本地真实 FILE，避免调用 Android pm；pclose 只关该文件。
+ * pm 查询替身：新接缝是 common_run_cmd_lines（按行回调，见文件末尾），旧实现的
+ * popen/pclose 替身也保留（SYS_PKG_SRC 负控要跑旧源），两者都回放同一份 pm_text。
  * 每个 gate 最长4秒自释放，失败断言后仍 release/join；不取消线程/越权close。
  */
 #ifndef _GNU_SOURCE
@@ -80,6 +81,30 @@ FILE* __wrap_popen(const char* command, const char* mode) {
     return fp;
 }
 int __wrap_pclose(FILE* fp) { return __real_fclose(fp); }
+/* 新接缝：sys_pkg 的 pm 查询改走 common_run_cmd_lines（有界执行）。这里按行回放
+   pm_text（默认一行旧系统包），timed_out 保持 false——超时分支由
+   test_cmd_bounded_pm.py 用真 fork 覆盖；保留上面的 popen 替身是为了让
+   SYS_PKG_SRC 指向旧实现时仍能注入同一份假 pm 输出。 */
+int __wrap_common_run_cmd_lines(const char* shell_cmd, int budget_ms, NspCmdLineFn on_line,
+                               void* ctx, bool* timed_out) {
+    (void)shell_cmd;
+    (void)budget_ms;
+    if (timed_out) *timed_out = false;
+    const char* text = pm_text ? pm_text : "package:com.system.old\n";
+    const char* p = text;
+    while (*p) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        char line[128];
+        if (len >= sizeof line) len = sizeof line - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        if (on_line) on_line(line, ctx);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
 static void check(bool ok, const char* name) {
     printf("%s %s\n", ok ? "PASS" : "FAIL", name); if (ok) pass++; else fail++;
 }

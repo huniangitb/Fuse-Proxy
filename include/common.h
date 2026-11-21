@@ -169,4 +169,17 @@ int common_mkdir_within_storage(const char* dir, mode_t mode);
    -1=非法（数字串溢出 int 的 atoi 别名，调用方须 fail-closed 返回 ENOENT）。 */
 int common_parse_user_layer(const char* path, int* user_id, const char** sub_path);
 
+/* ---- 有界外部命令（"pm list users"/"pm list packages" 走 binder，慢时无上界）----
+ * 旧用法是 popen + fgets/pclose：命令挂住多久，调用线程就冻多久。这两个调用点
+ * 都在关键路径上（scan_active_users 在配置写/读视图里，sys_pkg 刷新在注入器事件
+ * 循环与 fuse_daemon 热重载线程里），一次挂起就放大成整个进程/整个 FUSE 会话无
+ * 响应。本函数把 stdout 按行回调（语义等同 fgets：行长截断、末行无换行也回调），
+ * stderr 丢弃，总预算 budget_ms 覆盖输出与退出确认；超时即 SIGKILL 子进程并置
+ * *timed_out，调用方据此决定「保留旧表 / 回退推导」，绝不无限等待。
+ * 返回 0 = 拿到命令输出（含命令自己非零退出），-1 = spawn/读管道失败。
+ * 子进程只做 execl("/bin/sh","sh","-c",...)，不继承任何项目 fd（O_CLOEXEC）。 */
+typedef void (*NspCmdLineFn)(const char* line, void* ctx);
+int common_run_cmd_lines(const char* shell_cmd, int budget_ms, NspCmdLineFn on_line, void* ctx,
+                         bool* timed_out);
+
 #endif

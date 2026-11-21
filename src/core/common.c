@@ -11,6 +11,7 @@
 #include <sys/system_properties.h>
 #endif
 #include <stdatomic.h>
+#include <poll.h>
 #ifdef TARGET_ANDROID
 #include <sys/xattr.h>
 #endif
@@ -1071,4 +1072,142 @@ int common_parse_user_layer(const char* path, int* user_id, const char** sub_pat
     if (user_id) *user_id = (int)v;
     if (sub_path) *sub_path = (*d == '/') ? d : "/";
     return 1;
+}
+
+/* ---- 有界外部命令执行（见 include/common.h 的合同）----
+ * 旧调用点是 popen("pm list ...") + fgets：`pm` 要 binder 到 system_server，慢或挂
+ * 住时没有时间上界，而两处都在关键路径上（scan_active_users 在配置视图里、
+ * sys_pkg 刷新在注入器事件循环/热重载线程里）——一次挂起放大成整个进程无响应。
+ * 这里只做三件事：fork+exec /bin/sh -c、按行回调、预算到点 SIGKILL。
+ * 收尾纪律沿用 fw_pkg 的有界子进程：只在「尚未 wait 到退出」时 kill（已回收的
+ * pid 可能被内核复用），回收只用 WNOHANG + 20ms 宽限；仍不退出就交给调用方的
+ * SIGCHLD 回收/init，绝不在这里 waitpid(0)。 */
+#define COMMON_CMD_REAP_MS 20
+#define COMMON_CMD_DEFAULT_BUDGET_MS 1000 /* 调用方给了非正预算时的兜底 */
+#define COMMON_CMD_LINE_MAX 512
+
+static uint64_t common_cmd_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* 只在「尚未 wait 到退出」时才允许 kill（已回收的 pid 可能被内核复用） */
+static bool common_cmd_reaped(pid_t pid) {
+    pid_t w = waitpid(pid, NULL, WNOHANG);
+    return w == pid || (w < 0 && errno == ECHILD);
+}
+
+/* 有界回收：WNOHANG + 1ms 轮询，最多 COMMON_CMD_REAP_MS；仍不退出就交出去 */
+static bool common_cmd_reap_bounded(pid_t pid) {
+    uint64_t start = common_cmd_now_ms();
+    for (;;) {
+        if (common_cmd_reaped(pid)) return true;
+        uint64_t now = common_cmd_now_ms();
+        if (start == 0 || now == 0 || now - start >= COMMON_CMD_REAP_MS) return false;
+        struct pollfd none = {.fd = -1, .events = 0, .revents = 0};
+        (void)poll(&none, 1, 1);
+    }
+}
+
+int common_run_cmd_lines(const char* shell_cmd, int budget_ms, NspCmdLineFn on_line, void* ctx,
+                         bool* timed_out) {
+    if (timed_out) *timed_out = false;
+    if (!shell_cmd) return -1;
+    if (budget_ms <= 0) budget_ms = COMMON_CMD_DEFAULT_BUDGET_MS; /* 预算非法给默认值，绝不当成成功 */
+    int fds[2];
+    /* O_CLOEXEC：管道端不进入被 exec 的命令（子进程显式 dup2 到 stdout 后即不再需要） */
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+        if (errno != ENOSYS || pipe(fds) != 0) return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* 子进程：stdout 接管道、stderr 丢弃；这两个 fd 会在 exec 前被 dup2 到 0/1/2，
+         * 故不能设 CLOEXEC（exec 后它们就是标准 fd），其余项目 fd 不在本进程里。 */
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDERR_FILENO);
+            if (devnull != STDERR_FILENO) close(devnull);
+        }
+        close(fds[0]);
+        close(fds[1]);
+        execl("/bin/sh", "sh", "-c", shell_cmd, (char*)NULL);
+        execl("/system/bin/sh", "sh", "-c", shell_cmd, (char*)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    char line[COMMON_CMD_LINE_MAX];
+    size_t used = 0;
+    bool timed = false;
+    bool failed = false;
+    uint64_t start = common_cmd_now_ms();
+    for (;;) {
+        if (start == 0) { /* 单调钟不可用：不能把「量不了时间」当成「命令很快完成」 */
+            failed = true;
+            break;
+        }
+        uint64_t now = common_cmd_now_ms();
+        if (now == 0 || (int)(now - start) >= budget_ms) {
+            timed = true;
+            break;
+        }
+        int remain = budget_ms - (int)(now - start);
+        struct pollfd pfd = {.fd = fds[0], .events = POLLIN, .revents = 0};
+        int pr = poll(&pfd, 1, remain);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            failed = true;
+            break;
+        }
+        if (pr == 0) {
+            timed = true;
+            break;
+        }
+        ssize_t got = read(fds[0], line + used, sizeof line - used);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            failed = true;
+            break;
+        }
+        if (got == 0) break; /* EOF：命令自己退出 */
+        size_t pos = 0;
+        size_t end = used + (size_t)got;
+        while (pos < end) {
+            char* nl = memchr(line + pos, '\n', end - pos);
+            if (!nl) break;
+            size_t len = (size_t)(nl - (line + pos));
+            line[pos + len] = '\0'; /* 用换行占位，行长 = len */
+            if (on_line) on_line(line + pos, ctx);
+            pos += len + 1;
+        }
+        /* 剩余部分（含被截断的超长行）搬回行首，等下一段补齐 */
+        used = end - pos;
+        if (used >= sizeof line - 1) {
+            line[sizeof line - 1] = '\0';
+            if (on_line) on_line(line, ctx); /* fgets 语义：超长行按块返回 */
+            used = 0;
+        } else if (used > 0) {
+            memmove(line, line + pos, used);
+        }
+    }
+    if (used > 0 && !timed) { /* 末行无换行：fgets 同样返回 */
+        line[used] = '\0';
+        if (on_line) on_line(line, ctx);
+    }
+    if (timed && timed_out) *timed_out = true;
+    /* 超时或读管道失败都不能把子进程留在跑：只在「尚未 wait 到退出」时才 kill
+       （已回收的 pid 可能被内核复用，kill 它等于杀死陌生进程）。回收只用 WNOHANG
+       + 20ms 宽限，仍不退出的僵尸交给调用方的 SIGCHLD 回收者/init，绝不 waitpid(0)。 */
+    if (timed || failed) {
+        if (!common_cmd_reaped(pid)) (void)kill(pid, SIGKILL);
+    }
+    (void)common_cmd_reap_bounded(pid);
+    close(fds[0]);
+    return failed ? -1 : 0;
 }
