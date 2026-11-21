@@ -383,6 +383,14 @@ SUITE_MAP = [
        "BR_FACT_WARM_TRIES", "FW_PKG_PRIV_MISS_TTL_MS"),
       "配置读槽内的慢能力查询与慢身份事实（槽外预取 + 负结论缓存）"),
 
+    # 写者窗口里的读者等待方式：旧实现 sched_yield 自旋，多 worker 时把 CPU 从
+    # 写者正在排空的慢读者手里抢走（自旋放大）。新实现 futex 等待 + 放行唤醒。
+    (("test_config_read_wait.py",),
+     ("src/config/config_parser.c", "tests/test_config_read_wait.py",
+      "tests/fixtures/config_read_wait_driver.c"),
+     ("config_read_begin", "cfg_wait_publish", "config_publish_end"),
+     "配置读槽等待（futex 阻塞，不自旋）"),
+
     # 跨应用白名单数组是配置指针：发布者在排空旧读者后释放它，槽外读者若在
     # 比较途中被发布穿插就会读已释放条目（ASan：fw_acl_identity → strlen(freed)）。
     # 槽外调用者改走槽内快照入口。
@@ -579,6 +587,7 @@ LAYERS = {
             "test_log_persist_isolation.py",
             "test_cfg_watch.py",
             "test_cfg_reload_split.py",
+            "test_config_read_wait.py",
             "test_module_cfg_push.py",
             "test_fw_config_view.py",
             "test_rule_file_lock.py",
@@ -829,6 +838,7 @@ PARALLEL_SAFE = frozenset({
     "test_pkg_cache_isolation.py", # 真实 fw_pkg + 定向文件 gate，临时目录，无挂载
     "test_pkg_map_lifetime.py",   # 真实 fw_pkg/uid_map + 私有 uid.map，临时目录，无挂载
     "test_cfg_slot_isolation.py",  # 真实 fw_rules/fw_pkg/parser + 测试钩子，临时目录，无挂载
+    "test_config_read_wait.py",   # cc 直编真实 parser，纯线程/CPU 计时，无文件或挂载
     "test_acl_whitelist_lifetime.py", # 真实 fw_acl/fw_rules + 真实发布协议，临时目录，无挂载
     "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载

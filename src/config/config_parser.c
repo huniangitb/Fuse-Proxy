@@ -16,6 +16,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <time.h>
 AppConfig g_global_cfg;
 AppConfig** g_app_cfgs = nullptr;
 int g_app_cfg_count = 0;
@@ -47,7 +50,8 @@ static pthread_rwlock_t g_rules_lock;
 
 /* ============ 配置代际 + 读者计数（S1 无锁快照，per-thread 计数） ============
    热路径（br_resolve/br_probe）不再取 rwlock 读锁，改走 seqlock：
-   - g_cfg_gen：偶数 = 稳定代际；奇数 = 写者进行中（读者自旋等待）
+   - g_cfg_gen：偶数 = 稳定代际；奇数 = 写者进行中（读者 futex 阻塞等待，
+     见 cfg_wait_publish：早期实现是 sched_yield 自旋，多 worker 时抢 CPU）
    - g_cfg_readers[i][slot]：per-thread 读者计数，按代际奇偶分槽
      (slot = (gen>>1)&1)。每行 64B 缓存行对齐、每线程独占一行（首次调用
      经 g_cfg_reader_next 原子分配槽位）——8+ 线程并发时读者各自 RMW
@@ -73,6 +77,19 @@ static _Alignas(64) CfgReaderCell g_cfg_readers[CFG_READER_MAX];
 static _Atomic(int) g_cfg_reader_next = 0;       /* 下一个可分配读者槽位 */
 static _Thread_local int g_cfg_reader_slot = -1; /* 本线程读者槽（首次调用分配） */
 static _Atomic(uint64_t) g_cfg_gen = 0;
+/* 读者在写者窗口里的等待字：写者每把 gen 置偶一次 +1 并 FUTEX_WAKE。
+   旧实现是 sched_yield 自旋——多个 FUSE worker 同时自旋会把 CPU 从
+   「写者正在排空的那个慢读者」手里抢走，慢读者更慢、窗口更长（自旋
+   放大，且在没有空闲核的设备上是可观察的卡顿）。改成 futex 等待 +
+   200µs 兜底重检：判据仍是 g_cfg_gen（正确性不变），等待期间不占 CPU。
+   用 __atomic 内建访问普通 unsigned 字——futex 要求 4 字节对齐的整字，
+   无符号自增不会溢出处未定义。 */
+static unsigned g_cfg_publish_wake;
+static void cfg_wait_publish(void) {
+    unsigned seen = __atomic_load_n(&g_cfg_publish_wake, __ATOMIC_ACQUIRE);
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = 200000};
+    (void)syscall(SYS_futex, &g_cfg_publish_wake, FUTEX_WAIT_PRIVATE, (int)seen, &ts, nullptr, 0);
+}
 
 /* 获取本线程读者槽：首次调用经 fetch_add 分配（热路径此后只读 TLS）。
    槽位耗尽时共享最后一个槽（正确性不变，仅退化回有竞争——实际线程数
@@ -97,9 +114,9 @@ uint64_t config_read_begin(void) {
     for (;;) {
         uint64_t g1 = atomic_load_explicit(&g_cfg_gen, memory_order_acquire);
         if (g1 & 1) {
-            sched_yield();
+            cfg_wait_publish(); /* 写者进行中：阻塞等放行（不占 CPU） */
             continue;
-        } /* 写者进行中 */
+        }
         int slot = (int)((g1 >> 1) & 1);
         atomic_fetch_add_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_acq_rel);
         if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1) {
@@ -145,6 +162,9 @@ void config_drain_readers(uint64_t old_gen) {
 
 void config_publish_end(uint64_t old_gen) {
     atomic_store_explicit(&g_cfg_gen, old_gen + 2, memory_order_release);
+    /* 放行后唤醒在 cfg_wait_publish() 里睡的读者（遗漏由 200µs 兜底覆盖） */
+    __atomic_fetch_add(&g_cfg_publish_wake, 1, __ATOMIC_RELEASE);
+    (void)syscall(SYS_futex, &g_cfg_publish_wake, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
     int old_slot = (int)((old_gen >> 1) & 1);
     /* 扫描全部读者行等旧代际槽归零（无条件扫 MAX 行，规避槽位分配
        可见性竞态；热重载极低频，64×acquire load 开销可忽略）。
