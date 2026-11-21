@@ -316,7 +316,7 @@ fuse_daemon_sources = ['src/daemon/fuse_daemon.c', 'src/daemon/vfs_synth.c', 'sr
   # pthread_create 截持：libfuse worker 默认命名 fuse_worker（见文件头），
   # 仅 fuse_daemon 编入（injector/log_monitor 自有线程均已自命名，无需截持）
   'src/daemon/fuse_thread_naming.c']
-injector_sources = ['src/injector/injector.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_mount_health.c', 'src/injector/ns_global_replace.c', 'src/injector/ns_mountinfo.c', 'src/injector/ns_mnt_watch.c', 'src/injector/ns_mnt_wait.c', 'src/injector/reaped_managed.c', 'src/injector/retry_queue.c', 'src/core/fast_pid.c']
+injector_sources = ['src/injector/injector.c', 'src/injector/async_refresh.c', 'src/injector/inject_target.c', 'src/injector/mount_manager.c', 'src/injector/ipc_server.c', 'src/injector/config_publisher.c', 'src/injector/ns_utils.c', 'src/injector/ns_mount_health.c', 'src/injector/ns_global_replace.c', 'src/injector/ns_mountinfo.c', 'src/injector/ns_mnt_watch.c', 'src/injector/ns_mnt_wait.c', 'src/injector/reaped_managed.c', 'src/injector/retry_queue.c', 'src/core/fast_pid.c']
 
 # ================= 构建可执行文件 =================
 install_bin_dir = 'bin'

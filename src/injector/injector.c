@@ -18,6 +18,7 @@
 #include "ipc_server.h"
 #include "config_publisher.h"
 #include "sys_pkg.h"
+#include "async_refresh.h"
 #include "build_info.h"
 #include "crash_tail.h"
 #include <stdio.h>
@@ -1323,6 +1324,14 @@ static void parse_cli_args(int argc, char* argv[], bool* start_passive_out) {
 /* P3：信号集唯一构造点（early_init 填充，setup_epoll 复用，禁两处手写重复） */
 static sigset_t g_injector_sig_mask;
 
+/* sys_pkgs 表的重读在**后台**跑：`pm list packages -s` 有 3s 预算，内联在事件循环里
+   会让一次慢 pm 把 pre-hook 判定与挂载派发一起冻住（工具/用户连写配置时一轮接一轮）。
+   表由 sys_pkg 自己的锁与 epoch 发布，延迟一轮刷新的代价只是短暂沿用旧表。 */
+static void injector_sys_pkg_refresh_cb(void* ctx) {
+    (void)ctx;
+    if (config_has_category_rules()) sys_pkg_refresh();
+}
+
 static void injector_early_init(void) {
     /* 信号屏蔽须在 daemonize 之前（原 main 时序）：fork/setsid 期间不丢信号，
        signalfd 创建后统一经 epoll 分发 */
@@ -1343,6 +1352,8 @@ static void injector_early_init(void) {
     config_init_lock();
     fast_pid_init();
     init_uid_map_cache();
+    /* 装配异步刷新回调：在所有 init 之后、事件循环之前（此后才允许 request） */
+    nsp_async_refresh_init(injector_sys_pkg_refresh_cb, nullptr);
 }
 
 static void injector_setup_epoll(InjectorFds* fds) {
@@ -1977,7 +1988,8 @@ static void handle_pending_reload(void) {
         config_unlock_write();
         config_free_view(reload_recs, reload_count);
         apply_inject_method_switch();
-        if (config_has_category_rules()) sys_pkg_refresh();
+        /* 只入队，不在这里读盘/等 pm：本函数跑在唯一事件循环线程上 */
+        nsp_async_refresh_request();
         setup_inotify_watches();
         config_publisher_broadcast();
 
@@ -2071,6 +2083,8 @@ static void injector_shutdown(const InjectorFds* fds) {
     int ipc_sock = fds->ipc_sock;
     int timer_fd = fds->timer_fd;
     int sig_fd = fds->sig_fd;
+    /* 循环已退出，不再有新请求；等后台刷新把手上那轮跑完再动全局状态 */
+    nsp_async_refresh_shutdown();
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);
