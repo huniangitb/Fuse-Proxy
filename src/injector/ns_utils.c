@@ -63,6 +63,35 @@ static void replay_child_log_line(char* line) {
     log_internal((LogLevel)lv, "%s\n", msg);
 }
 
+/* 有界收尸：只等有限宽限就放弃，不在"可能卡死"的子进程上无限阻塞。
+ * 为什么必须放弃：子进程可能卡在不可中断的内核态（FUSE 回入曾实测出
+ * D-state，SIGKILL 在它返回前不生效），waitpid(...,0) 会把调用线程永久
+ * 钉住；而本函数跑在注入器事件循环线程上（perform_app_mount_sync、全局
+ * 替换），一条卡死的子进程等于整个事件循环停摆。
+ * 没被本函数收走的僵尸由主循环 reap_zombies（waitpid(-1,WNOHANG)）回收，
+ * 所以"放弃等待"不等于"丢事件"。 */
+#define NS_REAP_GRACE_MS 20
+enum { NS_REAP_GOT = 0, NS_REAP_GONE = 1, NS_REAP_STUCK = 2 };
+static int reap_child_bounded(pid_t child, int* status_out) {
+    for (int i = 0; i <= NS_REAP_GRACE_MS; i++) {
+        int status = 0;
+        pid_t w = waitpid(child, &status, WNOHANG);
+        if (w == child) {
+            if (status_out) *status_out = status;
+            return NS_REAP_GOT;
+        }
+        if (w < 0) {
+            if (errno == EINTR) continue; /* 被信号打断：立刻重试，不消耗宽限 */
+            /* ECHILD=主循环抢先收走；其它错误同样不会再有状态可等 */
+            if (errno != ECHILD)
+                LOG_WRN("ns操作子进程收尸失败 pid=%d: %s", (int)child, strerror(errno));
+            return NS_REAP_GONE;
+        }
+        struct timespec grace = {.tv_sec = 0, .tv_nsec = 1000000};
+        nanosleep(&grace, nullptr);
+    }
+    return NS_REAP_STUCK;
+}
 /* 非 static 导出：ns_global_replace.c（全局替换方案）在目标命名空间内
    执行 replace/restore 时共用本命名空间执行原语 */
 int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* child_err,
@@ -180,10 +209,13 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
            情况下拿不到真实状态必须判失败，不能默认成 0。
            更稳的做法是让主循环收尸时把 ns 子进程也留档（见 reaped_managed），
            此处先做"返回值必查"的最小修复。 */
-        pid_t w = waitpid(child, &status, 0);
-        bool know_status = (w == child);
-        if (w < 0 && errno != ECHILD && errno != EINTR)
-            LOG_WRN("ns操作 waitpid 失败 pid=%d: %s", target_pid, strerror(errno));
+        int reap = reap_child_bounded(child, &status);
+        bool know_status = (reap == NS_REAP_GOT);
+        if (reap == NS_REAP_STUCK)
+            /* 子进程已经把结果写进管道却没在宽限内退出（例如卡在不可中断的
+               内核态）：业务结果以管道为准，不必等它退出——等待会把事件循环
+               线程钉死，僵尸交主循环 reap_zombies 收尸 */
+            LOG_WRN("ns操作 pid=%d 子进程未在宽限内退出，僵尸交主循环收尸", target_pid);
         if (r_len == sizeof(child_ret)) {
             ret_val = child_ret;
             if (child_err) *child_err = child_ret;
@@ -221,9 +253,11 @@ int run_in_mnt_ns_timeout(int target_pid, int (*func)(void*), void* args, int* c
         }
     } else {
         kill(child, SIGKILL);
-        /* 强制终止后回收：同样不能假设成功——ECHILD 说明已被主循环收走 */
-        if (waitpid(child, NULL, 0) < 0 && errno != ECHILD)
-            LOG_WRN("ns操作超时后 waitpid 失败 pid=%d: %s", target_pid, strerror(errno));
+        /* 强制终止后回收：只给有限宽限。子进程可能卡在不可中断的内核态，
+           SIGKILL 在它返回前不生效，waitpid(...,0) 会把事件循环永久钉住；
+           宽限后仍未退出的僵尸交主循环 reap_zombies 回收 */
+        if (reap_child_bounded(child, nullptr) == NS_REAP_STUCK)
+            LOG_WRN("ns操作超时后子进程未在宽限内退出(pid=%d)，僵尸交主循环收尸", target_pid);
         if (child_err) *child_err = ETIMEDOUT;
         errno = ETIMEDOUT;
         LOG_WRN("ns操作 pid=%d 超时(%dms), 予以强制终止", target_pid, timeout_ms);

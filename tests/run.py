@@ -179,9 +179,12 @@ SUITE_MAP = [
      "原生子挂载显式规则冲突 / 用户层与类别判定"),
 
     (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py",
-      "test_ns_global_replace_rollback.py"),
+      "test_ns_global_replace_rollback.py",
+      # A：命名空间执行原语的超时收尸有界性（kill 不生效 / 子进程滞留）
+      "test_ns_timeout_reap.py"),
      ("src/injector/ns_utils.c", "include/ns_utils.h", "src/injector/ns_global_replace.c",
       "src/injector/injector.c", "include/injector.h",
+      "tests/fixtures/ns_timeout_reap.c",
       # mountinfo 扫描原语（C7 收口）与卸载序列同源；mount_manager 是注入挂载的
       # 执行体；ipc_server 随 injector 进程生命周期起停（zygisk 通知入口）
       "src/injector/ns_mountinfo.c", "src/injector/mount_manager.c",
@@ -643,6 +646,7 @@ LAYERS = {
             "test_submount_rules.py",
             "test_zygisk_post_wait.py",
             "test_ns_mnt_wait.py",
+            "test_ns_timeout_reap.py",
             "test_grepl_status_fast.py",
             "test_events_owner.py",
             "test_crash_tail.py",
