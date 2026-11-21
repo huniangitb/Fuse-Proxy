@@ -438,7 +438,7 @@ entry 级是项目内 libfuse fork 的追加接口（`subprojects/libfuse`，导
 | 全局 | 归属 | 保护 |
 |------|------|------|
 | `g_global_cfg` / `g_app_cfgs` | config_parser | S1 无锁快照（代际 + per-thread 读者计数）；冷路径查询与写者仍走 `g_rules_lock` rwlock |
-| `g_uid_maps` / `g_uid_map_count` | fuse_daemon `fw_pkg` | 重载时整体换入（`fw_pkg_reload`）+ 代际递增；查询二分 |
+| `g_uid_maps` / `g_uid_map_count` | fuse_daemon `fw_pkg` | 重载时整体换入（`fw_pkg_reload`）+ 代际递增；查询在 `g_uid_map_lock` 内二分并**拷贝**到调用方缓冲，装载（可能慢磁盘）与旧表释放全在锁外——借出表内指针会让并发重载的 `free` 变成 use-after-free（回归 `test_pkg_map_lifetime.py`） |
 | `g_uid_cache[2048]` / `g_mon_slots` | fuse_daemon `fw_pkg` / `fw_config` | seqlock（写者 wlock+seq 翻转，读者无锁），slot = `uid % 2048`，带配置代际校验 |
 | `g_uid_cache[2048]`（引擎内·uid→AppConfig 指针） | fuse_daemon `fw_rules` | 同上 seqlock；发布临界区钩子 `fw_rules_invalidate_caches` 随配置换入作废（旧 AppConfig 随即被 COW 释放） |
 | `g_recs` / `g_subs` / `g_gen` | fuse_daemon `fw_config` | 单一 `g_lock` 互斥 + 原子代际；发布路径「读锁内换视图 + 递增两槽引用计数 → 锁外回调模块」，故模块卸载的 drain 会等回调结束 |

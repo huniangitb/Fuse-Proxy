@@ -354,6 +354,14 @@ SUITE_MAP = [
      ("fw_pkg_is_privileged", "fw_pkg_uid_for_package", "fw_pkg_reload"),
      "包身份缓存锁外读取与代际发布隔离"),
 
+    # uid.map 数组的借用/释放所有权：重载换表与请求线程并发时，旧实现先 free
+     # 后 snprintf（ASan 实录 resolve_uncached heap-use-after-free）。
+    (("test_pkg_map_lifetime.py",),
+     ("src/daemon/fw_pkg.c", "src/core/uid_map.c", "include/uid_map.h",
+      "tests/test_pkg_map_lifetime.py", "tests/fixtures/pkg_map_lifetime.c"),
+     ("uid_map_copy", "uid_map_build"),
+     "uid.map 换表与请求借表所有权（锁内拷贝）"),
+
     (("test_sys_pkg_isolation.py",),
      ("src/core/sys_pkg.c", "tests/test_sys_pkg_isolation.py",
       "tests/fixtures/sys_pkg_isolation.c"),
@@ -533,6 +541,7 @@ LAYERS = {
             "test_path_vars.py",
             "test_pending_close.py",
             "test_pkg_cache_isolation.py",
+            "test_pkg_map_lifetime.py",
             "test_sys_pkg_isolation.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
@@ -785,6 +794,7 @@ PARALLEL_SAFE = frozenset({
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
     "test_pending_close.py",      # 真实队列/FD/线程与 daemon wrapper，临时目录，无挂载
     "test_pkg_cache_isolation.py", # 真实 fw_pkg + 定向文件 gate，临时目录，无挂载
+    "test_pkg_map_lifetime.py",   # 真实 fw_pkg/uid_map + 私有 uid.map，临时目录，无挂载
     "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志

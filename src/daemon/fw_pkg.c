@@ -51,11 +51,20 @@ static _Atomic uint64_t g_gen = 1;
 static UidMapEntry* g_uid_maps = nullptr;
 static int g_uid_map_count = 0;
 
-/* uid.map 条目数随已启动应用增长：按需扩容装载（同模块 load_uid_map） */
-static void load_uid_map(void) {
+/* uid.map 数组的所有权锁：读者只在锁内做二分并把命中的包名拷进自己的缓冲，
+   装载（可能是慢磁盘读，条目数随已启动应用增长）与旧表释放都在锁外。
+   历史缺陷（本次修复）：换表后立即 free 旧数组，而重载线程与 FUSE worker 并发，
+   resolve_uncached 拿着 lookup 借出的裸指针去 snprintf —— ASan 实录
+   resolve_uncached 读 heap-use-after-free（释放点是 load_uid_map 的 free）。
+   借出改为「锁内拷贝」后，释放点不再有任何存活 alias；锁内只有二分与一次有界
+   拷贝，故重载的慢 I/O 不会拖住请求路径，也不引入新的慢调用扇出。 */
+static pthread_mutex_t g_uid_map_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 装载候选：按需扩容读满整表。失败返回 nullptr（调用方保留旧表可用）。 */
+static UidMapEntry* uid_map_build(int* count_out) {
     int cap = UID_MAP_INIT_CAPACITY;
     UidMapEntry* maps = malloc((size_t)cap * sizeof(UidMapEntry));
-    if (!maps) return;
+    if (!maps) return nullptr;
     int count = uid_map_load(maps, cap);
     while (count > 0 && count == cap) {
         cap *= 2;
@@ -64,9 +73,34 @@ static void load_uid_map(void) {
         maps = bigger;
         count = uid_map_load(maps, cap);
     }
+    *count_out = count;
+    return maps;
+}
+
+/* uid → uid.map 里的包名（拷贝到调用方缓冲）。锁内只有二分与一次拷贝，无 I/O。 */
+static bool uid_map_copy(uid_t uid, char* out, size_t size) {
+    bool found = false;
+    pthread_mutex_lock(&g_uid_map_lock);
+    const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
+    if (mapped) {
+        snprintf(out, size, "%s", mapped);
+        found = true;
+    }
+    pthread_mutex_unlock(&g_uid_map_lock);
+    return found;
+}
+
+/* uid.map 条目数随已启动应用增长：按需扩容装载（同模块 load_uid_map） */
+static void load_uid_map(void) {
+    int count = 0;
+    UidMapEntry* maps = uid_map_build(&count);
+    if (!maps) return;
+    pthread_mutex_lock(&g_uid_map_lock);
     UidMapEntry* old = g_uid_maps;
     g_uid_maps = maps;
     g_uid_map_count = count;
+    pthread_mutex_unlock(&g_uid_map_lock);
+    /* 读者只在锁内借表，故此处释放时已无存活 alias（并发重载亦然）。 */
     free(old);
 }
 
@@ -79,9 +113,12 @@ static void appops_children_shutdown(void);
 
 void fw_pkg_shutdown(void) {
     appops_children_shutdown();
-    free(g_uid_maps);
+    pthread_mutex_lock(&g_uid_map_lock);
+    UidMapEntry* maps = g_uid_maps;
     g_uid_maps = nullptr;
     g_uid_map_count = 0;
+    pthread_mutex_unlock(&g_uid_map_lock);
+    free(maps);
 }
 
 /* /data/system/packages.list：Android 全量已装应用清单（"pkg uid ..."），
@@ -706,10 +743,9 @@ static bool resolve_from_pid(uid_t uid, pid_t tid, char* out, size_t size) {
    过短 / zygote / <pre- 一律只能命中 GLOBAL） */
 static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool* lookup_ok) {
     char pkg[FW_PKG_NAME_MAX] = {0};
-    const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
-    if (mapped) {
-        snprintf(pkg, sizeof pkg, "%s", mapped);
-    } else if (uid < NSP_SYSTEM_APP_UID_MIN) {
+    /* 锁内拷贝命中项，不借出表内指针：重载可在任意时刻换表并释放旧数组。 */
+    const bool from_map = uid_map_copy(uid, pkg, sizeof pkg);
+    if (!from_map && uid < NSP_SYSTEM_APP_UID_MIN) {
         /* 系统共享 uid（1000 等）在 uid.map 里通常没有条目（injector 只在应用
            REPORT 时写入），而 FUSE 请求侧拿不到 caller pid（q->pid 是 daemon
            伪造的连接标识），cmdline 回退也不可用——实机验证：系统应用的显式
@@ -723,7 +759,7 @@ static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool*
             /* packages.list 不可读（非 Android 环境）时退回 cmdline */
             goto cmdline_fallback;
         }
-    } else if (tid > 0) {
+    } else if (!from_map && tid > 0) {
       cmdline_fallback:;
         /* 主线程 id 取自 /proc/<tid>/status 的 Tgid：应用线程的 cmdline 就是包名，
            但只保证主线程可读（zygote fork 后线程组细节），故先定位 Tgid */
