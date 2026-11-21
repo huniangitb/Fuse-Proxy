@@ -32,6 +32,8 @@ typedef struct SysPkgTable {
 static SysPkgTable* g_sys_pkg_table;
 /* pm 查询冷却截止时刻（单调毫秒，0 = 无冷却）：见 SYS_PKG_PM_COOLDOWN_MS */
 static _Atomic uint64_t g_sys_pkg_pm_retry_at_ms;
+/* 降级读到空 cache 后的复查时刻（0 = 不需要复查） */
+static _Atomic uint64_t g_sys_pkg_recheck_at_ms;
 static pthread_mutex_t g_sys_pkg_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* 固定 .tmp 文件名是 inotify 协议；只序列化写者，查询永不取此锁。 */
 static pthread_mutex_t g_sys_pkg_save_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -229,6 +231,38 @@ static void sys_pkg_set_pm_cooldown(void) {
                           memory_order_release);
 }
 
+/* 表里是否至少有一个包名（降级读 cache 失败时判「空表」用） */
+static bool sys_pkg_table_nonempty(const SysPkgTable* table) {
+    if (!table) return false;
+    for (int i = 0; i < SYS_PKG_HASH_SIZE; i++) {
+        if (table->hash[i]) return true;
+    }
+    return false;
+}
+
+/* 空表复查：cache 由 injector 的 pm 成功后写回，查询侧到点自动重读（只读盘，
+   永不 fork pm）。间隔一秒：既不每查询一次 fopen，也不让空表一直钉住。 */
+#define SYS_PKG_CACHE_RETRY_MS 1000u
+
+static void sys_pkg_set_recheck(void) {
+    uint64_t now = sys_pkg_now_ms();
+    if (now == 0) return;
+    atomic_store_explicit(&g_sys_pkg_recheck_at_ms, now + SYS_PKG_CACHE_RETRY_MS,
+                          memory_order_release);
+}
+
+static void sys_pkg_clear_recheck(void) {
+    atomic_store_explicit(&g_sys_pkg_recheck_at_ms, 0, memory_order_release);
+}
+
+static bool sys_pkg_recheck_due(void) {
+    uint64_t at = atomic_load_explicit(&g_sys_pkg_recheck_at_ms, memory_order_acquire);
+    if (at == 0) return false;
+    uint64_t now = sys_pkg_now_ms();
+    if (now == 0) return false;
+    return now >= at;
+}
+
 static void sys_pkg_free_tmp(SysPkgTmp* head) {
     while (head) {
         SysPkgTmp* n = head->next;
@@ -242,12 +276,17 @@ static void sys_pkg_merge_tmp(SysPkgTable* table, SysPkgTmp* head) {
     for (SysPkgTmp* t = head; t; t = t->next) sys_pkg_add(table, t->pkg);
 }
 
-static void sys_pkg_build_and_publish(uint64_t epoch, bool allow_pm) {
+/* from_query：构建由查询侧（sys_pkg_is_system，生产里在 config_lock_read 内）触发。
+   查询侧**永不 fork pm**：pm 可能挂住整个预算，查询侧只允许读 cache（µs 级），
+   pm 只有在初始化/显式 refresh 时才跑。 */
+static void sys_pkg_build_and_publish(uint64_t epoch, bool allow_pm, bool from_query) {
     SysPkgTable* table = calloc(1, sizeof(*table));
+    bool degraded = false;   /* 本批没跑 pm（查询侧 / 冷却 / pm 失败），表内容只来自 cache */
+    bool cache_empty = false; /* 降级后 cache 也是空的：表虽然只有一个空桶，但要登记复查 */
     if (table) {
         /* pm 冷却期内不再 fork 第二个 pm：直接按「无 pm」读 cache（快），
            把「一次超预算」限制成一次。 */
-        bool use_pm = allow_pm && !sys_pkg_pm_cooling();
+        bool use_pm = allow_pm && !from_query && !sys_pkg_pm_cooling();
         if (use_pm) {
             bool pm_timed_out = false;
             SysPkgTmp* tmp = sys_pkg_collect_pm(&pm_timed_out);
@@ -259,6 +298,15 @@ static void sys_pkg_build_and_publish(uint64_t epoch, bool allow_pm) {
                         SYS_PKG_PM_BUDGET_MS, SYS_PKG_PM_COOLDOWN_MS / 1000u);
                 sys_pkg_set_pm_cooldown();
                 sys_pkg_load_file(table);
+                degraded = true;
+                cache_empty = !sys_pkg_table_nonempty(table);
+            } else if (!tmp) {
+                /* 非超时失败（fork/pipe/读错误/单调钟失效）：同样不发布空表、不落盘空
+                   cache（写空会覆盖好 hint，让下次冷启动退回 uid<10000 判定）。 */
+                LOG_WRN("sys_pkg: pm 查询失败，降级读缓存");
+                sys_pkg_load_file(table);
+                degraded = true;
+                cache_empty = !sys_pkg_table_nonempty(table);
             } else {
                 sys_pkg_merge_tmp(table, tmp);
                 pthread_mutex_lock(&g_sys_pkg_save_mutex);
@@ -273,6 +321,8 @@ static void sys_pkg_build_and_publish(uint64_t epoch, bool allow_pm) {
             sys_pkg_free_tmp(tmp);
         } else {
             sys_pkg_load_file(table);
+            degraded = true;
+            cache_empty = !sys_pkg_table_nonempty(table);
         }
     }
     SysPkgTable* old = NULL;
@@ -283,6 +333,13 @@ static void sys_pkg_build_and_publish(uint64_t epoch, bool allow_pm) {
             g_sys_pkg_table = table;
             table = NULL;
             g_sys_pkg_loaded = true;
+            /* 降级且 cache 为空：空表不能钉住（cache 由 injector 的 pm 成功后写回）。
+               登记复查时刻，查询侧到点自动重读 cache（µs 级，永不 fork pm）。 */
+            if (degraded && cache_empty) {
+                sys_pkg_set_recheck();
+            } else {
+                sys_pkg_clear_recheck();
+            }
         }
         g_sys_pkg_loading = false;
     }
@@ -306,7 +363,7 @@ void sys_pkg_init(bool allow_pm) {
     g_sys_pkg_loading = true;
     uint64_t epoch = ++g_sys_pkg_epoch;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
-    sys_pkg_build_and_publish(epoch, allow_pm);
+    sys_pkg_build_and_publish(epoch, allow_pm, false);
 }
 
 void sys_pkg_cleanup(void) {
@@ -326,7 +383,7 @@ void sys_pkg_refresh(void) {
     g_sys_pkg_loading = true;
     uint64_t epoch = ++g_sys_pkg_epoch;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
-    sys_pkg_build_and_publish(epoch, allow);
+    sys_pkg_build_and_publish(epoch, allow, false);
 }
 
 bool sys_pkg_is_system(const char* pkg) {
@@ -343,12 +400,14 @@ bool sys_pkg_is_system(const char* pkg) {
         q = base;
     }
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    if (!g_sys_pkg_loaded && !g_sys_pkg_loading) {
+    bool recheck_due = sys_pkg_recheck_due();
+    if ((!g_sys_pkg_loaded || recheck_due) && !g_sys_pkg_loading) {
+        if (recheck_due) sys_pkg_clear_recheck();
         bool allow = g_sys_pkg_allow_pm;
         g_sys_pkg_loading = true;
         uint64_t epoch = ++g_sys_pkg_epoch;
         pthread_mutex_unlock(&g_sys_pkg_mutex);
-        sys_pkg_build_and_publish(epoch, allow);
+        sys_pkg_build_and_publish(epoch, allow, true);
         pthread_mutex_lock(&g_sys_pkg_mutex);
     }
     unsigned int h = sys_pkg_hash(q);

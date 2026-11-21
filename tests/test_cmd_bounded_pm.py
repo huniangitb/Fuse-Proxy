@@ -15,6 +15,7 @@ common.c / config_parser.c / sys_pkg.c 时，同一夹具会跑旧实现——�
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -60,6 +61,7 @@ FAKE_PM = """#!/bin/sh
 # 假 pm：真机上是 binder 到 system_server 的命令，这里用 sleep 模拟挂起
 case "$FAKE_PM_MODE" in
   slow) sleep %d ;;
+  fail) exit 3 ;;
 esac
 case "$1 $2" in
   "list users")
@@ -75,9 +77,29 @@ exit 0
 """ % SLOW_PM_SLEEP_S
 
 
-def build(work, sources, tag):
+CONFIG_DIR_PAT = re.compile(
+    r'^#define\s+(?:NSP_CONFIG_DIR|CONFIG_DIR)\s+"/var/fuse-proxy"\s*$', re.M)
+
+
+def prepare_include(work, config_dir):
+    """把 CONFIG_DIR 换成本次临时目录：sys_pkgs.cache 的读写全程隔离在临时目录。"""
+    dst = work / "include"
+    if not dst.exists():
+        shutil.copytree(ROOT / "include", dst)
+    hits = 0
+    for path in sorted(dst.glob("*.h")):
+        text = path.read_text(encoding="utf-8")
+        patched, n = CONFIG_DIR_PAT.subn(
+            lambda m: m.group(0).replace('"/var/fuse-proxy"', '"%s"' % config_dir), text)
+        if n:
+            path.write_text(patched, encoding="utf-8")
+            hits += n
+    return dst if hits else None
+
+
+def build(work, sources, tag, incdir):
     exe = work / ("cmd_bounded_" + tag)
-    build = subprocess.run(["cc", "-std=gnu2x", "-O2", "-pthread", "-I", str(ROOT / "include"),
+    build = subprocess.run(["cc", "-std=gnu2x", "-O2", "-pthread", "-I", str(incdir),
                             "-o", str(exe), str(DRIVER)] + sources,
                            capture_output=True, text=True)
     (work / ("build-%s.log" % tag)).write_text(build.stdout + build.stderr, encoding="utf-8")
@@ -116,8 +138,15 @@ def main():
     pm.write_text(FAKE_PM, encoding="utf-8")
     pm.chmod(pm.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+    cfgdir = work / "cfg"
+    cfgdir.mkdir(exist_ok=True)
+    incdir = prepare_include(work, cfgdir)
+    if incdir is None:
+        print("❌ 没找到 CONFIG_DIR 宏，无法隔离 sys_pkgs.cache")
+        return 1
+
     sources = [str(ROOT / s) for s in SOURCES]
-    exe = build(work, sources, "new")
+    exe = build(work, sources, "new", incdir)
     if exe is None:
         return 1
     fails = 0
@@ -185,6 +214,41 @@ def main():
               % got.get("query_ms"))
         fails += 1
 
+    # 4b) 降级语义（P2）：cache 缺失 + pm 超时不得把空表钉住；查询侧不再 fork pm；
+    #     cache 一出现就自愈。
+    rc, out = run(exe, "pm-degrade", "slow", bin_dir)
+    log.append(out.strip())
+    got = parse(out, ["init_ms", "cache_after_init", "cold_ui", "lazy_ms", "healed", "healed_ms"])
+    if rc != 0 or got.get("init_ms", 10 ** 9) > LIMIT_PACKAGES_MS:
+        print("❌ pm-degrade 初始化超出预算：rc=%d out=%r" % (rc, out[-300:]))
+        fails += 1
+    if got.get("cache_after_init") != 0:
+        print("❌ 超时降级写了空 sys_pkgs.cache（覆盖下次冷启动的 hint）：out=%r" % out[-300:])
+        fails += 1
+    if got.get("lazy_ms", 10 ** 9) > LIMIT_QUERY_MS:
+        print("❌ 降级后懒查询又付了一遍 pm 预算：lazy_ms=%s（期望 <= %d）"
+              % (got.get("lazy_ms"), LIMIT_QUERY_MS))
+        fails += 1
+    if got.get("healed") != 1 or got.get("healed_ms", 10 ** 9) > LIMIT_QUERY_MS:
+        print("❌ cache 出现后没有自愈（空表被钉住）：healed=%s healed_ms=%s"
+              % (got.get("healed"), got.get("healed_ms")))
+        fails += 1
+
+    # 4c) pm 非零退出（不是超时）不得写空 cache 覆盖好 hint
+    cache = cfgdir / "sys_pkgs.cache"
+    cache.write_text("com.android.systemui\ncom.android.settings\n", encoding="utf-8")
+    sum_before = sum(cache.read_bytes())
+    rc, out = run(exe, "pm-fail", "fail", bin_dir)
+    log.append(out.strip())
+    got = parse(out, ["systemui", "cache_size", "sum_before", "sum_after"])
+    if rc != 0 or got.get("systemui") != 1:
+        print("❌ pm 失败时没有退回好 cache：rc=%d out=%r" % (rc, out[-300:]))
+        fails += 1
+    if got.get("sum_after") != sum_before or got.get("cache_size", 0) <= 0:
+        print("❌ pm 失败把好 cache 覆盖成空/改写：sum_before=%s sum_after=%s size=%s"
+              % (sum_before, got.get("sum_after"), got.get("cache_size")))
+        fails += 1
+
     # 5) 旧实现判别（可选）：同一夹具跑旧源码
     old_tree = os.environ.get("CMD_BOUNDED_OLD_TREE")
     if old_tree:
@@ -196,7 +260,7 @@ def main():
             old_sources[idx] = str(Path(old_tree) / name)
         shim = work / "old_capture_shim.c"
         shim.write_text(OLD_SHIM, encoding="utf-8")
-        old_exe = build(work, old_sources + [str(shim)], "old")
+        old_exe = build(work, old_sources + [str(shim)], "old", incdir)
         if old_exe is None:
             print("⚠️  旧源码编译失败，跳过旧红对照")
         else:

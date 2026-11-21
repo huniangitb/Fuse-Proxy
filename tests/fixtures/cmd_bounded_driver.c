@@ -15,7 +15,22 @@
 #include "sys_pkg.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+
+static void cache_path(char* out, size_t sz) { snprintf(out, sz, "%s/sys_pkgs.cache", CONFIG_DIR); }
+
+/* 内容校验和（判「失败路径有没有覆盖好 cache」用，不用比 mtime） */
+static unsigned long file_sum(const char* path) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) return 0;
+    unsigned long sum = 0;
+    int c;
+    while ((c = fgetc(fp)) != EOF) sum += (unsigned long)(unsigned char)c;
+    fclose(fp);
+    return sum;
+}
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -82,6 +97,56 @@ int main(int argc, char** argv) {
         printf("mode=pm-packages elapsed_ms=%llu systemui=%d settings=%d refresh_ms=%llu query_ms=%llu\n",
                (unsigned long long)elapsed, (int)systemui, (int)settings,
                (unsigned long long)refresh_ms, (unsigned long long)query_ms);
+        sys_pkg_cleanup();
+        return 0;
+    }
+    if (strcmp(mode, "pm-degrade") == 0) {
+        /* P2-1：cache 缺失 + pm 超时 → 不得发布空表把它钉住；查询侧不得再 fork pm；
+           cache 一出现就自愈（不需要 refresh / 重启）。 */
+        char path[PATH_MAX];
+        cache_path(path, sizeof path);
+        unlink(path);
+        uint64_t t0 = now_ms();
+        sys_pkg_init(true);
+        uint64_t init_ms = now_ms() - t0;
+        bool cold_ui = sys_pkg_is_system("com.android.systemui");
+        struct stat st;
+        int cache_after_init = (stat(path, &st) == 0 && st.st_size > 0) ? 1 : 0;
+        uint64_t t1 = now_ms();
+        (void)sys_pkg_is_system("com.android.settings");
+        (void)sys_pkg_is_system("com.android.systemui");
+        uint64_t lazy_ms = now_ms() - t1;
+        FILE* fp = fopen(path, "w");
+        if (fp) {
+            fprintf(fp, "com.android.systemui\ncom.android.settings\n");
+            fclose(fp);
+        }
+        /* 复查间隔 1s（SYS_PKG_CACHE_RETRY_MS）：等它到点，验证「不需要 refresh /
+           重启，下一次查询就自愈」。 */
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 300 * 1000000L};
+        nanosleep(&ts, NULL);
+        uint64_t t2 = now_ms();
+        bool healed = sys_pkg_is_system("com.android.systemui");
+        uint64_t healed_ms = now_ms() - t2;
+        printf("mode=pm-degrade init_ms=%llu cache_after_init=%d cold_ui=%d lazy_ms=%llu "
+               "healed=%d healed_ms=%llu\n",
+               (unsigned long long)init_ms, cache_after_init, (int)cold_ui,
+               (unsigned long long)lazy_ms, (int)healed, (unsigned long long)healed_ms);
+        sys_pkg_cleanup();
+        return 0;
+    }
+    if (strcmp(mode, "pm-fail") == 0) {
+        /* P2-2：pm 非零退出（不是超时）不得写空 cache 覆盖好 hint。 */
+        char path[PATH_MAX];
+        cache_path(path, sizeof path);
+        unsigned long sum_before = file_sum(path);
+        sys_pkg_init(true);
+        bool ui = sys_pkg_is_system("com.android.systemui");
+        unsigned long sum_after = file_sum(path);
+        struct stat st;
+        long size = stat(path, &st) == 0 ? (long)st.st_size : -1;
+        printf("mode=pm-fail systemui=%d cache_size=%ld sum_before=%lu sum_after=%lu\n",
+               (int)ui, size, sum_before, sum_after);
         sys_pkg_cleanup();
         return 0;
     }
