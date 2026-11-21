@@ -45,8 +45,22 @@ bool fw_pkg_uid_map_name(uid_t uid, char* out, size_t size);
    用途：跨应用隔离的自动豁免——DocumentsUI 等文件中介的本职就是访问他包
    /Android/data，逐包手工写规则不可维护，按 Android 自己的权限体系放行。
    fail-safe：packages.list 不可读或该 uid 无行 → false（不豁免）。
-   结果按 uid 缓存；fw_pkg_reload（规则重载）后随 gen 失效重读。 */
+   结果按 uid 缓存；fw_pkg_reload（规则重载）后随 gen 失效重读。负结论（打不开/
+   无该行）只缓存 FW_PKG_PRIV_MISS_TTL_MS（1s）：不留这一小段，读失败时每个请求
+   都会重扫文件，包括配置读槽里那次（槽内只认缓存）。 */
 bool fw_pkg_is_privileged(uid_t uid);
+
+/* 槽内只读入口（三条外部事实各一条）：命中缓存返回 true，**绝不做文件 IO 或
+   起子进程**。规则决策在 config_read_begin 槽里只能用这些函数取事实；返回 false
+   表示事实还没备好，调用方必须先出槽用上面的阻塞版本预热、再重新进入读槽判定。
+   把慢读留在槽里会拖住配置发布者的读者排空，让此后进入决策的每个 worker 都在
+   config_read_begin 上自旋——单次慢调用放大成整池停顿。
+   fw_pkg_priv_cached 的负结论同样受 1s TTL 约束（与阻塞版本同一口径）。
+   fw_pkg_uid_cached 的 known_out 区分"有 uid"与"无此包"：判定侧对两者处理不同
+   （已知同 uid = 同一 app 身份；无此包 = 维持隔离），不能压成一个 false。 */
+bool fw_pkg_priv_cached(uid_t uid, bool* priv_out);
+bool fw_pkg_ext_cached(uid_t uid, bool* manage_external_out, bool* installer_out);
+bool fw_pkg_uid_cached(const char* pkg, bool* known_out, uid_t* uid_out);
 
 /* uid 是否持有 **MANAGE_EXTERNAL_STORAGE**（"所有文件访问"，Android 11+ 的 All
    files access）。来源：AppOpsService 自身——该权限是 appop，AOSP 14+ 不再落
@@ -77,11 +91,13 @@ bool fw_pkg_manages_external(uid_t uid);
    fail-safe 与缓存策略同 fw_pkg_manages_external。 */
 bool fw_pkg_can_install_packages(uid_t uid);
 
-/* 槽外预取跨应用隔离所需的能力事实：系统 uid 与特权应用不付查询代价。规则决策
-   在 config_read_begin **之前**调用——槽内的外部命令会拖住配置发布者的读者
-   排空，把单次慢查询放大成此后进入决策的所有 worker 在 config_read_begin 上的
-   自旋等待。白名单只能按调用方包名判（要解析 uid→包名=IO，槽外拿不到），故白名单
-   应用会多付一次按 uid 缓存 30s 的查询，裁决不变。 */
+/* 槽外预取跨应用隔离所需的能力事实：特权应用不付查询代价（判定链在第一档就
+   放行）。规则决策在 config_read_begin **之前**调用——槽内的外部命令会拖住配置
+   发布者的读者排空，把单次慢查询放大成此后进入决策的所有 worker 在
+   config_read_begin 上的自旋等待。白名单只能按调用方包名判（要解析 uid→包名=IO，
+   槽外拿不到），故白名单应用会多付一次按 uid 缓存 30s 的查询，裁决不变。
+   系统 uid 不再一律跳过：判定链在任何 uid 上都先问特权，若特权为假而这里不给它
+   预热能力档，槽内就会缺事实。 */
 void fw_pkg_prefetch_isolation_facts(uid_t uid);
 
 /* 仅测试：替换 appop 查询实现（GNU 测试环境没有 /system/bin/cmd）。传 nullptr

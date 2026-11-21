@@ -172,11 +172,10 @@ def check_publish_pkgs(binary, conf_path, plist, fifo, slow_ms):
             (label + " 不冻住迟到读者",
              fields["late_reader_us"] < LIMIT_US,
              f"late_reader_us={fields['late_reader_us']} 阈值<{LIMIT_US}"),
-            (label + " 槽内没有慢读 packages.list",
-             fields["pkgl_slow_in_slot"] == 0,
-             f"pkgl_slow_in_slot={fields['pkgl_slow_in_slot']}"
-             f"（持读槽时读了 {slow_ms}ms 量级 = 旧行为；"
-             f"pkgl_in_slot={fields['pkgl_in_slot']} 含瞬时 EOF 读）"),
+            (label + " 槽内一次都没打开 packages.list",
+             fields["pkgl_in_slot"] == 0,
+             f"pkgl_in_slot={fields['pkgl_in_slot']}（持读槽时打开清单 = 把慢读"
+             f"留在槽内；pkgl_slow_in_slot={fields['pkgl_slow_in_slot']}）"),
         ]
         if delay == 0:
             checks += [
@@ -220,11 +219,10 @@ def check_probe_pkgs(binary, conf_path, plist, fifo, slow_ms):
             (label + " 不冻住迟到读者",
              fields["late_reader_us"] < LIMIT_US,
              f"late_reader_us={fields['late_reader_us']} 阈值<{LIMIT_US}"),
-            (label + " 槽内没有慢读 packages.list",
-             fields["pkgl_slow_in_slot"] == 0,
-             f"pkgl_slow_in_slot={fields['pkgl_slow_in_slot']}"
-             f"（持读槽时读了 {slow_ms}ms 量级 = 旧行为；"
-             f"pkgl_in_slot={fields['pkgl_in_slot']} 含瞬时 EOF 读）"),
+            (label + " 槽内一次都没打开 packages.list",
+             fields["pkgl_in_slot"] == 0,
+             f"pkgl_in_slot={fields['pkgl_in_slot']}（持读槽时打开清单 = 把慢读"
+             f"留在槽内；pkgl_slow_in_slot={fields['pkgl_slow_in_slot']}）"),
         ]
         if delay == PKG_PROBE_DELAYS[0]:
             checks += [
@@ -238,6 +236,52 @@ def check_probe_pkgs(binary, conf_path, plist, fifo, slow_ms):
                  f"probed={fields['probed']}"),
             ]
     return checks
+
+# 清单永远读空：身份解析拿不到结论，事实永远是「不知道」。这是负结论缓存的
+# 判别窗口——不缓存负结论的实现会在槽内反复重读这份慢清单。
+PKG_EMPTY_DELAYS = (0, 600, 1200)
+
+
+def check_publish_empty(binary, conf_path, plist, fifo, slow_ms):
+    """packages.list 慢读且**永远读空**：真实现里 known 恒为假。没有负结论缓存
+    就会在配置读槽内反复重读这份慢清单，把发布者按慢读时长钉住；有了负结论
+    TTL + 槽内零 IO 规则，重读次数被收敛在槽外。断言四件事：drain/迟到读者快、
+    槽内一次都没打开清单、慢读确实发生在槽外、重读次数有界（不是放弃事实），
+    并且裁决与既有实现一致（读不到清单也不漏判隔离）。"""
+    checks = []
+    for delay in PKG_EMPTY_DELAYS:
+        out, error = run_driver(
+            binary, ["publish-pkgs", str(conf_path), str(slow_ms)],
+            {"NSP_PACKAGELIST": str(plist), "NSP_PKGLIST_FIFO": str(fifo),
+             "NSP_PKGL_EMPTY": "1", "NSP_PUBLISH_DELAY_MS": str(delay)},
+            timeout=90)
+        label = f"清单恒空[{delay}ms 偏移]"
+        if error:
+            checks.append((label, False, error))
+            continue
+        fields = parse_kv(out)
+        checks += [
+            (label + " 不拖住发布 drain",
+             fields["drain_us"] < LIMIT_US,
+             f"drain_us={fields['drain_us']} 阈值<{LIMIT_US} (慢读 {slow_ms}ms)"),
+            (label + " 不冻住迟到读者",
+             fields["late_reader_us"] < LIMIT_US,
+             f"late_reader_us={fields['late_reader_us']} 阈值<{LIMIT_US}"),
+            (label + " 槽内一次都没打开 packages.list",
+             fields["pkgl_in_slot"] == 0,
+             f"pkgl_in_slot={fields['pkgl_in_slot']}（负结论没被复用 → 槽内重读）"),
+            (label + " 慢读确实发生在槽外",
+             fields["resolve_us"] >= slow_ms * 800,
+             f"resolve_us={fields['resolve_us']} 期望>={slow_ms * 800}"),
+            (label + " 槽外重读次数有界",
+             fields["pkgl_opens"] <= 12,
+             f"pkgl_opens={fields['pkgl_opens']} 阈值<=12（不收敛会一直重读）"),
+            (label + " 读不到清单也不漏判隔离",
+             fields["blocked"] == 1 and fields["probed"] == 1,
+             f"blocked={fields['blocked']} probed={fields['probed']}"),
+        ]
+    return checks
+
 
 def check_matrix(binary, directory, cfg, plist, name, conf, uid, paths, expect):
     conf_path = cfg / "injector.conf"
@@ -288,6 +332,9 @@ def run(directory):
     os.mkfifo(fifo)
     checks += check_publish_pkgs(binary, base_conf, plist, fifo, 250)
     checks += check_probe_pkgs(binary, base_conf, plist, fifo, 250)
+    # 负结论窗口：清单恒空时，事实永远是「不知道」。这是第六批验收漏出的残余
+    # 路径（预取读到空 → known 假不缓存 → 槽内重读慢清单）。
+    checks += check_publish_empty(binary, base_conf, plist, fifo, 250)
     # 语义矩阵（一次进程走多路径；只断言裁决，不看累计查询次数）
     checks += check_matrix(binary, directory, cfg, plist, "默认隔离", BASE, 10123,
                            [OTHER, OTHER_OBB, OWN, PLAIN], {

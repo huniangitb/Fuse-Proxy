@@ -179,8 +179,9 @@ static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size,
 typedef struct {
     _Atomic uint64_t seq; /* 奇数 = 写者进行中 */
     _Atomic uint64_t gen;
+    _Atomic uint64_t stamp_ms; /* 发布时间（单调毫秒），只用于负结论的短 TTL */
     _Atomic uid_t uid;
-    _Atomic bool known; /* packages.list 不可读/未命中时不负缓存 */
+    _Atomic bool known; /* false = 本次读不到结论：只在 stamp_ms 的短 TTL 内复用 */
     _Atomic bool priv;
 } FwPkgPrivSlot;
 
@@ -196,24 +197,44 @@ static bool seinfo_is_privileged(const char* seinfo) {
            (seinfo[8] == '\0' || seinfo[8] == ':');
 }
 
-bool fw_pkg_is_privileged(uid_t uid) {
-    FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
-    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+/* 负结论（packages.list 打不开/该 uid 无行）的有效期：读失败时若不留一个短 TTL，
+   每次请求都会重扫一遍文件——包括**在配置读槽里**的那次（槽内只认缓存，未命中就
+   要出槽预热再重来，没有缓存项等于每个请求都多一次 IO 且永远收敛不了）。
+   1s 与 appops 失败冷却同量级；成功结论不受这个 TTL 限制（按 gen 失效）。 */
+#define FW_PKG_PRIV_MISS_TTL_MS 1000u
+
+static uint64_t ext_clock_ms(void); /* 单调毫秒，定义见 appops 缓存段 */
+
+/* 取特权槽的可用快照：已知结论，或 TTL 内的负结论。判定快路与槽内只读查询
+   （fw_pkg_priv_cached）必须同一口径，故只写在这一个函数里。 */
+static bool priv_cached_lookup(FwPkgPrivSlot* s, uid_t uid, uint64_t gen, uint64_t now,
+                               bool* priv_out) {
     uint64_t claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
     uint64_t slot_gen = atomic_load_explicit(&s->gen, memory_order_seq_cst);
     uid_t slot_uid = atomic_load_explicit(&s->uid, memory_order_seq_cst);
     bool known = atomic_load_explicit(&s->known, memory_order_seq_cst);
     bool priv = atomic_load_explicit(&s->priv, memory_order_seq_cst);
-    if (!(claim & 1) && claim == atomic_load_explicit(&s->seq, memory_order_seq_cst) &&
-        slot_gen == gen && slot_uid == uid && known &&
+    uint64_t stamp = atomic_load_explicit(&s->stamp_ms, memory_order_seq_cst);
+    if ((claim & 1) || claim != atomic_load_explicit(&s->seq, memory_order_seq_cst)) return false;
+    if (slot_gen != gen || slot_uid != uid) return false;
+    if (!known && (!stamp || now < stamp || now - stamp >= FW_PKG_PRIV_MISS_TTL_MS)) return false;
+    *priv_out = priv;
+    return true;
+}
+
+bool fw_pkg_is_privileged(uid_t uid) {
+    FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    uint64_t claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    bool priv = false;
+    if (priv_cached_lookup(s, uid, gen, ext_clock_ms(), &priv) &&
         gen == atomic_load_explicit(&g_gen, memory_order_acquire)) return priv;
 
     /* 只认领版本，不把外部 I/O 变成其它 uid 的等待点。并发同 uid miss 可独立查询。 */
     pthread_mutex_lock(&g_priv_fill_lock);
     gen = atomic_load_explicit(&g_gen, memory_order_acquire);
     claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
-    if (s->gen == gen && s->uid == uid && s->known) {
-        priv = s->priv;
+    if (priv_cached_lookup(s, uid, gen, ext_clock_ms(), &priv)) {
         pthread_mutex_unlock(&g_priv_fill_lock);
         return gen == atomic_load_explicit(&g_gen, memory_order_acquire) && priv;
     }
@@ -221,7 +242,7 @@ bool fw_pkg_is_privileged(uid_t uid) {
 
     char pkg[FW_PKG_NAME_MAX];
     char seinfo[128];
-    known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo, sizeof seinfo);
+    bool known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo, sizeof seinfo);
     priv = known && seinfo_is_privileged(seinfo);
 
     pthread_mutex_lock(&g_priv_fill_lock);
@@ -239,10 +260,23 @@ bool fw_pkg_is_privileged(uid_t uid) {
         s->known = known;
         s->priv = priv;
         s->gen = gen;
+        s->stamp_ms = ext_clock_ms();
         atomic_store_explicit(&s->seq, claim + 2, memory_order_seq_cst);
     }
     pthread_mutex_unlock(&g_priv_fill_lock);
     return gen == atomic_load_explicit(&g_gen, memory_order_acquire) && priv;
+}
+
+/* 槽内只读入口：有可用结论（含 TTL 内的负结论）就返回 true，**绝不做文件 IO**。
+   配置读槽里的判定必须只走这里：未命中由调用方出槽预热后重来，慢读不落在槽内。 */
+bool fw_pkg_priv_cached(uid_t uid, bool* priv_out) {
+    FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    bool priv = false;
+    if (!priv_cached_lookup(s, uid, gen, ext_clock_ms(), &priv)) return false;
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (priv_out) *priv_out = priv;
+    return true;
 }
 
 
@@ -626,13 +660,26 @@ bool fw_pkg_can_install_packages(uid_t uid) {
     return installer;
 }
 
+/* 槽内只读入口：命中（含失败冷却与在途查询）就返回 true，绝不起子进程。
+   在途查询按 false/false 返回——与 ext_lookup 的既有口径一致：查询中不授予能力。 */
+bool fw_pkg_ext_cached(uid_t uid, bool* manage_external_out, bool* installer_out) {
+    FwPkgExtSlot* s = &g_ext_slots[uid % FW_PKG_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    bool manage_external = false;
+    bool installer = false;
+    if (!ext_cached(s, uid, gen, ext_clock_ms(), &manage_external, &installer)) return false;
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (manage_external_out) *manage_external_out = manage_external;
+    if (installer_out) *installer_out = installer;
+    return true;
+}
+
 /* 槽外预取入口：调用方在 config_read_begin 之前调，把外部命令查询赶出配置读槽。
    语义与 br_xapp_facts 前两档一致——系统 uid 与特权应用不会再问 appops，预取
    同样跳过，不为已被否决的判定付子进程代价。总闸（跨应用隔离/按能力放行）与
    路径形状由调用方 br_prefetch_xapp_facts 先判，本函数只管 uid 侧的跳过。
    命中缓存时只是一次槽位查找。 */
 void fw_pkg_prefetch_isolation_facts(uid_t uid) {
-    if ((unsigned)uid < (unsigned)NSP_SYSTEM_APP_UID_MIN) return;
     if (fw_pkg_is_privileged(uid)) return;
     /* 两个 appop 共用同一份查询与同一个 uid 槽：查一次即同时填好两档。 */
     (void)fw_pkg_manages_external(uid);
@@ -671,6 +718,32 @@ static bool resolve_uid_from_packagelist(const char* pkg, uid_t* out) {
     }
     fclose(fp);
     return found;
+}
+
+/* 槽内只读入口：缓存里有该包名的结论（**含"无此包"的负缓存**）就返回 true，
+   不读文件。known_out 告诉调用方结论是"有 uid"还是"无此包"——前者才填 uid_out。
+   判定侧对两种情形处理不同（已知同 uid = 同一 app 身份；无此包 = 维持隔离），
+   故不能把负结论压成 false 返回。这里的锁只罩槽扫描与发布（`resolve_uid_from_packagelist`
+   在锁外），所以槽内等待有界，不随 packages.list 的读时长增长。 */
+bool fw_pkg_uid_cached(const char* pkg, bool* known_out, uid_t* uid_out) {
+    if (!pkg || !pkg[0]) return false;
+    bool known = false;
+    uid_t uid = 0;
+    pthread_mutex_lock(&g_pkguid_fill_lock);
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        FwPkgUidSlot* s = &g_pkguid_slots[i];
+        if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
+            known = s->known;
+            uid = s->uid;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_pkguid_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (known_out) *known_out = known;
+    if (known && uid_out) *uid_out = uid;
+    return true;
 }
 
 bool fw_pkg_uid_for_package(const char* pkg, uid_t* out) {

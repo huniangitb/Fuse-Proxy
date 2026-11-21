@@ -174,7 +174,12 @@ int main(int argc, char** argv) {
         before = atomic_load(&opens);
         pass &= lookup(priv, 77777, "com.missing", false, 0);
         pass &= lookup(priv, 77777, "com.missing", false, 0);
-        pass &= atomic_load(&opens) == before + (priv ? 2 : 1); /* priv unknown retries; pkg negative caches */
+        pass &= atomic_load(&opens) == before + 1; /* 未知结论也进缓存（特权槽按 TTL、包名负缓存） */
+        /* 负结论不能永久钉住：代际变化后必须重新读一次文件。 */
+        before = atomic_load(&opens);
+        fw_pkg_reload();
+        pass &= lookup(priv, 77777, "com.missing", false, 0);
+        pass &= atomic_load(&opens) == before + 1;
         before = atomic_load(&opens);
         pass &= !fw_pkg_uid_for_package(NULL, NULL) && !fw_pkg_uid_for_package("", NULL);
         pass &= fw_pkg_uid_for_package("com.fast", NULL);

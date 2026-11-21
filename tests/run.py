@@ -374,9 +374,12 @@ SUITE_MAP = [
      # 各等 270ms）。预取移到取槽之前。
      (("test_cfg_slot_isolation.py",),
       ("src/daemon/fw_rules.c", "src/daemon/fw_pkg.c", "src/config/config_parser.c",
-       "tests/test_cfg_slot_isolation.py", "tests/fixtures/cfg_slot_isolation.c"),
-      ("fw_pkg_prefetch_isolation_facts", "br_prefetch_xapp_facts", "fw_pkg_uid_map_name"),
-      "配置读槽内的慢能力查询（槽外预取）"),
+       "src/daemon/fw_pkg.h", "tests/test_cfg_slot_isolation.py",
+       "tests/fixtures/cfg_slot_isolation.c"),
+      ("fw_pkg_prefetch_isolation_facts", "br_prefetch_xapp_facts", "fw_pkg_uid_map_name",
+       "priv_cached_lookup", "fw_pkg_priv_cached", "fw_pkg_uid_cached", "br_isolation_slot",
+       "BR_FACT_WARM_TRIES", "FW_PKG_PRIV_MISS_TTL_MS"),
+      "配置读槽内的慢能力查询与慢身份事实（槽外预取 + 负结论缓存）"),
 
     # 跨应用白名单数组是配置指针：发布者在排空旧读者后释放它，槽外读者若在
     # 比较途中被发布穿插就会读已释放条目（ASan：fw_acl_identity → strlen(freed)）。

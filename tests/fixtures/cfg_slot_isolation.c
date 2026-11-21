@@ -165,6 +165,7 @@ static void* late_reader(void* arg) {
 typedef struct {
     const char* fifo;
     int delay_ms;
+    bool empty; /* 只慢不写：清单永远读空，真实现里 known 永远为假 */
     _Atomic bool stop;
 } PkglProvider;
 
@@ -179,8 +180,10 @@ static void* pkgl_provider(void* arg) {
         if (fd < 0) break;
         struct timespec d = {0, (long)p->delay_ms * 1000000L};
         while (nanosleep(&d, &d) != 0) {}
-        ssize_t w = write(fd, kLines, sizeof kLines - 1);
-        (void)w; /* 读方可能拿够行就关掉：EPIPE 由 main 的 SIG_IGN 兜住 */
+        if (!p->empty) { /* 空清单模式：慢读照旧，但一个字都不写 = 读方永远 EOF */
+            ssize_t w = write(fd, kLines, sizeof kLines - 1);
+            (void)w; /* 读方可能拿够行就关掉：EPIPE 由 main 的 SIG_IGN 兜住 */
+        }
         close(fd); /* 数据留在管道里可读，关闭最后写端让读方 fgets 看到 EOF */
         /* 关后停 2ms 再开下一次：读方把 233 字节读完 + 读到 EOF + fclose 只需
            微秒；若立刻重开写端，读方可能永远等不到 EOF（实测整段挂死），而
@@ -212,7 +215,8 @@ static int run_publish_pkgs(const char* conf, const char* fifo, int slow_ms,
     setup(conf); /* 先把正常清单装好（reload 会读它），再切到 FIFO */
     fw_pkg_set_packagelist_path(fifo);
     g_plist_path = fifo;
-    PkglProvider prov = {.fifo = fifo, .delay_ms = g_slow_ms};
+    PkglProvider prov = {
+        .fifo = fifo, .delay_ms = g_slow_ms, .empty = getenv("NSP_PKGL_EMPTY") != NULL};
     atomic_init(&prov.stop, false);
     pthread_t pr;
     if (pthread_create(&pr, NULL, pkgl_provider, &prov) != 0) return 3;
