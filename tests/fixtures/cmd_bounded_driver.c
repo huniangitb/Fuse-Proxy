@@ -122,16 +122,29 @@ int main(int argc, char** argv) {
             fclose(fp);
         }
         /* 复查间隔 1s（SYS_PKG_CACHE_RETRY_MS）：等它到点，验证「不需要 refresh /
-           重启，下一次查询就自愈」。 */
+           重启就自愈」。查询侧只查已发布表，cache 的重读在后台装载线程里做，故按
+           有界轮询等它落地（不是同步构建）。 */
         struct timespec ts = {.tv_sec = 1, .tv_nsec = 300 * 1000000L};
         nanosleep(&ts, NULL);
         uint64_t t2 = now_ms();
-        bool healed = sys_pkg_is_system("com.android.systemui");
+        /* 查询线程本身不得同步读盘/构建：它只该给出既有未知结果（由后台装载补齐）。 */
+        bool healed_first = sys_pkg_is_system("com.android.systemui");
+        bool healed = healed_first;
         uint64_t healed_ms = now_ms() - t2;
+        for (int i = 0; i < 400 && !healed; i++) {
+            if (sys_pkg_is_system("com.android.systemui")) {
+                healed = true;
+                healed_ms = now_ms() - t2;
+                break;
+            }
+            struct timespec step = {.tv_sec = 0, .tv_nsec = 5 * 1000000L};
+            nanosleep(&step, NULL);
+        }
         printf("mode=pm-degrade init_ms=%llu cache_after_init=%d cold_ui=%d lazy_ms=%llu "
-               "healed=%d healed_ms=%llu\n",
+               "healed_first=%d healed=%d healed_ms=%llu\n",
                (unsigned long long)init_ms, cache_after_init, (int)cold_ui,
-               (unsigned long long)lazy_ms, (int)healed, (unsigned long long)healed_ms);
+               (unsigned long long)lazy_ms, (int)healed_first, (int)healed,
+               (unsigned long long)healed_ms);
         sys_pkg_cleanup();
         return 0;
     }

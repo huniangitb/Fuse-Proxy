@@ -8,7 +8,8 @@ FUSE 会话拖成无响应。新实现用 common_run_cmd_lines 的预算（pm li
 pm list packages 3s）：到点 SIGKILL 子进程并返回已读内容，调用方按「这次没结果」
 回退（用户表回退磁盘推导；系统包表保留已发布表、绝不写空 cache）。
 
-判别：CMD_BOUNDED_OLD_TREE 指向一个目录，里面放 `git show <旧提交>:<路径>` 得到的
+判别：CMD_BOUNDED_SYS_PKG_SRC 只替换 sys_pkg.c（复验「降级/自愈」两例旧红，旧实现
+在查询线程里同步读盘自愈 → healed_first=1）；CMD_BOUNDED_OLD_TREE 指向一个目录，里面放 `git show <旧提交>:<路径>` 得到的
 common.c / config_parser.c / sys_pkg.c 时，同一夹具会跑旧实现——慢 pm 下耗时
 ≈8s（真挂住），本文件把它当「旧红」证据打印，不做失败处理。
 """
@@ -33,6 +34,7 @@ LIMIT_PACKAGES_MS = 4500
 LIMIT_CAPTURE_MS = 1500
 LIMIT_REFRESH_MS = 800   # 冷却期内 refresh 只读磁盘 cache，不再 fork pm
 LIMIT_QUERY_MS = 200     # 冷却期内 is_system 直接命中已发布表
+LIMIT_HEAL_MS = 2000     # 自愈由后台装载线程完成，给有界轮询留余量
 # 旧源码树没有 common_run_cmd_lines：给旧树配一个「popen + fgets 无预算」的替身，
 # 让旧实现在同一夹具里仍然真的挂住（这才是要复现的红，而不是链接失败）。
 OLD_SHIM = """
@@ -146,6 +148,10 @@ def main():
         return 1
 
     sources = [str(ROOT / s) for s in SOURCES]
+    # 判别入口：只替换 sys_pkg.c，用来验证「降级/自愈」两例在旧实现上仍结构性红。
+    override = os.environ.get("CMD_BOUNDED_SYS_PKG_SRC")
+    if override:
+        sources[sources.index(str(ROOT / "src/core/sys_pkg.c"))] = str(Path(override).resolve())
     exe = build(work, sources, "new", incdir)
     if exe is None:
         return 1
@@ -218,7 +224,8 @@ def main():
     #     cache 一出现就自愈。
     rc, out = run(exe, "pm-degrade", "slow", bin_dir)
     log.append(out.strip())
-    got = parse(out, ["init_ms", "cache_after_init", "cold_ui", "lazy_ms", "healed", "healed_ms"])
+    got = parse(out, ["init_ms", "cache_after_init", "cold_ui", "lazy_ms",
+                      "healed_first", "healed", "healed_ms"])
     if rc != 0 or got.get("init_ms", 10 ** 9) > LIMIT_PACKAGES_MS:
         print("❌ pm-degrade 初始化超出预算：rc=%d out=%r" % (rc, out[-300:]))
         fails += 1
@@ -229,9 +236,13 @@ def main():
         print("❌ 降级后懒查询又付了一遍 pm 预算：lazy_ms=%s（期望 <= %d）"
               % (got.get("lazy_ms"), LIMIT_QUERY_MS))
         fails += 1
-    if got.get("healed") != 1 or got.get("healed_ms", 10 ** 9) > LIMIT_QUERY_MS:
-        print("❌ cache 出现后没有自愈（空表被钉住）：healed=%s healed_ms=%s"
-              % (got.get("healed"), got.get("healed_ms")))
+    if got.get("healed_first") != 0:
+        print("❌ cache 出现后的第一次查询在查询线程里同步读盘/自愈（应当交给后台装载）："
+              "out=%r" % out[-300:])
+        fails += 1
+    if got.get("healed") != 1 or got.get("healed_ms", 10 ** 9) > LIMIT_HEAL_MS:
+        print("❌ cache 出现后没有自愈（空表被钉住）：healed=%s healed_ms=%s（期望 <= %d）"
+              % (got.get("healed"), got.get("healed_ms"), LIMIT_HEAL_MS))
         fails += 1
 
     # 4c) pm 非零退出（不是超时）不得写空 cache 覆盖好 hint

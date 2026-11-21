@@ -28,6 +28,28 @@ static _Thread_local int gate_role;
 static _Thread_local FILE* target;
 static _Thread_local const char* pm_text;
 static int fail, pass;
+/* 冷缓存磁盘读观测：--wrap=fopen 统计「打开 sys_pkgs.cache 时本线程是否持配置读槽」，
+   并可选地把这次打开停在 gate 上（模拟慢 f2fs 读）。g_gate_cache 打开时，任何线程
+   读 cache 都会停在 gate —— 于是「谁在读盘」变成可观测事实。 */
+static _Atomic int g_cache_reads, g_cache_reads_in_slot, g_gate_cache;
+static pthread_t g_gate_owner;
+static bool g_gate_owner_set;
+static unsigned long long now_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000ull + (unsigned long long)t.tv_nsec / 1000ull;
+}
+static int tasks(void) {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) abort();
+    int count = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) count++;
+    }
+    closedir(d);
+    return count;
+}
 FILE* __real_fopen(const char*, const char*);
 char* __real_fgets(char*, int, FILE*);
 int __real_fclose(FILE*);
@@ -42,6 +64,8 @@ static struct timespec deadline(int ms) {
 }
 static void gate(void) {
     pthread_mutex_lock(&mu);
+    g_gate_owner = pthread_self();
+    g_gate_owner_set = true;
     entered = true;
     pthread_cond_broadcast(&cv);
     struct timespec d = deadline(4000);
@@ -61,6 +85,11 @@ static void release_gate(void) {
     pthread_mutex_lock(&mu); released = true; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
 }
 FILE* __wrap_fopen(const char* p, const char* mode) {
+    if (strcmp(p, CONFIG_DIR "/sys_pkgs.cache") == 0 && mode[0] == 'r') {
+        atomic_fetch_add(&g_cache_reads, 1);
+        if (config_read_in_slot()) atomic_fetch_add(&g_cache_reads_in_slot, 1);
+        if (atomic_load(&g_gate_cache)) gate(); /* 慢盘：停在 gate 上直到测试放行 */
+    }
     FILE* fp = __real_fopen(p, mode);
     if (gate_role == 1 && strcmp(p, CONFIG_DIR "/sys_pkgs.cache") == 0 && mode[0] == 'r') target = fp;
     if (gate_role == 2 && strstr(p, "/sys_pkgs.cache.tmp") && mode[0] == 'w') target = fp;
@@ -177,6 +206,48 @@ static void cold_init(void) {
     release_gate(); pthread_join(t, NULL); pthread_join(q, NULL);
     check(sys_pkg_is_system("com.system.old"), "cold init eventually visible");
 }
+/* 生产形状：查询落在配置读槽/读锁内（mount_manager 的 app_has_active_rules、
+   perform_app_mount，config_parser 的 print_active_rules，inject_target 的
+   is_target_app，fw_rules 的 br_pick_category，fw_config 的 monitor_uncached）。
+   冷缓存的磁盘读若发生在这里，就把配置写者与发布者排空一起冻住。断言：槽内一次
+   都不打开 cache、查询毫秒级返回、磁盘读发生在别的线程、后台装载把表补齐。 */
+static void cold_query_async(void) {
+    sys_pkg_cleanup();
+    write_cache("com.system.old\n");
+    reset_gate();
+    atomic_store(&g_cache_reads, 0);
+    atomic_store(&g_cache_reads_in_slot, 0);
+    atomic_store(&g_gate_cache, 1);
+    pthread_mutex_lock(&mu); g_gate_owner_set = false; pthread_mutex_unlock(&mu);
+    unsigned long long t0 = now_us();
+    uint64_t gen = config_read_begin();
+    bool first = sys_pkg_is_system("com.system.old");
+    unsigned long long in_slot_us = now_us() - t0;
+    config_read_end(gen);
+    /* 首次构建未完成 = 按无表回答 false（既有语义），不是「无此包」的结论 */
+    check(!first, "cold query inside config slot answers unknown without building");
+    check(in_slot_us < 20000ull, "cold query inside config slot returns without waiting for disk");
+    check(atomic_load(&g_cache_reads_in_slot) == 0,
+          "no sys_pkgs.cache read while the config read slot is held");
+    check(await_gate(), "background loader reaches the slow cache read");
+    bool same_thread;
+    pthread_mutex_lock(&mu);
+    same_thread = g_gate_owner_set && pthread_equal(g_gate_owner, pthread_self());
+    pthread_mutex_unlock(&mu);
+    check(!same_thread, "the cache read runs on the loader thread, not on the query thread");
+    release_gate();
+    bool healed = false;
+    for (int i = 0; i < 400 && !healed; i++) {
+        usleep(5000);
+        healed = sys_pkg_is_system("com.system.old");
+    }
+    check(healed, "background load heals the table asynchronously");
+    check(atomic_load(&g_cache_reads) >= 1, "healing actually read the cache file");
+    atomic_store(&g_gate_cache, 0);
+    sys_pkg_cleanup();
+    check(tasks() == 1, "cleanup joins the loader thread (no stray worker left)");
+}
+
 static void cleanup_epoch(bool init) {
     sys_pkg_cleanup(); write_cache("com.system.old\n"); if (!init) sys_pkg_init(false); reset_gate();
     Job slow = {.role=1, .action=init ? 1 : 0}; pthread_t s = start(&slow); check(await_gate(), "cleanup epoch read gate entered");
@@ -184,8 +255,14 @@ static void cleanup_epoch(bool init) {
     check(done(&cleanup, 300), "cleanup detaches table without waiting for disk");
     release_gate(); pthread_join(s, NULL); pthread_join(c, NULL);
     write_cache("com.system.after\n");
-    check(!sys_pkg_is_system("com.system.old") && sys_pkg_is_system("com.system.after"),
-          "stale refresh cannot resurrect table after cleanup");
+    /* 旧代际的 refresh 不得复活旧表；新内容由后台装载补齐（异步，故有界等待） */
+    bool stale_gone = !sys_pkg_is_system("com.system.old");
+    bool fresh = false;
+    for (int i = 0; i < 400 && !fresh; i++) {
+        usleep(5000);
+        fresh = sys_pkg_is_system("com.system.after");
+    }
+    check(stale_gone && fresh, "stale refresh cannot resurrect table after cleanup");
 }
 static void latest_epoch(bool init) {
     sys_pkg_cleanup(); write_cache("com.system.old\n"); if (!init) sys_pkg_init(false); reset_gate();
@@ -223,7 +300,7 @@ static void cache_unchanged(void) {
 }
 int main(void) {
     int before = fds(); config_init_lock();
-    isolation(1); isolation(2); cold_init();
+    isolation(1); isolation(2); cold_init(); cold_query_async();
     cleanup_epoch(false); cleanup_epoch(true); latest_epoch(false); latest_epoch(true);
     lifecycle_stress(); cache_unchanged();
     check(!sys_pkg_is_system(NULL) && !sys_pkg_is_system("") && !sys_pkg_is_system("com.unknown"), "unknown NULL empty semantics");

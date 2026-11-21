@@ -366,15 +366,92 @@ void sys_pkg_init(bool allow_pm) {
     sys_pkg_build_and_publish(epoch, allow_pm, false);
 }
 
-void sys_pkg_cleanup(void) {
+/* 后台装载线程：查询路径只查已发布表，冷缓存与迟到复查的磁盘读在这里做。
+ *
+ * 为什么必须搬走：查询在生产里常常落在配置读锁/读槽内（mount_manager 的
+ * app_has_active_rules/perform_app_mount、config_parser 的 print_active_rules、
+ * inject_target 的 is_target_app、fw_rules 的 br_pick_category、fw_config 的
+ * monitor_uncached）。一次慢 f2fs 读占着那把锁，配置写者（重载、控制编辑）与
+ * 发布者的读者排空就一起被冻住——单次慢调用放大成整池停顿。
+ *
+ * 装载线程只碰本文件的静态量：不取任何调用方的锁，发布仍走 g_sys_pkg_mutex +
+ * epoch 守卫（cleanup 之后迟到发布被拒，不会碰已释放的表）。 */
+static pthread_t g_sys_pkg_loader_thread;
+static bool g_sys_pkg_loader_running; /* 受 g_sys_pkg_mutex 保护 */
+
+/* 冷缓存/复查到期时的装载：只读 cache（from_query 语义，永不 fork pm）。 */
+static void sys_pkg_load_due(void) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    ++g_sys_pkg_epoch;
+    bool recheck = sys_pkg_recheck_due();
+    bool due = (!g_sys_pkg_loaded || recheck) && !g_sys_pkg_loading;
+    bool allow = g_sys_pkg_allow_pm;
+    uint64_t epoch = 0;
+    if (due) {
+        if (recheck) sys_pkg_clear_recheck();
+        g_sys_pkg_loading = true;
+        epoch = ++g_sys_pkg_epoch;
+    }
+    pthread_mutex_unlock(&g_sys_pkg_mutex);
+    if (due) sys_pkg_build_and_publish(epoch, allow, true);
+}
+
+static void* sys_pkg_loader_main(void* unused) {
+    (void)unused;
+    sys_pkg_load_due();
+    pthread_mutex_lock(&g_sys_pkg_mutex);
+    g_sys_pkg_loader_running = false;
+    pthread_mutex_unlock(&g_sys_pkg_mutex);
+    return NULL;
+}
+
+/* 请求后台装载：幂等、非阻塞。查询线程绝不在这里等磁盘。
+ * 线程起不来（资源耗尽）时退回同步读盘——宁可慢一次，也不能给调用方一个
+ * 「永远无表」的假答案（那会把系统应用判成普通应用，类别段直接错判）。 */
+static void sys_pkg_request_load(void) {
+    pthread_mutex_lock(&g_sys_pkg_mutex);
+    if (g_sys_pkg_loader_running) {
+        pthread_mutex_unlock(&g_sys_pkg_mutex);
+        return;
+    }
+    g_sys_pkg_loader_running = true;
+    /* tid 在放锁前就记账：否则 cleanup 可能看到 running=true 却 join 一个空 tid，
+     * 那个装载线程随后才发布，cleanup 的「之后没有表」就漏掉它（还漏 join）。 */
+    pthread_t th;
+    if (pthread_create(&th, NULL, sys_pkg_loader_main, NULL) == 0) {
+        g_sys_pkg_loader_thread = th;
+        pthread_mutex_unlock(&g_sys_pkg_mutex);
+        return;
+    }
+    g_sys_pkg_loader_running = false;
+    pthread_mutex_unlock(&g_sys_pkg_mutex);
+    sys_pkg_load_due();
+}
+
+void sys_pkg_cleanup(void) {
+    pthread_t loader = {0};
+    bool join_loader;
+    pthread_mutex_lock(&g_sys_pkg_mutex);
+    ++g_sys_pkg_epoch; /* 先关迟到发布路径，再回收表 */
+    join_loader = g_sys_pkg_loader_running;
+    loader = g_sys_pkg_loader_thread;
     SysPkgTable* old = g_sys_pkg_table;
     g_sys_pkg_table = NULL;
     g_sys_pkg_loaded = false;
     g_sys_pkg_loading = false;
     pthread_mutex_unlock(&g_sys_pkg_mutex);
+    /* cleanup 之后不留装载线程：它只碰本文件静态量，等它退出不会拖调用方的锁。
+       代价是磁盘挂住时 cleanup 跟着等（与日志 worker 的 join 同一类边界）。 */
+    if (join_loader) pthread_join(loader, NULL);
+    /* 装载线程可能在上面放掉锁之后才真正开始装载（那时它的 epoch 已是最新，发布
+       会成功）。cleanup 的语义是「之后没有表」，所以 join 完再摘一次：否则
+       cleanup 之后仍留着一张没人要的旧视图，紧随的 init 会提前返回。 */
+    pthread_mutex_lock(&g_sys_pkg_mutex);
+    SysPkgTable* late = g_sys_pkg_table;
+    g_sys_pkg_table = NULL;
+    g_sys_pkg_loaded = false;
+    pthread_mutex_unlock(&g_sys_pkg_mutex);
     sys_pkg_free_table(old);
+    sys_pkg_free_table(late);
 }
 
 void sys_pkg_refresh(void) {
@@ -400,16 +477,9 @@ bool sys_pkg_is_system(const char* pkg) {
         q = base;
     }
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    bool recheck_due = sys_pkg_recheck_due();
-    if ((!g_sys_pkg_loaded || recheck_due) && !g_sys_pkg_loading) {
-        if (recheck_due) sys_pkg_clear_recheck();
-        bool allow = g_sys_pkg_allow_pm;
-        g_sys_pkg_loading = true;
-        uint64_t epoch = ++g_sys_pkg_epoch;
-        pthread_mutex_unlock(&g_sys_pkg_mutex);
-        sys_pkg_build_and_publish(epoch, allow, true);
-        pthread_mutex_lock(&g_sys_pkg_mutex);
-    }
+    /* 查询路径**永不读盘**：冷缓存/复查到期只登记后台装载，本线程立刻按当前
+       已发布表回答（首次构建未完成时按无表回答 false，与既有语义一致）。 */
+    bool want_load = (!g_sys_pkg_loaded || sys_pkg_recheck_due()) && !g_sys_pkg_loading;
     unsigned int h = sys_pkg_hash(q);
     bool hit = false;
     /* 首次构建未完成时仍按无表回答 false，不让其它请求排队等磁盘。 */
@@ -421,5 +491,7 @@ bool sys_pkg_is_system(const char* pkg) {
         }
     }
     pthread_mutex_unlock(&g_sys_pkg_mutex);
+    /* 锁外请求（pthread_create 也在锁外）：装载线程的磁盘读不占任何调用方锁。 */
+    if (want_load) sys_pkg_request_load();
     return hit;
 }

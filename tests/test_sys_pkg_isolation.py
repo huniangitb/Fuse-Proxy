@@ -15,6 +15,34 @@ SOURCES = ["src/config/config_parser.c", "src/config/path_vars.c",
            "src/core/common.c"]
 
 
+def function_body(text, name):
+    start = text.find(name + "(")
+    if start < 0:
+        return None
+    brace = text.find("{", start)
+    if brace < 0:
+        return None
+    end = text.find("\n}\n", brace)
+    return text[brace:end if end > 0 else len(text)]
+
+
+def static_checks(source):
+    """查询路径必须在任何锁/读槽内保持「只查已发布表」，冷缓存交给后台装载。"""
+    body = function_body(source.read_text(), "bool sys_pkg_is_system")
+    if body is None:
+        print("❌ 找不到 sys_pkg_is_system 定义")
+        return False
+    ok = True
+    if "sys_pkg_request_load()" not in body:
+        print("❌ 查询路径没有把冷缓存装载交给后台线程（缺 sys_pkg_request_load()）")
+        ok = False
+    for forbidden in ("sys_pkg_build_and_publish(", "sys_pkg_load_file("):
+        if forbidden in body:
+            print(f"❌ 查询路径仍在同步构建/读盘（出现 {forbidden}）")
+            ok = False
+    return ok
+
+
 def main():
     # 临时头文件沿用 config_snapshot suite 的 GNU 常量覆写方式。
     with tempfile.TemporaryDirectory(prefix="sys_pkg_isolation_") as tmp:
@@ -34,6 +62,8 @@ def main():
         if not hits:
             raise RuntimeError("未找到 GNU CONFIG_DIR 常量")
         source = Path(os.environ.get("SYS_PKG_SRC", ROOT / "src/core/sys_pkg.c")).resolve()
+        # 静态判别与运行判别都保留：旧源应当同时红在这两层。
+        static_ok = static_checks(source)
         command = [*shlex.split(os.environ.get("CC", "cc")), "-std=c23", "-DTARGET_GNU=1",
                    "-D_GNU_SOURCE", "-O1", "-g", "-Wall", "-Wextra", "-Wno-unused-parameter",
                    "-ffunction-sections", "-fdata-sections", "-I", str(inc), "-I", str(ROOT / "include"),
@@ -49,6 +79,8 @@ def main():
             print(result.stderr, end="", file=sys.stderr)
             if result.returncode:
                 return 1
+    if not static_ok:
+        return 1
     print("sys_pkg 隔离测试通过")
     return 0
 

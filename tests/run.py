@@ -404,7 +404,7 @@ SUITE_MAP = [
      ("src/core/sys_pkg.c", "tests/test_sys_pkg_isolation.py",
       "tests/fixtures/sys_pkg_isolation.c"),
      ("sys_pkg_init", "sys_pkg_refresh", "sys_pkg_cleanup", "sys_pkg_is_system"),
-     "系统包缓存慢构建、刷新与读者隔离"),
+     "系统包缓存慢构建移出查询路径（后台装载）与读者隔离"),
 
     # `pm` 走 binder 到 system_server：旧 popen+fgets 没有时间上界，一次挂起就把
     # 配置视图/注入器事件循环/热重载线程整条冻住。新实现按预算跑命令并回退。
