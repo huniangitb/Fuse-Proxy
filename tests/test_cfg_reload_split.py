@@ -142,6 +142,40 @@ def main():
             return 1
         print("  ✅ uid.map / sys_pkgs.cache 不触发规则重载；规则文件仍触发（正对照）")
         print("  ✅ 规则文件重写为相同内容不再发布（无变化跳过）")
+
+        # 第二段：慢 sys_pkgs.cache 读取不得罩在配置写锁里冻住冷路径读者。
+        # 把该文件换成 FIFO、写端晚 300ms 交数据 = 真实慢盘；另一线程反复
+        # config_lock_read()/unlock 采样。旧实现（refresh 在写锁内）冷读者被冻
+        # ~300ms，新实现（refresh 在 unlock 之后）只有微秒级等待。
+        run2 = subprocess.run([exe, rules, cfgdir, "locks"], capture_output=True,
+                              text=True, timeout=180)
+        print(run2.stdout.rstrip())
+        if run2.stderr.strip():
+            print(run2.stderr.rstrip(), file=sys.stderr)
+        if run2.returncode != 0:
+            print(f"FAIL locks 驱动退出码 {run2.returncode}", file=sys.stderr)
+            return 1
+        lv = {m.group(1): int(m.group(2))
+              for m in re.finditer(r"(\w+)=(\d+)", run2.stdout)}
+        fails2 = []
+        # hit=「规则变更触发了全量重载」且「这次重载真的读了慢盘」：两个条件缺一即
+        # 说明测量没落在写锁窗口上（调度慢/事件被并批），不能拿它下结论。
+        if lv.get("hit", 0) != 1:
+            fails2.append(f"重载窗口没建立（hit={lv.get('hit')}、reloads={lv.get('reloads')}、"
+                          f"sys_reads={lv.get('sys_reads')}、waited_ms={lv.get('waited_ms')}）")
+        if lv.get("sys_reads", 0) < 1:
+            fails2.append(f"慢盘没有被真正读取（sys_reads={lv.get('sys_reads')}，期望 ≥1）")
+        if lv.get("reloads", 0) < 1:
+            fails2.append(f"规则变更未触发全量重载（reloads={lv.get('reloads')}，期望 ≥1）")
+        if lv.get("cold_max_us", 1 << 30) >= 50000:
+            fails2.append(f"慢 sys_pkgs.cache 读取把冷路径读者冻住了 "
+                          f"{lv.get('cold_max_us')}µs（期望 <50000µs：真读盘不得罩在写锁内；"
+                          "旧实现固定 300000µs 量级）")
+        if fails2:
+            for f in fails2:
+                print(f"  ❌ {f}", file=sys.stderr)
+            return 1
+        print("  ✅ 慢 sys_pkgs.cache 读取不再冻结冷路径读者（写锁不含真读盘）")
         print("配置重载分流测试通过 ✔")
         return 0
 

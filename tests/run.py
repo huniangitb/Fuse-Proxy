@@ -342,7 +342,9 @@ SUITE_MAP = [
       # pid→包名快取（fast_pid）——test_monitor_layers.py 直编它们
       "src/core/uid_map.c", "include/uid_map.h",
       "src/core/sys_pkg.c", "include/sys_pkg.h",
-      "src/core/fast_pid.c", "include/fast_pid.h"),
+      "src/core/fast_pid.c", "include/fast_pid.h",
+      # 分流判别驱动（C11 + 写锁内真读盘 locks 段）改它也要重跑
+      "tests/test_cfg_reload_split.py", "tests/fixtures/cfg_reload_split_driver.c"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),
      "监控开关三层合并 / uid→包名（框架权威）"),
 
