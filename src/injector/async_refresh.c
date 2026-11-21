@@ -20,22 +20,10 @@
 #define ASYNC_REFRESH_IDLE_MS 200
 
 static pthread_mutex_t g_ar_mu = PTHREAD_MUTEX_INITIALIZER;
+/* 空闲等待只有 200ms：墙钟被改最多让 worker 早退/晚退一会儿，没有正确性影响，所以
+   直接用默认时钟的静态初始化。不要去 pthread_cond_init 一个已经静态初始化的条件
+   变量（那是未定义行为），也不留「时钟设置失败」这种半初始化分支。 */
 static pthread_cond_t g_ar_cv = PTHREAD_COND_INITIALIZER;
-static pthread_once_t g_ar_once = PTHREAD_ONCE_INIT;
-/* 条件变量时钟：能设成 MONOTONIC 就用它（墙钟被改也不会把空闲等待拉长/立刻唤醒），
-   设不了退回默认时钟，等待截止时间相应改用 CLOCK_REALTIME。 */
-static bool g_ar_cv_monotonic;
-
-static void async_refresh_globals_init(void) {
-    pthread_condattr_t attr;
-    if (pthread_condattr_init(&attr) != 0) return; /* 保留静态初始化值（默认时钟） */
-    g_ar_cv_monotonic = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0;
-    if (pthread_cond_init(&g_ar_cv, &attr) != 0) {
-        g_ar_cv_monotonic = false;
-        (void)pthread_cond_init(&g_ar_cv, nullptr);
-    }
-    pthread_condattr_destroy(&attr);
-}
 static NspAsyncRefreshFn g_ar_fn;
 static void* g_ar_ctx;
 static bool g_ar_pending; /* 有未处理的请求（含 worker 正在跑时新到的） */
@@ -50,7 +38,7 @@ static void* async_refresh_worker(void* arg) {
         pthread_mutex_lock(&g_ar_mu);
         while (!g_ar_pending && !g_ar_stopping) {
             struct timespec deadline;
-            clock_gettime(g_ar_cv_monotonic ? CLOCK_MONOTONIC : CLOCK_REALTIME, &deadline);
+            clock_gettime(CLOCK_REALTIME, &deadline);
             deadline.tv_nsec += (long)ASYNC_REFRESH_IDLE_MS * 1000000L;
             if (deadline.tv_nsec >= 1000000000L) {
                 deadline.tv_sec += 1;
@@ -78,7 +66,6 @@ static void* async_refresh_worker(void* arg) {
 }
 
 void nsp_async_refresh_init(NspAsyncRefreshFn fn, void* ctx) {
-    pthread_once(&g_ar_once, async_refresh_globals_init);
     pthread_mutex_lock(&g_ar_mu);
     g_ar_fn = fn;
     g_ar_ctx = ctx;
@@ -86,7 +73,6 @@ void nsp_async_refresh_init(NspAsyncRefreshFn fn, void* ctx) {
 }
 
 void nsp_async_refresh_request(void) {
-    pthread_once(&g_ar_once, async_refresh_globals_init);
     bool spawn = false;
     pthread_mutex_lock(&g_ar_mu);
     if (!g_ar_fn || g_ar_stopping) {
@@ -111,10 +97,12 @@ void nsp_async_refresh_request(void) {
         pthread_attr_destroy(&attr);
     }
     if (!spawn) {
-        /* 起不来就丢弃本轮：绝不在调用线程上同步执行 */
+        /* 起不来：绝不在调用线程上同步执行。running 放回去但保留 pending，下一请求
+           重新拉起 worker 补上这一轮；broadcast 不可省——此刻可能已经有人在
+           nsp_async_refresh_shutdown 里等 running 归零，只清标志不唤醒就是永久挂住。 */
         pthread_mutex_lock(&g_ar_mu);
         g_ar_running = false;
-        g_ar_pending = false;
+        pthread_cond_broadcast(&g_ar_cv);
         pthread_mutex_unlock(&g_ar_mu);
     }
 }
@@ -127,7 +115,6 @@ bool nsp_async_refresh_active(void) {
 }
 
 void nsp_async_refresh_shutdown(void) {
-    pthread_once(&g_ar_once, async_refresh_globals_init);
     pthread_mutex_lock(&g_ar_mu);
     g_ar_stopping = true;
     g_ar_pending = false; /* 未开始的排空，正在跑的那一轮等它结束 */

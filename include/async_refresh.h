@@ -14,7 +14,7 @@ typedef void (*NspAsyncRefreshFn)(void* ctx);
 void nsp_async_refresh_init(NspAsyncRefreshFn fn, void* ctx);
 
 /* 非阻塞请求一次刷新。已有 worker 在跑时只置「再来一轮」标记（不新起线程）；
-   起线程失败则丢弃本次刷新——宁可少刷一次，也不在调用线程上同步执行。 */
+   起线程失败绝不在调用线程上同步执行（待刷标记保留，下一次请求重新拉起 worker）。*/
 void nsp_async_refresh_request(void);
 
 /* 是否还有 worker 在跑（诊断/测试用，不参与生产决策） */

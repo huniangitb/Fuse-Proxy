@@ -19,6 +19,7 @@
 #include "config_publisher.h"
 #include "sys_pkg.h"
 #include "async_refresh.h"
+#include "audit_worker.h"
 #include "build_info.h"
 #include "crash_tail.h"
 #include <stdio.h>
@@ -1976,7 +1977,7 @@ static void handle_pending_reload(void) {
     LOG("配置重载 #%lu: 来源=%s 触发=%s 合并事件=%u", g_reload_total, why, trigger, merged);
     {
         fast_pid_cache_clear();
-        ChangedPkg out_changed[128];
+        ChangedPkg out_changed[NSP_AUDIT_MAX_CHANGED];
         /* 锁外准备视图（真读盘 + pm 扫描），锁内只提交：本函数跑在注入器唯一事件循环
            线程上，写锁期间 pre-hook 的规则判定与发布器全被挡住。 */
         NspCfgRec* reload_recs = nullptr;
@@ -1984,7 +1985,8 @@ static void handle_pending_reload(void) {
         config_read_view(INJECTOR_CONFIG_PATH, &reload_recs, &reload_count);
         config_lock_write();
         int changed_count =
-            config_commit_prepared(reload_recs, reload_count, out_changed, 128);
+            config_commit_prepared(reload_recs, reload_count, out_changed,
+                                   NSP_AUDIT_MAX_CHANGED);
         config_unlock_write();
         config_free_view(reload_recs, reload_count);
         apply_inject_method_switch();
@@ -2006,21 +2008,14 @@ static void handle_pending_reload(void) {
             inject_media_fuse();
         }
 
-        if (inject_is_global_replace() || inject_restore_nontarget()) {
-            /* v2/v3：全局替换 + 还原策略，保持原有审计粒度 */
-            if (changed_count == -1) {
-                audit_tracked_apps();
-            } else if (changed_count > 0) {
-                audit_and_remount_specific_apps(out_changed, changed_count);
-            }
-        } else {
-            /* v1（逐应用挂载）：上面那条 diff 只认「应用段 inject_enable 翻转 /
-               全局开关变化」，规则内容变化、类别段与 App-rules 子文件的增删都会
-               判成 changed_count==0 → 旧实现什么都不做，运行中的应用只能靠杀进程
-               才换视图。这里无论 changed_count 取何值都对运行中应用做一次全量
-               对账：该挂的挂上、该卸的卸掉（热挂载 / 热卸载）。 */
-            audit_running_apps();
-        }
+        /* 运行中应用的挂载对账要对每个应用做「配置判定 + 实测视图 + 挂载/卸载/
+           还原」，单次预算就有数百毫秒：留在本线程会把 pre-hook 判定、IPC ACK
+           与挂载派发一起冻住，几十个在跑的应用叠起来就是数十秒无响应。这里只
+           入队；粒度（v1 无论 diff 如何都全量对账 / v2 整体变化重置 / v2 具体
+           变更只重挂这几个）由后台 worker 在动手那一刻按当时的注入方法重选，
+           连续重载的变更集合与它合并。 */
+        nsp_audit_request(changed_count > 0 ? out_changed : nullptr,
+                          changed_count > 0 ? changed_count : 0, changed_count == -1);
     }
     arm_due_timer(); /* 重载可能改了活跃用户集合，重臂一次兜住 */
 }
@@ -2083,8 +2078,9 @@ static void injector_shutdown(const InjectorFds* fds) {
     int ipc_sock = fds->ipc_sock;
     int timer_fd = fds->timer_fd;
     int sig_fd = fds->sig_fd;
-    /* 循环已退出，不再有新请求；等后台刷新把手上那轮跑完再动全局状态 */
+    /* 循环已退出，不再有新请求；等后台刷新与后台对账把手上那轮跑完再动全局状态 */
     nsp_async_refresh_shutdown();
+    nsp_audit_shutdown();
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);

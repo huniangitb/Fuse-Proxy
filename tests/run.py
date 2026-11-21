@@ -436,6 +436,17 @@ SUITE_MAP = [
      ("nsp_async_refresh_request", "nsp_async_refresh_init", "injector_sys_pkg_refresh_cb"),
      "重载路径的慢 pm 刷新不占事件循环线程（异步合并）"),
 
+    # 类同 async_refresh：handle_pending_reload 原先内联 audit_tracked_apps /
+    # audit_and_remount_specific_apps / audit_running_apps——逐个 tracked 应用做
+    # 配置判定 + 实测视图 + 挂载/卸载/还原，几十个在跑的应用叠起来把事件循环按在
+    # 那里数十秒。改成请求合并的后台 worker（至多一个线程、空闲自退）。
+    (("test_audit_defer.py",),
+     ("src/injector/audit_worker.c", "include/audit_worker.h",
+      "src/injector/injector.c", "tests/test_audit_defer.py",
+      "tests/fixtures/audit_defer_driver.c"),
+     ("nsp_audit_request", "nsp_audit_shutdown", "audit_run_job"),
+     "重载后的运行中应用对账不占事件循环线程（异步合并）"),
+
     (("test_ftp_lifecycle_isolation.py",),
      ("src/modules/ftp/ftp_backend_libcurl.c", "src/modules/ftp/ftp_mux.c",
       "tests/test_ftp_lifecycle_isolation.py",
@@ -616,6 +627,7 @@ LAYERS = {
             "test_cmd_bounded_pm.py",
             "test_cfg_reload_lock.py",
             "test_async_refresh.py",
+            "test_audit_defer.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
             "test_cfg_watch.py",
@@ -878,6 +890,7 @@ PARALLEL_SAFE = frozenset({
     "test_cmd_bounded_pm.py",     # cc 直编真实 common/parser/sys_pkg + PATH 假 pm，临时目录，无挂载
     "test_cfg_reload_lock.py",    # cc 直编真实 parser + --wrap 慢盘/慢 pm，临时配置目录，无挂载
     "test_async_refresh.py",      # cc 直编真实 async_refresh + 慢回调替身，纯线程，无文件/挂载
+    "test_audit_defer.py",        # cc 直编真实 audit_worker + 慢审计替身，纯线程，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
