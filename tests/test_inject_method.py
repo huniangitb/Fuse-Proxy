@@ -206,6 +206,8 @@ def direct_compile_group():
         # 补挂载盯梢的等待体与其事件源（ipc_server 直接调用）
         os.path.join(ROOT, "src", "injector", "ns_mnt_wait.c"),
         os.path.join(ROOT, "src", "injector", "ns_mnt_watch.c"),
+        # timeout 取消分支清真实重试账，不用空桩掩盖新增依赖。
+        os.path.join(ROOT, "src", "injector", "retry_queue.c"),
         os.path.join(ROOT, "src", "injector", "inject_target.c"),
         os.path.join(ROOT, "src", "core", "uid_map.c"),
         os.path.join(ROOT, "src", "core", "fast_pid.c"),

@@ -49,6 +49,8 @@
 
 static int g_retries;
 static int g_removed;
+static int g_cleared;
+static uid_t g_target_uid;
 
 void log_internal(LogLevel level, const char* format, ...) {
     (void)level;
@@ -67,8 +69,13 @@ void remove_tracked(int pid) {
 }
 uid_t get_app_uid(int pid) {
     (void)pid;
-    return getuid();
+    return g_target_uid;
 }
+bool is_isolated_uid(uid_t uid) {
+    uid %= 100000;
+    return uid >= 90000 && uid <= 99999;
+}
+bool nsp_retry_done(int pid) { (void)pid; g_cleared++; return true; }
 void get_target_storage_path(uid_t uid, char* path, size_t size) {
     (void)uid;
     snprintf(path, size, "/storage/emulated");
@@ -154,6 +161,8 @@ typedef struct {
     int want_retry;
     int want_removed;
     int exit_delay_ms;
+    uid_t uid; /* current target UID, independent of the fixture process UID */
+    int want_clear;
 } Row;
 
 static double monotonic_ms(void) {
@@ -212,6 +221,8 @@ static void run_row(const Row* r) {
     snprintf(ctx->pkg_name, sizeof ctx->pkg_name, "com.real.target");
     g_retries = 0;
     g_removed = 0;
+    g_cleared = 0;
+    g_target_uid = r->uid;
     struct pollfd ready = {.fd = p[0], .events = POLLIN};
     int pr;
     do { pr = poll(&ready, 1, 3000); } while (pr < 0 && errno == EINTR);
@@ -235,7 +246,9 @@ static void run_row(const Row* r) {
         if (fast) g_pass++; else g_fail++;
     }
 
-    bool okv = (g_retries == r->want_retry) && (g_removed == r->want_removed);
+    bool okv = (g_retries == r->want_retry) && (g_removed == r->want_removed) &&
+               (g_cleared == r->want_clear);
+    printf("    uid=%u queue_cleared=%d(expected%d)\n", g_target_uid, g_cleared, r->want_clear);
     printf("  %s %s — payload=%d pre_reaped=%d retries=%d(期望%d) removed=%d(期望%d)\n",
            okv ? "PASS" : "FAIL", r->label, r->payload, r->pre_reap, g_retries, r->want_retry,
            g_removed, r->want_removed);
@@ -255,15 +268,21 @@ static void run_row(const Row* r) {
 
 int main(void) {
     const Row rows[] = {
-        {"failure_control（失败码经管道回传，未预收尸）", ENOENT, 0, 1, 1, 0},
-        {"failure_ECHILD（失败码经管道回传，主循环先收尸）", ENOENT, 1, 1, 1, 0},
-        {"EOF_control（status 缺失=EOF，未预收尸）", -1, 0, 1, 1, 0},
-        {"EOF_ECHILD（status 缺失=EOF，主循环先收尸）", -1, 1, 1, 1, 0},
-        {"success_control（成功，未预收尸）", 0, 0, 0, 0, 0},
-        {"success_ECHILD（成功，主循环先收尸）", 0, 1, 0, 0, 0},
-        {"success_late_exit", 0, 0, 0, 0, 600},
-        {"failure_late_exit", ENOENT, 0, 1, 1, 600},
-        {"EOF_late_exit", -1, 0, 1, 1, 600},
+        {"unknown UID failure", ENOENT, 0, 0, 1, 0, 0, 1},
+        {"invalid UID EOF", -1, 0, 0, 1, 0, (uid_t)-1, 1},
+        {"isolated failure user0", ENOENT, 0, 0, 1, 0, 90000, 1},
+        {"isolated failure user1 ECHILD", ENOENT, 1, 0, 1, 0, 199999, 1},
+        {"isolated EOF user10", -1, 0, 0, 1, 0, 1090123, 1},
+        {"isolated failure late exit", ENOENT, 0, 0, 1, 600, 190123, 1},
+        {"failure_control（失败码经管道回传，未预收尸）", ENOENT, 0, 1, 1, 0, 10123, 0},
+        {"failure_ECHILD（失败码经管道回传，主循环先收尸）", ENOENT, 1, 1, 1, 0, 10123, 0},
+        {"EOF_control（status 缺失=EOF，未预收尸）", -1, 0, 1, 1, 0, 10123, 0},
+        {"EOF_ECHILD（status 缺失=EOF，主循环先收尸）", -1, 1, 1, 1, 0, 10123, 0},
+        {"success_control（成功，未预收尸）", 0, 0, 0, 0, 0, 10123, 0},
+        {"success_ECHILD（成功，主循环先收尸）", 0, 1, 0, 0, 0, 10123, 0},
+        {"success_late_exit", 0, 0, 0, 0, 600, 10123, 0},
+        {"failure_late_exit", ENOENT, 0, 1, 1, 600, 10123, 0},
+        {"EOF_late_exit", -1, 0, 1, 1, 600, 10123, 0},
     };
     printf("异步挂载完成事件：结果判定与收尸解耦用例\n");
     for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) run_row(&rows[i]);

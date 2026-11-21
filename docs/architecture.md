@@ -194,6 +194,8 @@ FUSE 回调（如 getattr）
 
 **沙盒不参与跨应用裁决，也不接管 `/Android` 的原生子树**：`SANDBOX ON` 的调用方访问下面四类路径时，`br_to_real_path` 的沙盒分支直接落回真实路径，不做镜像改写——他包 `Android/data|obb` 子树（`br_path_other_app_subtree`）、三个容器本身 `/Android/data|obb|media`、应用自己在三个容器里的私有目录（后两者由 `br_path_android_passthrough` 判定）。改写会把原生的判据整个掩盖掉（能力放行者读到空目录，非放行者拿到的 ENOENT 也不是原生那个原因）；容器本身让位还有一层：ACL 把三者当骨架目录（readdir 由 ACL 拒绝），容器里每个 `<pkg>` 要单独按调用方裁决，镜像化后这些裁决全部对着空目录做。这四类之外的 `/Android` 路径（`/Android/123.txt`、`/Android/<自己建的目录>`、他包 `/Android/media/<他包>`）与其它共享目录一样进镜像。旧实现是「沙盒生效即无条件豁免隔离」，那条口子随沙盒让位一并删掉，否则沙盒 ON 反而比原生更松。已知边界：`uid.map` 是 uid→单包名，旧 `sharedUserId` 共享 uid 的两个应用会互判「他包」——现代 Android 上罕见，逃生阀同上（见 `config.md` §4.1）。
 
+**沙盒骨架补建**：规则决策出配置读槽之后补建沙盒落点及其 `Android` 根，不预建 `data/obb/media` 容器；失败只记限频日志，不改已算出的路由。新增 `Android` 物化走 `common_mkdir_storage_child()`：从可信存储根 dirfd 逐组件 nofollow 打开既有父目录，子目录也不跟随符号链接，属性只经固定 fd 继承；`mkdirat` 返回 EEXIST 时不改既有目录属性。它不负责修复原有路径式补建/回调的全部符号链接语义，也不保证 mkdirat 到 openat 之间仍是同一个新 inode。没有永久“已就绪”TLS缓存，删除或配置换路径后仍重验。
+
 **backing 直通只在 media 实例里开**（`vfs_backing_setup`）：全局实例（服务所有被注入应用，dentry 全应用共用）**一个 dentry 也不挂 backing**，全部回落 daemon 全权 mediation。两条理由：① 隔离开生效时 `data`/`obb` 的可见性取决于调用方，backing 之后内核绕过 daemon，per-caller 裁决无从落地（该子树此前直通等于隔离整体失效）；② 更要紧的是 DAC——backing 之后的下层 I/O 由内核在**发起请求的应用进程上下文**里直接打到真实文件（lookup/create/opendir 都按调用方凭证判），而 `/data/media/0` 整棵树归 MediaProvider（`10277:1023`、顶层目录 `0770`、属组 `media_rw`），任何应用都过不了。backing 结论按 dentry 缓存、无法按调用方分别裁决，故共享实例上这条路只能整体关掉（线上实测：只写 `ALLOW /Download` 或不写路径规则时，注入后的应用写 `/Download` 反被内核 EACCES 拒绝）。media 实例（`--media-fuse`，调用方恒为 MediaProvider）保留直通，按路径门 `fw_backing_mediation_required_for()` 逐路径裁决。
 
 `ALLOW` 也算"要求仲裁"的维度（`fw_rules.c` 的 `br_cfg_touches_data()` / `br_cfg_mediates_path()`）：它只声明"这一层放行"，不代表可以让内核代跑 IO。旧实现把 ALLOW 当直通跳过，正是上面 ② 的触发点。代价是全局实例的 I/O 回到全量仲裁路径（等于是把 `--no-bpf` 变成全局实例的恒定行为），换来的是"注入后与未注入行为一致"。
@@ -291,7 +293,9 @@ FUSE 回调（如 getattr）
 ### 5.1 注入流程
 
 1. injector 启动先 `inject_global_fuse` 挂载全局 FUSE；若 `com.android.providers.media.module` 在目标之列，惰性起媒体专属实例。
-1b. **就绪后的启动扫描**（v1）：`repair_stale_app_mounts_at_startup` 遍历进程，只处理「挂着项目 FUSE 但连接已断」的那些——injector 重启不重建旧进程命名空间里的挂载，它们此后访问存储一律 `ENOTCONN`（内核只把 superblock 标成断开，mountinfo 条目仍在），杀模块进程、重启模块都没用，只有杀应用进程或重启设备才恢复。判据分两层：挂载状态来自 `statx` 快路径 ⇒ 连接已证明可用，直接跳过、一次探测都不做；只有结论来自 mountinfo 兜底扫描时才做一次 `statfs`（`ns_mount_conn_state`，必落超级块、不被 FUSE 属性缓存挡住），返回 `ENOTCONN`/`ECONNREFUSED` 才清理重挂。v2/v3 不适用（emulated 由全局替换统一提供）。同一判据也挂在两条挂载路径的「已存在项目 FUSE ⇒ 跳过」分支之前：注入前先查一次，死连接先清再挂。崩溃恢复重挂（remount_all_tracked）走的是同一个 fast_pid_each，而它按 PID 缓存跳过「本进程处理过的 pid」——守护进程崩溃后这些 pid 的挂载恰好是断的，所以恢复遍历前必须先 fast_pid_cache_clear()，否则只会看到崩溃之后新起的进程，活着的应用一个都不重挂（真机症状：日志报「重挂 0 个」而应用访问存储仍然失败）。
+1b. **就绪后的启动扫描**（v1、非 passive）：`repair_stale_app_mounts_at_startup` 遍历进程，只处理「挂着项目 FUSE 但连接已断」的那些——injector 重启不重建旧进程命名空间里的挂载，它们此后访问存储一律 `ENOTCONN`（内核只把 superblock 标成断开，mountinfo 条目仍在），杀模块进程、重启模块都没用，只有杀应用进程或重启设备才恢复。判据分两层：挂载状态来自 `statx` 快路径 ⇒ 连接已证明可用，直接跳过、一次探测都不做；只有结论来自 mountinfo 兜底扫描时才做一次 `statfs`（`ns_mount_conn_state`，必落超级块、不被 FUSE 属性缓存挡住），返回 `ENOTCONN`/`ECONNREFUSED` 才清理重挂。v2/v3 不适用（emulated 由全局替换统一提供）。同一判据也挂在两条挂载路径的「已存在项目 FUSE ⇒ 跳过」分支之前：注入前先查一次，死连接先清再挂。崩溃恢复重挂（remount_all_tracked）走的是同一个 fast_pid_each，而它按 PID 缓存跳过「本进程处理过的 pid」——守护进程崩溃后这些 pid 的挂载恰好是断的，所以恢复遍历前必须先 fast_pid_cache_clear()，否则只会看到崩溃之后新起的进程，活着的应用一个都不重挂（真机症状：日志报「重挂 0 个」而应用访问存储仍然失败）。
+
+   `--passive` 不执行这次扫描，以免启动等待遍历存量进程。此模式只靠后续 IPC 或应用重启重新注入：旧存活应用若仍挂着断开的 FUSE，可继续收到 `ENOTCONN`，不保证随 injector 重启自愈。运行期 FUSE 崩溃后的已追踪应用重挂不受此启动扫描开关影响。
 2. 经 zygote 子进程检测（`fast_pid` + `/proc` 扫描，timerfd 驱动）发现新启动应用。
 3. `inject_target` 判定是否为目标（含 `SKIP_SYSTEM_APPS` 过滤、隔离进程过滤）。
 4. 命中则 `mount_manager` + `ns_utils` 进入其 mount namespace 挂载 FUSE。
@@ -303,7 +307,7 @@ FUSE 回调（如 getattr）
 - `DEFER`：**仅 v1 目标应用**。pre 通道**只裁决、不挂载**：此刻进程还在 zygote 的挂载命名空间里（部分 ROM 该 ns 里就有 `/storage/emulated`），在这里挂载等于把项目 FUSE 装进 zygote ns——之后 fork 的每个应用（含非目标）都会继承它，且 `cleanup_app_mounts` 只会在应用自己的 ns 里卸载，这份挂载没人能清。应用自己的 ns 要到 `postAppSpecialize` 才成立，那才是唯一该挂载的时机。模块把进程记为 pending：proto<3 的旧模块在 `postAppSpecialize`（**仍早于应用 Java 代码**）发 `POST`；proto>=3 的模块不再回连（见下方"协议 3"），改由 injector 在回 `DEFER` 后派发**补挂载盯梢线程**。
 - `ERR`：主线程短等内没挂上（或 FUSE 暂不可用）；应用照常启动，本次无代理视图，挂载交给后台重试队列（静默、有界）。
 
-**协议 3/4（当前模块）：pre 只往返一次，post 不回连**。ZygiskNext 1.3.4+ 会关掉模块在 `preAppSpecialize` 返回后仍持有的 companion fd（其 wiki 的 fd-leaking 检查项），而官方 Zygisk 的 `connectCompanion` 契约本身也写明只在 pre 可用（"All API methods will stop working after post[XXX]Specialize"），所以"把连接留到 post 再用"这条路必须废弃。现在的分工：pre 阶段模块拿完 `OK`/`DEFER` 就 `close`，injector 收到 pre 上报后若判定需要挂载，就派一个**盯梢线程**（`ipc_post_mount_thread`，2ms 步进）盯 `/proc/<pid>/ns/mnt` 的 `(st_dev, st_ino)`——一变即说明应用自己的命名空间已成立，立刻 `perform_app_mount_sync`（预算 `IPC_MOUNT_READINESS_MS` 250ms，覆盖 vold 装配窗口）。模块侧在 `postAppSpecialize` 只做**本地**等待，**等多久由 injector 的应答下发**（协议 4 的 `DEFER <ms>`，源头是 `[GLOBAL] ZYGISK_POST_WAIT_MS`，默认 **0**），且**只在 injector 明确回 `DEFER` 且预算 >0 时才等**：预算 0 时模块**一次 `/proc/self/mountinfo` 都不读**，直接放行（补挂载交 injector 后台盯梢 + 重试队列收敛）；没应答/ERR（injector 尚未启动、崩溃、忙）一律直接放行——启动高峰期 zygote 连续 specialize 几十个进程（冷启动实测 60 个，含 SystemUI/launcher），若按"没应答就等满"处理，每个进程空转 1.5s 解析 mountinfo，开机会被拖慢几十秒。整个过程不用 companion 连接、不做 IPC（等待只借 `/proc/self/mountinfo` 当事件源，见下条）。盯梢上限 `IPC_POST_WAIT_MS`（1200ms）只约束 injector 后台线程自己，应用不等它走完；挂了由后台重试队列补。没等到命名空间切换就**绝不挂载**（zygote ns 污染红线同上），进程中途死亡则直接退出。
+**协议 3/4（当前模块）：pre 只往返一次，post 不回连**。ZygiskNext 1.3.4+ 会关掉模块在 `preAppSpecialize` 返回后仍持有的 companion fd（其 wiki 的 fd-leaking 检查项），而官方 Zygisk 的 `connectCompanion` 契约本身也写明只在 pre 可用（"All API methods will stop working after post[XXX]Specialize"），所以"把连接留到 post 再用"这条路必须废弃。现在的分工：pre 阶段模块拿完 `OK`/`DEFER` 就 `close`，injector 收到 pre 上报后若判定需要挂载，就派一个**盯梢线程**（`ipc_post_mount_thread`，事件 + 纳秒节拍）盯 `/proc/<pid>/ns/mnt` 的 `(st_dev, st_ino)`——一变即说明应用自己的命名空间已成立，立刻 `perform_app_mount_sync`（预算 `IPC_MOUNT_READINESS_MS` 250ms，覆盖 vold 装配窗口）。模块侧在 `postAppSpecialize` 只做**本地**等待，**等多久由 injector 的应答下发**（协议 4 的 `DEFER <ms>`，源头是 `[GLOBAL] ZYGISK_POST_WAIT_MS`，默认 **0**），且**只在 injector 明确回 `DEFER` 且预算 >0 时才等**：预算 0 时模块**一次 `/proc/self/mountinfo` 都不读**，直接放行（补挂载交 injector 后台盯梢 + 重试队列收敛）；没应答/ERR（injector 尚未启动、崩溃、忙）一律直接放行——启动高峰期 zygote 连续 specialize 几十个进程（冷启动实测 60 个，含 SystemUI/launcher），若按"没应答就等满"处理，每个进程空转 1.5s 解析 mountinfo，开机会被拖慢几十秒。整个过程不用 companion 连接、不做 IPC（等待只借 `/proc/self/mountinfo` 当事件源，见下条）。盯梢上限 `IPC_POST_WAIT_MS`（1200ms）只约束 injector 后台线程自己，应用不等它走完；挂了由后台重试队列补。没等到命名空间切换时不在盯梢线程直接挂载，而是将仍存活的非 isolated 进程交给有界重试。重试前复核当前 UID、目标配置与命名空间：只认目标和已识别的父 zygote/USAP/应用 `_zygote` 身份稳定、且挂载 ns 的 `(dev, ino)` 不同；配置检查前后还逐字段比较这对进程的 PPid/starttime/ns dev/ino 快照，不能拿两次各自稳定代替同一身份；已有 `/storage/emulated` 不构成隔离证明。未知父、被 init 收养或身份变化均暂缓，仍消耗最多 20 次的原退避预算，不保证这些进程最终挂上。进程死亡或当前 UID/配置不再允许注入则清账退出。
 
 **post 等待的预算是墙钟，等的是挂载表变化事件**：旧实现 `wait_storage_proxied(100)` 里累加进度的只有 `nanosleep(10ms)`，**不含探测自身的耗时**，于是"100ms 预算"实际是**固定 11 次整表扫描 + 100ms**——单次扫描 54ms 的机型上约 0.7s，仓库注释里 Redmi/A14 那种单次 134–136ms 的表则 1.5s，这段全落在应用 specialize 的热路径上。本机（一加平板 Pro）mountinfo 262–265 行、单次扫描 0.39ms，11×0.39+100≈104ms，所以本机量不出差异。现在的口径：
 - 预算 **0**（默认）：一次都不读挂载表。
@@ -391,7 +395,7 @@ app 进程  postAppSpecialize ──→ 本地轮询 /proc/self/mountinfo 等 /s
                             （上限 MODULE_PROXY_WAIT_MS 100ms；超时就放行，由后台重试补挂）
 ```
 
-injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫描（`maybe_periodic_scan`），此后新应用的发现完全依赖该模块——通知比轮询及时，也免去了持续扫描 `/proc` 的开销。
+injector 收到**首次**通知即置 `g_passive_mode` 并永久停止周期扫描（`maybe_periodic_scan`），此后新应用的发现完全依赖该模块。若以 `--passive` 启动，启动期的存量死挂载扫描也跳过；旧存活应用需要后续 IPC 或重启才能重新注入，不承诺存量死连接自动恢复。
 
 因此 Zygisk 模块**必须 64/32 位双 ABI 部署**：只装 64 位时，任一 64 位应用触发被动模式后，跑在 32 位 zygote 上的应用既收不到通知、也等不到扫描，将彻底漏注入。打包脚本对两个 ABI 都有存在性断言。
 

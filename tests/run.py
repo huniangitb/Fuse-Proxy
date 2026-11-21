@@ -404,8 +404,21 @@ SUITE_MAP = [
      ("reload_name_matches", "NSP_RELOAD_DEBOUNCE_MS", "NSP_RELOAD_MAX_DEFER_MS"),
      "配置重载只认 .conf 结尾（list.config 不再触发整份重载）"),
 
-    # FUSE worker 线程数：2 个在单个应用冷启动时排队，按核数一把梭又会互抢 CPU，
-    # 默认取 min(max(2, ncpu/2), 8)，显式值（0 单线程 / -1 libfuse 默认）仍保留。
+    # 1122 安全合并：源码包真实新增行为，旧源码路径可复验，不运行附件脚本。
+    (("test_import_1122_daemon.py",),
+     ("tests/test_import_1122_daemon.py", "tests/fixtures/import_1122_daemon_driver.c",
+      "src/daemon/fw_rules.c", "src/daemon/fuse_daemon.c", "src/core/common.c", "include/common.h"),
+     ("common_storage_child_path", "common_mkdir_storage_child", "common_apply_fd_attrs",
+      "new_entry_mode", "br_ensure_sandbox_dir",
+      "vfs_mknod", "chmod_acl_drop_note"),
+     "沙盒 Android 补建、mknod 补父、ACL chmod 日志限频与路径边界"),
+    (("test_import_1122_injector.py",),
+     ("tests/test_import_1122_injector.py", "tests/fixtures/import_1122_injector.c",
+      "src/injector/ipc_server.c", "src/injector/injector.c", "src/injector/ns_utils.c"),
+     ("ipc_post_mount_thread", "retry_pending_mounts"),
+     "超时盯梢入队、当前 UID/目标/命名空间重验及 passive 启动分支"),
+
+    # FUSE worker 默认按核数取 min(max(4, ncpu), 16)，配置覆盖仍保留。
     (("test_fuse_threads.py",),
      ("include/fuse_threads.h", "src/daemon/fuse_daemon.c", "src/injector/injector.c",
       "src/config/config_parser.c", "include/config_parser.h", "docs/config.md"),
@@ -526,6 +539,8 @@ LAYERS = {
             "test_build_scripts.py",
             "test_inject_reload_filter.py",
             "test_fuse_threads.py",
+            "test_import_1122_daemon.py",
+            "test_import_1122_injector.py",
             "test_hide_errno.py",
             "test_fuse_copy_range.py",
         ),
@@ -754,6 +769,8 @@ PARALLEL_SAFE = frozenset({
     "test_build_scripts.py",      # 假 HOME + PATH 桩跑脚本，TemporaryDirectory，不碰真实路径
     "test_inject_reload_filter.py",  # 抽出 injector.c 的纯函数直编，无挂载/无 daemon
     "test_fuse_threads.py",          # 抽出 fuse_threads.h 的内联函数直编，无挂载/无 daemon
+    "test_import_1122_daemon.py",    # 实际函数 + common，temp FIFO/目录，无挂载/无 daemon
+    "test_import_1122_injector.py",  # 实际函数 + retry_queue，合成 proc/ns，无挂载/无 daemon
     "test_hide_errno.py",            # 直编 nsp_hide_errno.h 的内联函数，无挂载/无 daemon
     "test_fuse_copy_range.py",       # 只读源码文本做静态契约，无挂载/无 daemon
 })

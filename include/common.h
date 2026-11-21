@@ -123,6 +123,16 @@ void persist_log_to_disk(const char* log_type, const char* message, bool append_
 void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz);
 void common_storage_root(int user_id, char* out, size_t sz);
 int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz);
+/* 已合成存储目录的单组件子路径：parent 必须在有效存储根的用户层之下，
+ * 且不含 ./.. 组件（词法校验，不解析符号链接）；
+ * child 不得为空、含斜杠或为 ./..；不做 I/O，失败返回 -1 并清空输出。
+ * out 不得与 parent/child 重叠；过长返回 ENAMETOOLONG，不输出截断路径。 */
+int common_storage_child_path(const char* parent, const char* child, char* out, size_t sz);
+/* 只物化既有存储目录的单组件子目录：沿可信存储根逐级 nofollow 打开 parent，
+ * 不创建用户根/祖先；child 已存在也必须是目录，符号链接一律拒绝。
+ * mkdirat 新建成功后经固定 fd 继承属性（失败仍 best-effort），EEXIST 时不改属性。
+ * 不钉住 mkdirat 与 openat 之间的新建 inode；但不跟随可换名路径做写操作。 */
+int common_mkdir_storage_child(const char* parent, const char* child, mode_t mode);
 void common_view_path(int user_id, const char* sub_path, char* out, size_t sz);
 /* common_fuse_user_path：FUSE 视角路径（"/<user_id><sub_path>"）——common_parse_user_layer
  * 的逆运算，供事件通道把 QUERY 的绝对 spath 反解结果交回 fw_acl_check/fw_rules_resolve

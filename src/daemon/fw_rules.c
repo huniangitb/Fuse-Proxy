@@ -1018,11 +1018,19 @@ static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path
    已算出的真实路径：后续 open/mkdir 以真实 errno 裁决。 */
 static void br_ensure_sandbox_dir(const char* dir) {
     if (!dir || !dir[0]) return;
+    /* Android 根参与沙盒镜像，须在内核 lookup 父目录之前补建。先检查完整路径，
+       放不下就不做 FS 操作；不缓存“已建好”，同线程删除/重载后仍须修复。 */
+    char sub_android[PATH_MAX];
+    if (common_storage_child_path(dir, "Android", sub_android, sizeof sub_android) < 0) return;
     /* 落点经守卫出口补建：effective_uid 来自路径解析（无存在性校验的历史形态），
-       若一级组件缺失不得替应用在存储根下 materialize 出目录（见 common.h）。
-       非存储根落点（自定义 REDIRECT 目标）照旧递归创建。 */
-    if (access(dir, F_OK) == 0) return;
-    if (common_mkdir_within_storage(dir, 0775) == 0) return;
+       若一级组件缺失不得替应用在存储根下 materialize 出目录（见 common.h）。 */
+    const char* failed_dir = dir;
+    if (access(dir, F_OK) == 0 || common_mkdir_within_storage(dir, 0775) == 0) {
+        /* 只补 Android 本身；data/obb/media 容器及自家私有目录仍让位真实树。
+           新增子目录只走逐组件 nofollow/dirfd 出口，避免 root/祖先/child 链接向外写。 */
+        if (common_mkdir_storage_child(dir, "Android", 0775) == 0) return;
+        failed_dir = sub_android;
+    }
     /* 补建失败不改裁决（后续 open/mkdir 以真实 errno 收场），但要留观测：
        落点是我们自己改写的，应用侧只会看到「文件不在」，分不清是规则问题还是
        目录没建起来。限速与本文件其它观测同节奏：首个命中与每 1024 次各一条。 */
@@ -1030,7 +1038,7 @@ static void br_ensure_sandbox_dir(const char* dir) {
     static atomic_ulong fail_seq;
     unsigned long n = atomic_fetch_add_explicit(&fail_seq, 1, memory_order_relaxed) + 1;
     if (n == 1 || (n & 1023u) == 0)
-        LOG_WRN("沙盒落点补建失败: %s errno=%d（累计 %lu 次）", dir, mkdir_errno, n);
+        LOG_WRN("沙盒落点补建失败: %s errno=%d（累计 %lu 次）", failed_dir, mkdir_errno, n);
 }
 
 /* 沙盒重定向的限速观测（WARN）：现场遇到 ENOENT 时先看这里——路径是被我们改写

@@ -2737,6 +2737,18 @@ static int vfs_mknod(const char* path, mode_t mode, dev_t rdev) {
        出来的节点属主是 root、mode 是 mode & ~umask，与同目录下 create 出来的
        条目（属主=父目录属主、mode=调用方 mode）方向完全相反。 */
     int ret = mknod(p, mode, rdev);
+    if (ret == -1 && errno == ENOENT) {
+        /* 沙盒/REDIRECT 的虚拟父目录可能尚未落盘；只经守卫出口补父，
+           不创建缺失的存储根一级组件，也不重试权限或其他业务错误。 */
+        char* p_dup = strdup(p);
+        if (p_dup) {
+            if (common_mkdir_within_storage(dirname(p_dup), 0775) == 0)
+                ret = mknod(p, mode, rdev);
+            int err = errno;
+            free(p_dup);
+            errno = err;
+        }
+    }
     if (ret == -1) {
         int err = errno;
         log_fuse_err("MKNOD", path, err);
@@ -2767,6 +2779,15 @@ static int vfs_fsyncdir(const char* path, int datasync, struct fuse_file_info* f
     VFS_RETURN(0);
 }
 
+/* ACL chmod 的丢弃结果不变，观测沿用框架首个/每 1024 次的有界计数。 */
+static void chmod_acl_drop_note(const char* path, mode_t mode) {
+    static atomic_ulong seq;
+    unsigned long n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed) + 1;
+    if (n == 1 || (n & 1023u) == 0)
+        LOG_WRN("丢弃带 ACL 条目的 chmod: path=%s mode=%04o（累计 %lu 次）",
+                path, (unsigned)(mode & 07777), n);
+}
+
 static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)fi;
     /* 与 AOSP 的取舍：普通条目上我们的 backing 是真实文件系统，属性可以真的保存
@@ -2785,7 +2806,7 @@ static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
        文件管理器按 ACL 设好的 a_* 权限压回 mode 位模型。AOSP 遇到已存在的
        system.posix_acl_access 也是丢弃 mode 变更。 */
     if (lgetxattr(p, "system.posix_acl_access", NULL, 0) > 0) {
-        LOG_WRN("丢弃带 ACL 条目的 chmod: path=%s mode=%04o", path, (unsigned)(mode & 07777));
+        chmod_acl_drop_note(path, mode);
         VFS_RETURN(0);
     }
     int ret = chmod(p, mode);

@@ -9,6 +9,7 @@
 #include "config_parser.h"
 #include "ns_utils.h"
 #include "ns_mnt_watch.h"
+#include "ns_mnt_wait.h"
 #include "fast_pid.h"
 #include "inject_target.h"
 #include "reaped_managed.h"
@@ -39,6 +40,7 @@
 #include <ctype.h>
 #include <fnmatch.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/syscall.h>
 
 volatile sig_atomic_t g_should_exit = 0;
@@ -512,8 +514,13 @@ void handle_fuse_ready_event(void* ptr) {
            repair_stale_app_mounts_at_startup）。 */
         if (g_pending_startup_scan) {
             g_pending_startup_scan = 0;
-            int repaired = repair_stale_app_mounts_at_startup();
-            if (repaired > 0) LOG("启动扫描: 修复了 %d 个连接已断的应用挂载", repaired);
+            /* 被动模式只处理新 IPC 通知，避免存量逐进程修复阻塞启动；旧应用需重启。 */
+            if (!g_passive_mode) {
+                int repaired = repair_stale_app_mounts_at_startup();
+                if (repaired > 0) LOG("启动扫描: 修复了 %d 个连接已断的应用挂载", repaired);
+            } else {
+                LOG_DBG("被动模式: 跳过存量应用启动修复，旧应用需重启或重新 IPC 通知");
+            }
         }
         if (g_pending_first_scan) {
             g_pending_first_scan = 0;
@@ -1473,6 +1480,91 @@ static void maybe_periodic_scan(void) {
     }
 }
 
+/* 读取 stat 的 PPid/starttime；comm 可含空格和 ')'，不能按空白拆整行。 */
+static bool retry_proc_identity(int pid, int* ppid, unsigned long long* starttime) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    char* text = read_file_dynamic(path, NULL, 4096);
+    if (!text) return false;
+    char* end = NULL;
+    errno = 0;
+    long actual_pid = strtol(text, &end, 10);
+    char* close = strrchr(text, ')');
+    bool ok = errno == 0 && actual_pid == pid && end && end[0] == ' ' && end[1] == '(' &&
+              close && close > end && close[1] == ' ';
+    char* cursor = ok ? close + 2 : NULL;
+    for (int field = 3; ok && field <= 22; field++) {
+        while (*cursor == ' ') cursor++;
+        char* token_end = cursor;
+        while (*token_end && !isspace((unsigned char)*token_end)) token_end++;
+        ok = token_end != cursor;
+        if (!ok) break;
+        if (field == 4 || field == 22) {
+            for (char* p = cursor; p < token_end; p++) {
+                if (!isdigit((unsigned char)*p)) { ok = false; break; }
+            }
+            errno = 0;
+            unsigned long long value = strtoull(cursor, &end, 10);
+            ok = ok && errno == 0 && end == token_end;
+            if (field == 4) {
+                ok = ok && value > 0 && value <= INT_MAX;
+                if (ok) *ppid = (int)value;
+            } else {
+                ok = ok && value > 0;
+                if (ok) *starttime = value;
+            }
+        }
+        cursor = token_end;
+    }
+    free(text);
+    return ok;
+}
+
+typedef struct {
+    int ppid, parent_ppid;
+    unsigned long long start, parent_start;
+    dev_t dev, parent_dev;
+    ino_t ino, parent_ino;
+} RetryMountIdentity;
+
+/* /storage/emulated 可能早已存在于 zygote ns，不能拿它证明已隔离。
+ * 只接受可识别的当前 zygote/USAP 父进程且 ns 不同；未知/重挂靠有界重试。
+ * 双读身份和 namespace 防止采样间的 PID 复用、reparent 或再次换 ns。 */
+static bool retry_mount_ns_ready(int pid, RetryMountIdentity* identity) {
+    int ppid = 0, parent_ppid = 0, ppid_after = 0, parent_ppid_after = 0;
+    unsigned long long start = 0, parent_start = 0, start_after = 0, parent_start_after = 0;
+    if (!retry_proc_identity(pid, &ppid, &start) || ppid <= 1 ||
+        !retry_proc_identity(ppid, &parent_ppid, &parent_start)) return false;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/cmdline", ppid);
+    char* cmd = read_file_dynamic(path, NULL, 4096);
+    if (!cmd) return false;
+    size_t len = strlen(cmd);
+    bool zygote = strcmp(cmd, "zygote") == 0 || strcmp(cmd, "zygote64") == 0 ||
+                  strcmp(cmd, "usap32") == 0 || strcmp(cmd, "usap64") == 0 ||
+                  (len > 7 && strcmp(cmd + len - 7, "_zygote") == 0);
+    free(cmd);
+    if (!zygote) return false;
+    dev_t dev, parent_dev, dev_after, parent_dev_after;
+    ino_t ino, parent_ino, ino_after, parent_ino_after;
+    if (!ns_mnt_wait_capture(pid, &dev, &ino) ||
+        !ns_mnt_wait_capture(ppid, &parent_dev, &parent_ino) ||
+        (dev == parent_dev && ino == parent_ino)) return false;
+    bool stable = retry_proc_identity(pid, &ppid_after, &start_after) && ppid == ppid_after &&
+           start == start_after &&
+           retry_proc_identity(ppid, &parent_ppid_after, &parent_start_after) &&
+           parent_ppid == parent_ppid_after && parent_start == parent_start_after &&
+           ns_mnt_wait_capture(pid, &dev_after, &ino_after) && dev == dev_after && ino == ino_after &&
+           ns_mnt_wait_capture(ppid, &parent_dev_after, &parent_ino_after) &&
+           parent_dev == parent_dev_after && parent_ino == parent_ino_after;
+    if (!stable) return false;
+    *identity = (RetryMountIdentity){
+        .ppid = ppid, .parent_ppid = parent_ppid, .start = start, .parent_start = parent_start,
+        .dev = dev, .parent_dev = parent_dev, .ino = ino, .parent_ino = parent_ino
+    };
+    return true;
+}
+
 static void retry_pending_mounts(void) {
     if (!g_fuse_ready) return;
     const char* mnt_src_retry = get_active_mnt_src();
@@ -1497,6 +1589,31 @@ static void retry_pending_mounts(void) {
             continue;
         }
         uid_t uid = get_app_uid(e.pid);
+        if (uid == 0 || uid == (uid_t)-1 || is_isolated_uid(uid)) {
+            nsp_retry_done(e.pid);
+            remove_tracked(e.pid);
+            continue;
+        }
+        RetryMountIdentity before, after;
+        if (!retry_mount_ns_ready(e.pid, &before)) continue;
+        if (!is_target_app(e.pkg, uid, e.pid, true)) {
+            nsp_retry_done(e.pid);
+            remove_tracked(e.pid);
+            continue;
+        }
+        /* UID 可在 specialize 中变化；配置裁决后再验证，禁止用 pre 的旧 UID 挂。 */
+        uid_t current_uid = get_app_uid(e.pid);
+        if (current_uid == 0 || current_uid == (uid_t)-1 || is_isolated_uid(current_uid)) {
+            nsp_retry_done(e.pid);
+            remove_tracked(e.pid);
+            continue;
+        }
+        /* 配置前后必须是同一对进程和 ns；两次各自稳定不代表跨窗口同一身份。 */
+        if (current_uid != uid || !retry_mount_ns_ready(e.pid, &after) ||
+            before.ppid != after.ppid || before.parent_ppid != after.parent_ppid ||
+            before.start != after.start || before.parent_start != after.parent_start ||
+            before.dev != after.dev || before.parent_dev != after.parent_dev ||
+            before.ino != after.ino || before.parent_ino != after.parent_ino) continue;
         LOG_DBG("重试挂载 %s(PID:%d, UID:%d) 第 %d 次", e.pkg, e.pid, uid, e.attempts);
         /* 结果由 handle_async_mount_event 收尾：成功清账、失败重新入队等下一轮退避。
            这里**不**按返回值摘条目——异步派发成功不等于挂载成功（旧实现正是在此

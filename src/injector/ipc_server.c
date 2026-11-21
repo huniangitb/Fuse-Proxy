@@ -6,6 +6,7 @@
 #include "nsp_util.h"
 #include "injector.h"
 #include "inject_target.h"
+#include "retry_queue.h"
 #include "mount_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -473,6 +474,13 @@ static void* ipc_post_mount_thread(void* raw) {
         /* 没等到切换就绝不挂：此时挂上去会落进 zygote 的命名空间，被之后 fork 的
            每个应用继承且无法清理。应用先用原生视图跑，视图交后台重试队列补。 */
         remove_tracked(arg->pid);
+        uid_t current_uid = get_app_uid(arg->pid);
+        if (kill(arg->pid, 0) == 0 && current_uid != 0 && current_uid != (uid_t)-1 &&
+            !is_isolated_uid(current_uid)) {
+            schedule_retry_mount(arg->pkg, arg->pid);
+        } else {
+            nsp_retry_done(arg->pid); /* 取消而非成功：清掉 specialize 前已有的条目 */
+        }
         LOG_DBG("IPC补挂载跳过: %s(PID:%d) %ldms 内未见命名空间切换", arg->pkg, arg->pid,
                 waited_ms);
         free(arg);

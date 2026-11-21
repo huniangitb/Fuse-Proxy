@@ -326,6 +326,19 @@ static bool path_in_private_tree(const char* real_path) {
     return private_tree_prefix(sub);
 }
 
+static mode_t new_entry_mode(const char* real_path, mode_t caller_mode,
+                             const struct stat* parent, mode_t entry_mode) {
+    bool is_dir = S_ISDIR(entry_mode);
+    mode_t mode = caller_mode & 07777;
+    if (mode == 0) mode = parent->st_mode & 07777;
+    if (path_in_shared_storage(real_path))
+        return shared_storage_mode(mode, parent, is_dir);
+    if (is_dir)
+        return (parent->st_mode & S_ISGID) ? (mode | S_ISGID) : (mode & ~S_ISGID);
+    if (S_ISREG(entry_mode) && path_in_private_tree(real_path)) mode |= 0060;
+    return mode;
+}
+
 /* 新建条目的属性收尾（唯一出口）：create / mkdir / mknod / symlink / 父目录补建 /
    沙盒落点全部经这里定最终 mode 与属主，各回调不得再自己 chmod。
 
@@ -375,18 +388,7 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
         /* 失败不致命（例如后端目标不支持 chown）：mode 照旧收敛，errno 留给调用点 */
     }
     if (!S_ISLNK(est.st_mode)) {
-        bool is_dir = S_ISDIR(est.st_mode);
-        mode_t final_mode = caller_mode & 07777;
-        if (final_mode == 0) final_mode = pst.st_mode & 07777;
-        if (path_in_shared_storage(real_path)) {
-            final_mode = shared_storage_mode(final_mode, &pst, is_dir);
-        } else if (is_dir) {
-            final_mode =
-                (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
-        } else if (S_ISREG(est.st_mode) && path_in_private_tree(real_path)) {
-            final_mode |= 0060;
-        }
-        chmod(real_path, final_mode);
+        chmod(real_path, new_entry_mode(real_path, caller_mode, &pst, est.st_mode));
     }
 #ifdef TARGET_ANDROID
     char context[256];
@@ -863,6 +865,105 @@ int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz) {
     else
         snprintf(out, sz, STORAGE_BASE "/%d/Android/data/%s/%s", uid, pkg, dirname);
     return 0;
+}
+
+int common_storage_child_path(const char* parent, const char* child, char* out, size_t sz) {
+    if (!out || sz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    out[0] = '\0';
+    if (!parent || !child || !child[0] || strchr(child, '/') ||
+        strcmp(child, ".") == 0 || strcmp(child, "..") == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t plen = strnlen(parent, PATH_MAX);
+    size_t clen = strnlen(child, NAME_MAX + 1);
+    if (plen == PATH_MAX || clen > NAME_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof base);
+    size_t blen = strlen(base);
+    if (!blen || plen <= blen || strncmp(parent, base, blen) != 0 || parent[blen] != '/' ||
+        common_parse_user_layer(parent + blen, nullptr, nullptr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (const char* p = parent + blen; *p;) {
+        if (*p == '/') { p++; continue; }
+        const char* start = p;
+        while (*p && *p != '/') p++;
+        size_t n = (size_t)(p - start);
+        if ((n == 1 && start[0] == '.') ||
+            (n == 2 && start[0] == '.' && start[1] == '.')) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    while (plen > blen + 1 && parent[plen - 1] == '/') plen--;
+    if (plen + 1 + clen >= sz || plen + 1 + clen >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, parent, plen);
+    out[plen] = '/';
+    memcpy(out + plen + 1, child, clen + 1);
+    return 0;
+}
+
+/* fd 属性收尾与路径口径复用同一个 mode 算法；路径仅用于词法归类，
+ * 不用它 stat/chown/chmod/xattr，避免 mkdir 后名字被换成链接时穿透目标。 */
+static void common_apply_fd_attrs(int parent_fd, int child_fd, const char* path, mode_t mode) {
+    struct stat pst, est;
+    if (fstat(parent_fd, &pst) != 0 || fstat(child_fd, &est) != 0) return;
+    (void)fchown(child_fd, pst.st_uid, pst.st_gid);
+    (void)fchmod(child_fd, new_entry_mode(path, mode, &pst, est.st_mode));
+#ifdef TARGET_ANDROID
+    char context[256];
+    ssize_t len = fgetxattr(parent_fd, "security.selinux", context, sizeof context);
+    if (len > 0)
+        (void)fsetxattr(child_fd, "security.selinux", context, (size_t)len, 0);
+    else if (strncmp(path, STORAGE_BASE, sizeof(STORAGE_BASE) - 1) == 0)
+        (void)fsetxattr(child_fd, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
+                       sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
+#endif
+}
+
+int common_mkdir_storage_child(const char* parent, const char* child, mode_t mode) {
+    char path[PATH_MAX], base[PATH_MAX];
+    if (common_storage_child_path(parent, child, path, sizeof path) < 0) return -1;
+    common_storage_base(base, sizeof base);
+    size_t blen = strlen(base);
+    char components[PATH_MAX];
+    /* 完整 child 路径已通过长度与根边界校验，parent 后缀必然放得下。 */
+    memcpy(components, parent + blen, strlen(parent + blen) + 1);
+    const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    int fd = open(base, flags);
+    if (fd < 0) return -1;
+    int rc = -1, child_fd = -1;
+    char* save = nullptr;
+    for (char* part = strtok_r(components, "/", &save); part;
+         part = strtok_r(nullptr, "/", &save)) {
+        int next = openat(fd, part, flags);
+        if (next < 0) goto done;
+        close(fd);
+        fd = next;
+    }
+    bool created = mkdirat(fd, child, mode) == 0;
+    if (!created && errno != EEXIST) goto done;
+    child_fd = openat(fd, child, flags);
+    if (child_fd < 0) goto done;
+    if (created) common_apply_fd_attrs(fd, child_fd, path, mode);
+    rc = 0;
+done:;
+    int saved_errno = errno;
+    if (child_fd >= 0) close(child_fd);
+    close(fd);
+    errno = saved_errno;
+    return rc;
 }
 
 /* ================= 存储根一级条目守卫 =================

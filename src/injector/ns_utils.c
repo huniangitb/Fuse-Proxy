@@ -29,6 +29,7 @@
 #include "fast_search.h"
 #include "injector.h"
 #include "inject_target.h"
+#include "retry_queue.h"
 /* 非 static 导出：全局替换方案（ns_global_replace.c）共用此 ns 错误日志 */
 void log_ns_error(const char* format, ...) {
     int fd = open(ERROR_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
@@ -1313,21 +1314,22 @@ void handle_async_mount_event(void* ptr) {
          * 2) 目标进程尚未被其他重试成功挂载上 FUSE
          */
         bool alive = (kill(ctx->target_pid, 0) == 0);
+        uid_t uid = alive ? get_app_uid(ctx->target_pid) : 0;
+        bool retryable_uid = uid != 0 && uid != (uid_t)-1 && !is_isolated_uid(uid);
         bool already_mounted = false;
-        if (alive) {
+        if (alive && retryable_uid) {
             char tgt[128];
-            uid_t uid = get_app_uid(ctx->target_pid);
             get_target_storage_path(uid, tgt, sizeof(tgt));
             already_mounted = (ns_is_mounted(ctx->target_pid, tgt, "fuse.fuse_daemon") > 0 ||
                                ns_is_mounted(ctx->target_pid, tgt, "fuse_daemon") > 0);
         }
-        if (alive && !already_mounted) {
+        if (!retryable_uid) {
+            /* 已死/isolated/未知 UID 不延续 specialize 前的重试记账。 */
+            nsp_retry_done(ctx->target_pid);
+            remove_tracked(ctx->target_pid);
+        } else if (alive && !already_mounted) {
             /* 加入重试队列并从追踪中移除，确保后续扫描可重新发现并注入 */
             schedule_retry_mount(ctx->pkg_name, ctx->target_pid);
-            remove_tracked(ctx->target_pid);
-        } else if (!alive) {
-            LOG_DBG("异步挂载失败，进程已死，不重试: %s(PID:%d)", ctx->pkg_name,
-                    ctx->target_pid);
             remove_tracked(ctx->target_pid);
         } else {
             LOG_DBG("异步挂载失败但目标已存在FUSE挂载，不重试: %s(PID:%d)", ctx->pkg_name,
