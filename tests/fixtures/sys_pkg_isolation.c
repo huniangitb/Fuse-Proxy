@@ -103,6 +103,13 @@ int __wrap_fclose(FILE* fp) {
     if (gate_role == 2 && fp == target) { target = NULL; gate(); }
     return __real_fclose(fp);
 }
+static _Atomic int g_joins; /* --wrap=pthread_join 计数：装载线程真被回收几次 */
+int __real_pthread_join(pthread_t th, void** ret);
+int __wrap_pthread_join(pthread_t th, void** ret) {
+    atomic_fetch_add(&g_joins, 1);
+    return __real_pthread_join(th, ret);
+}
+
 FILE* __wrap_popen(const char* command, const char* mode) {
     (void)command; (void)mode;
     FILE* fp = tmpfile();
@@ -248,6 +255,32 @@ static void cold_query_async(void) {
     check(tasks() == 1, "cleanup joins the loader thread (no stray worker left)");
 }
 
+/* 连续多轮「1s 复查到期 → 新装载」之间不 cleanup：上一轮的装载线程必须在下次请求时
+ * 被 join 回收。不回收的话每轮留下一个已退出未 join 的线程（8MB 栈映射），空 cache
+ * 的 daemon 每秒复查一次会稳定漏上去。 */
+/* 连续多轮「1s 复查到期 → 新装载」之间不 cleanup：上一轮的装载线程必须在下次请求时
+ * 被 join 回收。POSIX 只在线程被 join 时释放它的资源（不管它是否已经退出），空 cache
+ * 的 daemon 每秒复查一次，不回收就是稳定漏。用 --wrap=pthread_join 数真实回收次数。 */
+static void loader_reap(void) {
+    sys_pkg_cleanup();
+    FILE* fp = fopen(CONFIG_DIR "/sys_pkgs.cache", "w"); /* 空 cache：发布空表并登记复查 */
+    if (fp) fclose(fp);
+    sys_pkg_init(false);
+    const int joins_before = atomic_load(&g_joins);
+    int loads = 0;
+    for (int i = 0; i < 3; i++) {
+        const int reads_before = atomic_load(&g_cache_reads);
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 100 * 1000000L};
+        nanosleep(&ts, NULL);
+        (void)sys_pkg_is_system("com.android.systemui"); /* 复查到期 → 起新一轮装载 */
+        for (int w = 0; w < 200 && atomic_load(&g_cache_reads) == reads_before; w++) usleep(1000);
+        if (atomic_load(&g_cache_reads) > reads_before) loads++;
+    }
+    const int reaps = atomic_load(&g_joins) - joins_before;
+    check(loads == 3, "each recheck starts a new background load");
+    check(reaps >= 2, "each background load reaps the previous loader thread");
+    sys_pkg_cleanup();
+}
 static void cleanup_epoch(bool init) {
     sys_pkg_cleanup(); write_cache("com.system.old\n"); if (!init) sys_pkg_init(false); reset_gate();
     Job slow = {.role=1, .action=init ? 1 : 0}; pthread_t s = start(&slow); check(await_gate(), "cleanup epoch read gate entered");
@@ -300,7 +333,7 @@ static void cache_unchanged(void) {
 }
 int main(void) {
     int before = fds(); config_init_lock();
-    isolation(1); isolation(2); cold_init(); cold_query_async();
+    isolation(1); isolation(2); cold_init(); cold_query_async(); loader_reap();
     cleanup_epoch(false); cleanup_epoch(true); latest_epoch(false); latest_epoch(true);
     lifecycle_stress(); cache_unchanged();
     check(!sys_pkg_is_system(NULL) && !sys_pkg_is_system("") && !sys_pkg_is_system("com.unknown"), "unknown NULL empty semantics");

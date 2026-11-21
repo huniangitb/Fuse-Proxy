@@ -378,6 +378,7 @@ void sys_pkg_init(bool allow_pm) {
  * epoch 守卫（cleanup 之后迟到发布被拒，不会碰已释放的表）。 */
 static pthread_t g_sys_pkg_loader_thread;
 static bool g_sys_pkg_loader_running; /* 受 g_sys_pkg_mutex 保护 */
+static bool g_sys_pkg_loader_reap;    /* 同上：tid 已记账、还没 join 回收 */
 
 /* 冷缓存/复查到期时的装载：只读 cache（from_query 语义，永不 fork pm）。 */
 static void sys_pkg_load_due(void) {
@@ -409,7 +410,20 @@ static void* sys_pkg_loader_main(void* unused) {
  * 「永远无表」的假答案（那会把系统应用判成普通应用，类别段直接错判）。 */
 static void sys_pkg_request_load(void) {
     pthread_mutex_lock(&g_sys_pkg_mutex);
-    if (g_sys_pkg_loader_running) {
+    if (g_sys_pkg_loader_running) { /* 已有一轮在跑：合并，不攒线程 */
+        pthread_mutex_unlock(&g_sys_pkg_mutex);
+        return;
+    }
+    /* 上一轮已退出但还没回收：先 join 掉它。POSIX 只在线程被 join 时才释放它的
+       资源（与它是否已经退出无关），空 cache 的 daemon 每秒复查一次会稳定累积。
+       它已经退出，join 只等最后的返回指令，不碰磁盘。 */
+    pthread_t prev = g_sys_pkg_loader_thread;
+    bool reap = g_sys_pkg_loader_reap;
+    g_sys_pkg_loader_reap = false;
+    pthread_mutex_unlock(&g_sys_pkg_mutex);
+    if (reap) pthread_join(prev, NULL);
+    pthread_mutex_lock(&g_sys_pkg_mutex);
+    if (g_sys_pkg_loader_running) { /* 并发的另一个请求抢先起了线程 */
         pthread_mutex_unlock(&g_sys_pkg_mutex);
         return;
     }
@@ -419,6 +433,7 @@ static void sys_pkg_request_load(void) {
     pthread_t th;
     if (pthread_create(&th, NULL, sys_pkg_loader_main, NULL) == 0) {
         g_sys_pkg_loader_thread = th;
+        g_sys_pkg_loader_reap = true;
         pthread_mutex_unlock(&g_sys_pkg_mutex);
         return;
     }
@@ -432,8 +447,9 @@ void sys_pkg_cleanup(void) {
     bool join_loader;
     pthread_mutex_lock(&g_sys_pkg_mutex);
     ++g_sys_pkg_epoch; /* 先关迟到发布路径，再回收表 */
-    join_loader = g_sys_pkg_loader_running;
+    join_loader = g_sys_pkg_loader_running || g_sys_pkg_loader_reap;
     loader = g_sys_pkg_loader_thread;
+    g_sys_pkg_loader_reap = false;
     SysPkgTable* old = g_sys_pkg_table;
     g_sys_pkg_table = NULL;
     g_sys_pkg_loaded = false;
@@ -446,6 +462,7 @@ void sys_pkg_cleanup(void) {
        会成功）。cleanup 的语义是「之后没有表」，所以 join 完再摘一次：否则
        cleanup 之后仍留着一张没人要的旧视图，紧随的 init 会提前返回。 */
     pthread_mutex_lock(&g_sys_pkg_mutex);
+    g_sys_pkg_loader_running = false; /* join 保证线程已退出（没线程时本就是 false） */
     SysPkgTable* late = g_sys_pkg_table;
     g_sys_pkg_table = NULL;
     g_sys_pkg_loaded = false;
