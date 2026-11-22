@@ -144,6 +144,19 @@ static bool file_has(const char* path, const char* needle) {
     return found;
 }
 
+static int tasks(void);
+
+/* pthread_join 返回后，内核仍可能晚一拍才摘掉 /proc/self/task 里的条目（本仓其它
+   线程数断言都踩过）：退出后的收尾断言要给一个有界收敛窗口，而不是立刻快照。 */
+static int tasks_settle(void) {
+    for (int i = 0; i < 400; i++) {
+        int n = tasks();
+        if (n <= 1) return n;
+        usleep(5000);
+    }
+    return tasks();
+}
+
 static int tasks(void) {
     DIR* dir = opendir("/proc/self/task");
     if (!dir) return -1;
@@ -183,7 +196,7 @@ int main(int argc, char** argv) {
         int calls = atomic_load(&g_fsync_calls);
         uid_cache_write_shutdown();
         printf("request_us=%lld flush_ms=%lld fsync_calls=%d file_has_entry=%d tasks=%d\n",
-               request_us, flush_ms, calls, has, tasks());
+               request_us, flush_ms, calls, has, tasks_settle());
         return (request_us < 5000 && flush_ms >= 150 && calls >= 1 && has == 1) ? 0 : 1;
     }
     if (!strcmp(mode, "coalesce")) {
@@ -200,7 +213,7 @@ int main(int argc, char** argv) {
         int calls = atomic_load(&g_fsync_calls);
         int lines = count_lines(map_path);
         uid_cache_write_shutdown();
-        printf("fsync_calls=%d entries_in_file=%d tasks=%d\n", calls, lines, tasks());
+        printf("fsync_calls=%d entries_in_file=%d tasks=%d\n", calls, lines, tasks_settle());
         return (calls <= 4 && lines == 50) ? 0 : 1;
     }
     if (!strcmp(mode, "shutdown")) {
@@ -209,8 +222,9 @@ int main(int argc, char** argv) {
         uid_cache_write_request();
         uid_cache_write_shutdown(); /* 不先 flush：退出路径必须把已请求的一轮写完 */
         int has = file_has(map_path, "com.exit.app") ? 1 : 0;
-        printf("file_has_entry=%d tasks=%d\n", has, tasks());
-        return (has == 1 && tasks() == 1) ? 0 : 1;
+        const int t = tasks_settle();
+        printf("file_has_entry=%d tasks=%d\n", has, t);
+        return (has == 1 && t == 1) ? 0 : 1;
     }
     if (!strcmp(mode, "inline-old")) {
         /* 旧实现：ACK 路径上直接 upsert（读全表 + tmp + fsync + rename）。

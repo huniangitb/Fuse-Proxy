@@ -21,6 +21,7 @@
 #endif
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +174,9 @@ static int run_locks(const char* dir) {
 }
 
 int main(int argc, char** argv) {
+    /* 慢读夹具用 FIFO 供 sys_pkgs.cache：配置线程若先关读端，写端会吃 SIGPIPE 直接
+       杀掉驱动（看到的是「退出码 -13」而不是可诊断的失败）。忽略信号，让写返回 EPIPE。 */
+    signal(SIGPIPE, SIG_IGN);
     if (argc < 3) {
         fprintf(stderr, "usage: %s <rules.conf> <config_dir>\n", argv[0]);
         return 2;
