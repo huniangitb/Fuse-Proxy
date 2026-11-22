@@ -423,8 +423,12 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
    判据必须按落点归类、不能按「属主是否与父目录相同」：应用私有树与共享存储可能被
    同一个 uid 拥有（私有树里的文件本来就归应用，父目录也可能归应用），此时属主一致
    却正是「来源树 mode 削到 0600」的典型现场。故这里不设「属主一致就早退」，只判
-   落点在不在共享存储；应用私有树的落点一律不动——那里的属主由 installd 的 ACL
-   体系决定，把共享存储的形状搬进去只会造出第二个共享存储。
+   落点在不在共享存储。
+
+   私有树的落点按 nsp_new_entry_attrs 同一条窄口径补位：属主跟随目标父目录，普通
+   文件补组位（0060），目录与符号链接不动。此前这里对私有树整体早退，rename 落位与
+   新建两条路的口径分叉：QQ 群文件这类「写入临时名再改名落位」的条目保持 0600，
+   MediaProvider 直通视图等非属主身份读不到——而同一个文件若走 create 落位就是 0660。
 
    同属共享存储内部的改名也照同一口径收敛：宽度由树决定，不由上一次是谁写的决定。
 
@@ -432,10 +436,11 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
    只会连搬移一起丢掉），故只记日志。符号链接跳过：chmod 会穿透链接改到目标文件。 */
 void nsp_rehome_moved_entry(const char* real_path) {
     if (!real_path || real_path[0] != '/') return;
-    if (!path_in_shared_storage(real_path)) return;
     struct stat est;
     if (lstat(real_path, &est) != 0) return; /* 已不在（并发删）：无事可做 */
     if (S_ISLNK(est.st_mode)) return;
+    bool shared = path_in_shared_storage(real_path);
+    if (!shared && !(S_ISREG(est.st_mode) && path_in_private_tree(real_path))) return;
     char parent[PATH_MAX];
     int wn = snprintf(parent, sizeof(parent), "%s", real_path);
     if (wn <= 0 || (size_t)wn >= sizeof(parent)) return;
@@ -449,7 +454,8 @@ void nsp_rehome_moved_entry(const char* real_path) {
         LOG_WRN("落位条目改属主失败: path=%s uid=%u gid=%u errno=%d", real_path,
                 (unsigned)pst.st_uid, (unsigned)pst.st_gid, errno);
     mode_t want = est.st_mode & 07777;
-    mode_t final_mode = shared_storage_mode(want, &pst, S_ISDIR(est.st_mode));
+    mode_t final_mode =
+        shared ? shared_storage_mode(want, &pst, S_ISDIR(est.st_mode)) : (want | 0060);
     if (final_mode != want && chmod(real_path, final_mode) != 0)
         LOG_WRN("落位条目改 mode 失败: path=%s mode=%04o errno=%d", real_path,
                 (unsigned)final_mode, errno);

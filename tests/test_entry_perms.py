@@ -16,7 +16,7 @@ FUSE_CAP_DONT_MASK），daemon 不得再用父目录 mode 覆盖它——否则 
 目录不补，树的隔离靠目录位，连目录一起放宽才会造出第二个共享存储。
 
 判别性用例（父目录 mode 覆盖实现下 1/2/5 失败；私有树不补位的实现下 6/7 失败；
-私有树连目录一起补位的实现下 11 失败）：
+私有树连目录一起补位的实现下 11 失败；rename 落位早退的旧实现下 14/15 失败）：
   1. umask 022 建目录 → 0755 | 0770 = 0775
   2. umask 077 建目录 → 0700 | 0770 = 0770
   3. 父目录无 setgid 时，新建子目录不带 S_ISGID
@@ -31,6 +31,9 @@ FUSE_CAP_DONT_MASK），daemon 不得再用父目录 mode 覆盖它——否则 
  12. 深层同名目录（/sdcard/x/Android/data）仍按共享存储补位：目录 0770
 附加：
  13. 结构条目的 chmod 被丢弃（AOSP 口径）
+ 14. 0600 文件 rename 进私有树 → 0660（与 create 同口径，QQ 群文件落位缺口）
+ 15. 0600 目录 rename 进私有树 → 0700（目录不补位）
+ 16. 私有树内改名同样补组位（0600 → 0660）
 
 前置：build_gnu/ 产物、/dev/fuse、fusermount3。
 """
@@ -250,6 +253,24 @@ def main():
                 ok(f"chmod 顶层目录被丢弃（{oct(before)} 保持不变）")
             else:
                 fail("chmod 顶层目录", f"权限被改：{oct(before)} → {oct(after)}")
+
+        print("\n── I. rename 落位私有树：与 create 同口径，普通文件补组位 ──")
+        # 源条目手工压回 0600（绕过 create 收尾，模拟「临时名被 umask 削过再改名」的现场）
+        with_umask(0o077, lambda: create(dl / "mv0600"))
+        os.chmod(dl / "mv0600", 0o600)
+        os.rename(dl / "mv0600", priv / "mv0600")
+        expect_mode("0600 文件 rename 进私有树（0600 | 0060）", 0o660, priv / "mv0600")
+        expect_owner("rename 落位私有树的属主/属组", priv / "mv0600", priv)
+
+        with_umask(0o077, lambda: os.mkdir(dl / "mvdir"))
+        os.chmod(dl / "mvdir", 0o700)
+        os.rename(dl / "mvdir", priv / "mvdir")
+        expect_mode("0700 目录 rename 进私有树（目录不补位）", 0o700, priv / "mvdir")
+
+        with_umask(0o077, lambda: create(priv / "inner0600"))
+        os.chmod(priv / "inner0600", 0o600)
+        os.rename(priv / "inner0600", priv / "inner0660")
+        expect_mode("私有树内改名（0600 | 0060）", 0o660, priv / "inner0660")
     finally:
         stop(p)
 

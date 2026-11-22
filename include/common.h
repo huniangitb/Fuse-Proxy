@@ -94,7 +94,8 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode);
    的属主与 mode 落地，而共享存储里的文件由读者按 DAC 判他属主条目——应用私有树里
    一个 0600、属主为应用的条目被搬进 /sdcard 后，除它自己谁也打不开。这里把落进
    共享存储的条目按目标父目录重新归属（属主/属组跟随父目录、mode 补上共享存储的
-   历史形状），私有树落点与同属主的搬移一律不动。语义与失败口径见实现。 */
+   历史形状）。私有树落点按 nsp_new_entry_attrs 的同一条窄口径：属主跟随目标父
+   目录、普通文件补组位（0060），目录与符号链接不动。语义与失败口径见实现。 */
 void nsp_rehome_moved_entry(const char* real_path);
 /* 读取整个文件到堆内存（动态扩容，尾随 NUL）。失败返回 NULL（max_size 超限时
    errno=EFBIG）。max_size > 0 时超过该上限即失败；0 表不限制。

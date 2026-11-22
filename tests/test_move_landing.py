@@ -15,7 +15,9 @@ uid（私有树里的文件本就归应用），属主一致却正是来源树 m
   A3. 0700 目录搬进带 setgid 的共享目录 → 02770
   A4. 0700 目录搬进不带 setgid 的共享目录 → 0770（不带 S_ISGID）
   B5. 属主/属组与目标父目录一致的搬移 → 仍按树补齐 0660（旧实现按属主早退得 0600）
-  C6. 搬进应用私有树（/Android/data/<包>）→ 属性原样不动
+  C6. 搬进应用私有树（/Android/data/<包>）→ 普通文件补组位 0660（与 create 同口径；
+      旧实现私有树落点整体早退得 0600，QQ 群文件这类「写临时名再改名落位」的条目
+      因此 MediaProvider 直通视图读不到）
   D7. 符号链接搬进共享目录 → 仍是链接，链接自身 mode 不动、不改到目标文件
 
 前置：build_gnu/ 产物、/dev/fuse、fusermount3。跨用户（uid）搬移需要 root，本套件
@@ -213,7 +215,7 @@ def main():
         expect_attrs("B5 同属主改名后补到 0660", 0o660, os.getgid(),
                      own_backing / "keep600.renamed")
 
-        print("\n── C. 私有树落点不动 ──")
+        print("\n── C. 私有树落点：普通文件补组位（与 create 同口径）──")
         pv = staging / "private.bin"
         open(pv, "w").close()
         os.chmod(pv, 0o600)
@@ -222,7 +224,7 @@ def main():
         except OSError as e:
             skip("C6 搬进应用私有树", f"ACL 层不允许本用户写该包目录（{e}）")
         else:
-            expect_attrs("C6 搬进应用私有树", 0o600, os.getgid(),
+            expect_attrs("C6 搬进应用私有树（0600 | 0060）", 0o660, os.getgid(),
                          STORAGE / "0" / "Android" / "data" / "com.example.app" / "private.bin")
 
         print("\n── D. 符号链接：只搬链接本身 ──")
