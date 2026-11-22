@@ -408,7 +408,9 @@ env -u PYTHONPATH -u BASH_ENV PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin
   ASan + `--wrap=read/shutdown/accept` 跑 SIGTERM 退出路径；`LOG_MONITOR_SRC=`
   指向旧源码时 ASan 报 heap-use-after-free。
 - **R15 构建脚本**：新增 `tests/test_build_scripts.py`（L0），假 HOME + rm/cmake
-  桩断言危险路径在 rm 之前被拒；`BUILD_SSH2_SCRIPT=` 指向旧脚本必失败。
+  桩断言危险路径在 rm 之前被拒；`BUILD_SSH2_SCRIPT=` 指向旧脚本必失败。另有静态断言
+  「`scripts/*.sh` 模式均为 100755」——本文件与 `acceptance.sh` 都直接执行脚本，
+  644 不会在静态检查里报错，只在真跑时报 permission denied（G6 隔离跑此前即如此）。
 
 内存验收：`meson setup build_asan2 -Dtarget_os=gnu -Denable_debug=true -Db_sanitize=address,undefined`（等价 `-Dwith_asan=true -Dwith_ubsan=true`）。**sanitizer 标志必须同时进编译与链接**——只进 `link_flags` 会「链接了运行时但零插桩」，核对方式：`compile_commands.json` 里每条命令都含 `-fsanitize`（`-Dwith_asan/with_ubsan` 仅在 `enable_debug=true` 下生效，release 下给出 warning 并忽略）。
 
