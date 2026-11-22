@@ -481,7 +481,8 @@ typedef struct {
     pid_t child_pid;
 } FuseReadyCtx;
 
-static void remount_all_tracked(void);
+static bool remount_all_tracked(void);
+static void request_fuse_jobs(unsigned jobs);
 static void maybe_reconcile_global_replace(void);
 static void grepl_reconcile_reset(void);
 
@@ -519,20 +520,18 @@ void handle_fuse_ready_event(void* ptr) {
                            规避透传协商位导致回包再次被拒 */
                         g_no_passthrough_fallback = true;
                         LOG("回退处理: 透传协商异常，改用 --no-passthrough 标准 FUSE 模式重启");
-                        if (g_global_fuse.fuse_pid > 0) {
-                            kill(g_global_fuse.fuse_pid, SIGTERM);
-                            for (int w = 0; w < 50; w++) {
-                                if (kill(g_global_fuse.fuse_pid, 0) != 0) break;
-                                usleep(20000);
-                            }
-                            if (g_global_fuse.fuse_pid > 0 && kill(g_global_fuse.fuse_pid, 0) == 0)
-                                kill(g_global_fuse.fuse_pid, SIGKILL);
-                        }
+                        /* 只发 SIGTERM，不在这里等它退出：10ms×50 轮轮询与 SIGKILL 升级
+                           就是 inject_global_fuse() 里那一段，现在跑在维护 worker 上。
+                           在事件循环上等最多 1s 会把 pre-hook 判定与 IPC ACK 一起冻住。 */
+                        if (g_global_fuse.fuse_pid > 0) kill(g_global_fuse.fuse_pid, SIGTERM);
                         dump_crash_log_tail(g_global_fuse.crash_log_start);
                     }
                     g_fuse_ready = 0;
                     g_pending_remount = 1;
                     seconds_until_next_scan = 0;
+                    /* 重启交给维护 worker：它会在 inject_global_fuse() 里做有界 kill/wait
+                       与卸载复核；等 tick 的 1s 探测会白等一轮。 */
+                    request_fuse_jobs(NSP_FUSE_JOB_RECOVER);
                 }
             } else {
                 g_fuse_ready = 1;
@@ -547,6 +546,10 @@ void handle_fuse_ready_event(void* ptr) {
                 }
             }
         }
+        /* 就绪后的慢活（启动扫描、重挂全部追踪应用）都交给维护 worker：两次都要遍历
+           全进程表并逐个改挂载（百级应用即秒级），内联在这里会把 pre-hook 判定与 IPC
+           ACK 一起冻住。任务位在循环线程上按当前状态组合，顺序由 worker 侧固定。 */
+        unsigned jobs = 0;
         /* 启动扫描：injector 重启后，已注入应用命名空间里的旧挂载仍指向随旧 daemon
            中止的 FUSE 连接（访问一律 ENOTCONN）。追踪表此时是空的，崩溃恢复路径覆盖
            不到它们，只能靠这里扫一遍。健康进程零行为变化（判据见
@@ -555,8 +558,7 @@ void handle_fuse_ready_event(void* ptr) {
             g_pending_startup_scan = 0;
             /* 被动模式只处理新 IPC 通知，避免存量逐进程修复阻塞启动；旧应用需重启。 */
             if (!g_passive_mode) {
-                int repaired = repair_stale_app_mounts_at_startup();
-                if (repaired > 0) LOG("启动扫描: 修复了 %d 个连接已断的应用挂载", repaired);
+                jobs |= NSP_FUSE_JOB_STARTUP_SCAN;
             } else {
                 LOG_DBG("被动模式: 跳过存量应用启动修复，旧应用需重启或重新 IPC 通知");
             }
@@ -569,8 +571,15 @@ void handle_fuse_ready_event(void* ptr) {
             seconds_until_next_scan = 0;
         }
         if (g_pending_remount) {
-            remount_all_tracked();
+            /* 就绪判定留在循环线程：视图没就绪就把标记留着，等下一次就绪事件；
+               若把判定放进 worker，worker 判「未就绪」与就绪事件分发之间有一个窗口，
+               标记放回去就再没人消费（应用会一直停在断掉的旧挂载上）。 */
+            if (get_active_mnt_src() != nullptr) {
+                g_pending_remount = 0;
+                jobs |= NSP_FUSE_JOB_REMOUNT;
+            }
         }
+        request_fuse_jobs(jobs);
     } else {
         LOG_ERR("FUSE 异步启动失败，管道未收到就绪字符");
         dump_crash_log_tail(g_global_fuse.crash_log_start);
@@ -872,21 +881,38 @@ static void cleanup_all_target_apps() {
     fast_pid_each(cleanup_cb, nullptr);
 }
 
-/* FUSE 崩溃后的重启序列：等旧实例退出 → 卸载并复核 → fork 新实例 → 扫全进程清理残留。
- * 整段是秒级慢活（10ms×50 轮询 + 50ms + 20×20ms 复核 + 全进程表遍历），只能跑在
- * 恢复 worker 上，跑完由 worker 写就绪 eventfd 通知事件循环。
- * 「重挂所有追踪应用」的标记由事件循环在发请求时就置好（见 check_and_recover_fuse）：
- * 新实例的就绪事件一定晚于这个标记，若等 worker 回报才置标记，就绪事件可能已经过去，
- * 重挂会一直等到下一次 FUSE 就绪（追踪应用停在断掉的旧挂载上）。 */
-static void injector_fuse_recover_cb(void* ctx) {
+/* FUSE 维护 worker 的回调：三段慢活都在这条线程上串行跑，顺序固定（恢复 → 启动扫描
+ * → 重挂）。事件循环只按任务位发请求，不再内联任何一段。
+ *
+ * 恢复段：等旧实例退出 → 卸载并复核 → 清全进程残留 → fork 新实例。清理排在 fork
+ * 之前，否则新实例一写就绪字节，事件循环就可能发起重挂，与清理并发（同一应用刚挂上
+ * 又被拆，fast_pid 缓存被两边同时改）。
+ *
+ * 重挂段：`g_pending_remount` 的消费已经挪到循环线程（就绪判定必须在事件分发侧做），
+ * 这里的返回值只为「判定与执行之间视图又没了」兜底——把标记放回去，下一次就绪事件再跑。 */
+static void injector_fuse_maintenance_cb(unsigned jobs, void* ctx) {
     (void)ctx;
-    force_recover_tracked_mounts();
-    /* 先清旧实例残留、再起新实例：新实例一旦写就绪字节，事件循环立刻跑
-       remount_all_tracked()——清理排在 fork 之后就会与重挂并发（同一应用刚挂上
-       又被拆），且 remount 的 fast_pid_cache_clear 会与清理的遍历撞在一起。
-       清理不依赖新实例，挪到前面就没有这个窗口。 */
-    cleanup_all_target_apps();
-    inject_global_fuse();
+    if (jobs & NSP_FUSE_JOB_RECOVER) {
+        force_recover_tracked_mounts();
+        cleanup_all_target_apps();
+        inject_global_fuse();
+    }
+    if (jobs & NSP_FUSE_JOB_STARTUP_SCAN) {
+        const int repaired = repair_stale_app_mounts_at_startup();
+        if (repaired > 0) LOG("启动扫描: 修复了 %d 个连接已断的应用挂载", repaired);
+    }
+    if (jobs & NSP_FUSE_JOB_REMOUNT) {
+        if (!remount_all_tracked()) g_pending_remount = 1;
+    }
+}
+
+/* 请求维护 worker 跑 jobs；worker 起不来时按旧行为内联执行——宁可慢一次，
+   也不能把一次恢复或一次重挂丢掉。 */
+static void request_fuse_jobs(unsigned jobs) {
+    if (jobs == 0) return;
+    if (nsp_fuse_recover_request(jobs)) return;
+    LOG_WRN("FUSE 维护线程不可用：任务回退到事件循环内联执行");
+    injector_fuse_maintenance_cb(jobs, nullptr);
 }
 
 /* 崩溃恢复重挂的计数：只统计真正挂上的应用，失败另有逐条日志 */
@@ -911,11 +937,12 @@ static int remount_cb(int pid, const char* cmd, void* data) {
     return 0;
 }
 
-static void remount_all_tracked() {
+/* 返回 false = FUSE 视图还没就绪（调用方必须把重挂标记放回去）；true = 已跑完一轮。 */
+static bool remount_all_tracked() {
     const char* mnt_src = get_active_mnt_src();
     if (!mnt_src) {
         LOG_DBG("FUSE 尚未就绪，推迟重挂所有追踪应用");
-        return;
+        return false;
     }
     struct timespec ts_start;
     struct timespec ts_end;
@@ -927,11 +954,11 @@ static void remount_all_tracked() {
        崩溃后新起的进程，活着的应用一个都不会重挂。 */
     fast_pid_cache_clear();
     fast_pid_each(remount_cb, (void*)mnt_src);
-    g_pending_remount = 0;
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     long elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000L +
                       (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000L;
     LOG("FUSE 崩溃恢复重挂完成: 重挂 %d 个（用时 %ldms）", g_remount_done, elapsed_ms);
+    return true;
 }
 
 /* 受管子进程的退出状态留档与复核见 reaped_managed.{h,c}：通用收尸
@@ -971,10 +998,7 @@ static void check_and_recover_fuse() {
            若等 worker 回报再置，就绪事件可能已经过去，重挂会被无限推迟。
            worker 起不来时按旧行为内联执行——宁可慢一次也不能丢恢复。 */
         g_pending_remount = 1;
-        if (!nsp_fuse_recover_request()) {
-            LOG_WRN("FUSE 恢复线程不可用：重启序列回退到事件循环内联执行");
-            injector_fuse_recover_cb(nullptr);
-        }
+        request_fuse_jobs(NSP_FUSE_JOB_RECOVER);
     }
 
     /* 新挂载方案（全局替换模式）：媒体专属 FUSE 仅传统逐应用挂载方案需要。
@@ -1459,7 +1483,7 @@ static void injector_setup_epoll(InjectorFds* fds) {
         LOG_WRN("配置读取线程未启动：热重载的读盘仍内联在事件循环上");
     }
     /* FUSE 崩溃恢复 worker 同理：没起来就退回内联恢复。 */
-    g_fuse_recover_fd = nsp_fuse_recover_start(injector_fuse_recover_cb, nullptr);
+    g_fuse_recover_fd = nsp_fuse_recover_start(injector_fuse_maintenance_cb, nullptr);
     if (g_fuse_recover_fd >= 0) {
         struct epoll_event ev_recover = {.events = EPOLLIN, .data.fd = g_fuse_recover_fd};
         epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_fuse_recover_fd, &ev_recover);
@@ -2163,7 +2187,8 @@ static void injector_event_loop(const InjectorFds* fds) {
                 uint64_t drained;
                 while (read(fd, &drained, sizeof drained) == sizeof drained) {
                 }
-                if (nsp_fuse_recover_take()) LOG_DBG("FUSE 崩溃恢复序列已完成（worker）");
+                const unsigned done = nsp_fuse_recover_take();
+                if (done != 0) LOG_DBG("FUSE 维护任务完成（worker, bits=0x%x）", done);
             } else {
                 /* 就绪管道可能刚被恢复 worker 覆盖注册：只有「fd 仍是当前就绪
                    管道」才命中，并且在锁内把 ctx 一起摘走（之后归本线程独占，

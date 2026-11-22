@@ -17,6 +17,7 @@
 #include "retry_queue.h"
 #include "nsp_constants.h"
 #include "ns_mnt_wait.h"
+#include "fuse_recover.h"
 static void fixture_log(const char* format, ...) __attribute__((format(printf, 1, 2)));
 static void fixture_log(const char* format, ...) { (void)format; }
 #define LOG(...) fixture_log(__VA_ARGS__)
@@ -63,6 +64,10 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t value, const char* ca
     (void)pkg; (void)pid; (void)value; (void)category; (void)ms; sync_mounts++; return 0;
 }
 int repair_stale_app_mounts_at_startup(void) { scans++; return 2; }
+/* 启动扫描的慢活由维护 worker 跑；这里只按任务位模拟那一段（扫描只允许发生一次）。 */
+static void request_fuse_jobs(unsigned jobs) {
+    if (jobs & NSP_FUSE_JOB_STARTUP_SCAN) (void)repair_stale_app_mounts_at_startup();
+}
 long ns_mnt_wait_switch(int pid, dev_t dev, ino_t ino, long budget, bool* out) {
     (void)pid; (void)dev; (void)ino; (void)budget; *out = switched; return 250000;
 }
@@ -105,8 +110,11 @@ static int64_t fixture_now_ms(void) { return fake_now_ms; }
 #define nsp_retry_now_ms fixture_now_ms
 #include "production.inc"
 #undef nsp_retry_now_ms
+/* 真实处理函数只在这一段里组合任务位，真正的扫描由维护 worker 执行。 */
 static void startup(void) {
+    unsigned jobs = 0;
 #include "startup.inc"
+    request_fuse_jobs(jobs);
 }
 static void reset(void) {
     nsp_retry_reset();

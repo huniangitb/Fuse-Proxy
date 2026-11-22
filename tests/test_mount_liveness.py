@@ -118,8 +118,11 @@ def run_contracts():
 
     # 崩溃恢复重挂的耗时与条数：现场只能看到「开始/完成」两行时无法区分
     # 「重挂很快、卡在别处」和「重挂本身慢」，所以完成行必须带条数与毫秒
-    remount = inj.find("static void remount_all_tracked() {")
-    body = inj[remount:remount + 1200] if remount >= 0 else ""
+    # 重挂函数现在返回 bool（false = 视图未就绪，调用方放回标记），签名用正则取，
+    # 锚点不要写死 static void。
+    remount_match = re.search(r"static (?:bool|void) remount_all_tracked\(\s*(?:void\s*)?\)\s*\{", inj)
+    remount = remount_match.start() if remount_match else -1
+    body = inj[remount:remount + 1400] if remount >= 0 else ""
     failures += check("P13_recovery_timer_is_monotonic",
                       body.count("clock_gettime(CLOCK_MONOTONIC") == 2)
     failures += check("P14_recovery_finish_logs_count_and_ms",
@@ -129,7 +132,7 @@ def run_contracts():
                       0 <= ok_site and "g_remount_done++;" in inj[ok_site:ok_site + 200])
     # P16：崩溃恢复遍历前必须清 PID 缓存。缓存语义是「本进程处理过的 pid」，
     # 命中即跳过回调；不清缓存就只剩崩溃后新起的进程会被重挂，活着的应用全被漏掉。
-    remount_body = inj[remount:remount + 1200] if remount >= 0 else ""
+    remount_body = inj[remount:remount + 1400] if remount >= 0 else ""
     clear_site = remount_body.find("fast_pid_cache_clear();")
     each_site = remount_body.find("fast_pid_each(remount_cb")
     failures += check("P16_recovery_clears_pid_cache",

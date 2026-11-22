@@ -1,7 +1,10 @@
-/* FUSE 崩溃恢复阶段化的判别夹具：直编真实 src/injector/fuse_recover.c，
- * 用「慢回调」代替真实重启序列（等旧实例退出 + 卸载复核 + fork 新实例 +
- * 全进程扫描），只验证阶段本身：请求不阻塞调用线程、回调不在调用线程上跑、
- * 完成经 eventfd 交回、突发请求合并、shutdown 等手上那轮跑完。 */
+/* FUSE 维护 worker 的判别夹具：直编真实 src/injector/fuse_recover.c，用「慢回调」
+ * 代替真实慢活（重启序列 / 启动扫描 / 重挂全部追踪应用），只验证阶段本身：
+ * 请求不阻塞调用线程、回调不在调用线程上跑、任务位原样传到回调、完成经 eventfd
+ * 交回、突发请求按位合并、shutdown 等手上那轮跑完。
+ *
+ * queue2 模式用 --wrap=pthread_create 把「建 worker」推迟到两次请求之后：
+ * 模块必须在 pending 上按位 OR，用赋值会把先到的任务覆盖掉（一次恢复就此丢失）。 */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -23,6 +26,7 @@
 static _Atomic int g_runs;
 static _Atomic long long g_work_us = 150000;
 static _Atomic int g_cb_off_main;
+static _Atomic unsigned g_bits_seen;
 static pid_t g_main_tid;
 
 static pid_t self_tid(void) { return (pid_t)syscall(SYS_gettid); }
@@ -58,9 +62,10 @@ static int threads_settled(void) {
     return threads_now();
 }
 
-static void slow_cb(void* ctx) {
+static void slow_cb(unsigned jobs, void* ctx) {
     (void)ctx;
     if (self_tid() != g_main_tid) atomic_store(&g_cb_off_main, 1);
+    atomic_fetch_or(&g_bits_seen, jobs);
     usleep((useconds_t)atomic_load(&g_work_us));
     atomic_fetch_add(&g_runs, 1);
 }
@@ -85,15 +90,17 @@ static void mode_offload(int work_ms) {
         return;
     }
     const long long t0 = now_us();
-    const bool queued = nsp_fuse_recover_request();
+    const bool queued = nsp_fuse_recover_request(NSP_FUSE_JOB_RECOVER);
     const long long request_us = now_us() - t0;
     long long ready_ms = -1;
     const int got = wait_ready(fd, 10000, &ready_ms);
-    const bool took = got && nsp_fuse_recover_take();
+    const unsigned took_bits = got ? nsp_fuse_recover_take() : 0;
     usleep(20000);
-    printf("request_us=%lld ready_ms=%lld got=%d took=%d runs=%d cb_off_main=%d threads=%d\n",
-           request_us, ready_ms, got, (int)took, atomic_load(&g_runs), atomic_load(&g_cb_off_main),
-           threads_settled());
+    printf("request_us=%lld ready_ms=%lld got=%d took=%d took_bits=%u rrec=%u runs=%d "
+           "cb_off_main=%d threads=%d\n",
+           request_us, ready_ms, got, (int)(took_bits != 0), took_bits,
+           atomic_load(&g_bits_seen) & NSP_FUSE_JOB_RECOVER, atomic_load(&g_runs),
+           atomic_load(&g_cb_off_main), threads_settled());
     printf("queued=%d\n", (int)queued);
     nsp_fuse_recover_shutdown();
 }
@@ -101,7 +108,7 @@ static void mode_offload(int work_ms) {
 static void mode_inline(int work_ms) {
     atomic_store(&g_work_us, (long long)work_ms * 1000);
     const long long t0 = now_us();
-    slow_cb(NULL);
+    slow_cb(NSP_FUSE_JOB_RECOVER, NULL);
     const long long inline_ms = (now_us() - t0) / 1000;
     printf("inline_ms=%lld cb_off_main=%d runs=%d\n", inline_ms, atomic_load(&g_cb_off_main),
            atomic_load(&g_runs));
@@ -114,18 +121,18 @@ static void mode_coalesce(int work_ms) {
         printf("start_failed=1\n");
         return;
     }
-    nsp_fuse_recover_request();
+    nsp_fuse_recover_request(NSP_FUSE_JOB_RECOVER);
     usleep(5000); /* 让第一轮先跑起来，后续请求落进「再来一轮」 */
     const long long t0 = now_us();
-    for (int i = 0; i < 40; i++) nsp_fuse_recover_request();
+    for (int i = 0; i < 40; i++) nsp_fuse_recover_request(NSP_FUSE_JOB_RECOVER);
     const long long burst_us = now_us() - t0;
     long long ready_ms = -1;
     const int got = wait_ready(fd, 10000, &ready_ms);
-    const bool took = got && nsp_fuse_recover_take();
+    const unsigned took_bits = got ? nsp_fuse_recover_take() : 0;
     /* 等合并出来的第二轮也跑完（合并上限是「再来一轮」） */
     usleep((useconds_t)(work_ms * 3 * 1000));
     printf("burst_us=%lld ready_ms=%lld took=%d rounds=%d threads=%d\n", burst_us, ready_ms,
-           (int)took, atomic_load(&g_runs), threads_settled());
+           (int)(took_bits != 0), atomic_load(&g_runs), threads_settled());
     nsp_fuse_recover_shutdown();
 }
 
@@ -136,14 +143,14 @@ static void mode_shutdown(int work_ms) {
         printf("start_failed=1\n");
         return;
     }
-    nsp_fuse_recover_request();
+    nsp_fuse_recover_request(NSP_FUSE_JOB_RECOVER);
     usleep(10000);
     const long long t0 = now_us();
     nsp_fuse_recover_shutdown();
     const long long shutdown_ms = (now_us() - t0) / 1000;
     const int runs_before = atomic_load(&g_runs);
     /* 关停之后再请求必须被拒绝（不新起线程） */
-    const bool after_req = nsp_fuse_recover_request();
+    const bool after_req = nsp_fuse_recover_request(NSP_FUSE_JOB_RECOVER);
     usleep(20000);
     printf("shutdown_ms=%lld runs_before=%d runs_after=%d after_req=%d threads=%d\n", shutdown_ms,
            runs_before, atomic_load(&g_runs), (int)after_req, threads_settled());
@@ -155,15 +162,96 @@ static void mode_early(void) {
         printf("start_failed=1\n");
         return;
     }
-    const bool early = nsp_fuse_recover_take();
-    printf("early_take=%d threads=%d\n", (int)early, threads_settled());
+    const unsigned early = nsp_fuse_recover_take();
+    printf("early_take=%u threads=%d\n", early, threads_settled());
+    nsp_fuse_recover_shutdown();
+}
+
+/* 一次请求带上三段任务位：回调必须一次看到全部位（顺序由 injector 侧固定），
+   请求方仍然只是入队。 */
+static void mode_jobs(int work_ms) {
+    atomic_store(&g_work_us, (long long)work_ms * 1000);
+    const int fd = nsp_fuse_recover_start(slow_cb, NULL);
+    if (fd < 0) {
+        printf("start_failed=1\n");
+        return;
+    }
+    const long long t0 = now_us();
+    const bool queued = nsp_fuse_recover_request(NSP_FUSE_JOB_ALL);
+    const long long request_us = now_us() - t0;
+    long long ready_ms = -1;
+    const int got = wait_ready(fd, 10000, &ready_ms);
+    const unsigned took_bits = got ? nsp_fuse_recover_take() : 0;
+    usleep(20000);
+    printf("queued=%d request_us=%lld got=%d took_bits=%u bits_seen=%u has_recover=%d "
+           "has_scan=%d has_remount=%d runs=%d cb_off_main=%d threads=%d\n",
+           (int)queued, request_us, got, took_bits, atomic_load(&g_bits_seen),
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_RECOVER) ? 1 : 0,
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_STARTUP_SCAN) ? 1 : 0,
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_REMOUNT) ? 1 : 0, atomic_load(&g_runs),
+           atomic_load(&g_cb_off_main), threads_settled());
+    nsp_fuse_recover_shutdown();
+}
+
+/* 把模块的「建 worker」推迟到两次请求之后：模块此刻 running=true 且 pending 已置位，
+   第二次请求只能并进 pending。按位 OR 的两个任务位都要跑到；用赋值会丢第一个。 */
+static _Atomic int g_defer_spawn;
+static void* (*g_def_fn)(void*);
+static void* g_def_arg;
+
+int __real_pthread_create(pthread_t* tid, const pthread_attr_t* attr, void* (*fn)(void*),
+                          void* arg);
+
+int __wrap_pthread_create(pthread_t* tid, const pthread_attr_t* attr, void* (*fn)(void*),
+                          void* arg) {
+    if (atomic_load(&g_defer_spawn)) {
+        g_def_fn = fn;
+        g_def_arg = arg;
+        return 0; /* 假装创建成功，实际推迟到 queue2 自己建 */
+    }
+    return __real_pthread_create(tid, attr, fn, arg);
+}
+
+static void mode_queue2(int work_ms) {
+    atomic_store(&g_work_us, (long long)work_ms * 1000);
+    const int fd = nsp_fuse_recover_start(slow_cb, NULL);
+    if (fd < 0) {
+        printf("start_failed=1\n");
+        return;
+    }
+    atomic_store(&g_defer_spawn, 1);
+    const bool q1 = nsp_fuse_recover_request(NSP_FUSE_JOB_RECOVER);
+    const bool q2 = nsp_fuse_recover_request(NSP_FUSE_JOB_REMOUNT);
+    atomic_store(&g_defer_spawn, 0);
+    const bool have_fn = g_def_fn != NULL;
+    if (have_fn) {
+        pthread_attr_t attr;
+        pthread_t tid;
+        if (pthread_attr_init(&attr) == 0) {
+            (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            (void)__real_pthread_create(&tid, &attr, g_def_fn, g_def_arg);
+            pthread_attr_destroy(&attr);
+        }
+    }
+    long long ready_ms = -1;
+    const int got = have_fn ? wait_ready(fd, 10000, &ready_ms) : 0;
+    const unsigned took_bits = got ? nsp_fuse_recover_take() : 0;
+    usleep(20000);
+    printf("q1=%d q2=%d got=%d took_bits=%u bits_seen=%u has_recover=%d has_remount=%d "
+           "rounds=%d threads=%d\n",
+           (int)q1, (int)q2, got, took_bits, atomic_load(&g_bits_seen),
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_RECOVER) ? 1 : 0,
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_REMOUNT) ? 1 : 0, atomic_load(&g_runs),
+           threads_settled());
     nsp_fuse_recover_shutdown();
 }
 
 int main(int argc, char** argv) {
     g_main_tid = self_tid();
     if (argc < 2) {
-        fprintf(stderr, "usage: %s offload|inline|coalesce|shutdown|early [work_ms]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s offload|inline|coalesce|shutdown|early|jobs|queue2 [work_ms]\n",
+                argv[0]);
         return 2;
     }
     const int work_ms = argc >= 3 ? atoi(argv[2]) : 150;
@@ -172,6 +260,8 @@ int main(int argc, char** argv) {
     else if (strcmp(argv[1], "coalesce") == 0) mode_coalesce(work_ms);
     else if (strcmp(argv[1], "shutdown") == 0) mode_shutdown(work_ms);
     else if (strcmp(argv[1], "early") == 0) mode_early();
+    else if (strcmp(argv[1], "jobs") == 0) mode_jobs(work_ms);
+    else if (strcmp(argv[1], "queue2") == 0) mode_queue2(work_ms);
     else {
         fprintf(stderr, "unknown mode\n");
         return 2;

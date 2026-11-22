@@ -447,14 +447,15 @@ SUITE_MAP = [
       "tests/fixtures/reload_stage_driver.c"),
      ("nsp_reload_stage_request", "nsp_reload_stage_take", "nsp_reload_stage_start"),
      "配置重载的读盘与 pm 探测不占事件循环线程（阶段化读取）"),
-    # FUSE 崩溃恢复的重启序列（等旧实例退出、卸载复核、fork 新实例、全进程清理）
-    # 也在 fps 唯一事件循环线程上；阶段化后循环只发请求、收就绪 eventfd。
+    # FUSE 状态机上的三段秒级慢活（崩溃恢复、启动扫描、重挂全部追踪应用）都在
+    # 也在 唯一事件循环线程上；改成一条维护 worker + 任务位，循环只发请求、收完成位。
     (("test_fuse_recover.py",),
      ("src/injector/fuse_recover.c", "include/fuse_recover.h",
       "src/injector/injector.c", "tests/test_fuse_recover.py",
       "tests/fixtures/fuse_recover_driver.c"),
-     ("nsp_fuse_recover_request", "nsp_fuse_recover_take", "nsp_fuse_recover_start"),
-     "FUSE 崩溃恢复的重启序列不占事件循环线程（阶段化恢复）"),
+     ("nsp_fuse_recover_request", "nsp_fuse_recover_take", "nsp_fuse_recover_start",
+      "injector_fuse_maintenance_cb"),
+     "FUSE 恢复/启动扫描/重挂不占事件循环线程（任务位串行维护）"),
 
     # fast_pid 的位图与 pid 缓存是跨线程共享状态：恢复 worker 的全进程清理与事件
     # 循环的 remount/cache_clear 会同时读写（旧实现默认只有一个调用线程）。
