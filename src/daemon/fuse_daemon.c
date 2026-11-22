@@ -195,18 +195,18 @@ static bool g_fuse_threads_explicit = false;       /* 是否由 --fuse-threads �
 static int g_fuse_threads = 2;                      /* --fuse-threads: FUSE worker 线程数上限
                                                    （默认 2=双线程；0/-s=单线程；-1=libfuse 默认 10） */
 
-/* 延迟 close 队列（Android backing 路径）：daemon 把 backing fd 交给内核后不能
-   立刻 close（内核可能在 reply 发送完成前仍引用它），故入队，等下一次 FUSE
-   回调时机统一回收。并发语义与不变量（多生产者/多消费者、每个 fd 恰好关闭
-   一次、队满不阻塞且不制造被放弃的槽位）见 src/daemon/fd_close_queue.h。
-   静态实例按该头注释直接以 PTHREAD_MUTEX_INITIALIZER 初始化 lock。 */
-static FdCloseQueue g_pending_closes = {.lock = PTHREAD_MUTEX_INITIALIZER};
-
+/* Android backing fd 只由产生它的 worker 回收。legacy lookup 在 bpf_setup
+   后同步发送 reply，期间不再调用 daemon；同 worker 下一 getattr 才能确认
+   上次回复结束。别的 worker 进入回调不是成熟证明。worker 退出由 TSD 清尾。 */
 #ifdef TARGET_ANDROID
-static void vfs_defer_close(int fd) { fdq_defer(&g_pending_closes, fd); }
+static bool vfs_defer_close(int fd) { return fdq_thread_defer(fd); }
 #endif
 
-static void vfs_flush_pending_closes(void) { fdq_flush(&g_pending_closes); }
+static void vfs_flush_pending_closes(void) {
+#ifdef TARGET_ANDROID
+    fdq_thread_flush();
+#endif
+}
 
 static int recursive_rmdir(const char* path);
 /* *created（可为 NULL）只在本次调用**成功创建** dst 时置 true：调用方据此
@@ -352,7 +352,8 @@ static NspVisibility vfs_entry_visibility(const char* sub_path, const char* fuse
         bool same_app = (strcmp(name, current_pkg) == 0) ||
                         (fw_pkg_uid_for_package(name, &owner_uid) && owner_uid == uid);
         bool is_obb = (strncmp(sub_path, "/Android/obb", 12) == 0);
-        if (!same_app && fw_rules_cross_app_access(current_pkg, uid, is_obb) == NSP_XAPP_NONE)
+        if (!same_app &&
+            fw_rules_cross_app_access_snapshot(current_pkg, uid, is_obb) == NSP_XAPP_NONE)
             return NSP_VIS_SKIP;
     }
 
@@ -2380,6 +2381,17 @@ static bool is_fuse_hidden_name(const char* name) {
     return hex == 16 && *p == '\0';
 }
 
+/* 目标名是 libfuse 的 open-unlink 隐藏名吗？libfuse 只在 unlink 仍打开的文件时
+   生成它（rmdir 不走隐藏名），所以「目标是隐藏名」等价于「这是一次删除」。
+   判定必须放在 fw_route 之前：rename 会按 RENAME_SRC 过 ACL，而顶层条目的
+   「不可改名」结构规则会把「删除仍打开的顶层文件」误拒成 EPERM。 */
+static bool rename_is_open_unlink(const char* to, unsigned int flags) {
+    if (flags != 0 || !to) return false;
+    const char* base = strrchr(to, '/');
+    base = base ? base + 1 : to;
+    return is_fuse_hidden_name(base);
+}
+
 static int vfs_rename_copy_file(const char* src, const char* dst, struct stat* st) {
     int fd_src = open(src, O_RDONLY | O_CLOEXEC);
     if (fd_src < 0) return -errno;
@@ -2478,8 +2490,12 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
     bool redir_from = false, redir_to = false;
     char pkg_from[128], pkg_to[128];
     bool mon_from = false, mon_to = false;
+    /* 目标是隐藏名时这次调用其实是 unlink：from 按 DELETE 过 ACL——顶层条目的
+       「不可改名」结构规则不适用于删除，AOSP 也只限制改名。 */
+    const bool open_unlink = rename_is_open_unlink(to, flags);
+    const NspAclOp src_acl_op = open_unlink ? NSP_ACL_OP_DELETE : NSP_ACL_OP_RENAME_SRC;
     int rrc = fw_route(ctx, from, &r1, &ok1, pkg_from, &u_from, sub_from, p_from, &redir_from,
-                       &mon_from, VFS_OP_MUTATE, NSP_ACL_OP_RENAME_SRC, false, 0);
+                       &mon_from, VFS_OP_MUTATE, src_acl_op, false, 0);
     if (rrc != 0) return rrc;
     rrc = fw_route(ctx, to, &r2, &ok2, pkg_to, &u_to, sub_to, p_to, &redir_to, &mon_to,
                    VFS_OP_MUTATE, NSP_ACL_OP_RENAME_DST, false, 0);
@@ -2494,7 +2510,7 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
        所以直接删源、不产生隐藏名——与 Android 自带 FUSE 的可见行为一致，
        也不会在目录里留下「被改名却没删掉」的文件。后端路径不做此处理：
        远端立即删除会让正在下载/上传的句柄失去数据源，仍由隐藏名兜底。 */
-    if (flags == 0 && !r1.is_ftp && !r2.is_ftp) {
+    if (open_unlink && !r1.is_ftp && !r2.is_ftp) {
         const char* base = strrchr(sub_to, '/');
         base = base ? base + 1 : sub_to;
         if (is_fuse_hidden_name(base)) {
@@ -2502,7 +2518,15 @@ static int vfs_rename(const char* from, const char* to, unsigned int flags) {
                发 GETATTR（fstat）。快照以 FUSE 侧隐藏名为键，getattr/write/
                release 收到的 path 都是同一个名字。 */
             struct stat snap;
-            if (lstat(p_from, &snap) == 0) hidden_stat_put(to, &snap);
+            const bool have_snap = lstat(p_from, &snap) == 0;
+            /* libfuse 不为目录生成隐藏名：真收到目录说明应用自己把隐藏名当
+               改名目标，仍按 AOSP 的结构规则拒绝（源端已按 DELETE 放行，
+               故在此收口），免得「顶层目录改名为隐藏名」绕开不可改名规则。 */
+            if (have_snap && S_ISDIR(snap.st_mode)) {
+                log_fuse_err("RENAME_HIDDEN_DIR", from, EPERM);
+                return -EPERM;
+            }
+            if (have_snap) hidden_stat_put(to, &snap);
             if (unlink(p_from) == 0) {
                 log_open_unlink_direct(sub_from);
                 return 0;
@@ -2737,6 +2761,18 @@ static int vfs_mknod(const char* path, mode_t mode, dev_t rdev) {
        出来的节点属主是 root、mode 是 mode & ~umask，与同目录下 create 出来的
        条目（属主=父目录属主、mode=调用方 mode）方向完全相反。 */
     int ret = mknod(p, mode, rdev);
+    if (ret == -1 && errno == ENOENT) {
+        /* 沙盒/REDIRECT 的虚拟父目录可能尚未落盘；只经守卫出口补父，
+           不创建缺失的存储根一级组件，也不重试权限或其他业务错误。 */
+        char* p_dup = strdup(p);
+        if (p_dup) {
+            if (common_mkdir_within_storage(dirname(p_dup), 0775) == 0)
+                ret = mknod(p, mode, rdev);
+            int err = errno;
+            free(p_dup);
+            errno = err;
+        }
+    }
     if (ret == -1) {
         int err = errno;
         log_fuse_err("MKNOD", path, err);
@@ -2767,6 +2803,15 @@ static int vfs_fsyncdir(const char* path, int datasync, struct fuse_file_info* f
     VFS_RETURN(0);
 }
 
+/* ACL chmod 的丢弃结果不变，观测沿用框架首个/每 1024 次的有界计数。 */
+static void chmod_acl_drop_note(const char* path, mode_t mode) {
+    static atomic_ulong seq;
+    unsigned long n = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed) + 1;
+    if (n == 1 || (n & 1023u) == 0)
+        LOG_WRN("丢弃带 ACL 条目的 chmod: path=%s mode=%04o（累计 %lu 次）",
+                path, (unsigned)(mode & 07777), n);
+}
+
 static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void)fi;
     /* 与 AOSP 的取舍：普通条目上我们的 backing 是真实文件系统，属性可以真的保存
@@ -2785,7 +2830,7 @@ static int vfs_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
        文件管理器按 ACL 设好的 a_* 权限压回 mode 位模型。AOSP 遇到已存在的
        system.posix_acl_access 也是丢弃 mode 变更。 */
     if (lgetxattr(p, "system.posix_acl_access", NULL, 0) > 0) {
-        LOG_WRN("丢弃带 ACL 条目的 chmod: path=%s mode=%04o", path, (unsigned)(mode & 07777));
+        chmod_acl_drop_note(path, mode);
         VFS_RETURN(0);
     }
     int ret = chmod(p, mode);
@@ -3112,6 +3157,12 @@ static int passthrough_enable_fixed_method(int fd) {
 
 static void* vfs_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     cfg->use_ino = 1;
+#if defined(TARGET_ANDROID) && defined(FUSE_CAP_OVER_IO_URING)
+    /* 同 worker 下一回调清 backing fd 依赖同步 reply。预构建库也必须禁
+       异步 SQE 回复，不能只依赖 Meson 子项目的 enable-io-uring=false。 */
+    fuse_unset_feature_flag(conn, FUSE_CAP_OVER_IO_URING);
+    conn->want &= ~(unsigned)FUSE_CAP_OVER_IO_URING;
+#endif
     /* 缓存超时不在此处写死：`fuse_new` 已按 libfuse 默认值填好 conf
        （entry/attr=1.0、negative=0.0）**并已解析用户经 -o 传入的值**
        （fuse.c: 默认值 → fuse_opt_parse → fuse_fs_init 才回调本函数），
@@ -3299,12 +3350,17 @@ static int vfs_backing_setup(const char* path, struct fuse_entry_param* e) {
         return -errno;
     }
 
+    /* 线程所有权建立失败则保持 mediation；尚未发布的 fd 可以直接关，不能
+       先填 reply 字段再失败（内核可能取得被关闭/复用的 fd 号）。 */
+    if (!vfs_defer_close(bfd)) {
+        close(bfd);
+        return -ENOMEM;
+    }
     /* 只挂 backing，不挂系统策略程序（bpf_action 保持 KEEP=0）：见函数头注释 */
     e->backing_action = FUSE_ACTION_REPLACE;
     e->backing_fd = (uint64_t)bfd;
     LOG_DBG_PERF("FUSE backing: %s (fd=%d, media=%d)", real, bfd, g_is_media_fuse);
 
-    vfs_defer_close(bfd);
     return 0;
 }
 #endif
@@ -3677,6 +3733,8 @@ int main(int argc, char* argv[]) {
                     if (fmain_rc) fmain_rc = 8;
                 }
             }
+            /* 单线程循环由 main 执行，return main 不运行线程 TSD 析构。 */
+            vfs_flush_pending_closes();
             fuse_remove_signal_handlers(se);
         }
         fuse_unmount(f);

@@ -40,10 +40,13 @@ void handle_ipc_client_readable(int client_fd);
  * 把预算放大到 1s 才是红线禁止的——那是每次冷启动固定多等 1s。 */
 #define IPC_MOUNT_INLINE_MS 20
 
-/* v3 补挂载盯梢：pre 通道收到目标应用通知后，后台以 2ms 步进盯
- * /proc/<pid>/ns/mnt，命名空间一变（specialize 完成）就立刻挂载。模块侧在
- * post-specialize 里是否等、等多久由 [GLOBAL] ZYGISK_POST_WAIT_MS 决定，随
- * DEFER 应答下发（默认 0 = 不等，模块一次 mountinfo 都不读）。 */
+/* v3 补挂载盯梢：pre 通道收到目标应用通知后，后台盯 /proc/<pid>/ns/mnt 的
+ * (dev, ino)，命名空间一变（specialize 完成）就立刻挂载。等待挂在挂载表变化
+ * 事件源上、精度由节拍给出（见 ns_mnt_wait.h），最长等这么久——**这是兜底上限
+ * 而不是预期耗时**：应用可能始终不换命名空间，等的人不能陪着挂死，到点就跳过
+ * 并交后台重试队列。模块侧在 post-specialize 里是否等、等多久由
+ * [GLOBAL] ZYGISK_POST_WAIT_MS 决定，随 DEFER 应答下发（默认 0 = 不等，模块
+ * 一次 mountinfo 都不读）。 */
 #define IPC_POST_WAIT_MS 1200
 
 /* proto>=4 的模块按 DEFER 应答里的数字决定 post 等待预算："DEFER <ms>"。

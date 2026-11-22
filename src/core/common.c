@@ -11,6 +11,7 @@
 #include <sys/system_properties.h>
 #endif
 #include <stdatomic.h>
+#include <poll.h>
 #ifdef TARGET_ANDROID
 #include <sys/xattr.h>
 #endif
@@ -289,6 +290,19 @@ static mode_t shared_storage_mode(mode_t want, const struct stat* pst, bool is_d
 
    存储根之外的路径（后端、临时目录）一律不算共享存储：那里的属主与 mode 由调用方
    与后端自己决定，套共享存储的形状没有依据。 */
+static const char* const k_private_trees[] = {"/Android/data", "/Android/obb",
+                                               "/Android/media"};
+
+/* sub 是否正好落在根层三棵私有树之一（相等或以 '/' 接续）。同名深层目录不算。 */
+static bool private_tree_prefix(const char* sub) {
+    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
+        size_t tlen = strlen(k_private_trees[i]);
+        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
+            return true;
+    }
+    return false;
+}
+
 static bool path_in_shared_storage(const char* real_path) {
     char base[PATH_MAX];
     common_storage_base(base, sizeof(base));
@@ -297,14 +311,33 @@ static bool path_in_shared_storage(const char* real_path) {
     int user_id = -1;
     const char* sub = NULL;
     if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return false;
-    static const char* const k_private_trees[] = {"/Android/data", "/Android/obb",
-                                                 "/Android/media"};
-    for (size_t i = 0; i < sizeof(k_private_trees) / sizeof(k_private_trees[0]); i++) {
-        size_t tlen = strlen(k_private_trees[i]);
-        if (strncmp(sub, k_private_trees[i], tlen) == 0 && (sub[tlen] == '\0' || sub[tlen] == '/'))
-            return false;
-    }
-    return true;
+    return !private_tree_prefix(sub);
+}
+
+/* 条目是否落在根层私有树里：与 path_in_shared_storage 同一套解析，判据相反。
+   存储根之外、用户层解析不了的路径都不算。 */
+static bool path_in_private_tree(const char* real_path) {
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof(base));
+    size_t blen = strlen(base);
+    if (blen == 0 || strncmp(real_path, base, blen) != 0 || real_path[blen] != '/') return false;
+    int user_id = -1;
+    const char* sub = NULL;
+    if (common_parse_user_layer(real_path + blen, &user_id, &sub) != 1) return false;
+    return private_tree_prefix(sub);
+}
+
+static mode_t new_entry_mode(const char* real_path, mode_t caller_mode,
+                             const struct stat* parent, mode_t entry_mode) {
+    bool is_dir = S_ISDIR(entry_mode);
+    mode_t mode = caller_mode & 07777;
+    if (mode == 0) mode = parent->st_mode & 07777;
+    if (path_in_shared_storage(real_path))
+        return shared_storage_mode(mode, parent, is_dir);
+    if (is_dir)
+        return (parent->st_mode & S_ISGID) ? (mode | S_ISGID) : (mode & ~S_ISGID);
+    if (S_ISREG(entry_mode) && path_in_private_tree(real_path)) mode |= 0060;
+    return mode;
 }
 
 /* 新建条目的属性收尾（唯一出口）：create / mkdir / mknod / symlink / 父目录补建 /
@@ -320,8 +353,16 @@ static bool path_in_shared_storage(const char* real_path) {
 
    共享存储的落点另加一层：调用方 mode 只说明「它自己想给多少」，条目还要能被树里的
    其他应用打开，故最终 mode 再按父目录的组位与其他位补齐（见 shared_storage_mode），
-   与 MediaProvider 自己建条目的形状一致。私有树（Android/{data,obb,media}）不补：
-   那里的属主与 ACL 由 installd 体系决定，放宽只会造出第二个共享存储。
+   与 MediaProvider 自己建条目的形状一致。
+
+   私有树（Android/{data,obb,media}）另按一条窄口径补位：普通文件补组位（0060），
+   目录保持调用方 mode。这三棵树的属主与属组由 installd 体系给出（包目录 2770 归
+   ext_data_rw），能穿过包目录的身份本来就只有全盘访问能力应用与系统组件（
+   MediaProvider 的直通视图、MES 文件管理器）；应用在下载目录里写下的条目常被自己的
+   umask 削到 0600，这批身份便读不到（实测 MediaProvider 身份读 0600 条目 EACCES、
+   读 0660 条目成功）。补组位只对这批身份生效——不加 o 位（不暴露给任意应用）、不加
+   x 位（不造可执行文件）、不动属主位（应用显式建的 0400 不会变成可写）。
+   目录不补：树的隔离靠目录位，连目录一起放宽才会造出第二个共享存储。
 
    caller_mode 为 0 表示调用点确实没有 mode 可传（符号链接的 mode 在内核恒为 0777，
    真实值无意义）：此时回落父目录 mode，只作「值未知」的缺省，不用来覆盖已知值。
@@ -348,15 +389,7 @@ void nsp_new_entry_attrs(const char* real_path, mode_t caller_mode) {
         /* 失败不致命（例如后端目标不支持 chown）：mode 照旧收敛，errno 留给调用点 */
     }
     if (!S_ISLNK(est.st_mode)) {
-        bool is_dir = S_ISDIR(est.st_mode);
-        mode_t final_mode = caller_mode & 07777;
-        if (final_mode == 0) final_mode = pst.st_mode & 07777;
-        if (path_in_shared_storage(real_path))
-            final_mode = shared_storage_mode(final_mode, &pst, is_dir);
-        else if (is_dir)
-            final_mode =
-                (pst.st_mode & S_ISGID) ? (final_mode | S_ISGID) : (final_mode & ~S_ISGID);
-        chmod(real_path, final_mode);
+        chmod(real_path, new_entry_mode(real_path, caller_mode, &pst, est.st_mode));
     }
 #ifdef TARGET_ANDROID
     char context[256];
@@ -835,6 +868,105 @@ int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz) {
     return 0;
 }
 
+int common_storage_child_path(const char* parent, const char* child, char* out, size_t sz) {
+    if (!out || sz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    out[0] = '\0';
+    if (!parent || !child || !child[0] || strchr(child, '/') ||
+        strcmp(child, ".") == 0 || strcmp(child, "..") == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t plen = strnlen(parent, PATH_MAX);
+    size_t clen = strnlen(child, NAME_MAX + 1);
+    if (plen == PATH_MAX || clen > NAME_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    char base[PATH_MAX];
+    common_storage_base(base, sizeof base);
+    size_t blen = strlen(base);
+    if (!blen || plen <= blen || strncmp(parent, base, blen) != 0 || parent[blen] != '/' ||
+        common_parse_user_layer(parent + blen, nullptr, nullptr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (const char* p = parent + blen; *p;) {
+        if (*p == '/') { p++; continue; }
+        const char* start = p;
+        while (*p && *p != '/') p++;
+        size_t n = (size_t)(p - start);
+        if ((n == 1 && start[0] == '.') ||
+            (n == 2 && start[0] == '.' && start[1] == '.')) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    while (plen > blen + 1 && parent[plen - 1] == '/') plen--;
+    if (plen + 1 + clen >= sz || plen + 1 + clen >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, parent, plen);
+    out[plen] = '/';
+    memcpy(out + plen + 1, child, clen + 1);
+    return 0;
+}
+
+/* fd 属性收尾与路径口径复用同一个 mode 算法；路径仅用于词法归类，
+ * 不用它 stat/chown/chmod/xattr，避免 mkdir 后名字被换成链接时穿透目标。 */
+static void common_apply_fd_attrs(int parent_fd, int child_fd, const char* path, mode_t mode) {
+    struct stat pst, est;
+    if (fstat(parent_fd, &pst) != 0 || fstat(child_fd, &est) != 0) return;
+    (void)fchown(child_fd, pst.st_uid, pst.st_gid);
+    (void)fchmod(child_fd, new_entry_mode(path, mode, &pst, est.st_mode));
+#ifdef TARGET_ANDROID
+    char context[256];
+    ssize_t len = fgetxattr(parent_fd, "security.selinux", context, sizeof context);
+    if (len > 0)
+        (void)fsetxattr(child_fd, "security.selinux", context, (size_t)len, 0);
+    else if (strncmp(path, STORAGE_BASE, sizeof(STORAGE_BASE) - 1) == 0)
+        (void)fsetxattr(child_fd, "security.selinux", NSP_DEFAULT_FILE_CONTEXT,
+                       sizeof(NSP_DEFAULT_FILE_CONTEXT), 0);
+#endif
+}
+
+int common_mkdir_storage_child(const char* parent, const char* child, mode_t mode) {
+    char path[PATH_MAX], base[PATH_MAX];
+    if (common_storage_child_path(parent, child, path, sizeof path) < 0) return -1;
+    common_storage_base(base, sizeof base);
+    size_t blen = strlen(base);
+    char components[PATH_MAX];
+    /* 完整 child 路径已通过长度与根边界校验，parent 后缀必然放得下。 */
+    memcpy(components, parent + blen, strlen(parent + blen) + 1);
+    const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    int fd = open(base, flags);
+    if (fd < 0) return -1;
+    int rc = -1, child_fd = -1;
+    char* save = nullptr;
+    for (char* part = strtok_r(components, "/", &save); part;
+         part = strtok_r(nullptr, "/", &save)) {
+        int next = openat(fd, part, flags);
+        if (next < 0) goto done;
+        close(fd);
+        fd = next;
+    }
+    bool created = mkdirat(fd, child, mode) == 0;
+    if (!created && errno != EEXIST) goto done;
+    child_fd = openat(fd, child, flags);
+    if (child_fd < 0) goto done;
+    if (created) common_apply_fd_attrs(fd, child_fd, path, mode);
+    rc = 0;
+done:;
+    int saved_errno = errno;
+    if (child_fd >= 0) close(child_fd);
+    close(fd);
+    errno = saved_errno;
+    return rc;
+}
+
 /* ================= 存储根一级条目守卫 =================
  * 历史缺陷：/data/media（= /storage/emulated）顶层反复出现纯数字垃圾目录，
  * 只能在 /data/media 下删掉。链路：被注入的应用请求 /<数字>/… → fw_parse_path
@@ -940,4 +1072,142 @@ int common_parse_user_layer(const char* path, int* user_id, const char** sub_pat
     if (user_id) *user_id = (int)v;
     if (sub_path) *sub_path = (*d == '/') ? d : "/";
     return 1;
+}
+
+/* ---- 有界外部命令执行（见 include/common.h 的合同）----
+ * 旧调用点是 popen("pm list ...") + fgets：`pm` 要 binder 到 system_server，慢或挂
+ * 住时没有时间上界，而两处都在关键路径上（scan_active_users 在配置视图里、
+ * sys_pkg 刷新在注入器事件循环/热重载线程里）——一次挂起放大成整个进程无响应。
+ * 这里只做三件事：fork+exec /bin/sh -c、按行回调、预算到点 SIGKILL。
+ * 收尾纪律沿用 fw_pkg 的有界子进程：只在「尚未 wait 到退出」时 kill（已回收的
+ * pid 可能被内核复用），回收只用 WNOHANG + 20ms 宽限；仍不退出就交给调用方的
+ * SIGCHLD 回收/init，绝不在这里 waitpid(0)。 */
+#define COMMON_CMD_REAP_MS 20
+#define COMMON_CMD_DEFAULT_BUDGET_MS 1000 /* 调用方给了非正预算时的兜底 */
+#define COMMON_CMD_LINE_MAX 512
+
+static uint64_t common_cmd_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* 只在「尚未 wait 到退出」时才允许 kill（已回收的 pid 可能被内核复用） */
+static bool common_cmd_reaped(pid_t pid) {
+    pid_t w = waitpid(pid, NULL, WNOHANG);
+    return w == pid || (w < 0 && errno == ECHILD);
+}
+
+/* 有界回收：WNOHANG + 1ms 轮询，最多 COMMON_CMD_REAP_MS；仍不退出就交出去 */
+static bool common_cmd_reap_bounded(pid_t pid) {
+    uint64_t start = common_cmd_now_ms();
+    for (;;) {
+        if (common_cmd_reaped(pid)) return true;
+        uint64_t now = common_cmd_now_ms();
+        if (start == 0 || now == 0 || now - start >= COMMON_CMD_REAP_MS) return false;
+        struct pollfd none = {.fd = -1, .events = 0, .revents = 0};
+        (void)poll(&none, 1, 1);
+    }
+}
+
+int common_run_cmd_lines(const char* shell_cmd, int budget_ms, NspCmdLineFn on_line, void* ctx,
+                         bool* timed_out) {
+    if (timed_out) *timed_out = false;
+    if (!shell_cmd) return -1;
+    if (budget_ms <= 0) budget_ms = COMMON_CMD_DEFAULT_BUDGET_MS; /* 预算非法给默认值，绝不当成成功 */
+    int fds[2];
+    /* O_CLOEXEC：管道端不进入被 exec 的命令（子进程显式 dup2 到 stdout 后即不再需要） */
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+        if (errno != ENOSYS || pipe(fds) != 0) return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* 子进程：stdout 接管道、stderr 丢弃；这两个 fd 会在 exec 前被 dup2 到 0/1/2，
+         * 故不能设 CLOEXEC（exec 后它们就是标准 fd），其余项目 fd 不在本进程里。 */
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDERR_FILENO);
+            if (devnull != STDERR_FILENO) close(devnull);
+        }
+        close(fds[0]);
+        close(fds[1]);
+        execl("/bin/sh", "sh", "-c", shell_cmd, (char*)NULL);
+        execl("/system/bin/sh", "sh", "-c", shell_cmd, (char*)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    char line[COMMON_CMD_LINE_MAX];
+    size_t used = 0;
+    bool timed = false;
+    bool failed = false;
+    uint64_t start = common_cmd_now_ms();
+    for (;;) {
+        if (start == 0) { /* 单调钟不可用：不能把「量不了时间」当成「命令很快完成」 */
+            failed = true;
+            break;
+        }
+        uint64_t now = common_cmd_now_ms();
+        if (now == 0 || (int)(now - start) >= budget_ms) {
+            timed = true;
+            break;
+        }
+        int remain = budget_ms - (int)(now - start);
+        struct pollfd pfd = {.fd = fds[0], .events = POLLIN, .revents = 0};
+        int pr = poll(&pfd, 1, remain);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            failed = true;
+            break;
+        }
+        if (pr == 0) {
+            timed = true;
+            break;
+        }
+        ssize_t got = read(fds[0], line + used, sizeof line - used);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            failed = true;
+            break;
+        }
+        if (got == 0) break; /* EOF：命令自己退出 */
+        size_t pos = 0;
+        size_t end = used + (size_t)got;
+        while (pos < end) {
+            char* nl = memchr(line + pos, '\n', end - pos);
+            if (!nl) break;
+            size_t len = (size_t)(nl - (line + pos));
+            line[pos + len] = '\0'; /* 用换行占位，行长 = len */
+            if (on_line) on_line(line + pos, ctx);
+            pos += len + 1;
+        }
+        /* 剩余部分（含被截断的超长行）搬回行首，等下一段补齐 */
+        used = end - pos;
+        if (used >= sizeof line - 1) {
+            line[sizeof line - 1] = '\0';
+            if (on_line) on_line(line, ctx); /* fgets 语义：超长行按块返回 */
+            used = 0;
+        } else if (used > 0) {
+            memmove(line, line + pos, used);
+        }
+    }
+    if (used > 0 && !timed) { /* 末行无换行：fgets 同样返回 */
+        line[used] = '\0';
+        if (on_line) on_line(line, ctx);
+    }
+    if (timed && timed_out) *timed_out = true;
+    /* 超时或读管道失败都不能把子进程留在跑：只在「尚未 wait 到退出」时才 kill
+       （已回收的 pid 可能被内核复用，kill 它等于杀死陌生进程）。回收只用 WNOHANG
+       + 20ms 宽限，仍不退出的僵尸交给调用方的 SIGCHLD 回收者/init，绝不 waitpid(0)。 */
+    if (timed || failed) {
+        if (!common_cmd_reaped(pid)) (void)kill(pid, SIGKILL);
+    }
+    (void)common_cmd_reap_bounded(pid);
+    close(fds[0]);
+    return failed ? -1 : 0;
 }

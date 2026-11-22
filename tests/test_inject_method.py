@@ -203,7 +203,14 @@ def direct_compile_group():
     log(f"直编组 R8：被测 ipc_server 源 = {ipc_src}")
     exe, build = build_fixture(tmp, "ipc_binding", "ipc_binding.c", [
         ipc_src,
+        # 补挂载盯梢的等待体与其事件源（ipc_server 直接调用）
+        os.path.join(ROOT, "src", "injector", "ns_mnt_wait.c"),
+        os.path.join(ROOT, "src", "injector", "ns_mnt_watch.c"),
+        # timeout 取消分支清真实重试账，不用空桩掩盖新增依赖。
+        os.path.join(ROOT, "src", "injector", "retry_queue.c"),
         os.path.join(ROOT, "src", "injector", "inject_target.c"),
+        # uid 表写回已异步化：真实落盘线程 TU，不用空桩掩盖新增依赖。
+        os.path.join(ROOT, "src", "injector", "uid_cache_writer.c"),
         os.path.join(ROOT, "src", "core", "uid_map.c"),
         os.path.join(ROOT, "src", "core", "fast_pid.c"),
         os.path.join(ROOT, "src", "core", "nsp_util.c"),

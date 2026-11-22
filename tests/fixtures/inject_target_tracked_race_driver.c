@@ -40,6 +40,7 @@
 #include "ns_utils.h"
 #include "nsp_log.h"
 #include "sys_pkg.h"
+#include "uid_cache_writer.h"
 #include "uid_map.h"
 
 /* ================= 框架桩：仅为让 inject_target.c 独立链接 =================
@@ -154,6 +155,11 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
     (void)pkg;
     return 0;
 }
+
+/* uid.map 的整表落盘是独立 TU（另有 test_uid_cache_writer.py 直测）；本夹具只关心
+   追踪表的并发遍历，落盘线程按边界桩处理。 */
+void uid_cache_write_init(UidCacheSnapshotFn snapshot) { (void)snapshot; }
+void uid_cache_write_request(void) {}
 
 /* ================= 并发变更注入窗口 ================= */
 

@@ -6,6 +6,7 @@
 #include "nsp_util.h"
 #include "injector.h"
 #include "inject_target.h"
+#include "retry_queue.h"
 #include "mount_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 #include <dirent.h>
 #include "config_parser.h"
 #include "fast_pid.h"
+#include "ns_mnt_wait.h"
 #include "ns_utils.h"
 
 /* LIST_MODULES 应答：扫描模块目录，列出含 <name>.so 的模块（与 fuse_daemon 加载约定一致）。
@@ -462,28 +464,23 @@ static void* ipc_post_mount_thread(void* raw) {
     /* 先占追踪位，避免与后台重试队列对同一 pid 并发挂载 */
     add_tracked(arg->pid);
 
+    /* 等应用自己的挂载命名空间成立：挂载表变化事件能把等待提前叫醒，精度由
+       节拍给出，整个等待仍有界（IPC_POST_WAIT_MS），到点就走跳过分支。 */
     bool switched = false;
-    for (;;) {
-        if (kill(arg->pid, 0) != 0) break; /* 进程已死，没必要再等 */
-        char ns_path[64];
-        struct stat st;
-        snprintf(ns_path, sizeof ns_path, "/proc/%d/ns/mnt", arg->pid);
-        if (stat(ns_path, &st) == 0 && (st.st_dev != arg->ns_dev || st.st_ino != arg->ns_ino)) {
-            switched = true;
-            break;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &tn);
-        if (ipc_elapsed_ms(&t0, &tn) >= IPC_POST_WAIT_MS) break;
-        struct timespec step = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
-        nanosleep(&step, nullptr);
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &tn);
-    long waited_ms = ipc_elapsed_ms(&t0, &tn);
+    long waited_us = ns_mnt_wait_switch(arg->pid, arg->ns_dev, arg->ns_ino, IPC_POST_WAIT_MS,
+                                        &switched);
+    long waited_ms = waited_us / 1000L;
     if (!switched) {
         /* 没等到切换就绝不挂：此时挂上去会落进 zygote 的命名空间，被之后 fork 的
            每个应用继承且无法清理。应用先用原生视图跑，视图交后台重试队列补。 */
         remove_tracked(arg->pid);
+        uid_t current_uid = get_app_uid(arg->pid);
+        if (kill(arg->pid, 0) == 0 && current_uid != 0 && current_uid != (uid_t)-1 &&
+            !is_isolated_uid(current_uid)) {
+            schedule_retry_mount(arg->pkg, arg->pid);
+        } else {
+            nsp_retry_done(arg->pid); /* 取消而非成功：清掉 specialize 前已有的条目 */
+        }
         LOG_DBG("IPC补挂载跳过: %s(PID:%d) %ldms 内未见命名空间切换", arg->pkg, arg->pid,
                 waited_ms);
         free(arg);
@@ -511,8 +508,9 @@ static void* ipc_post_mount_thread(void* raw) {
         mark_injected(arg->pid);
         retry_mount_succeeded(arg->pid);
         print_active_rules(arg->pkg, arg->pid, arg->uid, "IPC通知");
-        LOG("IPC补挂载完成: %s(PID:%d) 切换后 %ldms 就绪（挂载 %ldms）", arg->pkg, arg->pid,
-            waited_ms, mount_ms);
+        /* 切换后的等待量按微秒记：节拍在毫秒以下，毫秒级取值把对照信息抹平了 */
+        LOG("IPC补挂载完成: %s(PID:%d) 切换后 %ldus 就绪（挂载 %ldms）", arg->pkg, arg->pid,
+            waited_us, mount_ms);
     } else if (ret == NSP_MOUNT_DEFERRED) {
         remove_tracked(arg->pid);
         schedule_retry_mount(arg->pkg, arg->pid);
@@ -530,10 +528,9 @@ static void* ipc_post_mount_thread(void* raw) {
 /* 派发补挂载盯梢（pre 通道，proto>=3）。先取当前命名空间身份作为"还没切换"的
    基线；取不到说明进程已消失，交由调用方按已就绪处理。 */
 static bool ipc_post_mount_dispatch(const char* pkg, int pid, uid_t uid) {
-    char ns_path[64];
-    struct stat st;
-    snprintf(ns_path, sizeof ns_path, "/proc/%d/ns/mnt", pid);
-    if (stat(ns_path, &st) != 0) {
+    dev_t ns_dev;
+    ino_t ns_ino;
+    if (!ns_mnt_wait_capture(pid, &ns_dev, &ns_ino)) {
         LOG_DBG("IPC补挂载: 无法读取 %s(PID:%d) 的命名空间（%s）", pkg, pid, strerror(errno));
         return false;
     }
@@ -543,8 +540,8 @@ static bool ipc_post_mount_dispatch(const char* pkg, int pid, uid_t uid) {
     snprintf(arg->pkg, sizeof arg->pkg, "%s", pkg);
     arg->pid = pid;
     arg->uid = uid;
-    arg->ns_dev = st.st_dev;
-    arg->ns_ino = st.st_ino;
+    arg->ns_dev = ns_dev;
+    arg->ns_ino = ns_ino;
     /* 盯梢线程不在应用主线程上等，可以给足 vold 装配窗口（实测 ~135–150ms），
        让"应用首次读存储"就能看到代理视图；模块侧只等 100ms（且仅在明确 DEFER
        时），没赶上就由后台重试队列补挂，应用启动不被拖慢。 */
@@ -670,7 +667,6 @@ void handle_ipc_client_readable(int client_fd) {
     if (flags >= 0) {
         fcntl(client_fd, F_SETFL, flags & ~O_NONBLOCK);
     }
-    // 设置严格的 500ms 读写超时，防止异常客户端引发挂起
     struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

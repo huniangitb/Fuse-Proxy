@@ -52,6 +52,11 @@ void handle_list_injected(int client_fd);
  */
 void init_uid_map_cache(void);
 /*
+ * 装配 uid.map 的后台落盘线程（在 early_init 的单线程阶段调用一次）。
+ * 落盘线程持有内存表快照、做整表重写 + fsync + rename；请求路径只置位唤醒。
+ */
+void init_uid_map_persist(void);
+/*
  * 通用的应用挂载清理/恢复操作：
  * 1. 尝试卸载 target_path 上的 FUSE 挂载
  * 2. 尝试卸载 backup_path 上的 FUSE 挂载

@@ -84,7 +84,6 @@ static void build_templates_json(json_object* root) {
     config_lock_read();
     json_object* templates = json_object_new_array();
 
-    // GLOBAL 模板
     json_object* global = json_object_new_object();
     json_object_object_add(global, "template_name", json_object_new_string("GLOBAL"));
 

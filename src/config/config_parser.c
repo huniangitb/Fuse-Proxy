@@ -16,6 +16,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <time.h>
 AppConfig g_global_cfg;
 AppConfig** g_app_cfgs = nullptr;
 int g_app_cfg_count = 0;
@@ -35,11 +38,12 @@ int g_active_user_count = 0;
    fuse_daemon（内建规则引擎）、log_ctl 等进程加载配置时只读，
    避免将 scan_active_users 误判出的伪用户固化为目录 */
 static bool g_allow_app_rules_mkdir = false;
-/* pm 探测开关：scan_active_users 默认经 popen("pm list users") 枚举活跃
-   用户——该命令需 binder 通信 system_server，在 fuse_daemon 等受限环境
-   可能长时间挂起（启动/热重载持写锁阻塞 → FUSE 无响应）。只读加载方
-   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 跳过，改由
-   /data/media 与已存在的 App-rules-<uid> 目录推导（无 popen，不会阻塞） */
+/* pm 探测开关：scan_active_users 默认经 common_run_cmd_lines 执行
+   `pm list users`（预算 CFG_PM_USERS_BUDGET_MS=800ms，超预算回退磁盘推导）
+   枚举活跃用户——该命令需 binder 通信 system_server，在 fuse_daemon 等受限
+   环境可能长时间挂起（启动/热重载持写锁阻塞 → FUSE 无响应）。只读加载方
+   （fuse_daemon/log_ctl）经 config_set_scan_users_skip_pm 直接跳过 pm 探测，
+   改由 /data/media 与已存在的 App-rules-<uid> 目录推导（连 fork 都不做） */
 static bool g_scan_users_skip_pm = false;
 static pthread_rwlock_t g_rules_lock;
 #include <sched.h>
@@ -47,7 +51,8 @@ static pthread_rwlock_t g_rules_lock;
 
 /* ============ 配置代际 + 读者计数（S1 无锁快照，per-thread 计数） ============
    热路径（br_resolve/br_probe）不再取 rwlock 读锁，改走 seqlock：
-   - g_cfg_gen：偶数 = 稳定代际；奇数 = 写者进行中（读者自旋等待）
+   - g_cfg_gen：偶数 = 稳定代际；奇数 = 写者进行中（读者 futex 阻塞等待，
+     见 cfg_wait_publish：早期实现是 sched_yield 自旋，多 worker 时抢 CPU）
    - g_cfg_readers[i][slot]：per-thread 读者计数，按代际奇偶分槽
      (slot = (gen>>1)&1)。每行 64B 缓存行对齐、每线程独占一行（首次调用
      经 g_cfg_reader_next 原子分配槽位）——8+ 线程并发时读者各自 RMW
@@ -73,10 +78,28 @@ static _Alignas(64) CfgReaderCell g_cfg_readers[CFG_READER_MAX];
 static _Atomic(int) g_cfg_reader_next = 0;       /* 下一个可分配读者槽位 */
 static _Thread_local int g_cfg_reader_slot = -1; /* 本线程读者槽（首次调用分配） */
 static _Atomic(uint64_t) g_cfg_gen = 0;
+/* 读者在写者窗口里的等待字：写者每把 gen 置偶一次 +1 并 FUTEX_WAKE。
+   旧实现是 sched_yield 自旋——多个 FUSE worker 同时自旋会把 CPU 从
+   「写者正在排空的那个慢读者」手里抢走，慢读者更慢、窗口更长（自旋
+   放大，且在没有空闲核的设备上是可观察的卡顿）。改成 futex 等待 +
+   200µs 兜底重检：判据仍是 g_cfg_gen（正确性不变），等待期间不占 CPU。
+   用 __atomic 内建访问普通 unsigned 字——futex 要求 4 字节对齐的整字，
+   无符号自增不会溢出处未定义。 */
+static unsigned g_cfg_publish_wake;
+static void cfg_wait_publish(void) {
+    unsigned seen = __atomic_load_n(&g_cfg_publish_wake, __ATOMIC_ACQUIRE);
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = 200000};
+    (void)syscall(SYS_futex, &g_cfg_publish_wake, FUTEX_WAIT_PRIVATE, (int)seen, &ts, nullptr, 0);
+}
 
 /* 获取本线程读者槽：首次调用经 fetch_add 分配（热路径此后只读 TLS）。
    槽位耗尽时共享最后一个槽（正确性不变，仅退化回有竞争——实际线程数
    （FUSE 线程池 + 监控线程）远小于 CFG_READER_MAX） */
+/* 本线程当前持读槽的嵌套深度：用于识别「已在读槽内」的调用方（槽内的
+   快照入口若再取一层槽，会在并发发布时与外层槽的排空互相等待）。只由
+   config_read_begin/end 维护，深度 0 表示当前线程不持槽。 */
+static _Thread_local int g_cfg_read_depth;
+
 static int cfg_reader_slot(void) {
     int s = g_cfg_reader_slot;
     if (s < 0) {
@@ -92,22 +115,27 @@ uint64_t config_read_begin(void) {
     for (;;) {
         uint64_t g1 = atomic_load_explicit(&g_cfg_gen, memory_order_acquire);
         if (g1 & 1) {
-            sched_yield();
+            cfg_wait_publish(); /* 写者进行中：阻塞等放行（不占 CPU） */
             continue;
-        } /* 写者进行中 */
+        }
         int slot = (int)((g1 >> 1) & 1);
         atomic_fetch_add_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_acq_rel);
-        if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1)
+        if (atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == g1) {
+            g_cfg_read_depth++;
             return g1; /* 稳定快照，持槽 */
+        }
         atomic_fetch_sub_explicit(&g_cfg_readers[s].cnt[slot], 1, memory_order_release);
     }
 }
 
 bool config_read_end(uint64_t gen) {
+    if (g_cfg_read_depth > 0) g_cfg_read_depth--;
     int slot = (int)((gen >> 1) & 1);
     atomic_fetch_sub_explicit(&g_cfg_readers[cfg_reader_slot()].cnt[slot], 1, memory_order_release);
     return atomic_load_explicit(&g_cfg_gen, memory_order_acquire) == gen;
 }
+
+bool config_read_in_slot(void) { return g_cfg_read_depth > 0; }
 
 uint64_t config_publish_begin(void) {
     uint64_t g = atomic_load_explicit(&g_cfg_gen, memory_order_relaxed);
@@ -115,11 +143,30 @@ uint64_t config_publish_begin(void) {
     return g;
 }
 
+/* 写者排空等待的退避：先让出几次（读者通常已经归零，绝大多数排空一轮就结束），
+   之后按 20µs → 100µs 睡眠退避。旧实现是裸 sched_yield 自旋：读者持槽 300ms
+   时写者烧掉 0.66–0.91 个核（实测 writer_cpu/wall=0.9959），而发布点在注入器
+   唯一事件循环上，烧核还会饿住同核的 pre-hook 判定。睡眠只把排空延迟抬高
+   ≤100µs，相对被等读者的剩余槽内时间可以忽略。 */
+#define CFG_DRAIN_YIELD_ROUNDS 8
+static void cfg_drain_backoff(int* rounds) {
+    if (*rounds < CFG_DRAIN_YIELD_ROUNDS) {
+        (*rounds)++;
+        sched_yield();
+        return;
+    }
+    long ns = (*rounds < CFG_DRAIN_YIELD_ROUNDS + 16) ? 20000L : 100000L;
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = ns};
+    (*rounds)++;
+    nanosleep(&ts, nullptr);
+}
+
 /* 等待旧代际读者归零（写者交换前调用）：gen 已置奇数封锁新读者，
    旧代际读者读完自动归零；归零后无读者在途，方可安全执行非原子交换。
    新读者进新槽（(new_gen>>1)&1 ≠ old_slot）不阻塞写者——无饥饿。 */
 void config_drain_readers(uint64_t old_gen) {
     int old_slot = (int)((old_gen >> 1) & 1);
+    int rounds = 0;
     for (;;) {
         bool busy = false;
         for (int i = 0; i < CFG_READER_MAX; i++) {
@@ -129,16 +176,20 @@ void config_drain_readers(uint64_t old_gen) {
             }
         }
         if (!busy) break;
-        sched_yield();
+        cfg_drain_backoff(&rounds);
     }
 }
 
 void config_publish_end(uint64_t old_gen) {
     atomic_store_explicit(&g_cfg_gen, old_gen + 2, memory_order_release);
+    /* 放行后唤醒在 cfg_wait_publish() 里睡的读者（遗漏由 200µs 兜底覆盖） */
+    __atomic_fetch_add(&g_cfg_publish_wake, 1, __ATOMIC_RELEASE);
+    (void)syscall(SYS_futex, &g_cfg_publish_wake, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
     int old_slot = (int)((old_gen >> 1) & 1);
     /* 扫描全部读者行等旧代际槽归零（无条件扫 MAX 行，规避槽位分配
        可见性竞态；热重载极低频，64×acquire load 开销可忽略）。
        新读者进新槽（(new_gen>>1)&1 ≠ old_slot）不阻塞写者——无饥饿。 */
+    int rounds = 0;
     for (;;) {
         bool busy = false;
         for (int i = 0; i < CFG_READER_MAX; i++) {
@@ -148,7 +199,7 @@ void config_publish_end(uint64_t old_gen) {
             }
         }
         if (!busy) break;
-        sched_yield();
+        cfg_drain_backoff(&rounds);
     }
 }
 static bool is_wildcard_string(const char* str) {
@@ -1041,29 +1092,39 @@ static void merge_users_from_app_rules_dirs(void) {
     closedir(dir);
 }
 
+/* pm list users 的预算：命令走 binder 到 system_server，实测几十毫秒，
+   挂起时无上界。800ms 足够慢设备，超预算就按「pm 没结果」回退磁盘推导。 */
+#define CFG_PM_USERS_BUDGET_MS 800
+
+/* 逐行解析 pm 输出（旧实现是 fgets 逐行，语义一致；切行由 common_run_cmd_lines 做） */
+static void cfg_user_line(const char* line, void* ctx) {
+    (void)ctx;
+    int uid = -1;
+    if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
+        if (uid >= 0 && g_active_user_count < MAX_USERS) g_active_users[g_active_user_count++] = uid;
+    }
+}
+
 void scan_active_users() {
     g_active_user_count = 0;
 
     // 优先通过 pm list users 获取真实用户列表（跳过模式：只读加载方
     // 不执行 popen——pm 需 binder 通信 system_server，受限环境会挂起）
     if (!g_scan_users_skip_pm) {
-        FILE* fp = popen("pm list users 2>/dev/null", "r");
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                int uid = -1;
-                if (sscanf(line, " UserInfo{%d:", &uid) == 1) {
-                    if (uid >= 0 && g_active_user_count < MAX_USERS)
-                        g_active_users[g_active_user_count++] = uid;
-                }
-            }
-            pclose(fp);
+        bool timed_out = false;
+        if (common_run_cmd_lines("pm list users 2>/dev/null", CFG_PM_USERS_BUDGET_MS, cfg_user_line,
+                                 NULL, &timed_out) != 0) {
+            LOG_WRN("scan_active_users: pm 探测启动失败，回退磁盘推导");
+        } else if (timed_out) {
+            /* 挂住的 binder 调用不再拖死调用者（旧 popen+fgets 无上界）：放弃本次
+               pm 结果，按「pm 没有结果」走 /data/media 与规则目录推导。 */
+            g_active_user_count = 0; /* 半截用户表会挡掉下面的磁盘推导，先清空 */
+            LOG_WRN("scan_active_users: pm 探测超预算 %dms，回退磁盘推导", CFG_PM_USERS_BUDGET_MS);
         }
     } else {
         LOG_DBG("scan_active_users: 只读模式跳过 pm 探测，仅扫描 /data/media");
     }
 
-    // pm 失败时回退到 /data/media/ 扫描
     if (g_active_user_count == 0) {
         DIR* dir = opendir("/data/media");
         if (dir) {
@@ -1092,7 +1153,6 @@ void scan_active_users() {
        有规则要加载，不能因 /data/media/<uid> 不可读而整段漏掉 */
     merge_users_from_app_rules_dirs();
 
-    // 确保至少有 user 0
     if (g_active_user_count == 0) {
         g_active_users[0] = 0;
         g_active_user_count = 1;
@@ -1112,12 +1172,13 @@ void config_set_allow_app_rules_mkdir(bool allow) {
 }
 
 /* pm 探测开关：只读加载方（fuse_daemon 内建引擎、log_ctl）置
-   true——scan_active_users 跳过 popen("pm list users")，改由 /data/media 与
+   true——scan_active_users 跳过 pm 探测，改由 /data/media 与
    已存在的 App-rules-<uid> 目录推导用户列表。
    pm 需 binder 通信 system_server，在 fuse_daemon 受限环境（SELinux/
-   命名空间）可能长时间挂起，而 load_config_rules 在 config_lock_write
-   写锁内执行：启动（br_rules_init，fuse_main 之前）与热重载（inotify
-   线程）都会因 popen 阻塞而卡死 → FUSE 会话无响应。log_ctl 虽是短命 CLI
+   命名空间）可能长时间挂起；虽有 800ms 预算兜底，只读加载方本来也不需要
+   这份列表，省掉一次 fork/exec 更干净。注：injector 侧 load_config_rules
+   仍在 config_lock_write 写锁内执行（启动与热重载都是），预算把「无上界」
+   压成 800ms。log_ctl 虽是短命 CLI
    不至于死锁，但每次 JSON API 调用都付一次 binder 开销同样无必要。
    injector 保持默认 false（主控进程有 pm 环境，需要完整用户列表） */
 void config_set_scan_users_skip_pm(bool skip) {
@@ -1600,9 +1661,12 @@ void load_config_rules(const char* path) {
     config_build_from_view(recs, count);
     config_free_view(recs, count);
 }
-int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
-    /* S1：load_config_rules 内部完成 COW 发布（旧配置在发布后即被释放），
-       diff 所需旧字段须在加载前快照（旧 AppConfig 指针发布后悬垂） */
+/* 提交段：调用方持 config_lock_write。快照旧表 → 从**已读好的视图**重建并 COW 发布
+   → 计算 inject_enable 变更集。视图由调用方在锁外用 config_read_view 准备。
+   锁内只剩解析与发布：一次慢盘/慢 `pm list users` 不再按写锁时长放大到整个进程。 */
+int config_commit_prepared(NspCfgRec* recs, int count, ChangedPkg* out_changed, int max_changed) {
+    /* S1：config_build_from_view 内部完成 COW 发布（旧配置在发布后即被释放），
+       diff 所需旧字段须在发布前快照（旧 AppConfig 指针发布后悬垂） */
     bool old_global_inject = g_global_cfg.global_inject;
     typedef struct {
         char pkg[128];
@@ -1621,7 +1685,7 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
         }
     }
     /* COW 发布：换入新配置并释放旧配置（含旧 g_app_cfgs 数组） */
-    load_config_rules(path);
+    config_build_from_view(recs, count);
     // 遵循设计：injector不处理单个挂载树内的文件规则变化，仅处理全局挂载ON/OFF与应用开关
     bool global_changed = (old_global_inject != g_global_cfg.global_inject);
     int changed_count = 0;
@@ -1671,6 +1735,17 @@ int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_
     }
     free(old_snap);
     return changed_count;
+}
+
+int reload_config_rules_diff(const char* path, ChangedPkg* out_changed, int max_changed) {
+    /* 兼容入口：读盘也在调用方锁内。注入器已改用「锁外 prepare + 锁内 commit」，
+       本入口留给仍在写锁内一次性收尾的调用方（当前无）与测试基线。 */
+    NspCfgRec* recs = nullptr;
+    int count = 0;
+    config_read_view(path, &recs, &count);
+    int rc = config_commit_prepared(recs, count, out_changed, max_changed);
+    config_free_view(recs, count);
+    return rc;
 }
 AppConfig* find_app_cfg_locked(const char* pkg, int user_id) {
     char base_pkg[256];

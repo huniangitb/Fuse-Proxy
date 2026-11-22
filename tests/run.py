@@ -93,12 +93,24 @@ SUITE_MAP = [
      ("fw_acl_decide", "fw_acl_classify", "fw_acl_check", "fw_acl_identity",
       "fw_rules_cross_app_isolated"),
      "访问控制判定表(fw_acl) / 跨应用隔离开关"),
+    (("test_appops_bounded.py",),
+     ("src/daemon/fw_pkg.c", "src/daemon/fw_pkg.h", "src/daemon/fw_acl.c",
+      "tests/fixtures/fw_pkg_appops_driver.c", "tests/fixtures/appops_cmd_fixture.c"),
+     ("ext_lookup", "ext_cached", "appops_query_storage_ops", "appops_child_finish",
+      "appops_children_shutdown", "acl_fill_capabilities"),
+     "AppOps 有界查询 / 锁外缓存填充与失败冷却"),
     # ── ACL 不干扰（验收门 G9）：真 daemon + 真挂载上以普通调用者身份做真实文件
     # 操作，断言「功能预期」而不是 ACL 内部判定——ACL 层不得改变功能语义。
     (("test_acl_nonintrusive.py",),
      ("src/daemon/fw_acl.c", "src/daemon/fw_acl.h", "src/daemon/fuse_daemon.c"),
      ("fw_acl_check", "fw_acl_decide", "fw_route", "vfs_check_read_only"),
      "ACL 不干扰(G9) / 真实挂载视图功能预期"),
+    # 打开中删除（libfuse 隐藏名 rename）的 ACL 语义：隐藏名等价于 unlink，
+    # 源端必须按 DELETE 路由，否则顶层条目的「不可改名」结构规则误拒 EPERM。
+    (("test_open_unlink_toplevel.py",),
+     ("src/daemon/fuse_daemon.c", "tests/test_open_unlink_toplevel.py"),
+     ("rename_is_open_unlink", "is_fuse_hidden_name", "vfs_rename"),
+     "打开中删除的隐藏名改名按删除路由 / 真实挂载视图"),
 
     (("test_rules.py", "test_config_snapshot.py", "test_monitor_layers.py",
       "test_decision_enforce.py", "test_negative_timeout.py",
@@ -153,10 +165,26 @@ SUITE_MAP = [
      ("inject-method",),
      "injector 目标判定 / 注入方法 / 追踪表并发遍历"),
 
+    (("test_inject_method.py",),
+     ("src/injector/ns_utils.c", "src/injector/ipc_server.c",
+      "tests/fixtures/async_reaped.c", "tests/fixtures/ipc_binding.c"),
+     ("handle_async_mount_event",),
+     "IPC 请求身份与异步完成回调收尾"),
+
+    (("test_submount_rules.py",),
+     ("src/injector/mount_manager.c", "include/mount_manager.h", "src/core/common.c",
+      "src/config/config_parser.c", "include/config_parser.h",
+      "tests/fixtures/submount_rules_driver.c"),
+     ("submount_conflicts_with_rules_locked", "path_prefix_overlap", "common_parse_user_layer"),
+     "原生子挂载显式规则冲突 / 用户层与类别判定"),
+
     (("test_inject_mount_env.py", "test_ns_combined_rollback.py", "test_ns_umount_overflow.py",
-      "test_ns_global_replace_rollback.py"),
+      "test_ns_global_replace_rollback.py",
+      # A：命名空间执行原语的超时收尸有界性（kill 不生效 / 子进程滞留）
+      "test_ns_timeout_reap.py"),
      ("src/injector/ns_utils.c", "include/ns_utils.h", "src/injector/ns_global_replace.c",
       "src/injector/injector.c", "include/injector.h",
+      "tests/fixtures/ns_timeout_reap.c",
       # mountinfo 扫描原语（C7 收口）与卸载序列同源；mount_manager 是注入挂载的
       # 执行体；ipc_server 随 injector 进程生命周期起停（zygisk 通知入口）
       "src/injector/ns_mountinfo.c", "src/injector/mount_manager.c",
@@ -176,6 +204,19 @@ SUITE_MAP = [
      ("ns_mnt_watch_open", "GREPL_STEADY_EVENT", "on_mnt_watch_event",
       "g_grepl_replace_gap"),
      "稳态对账由挂载表变化事件驱动"),
+
+    # ── 补挂载盯梢的等待：有界 + 事件驱动（ns_mnt_wait.c + 盯梢线程接线）──
+    # pre 阶段拿到的 pid 还在 zygote 的挂载 ns 里，真正的挂载要等应用自己的 ns 成立。
+    # 过去是「睡 2ms、stat 一次」，检测滞后被步进锁死。驱动直编等待体（自备事件源
+    # stub，可注入「打不开」与「挂载表变了」两种情形）：量切换检测延迟、预算到点必退、
+    # CPU 不随预算增长、进程已死立刻收工、事件能把等待叫醒、没有事件源时退回节拍；
+    # 静态契约锁住「等的是事件+纳秒节拍而不是固定步进」「注册掩码为 0」「超时仍走
+    # 跳过 + 后台重试」「每轮醒来都用 stat 复核」。
+    (("test_ns_mnt_wait.py",),
+     ("src/injector/ns_mnt_wait.c", "src/injector/ns_mnt_wait.h",
+      "src/injector/ipc_server.c"),
+     ("ns_mnt_wait_switch", "ns_mnt_wait_capture", "NS_MNT_WAIT_ARM_US"),
+     "补挂载盯梢的等待有界且由挂载表事件驱动"),
 
     # ── zygisk 模块 post-specialize 的等待预算（src/zygisk/post_wait.h + 下发链）──
     # pre 的 DEFER 应答带毫秒预算（proto 4 起），模块据此决定 post 等多久：0 = 不等待、
@@ -304,14 +345,172 @@ SUITE_MAP = [
       # pid→包名快取（fast_pid）——test_monitor_layers.py 直编它们
       "src/core/uid_map.c", "include/uid_map.h",
       "src/core/sys_pkg.c", "include/sys_pkg.h",
-      "src/core/fast_pid.c", "include/fast_pid.h"),
+      "src/core/fast_pid.c", "include/fast_pid.h",
+      # 分流判别驱动（C11 + 写锁内真读盘 locks 段）改它也要重跑
+      "tests/test_cfg_reload_split.py", "tests/fixtures/cfg_reload_split_driver.c"),
      ("fw_config_monitor_for", "fw_pkg_resolve"),
      "监控开关三层合并 / uid→包名（框架权威）"),
 
     (("test_pending_close.py",),
-     ("src/daemon/fd_close_queue.c", "src/daemon/fd_close_queue.h"),
-     ("fdq_defer", "fdq_flush"),
-     "延迟 close 环形队列（Android backing fd 回收）"),
+     ("src/daemon/fd_close_queue.c", "src/daemon/fd_close_queue.h",
+      "src/daemon/fuse_daemon.c", "tests/test_pending_close.py",
+      "tests/fixtures/fd_close_queue_test.c", "tests/fixtures/fd_reply_owner_test.c"),
+     ("fdq_defer", "fdq_flush", "fdq_thread_defer", "fdq_thread_flush",
+      "vfs_backing_setup", "vfs_init"),
+     "慢 close 隔离、worker 回复 FD 所有权与退出回收"),
+
+    (("test_pkg_cache_isolation.py",),
+     ("src/daemon/fw_pkg.c", "tests/test_pkg_cache_isolation.py",
+      "tests/fixtures/pkg_cache_isolation.c"),
+     ("fw_pkg_is_privileged", "fw_pkg_uid_for_package", "fw_pkg_reload"),
+     "包身份缓存锁外读取与代际发布隔离"),
+
+    # uid.map 数组的借用/释放所有权：重载换表与请求线程并发时，旧实现先 free
+     # 后 snprintf（ASan 实录 resolve_uncached heap-use-after-free）。
+    (("test_pkg_map_lifetime.py",),
+     ("src/daemon/fw_pkg.c", "src/core/uid_map.c", "include/uid_map.h",
+      "tests/test_pkg_map_lifetime.py", "tests/fixtures/pkg_map_lifetime.c"),
+     ("uid_map_copy", "uid_map_build"),
+     "uid.map 换表与请求借表所有权（锁内拷贝）"),
+
+    # 配置读槽 × 槽内慢能力查询：readdir/getattr 决策在 config_read_begin/end 槽里
+     # fork 查 appops，发布者排空旧读者时被它拖住，随后每个 worker 都在
+     # config_read_begin 上自旋（旧实现实测单次 300ms 查询 → 发布与迟到读者
+     # 各等 270ms）。预取移到取槽之前。
+     (("test_cfg_slot_isolation.py",),
+      ("src/daemon/fw_rules.c", "src/daemon/fw_pkg.c", "src/config/config_parser.c",
+       "src/daemon/fw_pkg.h", "tests/test_cfg_slot_isolation.py",
+       "tests/fixtures/cfg_slot_isolation.c"),
+      ("fw_pkg_prefetch_isolation_facts", "br_prefetch_xapp_facts", "fw_pkg_uid_map_name",
+       "priv_cached_lookup", "fw_pkg_priv_cached", "fw_pkg_uid_cached", "br_isolation_slot",
+       "BR_FACT_WARM_TRIES", "FW_PKG_PRIV_MISS_TTL_MS", "br_collect_ext_facts",
+       "BrExtFacts"),
+      "配置读槽内的慢能力查询与慢身份事实（槽外预取 + 负结论缓存）"),
+
+    # 写者窗口里的读者等待方式：旧实现 sched_yield 自旋，多 worker 时把 CPU 从
+    # 写者正在排空的慢读者手里抢走（自旋放大）。新实现 futex 等待 + 放行唤醒；
+    # 写者自己的排空也不许自旋（读者持槽 300ms 时旧实现烧 0.66-0.91 个核）。
+    (("test_config_read_wait.py",),
+     ("src/config/config_parser.c", "tests/test_config_read_wait.py",
+      "tests/fixtures/config_read_wait_driver.c"),
+     ("config_read_begin", "cfg_wait_publish", "config_publish_end",
+      "config_drain_readers", "cfg_drain_backoff"),
+     "配置读槽等待与写者排空（futex 阻塞 + 退避睡眠，都不自旋）"),
+
+    # uid.map 的整表落盘（tmp+fsync+rename）原本内联在 IPC ACK 路径上并持 uid 表锁：
+    # 一个慢 fsync 就冻住事件循环的其它 ACK（实测并发命中被拖到 2583ms）。
+    (("test_uid_cache_writer.py",),
+     ("src/injector/uid_cache_writer.c", "include/uid_cache_writer.h",
+      "src/core/uid_map.c", "include/uid_map.h", "src/injector/inject_target.c",
+      "src/injector/injector.c", "tests/test_uid_cache_writer.py",
+      "tests/fixtures/uid_cache_writer_test.c"),
+     ("uid_cache_write_request", "uid_cache_write_flush", "uid_cache_write_shutdown",
+      "uid_map_save", "init_uid_map_persist"),
+     "uid.map 后台落盘（ACK 路径零 I/O，请求合并，退出先冲刷）"),
+
+    # 跨应用白名单数组是配置指针：发布者在排空旧读者后释放它，槽外读者若在
+    # 比较途中被发布穿插就会读已释放条目（ASan：fw_acl_identity → strlen(freed)）。
+    # 槽外调用者改走槽内快照入口。
+    (("test_acl_whitelist_lifetime.py",),
+     ("src/daemon/fw_acl.c", "src/daemon/fw_rules.c", "src/daemon/fuse_daemon.c",
+      "tests/test_acl_whitelist_lifetime.py", "tests/fixtures/acl_whitelist_lifetime.c"),
+     ("fw_rules_cross_app_pkg_allowed_snapshot", "fw_rules_cross_app_access_snapshot"),
+     "跨应用白名单数组的槽外借用（槽内快照）"),
+
+    (("test_sys_pkg_isolation.py",),
+     ("src/core/sys_pkg.c", "tests/test_sys_pkg_isolation.py",
+      "tests/fixtures/sys_pkg_isolation.c"),
+     ("sys_pkg_init", "sys_pkg_refresh", "sys_pkg_cleanup", "sys_pkg_is_system"),
+     "系统包缓存慢构建移出查询路径（后台装载）与读者隔离"),
+
+    # `pm` 走 binder 到 system_server：旧 popen+fgets 没有时间上界，一次挂起就把
+    # 配置视图/注入器事件循环/热重载线程整条冻住。新实现按预算跑命令并回退。
+    (("test_cmd_bounded_pm.py",),
+     ("src/core/common.c", "src/core/sys_pkg.c", "src/config/config_parser.c",
+      "tests/test_cmd_bounded_pm.py", "tests/fixtures/cmd_bounded_driver.c"),
+     ("common_run_cmd_lines", "scan_active_users", "sys_pkg_collect_pm"),
+     "pm 查询的时间上界（有界命令执行）"),
+
+    # 注入器在唯一事件循环线程里重载配置：旧序列把 config_read_view（真读盘 +
+    # scan_active_users 的 pm 探测）放在 config_lock_write 内，写锁期间同进程所有
+    # config 读者一起被挡。两段式：读盘锁外 prepare，锁内只 commit。
+    (("test_cfg_reload_lock.py",),
+     ("src/config/config_parser.c", "src/injector/injector.c",
+      "tests/test_cfg_reload_lock.py", "tests/fixtures/cfg_reload_lock_driver.c"),
+     ("config_commit_prepared", "config_read_view", "reload_config_rules_diff"),
+     "配置重载的慢读盘/慢 pm 不跨配置写锁"),
+
+    # 重载路径里内联的 sys_pkg_refresh() 会 fork `pm list packages -s`（3s 预算），
+    # 而 handle_pending_reload 跑在注入器唯一的事件循环线程上：一次慢 pm 冻住
+    # pre-hook 判定与挂载派发。改成请求后台 worker（突发合并、至多一个线程）。
+    (("test_async_refresh.py",),
+     ("src/injector/async_refresh.c", "include/async_refresh.h",
+      "src/injector/injector.c", "tests/test_async_refresh.py",
+      "tests/fixtures/async_refresh_driver.c"),
+     ("nsp_async_refresh_request", "nsp_async_refresh_init", "injector_sys_pkg_refresh_cb"),
+     "重载路径的慢 pm 刷新不占事件循环线程（异步合并）"),
+
+    # 同一个重载路径上更靠前的一段：config_read_view 自身先跑 scan_active_users 的
+    # `pm list users`（800ms 预算）再逐个 fopen 主配置/App-rules/模块 conf，旧实现
+    # 把这段读盘整个内联在事件循环上。两段式：请求交给读取 worker（读合并），
+    # 就绪 eventfd 触发提交（提交仍在循环上，但读盘已经完成）。
+    (("test_reload_stage.py",),
+     ("src/injector/reload_stage.c", "include/reload_stage.h",
+      "src/injector/injector.c", "tests/test_reload_stage.py",
+      "tests/fixtures/reload_stage_driver.c"),
+     ("nsp_reload_stage_request", "nsp_reload_stage_take", "nsp_reload_stage_start"),
+     "配置重载的读盘与 pm 探测不占事件循环线程（阶段化读取）"),
+    # FUSE 状态机上的三段秒级慢活（崩溃恢复、启动扫描、重挂全部追踪应用）都在
+    # 也在 唯一事件循环线程上；改成一条维护 worker + 任务位，循环只发请求、收完成位。
+    (("test_fuse_recover.py",),
+     ("src/injector/fuse_recover.c", "include/fuse_recover.h",
+      "src/injector/injector.c", "tests/test_fuse_recover.py",
+      "tests/fixtures/fuse_recover_driver.c"),
+     ("nsp_fuse_recover_request", "nsp_fuse_recover_take", "nsp_fuse_recover_start",
+      "injector_fuse_maintenance_cb"),
+     "FUSE 恢复/启动扫描/重挂不占事件循环线程（任务位串行维护）"),
+
+    # 挂载表有三个写者（维护 worker、审计 worker、事件循环的重试派发）：谁都不许把
+    # 慢挂载叠进另一条线程的遍历里；事件循环侧只能用 trylock 且抢不到就 20ms 后重跑。
+    # 媒体实例的停/拉也随这一批挪进维护 worker（不再在循环上 kill 等待 + fork）。
+    (("test_mount_ops.py",),
+     ("src/injector/mount_ops.c", "include/mount_ops.h",
+      "src/injector/injector.c", "src/injector/audit_worker.c",
+      "tests/test_mount_ops.py", "tests/fixtures/mount_ops_driver.c"),
+     ("mount_ops_begin", "mount_ops_try_begin", "media_fuse_maintain",
+      "maybe_retry_recover"),
+     "挂载表写者串行化与事件循环 trylock（媒体实例维护、恢复有界重试）"),
+
+    # fast_pid 的位图与 pid 缓存是跨线程共享状态：恢复 worker 的全进程清理与事件
+    # 循环的 remount/cache_clear 会同时读写（旧实现默认只有一个调用线程）。
+    (("test_fast_pid_threads.py",),
+     ("src/core/fast_pid.c", "tests/test_fast_pid_threads.py",
+      "tests/fixtures/fast_pid_threads_driver.c"),
+     ("cache_prune_dead", "fast_pid_cache_clear"),
+     "fast_pid 缓存跨线程安全（扫描/清缓存无 use-after-free）"),
+    # 类同 async_refresh：handle_pending_reload 原先内联 audit_tracked_apps /
+    # audit_and_remount_specific_apps / audit_running_apps——逐个 tracked 应用做
+    # 配置判定 + 实测视图 + 挂载/卸载/还原，几十个在跑的应用叠起来把事件循环按在
+    # 那里数十秒。改成请求合并的后台 worker（至多一个线程、空闲自退）。
+    (("test_audit_defer.py",),
+     ("src/injector/audit_worker.c", "include/audit_worker.h",
+      "src/injector/injector.c", "tests/test_audit_defer.py",
+      "tests/fixtures/audit_defer_driver.c"),
+     ("nsp_audit_request", "nsp_audit_shutdown", "audit_run_job"),
+     "重载后的运行中应用对账不占事件循环线程（异步合并）"),
+
+    (("test_ftp_lifecycle_isolation.py",),
+     ("src/modules/ftp/ftp_backend_libcurl.c", "src/modules/ftp/ftp_mux.c",
+      "tests/test_ftp_lifecycle_isolation.py",
+      "tests/fixtures/ftp_lifecycle_isolation_test.c"),
+     ("backend_add_server", "backend_clear_servers", "backend_find", "backend_mux_ref"),
+     "FTP 生命周期慢构造及关闭不占服务元数据锁"),
+
+    (("test_log_persist_isolation.py",),
+     ("src/log/log_monitor.c", "tests/test_log_persist_isolation.py",
+      "tests/fixtures/log_persist_isolation.c"),
+     ("persist_stage", "persist_clear", "persist_worker_start", "persist_worker_stop"),
+     "日志慢落盘与主事件循环隔离"),
 
     (("test_cfg_watch.py",),
      ("src/daemon/cfg_watch.c", "src/daemon/cfg_watch.h"),
@@ -372,8 +571,21 @@ SUITE_MAP = [
      ("reload_name_matches", "NSP_RELOAD_DEBOUNCE_MS", "NSP_RELOAD_MAX_DEFER_MS"),
      "配置重载只认 .conf 结尾（list.config 不再触发整份重载）"),
 
-    # FUSE worker 线程数：2 个在单个应用冷启动时排队，按核数一把梭又会互抢 CPU，
-    # 默认取 min(max(2, ncpu/2), 8)，显式值（0 单线程 / -1 libfuse 默认）仍保留。
+    # 1122 安全合并：源码包真实新增行为，旧源码路径可复验，不运行附件脚本。
+    (("test_import_1122_daemon.py",),
+     ("tests/test_import_1122_daemon.py", "tests/fixtures/import_1122_daemon_driver.c",
+      "src/daemon/fw_rules.c", "src/daemon/fuse_daemon.c", "src/core/common.c", "include/common.h"),
+     ("common_storage_child_path", "common_mkdir_storage_child", "common_apply_fd_attrs",
+      "new_entry_mode", "br_ensure_sandbox_dir",
+      "vfs_mknod", "chmod_acl_drop_note"),
+     "沙盒 Android 补建、mknod 补父、ACL chmod 日志限频与路径边界"),
+    (("test_import_1122_injector.py",),
+     ("tests/test_import_1122_injector.py", "tests/fixtures/import_1122_injector.c",
+      "src/injector/ipc_server.c", "src/injector/injector.c", "src/injector/ns_utils.c"),
+     ("ipc_post_mount_thread", "retry_pending_mounts"),
+     "超时盯梢入队、当前 UID/目标/命名空间重验及 passive 启动分支"),
+
+    # FUSE worker 默认按核数取 min(max(4, ncpu), 16)，配置覆盖仍保留。
     (("test_fuse_threads.py",),
      ("include/fuse_threads.h", "src/daemon/fuse_daemon.c", "src/injector/injector.c",
       "src/config/config_parser.c", "include/config_parser.h", "docs/config.md"),
@@ -459,8 +671,25 @@ LAYERS = {
             "test_monitor_layers.py",
             "test_path_vars.py",
             "test_pending_close.py",
+            "test_pkg_cache_isolation.py",
+            "test_pkg_map_lifetime.py",
+            "test_cfg_slot_isolation.py",
+            "test_acl_whitelist_lifetime.py",
+            "test_sys_pkg_isolation.py",
+            "test_cmd_bounded_pm.py",
+            "test_cfg_reload_lock.py",
+            "test_async_refresh.py",
+            "test_reload_stage.py",
+            "test_fuse_recover.py",
+            "test_mount_ops.py",
+            "test_fast_pid_threads.py",
+            "test_audit_defer.py",
+            "test_ftp_lifecycle_isolation.py",
+            "test_log_persist_isolation.py",
             "test_cfg_watch.py",
             "test_cfg_reload_split.py",
+            "test_config_read_wait.py",
+            "test_uid_cache_writer.py",
             "test_module_cfg_push.py",
             "test_fw_config_view.py",
             "test_rule_file_lock.py",
@@ -483,7 +712,10 @@ LAYERS = {
             "test_mount_liveness.py",
             "test_mountinfo_dynamic.py",
             "test_mount_state_read.py",
+            "test_submount_rules.py",
             "test_zygisk_post_wait.py",
+            "test_ns_mnt_wait.py",
+            "test_ns_timeout_reap.py",
             "test_grepl_status_fast.py",
             "test_events_owner.py",
             "test_crash_tail.py",
@@ -492,6 +724,8 @@ LAYERS = {
             "test_build_scripts.py",
             "test_inject_reload_filter.py",
             "test_fuse_threads.py",
+            "test_import_1122_daemon.py",
+            "test_import_1122_injector.py",
             "test_hide_errno.py",
             "test_fuse_copy_range.py",
         ),
@@ -505,6 +739,7 @@ LAYERS = {
             "test_decision_enforce.py",
             "test_fw_events_fuse.py",
             "test_acl_nonintrusive.py",
+            "test_open_unlink_toplevel.py",
             "test_negative_timeout.py",
             "test_storage_root_guard.py",
             "test_readdir_skel_fallback.py",
@@ -523,6 +758,7 @@ LAYERS = {
     "L2": (
         "Android 拓扑仿真（rootless unshare 沙箱，须核对宿主 mountinfo 零变化）",
         (
+            "test_appops_bounded.py",
             "test_inject_mount_env.py",
             "test_global_replace.py",
             "test_mnt_watch.py",
@@ -693,6 +929,7 @@ PARALLEL_SAFE = frozenset({
     "test_mountinfo_dynamic.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap=fopen，
                                   # 合成 mountinfo，无挂载/无 daemon
     "test_mount_state_read.py",   # cc 直编 mount_manager.c + 桩，合成 mountinfo，无挂载/无 daemon
+    "test_submount_rules.py",     # 直编 mount_manager/common + 合成 mountinfo，无挂载/无 daemon
     "test_zygisk_post_wait.py",   # cc 直编 post_wait.h + 静态读源码，无挂载/无 daemon
     "test_grepl_status_fast.py",  # cc 直编 ns_mountinfo.c/ns_global_replace.c + --wrap 桩
                                   # stat/opendir/readdir/fopen，合成族目录，无挂载/无 daemon
@@ -700,7 +937,24 @@ PARALLEL_SAFE = frozenset({
     "test_crash_tail.py",         # cc 直编 crash_tail.c 纯函数，无文件/无 daemon
     "test_crash_log.py",          # --crash-test 挂载前退出，日志只写 mkstemp 临时文件
     "test_ftp_read_restart.py",   # cc+mock 直跑（TemporaryDirectory），无 FUSE/网络/端口/pkill
-    "test_pending_close.py",      # cc 直编队列实现 + 驱动，TemporaryDirectory，无挂载
+    "test_pending_close.py",      # 真实队列/FD/线程与 daemon wrapper，临时目录，无挂载
+    "test_pkg_cache_isolation.py", # 真实 fw_pkg + 定向文件 gate，临时目录，无挂载
+    "test_pkg_map_lifetime.py",   # 真实 fw_pkg/uid_map + 私有 uid.map，临时目录，无挂载
+    "test_cfg_slot_isolation.py",  # 真实 fw_rules/fw_pkg/parser + 测试钩子，临时目录，无挂载
+    "test_config_read_wait.py",   # cc 直编真实 parser，纯线程/CPU 计时，无文件或挂载
+    "test_acl_whitelist_lifetime.py", # 真实 fw_acl/fw_rules + 真实发布协议，临时目录，无挂载
+    "test_sys_pkg_isolation.py",   # 真实 sys_pkg/parser + 文件 gate，临时目录，无挂载
+    "test_cmd_bounded_pm.py",     # cc 直编真实 common/parser/sys_pkg + PATH 假 pm，临时目录，无挂载
+    "test_cfg_reload_lock.py",    # cc 直编真实 parser + --wrap 慢盘/慢 pm，临时配置目录，无挂载
+    "test_async_refresh.py",      # cc 直编真实 async_refresh + 慢回调替身，纯线程，无文件/挂载
+    "test_reload_stage.py",       # cc 直编真实 reload_stage + 慢 fopen 注入，临时配置目录，无挂载
+    "test_fuse_recover.py",       # cc 直编真实 fuse_recover + 慢回调替身，纯线程，无文件/挂载
+    "test_mount_ops.py",          # cc 直编真实 mount_ops.c + 静态接线检查，纯线程，无挂载
+    "test_uid_cache_writer.py",   # cc 直编真实 uid_cache_writer/uid_map，私有 uid.map，无挂载
+    "test_fast_pid_threads.py",   # cc 直编真实 fast_pid，两线程扫描/清缓存，ASan 判别
+    "test_audit_defer.py",        # cc 直编真实 audit_worker + 慢审计替身，纯线程，无挂载
+    "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
+    "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志
     "test_cfg_watch.py",          # cc 直编 watch 对账 + 驱动，/tmp mkdtemp，无挂载
     "test_rule_file_lock.py",     # cc 直编 nsp_rule_file + 子进程并发写，/tmp 工作目录
     "test_ns_combined_rollback.py",  # cc 直编 ns_utils.c + --wrap 桩 mount，无挂载/特权
@@ -718,6 +972,8 @@ PARALLEL_SAFE = frozenset({
     "test_build_scripts.py",      # 假 HOME + PATH 桩跑脚本，TemporaryDirectory，不碰真实路径
     "test_inject_reload_filter.py",  # 抽出 injector.c 的纯函数直编，无挂载/无 daemon
     "test_fuse_threads.py",          # 抽出 fuse_threads.h 的内联函数直编，无挂载/无 daemon
+    "test_import_1122_daemon.py",    # 实际函数 + common，temp FIFO/目录，无挂载/无 daemon
+    "test_import_1122_injector.py",  # 实际函数 + retry_queue，合成 proc/ns，无挂载/无 daemon
     "test_hide_errno.py",            # 直编 nsp_hide_errno.h 的内联函数，无挂载/无 daemon
     "test_fuse_copy_range.py",       # 只读源码文本做静态契约，无挂载/无 daemon
 })
@@ -734,6 +990,7 @@ TIER_EXCLUSIVE = frozenset({
 # 空间里挂/卸（L1 的 FUSE 挂载就落在宿主 ns），它们彼此之间也一样。调度器先让它们
 # 独占跑完，再放挂载类进来——否则写锁永远等不到「零读者」那个瞬间。
 QUIET_ON_HOST = frozenset({
+    "test_appops_bounded.py",
     "test_inject_mount_env.py",
     "test_global_replace.py",
     "test_mnt_watch.py",

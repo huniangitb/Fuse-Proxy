@@ -42,7 +42,7 @@ void config_publisher_handle_readable(int fd);
 
 /**
  * 广播当前全量配置 JSON 给所有已注册并处于活跃状态的订阅者
- * 在规则重载（SIGHUP 或 inotify 触发 reload_config_rules_diff）完成后被调用
+ * 在规则重载（SIGHUP 或 inotify 触发 config_commit_prepared）完成后被调用
  */
 void config_publisher_broadcast(void);
 
