@@ -304,8 +304,12 @@ static void reload_once(bool also_nonrule) {
     fw_pkg_reload();
     config_lock_write();
     config_build_from_view(new_recs, new_count);
-    sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     config_unlock_write();
+    /* sys_pkgs.cache 的重读是**真读盘**，必须留在配置写锁之外：写锁会挡住同进程
+       的冷路径读者（log_ctl 查询用 rwlock 读锁）与下一个写者，一次慢盘就把它们
+       一起冻住。sys 表有自己的锁与代际发布，与规则视图不需要同刻可见——
+       reload_sys_pkg_only() 本来就是无锁调用，这里与之同口径。 */
+    sys_pkg_refresh(); /* 重读 sys_pkgs.cache（injector 可能已更新落盘） */
     /* 内建规则引擎的 uid→AppConfig 指针缓存不在这里作废：容器会在发布临界区
        （旧读者已排空、新读者仍封锁）内经 config_set_publish_invalidate_hook
        自动作废——发布后补调会留出「命中已释放指针」的窗口 */

@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -49,11 +51,20 @@ static _Atomic uint64_t g_gen = 1;
 static UidMapEntry* g_uid_maps = nullptr;
 static int g_uid_map_count = 0;
 
-/* uid.map 条目数随已启动应用增长：按需扩容装载（同模块 load_uid_map） */
-static void load_uid_map(void) {
+/* uid.map 数组的所有权锁：读者只在锁内做二分并把命中的包名拷进自己的缓冲，
+   装载（可能是慢磁盘读，条目数随已启动应用增长）与旧表释放都在锁外。
+   历史缺陷（本次修复）：换表后立即 free 旧数组，而重载线程与 FUSE worker 并发，
+   resolve_uncached 拿着 lookup 借出的裸指针去 snprintf —— ASan 实录
+   resolve_uncached 读 heap-use-after-free（释放点是 load_uid_map 的 free）。
+   借出改为「锁内拷贝」后，释放点不再有任何存活 alias；锁内只有二分与一次有界
+   拷贝，故重载的慢 I/O 不会拖住请求路径，也不引入新的慢调用扇出。 */
+static pthread_mutex_t g_uid_map_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 装载候选：按需扩容读满整表。失败返回 nullptr（调用方保留旧表可用）。 */
+static UidMapEntry* uid_map_build(int* count_out) {
     int cap = UID_MAP_INIT_CAPACITY;
     UidMapEntry* maps = malloc((size_t)cap * sizeof(UidMapEntry));
-    if (!maps) return;
+    if (!maps) return nullptr;
     int count = uid_map_load(maps, cap);
     while (count > 0 && count == cap) {
         cap *= 2;
@@ -62,9 +73,44 @@ static void load_uid_map(void) {
         maps = bigger;
         count = uid_map_load(maps, cap);
     }
+    *count_out = count;
+    return maps;
+}
+
+/* uid → uid.map 里的包名（拷贝到调用方缓冲）。锁内只有二分与一次拷贝，无 I/O。 */
+static bool uid_map_copy(uid_t uid, char* out, size_t size) {
+    bool found = false;
+    pthread_mutex_lock(&g_uid_map_lock);
+    const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
+    if (mapped) {
+        snprintf(out, size, "%s", mapped);
+        found = true;
+    }
+    pthread_mutex_unlock(&g_uid_map_lock);
+    return found;
+}
+
+/* uid → 包名，**只查 uid.map**：不摸 /proc、不读 packages.list，纯内存（锁内
+   二分 + 一次有界拷贝）。FUSE 请求的 uid→包名绝大多数命中这里；调用方用它做
+   "这条请求是不是调用方自己的子树"的廉价判断（在 config 读槽之外）。 */
+bool fw_pkg_uid_map_name(uid_t uid, char* out, size_t size) {
+    if (!out || size == 0) return false;
+    out[0] = '\0';
+    if (!uid_map_copy(uid, out, size)) return false;
+    return out[0] != '\0';
+}
+
+/* uid.map 条目数随已启动应用增长：按需扩容装载（同模块 load_uid_map） */
+static void load_uid_map(void) {
+    int count = 0;
+    UidMapEntry* maps = uid_map_build(&count);
+    if (!maps) return;
+    pthread_mutex_lock(&g_uid_map_lock);
     UidMapEntry* old = g_uid_maps;
     g_uid_maps = maps;
     g_uid_map_count = count;
+    pthread_mutex_unlock(&g_uid_map_lock);
+    /* 读者只在锁内借表，故此处释放时已无存活 alias（并发重载亦然）。 */
     free(old);
 }
 
@@ -73,10 +119,16 @@ void fw_pkg_reload(void) {
     atomic_fetch_add_explicit(&g_gen, 1, memory_order_release);
 }
 
+static void appops_children_shutdown(void);
+
 void fw_pkg_shutdown(void) {
-    free(g_uid_maps);
+    appops_children_shutdown();
+    pthread_mutex_lock(&g_uid_map_lock);
+    UidMapEntry* maps = g_uid_maps;
     g_uid_maps = nullptr;
     g_uid_map_count = 0;
+    pthread_mutex_unlock(&g_uid_map_lock);
+    free(maps);
 }
 
 /* /data/system/packages.list：Android 全量已装应用清单（"pkg uid ..."），
@@ -122,58 +174,109 @@ static bool resolve_sys_pkg_from_packagelist(uid_t uid, char* out, size_t size,
     return found;
 }
 
-/* uid 是否为特权应用（Android 权限体系自动判定，见 fw_pkg.h）。缓存独立于
-   包名解析槽位：privileged 是"uid → 布尔"的稳定事实（packages.list 只在
-   应用安装/升级时变化），包名缓存 gen 失效不影响它。 */
+/* 特权缓存独立于包名缓存，但同样随 g_gen 失效。所有快读字段均为原子，
+   seq_cst 序保证两次 seq 之间读到的是完整发布；文件读取绝不占用填充锁。 */
 typedef struct {
     _Atomic uint64_t seq; /* 奇数 = 写者进行中 */
-    uint64_t gen;
-    uid_t uid;
-    bool known; /* packages.list 有该 uid 的行（不可读/未命中 = false） */
-    bool priv;
+    _Atomic uint64_t gen;
+    _Atomic uint64_t stamp_ms; /* 发布时间（单调毫秒），只用于负结论的短 TTL */
+    _Atomic uid_t uid;
+    _Atomic bool known; /* false = 本次读不到结论：只在 stamp_ms 的短 TTL 内复用 */
+    _Atomic bool priv;
 } FwPkgPrivSlot;
 
 static FwPkgPrivSlot g_priv_slots[FW_PKG_CACHE_SIZE];
 static pthread_mutex_t g_priv_fill_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* seinfo 以 "platform" 开头 = platform 签名（system/priv-app/签名共享）。
-   实测 packages.list：DocumentsUI "platform:privapp:…"、Settings "platform:privapp:…"、
-   系统签名覆盖层 "platform:targetSdkVersion=…"；普通应用恒为 "default:…"。
-   "privapp" 子串单独判会漏掉纯 platform 签名应用，故判前缀。 */
+   实测 packages.list：DocumentsUI/Settings "platform:privapp:…"、
+   签名覆盖层 "platform:targetSdkVersion=…"；普通应用恒为 "default:…"。
+   只判 "privapp" 子串会漏掉纯 platform 签名应用，故判前缀。 */
 static bool seinfo_is_privileged(const char* seinfo) {
     return strncmp(seinfo, "platform", 8) == 0 &&
            (seinfo[8] == '\0' || seinfo[8] == ':');
 }
 
+/* 负结论（packages.list 打不开/该 uid 无行）的有效期：读失败时若不留一个短 TTL，
+   每次请求都会重扫一遍文件——包括**在配置读槽里**的那次（槽内只认缓存，未命中就
+   要出槽预热再重来，没有缓存项等于每个请求都多一次 IO 且永远收敛不了）。
+   1s 与 appops 失败冷却同量级；成功结论不受这个 TTL 限制（按 gen 失效）。 */
+#define FW_PKG_PRIV_MISS_TTL_MS 1000u
+
+static uint64_t ext_clock_ms(void); /* 单调毫秒，定义见 appops 缓存段 */
+
+/* 取特权槽的可用快照：已知结论，或 TTL 内的负结论。判定快路与槽内只读查询
+   （fw_pkg_priv_cached）必须同一口径，故只写在这一个函数里。 */
+static bool priv_cached_lookup(FwPkgPrivSlot* s, uid_t uid, uint64_t gen, uint64_t now,
+                               bool* priv_out) {
+    uint64_t claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    uint64_t slot_gen = atomic_load_explicit(&s->gen, memory_order_seq_cst);
+    uid_t slot_uid = atomic_load_explicit(&s->uid, memory_order_seq_cst);
+    bool known = atomic_load_explicit(&s->known, memory_order_seq_cst);
+    bool priv = atomic_load_explicit(&s->priv, memory_order_seq_cst);
+    uint64_t stamp = atomic_load_explicit(&s->stamp_ms, memory_order_seq_cst);
+    if ((claim & 1) || claim != atomic_load_explicit(&s->seq, memory_order_seq_cst)) return false;
+    if (slot_gen != gen || slot_uid != uid) return false;
+    if (!known && (!stamp || now < stamp || now - stamp >= FW_PKG_PRIV_MISS_TTL_MS)) return false;
+    *priv_out = priv;
+    return true;
+}
+
 bool fw_pkg_is_privileged(uid_t uid) {
     FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
-    for (;;) {
-        uint64_t v1 = atomic_load_explicit(&s->seq, memory_order_acquire);
-        if (!(v1 & 1)) {
-            if (v1 == s->seq && s->gen == gen && s->uid == uid && s->known)
-                return s->priv;
-        }
-        if (atomic_load_explicit(&s->seq, memory_order_acquire) & 1) continue;
-        pthread_mutex_lock(&g_priv_fill_lock);
-        char pkg[FW_PKG_NAME_MAX];
-        char seinfo[128];
-        bool known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo,
-                                                      sizeof seinfo);
-        bool priv = known && seinfo_is_privileged(seinfo);
-        /* 槽位写回只依赖 g_priv_fill_lock（本函数独占路径）+ 自身 seqlock 标记；
-           绝不碰 g_fill_lock——包名填充路径（g_fill_lock）会调用本函数，嵌套即死锁 */
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release); /* 奇：写中 */
+    uint64_t claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    bool priv = false;
+    if (priv_cached_lookup(s, uid, gen, ext_clock_ms(), &priv) &&
+        gen == atomic_load_explicit(&g_gen, memory_order_acquire)) return priv;
+
+    /* 只认领版本，不把外部 I/O 变成其它 uid 的等待点。并发同 uid miss 可独立查询。 */
+    pthread_mutex_lock(&g_priv_fill_lock);
+    gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    claim = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    if (priv_cached_lookup(s, uid, gen, ext_clock_ms(), &priv)) {
+        pthread_mutex_unlock(&g_priv_fill_lock);
+        return gen == atomic_load_explicit(&g_gen, memory_order_acquire) && priv;
+    }
+    pthread_mutex_unlock(&g_priv_fill_lock);
+
+    char pkg[FW_PKG_NAME_MAX];
+    char seinfo[128];
+    bool known = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, seinfo, sizeof seinfo);
+    priv = known && seinfo_is_privileged(seinfo);
+
+    pthread_mutex_lock(&g_priv_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) {
+        pthread_mutex_unlock(&g_priv_fill_lock);
+        return false; /* 旧代查询不发布也不授予权限，不在请求里循环重读。 */
+    }
+    uint64_t current = atomic_load_explicit(&s->seq, memory_order_seq_cst);
+    if (current != claim && s->gen == gen && s->uid == uid) {
+        priv = s->priv; /* 同 key 已完成的发布优先，包括一次未命中。 */
+    } else if (current == claim) {
+        /* 版本标记阻止慢 miss 覆盖碰撞槽的新 key（包括 key 来回变化的 ABA）。 */
+        atomic_store_explicit(&s->seq, claim + 1, memory_order_seq_cst);
         s->uid = uid;
         s->known = known;
         s->priv = priv;
         s->gen = gen;
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release); /* 偶：写完 */
-        pthread_mutex_unlock(&g_priv_fill_lock);
-        return priv;
+        s->stamp_ms = ext_clock_ms();
+        atomic_store_explicit(&s->seq, claim + 2, memory_order_seq_cst);
     }
+    pthread_mutex_unlock(&g_priv_fill_lock);
+    return gen == atomic_load_explicit(&g_gen, memory_order_acquire) && priv;
+}
+
+/* 槽内只读入口：有可用结论（含 TTL 内的负结论）就返回 true，**绝不做文件 IO**。
+   配置读槽里的判定必须只走这里：未命中由调用方出槽预热后重来，慢读不落在槽内。 */
+bool fw_pkg_priv_cached(uid_t uid, bool* priv_out) {
+    FwPkgPrivSlot* s = &g_priv_slots[uid % FW_PKG_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    bool priv = false;
+    if (!priv_cached_lookup(s, uid, gen, ext_clock_ms(), &priv)) return false;
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (priv_out) *priv_out = priv;
+    return true;
 }
 
 
@@ -192,17 +295,18 @@ bool fw_pkg_is_privileged(uid_t uid) {
                                                    （两者都以同一子串结尾）
    "default" / "deny" / "ignore" 都不算。
 
-   结果按 uid 缓存（命中/未命中都缓存，只有命令失败时不缓存以免每次请求都 fork），
-   fw_pkg_reload 后随 gen 失效重查，另见 FW_PKG_EXT_TTL_MS。锁纪律同特权槽位：
-   只持 g_ext_fill_lock，函数体内只做 packages.list 解析与 posix_spawn。 */
+   成功结果缓存 30s，失败冷却 1s，规则重载按 gen 失效。填充锁只保护缓存
+   认领和发布，packages.list I/O 与外部命令都在锁外。 */
 typedef struct {
     _Atomic uint64_t seq; /* 奇数 = 写者进行中 */
-    uint64_t gen;
-    uint64_t stamp_ms; /* 填充时刻（单调时钟），见 FW_PKG_EXT_TTL_MS */
-    uid_t uid;
-    bool known; /* 本代已有结果（命令失败 → false，下次重查） */
-    bool manage_external;
-    bool installer;
+    _Atomic uint64_t gen;
+    _Atomic uint64_t stamp_ms;
+    _Atomic uid_t uid;
+    _Atomic bool known;
+    _Atomic bool pending; /* 同槽 uid/gen 存续期间去重；查询中暂不授予能力 */
+    _Atomic bool query_ok; /* 失败短冷却，成功保留正常 TTL */
+    _Atomic bool manage_external;
+    _Atomic bool installer;
 } FwPkgExtSlot;
 
 static FwPkgExtSlot g_ext_slots[FW_PKG_CACHE_SIZE];
@@ -218,54 +322,233 @@ void fw_pkg_set_installer_probe(bool (*fn)(const char* pkg)) {
     g_installer_probe = fn;
 }
 
+/* 查询预算包括 stdout 和退出确认；超时回收绝不在 FUSE 回调里 waitpid(0)。 */
+#define FW_PKG_APPOPS_TIMEOUT_MS 250u
+#define FW_PKG_APPOPS_REAP_MS 20u
+#define FW_PKG_APPOPS_QUERY_MS (FW_PKG_APPOPS_TIMEOUT_MS - FW_PKG_APPOPS_REAP_MS)
+#define FW_PKG_APPOPS_CHILD_MAX 32
+
+typedef struct {
+    pid_t pid; /* -1 = 查询线程占用，>0 = 已移交回收线程 */
+} AppopsChild;
+static AppopsChild g_appops_children[FW_PKG_APPOPS_CHILD_MAX];
+static pthread_mutex_t g_appops_child_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_appops_child_cv;
+static pthread_t g_appops_reaper;
+static bool g_appops_cv_ready;
+static bool g_appops_reaper_started;
+static bool g_appops_stopping;
+
+static uint64_t ext_clock_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* 只收自己移交的 pid，不抢模块的子进程；D 状态子进程也不能卡住回收线程。 */
+static void* appops_reaper(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_appops_child_lock);
+    for (;;) {
+        bool pending = false;
+        for (int i = 0; i < FW_PKG_APPOPS_CHILD_MAX; i++) {
+            pid_t pid = g_appops_children[i].pid;
+            if (pid <= 0) continue;
+            pid_t w = waitpid(pid, nullptr, WNOHANG);
+            if (w == pid || (w < 0 && errno == ECHILD)) {
+                g_appops_children[i].pid = 0;
+            } else {
+                pending = true;
+            }
+        }
+        if (g_appops_stopping) break;
+        if (!pending) {
+            pthread_cond_wait(&g_appops_child_cv, &g_appops_child_lock);
+        } else {
+            struct timespec until;
+            if (clock_gettime(CLOCK_MONOTONIC, &until) != 0) break;
+            until.tv_nsec += 20000000;
+            if (until.tv_nsec >= 1000000000) {
+                until.tv_sec++;
+                until.tv_nsec -= 1000000000;
+            }
+            pthread_cond_timedwait(&g_appops_child_cv, &g_appops_child_lock, &until);
+        }
+    }
+    pthread_mutex_unlock(&g_appops_child_lock);
+    return nullptr;
+}
+
+/* 先预留固定槽再 spawn：回收不及时最多占满 32 槽，不能无限堆线程或僵尸。 */
+static int appops_child_reserve(void) {
+    pthread_mutex_lock(&g_appops_child_lock);
+    if (g_appops_stopping) goto unavailable;
+    if (!g_appops_cv_ready) {
+        pthread_condattr_t attr;
+        if (pthread_condattr_init(&attr) != 0) goto unavailable;
+        int rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        if (rc == 0) rc = pthread_cond_init(&g_appops_child_cv, &attr);
+        pthread_condattr_destroy(&attr);
+        if (rc != 0) goto unavailable;
+        g_appops_cv_ready = true;
+    }
+    if (!g_appops_reaper_started) {
+        if (pthread_create(&g_appops_reaper, nullptr, appops_reaper, nullptr) != 0)
+            goto unavailable;
+        g_appops_reaper_started = true;
+    }
+    for (int i = 0; i < FW_PKG_APPOPS_CHILD_MAX; i++) {
+        if (g_appops_children[i].pid == 0) {
+            g_appops_children[i].pid = -1;
+            pthread_mutex_unlock(&g_appops_child_lock);
+            return i;
+        }
+    }
+unavailable:
+    pthread_mutex_unlock(&g_appops_child_lock);
+    return -1;
+}
+
+static void appops_child_finish(int slot, pid_t pid, bool reaped) {
+    /* 尚未 wait 到退出的独占子进程才可 kill；已回收 pid 可能被内核复用。 */
+    if (pid > 0 && !reaped) {
+        kill(pid, SIGKILL);
+        /* 总预算预留 20ms 给通常立即退出的 cmd；仍只用 WNOHANG。
+           超出这段或 D 状态交后台，绝不退回无限 waitpid。 */
+        uint64_t start = ext_clock_ms();
+        for (;;) {
+            pid_t w = waitpid(pid, nullptr, WNOHANG);
+            if (w == pid || (w < 0 && errno == ECHILD)) {
+                reaped = true;
+                break;
+            }
+            uint64_t now = ext_clock_ms();
+            if (start == 0 || now == 0 || now - start >= FW_PKG_APPOPS_REAP_MS) break;
+            poll(nullptr, 0, 1);
+        }
+    }
+    pthread_mutex_lock(&g_appops_child_lock);
+    g_appops_children[slot].pid = pid > 0 && !reaped ? pid : 0;
+    pthread_cond_signal(&g_appops_child_cv);
+    pthread_mutex_unlock(&g_appops_child_lock);
+}
+
+/* fuse 请求已停后的终态关闭；join 只等非阻塞回收线程，不等某个子进程。 */
+static void appops_children_shutdown(void) {
+    pthread_mutex_lock(&g_appops_child_lock);
+    g_appops_stopping = true;
+    bool started = g_appops_reaper_started;
+    pthread_t reaper = g_appops_reaper;
+    g_appops_reaper_started = false;
+    if (started) pthread_cond_signal(&g_appops_child_cv);
+    pthread_mutex_unlock(&g_appops_child_lock);
+    if (started) pthread_join(reaper, nullptr);
+}
+
 /* 跑 `cmd appops get <pkg>` 并解析输出。
-   子进程用 posix_spawn（vfork + execve，不经过 shell）；stdout 收到管道，
-   stderr 丢 /dev/null。返回 false = 命令本身失败（调用方不写缓存，下次重试）。 */
+   子进程用 posix_spawn，不经过 shell；stdout 收到管道，stderr 丢 /dev/null。
+   预算限制 spawn 返回后的输出/退出等待，不能中断同步 spawn 或此前的查包名。
+   返回 false = 命令失败或超时，调用方按短冷却缓存。 */
 static bool appops_query_storage_ops(const char* pkg, bool* manage_external_out,
                                      bool* installer_out) {
     *manage_external_out = false;
     *installer_out = false;
+    uint64_t start = ext_clock_ms();
+    if (start == 0) return false;
+    int slot = appops_child_reserve();
+    if (slot < 0) return false;
     int fds[2];
-    if (pipe(fds) != 0) return false;
+    if (pipe2(fds, O_CLOEXEC) != 0) {
+        appops_child_finish(slot, -1, true);
+        return false;
+    }
+    /* 只把读端设成非阻塞；子进程 stdout 仍须能正常写完整输出。 */
+    int flags = fcntl(fds[0], F_GETFL);
+    if (flags < 0 || fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        appops_child_finish(slot, -1, true);
+        return false;
+    }
     posix_spawn_file_actions_t fa;
     if (posix_spawn_file_actions_init(&fa) != 0) {
         close(fds[0]);
         close(fds[1]);
+        appops_child_finish(slot, -1, true);
         return false;
     }
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addclose(&fa, fds[0]);
-    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    int rc = posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    if (rc == 0)
+        rc = posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    if (rc == 0) rc = posix_spawn_file_actions_addclose(&fa, fds[0]);
+    if (rc == 0) rc = posix_spawn_file_actions_addclose(&fa, fds[1]);
     char* argv[] = {(char*)"cmd", (char*)"appops", (char*)"get", (char*)pkg, nullptr};
     pid_t pid = -1;
-    int rc = posix_spawn(&pid, "/system/bin/cmd", &fa, nullptr, argv, environ);
+    if (rc == 0) rc = posix_spawn(&pid, "/system/bin/cmd", &fa, nullptr, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     close(fds[1]);
     if (rc != 0) {
         close(fds[0]);
+        appops_child_finish(slot, -1, true);
         return false;
     }
-    /* 只留前 4KB 判定，其余照样读空——不留未读数据，子进程不会卡在写管道上 */
     char buf[4096];
     size_t used = 0;
-    for (;;) {
-        char tmp[256];
-        ssize_t n = read(fds[0], tmp, sizeof tmp);
-        if (n <= 0) break;
-        if (used + (size_t)n < sizeof buf) {
-            memcpy(buf + used, tmp, (size_t)n);
-            used += (size_t)n;
-        }
-    }
-    buf[used] = '\0';
-    close(fds[0]);
+    bool eof = false;
+    bool reaped = false;
+    bool ok = false;
     int status = 0;
-    pid_t waited;
-    do {
-        waited = waitpid(pid, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
+    for (;;) {
+        uint64_t now = ext_clock_ms();
+        if (now == 0 || now - start >= FW_PKG_APPOPS_QUERY_MS) break;
+        while (!eof) {
+            /* 持续输出也必须服从总预算，不能仅在 poll 前检查。 */
+            now = ext_clock_ms();
+            if (now == 0 || now - start >= FW_PKG_APPOPS_QUERY_MS) goto done;
+            char tmp[256];
+            ssize_t n = read(fds[0], tmp, sizeof tmp);
+            if (n > 0) {
+                size_t take = (size_t)n;
+                if (take > sizeof(buf) - 1 - used) take = sizeof(buf) - 1 - used;
+                memcpy(buf + used, tmp, take);
+                used += take;
+            } else if (n == 0) {
+                eof = true;
+            } else if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                goto done;
+            }
+        }
+        if (!reaped) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) reaped = true;
+            else if (w < 0 && errno != EINTR) {
+                if (errno == ECHILD) reaped = true;
+                goto done;
+            }
+        }
+        if (eof && reaped) {
+            ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            break;
+        }
+        now = ext_clock_ms();
+        if (now == 0 || now - start >= FW_PKG_APPOPS_QUERY_MS) break;
+        int remaining = (int)(FW_PKG_APPOPS_QUERY_MS - (now - start));
+        int interval = remaining < 5 ? remaining : 5;
+        struct pollfd pfd = {.fd = fds[0], .events = POLLIN};
+        /* EOF 后不能 poll 一个一直 HUP 的 fd 忙转；只按预算等待子进程退出。 */
+        rc = poll(eof ? nullptr : &pfd, eof ? 0 : 1, interval);
+        if (rc < 0 && errno != EINTR) break;
+        if (rc > 0 && (pfd.revents & (POLLERR | POLLNVAL))) break;
+    }
+done:
+    close(fds[0]);
+    appops_child_finish(slot, pid, reaped);
+    if (!ok) return false; /* 部分 allow 输出不构成授权，必须 EOF + 正常退出。 */
+    buf[used] = '\0';
     *manage_external_out = strstr(buf, "MANAGE_EXTERNAL_STORAGE: allow") != nullptr;
     *installer_out = strstr(buf, "INSTALL_PACKAGES: allow") != nullptr;
     return true;
@@ -275,61 +558,92 @@ static bool appops_query_storage_ops(const char* pkg, bool* manage_external_out,
    access，应用升级也可能改写），只靠 g_gen 失效会让 daemon 一直用旧结论直到配置
    重载或重启。取 30s：一次查询约 40ms，最长 30s 内自愈，代价可忽略。 */
 #define FW_PKG_EXT_TTL_MS 30000u
-
-static uint64_t ext_clock_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
+#define FW_PKG_EXT_FAILURE_TTL_MS 1000u
 
 /* 命中槽位即返回；未命中/过期则解析包名并查一次 appops（两个 op 共用一次查询），
    写回槽位后再返回。两个结论同进同出，避免为第二个 op 再 fork 一次。 */
+/* 读取完整原子快照后再核 seq，避免并发写入的字段拼成另一个 uid 的授权。 */
+static bool ext_cached(FwPkgExtSlot* s, uid_t uid, uint64_t gen, uint64_t now,
+                       bool* manage_external_out, bool* installer_out) {
+    uint64_t seq = atomic_load_explicit(&s->seq, memory_order_acquire);
+    if (seq & 1) return false;
+    uint64_t slot_gen = s->gen;
+    uid_t slot_uid = s->uid;
+    uint64_t stamp = s->stamp_ms;
+    bool pending = s->pending;
+    bool known = s->known;
+    bool query_ok = s->query_ok;
+    bool manage = s->manage_external;
+    bool installer = s->installer;
+    if (seq != atomic_load_explicit(&s->seq, memory_order_acquire) ||
+        slot_gen != gen || slot_uid != uid) return false;
+    if (pending) {
+        *manage_external_out = false;
+        *installer_out = false;
+        return true;
+    }
+    uint64_t ttl = query_ok ? FW_PKG_EXT_TTL_MS : FW_PKG_EXT_FAILURE_TTL_MS;
+    if (!known || now < stamp || now - stamp >= ttl) return false;
+    *manage_external_out = manage;
+    *installer_out = installer;
+    return true;
+}
+
 static void ext_lookup(uid_t uid, bool* manage_external_out, bool* installer_out) {
     FwPkgExtSlot* s = &g_ext_slots[uid % FW_PKG_CACHE_SIZE];
     uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
-    uint64_t now = ext_clock_ms();
-    for (;;) {
-        uint64_t v1 = atomic_load_explicit(&s->seq, memory_order_acquire);
-        if (!(v1 & 1)) {
-            if (v1 == atomic_load_explicit(&s->seq, memory_order_acquire) && s->gen == gen &&
-                s->uid == uid && s->known && now - s->stamp_ms < FW_PKG_EXT_TTL_MS) {
-                *manage_external_out = s->manage_external;
-                *installer_out = s->installer;
-                return;
-            }
-        }
-        if (atomic_load_explicit(&s->seq, memory_order_acquire) & 1) continue;
-        pthread_mutex_lock(&g_ext_fill_lock);
-        char pkg[FW_PKG_NAME_MAX];
-        bool resolved = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, nullptr, 0);
-        bool manage_external = false;
-        bool installer = false;
-        bool done = resolved;
-        if (resolved) {
-            if (g_manage_external_probe || g_installer_probe) {
-                manage_external = g_manage_external_probe && g_manage_external_probe(pkg);
-                installer = g_installer_probe && g_installer_probe(pkg);
-            } else {
-                /* 命令本身失败（无 /system/bin/cmd 等）不写缓存：交给下次请求重试。
-                   解析不到包名同样不缓存。 */
-                done = appops_query_storage_ops(pkg, &manage_external, &installer);
-            }
-        }
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release); /* 奇：写中 */
-        s->uid = uid;
-        s->known = done;
-        s->manage_external = manage_external;
-        s->installer = installer;
-        s->gen = gen;
-        s->stamp_ms = ext_clock_ms();
-        atomic_store_explicit(&s->seq, atomic_load_explicit(&s->seq, memory_order_relaxed) + 1,
-                              memory_order_release); /* 偶：写完 */
+    if (ext_cached(s, uid, gen, ext_clock_ms(), manage_external_out, installer_out)) return;
+    pthread_mutex_lock(&g_ext_fill_lock);
+    gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    /* 同 uid 的并发 miss 在锁内复查；进行中的查询不阻塞其它 FUSE worker。 */
+    if (ext_cached(s, uid, gen, ext_clock_ms(), manage_external_out, installer_out)) {
         pthread_mutex_unlock(&g_ext_fill_lock);
-        *manage_external_out = manage_external;
-        *installer_out = installer;
         return;
     }
+    uint64_t seq = atomic_load_explicit(&s->seq, memory_order_relaxed);
+    atomic_store_explicit(&s->seq, seq + 1, memory_order_release);
+    s->uid = uid;
+    s->gen = gen;
+    s->known = false;
+    s->pending = true;
+    s->query_ok = false;
+    s->manage_external = false;
+    s->installer = false;
+    atomic_store_explicit(&s->seq, seq + 2, memory_order_release);
+    uint64_t claim = seq + 2;
+    pthread_mutex_unlock(&g_ext_fill_lock);
+
+    /* packages.list I/O 与外部命令全部在全局锁外，避免跨 uid 放大等待。 */
+    char pkg[FW_PKG_NAME_MAX];
+    bool resolved = resolve_sys_pkg_from_packagelist(uid, pkg, sizeof pkg, nullptr, 0);
+    bool manage_external = false;
+    bool installer = false;
+    bool done = resolved;
+    if (resolved) {
+        if (g_manage_external_probe || g_installer_probe) {
+            manage_external = g_manage_external_probe && g_manage_external_probe(pkg);
+            installer = g_installer_probe && g_installer_probe(pkg);
+        } else {
+            done = appops_query_storage_ops(pkg, &manage_external, &installer);
+        }
+    }
+    if (!done) manage_external = installer = false;
+    pthread_mutex_lock(&g_ext_fill_lock);
+    bool current = gen == atomic_load_explicit(&g_gen, memory_order_acquire);
+    /* 哈希碰撞或重载的新查询拥有该槽后，旧完成不能覆盖新授权。 */
+    if (current && s->uid == uid && s->gen == gen && s->seq == claim) {
+        atomic_store_explicit(&s->seq, claim + 1, memory_order_release);
+        s->known = true;
+        s->pending = false;
+        s->query_ok = done;
+        s->manage_external = manage_external;
+        s->installer = installer;
+        s->stamp_ms = ext_clock_ms();
+        atomic_store_explicit(&s->seq, claim + 2, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_ext_fill_lock);
+    *manage_external_out = current && manage_external;
+    *installer_out = current && installer;
 }
 
 bool fw_pkg_manages_external(uid_t uid) {
@@ -346,13 +660,37 @@ bool fw_pkg_can_install_packages(uid_t uid) {
     return installer;
 }
 
+/* 槽内只读入口：命中（含失败冷却与在途查询）就返回 true，绝不起子进程。
+   在途查询按 false/false 返回——与 ext_lookup 的既有口径一致：查询中不授予能力。 */
+bool fw_pkg_ext_cached(uid_t uid, bool* manage_external_out, bool* installer_out) {
+    FwPkgExtSlot* s = &g_ext_slots[uid % FW_PKG_CACHE_SIZE];
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    bool manage_external = false;
+    bool installer = false;
+    if (!ext_cached(s, uid, gen, ext_clock_ms(), &manage_external, &installer)) return false;
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (manage_external_out) *manage_external_out = manage_external;
+    if (installer_out) *installer_out = installer;
+    return true;
+}
+
+/* 槽外预取入口：调用方在 config_read_begin 之前调，把外部命令查询赶出配置读槽。
+   语义与 br_xapp_facts 前两档一致——系统 uid 与特权应用不会再问 appops，预取
+   同样跳过，不为已被否决的判定付子进程代价。总闸（跨应用隔离/按能力放行）与
+   路径形状由调用方 br_prefetch_xapp_facts 先判，本函数只管 uid 侧的跳过。
+   命中缓存时只是一次槽位查找。 */
+void fw_pkg_prefetch_isolation_facts(uid_t uid) {
+    if (fw_pkg_is_privileged(uid)) return;
+    /* 两个 appop 共用同一份查询与同一个 uid 槽：查一次即同时填好两档。 */
+    (void)fw_pkg_manages_external(uid);
+}
+
 /* ---- 包名 → uid（FUSE 事件通道的白名单自动解析用） ----
-   与上面两条缓存三足鼎立、互不嵌套：本组只用 g_pkguid_fill_lock，且函数体内
-   只解析 packages.list（fopen/fgets，不取任何锁），**不**调用 resolve_uncached
-   → g_fill_lock、也不调用 fw_pkg_is_privileged → g_priv_fill_lock。反过来那两条
-   路径完全不会进本函数，故不存在「持一把锁再取另一把」的环。 */
+   g_pkguid_fill_lock 只保护缓存查找/选槽/发布；packages.list 全程在锁外读取。
+   不嵌套 g_fill_lock/g_priv_fill_lock；并发 miss 用槽版本守卫，旧查询不抢新槽。 */
 typedef struct {
     uint64_t gen;
+    uint64_t revision; /* 每次发布递增；仅在 g_pkguid_fill_lock 下访问 */
     char pkg[FW_PKG_NAME_MAX];
     bool known; /* packages.list 有该包名的行 */
     uid_t uid;
@@ -382,31 +720,86 @@ static bool resolve_uid_from_packagelist(const char* pkg, uid_t* out) {
     return found;
 }
 
+/* 槽内只读入口：缓存里有该包名的结论（**含"无此包"的负缓存**）就返回 true，
+   不读文件。known_out 告诉调用方结论是"有 uid"还是"无此包"——前者才填 uid_out。
+   判定侧对两种情形处理不同（已知同 uid = 同一 app 身份；无此包 = 维持隔离），
+   故不能把负结论压成 false 返回。这里的锁只罩槽扫描与发布（`resolve_uid_from_packagelist`
+   在锁外），所以槽内等待有界，不随 packages.list 的读时长增长。 */
+bool fw_pkg_uid_cached(const char* pkg, bool* known_out, uid_t* uid_out) {
+    if (!pkg || !pkg[0]) return false;
+    bool known = false;
+    bool matched = false; /* 没有匹配槽 = 事实还没备好，不是"无此包" */
+    uid_t uid = 0;
+    pthread_mutex_lock(&g_pkguid_fill_lock);
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        FwPkgUidSlot* s = &g_pkguid_slots[i];
+        if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
+            known = s->known;
+            uid = s->uid;
+            matched = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_pkguid_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+    if (!matched) return false; /* 冷缓存：调用方必须出槽预热（不允许当成负结论） */
+    if (known_out) *known_out = known;
+    if (known && uid_out) *uid_out = uid;
+    return true;
+}
+
 bool fw_pkg_uid_for_package(const char* pkg, uid_t* out) {
     if (!pkg || !pkg[0]) return false;
-    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
     pthread_mutex_lock(&g_pkguid_fill_lock);
-    int use = -1;
-    for (int i = 0; i < FW_PKG_UID_SLOTS && use < 0; i++) {
-        if (g_pkguid_slots[i].gen == gen && strcmp(g_pkguid_slots[i].pkg, pkg) == 0) use = i;
-    }
-    if (use < 0) {
-        /* 未命中：先找本代外的空槽（代际失效即空槽），都被占则用 0 号 */
-        use = 0;
-        for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
-            if (g_pkguid_slots[i].gen != gen) {
-                use = i;
-                break;
-            }
+    uint64_t gen = atomic_load_explicit(&g_gen, memory_order_acquire);
+    int use = 0;
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        FwPkgUidSlot* s = &g_pkguid_slots[i];
+        if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
+            bool known = s->known;
+            uid_t uid = s->uid;
+            pthread_mutex_unlock(&g_pkguid_fill_lock);
+            if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
+            if (known && out) *out = uid;
+            return known;
         }
-        FwPkgUidSlot* s = &g_pkguid_slots[use];
-        snprintf(s->pkg, sizeof s->pkg, "%s", pkg);
-        s->known = resolve_uid_from_packagelist(pkg, &s->uid); /* 失败也缓存，直到下次重载 */
-        s->gen = gen;
     }
-    bool known = g_pkguid_slots[use].known;
-    uid_t uid = g_pkguid_slots[use].uid;
+    /* 未命中：先选本代外的空槽，都被占则选 0；版本不是 key/gen，避免 ABA。 */
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        if (g_pkguid_slots[i].gen != gen) { use = i; break; }
+    }
+    uint64_t claim = g_pkguid_slots[use].revision;
     pthread_mutex_unlock(&g_pkguid_fill_lock);
+
+    uid_t uid = 0;
+    bool known = resolve_uid_from_packagelist(pkg, &uid);
+
+    pthread_mutex_lock(&g_pkguid_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) {
+        pthread_mutex_unlock(&g_pkguid_fill_lock);
+        return false; /* 旧代结果不发布，out 不变；调用者需要时发起新请求。 */
+    }
+    bool published = false;
+    for (int i = 0; i < FW_PKG_UID_SLOTS; i++) {
+        FwPkgUidSlot* s = &g_pkguid_slots[i];
+        if (s->gen == gen && strcmp(s->pkg, pkg) == 0) {
+            known = s->known;
+            uid = s->uid;
+            published = true; /* 同 key 已发布值（含负缓存）优先。 */
+            break;
+        }
+    }
+    FwPkgUidSlot* s = &g_pkguid_slots[use];
+    if (!published && s->revision == claim) {
+        snprintf(s->pkg, sizeof s->pkg, "%s", pkg);
+        s->known = known;
+        s->uid = uid;
+        s->gen = gen;
+        s->revision++;
+    }
+    pthread_mutex_unlock(&g_pkguid_fill_lock);
+    if (gen != atomic_load_explicit(&g_gen, memory_order_acquire)) return false;
     if (known && out) *out = uid;
     return known;
 }
@@ -448,10 +841,9 @@ static bool resolve_from_pid(uid_t uid, pid_t tid, char* out, size_t size) {
    过短 / zygote / <pre- 一律只能命中 GLOBAL） */
 static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool* lookup_ok) {
     char pkg[FW_PKG_NAME_MAX] = {0};
-    const char* mapped = uid_map_lookup(g_uid_maps, g_uid_map_count, uid);
-    if (mapped) {
-        snprintf(pkg, sizeof pkg, "%s", mapped);
-    } else if (uid < NSP_SYSTEM_APP_UID_MIN) {
+    /* 锁内拷贝命中项，不借出表内指针：重载可在任意时刻换表并释放旧数组。 */
+    const bool from_map = uid_map_copy(uid, pkg, sizeof pkg);
+    if (!from_map && uid < NSP_SYSTEM_APP_UID_MIN) {
         /* 系统共享 uid（1000 等）在 uid.map 里通常没有条目（injector 只在应用
            REPORT 时写入），而 FUSE 请求侧拿不到 caller pid（q->pid 是 daemon
            伪造的连接标识），cmdline 回退也不可用——实机验证：系统应用的显式
@@ -465,7 +857,7 @@ static void resolve_uncached(uid_t uid, pid_t tid, char* out, size_t size, bool*
             /* packages.list 不可读（非 Android 环境）时退回 cmdline */
             goto cmdline_fallback;
         }
-    } else if (tid > 0) {
+    } else if (!from_map && tid > 0) {
       cmdline_fallback:;
         /* 主线程 id 取自 /proc/<tid>/status 的 Tgid：应用线程的 cmdline 就是包名，
            但只保证主线程可读（zygote fork 后线程组细节），故先定位 Tgid */

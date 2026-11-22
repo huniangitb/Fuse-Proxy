@@ -1,0 +1,319 @@
+/* 审计工作线程判别夹具：直编真实 src/injector/audit_worker.c（无替身），
+ * 只把审计本体（audit_tracked_apps / audit_and_remount_specific_apps /
+ * audit_running_apps）换成「慢动作 + 记账」的替身——它们是挂载/卸载的边界，
+ * 夹具不碰真实挂载。
+ *
+ * 用途：
+ *   defer    —— 30 次突发请求在调用线程上必须 µs 级返回，慢审计只跑 1~3 轮，
+ *               恒只有一个 worker、跑在别的线程上，空闲后线程数回到 1；
+ *   inline   —— 旧形态对照：同样的慢审计在调用线程上直接跑，量化被冻住的时长；
+ *   mode_v1 / mode_reset_v2 / mode_specific_v2 —— 粒度选择与变更集合语义
+ *               （v1 全量对账、reset 走全量审计、具体变更去重后原样送达）；
+ *   mode_both_reset_first / mode_both_specific_first —— 同一轮里既有「整体变化」又有
+ *               具体条目时两路都必须跑（旧实现两路互斥，会把具体条目整轮丢掉）：
+ *               先占住 worker（慢审计 150ms），期间的请求必然合进同一待跑轮；
+ *   shutdown —— 退出等手上那一轮跑完，之后的请求不再执行。
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "audit_worker.h"
+#include "injector.h" /* InjectMethod 与 g_inject_method（生产侧同样包含） */
+
+#include <dirent.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* 生产侧注入方法全局（injector.h 里两个 inline 判定读它） */
+InjectMethod g_inject_method = INJECT_METHOD_V2;
+
+static _Atomic int g_calls_tracked;
+static _Atomic int g_calls_specific;
+static _Atomic int g_calls_running;
+static _Atomic int g_active;
+static _Atomic int g_peak;
+static _Atomic int g_offmain;
+static _Atomic int g_max_items;
+static char g_seen_pkgs[NSP_AUDIT_MAX_CHANGED][128];
+static int g_seen_user[NSP_AUDIT_MAX_CHANGED];
+static _Atomic int g_seen_count;
+static int g_slow_ms = 150;
+static pthread_t g_main_thread;
+
+static long long now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
+static void sleep_ms(int ms) {
+    struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L};
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+static int thread_count(void) {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return -1;
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] != '.') n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/* 线程退出后 /proc/self/task 的条目摘除晚于完成通知/关停返回：观测改成有界收敛
+   （最多 300ms），断言仍要求等于 1——不把内核收尾的那几微秒当成 worker 没退。 */
+static int thread_count_settled(void) {
+    for (int i = 0; i < 300; i++) {
+        const int n = thread_count();
+        if (n == 1) return n;
+        sleep_ms(1);
+    }
+    return thread_count();
+}
+
+/* 慢审计替身：只占住 worker 自己，不碰任何生产状态 */
+static void enter_slow(void) {
+    const int running = atomic_fetch_add_explicit(&g_active, 1, memory_order_acq_rel) + 1;
+    int peak = atomic_load_explicit(&g_peak, memory_order_acquire);
+    while (running > peak &&
+           !atomic_compare_exchange_weak_explicit(&g_peak, &peak, running,
+                                                  memory_order_acq_rel, memory_order_acquire)) {
+    }
+    if (!pthread_equal(pthread_self(), g_main_thread))
+        atomic_fetch_add_explicit(&g_offmain, 1, memory_order_acq_rel);
+    sleep_ms(g_slow_ms);
+    atomic_fetch_sub_explicit(&g_active, 1, memory_order_acq_rel);
+}
+
+void audit_tracked_apps(void) {
+    enter_slow();
+    atomic_fetch_add_explicit(&g_calls_tracked, 1, memory_order_acq_rel);
+}
+
+void audit_and_remount_specific_apps(ChangedPkg* changed, int count) {
+    /* 跨轮累积：mode_both_* 会先跑一轮 warm、再跑含具体条目的合并轮，
+       判据要看两轮合起来的送达集合。 */
+    const int n = count > NSP_AUDIT_MAX_CHANGED ? NSP_AUDIT_MAX_CHANGED : count;
+    int seen = atomic_load_explicit(&g_seen_count, memory_order_acquire);
+    for (int i = 0; i < n && seen < NSP_AUDIT_MAX_CHANGED; i++) {
+        snprintf(g_seen_pkgs[seen], sizeof g_seen_pkgs[seen], "%s", changed[i].pkg_name);
+        g_seen_user[seen] = changed[i].user_id;
+        seen++;
+    }
+    atomic_store_explicit(&g_seen_count, seen, memory_order_release);
+    int mx = atomic_load_explicit(&g_max_items, memory_order_acquire);
+    while (count > mx &&
+           !atomic_compare_exchange_weak_explicit(&g_max_items, &mx, count,
+                                                  memory_order_acq_rel, memory_order_acquire)) {
+    }
+    enter_slow();
+    atomic_fetch_add_explicit(&g_calls_specific, 1, memory_order_acq_rel);
+}
+
+void audit_running_apps(void) {
+    enter_slow();
+    atomic_fetch_add_explicit(&g_calls_running, 1, memory_order_acq_rel);
+}
+
+static void settle(void) {
+    const long long start = now_us();
+    int last = -1;
+    for (;;) {
+        const int total = atomic_load_explicit(&g_calls_tracked, memory_order_acquire) +
+                          atomic_load_explicit(&g_calls_specific, memory_order_acquire) +
+                          atomic_load_explicit(&g_calls_running, memory_order_acquire);
+        if (!nsp_audit_active() && total == last) break;
+        last = total;
+        if (now_us() - start > 20000000LL) break;
+        sleep_ms(5);
+    }
+    /* worker 空闲 200ms 自退，再多等一会儿确保线程真的没了 */
+    sleep_ms(400);
+}
+
+static int total_runs(void) {
+    return atomic_load_explicit(&g_calls_tracked, memory_order_acquire) +
+           atomic_load_explicit(&g_calls_specific, memory_order_acquire) +
+           atomic_load_explicit(&g_calls_running, memory_order_acquire);
+}
+
+static void report(const char* mode, long long call_us_max, long long total_us, int runs) {
+    printf("mode=%s call_us_max=%lld total_us=%lld runs=%d tracked=%d specific=%d running=%d "
+           "offmain=%d peak=%d threads=%d max_items=%d seen=%d\n",
+           mode, call_us_max, total_us, runs,
+           atomic_load_explicit(&g_calls_tracked, memory_order_acquire),
+           atomic_load_explicit(&g_calls_specific, memory_order_acquire),
+           atomic_load_explicit(&g_calls_running, memory_order_acquire),
+           atomic_load_explicit(&g_offmain, memory_order_acquire),
+           atomic_load_explicit(&g_peak, memory_order_acquire), thread_count_settled(),
+           atomic_load_explicit(&g_max_items, memory_order_acquire),
+           atomic_load_explicit(&g_seen_count, memory_order_acquire));
+}
+
+static void run_defer(void) {
+    long long call_us_max = 0;
+    const long long start = now_us();
+    for (int i = 0; i < 30; i++) {
+        ChangedPkg c;
+        memset(&c, 0, sizeof c);
+        snprintf(c.pkg_name, sizeof c.pkg_name, "com.burst.app%d", i);
+        c.user_id = 0;
+        const long long t0 = now_us();
+        nsp_audit_request(&c, 1, false);
+        const long long dt = now_us() - t0;
+        if (dt > call_us_max) call_us_max = dt;
+        sleep_ms(2);
+    }
+    const long long total_us = now_us() - start;
+    settle();
+    report("defer", call_us_max, total_us, total_runs());
+}
+
+static void run_inline(void) {
+    /* 旧形态：调用线程自己跑慢审计（对照，不进 worker） */
+    const long long start = now_us();
+    for (int i = 0; i < 30; i++) {
+        ChangedPkg c;
+        memset(&c, 0, sizeof c);
+        snprintf(c.pkg_name, sizeof c.pkg_name, "com.burst.app%d", i);
+        c.user_id = 0;
+        audit_and_remount_specific_apps(&c, 1);
+    }
+    const long long total_us = now_us() - start;
+    report("inline", 0, total_us, total_runs());
+}
+
+/* 同一待跑轮里同时有「整体变化」与具体条目：两路都必须跑。
+ * 先发一个慢的具体请求占住 worker，随后（必然合进同一待跑轮）按两种顺序各发一次
+ * 「整体变化」+3 条具体条目。旧实现两路互斥：reset 命中就 return，具体条目整轮丢失。 */
+static void run_both(const char* mode, bool reset_first) {
+    g_inject_method = INJECT_METHOD_V2;
+    g_slow_ms = 150;
+    ChangedPkg warm;
+    memset(&warm, 0, sizeof warm);
+    snprintf(warm.pkg_name, sizeof warm.pkg_name, "com.warm.app");
+    warm.user_id = 0;
+    nsp_audit_request(&warm, 1, false);
+    sleep_ms(40); /* worker 已经抓走 warm 并进入慢审计，后续请求只能合进下一待跑轮 */
+    ChangedPkg items[3];
+    memset(items, 0, sizeof items);
+    snprintf(items[0].pkg_name, sizeof items[0].pkg_name, "com.b1.app");
+    items[0].user_id = 0;
+    snprintf(items[1].pkg_name, sizeof items[1].pkg_name, "com.b2.app");
+    items[1].user_id = 10;
+    snprintf(items[2].pkg_name, sizeof items[2].pkg_name, "com.b3.app");
+    items[2].user_id = 0;
+    if (reset_first) {
+        nsp_audit_request(nullptr, 0, true);
+        nsp_audit_request(items, 3, false);
+    } else {
+        nsp_audit_request(items, 3, false);
+        nsp_audit_request(nullptr, 0, true);
+    }
+    settle();
+    report(mode, 0, 0, total_runs());
+    if (atomic_load_explicit(&g_seen_count, memory_order_acquire) > 0) {
+        printf("seen_items=");
+        for (int i = 0; i < atomic_load_explicit(&g_seen_count, memory_order_acquire); i++) {
+            printf("%s:%d,", g_seen_pkgs[i], g_seen_user[i]);
+        }
+        printf("\n");
+    }
+}
+
+static void run_mode(const char* mode) {
+    if (strcmp(mode, "mode_v1") == 0) {
+        g_inject_method = INJECT_METHOD_V1;
+        nsp_audit_request(nullptr, 0, false);
+    } else if (strcmp(mode, "mode_reset_v2") == 0) {
+        g_inject_method = INJECT_METHOD_V2;
+        ChangedPkg c;
+        memset(&c, 0, sizeof c);
+        snprintf(c.pkg_name, sizeof c.pkg_name, "com.reset.app");
+        c.user_id = -1;
+        nsp_audit_request(&c, 1, true);
+    } else if (strcmp(mode, "mode_both_reset_first") == 0) {
+        run_both(mode, true);
+        return;
+    } else if (strcmp(mode, "mode_both_specific_first") == 0) {
+        run_both(mode, false);
+        return;
+    } else { /* mode_specific_v2：两次请求，第二次带重复条目 */
+        g_inject_method = INJECT_METHOD_V2;
+        g_slow_ms = 120;
+        ChangedPkg a[2];
+        memset(a, 0, sizeof a);
+        snprintf(a[0].pkg_name, sizeof a[0].pkg_name, "com.one.app");
+        a[0].user_id = 0;
+        snprintf(a[1].pkg_name, sizeof a[1].pkg_name, "com.two.app");
+        a[1].user_id = 10;
+        nsp_audit_request(a, 2, false);
+        ChangedPkg b[3];
+        memset(b, 0, sizeof b);
+        snprintf(b[0].pkg_name, sizeof b[0].pkg_name, "com.one.app");
+        b[0].user_id = 0; /* 与上一轮重复，必须去重 */
+        snprintf(b[1].pkg_name, sizeof b[1].pkg_name, "com.three.app");
+        b[1].user_id = 0;
+        snprintf(b[2].pkg_name, sizeof b[2].pkg_name, "com.four.app");
+        b[2].user_id = 10;
+        nsp_audit_request(b, 3, false);
+    }
+    settle();
+    report(mode, 0, 0, total_runs());
+    if (atomic_load_explicit(&g_seen_count, memory_order_acquire) > 0) {
+        printf("seen_items=");
+        for (int i = 0; i < atomic_load_explicit(&g_seen_count, memory_order_acquire); i++) {
+            printf("%s:%d,", g_seen_pkgs[i], g_seen_user[i]);
+        }
+        printf("\n");
+    }
+}
+
+static void run_shutdown(void) {
+    g_inject_method = INJECT_METHOD_V2;
+    g_slow_ms = 150;
+    ChangedPkg c;
+    memset(&c, 0, sizeof c);
+    snprintf(c.pkg_name, sizeof c.pkg_name, "com.shutdown.app");
+    c.user_id = 0;
+    nsp_audit_request(&c, 1, false);
+    sleep_ms(20); /* 让 worker 先把这一轮抓走 */
+    const long long t0 = now_us();
+    nsp_audit_shutdown();
+    const long long shutdown_us = now_us() - t0;
+    const int runs_before = total_runs();
+    nsp_audit_request(&c, 1, false); /* 退出后请求不再执行 */
+    sleep_ms(300);
+    const int runs_after = total_runs();
+    printf("mode=shutdown shutdown_us=%lld runs_before=%d runs_after=%d threads=%d offmain=%d "
+           "active=%d\n",
+           shutdown_us, runs_before, runs_after, thread_count_settled(),
+           atomic_load_explicit(&g_offmain, memory_order_acquire),
+           nsp_audit_active() ? 1 : 0);
+}
+
+int main(int argc, char** argv) {
+    g_main_thread = pthread_self();
+    const char* mode = argc > 1 ? argv[1] : "defer";
+    if (strcmp(mode, "defer") == 0) {
+        run_defer();
+    } else if (strcmp(mode, "inline") == 0) {
+        run_inline();
+    } else if (strcmp(mode, "shutdown") == 0) {
+        run_shutdown();
+    } else {
+        run_mode(mode);
+    }
+    return 0;
+}

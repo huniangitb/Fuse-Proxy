@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 
 /* ================= 配置 ================= */
 
@@ -70,6 +71,7 @@ typedef struct FtpBackend {
     char prefix[PATH_MAX];   /* 虚拟前缀 = "/" + 段名 */
     FtpMux* mux;             /* 控制面复用器（epoll + curl_multi）：连接缓存 +
                                 并发在飞，取代旧的共享 easy 句柄 + op_lock */
+    FtpMux* retiring_mux;    /* 仅 lifecycle 锁持有者访问：全表摘除后锁外关停 */
     pthread_mutex_t lock;    /* 连接锁 */
     int fail_count;          /* 窗口内失败计数（熔断：后端不可达自动静默） */
     time_t fail_last;        /* 上次计入熔断的失败时间（滑动窗口计数用） */
@@ -92,12 +94,12 @@ typedef struct FtpBackend {
        读句柄为每文件独立（下载线程专用），与 mux 驱动的控制面互不干扰 */
     CURL* read_pool[FTP_READ_POOL_MAX];
     int read_pool_count;
+    bool pool_closed;         /* pool_lock 保护：退休后晚到 release 只能锁外销毁 */
     pthread_mutex_t pool_lock; /* 读句柄池锁（仅 open/release/clear 触碰） */
     bool mutex_inited;         /* 互斥锁已初始化（对象在 add 内一次性建好；clear
                                     不 destroy——对象可能仍被在途操作持有，销毁
                                     会让它们撞上已销毁锁 → SIGSEGV） */
-    bool in_use;               /* 注册表槽位占用（clear 后复用，不 free——在途
-                                    操作可能仍持 bk 指针，内存 immortal） */
+    bool in_use;               /* glock 保护：活跃条目；退休后不复用对象 */
     /* ---- V5 分页 LIST 缓存（单条目：最近列过的目录全量条目） ----
        框架顺序翻页（offset 0→N）时后续页零网络；并发交错列多目录时颠簸重取
        （正确，仅多一次 LIST）。bk->lock 保护（复用连接锁，短临界区）；
@@ -299,24 +301,17 @@ static bool silent_fast_fail(FtpBackend* bk) {
     return false;
 }
 
-/* 后端注册表：指针数组动态翻倍（初容 FTP_BACKEND_MAX），条目 immortal——
-   find 返回的 bk 指针在 glock 解锁后仍被在途操作使用，故条目内存永不 free
-   （clear 只关停 mux/标记空闲，add 复用空闲槽）。数组本身的 realloc 只在
-   glock 内发生，逃逸的 bk 指针不受影响。 */
+/* 后端对象 immortal：find 返回后仍可能被在途请求/文件持有，clear 不改 cfg
+   或销毁 mutex，add 永远追加新对象。只有 add/clear 修改数组，二者由 lifecycle
+   串行；serving 只拿 glock 做元数据快照，绝不等待 new/shutdown/join/cleanup。 */
 static FtpBackend** g_backends = NULL;
-static int g_backend_count = 0; /* 活跃条目数（in_use；ftp_backend_count 上报值） */
-static int g_backend_slots = 0; /* 已分配槽位数（每次 add 一个新对象，只增不减） */
-static int g_backend_cap = 0;   /* 指针数组容量 */
-/* 后端数组全局锁 + 热重载标志：
-   - g_backend_glock：保护 g_backend_count/cap 与 g_backends 数组的增删扫描
-     （find/add/clear/retry_all），杜绝热重载清表与在途查找的数组撕裂
-   - g_backend_clearing：模块配置热重载（ftp_backend_clear）期间置位，
-     find 立即拒绝新调用，保证 clear 之后不会有新操作触碰已清理的后端 */
+static int g_backend_count = 0; /* 活跃条目是最近一次 clear 后追加的连续后缀 */
+static int g_backend_slots = 0; /* 已分配槽位数，只增不减 */
+static int g_backend_cap = 0;
+static pthread_mutex_t g_backend_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_backend_glock = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic bool g_backend_clearing = false;
 
 /* ================= 文件句柄（每个打开的文件一个） ================= */
-
 typedef struct FtpBackendFile {
     FtpBackend* bk;
     char ftp_path[PATH_MAX]; /* 远程路径 */
@@ -503,98 +498,132 @@ static void ftp_list_cache_clear(FtpBackend* bk) {
 
 int ftp_backend_add(const FtpServerCfg* cfg) {
     if (!cfg || !cfg->name[0]) return -1;
+    pthread_mutex_lock(&g_backend_lifecycle_lock);
+    /* 尚未发布的对象可完整撤销；new/分配/失败清理都不持 serving 元数据锁。
+       发布后的对象不能复用：在途文件仍靠旧 cfg/mutex 工作。 */
+    FtpBackend* bk = calloc(1, sizeof *bk);
+    FtpBackend** grown = NULL;
+    int initialized = 0;
+    if (!bk) goto fail;
+    if (pthread_mutex_init(&bk->lock, NULL) != 0) goto fail;
+    initialized++;
+    if (pthread_mutex_init(&bk->pool_lock, NULL) != 0) goto fail;
+    initialized++;
+    if (pthread_mutex_init(&bk->stat_lock, NULL) != 0) goto fail;
+    initialized++;
+    bk->mutex_inited = true;
+    bk->cfg = *cfg;
+    snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
+    bk->mux = ftp_mux_new();
+    if (!bk->mux) goto fail;
+
+    /* lifecycle 排除了并发 add/clear，容量/数组此刻稳定。分配在 glock 外，
+       serving 不保留数组地址，只保留 immortal bk 指针。 */
+    int ncap = g_backend_cap;
+    if (g_backend_slots >= ncap) {
+        if (ncap > INT_MAX / 2) goto fail;
+        ncap = ncap > 0 ? ncap * 2 : FTP_BACKEND_MAX;
+        if ((size_t)ncap > SIZE_MAX / sizeof *grown) goto fail;
+        grown = calloc((size_t)ncap, sizeof *grown);
+        if (!grown) goto fail;
+    }
+    FtpBackend** old = NULL;
     pthread_mutex_lock(&g_backend_glock);
-    /* **每次 add 都新建后端对象**，不复用已 clear 槽位的内存：旧对象可能仍被
-       在途操作或已打开文件持有（它们缓存了 bk 指针，文件句柄还靠 bk->cfg 拼
-       URL/取凭据），原位 memset 会把在用的 pthread mutex 一起清零（UB：持有者
-       与新进入者同时进临界区），并把 cfg 换成新服务器——热重载与 serving 并发
-       时的跨代串用正源于此。对象内存依旧 immortal（既有设计：条目永不 free），
-       只是从注册表摘除（in_use=false，find 不再命中），新对象接管。
-       指针数组翻倍：realloc 只在 glock 内发生；已逃逸的 bk 指针指向对象本身，
-       不受数组搬移影响。 */
-    if (g_backend_slots >= g_backend_cap) {
-        int ncap = g_backend_cap > 0 ? g_backend_cap * 2 : FTP_BACKEND_MAX;
-        FtpBackend** grown = realloc(g_backends, (size_t)ncap * sizeof *grown);
-        if (!grown) {
-            pthread_mutex_unlock(&g_backend_glock);
-            return -1;
-        }
-        for (int i = g_backend_cap; i < ncap; i++) grown[i] = NULL;
+    if (grown) {
+        if (g_backend_slots > 0)
+            memcpy(grown, g_backends, (size_t)g_backend_slots * sizeof *grown);
+        old = g_backends;
         g_backends = grown;
         g_backend_cap = ncap;
     }
-    FtpBackend* bk = calloc(1, sizeof *bk);
-    if (!bk) {
-        pthread_mutex_unlock(&g_backend_glock);
-        return -1;
-    }
-    g_backends[g_backend_slots++] = bk;
-    pthread_mutex_init(&bk->lock, NULL);
-    pthread_mutex_init(&bk->pool_lock, NULL);
-    pthread_mutex_init(&bk->stat_lock, NULL);
-    bk->mutex_inited = true;
     bk->in_use = true;
-    bk->cfg = *cfg;
-    snprintf(bk->prefix, sizeof bk->prefix, "/%s", cfg->name);
-    /* 控制面复用器（epoll 事件线程 + CURLM 连接缓存） */
-    FtpMux* mux = ftp_mux_new();
-    if (!mux) {
-        pthread_mutex_unlock(&g_backend_glock);
-        return -1;
-    }
-    /* 在 bk->lock 内发布指针：backend_mux_ref 在同一锁内取引用，
-       两者互斥，故不存在"取到引用却已被释放"的窗口 */
-    pthread_mutex_lock(&bk->lock);
-    bk->mux = mux;
-    pthread_mutex_unlock(&bk->lock);
+    g_backends[g_backend_slots++] = bk;
     g_backend_count++;
     pthread_mutex_unlock(&g_backend_glock);
+    free(old);
+    pthread_mutex_unlock(&g_backend_lifecycle_lock);
     return 0;
+fail:
+    free(grown);
+    if (bk) {
+        if (bk->mux) {
+            ftp_mux_shutdown(bk->mux);
+            ftp_mux_unref(bk->mux);
+        }
+        if (initialized >= 3) pthread_mutex_destroy(&bk->stat_lock);
+        if (initialized >= 2) pthread_mutex_destroy(&bk->pool_lock);
+        if (initialized >= 1) pthread_mutex_destroy(&bk->lock);
+        free(bk);
+    }
+    pthread_mutex_unlock(&g_backend_lifecycle_lock);
+    return -1;
 }
 
 void ftp_backend_clear(void) {
-    atomic_store_explicit(&g_backend_clearing, true, memory_order_release);
+    pthread_mutex_lock(&g_backend_lifecycle_lock);
     pthread_mutex_lock(&g_backend_glock);
-    for (int i = 0; i < g_backend_slots; i++) {
+    /* 成功 add 只追加，活跃对象恰为连续后缀；失败构造从不进入表。先全表下线，
+       然后 glock 外摘资源/关停。lifecycle 保持数组稳定，无需可能失败的快照分配。 */
+    int end = g_backend_slots;
+    int first = end - g_backend_count;
+    for (int i = first; i < end; i++) g_backends[i]->in_use = false;
+    g_backend_count = 0;
+    pthread_mutex_unlock(&g_backend_glock);
+
+    /* 必须先摘全部 mux、关闭全部池，再等任一慢服务器 join。旧 bk 持有者也
+       拿不到未退休的 B mux；晚到 release 不会重新填已退休池。 */
+    for (int i = first; i < end; i++) {
         FtpBackend* bk = g_backends[i];
-        if (!bk || !bk->in_use) continue;
-        /* 先摘指针再关停：摘指针与 backend_mux_ref 的取引用互斥（同锁），
-           摘除后新操作拿不到旧 mux；关停会把在途任务归位（提交者拿到
-           失败码而非悬挂），并等其全部离开后才销毁 multi */
         pthread_mutex_lock(&bk->lock);
-        FtpMux* mux = bk->mux;
+        bk->retiring_mux = bk->mux;
         bk->mux = NULL;
-        ftp_list_cache_free_locked(bk); /* LIST 缓存同清（锁内） */
         pthread_mutex_unlock(&bk->lock);
+        pthread_mutex_lock(&bk->pool_lock);
+        bk->pool_closed = true;
+        pthread_mutex_unlock(&bk->pool_lock);
+    }
+    for (int i = first; i < end; i++) {
+        FtpBackend* bk = g_backends[i];
+        pthread_mutex_lock(&bk->lock);
+        char* list_path = bk->list_path;
+        FtpListEntry* list_entries = bk->list_entries;
+        bk->list_path = NULL;
+        bk->list_entries = NULL;
+        bk->list_count = 0;
+        bk->list_truncated = false;
+        bk->list_ts = 0;
+        pthread_mutex_unlock(&bk->lock);
+        free(list_path);
+        free(list_entries);
+        CURL* idle[FTP_READ_POOL_MAX];
+        pthread_mutex_lock(&bk->pool_lock);
+        int count = bk->read_pool_count;
+        memcpy(idle, bk->read_pool, (size_t)count * sizeof *idle);
+        memset(bk->read_pool, 0, sizeof bk->read_pool);
+        bk->read_pool_count = 0;
+        pthread_mutex_unlock(&bk->pool_lock);
+        for (int p = 0; p < count; p++) curl_easy_cleanup(idle[p]);
+        FtpMux* mux = bk->retiring_mux;
+        bk->retiring_mux = NULL;
         if (mux) {
             ftp_mux_shutdown(mux);
             ftp_mux_unref(mux);
         }
-        /* 释放池中空闲读句柄（在途句柄由各自 release 归还/销毁） */
-        pthread_mutex_lock(&bk->pool_lock);
-        for (int p = 0; p < bk->read_pool_count; p++) {
-            if (bk->read_pool[p]) curl_easy_cleanup(bk->read_pool[p]);
-        }
-        bk->read_pool_count = 0;
-        pthread_mutex_unlock(&bk->pool_lock);
-        /* 不再 pthread_mutex_destroy：槽位复用，互斥锁生命周期与模块一致，
-           杜绝在途操作 pthread_mutex_lock 已销毁锁 → UB/SIGSEGV。
-           条目内存 immortal（不 free）：在途操作仍可能持 bk 指针。 */
-        bk->in_use = false;
+        /* 已发布对象 immortal：不改 cfg、不 destroy mutex、不 free bk。 */
     }
-    g_backend_count = 0;
-    pthread_mutex_unlock(&g_backend_glock);
-    atomic_store_explicit(&g_backend_clearing, false, memory_order_release);
+    pthread_mutex_unlock(&g_backend_lifecycle_lock);
 }
 
 int ftp_backend_count(void) {
-    return g_backend_count;
+    pthread_mutex_lock(&g_backend_glock);
+    int count = g_backend_count;
+    pthread_mutex_unlock(&g_backend_glock);
+    return count;
 }
 
 /* 找 path 命中的后端（仅活跃条目；返回指针在 glock 外仍有效，
    条目内存 immortal） */
 static FtpBackend* ftp_backend_find(const char* path) {
-    if (atomic_load_explicit(&g_backend_clearing, memory_order_acquire)) return NULL;
     pthread_mutex_lock(&g_backend_glock);
     FtpBackend* r = NULL;
     for (int i = 0; i < g_backend_slots; i++) {
@@ -1554,7 +1583,7 @@ static void ftp_read_curl_release(FtpBackend* bk, CURL* c) {
     if (!c) return;
     ftp_reset_opts_curl(c); /* 清残留，防下次 acquire 拿到脏选项 */
     pthread_mutex_lock(&bk->pool_lock);
-    if (bk->read_pool_count < FTP_READ_POOL_MAX) {
+    if (!bk->pool_closed && bk->read_pool_count < FTP_READ_POOL_MAX) {
         bk->read_pool[bk->read_pool_count++] = c;
         pthread_mutex_unlock(&bk->pool_lock);
         return;

@@ -67,6 +67,7 @@
 #include "ns_utils.h" /* NSP_READINESS_QUIET：后台通道的负值哨兵 */
 #include "nsp_log.h"
 #include "nsp_util.h"
+#include "uid_cache_writer.h"
 #include "uid_map.h"
 
 /* ================= 被链接源码所需的全局 ================= */
@@ -408,6 +409,9 @@ static int run_case(const Case* c) {
         usleep(150 * 1000);
     }
 
+    /* uid.map 的整表写回在后台落盘线程（ACK 路径不做文件 IO）：断言文件内容前
+       必须先冲刷，否则读到的是上一条用例的旧内容。 */
+    uid_cache_write_flush();
     char map_after[512] = {0};
     read_text(CONFIG_DIR "/uid.map", map_after, sizeof map_after);
 
@@ -745,6 +749,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    init_uid_map_persist(); /* 起后台落盘线程（真实 uid_cache_writer） */
+
     const Case cases[] = {
         /* P1：合法目标应用自身请求（正对照：不得被绑定校验误伤） */
         {"P1 合法目标应用自身请求 → OK + 映射更新 + 标注入", "com.real.target", "REQ",
@@ -770,6 +776,8 @@ int main(int argc, char** argv) {
     run_v2_nonblocking_restore_case();
     run_plan_readiness_cases();
 
+    uid_cache_write_flush();
+    uid_cache_write_shutdown();
     printf("\n结果: %d 通过, %d 失败\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

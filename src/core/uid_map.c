@@ -48,12 +48,43 @@ int uid_map_load(UidMapEntry* entries, int max_entries) {
  * 支持动态扩容：堆分配初始 UID_MAP_INIT_CAPACITY 条，不够时自动翻倍。
  * 返回 0 成功，负值失败（UID_MAP_ERR_*）。
  */
-int uid_map_upsert(uid_t uid, const char* pkg) {
+/* 把整张表写成 uid.map：先写 .tmp、fsync、再 rename 原子替换。
+ * 调用方持有权威表（内存视图或已合并的本地副本）。 */
+static int uid_map_write_all(UidMapEntry* entries, int count) {
     char path[PATH_MAX];
     char tmp_path[PATH_MAX];
     snprintf(path, sizeof(path), CONFIG_DIR "/uid.map");
     snprintf(tmp_path, sizeof(tmp_path), CONFIG_DIR "/uid.map.tmp");
-
+    /* 先写临时文件，确保写入动作的鲁棒性 */
+    FILE* fp = fopen(tmp_path, "we");
+    if (!fp) {
+        LOG_ERR("uid_map: fopen(%s) 失败: %s", tmp_path, strerror(errno));
+        return UID_MAP_ERR_IO;
+    }
+    for (int j = 0; j < count; j++) {
+        if (fprintf(fp, "%d %s\n", entries[j].uid, entries[j].pkg) < 0) {
+            LOG_ERR("uid_map: fprintf 失败: %s", strerror(errno));
+            fclose(fp);
+            unlink(tmp_path);
+            return UID_MAP_ERR_IO;
+        }
+    }
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        LOG_ERR("uid_map: fflush/fsync 失败: %s", strerror(errno));
+        fclose(fp);
+        unlink(tmp_path);
+        return UID_MAP_ERR_IO;
+    }
+    fclose(fp);
+    /* 原子重命名替换，绝无并发脏读风险 */
+    if (rename(tmp_path, path) != 0) {
+        LOG_ERR("uid_map: rename(%s -> %s) 失败: %s", tmp_path, path, strerror(errno));
+        unlink(tmp_path);
+        return UID_MAP_ERR_RENAME;
+    }
+    return 0;
+}
+int uid_map_upsert(uid_t uid, const char* pkg) {
     size_t capacity = UID_MAP_INIT_CAPACITY;
     UidMapEntry* entries = malloc(capacity * sizeof(UidMapEntry));
     if (!entries) {
@@ -108,39 +139,27 @@ int uid_map_upsert(uid_t uid, const char* pkg) {
         count++;
     }
 
-    /* 4. 核心安全优化：先写入临时文件，确保写入动作的鲁棒性 */
-    FILE* fp = fopen(tmp_path, "we");
-    if (!fp) {
-        LOG_ERR("uid_map_upsert: fopen(%s) 失败: %s", tmp_path, strerror(errno));
-        free(entries);
-        return UID_MAP_ERR_IO;
-    }
-    for (int j = 0; j < count; j++) {
-        if (fprintf(fp, "%d %s\n", entries[j].uid, entries[j].pkg) < 0) {
-            LOG_ERR("uid_map_upsert: fprintf 失败: %s", strerror(errno));
-            fclose(fp);
-            unlink(tmp_path);
-            free(entries);
-            return UID_MAP_ERR_IO;
-        }
-    }
-    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
-        LOG_ERR("uid_map_upsert: fflush/fsync 失败: %s", strerror(errno));
-        fclose(fp);
-        unlink(tmp_path);
-        free(entries);
-        return UID_MAP_ERR_IO;
-    }
-    fclose(fp);
-    /* 原子重命名替换，绝无并发脏读风险 */
-    if (rename(tmp_path, path) != 0) {
-        LOG_ERR("uid_map_upsert: rename(%s -> %s) 失败: %s", tmp_path, path, strerror(errno));
-        unlink(tmp_path);
-        free(entries);
-        return UID_MAP_ERR_RENAME;
-    }
+    int rc = uid_map_write_all(entries, count);
     free(entries);
-    return 0;
+    return rc;
+}
+
+/* 用给定条目整体重写 uid.map（tmp + fsync + rename）。
+ * 供后台落盘线程使用：调用方持有权威内存表，磁盘表只用于下次启动冷加载，
+ * 因此这里不读旧文件、不合并——整表覆盖，天然不会留下过期条目。
+ * entries 不要求有序，内部排序后写出。返回 0 成功，负值失败（UID_MAP_ERR_*）。 */
+int uid_map_save(const UidMapEntry* entries, int count) {
+    if (!entries || count <= 0) return UID_MAP_ERR_IO;
+    UidMapEntry* copy = malloc((size_t)count * sizeof(UidMapEntry));
+    if (!copy) {
+        LOG_ERR("uid_map_save: malloc(%d) 失败", count);
+        return UID_MAP_ERR_IO;
+    }
+    memcpy(copy, entries, (size_t)count * sizeof(UidMapEntry));
+    qsort(copy, (size_t)count, sizeof(UidMapEntry), compare_entries);
+    int rc = uid_map_write_all(copy, count);
+    free(copy);
+    return rc;
 }
 /* O(log N) 二分折半快速检索 */
 const char* uid_map_lookup(const UidMapEntry* entries, int count, uid_t uid) {

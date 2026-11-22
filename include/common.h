@@ -123,6 +123,16 @@ void persist_log_to_disk(const char* log_type, const char* message, bool append_
 void common_default_real_path(int user_id, const char* sub_path, char* out, size_t sz);
 void common_storage_root(int user_id, char* out, size_t sz);
 int common_sandbox_path(int uid, const char* pkg, char* out, size_t sz);
+/* 已合成存储目录的单组件子路径：parent 必须在有效存储根的用户层之下，
+ * 且不含 ./.. 组件（词法校验，不解析符号链接）；
+ * child 不得为空、含斜杠或为 ./..；不做 I/O，失败返回 -1 并清空输出。
+ * out 不得与 parent/child 重叠；过长返回 ENAMETOOLONG，不输出截断路径。 */
+int common_storage_child_path(const char* parent, const char* child, char* out, size_t sz);
+/* 只物化既有存储目录的单组件子目录：沿可信存储根逐级 nofollow 打开 parent，
+ * 不创建用户根/祖先；child 已存在也必须是目录，符号链接一律拒绝。
+ * mkdirat 新建成功后经固定 fd 继承属性（失败仍 best-effort），EEXIST 时不改属性。
+ * 不钉住 mkdirat 与 openat 之间的新建 inode；但不跟随可换名路径做写操作。 */
+int common_mkdir_storage_child(const char* parent, const char* child, mode_t mode);
 void common_view_path(int user_id, const char* sub_path, char* out, size_t sz);
 /* common_fuse_user_path：FUSE 视角路径（"/<user_id><sub_path>"）——common_parse_user_layer
  * 的逆运算，供事件通道把 QUERY 的绝对 spath 反解结果交回 fw_acl_check/fw_rules_resolve
@@ -158,5 +168,18 @@ int common_mkdir_within_storage(const char* dir, mode_t mode);
    1=命中（*user_id / *sub_path 有效）、0=无用户层（*sub_path 指回原路径）、
    -1=非法（数字串溢出 int 的 atoi 别名，调用方须 fail-closed 返回 ENOENT）。 */
 int common_parse_user_layer(const char* path, int* user_id, const char** sub_path);
+
+/* ---- 有界外部命令（"pm list users"/"pm list packages" 走 binder，慢时无上界）----
+ * 旧用法是 popen + fgets/pclose：命令挂住多久，调用线程就冻多久。这两个调用点
+ * 都在关键路径上（scan_active_users 在配置写/读视图里，sys_pkg 刷新在注入器事件
+ * 循环与 fuse_daemon 热重载线程里），一次挂起就放大成整个进程/整个 FUSE 会话无
+ * 响应。本函数把 stdout 按行回调（语义等同 fgets：行长截断、末行无换行也回调），
+ * stderr 丢弃，总预算 budget_ms 覆盖输出与退出确认；超时即 SIGKILL 子进程并置
+ * *timed_out，调用方据此决定「保留旧表 / 回退推导」，绝不无限等待。
+ * 返回 0 = 拿到命令输出（含命令自己非零退出），-1 = spawn/读管道失败。
+ * 子进程只做 execl("/bin/sh","sh","-c",...)，不继承任何项目 fd（O_CLOEXEC）。 */
+typedef void (*NspCmdLineFn)(const char* line, void* ctx);
+int common_run_cmd_lines(const char* shell_cmd, int budget_ms, NspCmdLineFn on_line, void* ctx,
+                         bool* timed_out);
 
 #endif
