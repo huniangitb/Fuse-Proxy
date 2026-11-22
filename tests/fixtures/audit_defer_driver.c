@@ -71,6 +71,17 @@ static int thread_count(void) {
     return n;
 }
 
+/* 线程退出后 /proc/self/task 的条目摘除晚于完成通知/关停返回：观测改成有界收敛
+   （最多 300ms），断言仍要求等于 1——不把内核收尾的那几微秒当成 worker 没退。 */
+static int thread_count_settled(void) {
+    for (int i = 0; i < 300; i++) {
+        const int n = thread_count();
+        if (n == 1) return n;
+        sleep_ms(1);
+    }
+    return thread_count();
+}
+
 /* 慢审计替身：只占住 worker 自己，不碰任何生产状态 */
 static void enter_slow(void) {
     const int running = atomic_fetch_add_explicit(&g_active, 1, memory_order_acq_rel) + 1;
@@ -145,7 +156,7 @@ static void report(const char* mode, long long call_us_max, long long total_us, 
            atomic_load_explicit(&g_calls_specific, memory_order_acquire),
            atomic_load_explicit(&g_calls_running, memory_order_acquire),
            atomic_load_explicit(&g_offmain, memory_order_acquire),
-           atomic_load_explicit(&g_peak, memory_order_acquire), thread_count(),
+           atomic_load_explicit(&g_peak, memory_order_acquire), thread_count_settled(),
            atomic_load_explicit(&g_max_items, memory_order_acquire),
            atomic_load_explicit(&g_seen_count, memory_order_acquire));
 }
@@ -287,7 +298,7 @@ static void run_shutdown(void) {
     const int runs_after = total_runs();
     printf("mode=shutdown shutdown_us=%lld runs_before=%d runs_after=%d threads=%d offmain=%d "
            "active=%d\n",
-           shutdown_us, runs_before, runs_after, thread_count(),
+           shutdown_us, runs_before, runs_after, thread_count_settled(),
            atomic_load_explicit(&g_offmain, memory_order_acquire),
            nsp_audit_active() ? 1 : 0);
 }

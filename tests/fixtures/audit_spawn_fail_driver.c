@@ -79,6 +79,18 @@ static int tasks(void) {
     return n;
 }
 
+/* 线程退出后 /proc/self/task 的条目摘除晚于完成通知/关停返回：观测改成有界收敛
+   （最多 300ms），断言仍要求等于 1。 */
+static int tasks_settled(void) {
+    for (int i = 0; i < 300; i++) {
+        const int n = tasks();
+        if (n == 1) return n;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    return tasks();
+}
+
 int __real_pthread_create(pthread_t* tid, const pthread_attr_t* attr,
                          void* (*fn)(void*), void* arg);
 
@@ -131,7 +143,7 @@ static int run_retry(void) {
     nsp_audit_shutdown();
     const long long shutdown_us = now_us() - s0;
     if (shutdown_us > 3000000) return fail("shutdown 等太久");
-    if (tasks() != 1) return fail("shutdown 后仍有 worker 线程");
+    if (tasks_settled() != 1) return fail("shutdown 后仍有 worker 线程");
     printf("mode=retry create_calls=%d tracked_runs=%d specific_runs=%d seen=%d call_us=%lld "
            "shutdown_us=%lld ok=1\n",
            atomic_load(&g_create_calls), atomic_load(&g_tracked_runs),
@@ -157,7 +169,7 @@ static int run_shutdown_race(void) {
     const long long shutdown_us = now_us() - t0;
     pthread_join(helper, NULL);
     if (shutdown_us > 2000000) return fail("shutdown 被失败路径永久挂住");
-    if (tasks() != 1) return fail("shutdown 后仍有线程");
+    if (tasks_settled() != 1) return fail("shutdown 后仍有线程");
     printf("mode=shutdown_race create_calls=%d shutdown_us=%lld ok=1\n",
            atomic_load(&g_create_calls), shutdown_us);
     return 0;
