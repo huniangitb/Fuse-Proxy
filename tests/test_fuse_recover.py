@@ -89,7 +89,8 @@ def check_call_sites(fails, injector_path):
     with open(injector_path, encoding="utf-8") as fh:
         text = fh.read()
     names = ("check_and_recover_fuse", "injector_fuse_maintenance_cb", "request_fuse_jobs",
-             "handle_fuse_ready_event", "remount_all_tracked", "injector_event_loop",
+             "handle_fuse_ready_event", "remount_all_tracked", "inject_global_fuse",
+             "injector_event_loop",
              "injector_setup_epoll", "injector_shutdown")
     bodies = {name: func_body(text, name) for name in names}
     ok = True
@@ -108,6 +109,7 @@ def check_call_sites(fails, injector_path):
     loop = bodies["injector_event_loop"]
     setup = bodies["injector_setup_epoll"]
     shutdown = bodies["injector_shutdown"]
+    restart = strip_comments(bodies["inject_global_fuse"])
     ready_code = strip_comments(ready)
     tick_code = strip_comments(tick)
 
@@ -123,8 +125,10 @@ def check_call_sites(fails, injector_path):
     ready_slow_calls = ("repair_stale_app_mounts_at_startup(", "remount_all_tracked(",
                         "cleanup_all_target_apps(", "force_recover_tracked_mounts(",
                         "inject_global_fuse(")
-    need("g_pending_remount = 1" in tick_code and
-         tick_code.find("g_pending_remount = 1") < tick_code.find("request_fuse_jobs("),
+    tick_flag = tick_code.find("g_pending_remount = 1")
+    if tick_flag < 0:
+        tick_flag = tick_code.find("atomic_store_explicit(&g_pending_remount, 1")
+    need(tick_flag >= 0 and tick_code.find("request_fuse_jobs(", tick_flag) > tick_flag,
          "tick-remount-flag",
          "崩溃恢复前没有在循环侧置好重挂标记：新实例的就绪事件晚于这次崩溃，"
          "等 worker 回报再置会让重挂被无限推迟（快照必须在 request 之前）")
@@ -152,7 +156,11 @@ def check_call_sites(fails, injector_path):
          consume_at < ready_code.find("jobs |= NSP_FUSE_JOB_REMOUNT"),
          "ready-remount-consume",
          "重挂标记没有在循环线程上、发请求之前消费掉")
-    need("get_active_mnt_src()" in ready, "ready-readiness",
+    need("atomic_exchange_explicit(&g_pending_remount" in ready_code, "ready-remount-atomic",
+         "重挂标记用读-再-清消费：维护 worker 在另一条线程上置 1 会被丢掉（exchange 才不会）")
+    need("atomic_store_explicit(&g_pending_remount, 1" in ready_code, "ready-remount-restore",
+         "视图未就绪时没有把标记放回去：那次重挂再没人消费")
+    need("if (get_active_mnt_src() != nullptr)" in ready_code, "ready-readiness",
          "重挂的就绪判定不在循环线程上：worker 判「未就绪」与就绪事件分发之间有个窗口，"
          "标记放回去就再没人消费")
     need("request_fuse_jobs(jobs)" in squash(ready), "ready-request",
@@ -160,14 +168,29 @@ def check_call_sites(fails, injector_path):
     # 失败分支：不再在循环上等旧实例退出（10ms×50 + SIGKILL 升级由 worker 做）。
     need("for (int w = 0" not in ready_code, "ready-killwait",
          "handle_fuse_ready_event 仍在事件循环上轮询等旧实例退出")
-    need(re.search(r"kill\([^)]*SIGKILL", ready) is None, "ready-sigkill",
+    need(re.search(r"kill\([^)]*SIGKILL", ready_code) is None, "ready-sigkill",
          "handle_fuse_ready_event 仍自己做 SIGKILL 升级（应交给维护 worker）")
-    need("usleep(" not in ready_code, "ready-sleep",
-         "handle_fuse_ready_event 仍在事件循环上睡等（10ms×50 那类杀等待必须交给 worker）")
+    for spell in ("usleep(", "nanosleep(", "for (", "while ("):
+        need(spell not in ready_code, "ready-sleep-" + spell,
+             "handle_fuse_ready_event 仍在事件循环上等：出现 %s（10ms×50 那类杀等待必须交给 worker）"
+             % spell)
     need("NSP_FUSE_JOB_RECOVER" in ready, "ready-recover-bit",
          "就绪失败分支没有请求重启（等 tick 的 1s 探测会白等一轮）")
     need("g_passive_mode" in ready, "ready-passive",
          "就绪处理丢了被动模式判定（存量应用修复必须跳过）")
+    # 重启序列对旧 pid 的守卫：失败分支只发过 SIGTERM，醒来时 pid 可能已经失效或被复用。
+    need("const pid_t old_pid = g_global_fuse.fuse_pid;" in squash(restart),
+         "restart-pid-snapshot",
+         "inject_global_fuse 直接 kill(g_global_fuse.fuse_pid)：快照缺失，杀的是可能被换掉的 pid")
+    need("waitpid(old_pid" in restart, "restart-pid-check",
+         "inject_global_fuse 动手前没有 waitpid(old_pid, ...) 确认这是本进程还活着的子进程")
+    need("errno == ECHILD" in restart, "restart-echild",
+         "ECHILD（已回收或 pid 被复用）分支缺失：会把无关进程当旧实例杀")
+    need("kill(old_pid, SIGTERM)" in squash(restart), "restart-kill-snapshot",
+         "杀的不是快照 pid：中间被换掉就会杀错进程")
+    need("g_global_fuse.fuse_pid = 0;" in restart, "restart-pid-clear",
+         "收尸后没有把 fuse_pid 清 0：~400ms 卸载复核期间 tick 会把同一次崩溃记第二次，"
+         "并从陈旧 pid 再杀一遍新实例")
     # 维护回调：顺序固定（恢复 → 启动扫描 → 重挂），重挂失败要把标记放回去。
     need(cb.find("force_recover_tracked_mounts(") >= 0 and
          cb.find("force_recover_tracked_mounts(") < cb.find("inject_global_fuse("),

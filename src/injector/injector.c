@@ -618,8 +618,15 @@ static void inject_global_fuse() {
                 usleep(50000);
             }
             waitpid(old_pid, &status, WNOHANG);
-        } else if (reaped < 0 && errno == ECHILD) {
-            LOG_DBG("FUSE 重启: pid %d 已不是本进程的子进程（回收或复用），跳过 kill", old_pid);
+        } else {
+            /* 它已经退出（这次 waitpid 收的尸）或根本不是本进程的子进程：pid 的时效到此结束，
+               必须立刻清掉。否则后面 20×20ms 的卸载复核（~400ms）期间 fuse_pid 仍指向一个已回收
+               的 pid，1s tick 的 kill(pid,0) 会把它当第二次崩溃再请求一轮 RECOVER，那一轮在下面
+               看到的是刚拉起的新实例——照着这个陈旧 pid 再杀一遍。 */
+            if (reaped < 0 && errno == ECHILD) {
+                LOG_DBG("FUSE 重启: pid %d 已不是本进程的子进程（回收或复用），跳过 kill", old_pid);
+            }
+            g_global_fuse.fuse_pid = 0;
         }
     }
     ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
