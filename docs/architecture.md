@@ -482,9 +482,13 @@ read_view + commit），新调用点不要再用它。
 - 崩溃恢复的回调顺序是「先清旧残留、再起新实例」：`force_recover_tracked_mounts()` →
   `cleanup_all_target_apps()` → `inject_global_fuse()`。新实例一写就绪字节，事件循环立刻跑
   `remount_all_tracked()`；清理若排在 fork 之后，就会与重挂并发（同一应用刚挂上又被拆）。
-  仍留在事件循环上的同族慢活（下一批候选，未隔离）：媒体实例的三条拉起路径
-  （`inject_media_fuse`：kill `SIGTERM` + 最多 500ms 轮询 + `SIGKILL` + 20×20ms 复核 +
-  `fork/setns`，且没有全局实例那样的重入保护；只在 v1 逐应用挂载模式可达）。- [audit_worker.c](../src/injector/audit_worker.c) 的合并是「整体变化 + 具体条目同时保留」：worker 先按具体变更精确重挂、再做 tracked 全量扫描——全量扫描只走 tracked 表，运行中但未追踪的应用只有具体那一轮碰得到，提前丢掉具体条目就是漏对账；集合溢出（>128 条）时退化成全量扫描，超限条目交给全量扫描与下一次重载兜底。起线程失败（资源耗尽）时**保留待跑集合**并在下一请求重新拉起 worker，同时 broadcast 唤醒可能正等在 `nsp_audit_shutdown` 上的线程（只清 running 不唤醒会让退出永久挂住；[async_refresh.c](../src/injector/async_refresh.c) 是同一形状，一并修）。空闲等待用默认时钟的静态初始化条件变量：200ms 的等待被墙钟跳变影响只是早退/晚退，而 `pthread_cond_init` 一个已静态初始化的条件变量是未定义行为。
+  这条族里媒体实例的三条拉起路径（崩溃重拉、惰性启动、热重载终结）已按上一条并入维护
+  worker：事件循环只发 `NSP_FUSE_JOB_MEDIA`，`inject_media_fuse` 本身（kill `SIGTERM` +
+  最多 500ms 轮询 + `SIGKILL` + 20×20ms 复核 + `fork/setns`）只在 worker 线程上跑，且整轮
+  持着挂载表写者闸，没有全局实例那样的重入保护也不再是循环上的放大器。仍内联在循环上的
+  只有启动期 `injector_start_fuses()`（维护 worker 与写者闸都还没就位）与异步挂载完成
+  回调的记账；其余无硬时间上界的面见 §6.1 收尾声明。
+- [audit_worker.c](../src/injector/audit_worker.c) 的合并是「整体变化 + 具体条目同时保留」：worker 先按具体变更精确重挂、再做 tracked 全量扫描——全量扫描只走 tracked 表，运行中但未追踪的应用只有具体那一轮碰得到，提前丢掉具体条目就是漏对账；集合溢出（>128 条）时退化成全量扫描，超限条目交给全量扫描与下一次重载兜底。起线程失败（资源耗尽）时**保留待跑集合**并在下一请求重新拉起 worker，同时 broadcast 唤醒可能正等在 `nsp_audit_shutdown` 上的线程（只清 running 不唤醒会让退出永久挂住；[async_refresh.c](../src/injector/async_refresh.c) 是同一形状，一并修）。空闲等待用默认时钟的静态初始化条件变量：200ms 的等待被墙钟跳变影响只是早退/晚退，而 `pthread_cond_init` 一个已静态初始化的条件变量是未定义行为。
 - 跨应用隔离的能力事实（`cmd appops get`，实测 40ms 量级）在取配置读槽**之前**预取（`fw_pkg_prefetch_isolation_facts`，调用点在 `fw_rules_resolve` / `fw_rules_probe` 的槽外）：槽内的外部命令会拖住 `config_drain_readers`，把单次慢查询放大成此后每个 worker 在 `config_read_begin` 上的自旋（旧实现实测 300ms 查询 → 发布与迟到读者各等 270ms，回归 `test_cfg_slot_isolation.py`）。
   预取必须比判定更少付代价，否则会把常态请求变成子进程风暴：① 跨应用隔离、按能力放行两个总闸关掉时判定根本不问能力，预取也直接返回；② 先用只读 `uid.map` 的廉价命名（`fw_pkg_uid_map_name`，无 IO）跳过调用方自身子树（含 sharedUserId 兄弟包），命名拿不到时保守预取；③ 路径要按判定同一口径清理后再认前缀（判定用 `br_strip_and_sanitize` 的 `sub_path`，而 `path_sanitize` 会删字节——直接扫原始路径会漏掉「删掉一个 0x01 才凑出 `/Android/data/`」这类写法，慢查询就原样留在槽里）。命中缓存时只是一次按 uid 的槽位查找。
   白名单只能按调用方包名判（解析 uid→包名要 IO），故白名单应用会多付一次按 uid 缓存 30s 的查询，裁决不变；容器级 `readdir_extra` 只处理配置声明的虚拟目录、从不问能力（能力过滤在 `fuse_daemon` 的槽外），故不为容器预取。调用方身份是同一类慢事实，也必须留在槽外：`BrIdentity` 由 `br_identity_load` 在 `fw_rules_resolve` / `fw_rules_path_declared` / `fw_rules_readdir_extra` / `fw_rules_probe` 四个入口取读槽**之前**解析一次（`fw_pkg_resolve` 读 `/proc/<pid>/cmdline`、系统 uid 再走 `fw_pkg_resolve_exact`，必要时 `fw_pkg_uid_for_package` 扫 `packages.list`），槽内只调用纯内存的 `br_get_app_cfg_ident`。`fw_rules_probe` 是 readdir 条目级热路径，不能无条件多付两次 `/proc`：它用线程私有目录缓存 + 当前配置代际做一次槽前预判，命中就根本不解析身份（直接用缓存里的 `current_pkg`），未命中才在槽外解析；若预判命中、进槽后发现代际已变，先 `config_read_end` 退出读槽再解析重来——绝不在槽内开文件。目标属主 uid 与特权档由 `br_prefetch_xapp_facts` 一并预热（`fw_pkg_uid_for_package` + 按两个总闸选 `fw_pkg_prefetch_isolation_facts` / `fw_pkg_is_privileged`）：这些结果按包名/uid 缓存、只随 `fw_pkg` 代际失效，不随配置发布失效。

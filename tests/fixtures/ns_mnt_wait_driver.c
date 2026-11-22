@@ -274,29 +274,51 @@ static int mode_switch(long delay_us, int reps, const char* label) {
    在 arm 开始后 ~400µs，离下一次节拍还远。 */
 struct fire_arg {
     int fire;
+    int tries;
     long t_arm;
     long gap_us;
+    long late_us; /* 校准点 → 真正投递之间被调度推迟的时间 */
 };
+
+/* 校准「投递点落在本节拍 100µs 处」这件事在并发负载下会失准：nanosleep(100µs)
+   可能过睡到毫秒级，甚至跨过下一次节拍，于是 t_fire 落在后一个 arm 里，量出来
+   的间隔只剩节拍的一小截（实测 384µs，对照组判据直接失去意义）。过睡也反向
+   污染投递组：间隔看起来「很短」但事件其实没起作用。故每轮睡完都核一次
+   「还在同一个 arm 里、且睡过去不到 FIRE_SLACK_US」，没对上就换下一次节拍重来。 */
+#define FIRE_SLACK_US 500
 
 static void* fire_thread(void* raw) {
     struct fire_arg* a = (struct fire_arg*)raw;
     a->gap_us = -1;
+    a->tries = 0;
     /* 先等过高速窗：16ms 之后节拍才是 2ms 档，读数不会被窗内 200µs 的节拍混淆 */
     struct timespec warm = {.tv_sec = 0, .tv_nsec = 20 * 1000L * 1000L};
     nanosleep(&warm, NULL);
-    int seen = g_arms;
-    long stop = now_us() + 20 * 1000L;
-    while (g_arms == seen && now_us() < stop) sched_yield(); /* 跨过一次 arm 边界 */
-    if (g_arms == seen) return NULL;
-    struct timespec into = {.tv_sec = 0, .tv_nsec = 100 * 1000L};
-    nanosleep(&into, NULL); /* 睡进这次 arm 里，事件才「早」于下一次节拍 */
-    long t_fire = now_us();
-    if (a->fire) fire_event();
-    int after = g_arms;
-    long hard_stop = t_fire + 10 * 1000L;
-    while (g_arms == after && now_us() < hard_stop) sched_yield();
-    a->t_arm = t_fire;
-    if (g_arms != after) a->gap_us = g_arm_at[g_arms - 1] - t_fire;
+    long deadline = now_us() + 500 * 1000L;
+    while (now_us() < deadline) {
+        int seen = g_arms;
+        long stop = now_us() + 20 * 1000L;
+        while (g_arms == seen && now_us() < stop) sched_yield(); /* 跨过一次 arm 边界 */
+        if (g_arms == seen) break;
+        a->tries++;
+        int cur = g_arms; /* 刚起步的那一次 arm 记在 g_arm_at[cur - 1] */
+        struct timespec into = {.tv_sec = 0, .tv_nsec = 100 * 1000L};
+        nanosleep(&into, NULL); /* 睡进这次 arm 里，事件才「早」于下一次节拍 */
+        long t_fire = now_us();
+        if (g_arms != cur || t_fire - g_arm_at[cur - 1] > FIRE_SLACK_US) continue; /* 这轮没对准 */
+        /* 读数从**事件真正投递的那一刻**起算，不是从校准点起算：投递线程在并发负载
+           下可能被推迟到拍尾（实测晚 1ms），从校准点起算会把这段推迟算进响应延迟，
+           量出半个节拍（实测 1002µs）看着像「事件没叫醒」。 */
+        long t_deliver = now_us();
+        if (a->fire) fire_event();
+        int after = g_arms;
+        long hard_stop = t_deliver + 10 * 1000L;
+        while (g_arms == after && now_us() < hard_stop) sched_yield();
+        a->t_arm = t_deliver;
+        a->late_us = t_deliver - t_fire;
+        if (g_arms != after) a->gap_us = g_arm_at[g_arms - 1] - t_deliver;
+        return NULL;
+    }
     return NULL;
 }
 
@@ -305,14 +327,14 @@ static int mode_event(long budget_ms, int fire) {
     dev_t d;
     ino_t i;
     if (!ns_mnt_wait_capture((int)getpid(), &d, &i)) return 1;
-    struct fire_arg a = {.fire = fire, .t_arm = 0, .gap_us = -1};
+    struct fire_arg a = {.fire = fire, .t_arm = 0, .gap_us = -1, .late_us = -1};
     pthread_t tid;
     if (pthread_create(&tid, NULL, fire_thread, &a) != 0) return 1;
     bool sw = true;
     long us = ns_mnt_wait_switch((int)getpid(), d, i, budget_ms, &sw);
     pthread_join(tid, NULL);
-    printf("switched=%d waited_us=%ld arms=%d fire=%d gap_us=%ld\n", sw ? 1 : 0, us, g_arms, fire,
-           a.gap_us);
+    printf("switched=%d waited_us=%ld arms=%d fire=%d gap_us=%ld fire_tries=%d fire_late_us=%ld\n",
+           sw ? 1 : 0, us, g_arms, fire, a.gap_us, a.tries, a.late_us);
     close_pipes();
     return 0;
 }
