@@ -47,6 +47,17 @@ static int threads_now(void) {
     return n;
 }
 
+/* 线程退出后 /proc/self/task 条目摘除晚于完成通知/关停返回：观测改成有界收敛
+   （最多 300ms），断言仍要求等于 1——不把内核收尾的那几微秒当成线程泄漏。 */
+static int threads_settled(void) {
+    for (int i = 0; i < 300; i++) {
+        const int n = threads_now();
+        if (n == 1) return n;
+        usleep(1000);
+    }
+    return threads_now();
+}
+
 static void slow_cb(void* ctx) {
     (void)ctx;
     if (self_tid() != g_main_tid) atomic_store(&g_cb_off_main, 1);
@@ -82,7 +93,7 @@ static void mode_offload(int work_ms) {
     usleep(20000);
     printf("request_us=%lld ready_ms=%lld got=%d took=%d runs=%d cb_off_main=%d threads=%d\n",
            request_us, ready_ms, got, (int)took, atomic_load(&g_runs), atomic_load(&g_cb_off_main),
-           threads_now());
+           threads_settled());
     printf("queued=%d\n", (int)queued);
     nsp_fuse_recover_shutdown();
 }
@@ -114,7 +125,7 @@ static void mode_coalesce(int work_ms) {
     /* 等合并出来的第二轮也跑完（合并上限是「再来一轮」） */
     usleep((useconds_t)(work_ms * 3 * 1000));
     printf("burst_us=%lld ready_ms=%lld took=%d rounds=%d threads=%d\n", burst_us, ready_ms,
-           (int)took, atomic_load(&g_runs), threads_now());
+           (int)took, atomic_load(&g_runs), threads_settled());
     nsp_fuse_recover_shutdown();
 }
 
@@ -135,7 +146,7 @@ static void mode_shutdown(int work_ms) {
     const bool after_req = nsp_fuse_recover_request();
     usleep(20000);
     printf("shutdown_ms=%lld runs_before=%d runs_after=%d after_req=%d threads=%d\n", shutdown_ms,
-           runs_before, atomic_load(&g_runs), (int)after_req, threads_now());
+           runs_before, atomic_load(&g_runs), (int)after_req, threads_settled());
 }
 
 static void mode_early(void) {
@@ -145,7 +156,7 @@ static void mode_early(void) {
         return;
     }
     const bool early = nsp_fuse_recover_take();
-    printf("early_take=%d threads=%d\n", (int)early, threads_now());
+    printf("early_take=%d threads=%d\n", (int)early, threads_settled());
     nsp_fuse_recover_shutdown();
 }
 

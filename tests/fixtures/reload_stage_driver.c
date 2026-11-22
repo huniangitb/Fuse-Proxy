@@ -74,6 +74,19 @@ static int task_count(void) {
     return n;
 }
 
+/* 线程退出后，/proc/self/task 里的条目摘除晚于 pthread_join/shutdown 返回：
+   直接读一次会在负载下看到「已 join 的线程还留着」（实测 8 连跑红 2 次）。
+   这里只把观测改成有界收敛（最多 300ms，轮询 1ms），断言仍要求回到 1——
+   不是放宽判据，而是不把内核收尾的那几微秒当成产品泄漏。 */
+static int task_count_settled(void) {
+    for (int i = 0; i < 300; i++) {
+        const int n = task_count();
+        if (n == 1) return n;
+        usleep(1000);
+    }
+    return task_count();
+}
+
 static bool wait_in_flight(int timeout_ms) {
     for (int waited = 0; waited < timeout_ms; waited++) {
         if (atomic_load(&g_in_flight)) return true;
@@ -120,7 +133,7 @@ static int mode_offload(void) {
     report("start=1 request_us=%lld ready_ms=%d took=%d count=%d read_on_worker=%d reads=%d "
            "threads_after=%d",
            (long long)request_us, ready_ms, took ? 1 : 0, count, on_worker ? 1 : 0,
-           atomic_load(&g_reads), task_count());
+           atomic_load(&g_reads), task_count_settled());
     return 0;
 }
 
@@ -168,7 +181,7 @@ static int mode_coalesce(void) {
     }
     nsp_reload_stage_shutdown();
     report("start=1 burst_us=%lld rounds=%d reads=%d threads_after=%d", (long long)burst_us,
-           rounds, atomic_load(&g_reads), task_count());
+           rounds, atomic_load(&g_reads), task_count_settled());
     return 0;
 }
 
@@ -185,7 +198,7 @@ static int mode_shutdown(void) {
     const bool leftover = nsp_reload_stage_take(&recs, &count);
     if (recs) config_free_view(recs, count);
     report("start=1 shutdown_ms=%lld leftover=%d reads=%d threads_after=%d",
-           (long long)shutdown_ms, leftover ? 1 : 0, atomic_load(&g_reads), task_count());
+           (long long)shutdown_ms, leftover ? 1 : 0, atomic_load(&g_reads), task_count_settled());
     return 0;
 }
 
