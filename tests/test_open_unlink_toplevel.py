@@ -20,8 +20,8 @@
     - 普通 rename 仍成功；顶层目录改名仍 EPERM（含 rename 到隐藏名的旁路）；
     - RO 路径的删除仍 EROFS；他包 Android/data 的删除仍 ENOENT（DELETE 路由
       不得绕过跨应用隔离）。
-  判别性：FUSE_DAEMON=<未修复二进制>（.cache/global-slowcall-20261121/
-  fuse_daemon-pre-fix）运行时「顶层打开中删除」必须红（实际 E1）。
+  判别性：FUSE_DAEMON=<未修复二进制>（本分支修复前的 fuse_daemon）运行
+  时「顶层打开中删除」必须红（实际 E1）。
 
 隔离：rootless user namespace（unshare -Urm --map-auto）内挂私有 tmpfs /tmp、
 起 daemon、做挂载；宿主 /tmp、/var/fuse-proxy 与 mountinfo 零污染。客户端以
