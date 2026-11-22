@@ -1,18 +1,13 @@
-<type>(<scope>)!: <做了什么更改>
+<type>(<scope>): <做了什么更改>
 
-
-# ── 以下提示行提交时由 git 自动删除（core.commentChar 为 #）────────────────
-# type ：feat fix docs refactor perf test build chore
-# scope：fw fuse module ftp injector zygisk log rule config core build scripts test docs
+# type：feat fix docs style refactor perf test build ci chore
+# scope：fw fuse module ftp injector zygisk log rule config core build scripts test docs（可省略）
 #
-# 标题：目标 ≤50、硬上限 72 **显示列**（中文按 2 列计，约 36 个汉字）；
-#       句末不加句号；不要用「+」「；」把两件事挤在一行。
+# 默认只写标题一行：≤72 显示列；中文摘要 ≤25 字；祈使句，写「做了什么」。
+# 仅当原因无法从标题看出才写 body：最多 3 行，每行 ≤72 列，只写原因/影响。
+# 禁止：背景、解释、列表、测试计划、复述 diff、罗列文件、空话、模板词。
 #
-# 正文（可选）：直接说清这次改了什么
-#   不写「以实现：」「凭什么对：」这类固定标签
-#   取舍论证、测试计数与逐条断言清单不进提交（放 docs/testing.md 或 PR 描述）
-#
-# 破坏性变更（ABI / 接口不兼容）：标题加 !，正文末尾另起一段
+# 破坏性变更（ABI / 接口不兼容）：标题加 !，末尾另起一段
 #   BREAKING CHANGE: <旧→新；调用方须做什么>
 #
-# 8 条校验由 scripts/commit_msg.py lint 逐条实现，规则见 CONTRIBUTING.md §5
+# 由 scripts/commit_msg.py lint 校验，规则见 CONTRIBUTING.md §5

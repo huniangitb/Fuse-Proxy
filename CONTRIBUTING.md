@@ -148,7 +148,7 @@ PROBE_VARIANT=old                        # 透传探测
 
 ## 5. 提交规范
 
-**标题回答「做了什么更改」，正文按需直接描述改动（可选）。** 本节是规则的权威
+**默认只写一行 `<type>(<scope>): <做了什么更改>`；正文仅在原因无法从标题看出时追加。** 本节是规则的权威
 出处，`scripts/commit_msg.py lint` 是它**唯一**的可执行形式——改规则要同时改两边，
 `tests/test_commit_msg_lint.py` 会拦住漂移。
 
@@ -167,10 +167,10 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 
 `<type>(<scope>)!: <做了什么更改>`
 
-- **type**：`feat` / `fix` / `docs` / `refactor` / `perf` / `test` / `build` / `chore`。
+- **type**：`feat` / `fix` / `docs` / `style` / `refactor` / `perf` / `test` / `build` / `ci` / `chore`。
 - **scope 从下表选，不得自造**；同一个文件只允许一个 scope，无明确归属可省略。
   省略或写错时，校验器会按**本次改动的文件**给出建议（如 `src/modules/ftp/…` → `ftp`）。
-- 一句话说清改了什么，**目标 ≤ 50、硬上限 72 显示列**（中文按 2 列计，约 36 个汉字），
+- 用**祈使句**写「做了什么」：目标 ≤ 50、**硬上限 72 显示列**（中文按 2 列计），中文摘要另受 ≤ 25 字限制，
   句末不加句号。口径是**显示宽度**不是字符数：40 个汉字是 40 字符却占 80 列，终端
   必然折行——按字符数计的校验器（如 commitlint 的默认口径）会把它放行。
 - **不把内部计划/评审编号（`B1`/`C9`/`A26`…）写进标题**——仓库外无人知道它指什么，
@@ -194,11 +194,12 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 | `test` | 测试夹具与驱动本身 |
 | `docs` | 仅文档 |
 
-### 5.2 正文（中文，可选）
+### 5.2 正文（中文，可选，最多 3 行）
 
-**直接描述这次提交改了什么**：不写固定标签（「以实现：」「凭什么对：」已废除），
-不写取舍论证与取证细节（那些放 `docs/testing.md` 或 PR 描述）。标题已说清改动的，
-正文可省。
+**只在「为什么」无法从标题看出时才写**：最多 3 行，每行 ≤ 72 显示列，只写原因/影响。
+不写背景、解释、列表、测试计划、复述 diff、罗列文件、空话与模板词（comprehensive/
+robust/seamlessly/本次提交/我们/修改了多个文件）；取舍论证与取证放 `docs/testing.md`
+或 PR 描述。标题已说清改动的，正文必须省。
 
 正文每行 **≤ 72 显示列**（含 URL 的行与 4 空格缩进的代码块豁免）——`git log` 缩进 4 列
 后仍不折行。正文用真换行，**不要写字面 `\n`**（shell 里漏写 `$'…'` 就会这样，GitHub
@@ -219,14 +220,15 @@ scripts/setup-hooks.sh     # core.hooksPath=.githooks + commit.template=.gitmess
 
 | # | 规则 | 判据 |
 |---|---|---|
-| 1 | 标题 ≤ 72 显示列 | 目标 50，超出仅提示；> 72 拒绝 |
-| 2 | type / scope 取自词表 | scope 只能一个；`B1` 这类内部编号单独报错 |
-| 3 | 标题无句号、无 `+` / `；`、无内部编号 | 三者任一即拒 |
-| 4 | 标题与正文之间空一行 | 否则拒 |
-| 5 | 正文可选，直接描述改动 | 不写「以实现：」这类固定标签 |
-| 6 | 正文每行 ≤ 72 显示列 | 含 URL 的行与缩进代码块豁免 |
-| 7 | `!` 与 `BREAKING CHANGE:` 成对；trailer 在正文末尾且空一行 | 否则拒 |
-| 8 | 不得引用未入库的本地材料 | 黑名单：`.workbuddy-ai`、`review-findings-*`、`review-todo-*`、`.zcode`、`reports/` |
+| 1 | 默认只写标题一行 | 有 body 时最多 3 行（footer 不计），超拒 |
+| 2 | 标题 ≤ 72 显示列；中文摘要 ≤ 25 字 | 目标 50，超出仅提示；> 72 或 > 25 汉字拒绝 |
+| 3 | type / scope 取自词表 | scope 只能一个；`B1` 这类内部编号单独报错 |
+| 4 | 摘要用祈使句写「做了什么」 | 过去式（修复了/修改了…）与模板词、空话即拒 |
+| 5 | 标题无句号、无 `+` / `；`、无内部编号、无原因/影响/测试计划字样 | 任一命中即拒 |
+| 6 | 标题与正文之间空一行 | 否则拒 |
+| 7 | 正文每行 ≤ 72 显示列 | 含 URL 的行与缩进代码块豁免 |
+| 8 | `!` 与 `BREAKING CHANGE:` 成对；trailer 在正文末尾且空一行 | 否则拒 |
+| 9 | 不得引用未入库的本地材料 | 黑名单：`.workbuddy-ai`、`review-findings-*`、`review-todo-*`、`.zcode`、`reports/` |
 | — | `Merge` / `Revert "` / `fixup!` / `squash!` | git 生成，整体跳过 |
 
 ### 5.5 CHANGELOG（让规范有回报）

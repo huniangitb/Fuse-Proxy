@@ -37,7 +37,7 @@ CASES = [
     ("合规 chore 免正文", "chore: 忽略本机产物\n", 0, None),
     # ── 判别性：显示宽度 vs 字符数 ──
     ("标题 40 汉字 = 80 列 必须拒绝", "fix(fuse): " + "中" * 40 + "\n\n补充说明。\n", 1, "显示列"),
-    ("标题 30 汉字 = 60 列 放行", "fix(fuse): " + "中" * 30 + "\n\n补充说明。\n", 0, None),
+    ("标题 25 汉字 = 50 列 放行", "fix(fuse): " + "中" * 25 + "\n\n补充说明。\n", 0, None),
     ("标题 60 ASCII = 60 列 放行", "fix(fuse): " + "a" * 60 + "\n\n补充说明。\n", 0, None),
     # ── 标题 ──
     ("type 不在词表", "nope: 改点东西\n\n补充说明。\n", 1, "不在词表"),
@@ -67,6 +67,14 @@ CASES = [
     ("fixup! 跳过", "fixup! fix(fuse): 改点东西\n", 0, None),
     ("引用未入库的本地材料", "fix(fuse): 改点东西\n\n见 review-findings-20261007.md。\n", 1, "本机材料"),
     ("引用本机报告目录", "fix(fuse): 改点东西\n\n见 reports/2026-11-09-x.md。\n", 1, "本机材料"),
+    # ── 一行祈使 / 无空话 / body ≤3 行（§5.4 新增） ──
+    ("过去式摘要被拒", "fix(fuse): 修复了列举可见性漂移\n", 1, "祈使句"),
+    ("模板词被拒", "fix(fuse): 使用 robust 方式修可见性\n", 1, "模板词"),
+    ("空话被拒", "fix(fuse): 本次提交修改多个文件\n", 1, "空话"),
+    ("中文摘要超 25 字被拒", "fix(fuse): " + "修" * 26 + "\n", 1, "摘要"),
+    ("body 超过 3 行被拒", "fix(fuse): 改点东西\n\n第一行\n第二行\n第三行\n第四行\n", 1, "正文 4 行"),
+    ("原因字样被拒", "fix(fuse): 改点东西\n\n背景：为了兼容旧模块。\n", 1, "背景"),
+    ("3 行 body 放行", "fix(fuse): 改点东西\n\n第一行\n第二行\n第三行\n", 0, None),
 ]
 
 
@@ -143,7 +151,7 @@ def check_wrap(fails):
     mod = load_module()
     cases = {
         "中文长段落": "fix(fuse): 甲\n\n" + "中" * 90 + "\n",
-        "要点+列表混排": "fix(fuse): 甲\n\n要点：\n- " + "乙" * 50 + "\n- 短的\n",
+        "要点+列表混排": "fix(fuse): 甲\n\n要点：\n- " + "乙" * 30 + "\n- 短的\n",
         "footer 折行": "fix(fuse)!: 甲\n\n补充说明。\n\nBREAKING CHANGE: " + "丙" * 60 + "\n",
     }
     for name, src in cases.items():
@@ -165,7 +173,7 @@ def check_wrap(fails):
             os.unlink(path)
 
     # 结构保持：列表项不被并进上一段；URL 不被拆；缩进代码块原样
-    path = write_tmp("fix(fuse): 甲\n\n要点：\n- " + "乙" * 50 + "\n- 短的\n")
+    path = write_tmp("fix(fuse): 甲\n\n要点：\n- " + "乙" * 30 + "\n- 短的\n")
     try:
         run_tool("wrap", path)
         out = open(path, encoding="utf-8").read()

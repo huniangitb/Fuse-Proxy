@@ -23,13 +23,17 @@ import sys
 import unicodedata
 from datetime import date
 
-TYPES = ("feat", "fix", "docs", "refactor", "perf", "test", "build", "chore")
+TYPES = ("feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore")
 SCOPES = ("fw", "fuse", "module", "ftp", "injector", "zygisk", "log", "rule",
           "config", "core", "build", "scripts", "test", "docs")
 
 HEADER_TARGET = 50
 HEADER_MAX = 72
 LINE_MAX = 72
+DESC_CJK_MAX = 25      # 中文摘要最多 25 字
+BODY_MAX_LINES = 3     # body 最多 3 行（commitlint body-max-lines）
+TEMPLATE_WORDS = ("comprehensive", "robust", "seamlessly",
+                  "本次提交", "我们", "修改了多个文件", "co-authored-by")
 
 # 仓库外的本机材料：读者解析不了，等于噪声
 LOCAL_REFS = (".workbuddy-ai", "review-findings-", "review-todo-", ".zcode", "reports/", "会话记忆")
@@ -81,6 +85,11 @@ SECTIONS = (("feat", "新功能"), ("fix", "缺陷修复"), ("perf", "性能"),
 def width(s):
     """显示宽度：CJK 全角占 2 列（终端与 git log 的实际排版口径）。"""
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def cjk_count(s):
+    """中文摘要的实际汉字数（摘要是否超 25 字按此计，不按显示宽度）。"""
+    return sum(1 for c in s if unicodedata.east_asian_width(c) in "WF")
 
 
 def strip_comments(text):
@@ -280,6 +289,26 @@ def check(text, paths=None):
     code = re.search(r"(?<![A-Za-z0-9])([ABC][0-9]+)(?![0-9])", desc)
     if code:
         errs.append("标题不得含内部计划/评审编号 %s（仓库外不可解；追溯写进正文）" % code.group(1))
+    if cjk_count(desc) > DESC_CJK_MAX:
+        errs.append("中文摘要 %d 字 > 上限 %d 字：%s" % (cjk_count(desc), DESC_CJK_MAX, desc))
+
+    # 摘要写「做了什么」：祈使/动宾，不写原因/影响/测试计划/空话/模板词。
+    low = text.lower()
+    for w in TEMPLATE_WORDS:
+        if w.lower() in low:
+            errs.append("含模板词/空话「%s」：只写做了什么，删掉空话" % w)
+    for marker in ("背景", "原因：", "影响：", "测试计划", "复现步骤"):
+        if marker in body:
+            errs.append("正文出现「%s」：提交信息不写原因/影响/测试计划" % marker)
+    NON_IMPERATIVE = ("修复了", "修改了", "增加了", "添加了", "更新了", "实现了", "调整了", "优化了", "删除了")
+    for w in NON_IMPERATIVE:
+        if desc.startswith(w):
+            errs.append("摘要用过去式「%s」：改用祈使句（如「修复…」「补…」）" % w)
+
+    # body 最多 3 行（commitlint body-max-lines）；footer 不计入
+    body_lines = [ln for ln in body.splitlines() if ln.strip()]
+    if len(body_lines) > BODY_MAX_LINES:
+        errs.append("正文 %d 行 > 上限 %d 行（footer 不计）" % (len(body_lines), BODY_MAX_LINES))
 
     breaking = bool(BREAKING_RE.search(body))
     if bool(bang) != breaking:
