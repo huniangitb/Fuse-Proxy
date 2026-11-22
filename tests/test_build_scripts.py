@@ -114,7 +114,34 @@ def read_log(log):
         return ""
 
 
+def check_script_exec_bits():
+    """仓库 .sh 的模式必须是 100755。
+
+    docs/testing.md 与 scripts/acceptance.sh 都是**直接执行**这些脚本
+    （`scripts/test-isolated.sh`、`scripts/pack-module.sh` 不带 `bash` 前缀），
+    644 只在真跑时以 permission denied 暴露——G6 宿主隔离跑此前就一直是这个状态。
+    """
+    try:
+        r = subprocess.run(["git", "ls-files", "-s", "scripts/"], cwd=ROOT,
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("无 git，跳过脚本权限位检查（%s）" % exc, file=sys.stderr)
+        return
+    if r.returncode != 0:
+        print("非 git 工作树，跳过脚本权限位检查", file=sys.stderr)
+        return
+    bad = []
+    for line in r.stdout.splitlines():
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        mode = fields[0] if fields else ""
+        if path.endswith(".sh") and mode != "100755":
+            bad.append("%s(%s)" % (path, mode))
+    check("仓库 .sh 模式均为 100755", not bad, "、".join(bad))
+
+
 def main():
+    check_script_exec_bits()
     if not os.path.isfile(SCRIPT):
         print("缺少脚本 %s" % SCRIPT, file=sys.stderr)
         return 1
