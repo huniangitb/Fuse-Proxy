@@ -17,6 +17,8 @@
  *   publish <conf> <slow_ms> [path]  线程 A 在槽内/槽前做慢查询，主线程走 published
  *                             begin→drain→end 协议，打印三段耗时
  *   matrix  <conf> <path...>  逐路径裁决 + 能力查询次数（slow_ms 固定 0）
+ *   churn   <conf> <iters> <path...>  代际抖动线程（每 1ms fw_pkg_reload）+ 两个请求
+ *                            线程反复判定，打印槽内打开清单次数（放大信号）
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -183,6 +185,13 @@ static void* pkgl_provider(void* arg) {
         if (!p->empty) { /* 空清单模式：慢读照旧，但一个字都不写 = 读方永远 EOF */
             ssize_t w = write(fd, kLines, sizeof kLines - 1);
             (void)w; /* 读方可能拿够行就关掉：EPIPE 由 main 的 SIG_IGN 兜住 */
+            /* 追加行：让调用方 uid 也能是特权应用（平台签名档）——隔离判定先问
+               「是不是他包路径」再问特权档，特权调用方同样需要目标属主那条事实。 */
+            const char* extra = getenv("NSP_PKGLIST_EXTRA");
+            if (extra && extra[0]) {
+                ssize_t w2 = write(fd, extra, strlen(extra));
+                (void)w2;
+            }
         }
         close(fd); /* 数据留在管道里可读，关闭最后写端让读方 fgets 看到 EOF */
         /* 关后停 2ms 再开下一次：读方把 233 字节读完 + 读到 EOF + fclose 只需
@@ -249,9 +258,63 @@ static int run_publish_pkgs(const char* conf, const char* fifo, int slow_ms,
     return 0;
 }
 
+/* 代际抖动：生产里 uid.map 变化会调 fw_pkg_reload()，而它把**整代** fw_pkg 事实
+   缓存（packages.list/appops 结论）一并作废——即便这些结论的来源文件没变。槽内
+   判定因此反复未命中，旧实现预热 8 次后退回「槽内阻塞查询」，把 packages.list
+   的慢读重新挂回配置读槽：发布者排空读者要等它，之后每个决策线程都在
+   config_read_begin 上排队。新实现在槽外把事实取全再进槽，槽内零 IO。
+   本模式观测的信号就是「持读槽时打开 packages.list」的次数。 */
+typedef struct {
+    _Atomic bool stop;
+} Churn;
+
+static void* churn_thread(void* arg) {
+    Churn* c = arg;
+    while (!atomic_load(&c->stop)) {
+        fw_pkg_reload(); /* 生产入口：uid.map 变化 → 整代事实缓存作废 */
+        struct timespec d = {0, 1000000L};
+        while (nanosleep(&d, &d) != 0 && errno == EINTR) {}
+    }
+    return NULL;
+}
+
+typedef struct {
+    char** paths;
+    int npaths;
+    int iters;
+    uid_t uid;
+    _Atomic int* resolves;
+    _Atomic int* blocked;
+    _Atomic unsigned long long* max_us;
+} ChurnJob;
+
+static void* churn_resolver(void* arg) {
+    ChurnJob* j = arg;
+    for (int it = 0; it < j->iters; it++) {
+        for (int i = 0; i < j->npaths; i++) {
+            NspQueryCtx q = {.uid = j->uid, .pid = getpid(), .gid = 0, .path = j->paths[i]};
+            const unsigned long long t0 = now_us();
+            NspPathDecision d;
+            memset(&d, 0, sizeof d);
+            fw_rules_resolve(&q, &d);
+            const unsigned long long us = now_us() - t0;
+            NspProbeResult p;
+            memset(&p, 0, sizeof p);
+            fw_rules_probe(&q, &p);
+            atomic_fetch_add(j->resolves, 1);
+            if (d.appear_missing) atomic_fetch_add(j->blocked, 1);
+            unsigned long long prev = atomic_load(j->max_us);
+            while (us > prev && !atomic_compare_exchange_weak(j->max_us, &prev, us)) {}
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <publish|publish-pkgs|probe-pkgs|matrix> <conf> [slow_ms] [path...]\n",
+        fprintf(stderr,
+                "usage: %s <publish|publish-pkgs|probe-pkgs|matrix|churn|uidcache> <conf>"
+                " [args...]\n",
                 argv[0]);
         return 2;
     }
@@ -331,6 +394,61 @@ int main(int argc, char** argv) {
                " warm_src=%d absent_src=%d opens=%d\n",
                cold_false, warm_true, absent_cold, absent_neg, bad_args, warm_src, absent_src,
                atomic_load(&g_pkgl_opens));
+        config_destroy_lock();
+        return 0;
+    }
+    if (strcmp(mode, "churn") == 0) {
+        if (argc < 5) {
+            fprintf(stderr, "churn 需要 <iters> <path...>\n");
+            return 2;
+        }
+        const char* fifo = getenv("NSP_PKGLIST_FIFO");
+        if (!fifo) {
+            fprintf(stderr, "churn 需要 NSP_PKGLIST_FIFO\n");
+            return 2;
+        }
+        const int iters = atoi(argv[3]);
+        g_slow_ms = 0;
+        signal(SIGPIPE, SIG_IGN);
+        setup(conf); /* 先用正常清单装好，再切到 FIFO */
+        fw_pkg_set_packagelist_path(fifo);
+        g_plist_path = fifo;
+        const char* delay_env = getenv("NSP_CHURN_PKGL_DELAY_MS");
+        PkglProvider prov = {.fifo = fifo,
+                             .delay_ms = delay_env ? atoi(delay_env) : 3,
+                             .empty = false};
+        atomic_init(&prov.stop, false);
+        pthread_t pr;
+        if (pthread_create(&pr, NULL, pkgl_provider, &prov) != 0) return 3;
+        pthread_detach(pr); /* 提供者在 FIFO 上阻塞等读方，进程退出即回收 */
+        Churn churn;
+        atomic_init(&churn.stop, false);
+        pthread_t ct;
+        if (pthread_create(&ct, NULL, churn_thread, &churn) != 0) return 3;
+        _Atomic int resolves = 0;
+        _Atomic int blocked = 0;
+        _Atomic unsigned long long max_us = 0;
+        const char* uid_env = getenv("NSP_CHURN_UID");
+        ChurnJob job = {.paths = argv + 4,
+                        .npaths = argc - 4,
+                        .iters = iters,
+                        .uid = uid_env ? (uid_t)strtoul(uid_env, NULL, 10) : (uid_t)10123,
+                        .resolves = &resolves,
+                        .blocked = &blocked,
+                        .max_us = &max_us};
+        enum { CHURN_THREADS = 2 };
+        pthread_t th[CHURN_THREADS];
+        for (int i = 0; i < CHURN_THREADS; i++) {
+            if (pthread_create(&th[i], NULL, churn_resolver, &job) != 0) return 3;
+        }
+        for (int i = 0; i < CHURN_THREADS; i++) pthread_join(th[i], NULL);
+        atomic_store(&churn.stop, true);
+        pthread_join(ct, NULL);
+        printf("resolves=%d pkgl_opens=%d pkgl_in_slot=%d pkgl_slow_in_slot=%d blocked=%d "
+               "max_resolve_us=%llu\n",
+               atomic_load(&resolves), atomic_load(&g_pkgl_opens), atomic_load(&g_pkgl_in_slot),
+               atomic_load(&g_pkgl_slow_in_slot), atomic_load(&blocked),
+               atomic_load(&max_us));
         config_destroy_lock();
         return 0;
     }

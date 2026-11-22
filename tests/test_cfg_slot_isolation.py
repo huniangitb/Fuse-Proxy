@@ -286,6 +286,65 @@ def check_publish_empty(binary, conf_path, plist, fifo, slow_ms):
     return checks
 
 
+# 代际抖动：uid.map 变化在生产里就调 fw_pkg_reload()，它把整代 fw_pkg 事实缓存
+# 一并作废（即便 packages.list 没变）。预热因此反复失效，旧实现预热 8 次后退回
+# 「槽内阻塞查询」——把慢读挂回配置读槽。断言槽内打开清单的次数为 0。
+CHURN_ITERS = 6
+
+
+def check_churn(binary, conf_path, plist, fifo, label="代际抖动", uid=None,
+               delay_ms=3, extra_line=None, expect_blocked=True):
+    """真慢清单 + 每 1ms 一次 fw_pkg_reload() 的代际抖动 + 两个请求线程。旧实现
+    在升级路径上把 packages.list 的阻塞读放回读槽（实测 40 次判定里 158 次槽内
+    打开、单次 resolve 217ms）；新实现槽外取全事实，槽内零 IO，裁决不变。
+
+    `uid` 换调用方身份：隔离判定**先**问「是不是他包路径」（要目标属主那条事实）
+    **再**问特权档，所以特权调用方也会走升级路径——槽外取全时若只在非特权分支收
+    集属主事实，槽内仍会未命中并退回阻塞读，这条断言就是那个缺口的判别器。
+    `extra_line` 往清单补一行（例如给调用方一个平台签名档）。"""
+    env = {"NSP_PACKAGELIST": str(plist), "NSP_PKGLIST_FIFO": str(fifo),
+           "NSP_CHURN_PKGL_DELAY_MS": str(delay_ms)}
+    if uid is not None:
+        env["NSP_CHURN_UID"] = str(uid)
+    if extra_line:
+        env["NSP_PKGLIST_EXTRA"] = extra_line
+    out, error = run_driver(
+        binary, ["churn", str(conf_path), str(CHURN_ITERS), OTHER, OTHER_OBB],
+        env, timeout=300)  # sanitizer 下 2 线程 × 6 轮 + 20ms 慢读会被放大，给足时限
+    if error:
+        return [(label, False, error)]
+    f = parse_kv(out)
+    expected = 2 * CHURN_ITERS * 2
+    checks = [
+        (label + " 所有判定都跑完（没有活锁）", f["resolves"] == expected,
+         f"resolves={f['resolves']} 期望={expected}"),
+        (label + " 事实真被查过（没把查询删掉了事）", f["pkgl_opens"] >= 1,
+         f"pkgl_opens={f['pkgl_opens']}"),
+        (label + " 槽内一次都没打开 packages.list",
+         f["pkgl_in_slot"] == 0,
+         f"pkgl_in_slot={f['pkgl_in_slot']}（预热反复失效后旧实现把阻塞读放回读槽；"
+         f"pkgl_opens={f['pkgl_opens']} pkgl_slow_in_slot={f['pkgl_slow_in_slot']}）"),
+        # 槽内只可能因为 allow_io 兜底才开文件；这里连同「慢读」一起钉住，
+        # 免得将来兜底被触发时只靠 pkgl_in_slot 一个信号（快读也可能 0 次）。
+        (label + " 槽内没有慢读", f["pkgl_slow_in_slot"] == 0,
+         f"pkgl_slow_in_slot={f['pkgl_slow_in_slot']}"),
+    ]
+    if expect_blocked is None:
+        # 每 1ms 一次 reload 时 `fw_pkg_is_privileged` 的代际守卫会把「读盘期间代际
+        # 变了」答成未知（旧实现同样如此），特权档因此时真时假——裁决属于既有语义，
+        # 本变体只钉「槽内零 IO」。
+        pass
+    elif expect_blocked:
+        checks.append((label + " 他包 data/obb 仍被隔离", f["blocked"] == f["resolves"],
+                       f"blocked={f['blocked']} resolves={f['resolves']}"))
+    else:
+        checks.append((label + " 特权调用方仍全部放行（裁决不变）", f["blocked"] == 0,
+                       f"blocked={f['blocked']} resolves={f['resolves']}"))
+    checks.append((label + " 单次判定耗时没有失控", f["max_resolve_us"] < 2000000,
+                   f"max_resolve_us={f['max_resolve_us']} 阈值<2000000"))
+    return checks
+
+
 def check_uidcache(binary, conf_path, plist):
     """新只读入口 `fw_pkg_uid_cached` 的契约：冷缓存返回 false（事实还没备好），
     已查过的正/负结论返回 true。把它写成「冷缓存 = 无此包」会让**同 uid 兄弟包**
@@ -362,6 +421,15 @@ def run(directory):
     # 负结论窗口：清单恒空时，事实永远是「不知道」。这是第六批验收漏出的残余
     # 路径（预取读到空 → known 假不缓存 → 槽内重读慢清单）。
     checks += check_publish_empty(binary, base_conf, plist, fifo, 250)
+    # 代际抖动 × 预热失效：旧实现的升级路径把慢读放回读槽（第十三批修的第一个
+    # 「在槽内做 IO」出口）。断言槽内零打开，且裁决不变。
+    checks += check_churn(binary, base_conf, plist, fifo)
+    # 特权调用方：判定先问属主事实、再问特权档，属主事实漏了就同样退回槽内阻塞读
+    checks += check_churn(binary, base_conf, plist, fifo, label="代际抖动（特权调用方）",
+                          uid=10150, delay_ms=20,
+                          extra_line="com.priv.app 10150 0 /data/user/0/com.priv.app "
+                                     "platform:privapp:targetSdkVersion=34\n",
+                          expect_blocked=None)
     checks += check_uidcache(binary, base_conf, plist)
     # 语义矩阵（一次进程走多路径；只断言裁决，不看累计查询次数）
     checks += check_matrix(binary, directory, cfg, plist, "默认隔离", BASE, 10123,

@@ -383,7 +383,8 @@ SUITE_MAP = [
        "tests/fixtures/cfg_slot_isolation.c"),
       ("fw_pkg_prefetch_isolation_facts", "br_prefetch_xapp_facts", "fw_pkg_uid_map_name",
        "priv_cached_lookup", "fw_pkg_priv_cached", "fw_pkg_uid_cached", "br_isolation_slot",
-       "BR_FACT_WARM_TRIES", "FW_PKG_PRIV_MISS_TTL_MS"),
+       "BR_FACT_WARM_TRIES", "FW_PKG_PRIV_MISS_TTL_MS", "br_collect_ext_facts",
+       "BrExtFacts"),
       "配置读槽内的慢能力查询与慢身份事实（槽外预取 + 负结论缓存）"),
 
     # 写者窗口里的读者等待方式：旧实现 sched_yield 自旋，多 worker 时把 CPU 从
