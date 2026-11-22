@@ -150,16 +150,39 @@ static int g_async_mount_count = 0;
    把旧 fd 当新管道读（读不到就绪字节 → 走失败分支，旧 daemon 被误判）。
    故覆盖前必须把旧 fd 从 epoll 摘除并关闭，同时释放其 ctx（ctx 由本文件的
    malloc 分配，所有权随管道转移）。 */
+/* 注册在恢复 worker 上、分发在事件循环上（崩溃恢复把重启序列搬出循环后，这对
+   全局第一次跨线程）：覆盖注册时不能 free 掉循环正拿在手里的 ctx（double free），
+   循环取出 ctx 后也必须把它从全局摘掉（否则 worker 会再 free 一次，或把已被
+   复用的 fd 当成自己的关掉）。锁只罩这两个全局的改写/摘取，DEL/close/free 在锁外。 */
+static pthread_mutex_t g_ready_mu = PTHREAD_MUTEX_INITIALIZER;
+
 void register_fuse_ready_pipe(int fd, void* ctx) {
-    if (g_fuse_ready_pipe_fd >= 0 && g_fuse_ready_pipe_fd != fd) {
-        LOG_WRN("FUSE 就绪管道被重新注册（旧 fd=%d 尚未就绪），关闭旧管道",
-                g_fuse_ready_pipe_fd);
-        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_fuse_ready_pipe_fd, nullptr);
-        close(g_fuse_ready_pipe_fd);
-        free(g_fuse_ready_ctx);
-    }
+    pthread_mutex_lock(&g_ready_mu);
+    const int old_fd = g_fuse_ready_pipe_fd;
+    void* old_ctx = g_fuse_ready_ctx;
     g_fuse_ready_pipe_fd = fd;
     g_fuse_ready_ctx = ctx;
+    pthread_mutex_unlock(&g_ready_mu);
+    if (old_fd >= 0 && old_fd != fd) {
+        LOG_WRN("FUSE 就绪管道被重新注册（旧 fd=%d 尚未就绪），关闭旧管道", old_fd);
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, old_fd, nullptr);
+        close(old_fd);
+        free(old_ctx);
+    }
+}
+
+/* 分发前把就绪管道连同 ctx 从全局摘下来（之后由调用方独占 DEL/close/free）。
+   没命中返回 NULL——那不是就绪管道的事件。 */
+static void* fuse_ready_take(int fd) {
+    pthread_mutex_lock(&g_ready_mu);
+    void* ctx = nullptr;
+    if (fd >= 0 && fd == g_fuse_ready_pipe_fd) {
+        ctx = g_fuse_ready_ctx;
+        g_fuse_ready_pipe_fd = -1;
+        g_fuse_ready_ctx = nullptr;
+    }
+    pthread_mutex_unlock(&g_ready_mu);
+    return ctx;
 }
 
 /* 异步挂载完成注册表：生产者是挂载工作线程（run_in_mnt_ns_async），消费者是主
@@ -858,8 +881,12 @@ static void cleanup_all_target_apps() {
 static void injector_fuse_recover_cb(void* ctx) {
     (void)ctx;
     force_recover_tracked_mounts();
+    /* 先清旧实例残留、再起新实例：新实例一旦写就绪字节，事件循环立刻跑
+       remount_all_tracked()——清理排在 fork 之后就会与重挂并发（同一应用刚挂上
+       又被拆），且 remount 的 fast_pid_cache_clear 会与清理的遍历撞在一起。
+       清理不依赖新实例，挪到前面就没有这个窗口。 */
+    cleanup_all_target_apps();
     inject_global_fuse();
-    if (g_global_fuse.fuse_pid > 0) cleanup_all_target_apps();
 }
 
 /* 崩溃恢复重挂的计数：只统计真正挂上的应用，失败另有逐条日志 */
@@ -2137,12 +2164,16 @@ static void injector_event_loop(const InjectorFds* fds) {
                 while (read(fd, &drained, sizeof drained) == sizeof drained) {
                 }
                 if (nsp_fuse_recover_take()) LOG_DBG("FUSE 崩溃恢复序列已完成（worker）");
-            } else if (fd == g_fuse_ready_pipe_fd) {
-                handle_fuse_ready_event(g_fuse_ready_ctx); /* 内部已 free(ctx) */
-                g_fuse_ready_pipe_fd = -1;
-                g_fuse_ready_ctx = nullptr;
             } else {
-                on_client_fd(fd);
+                /* 就绪管道可能刚被恢复 worker 覆盖注册：只有「fd 仍是当前就绪
+                   管道」才命中，并且在锁内把 ctx 一起摘走（之后归本线程独占，
+                   handler 自己 DEL/close/free）。 */
+                void* ready_ctx = fuse_ready_take(fd);
+                if (ready_ctx != nullptr) {
+                    handle_fuse_ready_event(ready_ctx);
+                } else {
+                    on_client_fd(fd);
+                }
             }
         }
         handle_pending_reload_begin();

@@ -105,7 +105,19 @@ def check_call_sites(fails, injector_path):
     need("fd == g_fuse_recover_fd" in loop, "loop-branch",
          "事件循环里没有恢复 worker 的就绪 fd 分支")
     need("nsp_fuse_recover_take()" in loop, "loop-take",
-         "就绪分支没有取走完成结果（重挂记账会丢）")
+         "就绪分支没有取走完成标志（worker 的完成状态会一直挂着）")
+    # P1-2 回归：清理必须排在 fork 之前，否则新实例一就绪，remount_all_tracked()
+    # 就会与全进程清理并发（同一应用刚挂上又被拆，且 fast_pid 缓存被两边同时改）。
+    need(recover.find("cleanup_all_target_apps(") >= 0 and
+         recover.find("cleanup_all_target_apps(") < recover.find("inject_global_fuse("),
+         "recover-cleanup-order",
+         "恢复回调把 cleanup_all_target_apps() 排在 inject_global_fuse() 之后："
+         "新实例就绪后重挂会与清理并发")
+    # P1-3 回归：就绪管道的注册/分发现在跨线程，所有权全局必须持锁改。
+    need(text.count("g_ready_mu") >= 4, "ready-mu",
+         "就绪管道所有权没有加锁（注册在 worker、分发在事件循环）")
+    need("fuse_ready_take(" in loop, "ready-take",
+         "事件循环没有用 fuse_ready_take() 摘取 ctx（跨线程会 double free/关错 fd）")
     need("nsp_fuse_recover_start(" in setup, "setup-start",
          "injector_setup_epoll 没有启动恢复 worker")
     need("nsp_fuse_recover_shutdown()" in shutdown, "shutdown-join",

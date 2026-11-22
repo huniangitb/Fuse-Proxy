@@ -456,6 +456,13 @@ SUITE_MAP = [
      ("nsp_fuse_recover_request", "nsp_fuse_recover_take", "nsp_fuse_recover_start"),
      "FUSE 崩溃恢复的重启序列不占事件循环线程（阶段化恢复）"),
 
+    # fast_pid 的位图与 pid 缓存是跨线程共享状态：恢复 worker 的全进程清理与事件
+    # 循环的 remount/cache_clear 会同时读写（旧实现默认只有一个调用线程）。
+    (("test_fast_pid_threads.py",),
+     ("src/core/fast_pid.c", "tests/test_fast_pid_threads.py",
+      "tests/fixtures/fast_pid_threads_driver.c"),
+     ("cache_prune_dead", "fast_pid_cache_clear"),
+     "fast_pid 缓存跨线程安全（扫描/清缓存无 use-after-free）"),
     # 类同 async_refresh：handle_pending_reload 原先内联 audit_tracked_apps /
     # audit_and_remount_specific_apps / audit_running_apps——逐个 tracked 应用做
     # 配置判定 + 实测视图 + 挂载/卸载/还原，几十个在跑的应用叠起来把事件循环按在
@@ -649,6 +656,7 @@ LAYERS = {
             "test_async_refresh.py",
             "test_reload_stage.py",
             "test_fuse_recover.py",
+            "test_fast_pid_threads.py",
             "test_audit_defer.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
@@ -914,6 +922,7 @@ PARALLEL_SAFE = frozenset({
     "test_async_refresh.py",      # cc 直编真实 async_refresh + 慢回调替身，纯线程，无文件/挂载
     "test_reload_stage.py",       # cc 直编真实 reload_stage + 慢 fopen 注入，临时配置目录，无挂载
     "test_fuse_recover.py",       # cc 直编真实 fuse_recover + 慢回调替身，纯线程，无文件/挂载
+    "test_fast_pid_threads.py",   # cc 直编真实 fast_pid，两线程扫描/清缓存，ASan 判别
     "test_audit_defer.py",        # cc 直编真实 audit_worker + 慢审计替身，纯线程，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志
