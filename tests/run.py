@@ -447,6 +447,14 @@ SUITE_MAP = [
       "tests/fixtures/reload_stage_driver.c"),
      ("nsp_reload_stage_request", "nsp_reload_stage_take", "nsp_reload_stage_start"),
      "配置重载的读盘与 pm 探测不占事件循环线程（阶段化读取）"),
+    # FUSE 崩溃恢复的重启序列（等旧实例退出、卸载复核、fork 新实例、全进程清理）
+    # 也在 fps 唯一事件循环线程上；阶段化后循环只发请求、收就绪 eventfd。
+    (("test_fuse_recover.py",),
+     ("src/injector/fuse_recover.c", "include/fuse_recover.h",
+      "src/injector/injector.c", "tests/test_fuse_recover.py",
+      "tests/fixtures/fuse_recover_driver.c"),
+     ("nsp_fuse_recover_request", "nsp_fuse_recover_take", "nsp_fuse_recover_start"),
+     "FUSE 崩溃恢复的重启序列不占事件循环线程（阶段化恢复）"),
 
     # 类同 async_refresh：handle_pending_reload 原先内联 audit_tracked_apps /
     # audit_and_remount_specific_apps / audit_running_apps——逐个 tracked 应用做
@@ -640,6 +648,7 @@ LAYERS = {
             "test_cfg_reload_lock.py",
             "test_async_refresh.py",
             "test_reload_stage.py",
+            "test_fuse_recover.py",
             "test_audit_defer.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
@@ -904,6 +913,7 @@ PARALLEL_SAFE = frozenset({
     "test_cfg_reload_lock.py",    # cc 直编真实 parser + --wrap 慢盘/慢 pm，临时配置目录，无挂载
     "test_async_refresh.py",      # cc 直编真实 async_refresh + 慢回调替身，纯线程，无文件/挂载
     "test_reload_stage.py",       # cc 直编真实 reload_stage + 慢 fopen 注入，临时配置目录，无挂载
+    "test_fuse_recover.py",       # cc 直编真实 fuse_recover + 慢回调替身，纯线程，无文件/挂载
     "test_audit_defer.py",        # cc 直编真实 audit_worker + 慢审计替身，纯线程，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志

@@ -21,8 +21,10 @@
 #include "async_refresh.h"
 #include "audit_worker.h"
 #include "reload_stage.h"
+#include "fuse_recover.h"
 #include "build_info.h"
 #include "crash_tail.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,6 +136,8 @@ static volatile sig_atomic_t g_pending_startup_scan = 0;
 static int g_fuse_ready_pipe_fd = -1;
 /* 配置读取 worker 的就绪 eventfd（<0 = worker 没起来，重载退回内联读） */
 static int g_reload_ready_fd = -1;
+/* FUSE 崩溃恢复 worker 的就绪 eventfd（<0 = worker 没起来，恢复退回内联执行） */
+static int g_fuse_recover_fd = -1;
 static void* g_fuse_ready_ctx = nullptr;
 #define MAX_ASYNC_MOUNTS 128
 static int g_async_mount_fds[MAX_ASYNC_MOUNTS];
@@ -845,6 +849,19 @@ static void cleanup_all_target_apps() {
     fast_pid_each(cleanup_cb, nullptr);
 }
 
+/* FUSE 崩溃后的重启序列：等旧实例退出 → 卸载并复核 → fork 新实例 → 扫全进程清理残留。
+ * 整段是秒级慢活（10ms×50 轮询 + 50ms + 20×20ms 复核 + 全进程表遍历），只能跑在
+ * 恢复 worker 上，跑完由 worker 写就绪 eventfd 通知事件循环。
+ * 「重挂所有追踪应用」的标记由事件循环在发请求时就置好（见 check_and_recover_fuse）：
+ * 新实例的就绪事件一定晚于这个标记，若等 worker 回报才置标记，就绪事件可能已经过去，
+ * 重挂会一直等到下一次 FUSE 就绪（追踪应用停在断掉的旧挂载上）。 */
+static void injector_fuse_recover_cb(void* ctx) {
+    (void)ctx;
+    force_recover_tracked_mounts();
+    inject_global_fuse();
+    if (g_global_fuse.fuse_pid > 0) cleanup_all_target_apps();
+}
+
 /* 崩溃恢复重挂的计数：只统计真正挂上的应用，失败另有逐条日志 */
 static int g_remount_done;
 
@@ -921,11 +938,15 @@ static void check_and_recover_fuse() {
             g_should_exit = 1;
             return;
         }
-        force_recover_tracked_mounts();
-        inject_global_fuse();
-        if (g_global_fuse.fuse_pid > 0) {
-            cleanup_all_target_apps();
-            g_pending_remount = 1;
+        /* 重启序列是秒级慢活，必须移出事件循环：循环同时承载 pre-hook 判定、
+           挂载派发与 IPC ACK，一次慢恢复会让这段时间里的所有启动走 fail-open。
+           重挂标记在这里就置好——新实例的就绪事件晚于本次崩溃，就绪处理器会消费它；
+           若等 worker 回报再置，就绪事件可能已经过去，重挂会被无限推迟。
+           worker 起不来时按旧行为内联执行——宁可慢一次也不能丢恢复。 */
+        g_pending_remount = 1;
+        if (!nsp_fuse_recover_request()) {
+            LOG_WRN("FUSE 恢复线程不可用：重启序列回退到事件循环内联执行");
+            injector_fuse_recover_cb(nullptr);
         }
     }
 
@@ -1409,6 +1430,14 @@ static void injector_setup_epoll(InjectorFds* fds) {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_reload_ready_fd, &ev_reload);
     } else {
         LOG_WRN("配置读取线程未启动：热重载的读盘仍内联在事件循环上");
+    }
+    /* FUSE 崩溃恢复 worker 同理：没起来就退回内联恢复。 */
+    g_fuse_recover_fd = nsp_fuse_recover_start(injector_fuse_recover_cb, nullptr);
+    if (g_fuse_recover_fd >= 0) {
+        struct epoll_event ev_recover = {.events = EPOLLIN, .data.fd = g_fuse_recover_fd};
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_fuse_recover_fd, &ev_recover);
+    } else {
+        LOG_WRN("FUSE 恢复线程未启动：崩溃恢复的重启序列仍内联在事件循环上");
     }
     int ipc_sock = ipc_server_init();
     if (ipc_sock < 0) {
@@ -2102,6 +2131,12 @@ static void injector_event_loop(const InjectorFds* fds) {
                 while (read(fd, &drained, sizeof drained) == sizeof drained) {
                 }
                 handle_pending_reload_finish();
+            } else if (fd == g_fuse_recover_fd) {
+                /* 恢复 worker 跑完了一轮重启序列（新实例是否就绪仍由 ready 管道裁决） */
+                uint64_t drained;
+                while (read(fd, &drained, sizeof drained) == sizeof drained) {
+                }
+                if (nsp_fuse_recover_take()) LOG_DBG("FUSE 崩溃恢复序列已完成（worker）");
             } else if (fd == g_fuse_ready_pipe_fd) {
                 handle_fuse_ready_event(g_fuse_ready_ctx); /* 内部已 free(ctx) */
                 g_fuse_ready_pipe_fd = -1;
@@ -2123,6 +2158,8 @@ static void injector_shutdown(const InjectorFds* fds) {
     nsp_audit_shutdown();
     /* 读取 worker 也一样：等它手上那轮读盘结束（有界），再释放槽里没取走的视图 */
     nsp_reload_stage_shutdown();
+    /* 恢复 worker 若正在跑重启序列，等它跑完再拆全局状态，不取消 */
+    nsp_fuse_recover_shutdown();
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);
