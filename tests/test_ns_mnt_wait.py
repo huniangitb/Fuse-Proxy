@@ -246,10 +246,28 @@ def check_contracts():
             ok("线程里不再有固定步进的 sleep")
         else:
             fail("线程里还留着固定步进", "等待必须由等待体统一做，否则又出现两套步进")
-        if "IPC补挂载跳过" in body and "schedule_retry_mount" in body:
-            ok("超时仍走「跳过 + 交后台重试」分支")
+        timeout = ""
+        branch = re.search(r"if\s*\(\s*!switched\s*\)\s*\{", body)
+        if branch:
+            start = branch.end() - 1
+            depth = 0
+            for end in range(start, len(body)):
+                depth += (body[end] == "{") - (body[end] == "}")
+                if depth == 0:
+                    timeout = body[start:end + 1]
+                    break
+        if "IPC补挂载跳过" in timeout and "schedule_retry_mount(" in timeout:
+            ok("超时本分支走「跳过 + 交后台重试」，不再误认别的分支的调用")
         else:
-            fail("超时分支被改动", "没等到切换就绝不挂，且要交后台重试队列")
+            fail("超时分支未接重试", "必须检查 !switched 本分支，不能查整个线程体")
+        if timeout and not re.search(r"\bperform_app_mount(?:_sync)?\s*\(", timeout):
+            ok("超时未证明私有命名空间时不直接挂载")
+        else:
+            fail("超时分支直接挂载", "存储条目存在不能证明不是 zygote ns")
+        if "get_app_uid(" in timeout and "is_isolated_uid(" in timeout:
+            ok("超时入队核对当前 UID，过滤 isolated")
+        else:
+            fail("超时入队没有当前 UID / isolated 判定")
 
     body = func_body(ipc, "ipc_post_mount_dispatch")
     if "ns_mnt_wait_capture(" in body:

@@ -49,6 +49,8 @@ def run_driver():
         exe = Path(tmp) / "mount_state_read_driver"
         cmd = cc + [
             "-std=c23", "-O1", "-g", "-D_GNU_SOURCE",
+            # 本组只调用 read_mount_state；不让无调用者的挂载执行体引入依赖。
+            "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
             "-I", str(ROOT / "include"),
             "-I", str(ROOT / "src" / "core"),
             "-I", str(ROOT / "src" / "injector"),

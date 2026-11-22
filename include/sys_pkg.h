@@ -11,7 +11,10 @@
  * CONFIG_DIR/sys_pkgs.cache；fuse_daemon（内建引擎与后端模块）只读
  * 文件、永不 popen。无表时行为 = pm 查询失败（uid<10000 回退）。
  * 查询侧统一归一 `:process` 后缀与 pm 行内冒号，调用方直接传原始包名；
- * NULL/空串返回 false。 */
+ * NULL/空串返回 false。
+ * 查询路径只查已发布表：sys_pkg_is_system 永不读 CONFIG_DIR/sys_pkgs.cache、
+ * 永不 fork pm；冷缓存与 1s 复查到期时由后台装载线程读文件（from_query），
+ * 线程创建失败退回同步装载。sys_pkg_cleanup 之后不留表也不留装载线程。 */
 void sys_pkg_init(bool allow_pm);
 void sys_pkg_cleanup(void);
 bool sys_pkg_is_system(const char* pkg);

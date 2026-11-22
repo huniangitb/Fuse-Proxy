@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """FUSE worker 线程数：按核数取默认，但可配置覆盖
 =====================================================
-libfuse 多线程 loop 自身默认 10 个 worker，项目长期固定 2 个。2 个在「单个应用
-冷启动」这种成百上千次并发 getattr/open/read 的窗口里容易排队；而按核数一把梭
-在 4 核低端机上是让线程互抢 CPU。默认取 min(max(2, ncpu/2), 8)：4 核→2、
-6 核→3、8 核→4、16 核→8。
+全局连接服务多个应用，默认保留慢请求之外的调度余量。合并 1122 版本策略：
+min(max(4, ncpu), 16)，4 核→4、8 核→8、16 核及以上→16。
+这只是并发默认值调整，不是消除永久阻塞的替代品。
 
 判别方式：把 `nsp_default_fuse_threads()` 从 include/fuse_threads.h 原样抽出编译，
-用核数表判定（把下限写成 1 或上限写成 16，对应格立刻失败）。静态契约钉住：
+用边界核数表判定（旧的半核数/上限 8 策略失败）。静态契约钉住：
 daemon 未显式指定时才取默认、显式值仍保留 0=单线程 / -1=libfuse 默认、注入器
 按 [GLOBAL] FUSE_THREADS 下发、配置解析器接受该键、文档有该键。
 
@@ -23,14 +22,15 @@ import tempfile
 
 SKIP_RC = 77
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-HEADER = os.path.join(ROOT, "include", "fuse_threads.h")
+HEADER = os.environ.get("FUSE_THREADS_HEADER") or os.path.join(ROOT, "include", "fuse_threads.h")
 DAEMON = os.path.join(ROOT, "src", "daemon", "fuse_daemon.c")
 INJECTOR = os.path.join(ROOT, "src", "injector", "injector.c")
 CONFIG = os.path.join(ROOT, "src", "config", "config_parser.c")
 CONFIG_H = os.path.join(ROOT, "include", "config_parser.h")
 DOC = os.path.join(ROOT, "docs", "config.md")
 
-CASES = [(0, 2), (1, 2), (2, 2), (3, 2), (4, 2), (6, 3), (8, 4), (12, 6), (16, 8), (32, 8)]
+CASES = [(-1, 4), (0, 4), (1, 4), (2, 4), (3, 4), (4, 4), (5, 5), (6, 6),
+         (8, 8), (12, 12), (15, 15), (16, 16), (17, 16), (32, 16), (2147483647, 16)]
 
 MAIN = r'''
 #include <stdbool.h>

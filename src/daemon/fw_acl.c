@@ -401,7 +401,9 @@ void fw_acl_identity(uid_t uid, pid_t pid, NspAclIdentity* out) {
             out->pkg_known = true;
         }
         out->privileged = fw_pkg_is_privileged(uid);
-        out->cross_app_allowed = fw_rules_cross_app_pkg_allowed(out->pkg);
+        /* 槽外读白名单必须走快照版：白名单数组随旧配置在发布排空后释放，
+           裸读会在重载窗口里比较已释放的条目（回归 test_acl_whitelist_lifetime.py）。 */
+        out->cross_app_allowed = fw_rules_cross_app_pkg_allowed_snapshot(out->pkg);
         out->cross_app_by_capability = fw_rules_cross_app_capability();
         out->cross_app_isolated = fw_rules_cross_app_isolated();
     }
@@ -425,6 +427,9 @@ static void acl_log_deny(uid_t uid, const char* pkg, const char* path, NspAclOp 
 static NspPathClass acl_fill_capabilities(const NspAclQuery* q, NspAclIdentity* id) {
     NspPathClass cls = fw_acl_classify(q->path, nullptr, 0);
     if (id->cross_app_allowed || id->privileged) return cls;
+    /* 自己包/同 uid 包、默认目录等已有确定放行结论，不依赖外部查询。
+       能力位初始为 false：提前放行不扩大权限，只消除无谓的阻塞入口。 */
+    if (fw_acl_decide(q, id) == NSP_ACL_ALLOW) return cls;
     if (cls == NSP_PATH_OWNED) {
         if (!id->cross_app_by_capability) return cls;
         id->manage_external = fw_pkg_manages_external(id->uid);

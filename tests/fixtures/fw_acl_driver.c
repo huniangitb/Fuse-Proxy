@@ -32,15 +32,19 @@ bool fw_pkg_is_privileged(uid_t uid) {
     (void)uid;
     return g_stub_priv;
 }
-/* 能力事实（All files access / 能装包）在驱动里由 mkdecide* 的参数直接给定，
-   桩恒 false */
+/* 能力事实由 mkdecide* 参数给定；生产入口记录查询次数，验证已放行路径
+   不依赖 AppOps 子进程的活性。 */
+static unsigned g_cap_queries;
+static bool g_stub_manage_external, g_stub_installer;
 bool fw_pkg_manages_external(uid_t uid) {
     (void)uid;
-    return false;
+    g_cap_queries++;
+    return g_stub_manage_external;
 }
 bool fw_pkg_can_install_packages(uid_t uid) {
     (void)uid;
-    return false;
+    g_cap_queries++;
+    return g_stub_installer;
 }
 /* 显式声明回查（生产走规则层）：驱动里恒 false，判定链保持纯 ACL 语义；
    声明优先的用例在 tests/test_rules.py 里走真实规则层覆盖。 */
@@ -89,6 +93,12 @@ bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
     }
     return false;
 }
+/* 槽内快照入口：驱动不链接 config_parser，等价桩直接转发（真实槽协议由
+   tests/test_acl_whitelist_lifetime.py 直编生产源码覆盖）。 */
+bool fw_rules_cross_app_pkg_allowed_snapshot(const char* pkg) {
+    return fw_rules_cross_app_pkg_allowed(pkg);
+}
+
 bool fw_rules_cross_app_capability(void) { return g_stub_capability; }
 
 /* 拒绝日志走 LOG_DBG → log_internal：驱动里吞掉（判定逻辑与日志无关） */
@@ -474,6 +484,59 @@ int main(void) {
     } else {
         g_pass++;
     }
+    /* 已按身份或目录结构获准的操作不应等待能力查询。 */
+    const char* independent[] = {
+        "/0/Android/data/com.mine/a",
+        "/0/Android/obb/com.mine/a",
+        "/0/Android/data/com.shared.a/a",
+    };
+    for (size_t i = 0; i < sizeof(independent) / sizeof(independent[0]); i++) {
+        g_cap_queries = 0;
+        int rc = fw_acl_check(10123, 0, independent[i], NSP_ACL_OP_GENERIC_READ, false, 0);
+        if (rc != 0 || g_cap_queries != 0) {
+            g_fail++;
+            printf("❌ 已获准路径依赖能力查询: %s rc=%d queries=%u\n", independent[i], rc,
+                   g_cap_queries);
+        } else {
+            g_pass++;
+        }
+    }
+    g_cap_queries = 0;
+    int rc_default = fw_acl_check(10123, 0, "/0/Download", NSP_ACL_OP_MKDIR, true, 0);
+    if (rc_default != 0 || g_cap_queries != 0) {
+        g_fail++;
+        printf("❌ 默认顶层目录依赖能力查询: rc=%d queries=%u\n", rc_default, g_cap_queries);
+    } else {
+        g_pass++;
+    }
+    const struct {
+        const char* path;
+        NspAclOp op;
+        bool manage, installer;
+        int rc;
+        unsigned queries;
+    } dependent[] = {
+        {"/0/Android/data/com.other/x", NSP_ACL_OP_GENERIC_READ, false, false, -ENOENT, 2},
+        {"/0/Android/data/com.other/x", NSP_ACL_OP_GENERIC_READ, true, false, 0, 1},
+        {"/0/Android/obb/com.other/x", NSP_ACL_OP_GENERIC_READ, false, true, 0, 2},
+        {"/0/Android/data/com.other/x", NSP_ACL_OP_GENERIC_READ, false, true, -ENOENT, 2},
+        {"/0/Tencent", NSP_ACL_OP_MKDIR, false, false, -EACCES, 1},
+        {"/0/Tencent", NSP_ACL_OP_MKDIR, true, false, 0, 1},
+    };
+    for (size_t i = 0; i < sizeof dependent / sizeof dependent[0]; i++) {
+        g_stub_manage_external = dependent[i].manage;
+        g_stub_installer = dependent[i].installer;
+        g_cap_queries = 0;
+        int rc = fw_acl_check(10123, 0, dependent[i].path, dependent[i].op, true, 0);
+        if (rc != dependent[i].rc || g_cap_queries != dependent[i].queries) {
+            g_fail++;
+            printf("❌ 能力依赖路径: %s rc=%d queries=%u，预期 %d/%u\n",
+                   dependent[i].path, rc, g_cap_queries, dependent[i].rc, dependent[i].queries);
+        } else {
+            g_pass++;
+        }
+    }
+    g_stub_manage_external = g_stub_installer = false;
     fw_acl_set_test_uid(0);
 
     printf("fw_acl 驱动: %d 通过 / %d 失败\n", g_pass, g_fail);

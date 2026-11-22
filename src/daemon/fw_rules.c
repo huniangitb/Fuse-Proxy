@@ -43,8 +43,9 @@ static bool g_br_disable_sandbox = false;
      读者零原子写，多线程并发读不产生缓存行颠簸（原 rwlock 读路径每次
      rdlock/unlock 均原子改写同一缓存行，高并发下成瓶颈）；
    - 写者（缓存填充/重载失效）取 wlock 互斥 + seq 奇数/偶数翻转。
-   所有调用方（fw_rules_resolve/fw_rules_probe）均持 config_lock_read，
-   cfg 指针不会被重载并发释放；seqlock 仅需防止并发填充互相撕裂。 */
+   所有调用方（fw_rules_resolve/fw_rules_probe 及其槽内辅助）都持配置读槽
+   （config_read_begin），cfg 指针不会被重载并发释放；seqlock 仅需防止并发
+   填充互相撕裂。槽外借用白名单等配置指针须走 *_snapshot 入口。 */
 typedef struct {
     pthread_mutex_t wlock; /* 写者互斥（填充/失效），读侧无锁 */
     _Atomic uint64_t seq;  /* seqlock 序号 */
@@ -156,13 +157,34 @@ static AppConfig* br_pick_category(uid_t uid, int user_id, const char* base_pkg)
     return find_category_cfg_locked(false, user_id);
 }
 
-/* uid → (应用段, 类别段)。包名由框架统一解析（fw_pkg.c：uid.map → /proc 回退，
-   与模块时代同源同序），本函数只做段匹配 + 指针缓存：
-   命中路径（含负面结果）缓存 uid→(cfg,cat)，避免每请求线性扫 g_app_cfgs。 */
-static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, AppConfig** cat_out) {
+/* 身份事实（uid → 包名）：由 fw_pkg 统一解析（uid.map → /proc → packages.list，
+   与模块时代同源同序）。uid.map 命中是纯内存，未命中就要读 /proc/<tid>/…，
+   系统 uid 还要扫 /data/system/packages.list —— 那是真文件 IO（f2fs 上可能毫秒
+   量级）。它一旦落在 config_read_begin 读槽里，配置发布者的读者排空就被拖住，
+   此后进入决策的**每个** worker 都在 config_read_begin 上自旋（与 AppOps 查询
+   同一条放大链）。故在取槽前解析一次，槽内只做段匹配与指针缓存。 */
+typedef struct {
+    char pkg[128];   /* fw_pkg_resolve 结果：包名、"system" 或 "unknown" */
+    char exact[128]; /* 系统 uid 的精确包名；其余恒为空 */
+    bool lookup_ok;  /* 包名可用于应用段/类别段匹配 */
+    bool exact_ok;   /* 精确包名可用 */
+} BrIdentity;
+
+static void br_identity_load(uid_t uid, pid_t tid, BrIdentity* id) {
+    memset(id, 0, sizeof *id);
+    id->lookup_ok = fw_pkg_resolve(uid, tid, id->pkg, sizeof id->pkg);
+    if (uid < NSP_SYSTEM_APP_UID_MIN)
+        id->exact_ok = fw_pkg_resolve_exact(uid, tid, id->exact, sizeof id->exact);
+}
+
+/* uid → (应用段, 类别段)。包名来自 BrIdentity（取槽前解析，见上），本函数只做
+   段匹配 + 指针缓存：命中路径（含负面结果）缓存 uid→(cfg,cat)，避免每请求线性
+   扫 g_app_cfgs。 */
+static AppConfig* br_get_app_cfg_ident(const BrIdentity* id, uid_t uid, char* current_pkg_out,
+                                       AppConfig** cat_out) {
     if (cat_out) *cat_out = nullptr;
-    char pkg[128];
-    bool lookup_ok = fw_pkg_resolve(uid, tid, pkg, sizeof pkg);
+    const char* pkg = id->pkg;
+    const bool lookup_ok = id->lookup_ok;
     strncpy(current_pkg_out, pkg, 127);
     current_pkg_out[127] = '\0';
 
@@ -174,13 +196,12 @@ static AppConfig* br_get_app_cfg(uid_t uid, pid_t tid, char* current_pkg_out, Ap
            fw_pkg_resolve_exact 解析真实包名（uid.map → cmdline）后再匹配
            应用段；解析不出或未命中时维持伪包口径。 */
         int user_id = (int)(uid / NSP_PER_USER_UID_STRIDE);
-        char exact[128];
-        if (fw_pkg_resolve_exact(uid, tid, exact, sizeof exact) && pkg_resolvable(exact)) {
-            AppConfig* sys_matched = find_app_cfg_locked(exact, user_id);
+        if (id->exact_ok && pkg_resolvable(id->exact)) {
+            AppConfig* sys_matched = find_app_cfg_locked(id->exact, user_id);
             if (sys_matched) {
-                strncpy(current_pkg_out, exact, 127);
+                strncpy(current_pkg_out, id->exact, 127);
                 current_pkg_out[127] = '\0';
-                if (cat_out) *cat_out = br_pick_category(uid, user_id, exact);
+                if (cat_out) *cat_out = br_pick_category(uid, user_id, id->exact);
                 return sys_matched;
             }
         }
@@ -273,28 +294,222 @@ bool fw_rules_cross_app_pkg_allowed(const char* pkg) {
     return false;
 }
 
+/* 槽内取白名单决定：内部按配置读槽读、重载窗口内重试。
+   槽外调用者（如 fw_acl_identity 组装身份）必须用这个入口——白名单数组在
+   config_publish 排空旧读者后即随旧配置一起释放，裸读 fw_rules_cross_app_pkg_allowed
+   会在重载窗口里比较已释放的条目（现场：一个 FUSE 请求正在 strlen 条目，发布把
+   旧数组 free 掉）。持槽后发布者的 config_drain_readers 会等它读完，读到的必是活配置。
+   契约：不得在持配置写锁（发布临界区）的线程上调用——那时代际为奇数，
+   config_read_begin 会自旋等发布结束，而发布正等本线程。
+   本线程**已持读槽**时不能再取一层：外层槽仍被本线程占着，发布者的
+   config_drain_readers 等它归零，而内层 config_read_begin 又在等发布结束
+   ——两者互等（实测 3s 仍卡在 config_read_begin）。此时外层槽已经把当前配置
+   钉住（发布者在排空它之前不会释放旧配置），直接裸读即可，语义等价。 */
+bool fw_rules_cross_app_pkg_allowed_snapshot(const char* pkg) {
+    if (!pkg || !pkg[0]) return false;
+    if (config_read_in_slot()) return fw_rules_cross_app_pkg_allowed(pkg);
+    for (;;) {
+        uint64_t gen = config_read_begin();
+        const bool allowed = fw_rules_cross_app_pkg_allowed(pkg);
+        if (config_read_end(gen)) return allowed;
+    }
+}
+
 bool fw_rules_cross_app_capability(void) { return g_global_cfg.allow_cross_by_capability; }
 
+/* 槽外预计算的**外部**事实：只取决于 uid 与目标包名，与配置代际无关。预热反复
+   失效时（fw_pkg 代际抖动让缓存读全部 miss）旧实现退回 allow_io=true —— 那把
+   packages.list/appops 的慢读重新挂回配置读槽：发布者的 config_drain_readers 等
+   这个读者出槽，之后每个决策线程都在 config_read_begin 上排队。实测一次重载
+   风暴下单次 resolve 217ms、40 次判定在槽内打开 packages.list 158 次。改为在
+   槽外把这三条事实取全带进槽，裁决值与阻塞查询逐字一致，槽内零 IO。 */
+typedef struct {
+    bool have_priv;
+    bool priv;
+    bool have_ext;
+    bool manage_external;
+    bool installer;
+    bool have_owner;
+    bool owner_known;
+    uid_t owner_uid;
+    char owner_pkg[256];
+} BrExtFacts;
+
 /* 现场取能力事实：白名单/特权命中就不再问 appops——那是一次 fork 子进程的代价
-   （虽然按 uid 缓存 30s），不该为已被前几档否决的判定去付。 */
-static NspXAppFacts br_xapp_facts(const char* pkg, uid_t uid, bool is_obb) {
+   （虽然按 uid 缓存 30s），不该为已被前几档否决的判定去付。
+   have_whitelist=true 时白名单决定由调用方在槽内先取（槽外调用者必须如此：
+   白名单数组随旧配置在发布排空后释放）；组合顺序仍只写在本函数一处。 */
+static NspXAppFacts br_xapp_facts_common(const char* pkg, uid_t uid, bool is_obb,
+                                         bool whitelisted, bool have_whitelist, bool allow_io,
+                                         const BrExtFacts* pre, bool* need_io) {
     NspXAppFacts f = {0};
     f.is_obb = is_obb;
-    f.whitelisted = fw_rules_cross_app_pkg_allowed(pkg);
+    f.whitelisted = have_whitelist ? whitelisted : fw_rules_cross_app_pkg_allowed(pkg);
     if (f.whitelisted) return f;
-    f.privileged = fw_pkg_is_privileged(uid);
+    /* allow_io=false（配置读槽内）：外部事实只查缓存，缺一条就置 need_io 返回，
+       调用方出槽预热后重来。不完整的事实绝不能被当作判定结论使用。 */
+    bool privileged = false;
+    if (pre && pre->have_priv) {
+        privileged = pre->priv; /* 槽外已取全：不再查缓存，也不再报缺 */
+    } else if (allow_io) {
+        privileged = fw_pkg_is_privileged(uid);
+    } else if (!fw_pkg_priv_cached(uid, &privileged)) {
+        if (need_io) *need_io = true;
+        return f;
+    }
+    f.privileged = privileged;
     if (f.privileged) return f;
     f.gate = fw_rules_cross_app_capability();
     if (!f.gate) return f;
-    f.manage_external = fw_pkg_manages_external(uid);
+    bool manage_external = false;
+    bool installer = false;
+    if (pre && pre->have_ext) {
+        f.manage_external = pre->manage_external;
+        if (f.manage_external) return f;
+        f.installer = pre->installer;
+        return f;
+    }
+    if (allow_io) {
+        manage_external = fw_pkg_manages_external(uid);
+        if (manage_external) {
+            f.manage_external = true;
+            return f;
+        }
+        f.installer = fw_pkg_can_install_packages(uid);
+        return f;
+    }
+    if (!fw_pkg_ext_cached(uid, &manage_external, &installer)) {
+        if (need_io) *need_io = true;
+        return f;
+    }
+    f.manage_external = manage_external;
     if (f.manage_external) return f;
-    f.installer = fw_pkg_can_install_packages(uid);
+    f.installer = installer;
     return f;
+}
+
+static NspXAppFacts br_xapp_facts(const char* pkg, uid_t uid, bool is_obb) {
+    return br_xapp_facts_common(pkg, uid, is_obb, false, false, true, NULL, NULL);
 }
 
 NspXAppAccess fw_rules_cross_app_access(const char* pkg, uid_t uid, bool is_obb) {
     NspXAppFacts f = br_xapp_facts(pkg, uid, is_obb);
     return nsp_xapp_access_of(&f);
+}
+
+NspXAppAccess fw_rules_cross_app_access_snapshot(const char* pkg, uid_t uid, bool is_obb) {
+    /* 只有白名单一档持有配置指针，故只在槽内取这一档；特权/能力查询是外部命令，
+       必须留在槽外——把 appops 放回槽里就是本轮修掉的整池停顿。 */
+    const bool whitelisted = fw_rules_cross_app_pkg_allowed_snapshot(pkg);
+    NspXAppFacts f = br_xapp_facts_common(pkg, uid, is_obb, whitelisted, true, true, NULL, NULL);
+    return nsp_xapp_access_of(&f);
+}
+
+static int br_strip_and_sanitize(const char* path, int* path_user_id_out, char* sub_path_out,
+                                 size_t sub_path_size);
+
+/* 槽外预取（实现见 fw_pkg_prefetch_isolation_facts）：能力事实来自一次外部
+   命令查询（实测 40ms 量级），放在 config_read_begin/end 槽里就会拖住配置发布
+   的读者排空，让之后进入决策的**每个** worker 在 config_read_begin 上自旋——
+   单次慢查询放大成整池停顿。故在取槽之前预取。
+
+   预取必须比判定更保守地"少付代价"，否则会把常态请求变成子进程风暴：
+   1. 两个总闸（跨应用隔离、按能力放行）关掉时判定根本不问能力，直接不预取；
+   2. 调用方自己的子树（含 sharedUserId 兄弟包）在 br_isolation_impl 第一档就
+      放行，从不问能力，故先用只读 uid.map 的廉价命名（无 IO）判同包，同名跳过；
+      命名拿不到时保守预取——代价只是一次按 uid 缓存 30s 的查询，漏预取却会把
+      慢查询放回槽里；
+   3. 路径必须按判定同一口径清理后再认前缀：判定用的是 br_strip_and_sanitize
+      的 sub_path，而 path_sanitize 会删字节，直接扫原始路径会漏掉"删字节才凑出
+      /Android/data/ 前缀"的写法，那种写法能把慢查询原样送回槽内。
+
+    预取的是隔离判定要用的**三条外部事实**（br_xapp_facts_common 的事实链 +
+    br_is_other_app_pkg 的属主 uid），它们全部落在真文件/子进程上：
+    1. 目标目录属主 uid（packages.list 扫描）——判同 uid 多包；
+    2. 调用方特权（packages.list 扫描）——与能力开关无关，判定恒问；
+    3. manage_external / installer（cmd appops get 子进程）——只在能力档开着时问。
+    三条都在槽内会随「一次配置发布」放大成整池停顿，故按同一处预热。 */
+/* 槽内事实缺失时的重试上限：正常一次预热即命中；留 8 次覆盖「预热刚做完就遇上
+   fw_pkg_reload（gen 变化让预热结果失效）」的极端串行。耗尽后退回槽内阻塞查询
+   （修复前行为），绝不拿不完整事实下结论。 */
+#define BR_FACT_WARM_TRIES 8
+
+static void br_prefetch_xapp_facts(const NspQueryCtx* q, const char* path) {
+    if (!q || !path) return;
+    /* 总闸在槽外读：它们在重载窗口内可能正被整结构体发布（撕裂读），但这里只读
+       两个 bool，最坏是窗口内多付或少付一次预取（少付那次即修复前行为），裁决
+       仍在槽内重读同一开关，不受影响。隔离开关关掉时这三条事实根本不会被问，
+       故只有它关掉才整体跳过；能力开关只决定第 3 条要不要付子进程代价。 */
+    if (!fw_rules_cross_app_isolated()) return;
+    const bool capability = fw_rules_cross_app_capability();
+    char sub_path[PATH_MAX];
+    if (br_strip_and_sanitize(path, NULL, sub_path, sizeof sub_path) != 0) return;
+    const char* prefixes[] = {"/Android/data/", "/Android/obb/"};
+    const char* target = nullptr;
+    for (int i = 0; i < 2 && !target; i++) {
+        const size_t plen = strlen(prefixes[i]);
+        if (strncmp(sub_path, prefixes[i], plen) == 0) target = sub_path + plen;
+    }
+    /* 容器本身（"…/Android/data"）不预取：条目级 readdir 与按名打开都走
+       fw_rules_probe/resolve（已在上面预取），容器级的 fw_rules_readdir_extra
+       只处理配置声明的虚拟目录、从不问能力（能力过滤在 fuse_daemon 的槽外），
+       故为容器常态 fork 一次不划算。 */
+    if (!target) return;
+    size_t len = strcspn(target, "/");
+    if (len == 0 || len >= 256) return;
+    /* .nomedia 是 Android 认的标记名而不是包名：判定在 br_path_other_app_subtree
+       里直接当"不是他包"放行、从不问能力，预取也不该为它 fork。 */
+    if (len == sizeof(".nomedia") - 1 && memcmp(target, ".nomedia", len) == 0) return;
+    char want[256];
+    memcpy(want, target, len);
+    want[len] = '\0';
+    char self[128];
+    if (fw_pkg_uid_map_name(q->uid, self, sizeof self) && br_pkg_same_base(want, self)) return;
+    /* 事实 1：目标目录属主 uid（br_is_other_app_pkg 判「同 uid 多包 = 同一 app 身份」）。
+       key 必须与判定里的 target pkg 逐字一致，否则槽内仍会未命中并再扫一次文件。 */
+    uid_t owner_uid = 0;
+    (void)fw_pkg_uid_for_package(want, &owner_uid);
+    /* 事实 2：特权——判定链第一档恒问，系统 uid 也要热身（槽内只查缓存，缺了就得
+       出槽重来；预热漏一个 uid 类别等于每个请求多一次往返）。 */
+    (void)fw_pkg_is_privileged(q->uid);
+    /* 事实 3：能力档（开关打开才问，含 appops 子进程）。 */
+    if (capability) fw_pkg_prefetch_isolation_facts(q->uid);
+}
+
+/* 槽外把整条外部事实链取全（允许阻塞）。只在缓存预热反复失效的升级路径上调用：
+   取全之后槽内每一次读都命中 BrExtFacts，need_io 不再产生，慢读彻底留在槽外。
+   取值口径与槽内缓存读同一批 fw_pkg 入口，故裁决与旧阻塞实现逐字一致。 */
+static void br_collect_ext_facts(const NspQueryCtx* q, const char* path, BrExtFacts* out) {
+    memset(out, 0, sizeof *out);
+    if (!q) return;
+    out->priv = fw_pkg_is_privileged(q->uid);
+    out->have_priv = true;
+    /* 能力档只在「非特权 且 能力总闸打开」时才可能被问：br_xapp_facts_common 在
+       特权处已返回，槽内 362-363 与预取 444/476 也都先看总闸。闸关时不去取，
+       免得每次升级都白付一次清单读（甚至一次 cmd appops 子进程）。 */
+    if (!out->priv && fw_rules_cross_app_capability()) {
+        out->manage_external = fw_pkg_manages_external(q->uid);
+        out->installer = out->manage_external ? false : fw_pkg_can_install_packages(q->uid);
+        out->have_ext = true;
+    }
+    /* 目标属主那条事实与特权档**无关**：br_isolation_impl 先问「是不是他包路径」
+       再问特权/能力档，所以特权调用方同样要它。漏收集会让槽内再次未命中，进而
+       退回 allow_io=true 的槽内阻塞查询——正是本函数要消掉的那个出口。 */
+    char sub_path[PATH_MAX];
+    if (!path || br_strip_and_sanitize(path, NULL, sub_path, sizeof sub_path) != 0) return;
+    const char* prefixes[] = {"/Android/data/", "/Android/obb/"};
+    const char* target = nullptr;
+    for (int i = 0; i < 2 && !target; i++) {
+        const size_t plen = strlen(prefixes[i]);
+        if (strncmp(sub_path, prefixes[i], plen) == 0) target = sub_path + plen;
+    }
+    if (!target) return;
+    const size_t len = strcspn(target, "/");
+    if (len == 0 || len >= sizeof out->owner_pkg) return;
+    memcpy(out->owner_pkg, target, len);
+    out->owner_pkg[len] = '\0';
+    out->owner_known = fw_pkg_uid_for_package(out->owner_pkg, &out->owner_uid);
+    out->have_owner = true;
 }
 
 /* 纯路径判定：是否指向**他包**的 Android/data|obb 子树。不看开关也不看能力——
@@ -361,17 +576,38 @@ static bool br_path_is_obb_subtree(const char* sub_path) {
     return sub_path && strncmp(sub_path, "/Android/obb/", 13) == 0;
 }
 
-static bool br_is_other_app_pkg(const char* sub_path, const char* current_pkg, uid_t uid) {
+/* 判定侧取"目标目录属主 uid"这条事实。allow_io=false 是**配置读槽内**的口径：
+   只查 fw_pkg 的缓存（含"无此包"的负缓存），未命中就置 *need_io 并返回 false，
+   调用方出槽预热后重新判定——槽内读 packages.list 会把慢读挂在配置发布者的
+   读者排空上。allow_io=true 时与旧实现逐字一致（阻塞解析）。 */
+static bool br_is_other_app_pkg_fact(const char* sub_path, const char* current_pkg, uid_t uid,
+                                     bool allow_io, const BrExtFacts* pre, bool* need_io) {
     char target_pkg[256];
     if (!br_path_other_app_subtree(sub_path, current_pkg, target_pkg, sizeof target_pkg))
         return false;
     if (g_global_cfg.allow_cross_app_data) return false;
     /* 同 uid 多包 = 同一 app 身份（见上方注释）：目标目录属主 uid 等于调用方 uid
        时不算"他应用"。解析不到属主 uid 则维持隔离。 */
+    bool known = false;
     uid_t owner_uid = 0;
-    if (fw_pkg_uid_for_package(target_pkg, &owner_uid) && owner_uid == uid) return false;
+    /* 槽外预取到的目标包名与槽内由同一条 q->path 抽出（sub_path 只由路径决定），
+       故 key 逐字可比；命中就完全不用碰缓存。 */
+    if (pre && pre->have_owner && strcmp(pre->owner_pkg, target_pkg) == 0) {
+        known = pre->owner_known;
+        owner_uid = pre->owner_uid;
+        if (known && owner_uid == uid) return false;
+        return true;
+    }
+    if (allow_io) {
+        known = fw_pkg_uid_for_package(target_pkg, &owner_uid);
+    } else if (!fw_pkg_uid_cached(target_pkg, &known, &owner_uid)) {
+        if (need_io) *need_io = true;
+        return false;
+    }
+    if (known && owner_uid == uid) return false;
     return true;
 }
+
 
 static void br_trie_resolve(AppConfig* cfg, AppConfig* cat, const char* sub_path, FwRulesTrieMatch* out) {
     if (!out) return;
@@ -717,29 +953,47 @@ static bool br_decl_present(AppConfig* cfg, AppConfig* cat, const char* sub_path
       全放，能装包的应用只放 Android/obb；组合排序只写在 nsp_xapp_access_of 一处。
    同 uid 内的多包（sharedUserId / 系统同进程宿主）在 br_is_other_app_pkg 里已按
    uid 视为同一应用。其余情形：看不见 = 打不开（与 HIDE 同口径）。 */
+/* allow_io=false 是配置读槽内的口径：两条外部事实（目标目录属主 uid、特权/能力）
+   只查缓存，缺任一条就置 *need_io 并返回 false——调用方必须先出槽预热再重来，
+   不能拿不完整事实下结论（那会把特权应用判成隔离）。allow_io=true 与旧实现一致。 */
 static bool br_isolation_impl(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                               const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
-                              int user_id, bool note) {
-    if (!br_is_other_app_pkg(sub_path, current_pkg, uid)) return false;
+                              int user_id, bool note, bool allow_io, const BrExtFacts* pre,
+                              bool* need_io) {
+    bool local_need = false;
+    const bool other_app =
+        br_is_other_app_pkg_fact(sub_path, current_pkg, uid, allow_io, pre, &local_need);
+    if (local_need) {
+        if (need_io) *need_io = true;
+        return false;
+    }
+    if (!other_app) return false;
     if (br_media_provider_exempt(current_pkg)) return false;
     if (br_decl_present(cfg, cat, sub_path, current_pkg, tm, user_id, uid)) return false;
-    if (fw_rules_cross_app_access(current_pkg, uid, br_path_is_obb_subtree(sub_path)) !=
-        NSP_XAPP_NONE)
+    NspXAppFacts facts =
+        br_xapp_facts_common(current_pkg, uid, br_path_is_obb_subtree(sub_path), false, false,
+                             allow_io, pre, &local_need);
+    if (local_need) {
+        if (need_io) *need_io = true;
         return false;
+    }
+    if (nsp_xapp_access_of(&facts) != NSP_XAPP_NONE) return false;
     if (note) br_note_isolation(current_pkg, sub_path);
     return true;
 }
 
 static bool br_isolation_blocks(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                 const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
-                                int user_id) {
-    return br_isolation_impl(cfg, cat, sub_path, current_pkg, uid, tm, user_id, true);
+                                int user_id, bool allow_io, const BrExtFacts* pre, bool* need_io) {
+    return br_isolation_impl(cfg, cat, sub_path, current_pkg, uid, tm, user_id, true, allow_io,
+                             pre, need_io);
 }
 
 static bool br_isolation_hides(AppConfig* cfg, AppConfig* cat, const char* sub_path,
                                const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
-                               int user_id) {
-    return br_isolation_impl(cfg, cat, sub_path, current_pkg, uid, tm, user_id, false);
+                               int user_id, bool allow_io, const BrExtFacts* pre, bool* need_io) {
+    return br_isolation_impl(cfg, cat, sub_path, current_pkg, uid, tm, user_id, false, allow_io,
+                             pre, need_io);
 }
 
 static int br_sanitize_and_check_hidden(AppConfig* cfg, AppConfig* cat, const char* path,
@@ -1018,11 +1272,19 @@ static void br_resolve_decl(AppConfig* cfg, AppConfig* cat, const char* sub_path
    已算出的真实路径：后续 open/mkdir 以真实 errno 裁决。 */
 static void br_ensure_sandbox_dir(const char* dir) {
     if (!dir || !dir[0]) return;
+    /* Android 根参与沙盒镜像，须在内核 lookup 父目录之前补建。先检查完整路径，
+       放不下就不做 FS 操作；不缓存“已建好”，同线程删除/重载后仍须修复。 */
+    char sub_android[PATH_MAX];
+    if (common_storage_child_path(dir, "Android", sub_android, sizeof sub_android) < 0) return;
     /* 落点经守卫出口补建：effective_uid 来自路径解析（无存在性校验的历史形态），
-       若一级组件缺失不得替应用在存储根下 materialize 出目录（见 common.h）。
-       非存储根落点（自定义 REDIRECT 目标）照旧递归创建。 */
-    if (access(dir, F_OK) == 0) return;
-    if (common_mkdir_within_storage(dir, 0775) == 0) return;
+       若一级组件缺失不得替应用在存储根下 materialize 出目录（见 common.h）。 */
+    const char* failed_dir = dir;
+    if (access(dir, F_OK) == 0 || common_mkdir_within_storage(dir, 0775) == 0) {
+        /* 只补 Android 本身；data/obb/media 容器及自家私有目录仍让位真实树。
+           新增子目录只走逐组件 nofollow/dirfd 出口，避免 root/祖先/child 链接向外写。 */
+        if (common_mkdir_storage_child(dir, "Android", 0775) == 0) return;
+        failed_dir = sub_android;
+    }
     /* 补建失败不改裁决（后续 open/mkdir 以真实 errno 收场），但要留观测：
        落点是我们自己改写的，应用侧只会看到「文件不在」，分不清是规则问题还是
        目录没建起来。限速与本文件其它观测同节奏：首个命中与每 1024 次各一条。 */
@@ -1030,7 +1292,7 @@ static void br_ensure_sandbox_dir(const char* dir) {
     static atomic_ulong fail_seq;
     unsigned long n = atomic_fetch_add_explicit(&fail_seq, 1, memory_order_relaxed) + 1;
     if (n == 1 || (n & 1023u) == 0)
-        LOG_WRN("沙盒落点补建失败: %s errno=%d（累计 %lu 次）", dir, mkdir_errno, n);
+        LOG_WRN("沙盒落点补建失败: %s errno=%d（累计 %lu 次）", failed_dir, mkdir_errno, n);
 }
 
 /* 沙盒重定向的限速观测（WARN）：现场遇到 ENOENT 时先看这里——路径是被我们改写
@@ -1152,11 +1414,13 @@ static bool br_is_path_ro(AppConfig* cfg, AppConfig* cat, const char* sub_path,
    无锁读约定，故本函数可以在 ACL 回调里安全调用。 */
 bool fw_rules_path_declared(uid_t uid, pid_t pid, const char* path) {
     if (!path || !fw_rules_path_has_uid_layer(path)) return false;
+    BrIdentity ident; /* 槽外解析身份（见 BrIdentity 注释） */
+    br_identity_load(uid, pid, &ident);
     for (;;) {
         uint64_t cfg_gen = config_read_begin();
         char current_pkg[128] = "unknown";
         AppConfig* cat = nullptr;
-        AppConfig* cfg = br_get_app_cfg(uid, pid, current_pkg, &cat);
+        AppConfig* cfg = br_get_app_cfg_ident(&ident, uid, current_pkg, &cat);
         int path_user_id = -1;
         char sub_path[PATH_MAX];
         bool declared = false;
@@ -1375,15 +1639,23 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     if (!out) return;
     br_result_init(out);
     if (!q || !fw_rules_path_has_uid_layer(q->path)) return; /* 直通：不参与规则 */
+    br_prefetch_xapp_facts(q, q->path); /* 槽外预取：慢查询不许落在读槽里 */
+    BrIdentity ident; /* 身份解析同样在槽外：/proc 与 packages.list 都是真 IO */
+    br_identity_load(q->uid, q->pid, &ident);
     /* S1 无锁快照读：替代 rwlock 读锁。config_read_begin 持槽期间旧配置
        不会被发布者释放；config_read_end 返回 false（读期间发生发布）则
-       整体重试——热重载极低频，重试代价可忽略 */
+       整体重试——热重载极低频，重试代价可忽略（身份已在槽外备好，重试不重复 IO） */
+    bool allow_io = false; /* 槽内只查事实缓存，未命中先出槽预热 */
+    unsigned warm_tries = 0;
+    BrExtFacts pre; /* 预热反复失效时槽外取全的事实（见 br_collect_ext_facts） */
+    memset(&pre, 0, sizeof pre);
+    bool pre_ready = false;
     for (;;) {
         uint64_t cfg_gen = config_read_begin();
         br_result_init(out);
         char current_pkg[128] = "unknown";
         AppConfig* cat = nullptr;
-        AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, current_pkg, &cat);
+        AppConfig* cfg = br_get_app_cfg_ident(&ident, q->uid, current_pkg, &cat);
 
         int path_user_id = -1;
         char sub_path[PATH_MAX];
@@ -1393,9 +1665,23 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
                                                   sizeof sub_path, current_pkg, q->uid, &tm,
                                                   &hidden_scope) != 0;
         /* 隔离只在未命中隐藏时判定（保持原短路语义），并单独标注成因 */
+        bool need_io = false;
         bool isolated =
             !hidden && br_isolation_blocks(cfg, cat, sub_path, current_pkg, q->uid, &tm,
-                                           path_user_id);
+                                           path_user_id, allow_io, pre_ready ? &pre : NULL,
+                                           &need_io);
+        if (need_io) { /* 槽内只查缓存：事实没备好就出槽预热再重来，慢读不进槽 */
+            (void)config_read_end(cfg_gen);
+            if (pre_ready) {
+                allow_io = true; /* 不变式兜底（事实已取全仍报缺）：退回旧行为 */
+            } else if (++warm_tries > BR_FACT_WARM_TRIES) {
+                br_collect_ext_facts(q, q->path, &pre); /* 预热反复失效：槽外取全 */
+                pre_ready = true;
+            } else {
+                br_prefetch_xapp_facts(q, q->path);
+            }
+            continue;
+        }
         if (hidden || isolated) {
             out->valid = true;
             out->appear_missing = true;
@@ -1469,6 +1755,57 @@ void fw_rules_resolve(const NspQueryCtx* q, NspPathDecision* out) {
     }
 }
 
+/* 「/a/b」→ 父目录「/a」、条目名「b」；「/xxx」→ 父「/」、名「xxx」。probe 内
+   与读槽前的预判共用同一实现，避免两处口径漂移 */
+static bool br_probe_parent(const char* sub_path, char* dir, size_t dir_size, const char** name,
+                            size_t* name_len) {
+    if (!sub_path || !dir || dir_size == 0 || !name || !name_len) return false;
+    const char* last = strrchr(sub_path, '/');
+    if (!last) { /* 无 '/'（防御） */
+        snprintf(dir, dir_size, "/");
+        *name = sub_path;
+    } else if (last == sub_path) { /* "/xxx" → 父目录 "/" */
+        snprintf(dir, dir_size, "/");
+        *name = last + 1;
+    } else {
+        size_t dlen = (size_t)(last - sub_path);
+        if (dlen >= dir_size) dlen = dir_size - 1;
+        memcpy(dir, sub_path, dlen);
+        dir[dlen] = '\0';
+        *name = last + 1;
+    }
+    *name_len = strlen(*name);
+    return true;
+}
+
+/* 线程私有目录缓存是否对 (uid,pid,父目录,配置代际) 命中——槽内槽外同一判据 */
+static bool br_probe_cache_hit(uid_t uid, pid_t pid, const char* dir, uint64_t gen) {
+    const BrProbeDirCache* pc = &g_probe_dir_cache;
+    return pc->valid && pc->gen == gen && pc->uid == uid && pc->pid == pid &&
+           strcmp(pc->dir, dir) == 0;
+}
+/* 槽内取跨应用判定，三态返回：1=隐藏/隔离、0=可见、-1=外部事实还没预热（调用方
+   必须出槽预热后重新进入读槽）。probe 的三条分支共用这一处口径，避免各写一遍
+   need_io 处理。 */
+static int br_isolation_slot(AppConfig* cfg, AppConfig* cat, const char* sub_path,
+                             const char* current_pkg, uid_t uid, const FwRulesTrieMatch* tm,
+                             int user_id, bool allow_io, const BrExtFacts* pre) {
+    bool need_io = false;
+    const bool hides = br_isolation_hides(cfg, cat, sub_path, current_pkg, uid, tm, user_id,
+                                          allow_io, pre, &need_io);
+    if (need_io) return -1;
+    return hides ? 1 : 0;
+}
+
+static int br_other_app_slot(const char* sub_path, const char* current_pkg, uid_t uid,
+                             bool allow_io, const BrExtFacts* pre) {
+    bool need_io = false;
+    const bool other =
+        br_is_other_app_pkg_fact(sub_path, current_pkg, uid, allow_io, pre, &need_io);
+    if (need_io) return -1;
+    return other ? 1 : 0;
+}
+
 /* 轻量探测：readdir 逐条目过滤用。只做 sanitize + hidden/redirect_target/
    虚拟目录判断，不构建真实路径、不触发 sandbox 目录创建（性能敏感） */
 void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
@@ -1476,10 +1813,38 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
     memset(out, 0, sizeof *out);
     out->valid = false;
     if (!q || !fw_rules_path_has_uid_layer(q->path)) return; /* 直通：不过滤 */
+    br_prefetch_xapp_facts(q, q->path); /* 槽外预取：慢查询不许落在读槽里 */
+    /* 身份解析（/proc + packages.list）也是文件 IO，只在「本次要填缓存」时
+       需要，且必须留在读槽外。槽前按当前代际预判一次目录缓存：命中就不解析
+       （readdir 逐条目热路径不许多两次 /proc），未命中就在槽外解析；若预判
+       命中而进槽后发现已失效（并发发布），退出读槽解析身份后再来一次 */
+    char sub_pre[PATH_MAX];
+    int user_pre = -1;
+    char dir_pre[PATH_MAX];
+    const char* name_pre = NULL;
+    size_t name_pre_len = 0;
+    const bool pre_ok =
+        br_strip_and_sanitize(q->path, &user_pre, sub_pre, sizeof sub_pre) == 0 &&
+        br_probe_parent(sub_pre, dir_pre, sizeof dir_pre, &name_pre, &name_pre_len);
+    BrIdentity ident;
+    memset(&ident, 0, sizeof ident);
+    bool ident_ready = false;
     /* S1 无锁快照读：替代 rwlock 读锁。config_read_begin 持槽期间旧配置
        不会被发布者释放；config_read_end 返回 false（读期间发生发布）则
        整体重试（probe 是 readdir 条目级热路径，重载极低频可忽略） */
+    bool allow_io = false; /* 槽内只查事实缓存，未命中先出槽预热 */
+    unsigned warm_tries = 0;
+    BrExtFacts pre; /* 预热反复失效时槽外取全的事实（见 br_collect_ext_facts） */
+    memset(&pre, 0, sizeof pre);
+    bool pre_ready = false;
     for (;;) {
+        if (!ident_ready && pre_ok) {
+            const uint64_t gen_hint = atomic_load_explicit(&g_br_cfg_gen, memory_order_acquire);
+            if (!br_probe_cache_hit(q->uid, q->pid, dir_pre, gen_hint)) {
+                br_identity_load(q->uid, q->pid, &ident); /* 唯一允许的文件 IO：槽外 */
+                ident_ready = true;
+            }
+        }
         uint64_t cfg_gen = config_read_begin();
         memset(out, 0, sizeof *out);
         char current_pkg[128] = "unknown";
@@ -1495,33 +1860,14 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
 
         /* 提取父目录与条目名："/a/b" → 父 "/a"、名 "b"；"/xxx" → 父 "/"、名 "xxx" */
         char dir[PATH_MAX];
-        const char* name;
-        size_t name_len;
-        {
-            const char* last = strrchr(sub_path, '/');
-            if (!last) { /* 无 '/'（防御） */
-                strncpy(dir, "/", sizeof dir - 1);
-                dir[sizeof dir - 1] = '\0';
-                name = sub_path;
-            } else if (last == sub_path) { /* "/xxx" → 父目录 "/" */
-                strncpy(dir, "/", sizeof dir - 1);
-                dir[sizeof dir - 1] = '\0';
-                name = last + 1;
-            } else {
-                size_t dlen = (size_t)(last - sub_path);
-                if (dlen >= sizeof dir) dlen = sizeof dir - 1;
-                memcpy(dir, sub_path, dlen);
-                dir[dlen] = '\0';
-                name = last + 1;
-            }
-            name_len = strlen(name);
-        }
+        const char* name = NULL;
+        size_t name_len = 0;
+        (void)br_probe_parent(sub_path, dir, sizeof dir, &name, &name_len);
 
         BrProbeDirCache* pc = &g_probe_dir_cache;
         /* 缓存命中：同线程同一 (uid,pid,父目录) 的连续条目共享一次
        「根→父目录」trie 下降与 uid→cfg 解析，这里只按最后一段查子节点 */
-        if (pc->valid && pc->gen == gen && pc->uid == q->uid && pc->pid == q->pid &&
-            strcmp(pc->dir, dir) == 0) {
+        if (br_probe_cache_hit(q->uid, q->pid, dir, gen)) {
             cfg = pc->cfg;
             AppConfig* cat = pc->cat;
             strncpy(current_pkg, pc->current_pkg, 127);
@@ -1540,8 +1886,22 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                 /* 跨应用隔离与隐藏同口径（br_sanitize_and_check_hidden 亦判，
                此处为同一判据的读取侧：列举过滤走本路径）。tm 传 NULL：快路径本就不
                建 trie 匹配视图，由被判据自己按层现查 */
-                bool iso =
-                    br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, NULL, path_user_id);
+                const int iso_slot =
+                    br_isolation_slot(cfg, cat, sub_path, current_pkg, q->uid, NULL, path_user_id,
+                                      allow_io, pre_ready ? &pre : NULL);
+                if (iso_slot < 0) { /* 事实没预热：出槽预热后重来，慢读不进槽 */
+                    (void)config_read_end(cfg_gen);
+                    if (pre_ready) {
+                        allow_io = true; /* 不变式兜底（事实已取全仍报缺）：退回旧行为 */
+                    } else if (++warm_tries > BR_FACT_WARM_TRIES) {
+                        br_collect_ext_facts(q, q->path, &pre); /* 预热反复失效：槽外取全 */
+                        pre_ready = true;
+                    } else {
+                        br_prefetch_xapp_facts(q, q->path);
+                    }
+                    continue;
+                }
+                bool iso = iso_slot == 1;
                 /* 作用域优先语义下**不能**再用合并视图（tm.hidden 并集）做静态短路：
                    GLOBAL 的 HIDE 会因此压过应用段 ALLOW，列举与打开判定分叉。all_static
                    下无线性规则扫描，逐层现查 trie（每作用域一次下降）的成本远低于一次
@@ -1564,8 +1924,22 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                应用段 ALLOW 取消不掉全局 HIDE。ca/cc/cg 只留给下面的虚拟目录判定。
                跨应用隔离同样在此叠加（与 resolve 侧 br_sanitize_and_check_hidden
                同判据：看不见 = 打不开） */
-            bool iso = br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, NULL,
-                                          path_user_id);
+            const int iso_slot =
+                br_isolation_slot(cfg, cat, sub_path, current_pkg, q->uid, NULL, path_user_id,
+                                  allow_io, pre_ready ? &pre : NULL);
+            if (iso_slot < 0) {
+                (void)config_read_end(cfg_gen);
+                if (pre_ready) {
+                    allow_io = true; /* 不变式兜底（事实已取全仍报缺）：退回旧行为 */
+                } else if (++warm_tries > BR_FACT_WARM_TRIES) {
+                    br_collect_ext_facts(q, q->path, &pre); /* 预热反复失效：槽外取全 */
+                    pre_ready = true;
+                } else {
+                    br_prefetch_xapp_facts(q, q->path);
+                }
+                continue;
+            }
+            bool iso = iso_slot == 1;
             if (br_is_path_hidden_internal(cfg, cat, sub_path, current_pkg, NULL, q->uid, NULL) ||
                 iso) {
                 out->valid = true;
@@ -1591,13 +1965,39 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
             continue;
         }
 
-        /* 未命中：完整路径解析（原逻辑）+ 填充目录缓存 */
+        /* 未命中：完整路径解析（原逻辑）+ 填充目录缓存。身份必须在槽外解析：
+           槽前预判命中、进槽后因并发发布失效时，先退出读槽再解析，然后重来 */
+        if (!ident_ready) {
+            if (config_read_end(cfg_gen)) return;
+            br_identity_load(q->uid, q->pid, &ident);
+            ident_ready = true;
+            continue;
+        }
         AppConfig* cat = nullptr;
-        cfg = br_get_app_cfg(q->uid, q->pid, current_pkg, &cat);
+        cfg = br_get_app_cfg_ident(&ident, q->uid, current_pkg, &cat);
         FwRulesTrieMatch tm;
         if (br_sanitize_and_check_hidden(cfg, cat, q->path, &path_user_id, sub_path,
-                                         sizeof sub_path, current_pkg, q->uid, &tm, NULL) != 0 ||
-            br_isolation_hides(cfg, cat, sub_path, current_pkg, q->uid, &tm, path_user_id)) {
+                                         sizeof sub_path, current_pkg, q->uid, &tm, NULL) != 0) {
+            out->valid = true;
+            out->appear_missing = true;
+            if (config_read_end(cfg_gen)) return;
+            continue;
+        }
+        const int iso_slot = br_isolation_slot(cfg, cat, sub_path, current_pkg, q->uid, &tm,
+                                               path_user_id, allow_io, pre_ready ? &pre : NULL);
+        if (iso_slot < 0) {
+            (void)config_read_end(cfg_gen);
+            if (pre_ready) {
+                allow_io = true; /* 不变式兜底（事实已取全仍报缺）：退回旧行为 */
+            } else if (++warm_tries > BR_FACT_WARM_TRIES) {
+                br_collect_ext_facts(q, q->path, &pre); /* 预热反复失效：槽外取全 */
+                pre_ready = true;
+            } else {
+                br_prefetch_xapp_facts(q, q->path);
+            }
+            continue;
+        }
+        if (iso_slot == 1) {
             out->valid = true;
             out->appear_missing = true;
             if (config_read_end(cfg_gen)) return;
@@ -1610,7 +2010,21 @@ void fw_rules_probe(const NspQueryCtx* q, NspProbeResult* out) {
                                 ? NSP_VK_ANCESTOR
                                 : (br_is_redirect_target(cfg, cat, sub_path) ? NSP_VK_TARGET
                                                                             : NSP_VK_NONE);
-        out->is_other_app_pkg = br_is_other_app_pkg(sub_path, current_pkg, q->uid);
+        const int other_slot =
+            br_other_app_slot(sub_path, current_pkg, q->uid, allow_io, pre_ready ? &pre : NULL);
+        if (other_slot < 0) {
+            (void)config_read_end(cfg_gen);
+            if (pre_ready) {
+                allow_io = true; /* 不变式兜底（事实已取全仍报缺）：退回旧行为 */
+            } else if (++warm_tries > BR_FACT_WARM_TRIES) {
+                br_collect_ext_facts(q, q->path, &pre); /* 预热反复失效：槽外取全 */
+                pre_ready = true;
+            } else {
+                br_prefetch_xapp_facts(q, q->path);
+            }
+            continue;
+        }
+        out->is_other_app_pkg = other_slot == 1;
 
         /* 填充目录缓存（trie 沿父目录一次下降，后续条目复用） */
         memset(pc, 0, sizeof *pc);
@@ -1711,13 +2125,15 @@ static int br_process_cfg_dirs(AppConfig* c, const char* sub_path, int user_id, 
 int fw_rules_readdir_extra(const NspQueryCtx* q, const char* sub_path, int user_id, const char* pkg,
                      bool is_root, NspDirEntry* out, int max) {
     if (!q || !out || max <= 0 || !sub_path) return 0;
+    BrIdentity ident; /* 槽外解析身份：容器级 readdir 每请求一次，不是每条目一次 */
+    br_identity_load(q->uid, q->pid, &ident);
     /* S1 无锁快照读：替代 rwlock 读锁（与 fw_rules_resolve 一致，发布发生则重试） */
     for (;;) {
         uint64_t cfg_gen = config_read_begin();
         char pkg_buf[128];
         (void)pkg;
         AppConfig* cat = nullptr;
-        AppConfig* cfg = br_get_app_cfg(q->uid, q->pid, pkg_buf, &cat);
+        AppConfig* cfg = br_get_app_cfg_ident(&ident, q->uid, pkg_buf, &cat);
 
         int n = 0;
         n = br_process_cfg_dirs(cfg, sub_path, user_id, pkg_buf, is_root, out, max, n);

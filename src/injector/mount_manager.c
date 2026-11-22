@@ -261,53 +261,34 @@ static bool read_mount_state(int pid, const char* target, const char* backup, Mo
 }
 
 static bool path_prefix_overlap(const char* a, const char* b) {
+    if ((strcmp(a, "/") == 0 && b[0] == '/') || (strcmp(b, "/") == 0 && a[0] == '/')) return true;
     size_t alen = strlen(a), blen = strlen(b), minlen = alen < blen ? alen : blen;
     if (strncmp(a, b, minlen) != 0) return false;
     return (a[minlen] == '/' || a[minlen] == '\0') && (b[minlen] == '/' || b[minlen] == '\0');
 }
 
-static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const char* rel_path,
-                                                 const char* pkg) {
-    bool conflicts = false;
-    bool is_media = is_media_provider(pkg);
-    bool app_sandbox_off = (cfg && cfg->sandbox_explicit && !cfg->sandbox);
-    if (cfg) {
-        for (int i = 0; i < cfg->redir_count && !conflicts; i++) {
-            if (path_prefix_overlap(cfg->redir_rules[i].virtual_prefix, rel_path)) conflicts = true;
+static bool submount_conflicts_with_rules_locked(const AppConfig* cfg, const AppConfig* category,
+                                                 const char* rel_path) {
+    /* 规则前缀不含用户层；只规范化判定视图，preserve 的物理路径仍保留用户层。 */
+    const char* sub_path = rel_path;
+    if (common_parse_user_layer(rel_path, nullptr, &sub_path) < 0) return true;
+    /* 保守并集只阻止原生子挂载覆盖显式规则，作用域优先级仍由 FUSE 层裁决。
+       ALLOW 也需要仲裁；SANDBOX 本身不否决 data/obb 等真实路径让位。 */
+    const AppConfig* scopes[] = {cfg, category, &g_global_cfg};
+    for (size_t s = 0; s < sizeof(scopes) / sizeof(scopes[0]); s++) {
+        const AppConfig* scope = scopes[s];
+        if (!scope) continue;
+        for (int i = 0; i < scope->redir_count; i++) {
+            if (path_prefix_overlap(scope->redir_rules[i].virtual_prefix, sub_path)) return true;
         }
-        for (int i = 0; i < cfg->hide_count && !conflicts; i++) {
-            if (path_prefix_overlap(cfg->hide_rules[i], rel_path)) conflicts = true;
+        for (int i = 0; i < scope->hide_count; i++) {
+            if (path_prefix_overlap(scope->hide_rules[i], sub_path)) return true;
         }
-        for (int i = 0; i < cfg->ro_count && !conflicts; i++) {
-            if (path_prefix_overlap(cfg->ro_rules[i], rel_path)) conflicts = true;
-        }
-        if (cfg->sandbox && !conflicts) {
-            const char* sb[] = {"/Android/data", "/Android/obb"};
-            for (int s = 0; s < 2 && !conflicts; s++) {
-                if (path_prefix_overlap(sb[s], rel_path)) conflicts = true;
-            }
-        }
-    }
-    if (!conflicts) {
-        for (int i = 0; i < g_global_cfg.redir_count && !conflicts; i++) {
-            if (path_prefix_overlap(g_global_cfg.redir_rules[i].virtual_prefix, rel_path))
-                conflicts = true;
-        }
-        for (int i = 0; i < g_global_cfg.hide_count && !conflicts; i++) {
-            if (path_prefix_overlap(g_global_cfg.hide_rules[i], rel_path)) conflicts = true;
-        }
-        for (int i = 0; i < g_global_cfg.ro_count && !conflicts; i++) {
-            if (path_prefix_overlap(g_global_cfg.ro_rules[i], rel_path)) conflicts = true;
-        }
-        /* com.android.providers.media.module 默认关闭沙盒，不受全局设置影响，除非显式配置开启 */
-        if (g_global_cfg.sandbox && !conflicts && !is_media && !app_sandbox_off) {
-            const char* sb[] = {"/Android/data", "/Android/obb"};
-            for (int s = 0; s < 2 && !conflicts; s++) {
-                if (path_prefix_overlap(sb[s], rel_path)) conflicts = true;
-            }
+        for (int i = 0; i < scope->ro_count; i++) {
+            if (path_prefix_overlap(scope->ro_rules[i], sub_path)) return true;
         }
     }
-    return conflicts;
+    return false;
 }
 
 /*
@@ -444,13 +425,16 @@ int perform_app_mount(const char* pkg, int pid, uid_t uid, const char* mnt_src,
         int n = ns_find_native_submounts(pid, target_path, found, 16);
         if (n > 0) {
             config_lock_read();
-            AppConfig* cfg = find_app_cfg_locked(pkg, uid / NSP_PER_USER_UID_STRIDE);
+            int user_id = uid / NSP_PER_USER_UID_STRIDE;
+            const AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
+            bool is_sys = (uid < NSP_SYSTEM_APP_UID_MIN) || (pkg && sys_pkg_is_system(pkg));
+            const AppConfig* category = find_category_cfg_locked(is_sys, user_id);
             size_t tlen = strlen(target_path);
             for (int i = 0; i < n; i++) {
                 const char* rel = found[i] + tlen;
                 char rel_buf[256];
                 snprintf(rel_buf, sizeof(rel_buf), "/%s", rel[0] == '/' ? rel + 1 : rel);
-                if (!submount_conflicts_with_rules_locked(cfg, rel_buf, pkg)) {
+                if (!submount_conflicts_with_rules_locked(cfg, category, rel_buf)) {
                     snprintf(preserve_paths[preserve_count++], 256, "%s%s", target_path, rel_buf);
                 }
             }
@@ -553,13 +537,16 @@ int perform_app_mount_sync(const char* pkg, int pid, uid_t uid, const char* mnt_
         int n = ns_find_native_submounts(pid, target_path, found, 16);
         if (n > 0) {
             config_lock_read();
-            AppConfig* cfg = find_app_cfg_locked(pkg, uid / NSP_PER_USER_UID_STRIDE);
+            int user_id = uid / NSP_PER_USER_UID_STRIDE;
+            const AppConfig* cfg = find_app_cfg_locked(pkg, user_id);
+            bool is_sys = (uid < NSP_SYSTEM_APP_UID_MIN) || (pkg && sys_pkg_is_system(pkg));
+            const AppConfig* category = find_category_cfg_locked(is_sys, user_id);
             size_t tlen = strlen(target_path);
             for (int i = 0; i < n; i++) {
                 const char* rel = found[i] + tlen;
                 char rel_buf[256];
                 snprintf(rel_buf, sizeof(rel_buf), "/%s", rel[0] == '/' ? rel + 1 : rel);
-                if (!submount_conflicts_with_rules_locked(cfg, rel_buf, pkg)) {
+                if (!submount_conflicts_with_rules_locked(cfg, category, rel_buf)) {
                     snprintf(preserve_paths[preserve_count++], 256, "%s%s", target_path, rel_buf);
                 }
             }

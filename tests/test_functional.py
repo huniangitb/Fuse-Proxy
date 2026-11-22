@@ -758,7 +758,8 @@ def test_rename_exdev_hardening():
     funcs = _extract_static_functions(
         src_text,
         ["recursive_rmdir", "recursive_copy_dir", "vfs_rename_copy_file",
-         "xdev_temp_name", "is_fuse_hidden_name", "vfs_rename_event", "vfs_rename"])
+         "xdev_temp_name", "is_fuse_hidden_name", "rename_is_open_unlink",
+         "vfs_rename_event", "vfs_rename"])
     if "static int vfs_rename(" not in funcs:
         fail("抽取 vfs_rename", f"{src_path} 中未找到定义")
         return

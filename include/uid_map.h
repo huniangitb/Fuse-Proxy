@@ -26,6 +26,14 @@ int uid_map_load(UidMapEntry *entries, int max_entries);
  */
 int uid_map_upsert(uid_t uid, const char* pkg);
 
+/*
+ * 用给定快照整体重写 uid.map（tmp + fsync + rename，整表覆盖）。
+ * 供后台落盘线程使用：内存表才是权威视图，磁盘表只用于下次启动冷加载；
+ * 因此这里不读旧文件、不合并，天然不会留下过期条目。
+ * 返回 0 成功，负值失败（UID_MAP_ERR_*）。
+ */
+int uid_map_save(const UidMapEntry *entries, int count);
+
 /* 平铺数组查询：对已排序的 entries 做 O(log N) 折半匹配 */
 const char* uid_map_lookup(const UidMapEntry *entries, int count, uid_t uid);
 
