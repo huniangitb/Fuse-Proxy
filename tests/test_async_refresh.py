@@ -63,17 +63,24 @@ def check_call_sites(fails, log, injector_path):
         return False
     text = open(injector_path, encoding="utf-8").read()
     ok = True
-    reload_body = func_body(text, "handle_pending_reload")
-    if reload_body is None:
-        print("❌ 找不到 handle_pending_reload 函数体（静态检查失效）")
+    # 重载已拆两段（读取在工作线程、提交在循环上）：刷新派发在提交段
+    # reload_apply_view；旧源只有一次性 handle_pending_reload，这里自然红。
+    start_body = func_body(text, "handle_pending_reload_begin")
+    finish_body = func_body(text, "handle_pending_reload_finish")
+    reload_body = func_body(text, "reload_apply_view")
+    if start_body is None or finish_body is None or reload_body is None:
+        print("❌ 找不到两段式重载的入口/提交段（静态检查失效）")
         fails.append("no-reload-body")
         return False
-    if "sys_pkg_refresh()" in reload_body:
-        print("❌ handle_pending_reload 仍内联 sys_pkg_refresh()：慢 pm 会冻住事件循环")
-        fails.append("inline-refresh")
-        ok = False
+    for name, body in (("handle_pending_reload_begin", start_body),
+                       ("handle_pending_reload_finish", finish_body),
+                       ("reload_apply_view", reload_body)):
+        if "sys_pkg_refresh()" in body:
+            print("❌ %s 仍内联 sys_pkg_refresh()：慢 pm 会冻住事件循环" % name)
+            fails.append("inline-refresh")
+            ok = False
     if "nsp_async_refresh_request()" not in reload_body:
-        print("❌ handle_pending_reload 没有把刷新改成 nsp_async_refresh_request()")
+        print("❌ 重载提交段没有把刷新改成 nsp_async_refresh_request()")
         fails.append("no-request")
         ok = False
     startup_body = func_body(text, "reload_injector_config")

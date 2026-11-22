@@ -20,6 +20,7 @@
 #include "sys_pkg.h"
 #include "async_refresh.h"
 #include "audit_worker.h"
+#include "reload_stage.h"
 #include "build_info.h"
 #include "crash_tail.h"
 #include <stdio.h>
@@ -131,6 +132,8 @@ static volatile sig_atomic_t g_pending_startup_scan = 0;
 
 /* 异步就绪与挂载任务全局描述符注册系统 */
 static int g_fuse_ready_pipe_fd = -1;
+/* 配置读取 worker 的就绪 eventfd（<0 = worker 没起来，重载退回内联读） */
+static int g_reload_ready_fd = -1;
 static void* g_fuse_ready_ctx = nullptr;
 #define MAX_ASYNC_MOUNTS 128
 static int g_async_mount_fds[MAX_ASYNC_MOUNTS];
@@ -1398,6 +1401,15 @@ static void injector_setup_epoll(InjectorFds* fds) {
     struct epoll_event ev_due = {.events = EPOLLIN, .data.fd = due_fd};
     epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, due_fd, &ev_due);
     g_due_fd = due_fd; /* 初始不臂：it_value 全 0 = 解除定时 */
+    /* 配置视图读取 worker：daemonize 之后、事件循环之前起（线程不能跨 fork）。
+       没起来就退回内联读：宁可慢一次也不能丢重载。 */
+    g_reload_ready_fd = nsp_reload_stage_start(INJECTOR_CONFIG_PATH);
+    if (g_reload_ready_fd >= 0) {
+        struct epoll_event ev_reload = {.events = EPOLLIN, .data.fd = g_reload_ready_fd};
+        epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, g_reload_ready_fd, &ev_reload);
+    } else {
+        LOG_WRN("配置读取线程未启动：热重载的读盘仍内联在事件循环上");
+    }
     int ipc_sock = ipc_server_init();
     if (ipc_sock < 0) {
         PERROR("无法初始化 IPC 服务");
@@ -1948,11 +1960,55 @@ static void on_client_fd(int fd) {
     }
 }
 
-/* 配置重载的唯一执行点。只有两件事能推进来：SIGHUP（显式请求，立即执行）
-   与去抖窗口到期（inotify 事件折叠后）。重载次数与触发源必须留痕——旧实现
-   重载完全静默，现场只能靠"配置广播: 0 订阅者"行反推次数，取证极难；
-   而"到底谁在写 .conf"正是本次真机 54 次/秒风暴查不下去的原因。 */
-static void handle_pending_reload(void) {
+/* 提交一份准备好的视图：写锁只罩内存构建（读盘已经在读取 worker 上完成），
+   其余后续动作照旧。只在事件循环线程上执行。 */
+static void reload_apply_view(NspCfgRec* reload_recs, int reload_count) {
+    ChangedPkg out_changed[NSP_AUDIT_MAX_CHANGED];
+    config_lock_write();
+    int changed_count =
+        config_commit_prepared(reload_recs, reload_count, out_changed, NSP_AUDIT_MAX_CHANGED);
+    config_unlock_write();
+    config_free_view(reload_recs, reload_count);
+    apply_inject_method_switch();
+    /* 只入队，不在这里读盘/等 pm：本函数跑在唯一事件循环线程上 */
+    nsp_async_refresh_request();
+    setup_inotify_watches();
+    config_publisher_broadcast();
+
+    if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
+        LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
+        kill(g_media_fuse.fuse_pid, SIGTERM);
+        int status;
+        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+        g_media_fuse.fuse_pid = 0;
+        ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
+    } else if (g_media_fuse.fuse_pid <= 0 && !inject_is_global_replace() &&
+               is_media_module_injected_target() && g_fuse_ready) {
+        LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
+        inject_media_fuse();
+    }
+
+    /* 运行中应用的挂载对账要对每个应用做「配置判定 + 实测视图 + 挂载/卸载/
+       还原」，单次预算就有数百毫秒：留在本线程会把 pre-hook 判定、IPC ACK
+       与挂载派发一起冻住，几十个在跑的应用叠起来就是数十秒无响应。这里只
+       入队；粒度（v1 无论 diff 如何都全量对账 / v2 整体变化重置 / v2 具体
+       变更只重挂这几个）由后台 worker 在动手那一刻按当时的注入方法重选，
+       连续重载的变更集合与它合并。 */
+    nsp_audit_request(changed_count > 0 ? out_changed : nullptr,
+                      changed_count > 0 ? changed_count : 0, changed_count == -1);
+
+    arm_due_timer(); /* 重载可能改了活跃用户集合，重臂一次兜住 */
+}
+
+/* 配置重载的第一段：判定本次重载是否到期，清 pending 标记并把「读盘 + pm 用户
+   探测」派给读取 worker。本函数仍在事件循环线程上——但只发请求，不碰磁盘：
+   旧实现内联 config_read_view()，一次慢盘读写或一次慢 `pm list users`（预算
+   800ms）就把 pre-hook 判定、挂载派发与 IPC ACK 一起冻住，而 zygisk pre-hook 的
+   IPC 超时只有 100ms，超时即 fail-open（这次启动看到的是系统视图）。
+   重载次数与触发源必须留痕——旧实现重载完全静默，现场只能靠"配置广播: 0
+   订阅者"行反推次数，取证极难；而"到底谁在写 .conf"正是本次真机 54 次/秒
+   风暴查不下去的原因。 */
+static void handle_pending_reload_begin(void) {
     if (g_should_exit) return;
     const char* why;
     if (g_reload_config) {
@@ -1975,49 +2031,27 @@ static void handle_pending_reload(void) {
     g_reload_trigger[0] = '\0';
     g_reload_total++;
     LOG("配置重载 #%lu: 来源=%s 触发=%s 合并事件=%u", g_reload_total, why, trigger, merged);
-    {
-        fast_pid_cache_clear();
-        ChangedPkg out_changed[NSP_AUDIT_MAX_CHANGED];
-        /* 锁外准备视图（真读盘 + pm 扫描），锁内只提交：本函数跑在注入器唯一事件循环
-           线程上，写锁期间 pre-hook 的规则判定与发布器全被挡住。 */
-        NspCfgRec* reload_recs = nullptr;
-        int reload_count = 0;
-        config_read_view(INJECTOR_CONFIG_PATH, &reload_recs, &reload_count);
-        config_lock_write();
-        int changed_count =
-            config_commit_prepared(reload_recs, reload_count, out_changed,
-                                   NSP_AUDIT_MAX_CHANGED);
-        config_unlock_write();
-        config_free_view(reload_recs, reload_count);
-        apply_inject_method_switch();
-        /* 只入队，不在这里读盘/等 pm：本函数跑在唯一事件循环线程上 */
-        nsp_async_refresh_request();
-        setup_inotify_watches();
-        config_publisher_broadcast();
-
-        if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
-            LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
-            kill(g_media_fuse.fuse_pid, SIGTERM);
-            int status;
-            waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
-            g_media_fuse.fuse_pid = 0;
-            ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
-        } else if (g_media_fuse.fuse_pid <= 0 && !inject_is_global_replace() &&
-                   is_media_module_injected_target() && g_fuse_ready) {
-            LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
-            inject_media_fuse();
-        }
-
-        /* 运行中应用的挂载对账要对每个应用做「配置判定 + 实测视图 + 挂载/卸载/
-           还原」，单次预算就有数百毫秒：留在本线程会把 pre-hook 判定、IPC ACK
-           与挂载派发一起冻住，几十个在跑的应用叠起来就是数十秒无响应。这里只
-           入队；粒度（v1 无论 diff 如何都全量对账 / v2 整体变化重置 / v2 具体
-           变更只重挂这几个）由后台 worker 在动手那一刻按当时的注入方法重选，
-           连续重载的变更集合与它合并。 */
-        nsp_audit_request(changed_count > 0 ? out_changed : nullptr,
-                          changed_count > 0 ? changed_count : 0, changed_count == -1);
+    fast_pid_cache_clear();
+    if (g_reload_ready_fd >= 0) {
+        nsp_reload_stage_request();
+        return;
     }
-    arm_due_timer(); /* 重载可能改了活跃用户集合，重臂一次兜住 */
+    /* 读取 worker 起不来（eventfd/线程创建失败）时的退路：仍在本线程内联读。
+       宁可慢一次也不能丢重载——重载失败会让规则与运行视图长期不一致。 */
+    NspCfgRec* reload_recs = nullptr;
+    int reload_count = 0;
+    config_read_view(INJECTOR_CONFIG_PATH, &reload_recs, &reload_count);
+    reload_apply_view(reload_recs, reload_count);
+}
+
+/* 配置重载的第二段：读取 worker 的就绪 eventfd 可读时调用——取走视图并提交。
+   这一段的耗时只在内存构建与派发上（写锁内的 config_commit_prepared）。 */
+static void handle_pending_reload_finish(void) {
+    if (g_should_exit) return; /* 退出中：视图留槽，由 shutdown 释放 */
+    NspCfgRec* reload_recs = nullptr;
+    int reload_count = 0;
+    if (!nsp_reload_stage_take(&reload_recs, &reload_count)) return;
+    reload_apply_view(reload_recs, reload_count);
 }
 
 /* 毫秒到期定时器到点：跑「重试到期」与「重载窗口到期」，再重新臂。
@@ -2027,7 +2061,7 @@ static void on_due_event(int due_fd) {
     while (read(due_fd, &expirations, sizeof(expirations)) == sizeof(expirations)) {
     }
     retry_pending_mounts();
-    handle_pending_reload();
+    handle_pending_reload_begin();
     arm_due_timer();
 }
 
@@ -2062,6 +2096,12 @@ static void injector_event_loop(const InjectorFds* fds) {
                 on_ipc_accept(fds->ipc_sock);
             } else if (fd == g_config_pub_fd) {
                 config_publisher_handle_readable(fd);
+            } else if (fd == g_reload_ready_fd) {
+                /* 配置读取 worker 备好了视图：取走并提交（读盘已经在别的线程完成） */
+                uint64_t drained;
+                while (read(fd, &drained, sizeof drained) == sizeof drained) {
+                }
+                handle_pending_reload_finish();
             } else if (fd == g_fuse_ready_pipe_fd) {
                 handle_fuse_ready_event(g_fuse_ready_ctx); /* 内部已 free(ctx) */
                 g_fuse_ready_pipe_fd = -1;
@@ -2070,7 +2110,7 @@ static void injector_event_loop(const InjectorFds* fds) {
                 on_client_fd(fd);
             }
         }
-        handle_pending_reload();
+        handle_pending_reload_begin();
     }
 }
 
@@ -2081,6 +2121,8 @@ static void injector_shutdown(const InjectorFds* fds) {
     /* 循环已退出，不再有新请求；等后台刷新与后台对账把手上那轮跑完再动全局状态 */
     nsp_async_refresh_shutdown();
     nsp_audit_shutdown();
+    /* 读取 worker 也一样：等它手上那轮读盘结束（有界），再释放槽里没取走的视图 */
+    nsp_reload_stage_shutdown();
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);

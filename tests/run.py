@@ -437,6 +437,17 @@ SUITE_MAP = [
      ("nsp_async_refresh_request", "nsp_async_refresh_init", "injector_sys_pkg_refresh_cb"),
      "重载路径的慢 pm 刷新不占事件循环线程（异步合并）"),
 
+    # 同一个重载路径上更靠前的一段：config_read_view 自身先跑 scan_active_users 的
+    # `pm list users`（800ms 预算）再逐个 fopen 主配置/App-rules/模块 conf，旧实现
+    # 把这段读盘整个内联在事件循环上。两段式：请求交给读取 worker（读合并），
+    # 就绪 eventfd 触发提交（提交仍在循环上，但读盘已经完成）。
+    (("test_reload_stage.py",),
+     ("src/injector/reload_stage.c", "include/reload_stage.h",
+      "src/injector/injector.c", "tests/test_reload_stage.py",
+      "tests/fixtures/reload_stage_driver.c"),
+     ("nsp_reload_stage_request", "nsp_reload_stage_take", "nsp_reload_stage_start"),
+     "配置重载的读盘与 pm 探测不占事件循环线程（阶段化读取）"),
+
     # 类同 async_refresh：handle_pending_reload 原先内联 audit_tracked_apps /
     # audit_and_remount_specific_apps / audit_running_apps——逐个 tracked 应用做
     # 配置判定 + 实测视图 + 挂载/卸载/还原，几十个在跑的应用叠起来把事件循环按在
@@ -628,6 +639,7 @@ LAYERS = {
             "test_cmd_bounded_pm.py",
             "test_cfg_reload_lock.py",
             "test_async_refresh.py",
+            "test_reload_stage.py",
             "test_audit_defer.py",
             "test_ftp_lifecycle_isolation.py",
             "test_log_persist_isolation.py",
@@ -891,6 +903,7 @@ PARALLEL_SAFE = frozenset({
     "test_cmd_bounded_pm.py",     # cc 直编真实 common/parser/sys_pkg + PATH 假 pm，临时目录，无挂载
     "test_cfg_reload_lock.py",    # cc 直编真实 parser + --wrap 慢盘/慢 pm，临时配置目录，无挂载
     "test_async_refresh.py",      # cc 直编真实 async_refresh + 慢回调替身，纯线程，无文件/挂载
+    "test_reload_stage.py",       # cc 直编真实 reload_stage + 慢 fopen 注入，临时配置目录，无挂载
     "test_audit_defer.py",        # cc 直编真实 audit_worker + 慢审计替身，纯线程，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载
     "test_log_persist_isolation.py", # 原 log_monitor TU/满pipe，无服务或全局日志

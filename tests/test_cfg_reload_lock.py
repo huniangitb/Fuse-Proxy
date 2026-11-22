@@ -86,7 +86,7 @@ def check_call_sites(fails, log):
         fails.append("missing-injector")
         return
     text = open(INJECTOR, encoding="utf-8").read()
-    for fn in ("reload_injector_config", "handle_pending_reload"):
+    for fn in ("reload_injector_config", "reload_apply_view"):
         body = func_body(text, fn)
         if body is None:
             print("❌ 找不到 %s 函数体（静态检查失效）" % fn)
@@ -109,10 +109,31 @@ def check_call_sites(fails, log):
             if banned in span:
                 print("❌ %s 在写锁内仍有 %s（慢读盘会跨写锁）" % (fn, banned))
                 fails.append(fn + "-" + banned)
-        if "config_read_view" not in body[:lw]:
+        if fn == "reload_apply_view":
+            # 重载已两段式：提交段根本不该出现读视图（读盘在 reload_stage worker 上）
+            if "config_read_view" in body:
+                print("❌ reload_apply_view 里出现了 config_read_view（读盘又回到事件循环）")
+                fails.append(fn + "-inline-read")
+        elif "config_read_view" not in body[:lw]:
             print("❌ %s 没有在取写锁前准备视图（config_read_view）" % fn)
             fails.append(fn + "-no-prepare")
         log.append("%s: 写锁区间 %d 字节，锁内无读视图调用" % (fn, len(span)))
+    # 两段式入口：第一段只发请求、全程不取写锁（读盘不在循环上，也就没有锁内读盘）
+    start_body = func_body(text, "handle_pending_reload_begin")
+    if start_body is None:
+        print("❌ 找不到 handle_pending_reload_begin 函数体（静态检查失效）")
+        fails.append("no-reload-begin")
+    else:
+        if "config_lock_write();" in start_body:
+            print("❌ 重载第一段取了配置写锁（慢读盘会跨写锁）")
+            fails.append("begin-write-lock")
+        if "nsp_reload_stage_request()" not in start_body:
+            print("❌ 重载第一段没有把读取派给 worker")
+            fails.append("begin-no-request")
+    finish_body = func_body(text, "handle_pending_reload_finish")
+    if finish_body is None or "nsp_reload_stage_take(" not in finish_body:
+        print("❌ 重载第二段没有取走 worker 备好的视图")
+        fails.append("finish-no-take")
 
 
 def main():

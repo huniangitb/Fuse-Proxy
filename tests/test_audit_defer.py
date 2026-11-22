@@ -67,15 +67,21 @@ def check_call_sites(fails, injector_path):
     text = open(injector_path, encoding="utf-8").read()
     if '#include "audit_worker.h"' not in text:
         fails.append("injector.c 未包含 audit_worker.h")
-    body = func_body(text, "handle_pending_reload")
-    if body is None:
-        fails.append("找不到 handle_pending_reload()")
+    # 重载已拆两段：对账派发在提交段 reload_apply_view；旧源只有一次性
+    # handle_pending_reload，这里自然红。
+    start_body = func_body(text, "handle_pending_reload_begin")
+    finish_body = func_body(text, "handle_pending_reload_finish")
+    body = func_body(text, "reload_apply_view")
+    if start_body is None or finish_body is None or body is None:
+        fails.append("找不到两段式重载的入口/提交段")
     else:
         if "nsp_audit_request(" not in body:
-            fails.append("handle_pending_reload 未派发 nsp_audit_request()")
+            fails.append("重载提交段未派发 nsp_audit_request()")
         for name in AUDITS:
-            if re.search(r"\b%s\s*\(" % name, body):
-                fails.append(f"handle_pending_reload 仍内联 {name}()（慢对账还在事件循环上）")
+            for where, blob in (("begin", start_body), ("finish", finish_body),
+                                ("apply", body)):
+                if re.search(r"\b%s\s*\(" % name, blob):
+                    fails.append(f"重载{where}段仍内联 {name}()（慢对账还在事件循环上）")
         commit = body.find("config_commit_prepared(")
         request = body.find("nsp_audit_request(")
         if commit >= 0 and request >= 0 and not commit < request:
