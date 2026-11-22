@@ -403,6 +403,9 @@ else
     ['src/injector/global_replace_ctl.c', 'src/injector/ns_utils.c', 'src/injector/ns_global_replace.c',
      'src/injector/ns_mountinfo.c', 'src/injector/ns_mount_health.c',
      'src/injector/inject_target.c', 'src/injector/mount_manager.c',
+      # inject_target 的 uid 表写回走后台落盘线程：控制工具也要链真实 TU，
+      # 否则 update_uid_map_locked 的 uid_cache_write_request 无定义。
+      'src/injector/uid_cache_writer.c',
       'src/core/fast_pid.c'] + common_sources,
     include_directories: all_inc_dirs,
     dependencies: project_deps + [nsp_util_dep, nsp_comm_dep],
