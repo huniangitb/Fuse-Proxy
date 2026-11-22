@@ -120,7 +120,7 @@ static volatile int g_fuse_starting = 0;
 /* 延迟首次扫描标记：main() 中注入 FUSE 后不立即扫描，等就绪后再触发 */
 static int g_pending_first_scan = 0;
 /* FUSE 崩溃恢复后待重挂标记：新 FUSE 就绪时重挂所有追踪应用 */
-static volatile sig_atomic_t g_pending_remount = 0;
+static _Atomic int g_pending_remount = 0;
 /* 启动扫描待办标记：FUSE 就绪后扫一次「挂着项目 FUSE 但连接已断」的进程。
    只在进程启动时置位——FUSE 崩溃恢复走 g_pending_remount（追踪表），两者不同：
    前者覆盖本进程启动前就已存在、且不在追踪表里的旧进程。 */
@@ -570,13 +570,16 @@ void handle_fuse_ready_event(void* ptr) {
         if (nsp_retry_count() > 0) {
             seconds_until_next_scan = 0;
         }
-        if (g_pending_remount) {
-            /* 就绪判定留在循环线程：视图没就绪就把标记留着，等下一次就绪事件；
-               若把判定放进 worker，worker 判「未就绪」与就绪事件分发之间有一个窗口，
-               标记放回去就再没人消费（应用会一直停在断掉的旧挂载上）。 */
+        /* 先原子取走标记再判就绪：标记可能被维护 worker 在另一条线程上重新置 1
+           （重挂的视图在 worker 执行时消失 → remount_all_tracked 返 false → 置回 1）。
+           读-再-清会丢掉这个并发置位，exchange 不会；视图没就绪时把 1 放回去即可。
+           就绪判定本身留在循环线程：若把判定放进 worker，worker 判「未就绪」与就绪
+           事件分发之间有一个窗口，标记放回去就再没人消费（应用会一直停在断掉的旧挂载上）。 */
+        if (atomic_exchange_explicit(&g_pending_remount, 0, memory_order_acq_rel)) {
             if (get_active_mnt_src() != nullptr) {
-                g_pending_remount = 0;
                 jobs |= NSP_FUSE_JOB_REMOUNT;
+            } else {
+                atomic_store_explicit(&g_pending_remount, 1, memory_order_release);
             }
         }
         request_fuse_jobs(jobs);
@@ -594,17 +597,30 @@ static void inject_global_fuse() {
         return;
     }
     if (g_global_fuse.fuse_pid > 0) {
-        kill(g_global_fuse.fuse_pid, SIGTERM);
-        for (int wait_ms = 0; wait_ms < 500; wait_ms += 10) {
-            if (kill(g_global_fuse.fuse_pid, 0) != 0) break;
-            usleep(10000);
+        /* 快照 pid 再动手：失败分支只发过 SIGTERM，等 worker 醒来时 g_global_fuse.fuse_pid
+           可能已被别的路径换掉，旧 pid 也可能早就退出并被回收（甚至被系统复用）。先确认
+           它是本进程的、还活着的子进程，才有资格杀：
+             waitpid(pid,&st,WNOHANG)==0  → 活着且是我们的子进程，可以做有界杀等；
+             返回 pid                     → 刚收到退出，已经收尸，不必再杀；
+             -1 且 errno==ECHILD          → 不是本进程的子进程（已回收或 pid 被复用），
+                                            绝不能 kill，否则会误杀无关进程。 */
+        const pid_t old_pid = g_global_fuse.fuse_pid;
+        int status = 0;
+        const pid_t reaped = waitpid(old_pid, &status, WNOHANG);
+        if (reaped == 0) {
+            kill(old_pid, SIGTERM);
+            for (int wait_ms = 0; wait_ms < 500; wait_ms += 10) {
+                if (kill(old_pid, 0) != 0) break;
+                usleep(10000);
+            }
+            if (kill(old_pid, 0) == 0) {
+                kill(old_pid, SIGKILL);
+                usleep(50000);
+            }
+            waitpid(old_pid, &status, WNOHANG);
+        } else if (reaped < 0 && errno == ECHILD) {
+            LOG_DBG("FUSE 重启: pid %d 已不是本进程的子进程（回收或复用），跳过 kill", old_pid);
         }
-        if (kill(g_global_fuse.fuse_pid, 0) == 0) {
-            kill(g_global_fuse.fuse_pid, SIGKILL);
-            usleep(50000);
-        }
-        int status;
-        waitpid(g_global_fuse.fuse_pid, &status, WNOHANG);
     }
     ns_force_umount_stale(g_global_fuse.pid, g_global_fuse.mnt_path);
     for (int verify = 0; verify < 20; verify++) {

@@ -74,36 +74,54 @@ int nsp_fuse_recover_start(NspFuseRecoverFn fn, void* ctx) {
     return fd;
 }
 
+static bool fuse_recover_spawn(void) {
+    pthread_attr_t attr;
+    pthread_t tid;
+    bool ok = false;
+    if (pthread_attr_init(&attr) != 0) return false;
+    (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    ok = pthread_create(&tid, &attr, fuse_recover_worker, NULL) == 0;
+    pthread_attr_destroy(&attr);
+    return ok;
+}
+
 bool nsp_fuse_recover_request(unsigned jobs) {
     jobs &= NSP_FUSE_JOB_ALL;
     if (jobs == 0) return false;
-    bool spawn = false;
     pthread_mutex_lock(&g_fr_mu);
     if (!g_fr_fn || g_fr_stopping || g_fr_fd < 0) {
         pthread_mutex_unlock(&g_fr_mu);
         return false;
     }
     g_fr_pending |= jobs; /* 按位合并：赋值会丢掉先到的任务 */
-    if (!g_fr_running) {
-        g_fr_running = true;
-        spawn = true;
+    if (g_fr_running) {
+        pthread_mutex_unlock(&g_fr_mu);
+        return true; /* 已有 worker：请求并入它的下一轮 */
     }
+    g_fr_running = true;
     pthread_mutex_unlock(&g_fr_mu);
-    if (!spawn) return true; /* 已有 worker：请求并入它的下一轮 */
-    pthread_attr_t attr;
-    pthread_t tid;
-    bool ok = false;
-    if (pthread_attr_init(&attr) == 0) {
-        (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        ok = pthread_create(&tid, &attr, fuse_recover_worker, NULL) == 0;
-        pthread_attr_destroy(&attr);
-    }
-    if (ok) return true;
-    /* 起不来：清掉待跑标记并放回 running，由调用方内联执行这一轮——任务不能丢。
-       broadcast 不可省：此刻可能已有人在 shutdown 里等 running 归零。 */
+    if (fuse_recover_spawn()) return true;
+    /* 起不来：只撤回自己这几位，别人的并入必须保留（别人已经拿到 true，不会再内联）。
+       旧实现把 g_fr_pending 整个清 0，会把它们的任务位一起抹掉、谁都不会再跑。 */
     pthread_mutex_lock(&g_fr_mu);
     g_fr_running = false;
-    g_fr_pending = 0;
+    g_fr_pending &= ~jobs;
+    pthread_mutex_unlock(&g_fr_mu);
+    /* 还有别人的任务位：就地再试几次建线程，别让它等到下一次请求。自己这几位已撤下，
+       无论这里成不成，调用方都要内联跑它们，所以照旧返回 false。 */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        pthread_mutex_lock(&g_fr_mu);
+        const bool more = g_fr_pending != 0 && !g_fr_running && g_fr_fn && !g_fr_stopping;
+        if (more) g_fr_running = true;
+        pthread_mutex_unlock(&g_fr_mu);
+        if (!more) break;
+        if (fuse_recover_spawn()) break;
+        pthread_mutex_lock(&g_fr_mu);
+        g_fr_running = false;
+        pthread_mutex_unlock(&g_fr_mu);
+    }
+    /* 三次都没起来：任务位留在 pending，下一次请求再拉起；running 已归零，shutdown 不挂。 */
+    pthread_mutex_lock(&g_fr_mu);
     pthread_cond_broadcast(&g_fr_cv);
     pthread_mutex_unlock(&g_fr_mu);
     return false;

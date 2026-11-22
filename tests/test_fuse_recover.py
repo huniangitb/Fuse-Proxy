@@ -20,6 +20,8 @@
   jobs     —— 一次请求带三段任务位，回调必须一次看到全部位；
   queue2   —— `--wrap=pthread_create` 把建 worker 推迟到两次请求之后，两次请求的位都
               必须跑到（按位 OR；用赋值会丢先到的那个任务，一次恢复就此消失）。
+  spawn_fail —— 首次建 worker 返回 EAGAIN，而另一请求已并入 pending 并拿到 true：
+                失败路径只能撤回自己那几位，别人的任务位必须留住（旧实现清 0 会丢）
 静态检查同时核对注入器接线（tick 只发请求、就绪处理只组合任务位且就绪判定留在循环侧、
 失败分支不再内联杀等待、维护回调里三段顺序固定、shutdown join）。
 
@@ -72,6 +74,12 @@ def squash(body):
     return re.sub(r"\s+", " ", body)
 
 
+def strip_comments(body):
+    """去掉 C 注释：内联检查只看代码，注释里提到某个函数不算内联调用。"""
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    return re.sub(r"//[^\n]*", "", body)
+
+
 def check_call_sites(fails, injector_path):
     """注入器接线检查；返回是否全部通过（旧源应当在这里红）。"""
     if not os.path.isfile(injector_path):
@@ -100,6 +108,8 @@ def check_call_sites(fails, injector_path):
     loop = bodies["injector_event_loop"]
     setup = bodies["injector_setup_epoll"]
     shutdown = bodies["injector_shutdown"]
+    ready_code = strip_comments(ready)
+    tick_code = strip_comments(tick)
 
     def need(cond, tag, message):
         nonlocal ok
@@ -110,7 +120,14 @@ def check_call_sites(fails, injector_path):
 
     slow_calls = ("force_recover_tracked_mounts(", "inject_global_fuse(",
                   "cleanup_all_target_apps(")
-    ready_slow_calls = ("repair_stale_app_mounts_at_startup(", "remount_all_tracked(")
+    ready_slow_calls = ("repair_stale_app_mounts_at_startup(", "remount_all_tracked(",
+                        "cleanup_all_target_apps(", "force_recover_tracked_mounts(",
+                        "inject_global_fuse(")
+    need("g_pending_remount = 1" in tick_code and
+         tick_code.find("g_pending_remount = 1") < tick_code.find("request_fuse_jobs("),
+         "tick-remount-flag",
+         "崩溃恢复前没有在循环侧置好重挂标记：新实例的就绪事件晚于这次崩溃，"
+         "等 worker 回报再置会让重挂被无限推迟（快照必须在 request 之前）")
     need("NSP_FUSE_JOB_RECOVER" in tick, "tick-request",
          "check_and_recover_fuse 没有把重启序列交给维护 worker（缺 NSP_FUSE_JOB_RECOVER）")
     for call in slow_calls:
@@ -120,14 +137,19 @@ def check_call_sites(fails, injector_path):
              "维护回调里没有 %s（慢活没有真正搬进 worker）" % call)
     # 就绪处理：两段慢活都必须只表现为任务位，且就绪判定留在循环侧。
     for call in ready_slow_calls:
-        need(call not in ready, "ready-inline-" + call,
+        need(call not in ready_code, "ready-inline-" + call,
              "handle_fuse_ready_event 仍在事件循环上内联 %s" % call)
-    need("NSP_FUSE_JOB_STARTUP_SCAN" in ready, "ready-scan-bit",
+    need(re.search(r"jobs \|= NSP_FUSE_JOB_STARTUP_SCAN", ready_code) is not None,
+         "ready-scan-bit",
          "就绪处理没有把启动扫描交给 worker")
-    need("NSP_FUSE_JOB_REMOUNT" in ready, "ready-remount-bit",
+    need(re.search(r"jobs \|= NSP_FUSE_JOB_REMOUNT", ready_code) is not None,
+         "ready-remount-bit",
          "就绪处理没有把重挂交给 worker")
-    need(ready.find("g_pending_remount = 0") >= 0 and
-         ready.find("g_pending_remount = 0") < ready.find("NSP_FUSE_JOB_REMOUNT"),
+    consume_at = ready_code.find("g_pending_remount = 0")
+    if consume_at < 0:
+        consume_at = ready_code.find("atomic_exchange_explicit(&g_pending_remount")
+    need(consume_at >= 0 and
+         consume_at < ready_code.find("jobs |= NSP_FUSE_JOB_REMOUNT"),
          "ready-remount-consume",
          "重挂标记没有在循环线程上、发请求之前消费掉")
     need("get_active_mnt_src()" in ready, "ready-readiness",
@@ -136,10 +158,12 @@ def check_call_sites(fails, injector_path):
     need("request_fuse_jobs(jobs)" in squash(ready), "ready-request",
          "就绪处理没有把组合出来的任务位发给维护 worker")
     # 失败分支：不再在循环上等旧实例退出（10ms×50 + SIGKILL 升级由 worker 做）。
-    need("for (int w = 0" not in ready, "ready-killwait",
+    need("for (int w = 0" not in ready_code, "ready-killwait",
          "handle_fuse_ready_event 仍在事件循环上轮询等旧实例退出")
     need(re.search(r"kill\([^)]*SIGKILL", ready) is None, "ready-sigkill",
          "handle_fuse_ready_event 仍自己做 SIGKILL 升级（应交给维护 worker）")
+    need("usleep(" not in ready_code, "ready-sleep",
+         "handle_fuse_ready_event 仍在事件循环上睡等（10ms×50 那类杀等待必须交给 worker）")
     need("NSP_FUSE_JOB_RECOVER" in ready, "ready-recover-bit",
          "就绪失败分支没有请求重启（等 tick 的 1s 探测会白等一轮）")
     need("g_passive_mode" in ready, "ready-passive",
@@ -218,7 +242,8 @@ def main():
     fails = []
     injector_path = os.environ.get("FUSE_RECOVER_INJECTOR_SRC", str(INJECTOR))
     wiring_ok = check_call_sites(fails, injector_path)
-    modes = ("offload", "inline", "coalesce", "shutdown", "early", "jobs", "queue2")
+    modes = ("offload", "inline", "coalesce", "shutdown", "early", "jobs", "queue2",
+             "spawn_fail")
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
         exe = build(work, "plain")
@@ -237,7 +262,7 @@ def main():
         else:
             vals["offload"] = run_mode(exe, "offload")
         if not expect_old_red and asan is not None:
-            for mode in ("offload", "shutdown", "coalesce", "jobs", "queue2"):
+            for mode in ("offload", "shutdown", "coalesce", "jobs", "queue2", "spawn_fail"):
                 if run_mode(asan, mode, timeout=120) is None:
                     print("❌ ASan 版 %s 模式运行失败" % mode)
                     fails.append("asan-" + mode)
@@ -369,6 +394,20 @@ def main():
         print("❌ 同一轮内的两次请求跑了 %s 轮" % q2.get("rounds"))
     if int(q2.get("threads", -1)) != 1:
         fails.append("queue2-threads")
+
+    sf = vals.get("spawn_fail") or {}
+    if sf.get("helper_ret") != "1":
+        fails.append("spawn-fail-helper")
+        print("❌ 建 worker 失败前帮手的请求没被接受（helper_ret=%s）" % sf.get("helper_ret"))
+    if sf.get("got") != "1" or sf.get("has_remount") != "1":
+        fails.append("spawn-fail-keep-bits")
+        print("❌ 建线程失败把别人的任务位一起清了（got=%s has_remount=%s）："
+              "对方拿到 true 不会内联，任务永久丢失" % (sf.get("got"), sf.get("has_remount")))
+    if int(sf.get("runs", -1)) < 2:
+        fails.append("spawn-fail-runs")
+        print("❌ 失败后没有补跑留下的任务位（runs=%s）" % sf.get("runs"))
+    if int(sf.get("threads", -1)) != 1:
+        fails.append("spawn-fail-threads")
 
     if fails:
         for item in fails:

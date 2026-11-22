@@ -10,6 +10,7 @@
 #endif
 
 #include <dirent.h>
+#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -202,17 +203,62 @@ static void* g_def_arg;
 int __real_pthread_create(pthread_t* tid, const pthread_attr_t* attr, void* (*fn)(void*),
                           void* arg);
 
+/* spawn 失败路径的判别：A 建 worker 失败的同时，B 的请求已经并入 pending 并拿到 true。
+   模块必须只撤回 A 自己那几位、把 B 的位留住（下一次建线程跑它），否则 B 的任务位
+   永久丢失且无人内联。旧实现失败路径 g_fr_pending = 0 就会丢掉 B 的 REMOUNT。 */
+static _Atomic int g_fail_spawn;
+static _Atomic int g_helper_done;
+static _Atomic int g_helper_ret;
+static pthread_t g_helper_tid;
+
+static void* helper_request(void* arg) {
+    (void)arg;
+    atomic_store(&g_helper_ret, nsp_fuse_recover_request(NSP_FUSE_JOB_REMOUNT) ? 1 : 0);
+    atomic_store(&g_helper_done, 1);
+    return NULL;
+}
+
+static void mode_spawn_fail(int work_ms) {
+    atomic_store(&g_work_us, (long long)work_ms * 1000);
+    const int fd = nsp_fuse_recover_start(slow_cb, NULL);
+    if (fd < 0) {
+        printf("start_failed=1\n");
+        return;
+    }
+    atomic_store(&g_fail_spawn, 1);
+    const bool q1 = nsp_fuse_recover_request(NSP_FUSE_JOB_STARTUP_SCAN);
+    if (!q1) slow_cb(NSP_FUSE_JOB_STARTUP_SCAN, NULL); /* 按 injector 口径内联自己那几位 */
+    long long ready_ms = -1;
+    const int got = wait_ready(fd, 10000, &ready_ms);
+    const unsigned took_bits = got ? nsp_fuse_recover_take() : 0;
+    usleep(30000);
+    printf("q1=%d helper_ret=%d got=%d took_bits=%u bits_seen=%u has_scan=%d has_remount=%d "
+           "runs=%d threads=%d\n",
+           (int)q1, atomic_load(&g_helper_ret), got, took_bits, atomic_load(&g_bits_seen),
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_STARTUP_SCAN) ? 1 : 0,
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_REMOUNT) ? 1 : 0, atomic_load(&g_runs),
+           threads_settled());
+    nsp_fuse_recover_shutdown();
+}
 int __wrap_pthread_create(pthread_t* tid, const pthread_attr_t* attr, void* (*fn)(void*),
                           void* arg) {
+    if (atomic_exchange(&g_fail_spawn, 0) == 1) {
+        if (__real_pthread_create(&g_helper_tid, NULL, helper_request, NULL) != 0) {
+            atomic_store(&g_helper_ret, -1);
+            atomic_store(&g_helper_done, 1);
+        } else {
+            (void)pthread_detach(g_helper_tid);
+        }
+        for (int i = 0; i < 2000 && !atomic_load(&g_helper_done); i++) usleep(1000);
+        return EAGAIN; /* 首次建 worker 失败，且此时 B 的请求已并入 pending */
+    }
     if (atomic_load(&g_defer_spawn)) {
         g_def_fn = fn;
         g_def_arg = arg;
         return 0; /* 假装创建成功，实际推迟到 queue2 自己建 */
     }
     return __real_pthread_create(tid, attr, fn, arg);
-}
-
-static void mode_queue2(int work_ms) {
+}static void mode_queue2(int work_ms) {
     atomic_store(&g_work_us, (long long)work_ms * 1000);
     const int fd = nsp_fuse_recover_start(slow_cb, NULL);
     if (fd < 0) {
@@ -250,7 +296,7 @@ int main(int argc, char** argv) {
     g_main_tid = self_tid();
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s offload|inline|coalesce|shutdown|early|jobs|queue2 [work_ms]\n",
+                "usage: %s offload|inline|coalesce|shutdown|early|jobs|queue2|spawn_fail [work_ms]\n",
                 argv[0]);
         return 2;
     }
@@ -262,6 +308,7 @@ int main(int argc, char** argv) {
     else if (strcmp(argv[1], "early") == 0) mode_early();
     else if (strcmp(argv[1], "jobs") == 0) mode_jobs(work_ms);
     else if (strcmp(argv[1], "queue2") == 0) mode_queue2(work_ms);
+    else if (strcmp(argv[1], "spawn_fail") == 0) mode_spawn_fail(work_ms);
     else {
         fprintf(stderr, "unknown mode\n");
         return 2;
