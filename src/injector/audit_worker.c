@@ -17,6 +17,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "mount_ops.h"
 #include "inject_target.h" /* audit_tracked_apps / audit_and_remount_specific_apps /
                                   audit_running_apps */
 #include "injector.h"      /* inject_is_global_replace / inject_restore_nontarget */
@@ -124,7 +125,12 @@ static void* audit_worker(void* arg) {
         g_aw_pending = false;
         pthread_mutex_unlock(&g_aw_mu);
         atomic_fetch_add_explicit(&g_aw_active, 1, memory_order_acq_rel);
+        /* 一整轮对账独占挂载视图：与维护 worker（恢复/重挂/媒体）、事件循环的重试
+           派发互斥——同时改挂载会「刚挂上又被清理」，同一次进程遍历也会被两边各改一遍。
+           事件循环侧只用 trylock，故这里持锁不会把循环按在等锁上。 */
+        mount_ops_begin();
         audit_run_job(&job); /* items 只被读（fnmatch 匹配），私有副本可以传非 const */
+        mount_ops_end();
         atomic_fetch_sub_explicit(&g_aw_active, 1, memory_order_acq_rel);
     }
 }

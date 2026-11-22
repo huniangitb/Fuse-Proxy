@@ -30,8 +30,10 @@
 #define NSP_FUSE_JOB_RECOVER (1u << 0)      /* 崩溃恢复：清残留 → 起新实例 */
 #define NSP_FUSE_JOB_STARTUP_SCAN (1u << 1) /* 就绪后：修复存量断连挂载 */
 #define NSP_FUSE_JOB_REMOUNT (1u << 2)      /* 就绪后：重挂全部追踪应用 */
+#define NSP_FUSE_JOB_MEDIA (1u << 3)      /* 媒体实例：停旧 + 按当前配置决定是否重拉 */
 #define NSP_FUSE_JOB_ALL \
-    (NSP_FUSE_JOB_RECOVER | NSP_FUSE_JOB_STARTUP_SCAN | NSP_FUSE_JOB_REMOUNT)
+    (NSP_FUSE_JOB_RECOVER | NSP_FUSE_JOB_STARTUP_SCAN | NSP_FUSE_JOB_REMOUNT | \
+     NSP_FUSE_JOB_MEDIA)
 
 typedef void (*NspFuseRecoverFn)(unsigned jobs, void* ctx);
 

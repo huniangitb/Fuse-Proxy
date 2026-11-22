@@ -185,11 +185,12 @@ static void mode_jobs(int work_ms) {
     const unsigned took_bits = got ? nsp_fuse_recover_take() : 0;
     usleep(20000);
     printf("queued=%d request_us=%lld got=%d took_bits=%u bits_seen=%u has_recover=%d "
-           "has_scan=%d has_remount=%d runs=%d cb_off_main=%d threads=%d\n",
+           "has_scan=%d has_remount=%d has_media=%d runs=%d cb_off_main=%d threads=%d\n",
            (int)queued, request_us, got, took_bits, atomic_load(&g_bits_seen),
            (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_RECOVER) ? 1 : 0,
            (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_STARTUP_SCAN) ? 1 : 0,
-           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_REMOUNT) ? 1 : 0, atomic_load(&g_runs),
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_REMOUNT) ? 1 : 0,
+           (atomic_load(&g_bits_seen) & NSP_FUSE_JOB_MEDIA) ? 1 : 0, atomic_load(&g_runs),
            atomic_load(&g_cb_off_main), threads_settled());
     nsp_fuse_recover_shutdown();
 }

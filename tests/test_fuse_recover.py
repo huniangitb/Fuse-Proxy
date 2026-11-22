@@ -17,7 +17,7 @@
   coalesce —— 慢回调进行中再发 40 次请求，只许多跑 1 轮（请求合并）；
   shutdown —— 退出等手上那轮跑完（有界），之后请求被拒绝、线程数回 1；
   early    —— 没有完成过一轮时 take 返回 0；
-  jobs     —— 一次请求带三段任务位，回调必须一次看到全部位；
+  jobs     —— 一次请求带四段任务位（含媒体实例停/拉），回调必须一次看到全部位；
   queue2   —— `--wrap=pthread_create` 把建 worker 推迟到两次请求之后，两次请求的位都
               必须跑到（按位 OR；用赋值会丢先到的那个任务，一次恢复就此消失）。
   spawn_fail —— 首次建 worker 返回 EAGAIN，而另一请求已并入 pending 并拿到 true：
@@ -51,7 +51,7 @@ MAX_ROUNDS = 2                # 40 次突发只许多跑 1 轮
 BURST_LIMIT_US = 20000
 SHUTDOWN_MIN_MS = WORK_MS // 2
 SHUTDOWN_MAX_MS = 3000
-JOB_ALL = 7                   # RECOVER | STARTUP_SCAN | REMOUNT
+JOB_ALL = 15                  # RECOVER | STARTUP_SCAN | REMOUNT | MEDIA
 
 
 def func_body(text, name):
@@ -102,8 +102,12 @@ def check_call_sites(fails, injector_path):
     if not ok:
         return False
     tick = bodies["check_and_recover_fuse"]
-    cb = bodies["injector_fuse_maintenance_cb"]
+    # 任务体在 fuse_jobs_run_locked 里（锁由 injector_fuse_maintenance_cb 持有）；
+    # 旧基线（无该拆分）回落到回调本体，判别仍落在「慢活是否还在循环线程上」。
+    run_locked = func_body(text, "fuse_jobs_run_locked")
+    cb = run_locked if run_locked is not None else bodies["injector_fuse_maintenance_cb"]
     req = squash(bodies["request_fuse_jobs"])
+    fallback = squash(func_body(text, "flush_deferred_fuse_jobs") or "")
     ready = bodies["handle_fuse_ready_event"]
     remount = squash(bodies["remount_all_tracked"])
     loop = bodies["injector_event_loop"]
@@ -212,8 +216,12 @@ def check_call_sites(fails, injector_path):
     # 请求入口：非阻塞请求 + 起线程失败内联兜底。
     need("nsp_fuse_recover_request(jobs)" in req, "request-call",
          "request_fuse_jobs 没有把任务位交给 worker")
-    need("injector_fuse_maintenance_cb(jobs, nullptr)" in req, "request-fallback",
-         "worker 起不来时没有内联兜底（宁可慢一次也不能丢任务）")
+    need("flush_deferred_fuse_jobs()" in req, "request-fallback",
+         "worker 起不来时没有兜底（宁可慢一次也不能丢任务）")
+    if fallback:
+        need("mount_ops_try_begin()" in fallback and "mount_ops_begin()" not in fallback,
+             "fallback-trylock",
+             "兜底执行在事件循环上等挂载锁（抢不到必须延后，不能等一轮审计）")
     need("fd == g_fuse_recover_fd" in loop, "loop-branch",
          "事件循环里没有维护 worker 的就绪 fd 分支")
     need("nsp_fuse_recover_take()" in loop, "loop-take",
@@ -392,7 +400,7 @@ def main():
         fails.append("jobs-bits")
         print("❌ 任务位没有原样到达回调（bits_seen=%s took_bits=%s）"
               % (jobs.get("bits_seen"), jobs.get("took_bits")))
-    for bit in ("has_recover", "has_scan", "has_remount"):
+    for bit in ("has_recover", "has_scan", "has_remount", "has_media"):
         if jobs.get(bit) != "1":
             fails.append("jobs-" + bit)
             print("❌ 回调没看到任务位 %s" % bit)

@@ -388,12 +388,25 @@ SUITE_MAP = [
       "配置读槽内的慢能力查询与慢身份事实（槽外预取 + 负结论缓存）"),
 
     # 写者窗口里的读者等待方式：旧实现 sched_yield 自旋，多 worker 时把 CPU 从
-    # 写者正在排空的慢读者手里抢走（自旋放大）。新实现 futex 等待 + 放行唤醒。
+    # 写者正在排空的慢读者手里抢走（自旋放大）。新实现 futex 等待 + 放行唤醒；
+    # 写者自己的排空也不许自旋（读者持槽 300ms 时旧实现烧 0.66-0.91 个核）。
     (("test_config_read_wait.py",),
      ("src/config/config_parser.c", "tests/test_config_read_wait.py",
       "tests/fixtures/config_read_wait_driver.c"),
-     ("config_read_begin", "cfg_wait_publish", "config_publish_end"),
-     "配置读槽等待（futex 阻塞，不自旋）"),
+     ("config_read_begin", "cfg_wait_publish", "config_publish_end",
+      "config_drain_readers", "cfg_drain_backoff"),
+     "配置读槽等待与写者排空（futex 阻塞 + 退避睡眠，都不自旋）"),
+
+    # uid.map 的整表落盘（tmp+fsync+rename）原本内联在 IPC ACK 路径上并持 uid 表锁：
+    # 一个慢 fsync 就冻住事件循环的其它 ACK（实测并发命中被拖到 2583ms）。
+    (("test_uid_cache_writer.py",),
+     ("src/injector/uid_cache_writer.c", "include/uid_cache_writer.h",
+      "src/core/uid_map.c", "include/uid_map.h", "src/injector/inject_target.c",
+      "src/injector/injector.c", "tests/test_uid_cache_writer.py",
+      "tests/fixtures/uid_cache_writer_test.c"),
+     ("uid_cache_write_request", "uid_cache_write_flush", "uid_cache_write_shutdown",
+      "uid_map_save", "init_uid_map_persist"),
+     "uid.map 后台落盘（ACK 路径零 I/O，请求合并，退出先冲刷）"),
 
     # 跨应用白名单数组是配置指针：发布者在排空旧读者后释放它，槽外读者若在
     # 比较途中被发布穿插就会读已释放条目（ASan：fw_acl_identity → strlen(freed)）。
@@ -456,6 +469,17 @@ SUITE_MAP = [
      ("nsp_fuse_recover_request", "nsp_fuse_recover_take", "nsp_fuse_recover_start",
       "injector_fuse_maintenance_cb"),
      "FUSE 恢复/启动扫描/重挂不占事件循环线程（任务位串行维护）"),
+
+    # 挂载表有三个写者（维护 worker、审计 worker、事件循环的重试派发）：谁都不许把
+    # 慢挂载叠进另一条线程的遍历里；事件循环侧只能用 trylock 且抢不到就 20ms 后重跑。
+    # 媒体实例的停/拉也随这一批挪进维护 worker（不再在循环上 kill 等待 + fork）。
+    (("test_mount_ops.py",),
+     ("src/injector/mount_ops.c", "include/mount_ops.h",
+      "src/injector/injector.c", "src/injector/audit_worker.c",
+      "tests/test_mount_ops.py", "tests/fixtures/mount_ops_driver.c"),
+     ("mount_ops_begin", "mount_ops_try_begin", "media_fuse_maintain",
+      "maybe_retry_recover"),
+     "挂载表写者串行化与事件循环 trylock（媒体实例维护、恢复有界重试）"),
 
     # fast_pid 的位图与 pid 缓存是跨线程共享状态：恢复 worker 的全进程清理与事件
     # 循环的 remount/cache_clear 会同时读写（旧实现默认只有一个调用线程）。
@@ -657,6 +681,7 @@ LAYERS = {
             "test_async_refresh.py",
             "test_reload_stage.py",
             "test_fuse_recover.py",
+            "test_mount_ops.py",
             "test_fast_pid_threads.py",
             "test_audit_defer.py",
             "test_ftp_lifecycle_isolation.py",
@@ -664,6 +689,7 @@ LAYERS = {
             "test_cfg_watch.py",
             "test_cfg_reload_split.py",
             "test_config_read_wait.py",
+            "test_uid_cache_writer.py",
             "test_module_cfg_push.py",
             "test_fw_config_view.py",
             "test_rule_file_lock.py",
@@ -923,6 +949,8 @@ PARALLEL_SAFE = frozenset({
     "test_async_refresh.py",      # cc 直编真实 async_refresh + 慢回调替身，纯线程，无文件/挂载
     "test_reload_stage.py",       # cc 直编真实 reload_stage + 慢 fopen 注入，临时配置目录，无挂载
     "test_fuse_recover.py",       # cc 直编真实 fuse_recover + 慢回调替身，纯线程，无文件/挂载
+    "test_mount_ops.py",          # cc 直编真实 mount_ops.c + 静态接线检查，纯线程，无挂载
+    "test_uid_cache_writer.py",   # cc 直编真实 uid_cache_writer/uid_map，私有 uid.map，无挂载
     "test_fast_pid_threads.py",   # cc 直编真实 fast_pid，两线程扫描/清缓存，ASan 判别
     "test_audit_defer.py",        # cc 直编真实 audit_worker + 慢审计替身，纯线程，无挂载
     "test_ftp_lifecycle_isolation.py", # 真实 backend/mux/curl file://，无网络或挂载

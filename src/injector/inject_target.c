@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "inject_target.h"
+#include "uid_cache_writer.h"
 #include "injector.h"
 #include "common.h"
 #include "config_parser.h"
@@ -370,10 +371,6 @@ static UidMapEntry* g_uid_map = NULL;
 static int g_uid_map_count = 0;
 static int g_uid_map_cap = 0;
 
-/* uid_map_upsert 失败的 UID 集合，避免反复重试 */
-#define MAX_FAILED_UIDS 64
-static uid_t g_failed_uids[MAX_FAILED_UIDS];
-static int g_failed_uid_count = 0;
 
 /* g_uid_map / g_failed_uids 的互斥：update_uid_map 的调用方既有主线程
    （ipc_server 的 IPC 客户端处理），也有每次 IPC 通知 detach 出来的挂载线程
@@ -383,16 +380,23 @@ static int g_failed_uid_count = 0;
    init_uid_map_cache 不取锁。 */
 static pthread_mutex_t g_uid_map_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static bool uid_has_failed(uid_t uid) {
-    for (int i = 0; i < g_failed_uid_count; i++) {
-        if (g_failed_uids[i] == uid) return true;
+/* 落盘线程的快照回调：在调用方（落盘线程）里拷一份内存表，I/O 全在锁外发生。 */
+static UidMapEntry* uid_map_snapshot(int* count_out) {
+    if (count_out) *count_out = 0;
+    pthread_mutex_lock(&g_uid_map_mutex);
+    int count = g_uid_map_count;
+    UidMapEntry* copy = NULL;
+    if (count > 0) {
+        copy = malloc((size_t)count * sizeof(UidMapEntry));
+        if (copy) {
+            memcpy(copy, g_uid_map, (size_t)count * sizeof(UidMapEntry));
+        } else {
+            count = 0;
+        }
     }
-    return false;
-}
-
-static void uid_mark_failed(uid_t uid) {
-    if (uid_has_failed(uid)) return;
-    if (g_failed_uid_count < MAX_FAILED_UIDS) g_failed_uids[g_failed_uid_count++] = uid;
+    pthread_mutex_unlock(&g_uid_map_mutex);
+    if (count_out) *count_out = count;
+    return copy;
 }
 
 void init_uid_map_cache(void) {
@@ -423,6 +427,11 @@ void init_uid_map_cache(void) {
     g_uid_map_cap = cap;
     LOG_DBG("UID映射内存缓存已初始化: 从文件载入 %d 条映射记录 (容量 %d)", g_uid_map_count,
             g_uid_map_cap);
+}
+
+/* 装配 uid.map 落盘线程（在 early_init 的单线程阶段调用）。 */
+void init_uid_map_persist(void) {
+    uid_cache_write_init(uid_map_snapshot);
 }
 
 bool is_isolated_uid(uid_t uid) {
@@ -537,10 +546,18 @@ void get_target_storage_path(uid_t uid, char* path, size_t size) {
     snprintf(path, size, "%s", NSP_ANDROID_EMULATED_ROOT);
 }
 
-/* 加锁实现（调用方须持 g_uid_map_mutex）：拆分只为让早退分支不必逐个解锁 */
+/* 加锁实现（调用方须持 g_uid_map_mutex）：拆分只为让早退分支不必逐个解锁。
+ *
+ * 这里**只动内存表**：磁盘整表落盘交给 uid_cache_writer 的后台线程。本函数在
+ * IPC ACK 前（ipc_server 的 update_uid_map 调用点）与每个挂载线程上都会被调用，
+ * 而 uid.map 的整表重写 + fsync 实测首次 58.9ms（p90 108.3、max 133.4），并发命中
+ * 被拖到 2583ms——一个慢盘足以把事件循环上的其它 ACK 一起冻住。内存表才是权威
+ * 视图，磁盘表只用于下次启动冷加载，晚落盘不影响本进程任何判定。
+ *
+ * 落盘请求在持 g_uid_map_mutex 时发出是安全的：uid_cache_write_request 只置位 +
+ * 唤醒（不取表锁、不等待），快照由落盘线程自己取锁拷贝。 */
 static void update_uid_map_locked(uid_t uid, const char* pkg) {
     if (uid < NSP_SYSTEM_APP_UID_MIN || is_isolated_uid(uid)) return;
-    if (uid_has_failed(uid)) return;
     char clean_pkg[128];
     strncpy(clean_pkg, pkg, sizeof(clean_pkg) - 1);
     clean_pkg[sizeof(clean_pkg) - 1] = '\0';
@@ -555,21 +572,7 @@ static void update_uid_map_locked(uid_t uid, const char* pkg) {
             break;
         }
     }
-    /* 2. 只有在数据发生变更或属于全新映射时，才穿透执行物理磁盘落盘 */
-    int ret = uid_map_upsert(uid, clean_pkg);
-    if (ret != 0) {
-        const char* reason = "未知错误";
-        if (ret == UID_MAP_ERR_FULL)
-            reason = "条目已满(>1024)";
-        else if (ret == UID_MAP_ERR_IO)
-            reason = "文件写入失败";
-        else if (ret == UID_MAP_ERR_RENAME)
-            reason = "原子重命名失败";
-        LOG_ERR("uid_map_upsert 失败: %u -> %s (%s)", uid, clean_pkg, reason);
-        uid_mark_failed(uid);
-        return;
-    }
-    /* 3. 同步更新内存缓存 */
+    /* 2. 先更新内存缓存（µs 级） */
     bool updated = false;
     for (int i = 0; i < g_uid_map_count; i++) {
         if (g_uid_map[i].uid == uid) {
@@ -596,7 +599,11 @@ static void update_uid_map_locked(uid_t uid, const char* pkg) {
         g_uid_map[g_uid_map_count].pkg[127] = '\0';
         g_uid_map_count++;
         LOG_DBG("UID内存映射已更新 (新增记录): %u -> %s", uid, clean_pkg);
+    } else {
+        LOG_DBG("UID内存映射已更新 (包名变更): %u -> %s", uid, clean_pkg);
     }
+    /* 3. 请求后台整表落盘：只置位 + 唤醒，微秒级返回，不碰磁盘 */
+    uid_cache_write_request();
 }
 
 void update_uid_map(uid_t uid, const char* pkg) {

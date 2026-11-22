@@ -22,6 +22,8 @@
 #include "audit_worker.h"
 #include "reload_stage.h"
 #include "fuse_recover.h"
+#include "mount_ops.h"
+#include "uid_cache_writer.h"
 #include "build_info.h"
 #include "crash_tail.h"
 #include <stdatomic.h>
@@ -121,6 +123,12 @@ static volatile int g_fuse_starting = 0;
 static int g_pending_first_scan = 0;
 /* FUSE 崩溃恢复后待重挂标记：新 FUSE 就绪时重挂所有追踪应用 */
 static _Atomic int g_pending_remount = 0;
+/* 挂载锁竞争时的重试派发延后时刻（毫秒，0=未延后）：只在事件循环线程读写 */
+static int64_t g_retry_defer_ms;
+#define NSP_RETRY_DEFER_MS 20
+/* 维护 worker 不可用时回退到事件循环的任务位与延后时刻（0=没有待办） */
+static unsigned g_fuse_jobs_pending;
+static int64_t g_fuse_jobs_defer_ms;
 /* 启动扫描待办标记：FUSE 就绪后扫一次「挂着项目 FUSE 但连接已断」的进程。
    只在进程启动时置位——FUSE 崩溃恢复走 g_pending_remount（追踪表），两者不同：
    前者覆盖本进程启动前就已存在、且不在追踪表里的旧进程。 */
@@ -271,6 +279,18 @@ static void arm_due_timer(void) {
     int64_t wait = -1;
     int64_t retry_wait = nsp_retry_next_due_ms(now);
     if (retry_wait >= 0) wait = retry_wait;
+    /* 挂载锁被 worker 占着时派发被延后：定时器也要按延后时刻重臂，否则这条重试
+       可能一直等不到下一次 tick（tick 由 nsp_retry_next_due_ms 决定）。 */
+    if (g_retry_defer_ms > 0) {
+        int64_t dw = g_retry_defer_ms - now;
+        if (dw < 0) dw = 0;
+        if (wait < 0 || dw < wait) wait = dw;
+    }
+    if (g_fuse_jobs_defer_ms > 0) {
+        int64_t fw = g_fuse_jobs_defer_ms - now;
+        if (fw < 0) fw = 0;
+        if (wait < 0 || fw < wait) wait = fw;
+    }
     if (g_reload_due_ms > 0) {
         int64_t rw = g_reload_due_ms - now;
         if (rw < 0) rw = 0;
@@ -483,6 +503,9 @@ typedef struct {
 
 static bool remount_all_tracked(void);
 static void request_fuse_jobs(unsigned jobs);
+static void recover_arm_deadline(void);
+static void recover_clear_deadline(void);
+static void maybe_retry_recover(void);
 static void maybe_reconcile_global_replace(void);
 static void grepl_reconcile_reset(void);
 
@@ -531,10 +554,12 @@ void handle_fuse_ready_event(void* ptr) {
                     seconds_until_next_scan = 0;
                     /* 重启交给维护 worker：它会在 inject_global_fuse() 里做有界 kill/wait
                        与卸载复核；等 tick 的 1s 探测会白等一轮。 */
+                    recover_arm_deadline();
                     request_fuse_jobs(NSP_FUSE_JOB_RECOVER);
                 }
             } else {
                 g_fuse_ready = 1;
+                recover_clear_deadline(); /* 视图已回来：恢复重试链清零 */
                 LOG_DBG("FUSE 就绪确认: %s", g_global_fuse.mnt_path);
                 /* 全局替换模式：FUSE 就绪后立即尝试把 emulated 族根替换为代理视图。
                    此时 vold 可能尚未建立族根（用户未启动）——replace 返回 1 表示
@@ -770,9 +795,11 @@ static void inject_global_fuse() {
     __sync_lock_release(&g_fuse_starting);
 }
 
-static void inject_media_fuse() {
-    if (inject_is_global_replace()) return; /* 新挂载方案（全局替换）无需媒体专属 FUSE */
-    if (g_media_fuse.disabled) return;
+/* 停掉媒体实例并清残留：旧实现把这一整段内联在三条事件循环路径里（崩溃重拉、
+   惰性启动、热重载终结）。一次 kill 等待 + SIGKILL + 20×20ms 卸载复核最坏约 1s，
+   全压在唯一事件循环线程上——期间 pre-hook 判定与 IPC ACK 一起停。现在只由维护
+   worker 的 NSP_FUSE_JOB_MEDIA 调用，不占循环。 */
+static void media_fuse_stop(void) {
     if (g_media_fuse.fuse_pid > 0) {
         kill(g_media_fuse.fuse_pid, SIGTERM);
         for (int wait_ms = 0; wait_ms < 500; wait_ms += 10) {
@@ -785,6 +812,7 @@ static void inject_media_fuse() {
         }
         int status;
         waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
+        g_media_fuse.fuse_pid = 0;
     }
     ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
     for (int verify = 0; verify < 20; verify++) {
@@ -792,6 +820,12 @@ static void inject_media_fuse() {
         usleep(20000);
     }
     ns_umount_and_rmdir(g_media_fuse.pid, g_media_fuse.mnt_path);
+}
+
+/* 只负责拉起：调用方已确认「应当有媒体实例」且旧实例已停。 */
+static void inject_media_fuse() {
+    if (inject_is_global_replace()) return; /* 新挂载方案（全局替换）无需媒体专属 FUSE */
+    if (g_media_fuse.disabled) return;
     int ready_pipe[2];
     if (pipe2(ready_pipe, O_CLOEXEC | O_NONBLOCK) == -1) return;
     /* 同全局实例：fork 前打开 crash log 并记下偏移，子进程只管接 stderr */
@@ -884,6 +918,33 @@ static void inject_media_fuse() {
     close(ready_pipe[0]);
 }
 
+/* 媒体实例的维护动作：维护 worker 上执行（与恢复/重挂同一条线程、同一把挂载锁），
+   先停旧实例，再按**此刻**的配置决定要不要拉起。事件循环只发 NSP_FUSE_JOB_MEDIA，
+   不再内联 kill 等待、卸载复核与 fork。 */
+static void media_fuse_maintain(void) {
+    if (inject_is_global_replace()) {
+        /* 全局替换：媒体专属实例不需要（全局 FUSE 已提供代理视图），残留一并清掉 */
+        media_fuse_stop();
+        return;
+    }
+    const bool want = is_media_module_injected_target();
+    media_fuse_stop(); /* 幂等：没有实例时只是清残留挂载 */
+    if (!want) {
+        LOG("媒体组件不再是注入目标：专属媒体 FUSE 已停");
+        return;
+    }
+    if (g_media_fuse.disabled) return;
+    if (!g_fuse_ready) {
+        /* 全局视图还没回来：媒体实例此刻拉起没有代理视图可依赖——旧逻辑在 tick 的
+           惰性启动分支上用 g_fuse_ready 门控，决策时刻挪到 worker 后必须在这里重核。
+           下一次 tick/就绪事件会再发一次任务位。 */
+        LOG_DBG("媒体 FUSE 拉起推迟：全局视图未就绪");
+        return;
+    }
+    LOG("拉起专属媒体 FUSE 实例 (com.android.providers.media.module)");
+    inject_media_fuse();
+}
+
 static int cleanup_cb(int pid, const char* cmd, void* data) {
     (void)data;
     if (!is_process_safe_to_inject(cmd)) return 0;
@@ -913,8 +974,7 @@ static void cleanup_all_target_apps() {
  *
  * 重挂段：`g_pending_remount` 的消费已经挪到循环线程（就绪判定必须在事件分发侧做），
  * 这里的返回值只为「判定与执行之间视图又没了」兜底——把标记放回去，下一次就绪事件再跑。 */
-static void injector_fuse_maintenance_cb(unsigned jobs, void* ctx) {
-    (void)ctx;
+static void fuse_jobs_run_locked(unsigned jobs) {
     if (jobs & NSP_FUSE_JOB_RECOVER) {
         force_recover_tracked_mounts();
         cleanup_all_target_apps();
@@ -927,15 +987,90 @@ static void injector_fuse_maintenance_cb(unsigned jobs, void* ctx) {
     if (jobs & NSP_FUSE_JOB_REMOUNT) {
         if (!remount_all_tracked()) g_pending_remount = 1;
     }
+    if (jobs & NSP_FUSE_JOB_MEDIA) {
+        media_fuse_maintain();
+    }
 }
 
-/* 请求维护 worker 跑 jobs；worker 起不来时按旧行为内联执行——宁可慢一次，
-   也不能把一次恢复或一次重挂丢掉。 */
+static void injector_fuse_maintenance_cb(unsigned jobs, void* ctx) {
+    (void)ctx;
+    /* 整轮挂载操作独占：与审计 worker、事件循环的重试派发互斥——三条线程同时改
+       挂载视图会「刚挂上又被清理」，也让同一次进程遍历被两边各改一遍。事件循环侧
+       只用 trylock（见 flush_deferred_fuse_jobs / retry_pending_mounts），绝不在
+       循环上等这把锁。 */
+    mount_ops_begin();
+    fuse_jobs_run_locked(jobs);
+    mount_ops_end();
+}
+
+/* 维护 worker 起不来时的回退执行：**不在事件循环上等挂载锁**。审计/维护 worker
+   的一轮对账可能数十秒，等它等于把 pre-hook 判定与 IPC ACK 一起按下；抢不到就把
+   任务位攒起来，20ms 后再试（定时器按延后时刻重臂）。 */
+static void flush_deferred_fuse_jobs(void) {
+    if (g_fuse_jobs_pending == 0) return;
+    const int64_t now = nsp_retry_now_ms();
+    if (g_fuse_jobs_defer_ms > 0 && now < g_fuse_jobs_defer_ms) return;
+    if (!mount_ops_try_begin()) {
+        g_fuse_jobs_defer_ms = now + NSP_RETRY_DEFER_MS;
+        arm_due_timer();
+        return;
+    }
+    const unsigned jobs = g_fuse_jobs_pending;
+    g_fuse_jobs_pending = 0;
+    g_fuse_jobs_defer_ms = 0;
+    LOG_WRN("FUSE 维护线程不可用：任务回退到事件循环执行 (jobs=0x%x)", jobs);
+    fuse_jobs_run_locked(jobs);
+    mount_ops_end();
+}
+
+/* 请求维护 worker 跑 jobs；worker 起不来时回退到事件循环（有界、不等锁）。 */
 static void request_fuse_jobs(unsigned jobs) {
     if (jobs == 0) return;
     if (nsp_fuse_recover_request(jobs)) return;
-    LOG_WRN("FUSE 维护线程不可用：任务回退到事件循环内联执行");
-    injector_fuse_maintenance_cb(jobs, nullptr);
+    g_fuse_jobs_pending |= jobs;
+    flush_deferred_fuse_jobs();
+}
+
+/* 恢复请求的超时重试。RECOVER 一轮里可能卡住：旧实例在 D 态杀不掉、卸载复核等不到、
+   或新实例永远不写就绪字节。旧实现只在「下一次 tick 看到 pid 死了」时才再请求恢复，
+   真卡住时既不恢复也不重试——整机 FUSE 视图一直不可用，而事件循环本身还在跑。
+   这里按墙钟节拍重发同一任务位（decay：2s→4s→8s→16s→30s 封顶，最多 5 次），
+   只在事件循环线程上读写这两个标量。 */
+#define FUSE_RECOVER_RETRY_MS 2000
+#define FUSE_RECOVER_RETRY_MAX 5
+#define FUSE_RECOVER_RETRY_CAP_MS 30000
+static int64_t g_recover_deadline_ms;
+static unsigned g_recover_retries;
+
+static void recover_arm_deadline(void) {
+    g_recover_deadline_ms = nsp_retry_now_ms() + FUSE_RECOVER_RETRY_MS;
+}
+
+static void recover_clear_deadline(void) {
+    g_recover_deadline_ms = 0;
+    g_recover_retries = 0;
+}
+
+static void maybe_retry_recover(void) {
+    if (g_recover_deadline_ms <= 0) return;
+    const int64_t now = nsp_retry_now_ms();
+    if (now < g_recover_deadline_ms) return;
+    if (g_fuse_ready && g_global_fuse.fuse_pid > 0) {
+        recover_clear_deadline(); /* 迟到的就绪：视图已回来，重试链到此为止 */
+        return;
+    }
+    if (g_recover_retries >= FUSE_RECOVER_RETRY_MAX) {
+        LOG_ERR("FUSE 恢复重试 %u 次仍未就绪，停止重试（保持当前视图）", g_recover_retries);
+        recover_clear_deadline();
+        return;
+    }
+    g_recover_retries++;
+    int64_t backoff = (int64_t)FUSE_RECOVER_RETRY_MS << g_recover_retries;
+    if (backoff > FUSE_RECOVER_RETRY_CAP_MS) backoff = FUSE_RECOVER_RETRY_CAP_MS;
+    g_recover_deadline_ms = now + backoff;
+    LOG_WRN("FUSE 恢复超过 %dms 未就绪，第 %u 次重新请求恢复", FUSE_RECOVER_RETRY_MS,
+            g_recover_retries);
+    request_fuse_jobs(NSP_FUSE_JOB_RECOVER);
 }
 
 /* 崩溃恢复重挂的计数：只统计真正挂上的应用，失败另有逐条日志 */
@@ -1021,6 +1156,7 @@ static void check_and_recover_fuse() {
            若等 worker 回报再置，就绪事件可能已经过去，重挂会被无限推迟。
            worker 起不来时按旧行为内联执行——宁可慢一次也不能丢恢复。 */
         g_pending_remount = 1;
+        recover_arm_deadline();
         request_fuse_jobs(NSP_FUSE_JOB_RECOVER);
     }
 
@@ -1047,8 +1183,9 @@ static void check_and_recover_fuse() {
             return;
         }
         if (!inject_is_global_replace() && is_media_module_injected_target()) {
-            LOG("专用媒体 FUSE 异常退出，执行重新拉起任务");
-            inject_media_fuse();
+            /* 重拉要 kill 等待 + 卸载复核 + fork（最坏约 1s）：交给维护 worker */
+            LOG("专用媒体 FUSE 异常退出，安排重新拉起任务");
+            request_fuse_jobs(NSP_FUSE_JOB_MEDIA);
         }
     } else if (g_media_fuse.fuse_pid <= 0 && !g_media_fuse.disabled && g_fuse_ready &&
                !inject_is_global_replace()) {
@@ -1059,18 +1196,15 @@ static void check_and_recover_fuse() {
          */
         if (is_media_module_injected_target()) {
             LOG("惰性启动媒体 FUSE 实例 (com.android.providers.media.module 专属)");
-            inject_media_fuse();
+            request_fuse_jobs(NSP_FUSE_JOB_MEDIA);
         }
     } else if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
         /*
          * 热重载安全防御：
          * 媒体组件不再是注入目标时，安全终结其专属 FUSE，防止挂载空转。
          */
-        LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
-        kill(g_media_fuse.fuse_pid, SIGTERM);
-        (void)reaped_managed_exited(g_media_fuse.fuse_pid, nullptr);
-        g_media_fuse.fuse_pid = 0;
-        ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
+        LOG("配置变更：媒体组件不再是注入目标。安排终结专属媒体 FUSE...");
+        request_fuse_jobs(NSP_FUSE_JOB_MEDIA);
     }
 }
 
@@ -1451,6 +1585,9 @@ static void injector_early_init(void) {
     config_init_lock();
     fast_pid_init();
     init_uid_map_cache();
+    /* uid.map 的整表落盘交给独立线程：内存表是权威视图，磁盘只是启动期缓存，
+       fsync 绝不留在 IPC ACK 路径上（见 include/uid_cache_writer.h） */
+    init_uid_map_persist();
     /* 装配异步刷新回调：在所有 init 之后、事件循环之前（此后才允许 request） */
     nsp_async_refresh_init(injector_sys_pkg_refresh_cb, nullptr);
 }
@@ -1701,8 +1838,19 @@ static bool retry_mount_ns_ready(int pid, RetryMountIdentity* identity) {
 
 static void retry_pending_mounts(void) {
     if (!g_fuse_ready) return;
+    if (g_retry_defer_ms > 0) {
+        if (nsp_retry_now_ms() < g_retry_defer_ms) return;
+        g_retry_defer_ms = 0;
+    }
     const char* mnt_src_retry = get_active_mnt_src();
     if (!mnt_src_retry) return;
+    /* 挂载表写者互斥：审计/维护 worker 正在改挂载视图时**不**在循环上等（那是一轮
+       可能数十秒的全量对账），把本轮重试推到 20ms 后再跑；抢到就在整轮里持有。 */
+    if (!mount_ops_try_begin()) {
+        g_retry_defer_ms = nsp_retry_now_ms() + NSP_RETRY_DEFER_MS;
+        arm_due_timer();
+        return;
+    }
     /* 每 tick 至多取 NSP_RETRY_TICK_BUDGET 条：重试要读 mountinfo + fork，主循环里
        一次做完几十条会把其它应用的 IPC 应答排到后面（批量冷启动时的抖动来源）。
        退避与尝试上限都在 retry_queue 内（nsp_retry_next 自带到期判定与计数）。 */
@@ -1754,6 +1902,7 @@ static void retry_pending_mounts(void) {
            把条目摘掉，于是每个 tick 都从头再试）。 */
         perform_app_mount(e.pkg, e.pid, uid, nullptr, "失败重试");
     }
+    mount_ops_end();
     /* 队列里还有未到期的条目 → 把毫秒定时器臂到最近那个到期时刻（快档 20ms）；
        空了就解除定时（nsp_retry_next_due_ms 返回 -1）。 */
     arm_due_timer();
@@ -1974,6 +2123,8 @@ static void on_timer_event(int timer_fd) {
     uint64_t expirations;
     if (read(timer_fd, &expirations, sizeof(expirations)) > 0) {
         check_and_recover_fuse();
+        maybe_retry_recover();
+        flush_deferred_fuse_jobs();
         maybe_reconcile_global_replace();
         reap_zombies();
         maybe_periodic_scan();
@@ -2078,17 +2229,11 @@ static void reload_apply_view(NspCfgRec* reload_recs, int reload_count) {
     setup_inotify_watches();
     config_publisher_broadcast();
 
-    if (g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) {
-        LOG("配置变更：媒体组件不再是注入目标。正在终结专属媒体 FUSE...");
-        kill(g_media_fuse.fuse_pid, SIGTERM);
-        int status;
-        waitpid(g_media_fuse.fuse_pid, &status, WNOHANG);
-        g_media_fuse.fuse_pid = 0;
-        ns_force_umount_stale(g_media_fuse.pid, g_media_fuse.mnt_path);
-    } else if (g_media_fuse.fuse_pid <= 0 && !inject_is_global_replace() &&
-               is_media_module_injected_target() && g_fuse_ready) {
-        LOG("配置变更：检测到专属媒体 FUSE 需要被拉起...");
-        inject_media_fuse();
+    if (!inject_is_global_replace() && !g_media_fuse.disabled &&
+        ((g_media_fuse.fuse_pid > 0 && !is_media_module_injected_target()) ||
+         (g_media_fuse.fuse_pid <= 0 && g_fuse_ready && is_media_module_injected_target()))) {
+        /* 终结与拉起都要动命名空间（kill 等待 + 卸载复核 + fork）：交给维护 worker */
+        request_fuse_jobs(NSP_FUSE_JOB_MEDIA);
     }
 
     /* 运行中应用的挂载对账要对每个应用做「配置判定 + 实测视图 + 挂载/卸载/
@@ -2239,6 +2384,10 @@ static void injector_shutdown(const InjectorFds* fds) {
     nsp_reload_stage_shutdown();
     /* 恢复 worker 若正在跑重启序列，等它跑完再拆全局状态，不取消 */
     nsp_fuse_recover_shutdown();
+    /* uid.map 落盘线程要有界收尾：先把已请求的一轮写完，再回收线程；
+       写盘失败只记日志，内存表已生效，退出不因此失败 */
+    uid_cache_write_flush();
+    uid_cache_write_shutdown();
     do_cleanup();
     ipc_server_cleanup(ipc_sock);
     if (timer_fd >= 0) close(timer_fd);

@@ -209,6 +209,8 @@ def direct_compile_group():
         # timeout 取消分支清真实重试账，不用空桩掩盖新增依赖。
         os.path.join(ROOT, "src", "injector", "retry_queue.c"),
         os.path.join(ROOT, "src", "injector", "inject_target.c"),
+        # uid 表写回已异步化：真实落盘线程 TU，不用空桩掩盖新增依赖。
+        os.path.join(ROOT, "src", "injector", "uid_cache_writer.c"),
         os.path.join(ROOT, "src", "core", "uid_map.c"),
         os.path.join(ROOT, "src", "core", "fast_pid.c"),
         os.path.join(ROOT, "src", "core", "nsp_util.c"),

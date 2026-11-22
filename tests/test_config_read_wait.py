@@ -31,6 +31,8 @@ LIMIT_READER_CPU_MS = 20   # 读者在窗口里的线程 CPU 上限
 LIMIT_WINDOW_CPU_MS = 120  # 60ms 采样窗口的进程 CPU 上限（自旋时 8 线程×窗口）
 MIN_WAIT_MS = 100          # 慢读者持槽 150ms，读者必须真的等到快结束
 MAX_LAG_MS = 50            # 放行后返回延迟：futex 唤醒不得丢
+MIN_DRAIN_WALL_MS = 50     # 排空真的等到了慢读者（否则写者 CPU 断言无意义）
+LIMIT_DRAIN_CPU_MS = 20    # 写者排空期间烧的 CPU（新 ~0-3ms，旧自旋 ≈ 窗口长度）
 
 
 def main():
@@ -60,13 +62,15 @@ def main():
         print("❌ 运行失败 rc=%d：%s" % (run.returncode, (run.stdout + run.stderr)[-500:]))
         return 1
     m = re.search(r"readers=(\d+) window_cpu_ms=(-?\d+) max_reader_cpu_ms=(-?\d+) "
-                  r"max_reader_wait_ms=(-?\d+) max_return_lag_ms=(-?\d+)", run.stdout)
+                  r"max_reader_wait_ms=(-?\d+) max_return_lag_ms=(-?\d+) "
+                  r"drain_wall_ms=(-?\d+) drain_cpu_ms=(-?\d+)", run.stdout)
     if not m:
         print("❌ 输出无法解析：%r" % run.stdout[-500:])
         return 1
-    readers, window_cpu, reader_cpu, wait_ms, lag = (int(x) for x in m.groups())
+    readers, window_cpu, reader_cpu, wait_ms, lag, drain_wall, drain_cpu = (int(x) for x in m.groups())
     print("readers=%d window_cpu_ms=%d max_reader_cpu_ms=%d max_reader_wait_ms=%d "
-          "max_return_lag_ms=%d" % (readers, window_cpu, reader_cpu, wait_ms, lag))
+          "max_return_lag_ms=%d drain_wall_ms=%d drain_cpu_ms=%d"
+          % (readers, window_cpu, reader_cpu, wait_ms, lag, drain_wall, drain_cpu))
     fails = 0
     if readers <= 0:
         print("❌ 读者线程数异常：%d" % readers)
@@ -86,6 +90,14 @@ def main():
     if lag > MAX_LAG_MS:
         print("❌ 放行后返回延迟 %dms（期望 <= %dms）：唤醒丢了或判据没跟上"
               % (lag, MAX_LAG_MS))
+        fails += 1
+    if drain_wall < MIN_DRAIN_WALL_MS:
+        print("❌ 写者排空只等了 %dms（期望 >= %dms）：场景没成立，CPU 断言无意义"
+              % (drain_wall, MIN_DRAIN_WALL_MS))
+        fails += 1
+    if drain_cpu >= LIMIT_DRAIN_CPU_MS:
+        print("❌ 写者排空烧了 %dms CPU（期望 < %dms；旧实现自旋 ≈ 整个窗口）"
+              % (drain_cpu, LIMIT_DRAIN_CPU_MS))
         fails += 1
     if fails:
         print("配置读槽等待测试失败：%d 项（证据 %s）" % (fails, work))

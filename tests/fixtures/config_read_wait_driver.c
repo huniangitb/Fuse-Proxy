@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #define READERS 8
-#define SLOW_IN_SLOT_US (150 * 1000)
+#define SLOW_IN_SLOT_US (300 * 1000) /* 槽内慢活：给排空阶段留出可判别的等待窗口 */
 #define SAMPLE_US (60 * 1000)
 
 static atomic_int g_go;
@@ -73,8 +73,14 @@ int main(void) {
     usleep(SAMPLE_US);
     long long cpu_b = now_ns(CLOCK_PROCESS_CPUTIME_ID);
 
-    pthread_join(slow, nullptr);
+    /* 写者排空：此刻慢读者仍持旧槽，旧实现（裸 sched_yield 自旋）会在这里
+       烧掉整个窗口的 CPU；新实现退避睡眠，CPU 应接近 0。 */
+    long long drain_cpu0 = now_ns(CLOCK_THREAD_CPUTIME_ID);
+    long long drain_wall0 = now_ns(CLOCK_MONOTONIC);
     config_drain_readers(old); /* 真实写者排空旧读者 */
+    long long drain_cpu = now_ns(CLOCK_THREAD_CPUTIME_ID) - drain_cpu0;
+    long long drain_wall = now_ns(CLOCK_MONOTONIC) - drain_wall0;
+    pthread_join(slow, nullptr);
     g_publish_at = now_ns(CLOCK_MONOTONIC);
     config_publish_end(old); /* 放行 + 唤醒 */
     for (int i = 0; i < READERS; i++) pthread_join(th[i], nullptr);
@@ -87,8 +93,8 @@ int main(void) {
         if (lag > max_lag) max_lag = lag;
     }
     printf("readers=%d window_cpu_ms=%lld max_reader_cpu_ms=%lld max_reader_wait_ms=%lld "
-           "max_return_lag_ms=%lld\n",
+           "max_return_lag_ms=%lld drain_wall_ms=%lld drain_cpu_ms=%lld\n",
            READERS, (cpu_b - cpu_a) / 1000000, max_cpu / 1000000, max_wait / 1000000,
-           max_lag / 1000000);
+           max_lag / 1000000, drain_wall / 1000000, drain_cpu / 1000000);
     return 0;
 }

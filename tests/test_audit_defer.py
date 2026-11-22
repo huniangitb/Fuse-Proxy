@@ -32,6 +32,8 @@ SKIP_RC = 77
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DRIVER = os.path.join(ROOT, 'tests', 'fixtures', 'audit_defer_driver.c')
 MODULE = os.path.join(ROOT, 'src', 'injector', 'audit_worker.c')
+# 审计轮整轮持挂载锁（src/injector/mount_ops.c）：真 TU 必须一起链，不能桩掉。
+MOUNT_OPS = os.path.join(ROOT, 'src', 'injector', 'mount_ops.c')
 INJECTOR = os.path.join(ROOT, 'src', 'injector', 'injector.c')
 SPAWN_DRIVER = os.path.join(ROOT, 'tests', 'fixtures', 'audit_spawn_fail_driver.c')
 AUDITS = ('audit_tracked_apps', 'audit_and_remount_specific_apps', 'audit_running_apps')
@@ -107,7 +109,7 @@ def build(work, tag, sanitize):
     ]
     if sanitize:
         cmd += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    cmd += [DRIVER, MODULE, "-o", exe, "-pthread"]
+    cmd += [DRIVER, MODULE, MOUNT_OPS, "-o", exe, "-pthread"]
     print("$", shlex.join(cmd), flush=True)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.stdout + result.stderr:
@@ -123,7 +125,7 @@ def build_spawn(work):
     cmd = [
         "cc", "-std=gnu2x", "-DTARGET_GNU=1", "-D_GNU_SOURCE", "-O1",
         "-Wall", "-Wextra", "-Werror", "-I", os.path.join(ROOT, "include"),
-        SPAWN_DRIVER, MODULE, "-Wl,--wrap=pthread_create", "-o", exe, "-pthread",
+        SPAWN_DRIVER, MODULE, MOUNT_OPS, "-Wl,--wrap=pthread_create", "-o", exe, "-pthread",
     ]
     print("$", shlex.join(cmd), flush=True)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

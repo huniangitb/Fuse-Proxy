@@ -143,11 +143,30 @@ uint64_t config_publish_begin(void) {
     return g;
 }
 
+/* 写者排空等待的退避：先让出几次（读者通常已经归零，绝大多数排空一轮就结束），
+   之后按 20µs → 100µs 睡眠退避。旧实现是裸 sched_yield 自旋：读者持槽 300ms
+   时写者烧掉 0.66–0.91 个核（实测 writer_cpu/wall=0.9959），而发布点在注入器
+   唯一事件循环上，烧核还会饿住同核的 pre-hook 判定。睡眠只把排空延迟抬高
+   ≤100µs，相对被等读者的剩余槽内时间可以忽略。 */
+#define CFG_DRAIN_YIELD_ROUNDS 8
+static void cfg_drain_backoff(int* rounds) {
+    if (*rounds < CFG_DRAIN_YIELD_ROUNDS) {
+        (*rounds)++;
+        sched_yield();
+        return;
+    }
+    long ns = (*rounds < CFG_DRAIN_YIELD_ROUNDS + 16) ? 20000L : 100000L;
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = ns};
+    (*rounds)++;
+    nanosleep(&ts, nullptr);
+}
+
 /* 等待旧代际读者归零（写者交换前调用）：gen 已置奇数封锁新读者，
    旧代际读者读完自动归零；归零后无读者在途，方可安全执行非原子交换。
    新读者进新槽（(new_gen>>1)&1 ≠ old_slot）不阻塞写者——无饥饿。 */
 void config_drain_readers(uint64_t old_gen) {
     int old_slot = (int)((old_gen >> 1) & 1);
+    int rounds = 0;
     for (;;) {
         bool busy = false;
         for (int i = 0; i < CFG_READER_MAX; i++) {
@@ -157,7 +176,7 @@ void config_drain_readers(uint64_t old_gen) {
             }
         }
         if (!busy) break;
-        sched_yield();
+        cfg_drain_backoff(&rounds);
     }
 }
 
@@ -170,6 +189,7 @@ void config_publish_end(uint64_t old_gen) {
     /* 扫描全部读者行等旧代际槽归零（无条件扫 MAX 行，规避槽位分配
        可见性竞态；热重载极低频，64×acquire load 开销可忽略）。
        新读者进新槽（(new_gen>>1)&1 ≠ old_slot）不阻塞写者——无饥饿。 */
+    int rounds = 0;
     for (;;) {
         bool busy = false;
         for (int i = 0; i < CFG_READER_MAX; i++) {
@@ -179,7 +199,7 @@ void config_publish_end(uint64_t old_gen) {
             }
         }
         if (!busy) break;
-        sched_yield();
+        cfg_drain_backoff(&rounds);
     }
 }
 static bool is_wildcard_string(const char* str) {

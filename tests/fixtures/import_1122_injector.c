@@ -104,6 +104,13 @@ bool ns_mnt_wait_capture(int pid, dev_t* dev, ino_t* ino) {
     if (child && read >= 3 && mutation == 7) *ino += 10;
     return true;
 }
+/* 重试派发的写者闸与延后时刻：真实实现在 src/injector/mount_ops.c（另有专套件直测）。
+   这里按「总能拿到锁」的边界替身，专注重试记账本身。 */
+static int64_t g_retry_defer_ms;
+#define NSP_RETRY_DEFER_MS 20
+static bool mount_ops_try_begin(void) { return true; }
+static void mount_ops_end(void) {}
+
 static int64_t fake_now_ms;
 static int64_t fixture_now_ms(void) { return fake_now_ms; }
 /* Only production clock calls use synthetic time; retry_queue.c stays unmodified. */
